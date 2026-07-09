@@ -47,7 +47,7 @@ jobs:
       ui: ${{ steps.f.outputs.ui }}
       stack: ${{ steps.f.outputs.stack }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - id: f
@@ -85,7 +85,7 @@ jobs:
       RUSTC_WRAPPER: sccache
       SCCACHE_CACHE_SIZE: "12G"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # Installs protoc + node (and, where it works, rust) per mise.toml.
       - uses: jdx/mise-action@v4
       # mise's rust plugin wraps rustup and on some self-hosted runners silently
@@ -129,7 +129,7 @@ jobs:
     if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'self-hosted' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses bans
@@ -146,7 +146,7 @@ jobs:
       run:
         working-directory: ui
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v5
         with:
           node-version: 22
@@ -182,7 +182,7 @@ jobs:
       RUSTC_WRAPPER: sccache
       SCCACHE_CACHE_SIZE: "12G"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
       # See build-test: guarantee a usable cargo on self-hosted runners.
       - name: Ensure Rust toolchain
@@ -233,7 +233,7 @@ jobs:
   lint:
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'self-hosted' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # node for `npx markdownlint-cli2`; consistent toolchain with the rest of CI.
       - uses: jdx/mise-action@v4
       - name: Install linters (pinned)
