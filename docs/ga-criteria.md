@@ -52,7 +52,7 @@ honestly.
 | Criterion | Status | Evidence |
 |---|---|---|
 | SemVer + changelog + deprecation policy | ✅ Met | [RELEASING.md](https://github.com/GrowlerDB/growlerdb/blob/main/RELEASING.md), [CHANGELOG.md](https://github.com/GrowlerDB/growlerdb/blob/main/CHANGELOG.md) |
-| Signed, multi-arch artifacts + SBOM; Helm chart published | ✅ Met | `release.yml` verified on v0.1.8 — `imagetools inspect` shows a linux/amd64 + linux/arm64 manifest list with cosign signature + SBOM; both arches run (task-157). Helm chart pushed to GHCR OCI |
+| Signed, multi-arch artifacts + SBOM; Helm chart published | ✅ Met | `release.yml` publishes a linux/amd64 + linux/arm64 manifest list with a cosign signature + SBOM (`imagetools inspect`), the Helm chart to GHCR OCI, and release binaries + checksums; both arches run (task-157) |
 | Getting-started + reference + migration docs | ✅ Met | [docs/](index) |
 
 ## Summary
