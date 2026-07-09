@@ -17,7 +17,7 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
     <trino.version>470</trino.version>
-    <grpc.version>1.68.1</grpc.version>
+    <grpc.version>1.75.0</grpc.version>
     <protobuf.version>4.28.3</protobuf.version>
 
     <!-- Live tests (a real Trino QueryRunner / running Gateway) are tag-gated out of the default
