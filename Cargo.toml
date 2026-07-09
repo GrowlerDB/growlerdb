@@ -20,7 +20,7 @@ serde_json = "1"
 # tz database needed (parsing only), so drop the default features (iana-time-zone/js-sys/wasm).
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 tracing = "0.1"
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 # zstd-compression: the doc store defaults to zstd for NEW indexes (task-212) — unlike lz4 it
 # entropy-codes incompressible-to-lz4 literals (hex/UUID keys, high-entropy cached fields).
 # Existing indexes keep the compressor persisted in their meta.json.
