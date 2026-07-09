@@ -27,7 +27,7 @@
 
     <!-- Spark/Iceberg are `provided` (supplied by spark-submit); added with the
          changelog read in task-63. Pinned here per the locked stack. -->
-    <spark.version>4.0.0</spark.version>
+    <spark.version>4.1.2</spark.version>
     <scala.binary.version>2.13</scala.binary.version>
     <iceberg.version>1.10.0</iceberg.version>
 
