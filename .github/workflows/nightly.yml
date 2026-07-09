@@ -45,7 +45,7 @@ jobs:
           rustup default stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: Swatinem/rust-cache@v2
-      - uses: mozilla-actions/sccache-action@v0.0.6
+      - uses: mozilla-actions/sccache-action@v0.0.10
       # The catalog vends an S3 endpoint of `minio:9000`; map it for host clients.
       - name: Map minio hostname
         run: echo "127.0.0.1 minio" | sudo tee -a /etc/hosts

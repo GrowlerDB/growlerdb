@@ -105,7 +105,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Install sccache (the RUSTC_WRAPPER set above). Disk-backed cache persists across runs on the
       # self-hosted box, so workspace-crate codegen is reused even though rust-cache drops it.
-      - uses: mozilla-actions/sccache-action@v0.0.6
+      - uses: mozilla-actions/sccache-action@v0.0.10
       # Surface disk headroom: a silent death in "Build tests" is usually ENOSPC.
       - name: Disk free
         run: df -h / "$HOME" "$RUNNER_TEMP" || true
@@ -195,7 +195,7 @@ jobs:
           rustup default stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: Swatinem/rust-cache@v2
-      - uses: mozilla-actions/sccache-action@v0.0.6
+      - uses: mozilla-actions/sccache-action@v0.0.10
       # The catalog vends an S3 endpoint of `minio:9000`; map it for host clients.
       - name: Map minio hostname
         run: echo "127.0.0.1 minio" | sudo tee -a /etc/hosts
