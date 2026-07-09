@@ -13,6 +13,10 @@
 
 **Open-source text search engine over Apache Iceberg** (and other datastores).
 
+[![CI](https://github.com/GrowlerDB/growlerdb/actions/workflows/ci.yml/badge.svg)](https://github.com/GrowlerDB/growlerdb/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/GrowlerDB/growlerdb?sort=semver)](https://github.com/GrowlerDB/growlerdb/releases)
+
 📖 **Documentation: <https://growlerdb.github.io/growlerdb/>** — [Getting started](https://growlerdb.github.io/growlerdb/getting-started) · [Install & run modes](https://growlerdb.github.io/growlerdb/install) · [Configuration](https://growlerdb.github.io/growlerdb/configuration) · [API reference](https://growlerdb.github.io/growlerdb/reference)
 
 GrowlerDB keeps Apache Iceberg as the system of record and maintains a fast, derived

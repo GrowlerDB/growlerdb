@@ -1,0 +1,33 @@
+version: 2
+updates:
+  # Rust workspace
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  # Console (Svelte SPA)
+  - package-ecosystem: npm
+    directory: /ui
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  # GitHub Actions used by the workflows
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  # JVM connectors (Spark + Trino)
+  - package-ecosystem: maven
+    directory: /connector
+    schedule:
+      interval: weekly
+  - package-ecosystem: maven
+    directory: /connector-trino
+    schedule:
+      interval: weekly
+  # Server image base
+  - package-ecosystem: docker
+    directory: /deploy
+    schedule:
+      interval: weekly
