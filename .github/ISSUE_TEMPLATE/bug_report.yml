@@ -1,0 +1,48 @@
+name: Bug report
+description: Report a defect in GrowlerDB.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Please **do not** report security issues here — use the
+        [security advisory](https://github.com/GrowlerDB/growlerdb/security/advisories/new) link instead.
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: Output of `growlerdb --version`, the image tag, or a commit SHA.
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps, index definition, and query if applicable.
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / output
+      render: shell
+    validations:
+      required: false
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options:
+        - Docker Compose (local)
+        - Kubernetes (Helm)
+        - Binary
+        - Other
+    validations:
+      required: false
