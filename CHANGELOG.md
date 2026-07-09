@@ -8,6 +8,14 @@ All notable changes to GrowlerDB are documented here. The format is based on
 
 This is the first release line — everything below is the initial GA surface.
 
+### Security
+
+- Dependency security bumps ahead of the first public release, surfaced by Dependabot alerts:
+  gRPC `1.75.0` (Netty "MadeYouReset" HTTP/2 DoS — high), `jsonwebtoken` `10` (type-confusion
+  authorization-bypass advisory; the pure-Rust `rust_crypto` provider is selected explicitly), and
+  ECharts `6.1` (console XSS advisory). A medium transitive `thrift` advisory (via `parquet`, in the
+  own-data metadata-parse path) is tracked for the arrow/parquet 59 upgrade.
+
 ### Added
 
 **Core engine & query**

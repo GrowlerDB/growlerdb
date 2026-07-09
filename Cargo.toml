@@ -20,7 +20,10 @@ serde_json = "1"
 # tz database needed (parsing only), so drop the default features (iana-time-zone/js-sys/wasm).
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 tracing = "0.1"
-jsonwebtoken = "9"
+# v10 gates the crypto backend behind a feature (default enables none → runtime panic). Use the
+# pure-Rust provider (no aws-lc C deps) so the multi-arch cross-build stays simple. `use_pem` (default)
+# stays on for RS256 `from_rsa_pem`.
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 # zstd-compression: the doc store defaults to zstd for NEW indexes (task-212) — unlike lz4 it
 # entropy-codes incompressible-to-lz4 literals (hex/UUID keys, high-entropy cached fields).
 # Existing indexes keep the compressor persisted in their meta.json.
