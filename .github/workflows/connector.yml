@@ -13,9 +13,13 @@ concurrency:
   group: connector-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
+  # pull_request runs on GitHub-hosted, push (main) on self-hosted — see ADR d34 (runner safety).
   build:
-    runs-on: self-hosted
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'self-hosted' }}
     steps:
       - uses: actions/checkout@v5
       - uses: jdx/mise-action@v4
