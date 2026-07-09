@@ -41,4 +41,4 @@ http-body-util = "0.1"
 # fixture files — same major as growlerdb-source's pins.
 parquet = { version = "57", features = ["arrow"] }
 arrow-array = "57"
-arrow-schema = "57"
+arrow-schema = "59"
