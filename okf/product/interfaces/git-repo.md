@@ -26,7 +26,8 @@ The GitHub repository is how users and contributors engage the open-source proje
 
 Repository health is complete for public launch: LICENSE (Apache-2.0), CONTRIBUTING (DCO),
 CODE_OF_CONDUCT, SECURITY, plus `CODEOWNERS`, issue forms + `config.yml`, a PR template, and
-`dependabot.yml` (cargo / npm / actions / maven / docker). **Dependabot alerts + security updates,
+`dependabot.yml` (cargo / npm / actions / maven / docker; minor+patch grouped weekly per ecosystem,
+majors as individual PRs). **Dependabot alerts + security updates,
 secret scanning, and push protection** are enabled; branch protection guards `main`. Runner safety
 for the public repo is [D34](/system/decisions/d34-runner-safety.md); the release pipeline is in
 [system/build](/system/build.md).
