@@ -24,7 +24,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/dist/growlerdb /usr/local/bin/growlerdb
 
 # Build the UI SPA (task-45/46/47/48) — the gateway serves it via --ui-dir.
-FROM node:22-bookworm-slim AS ui-build
+FROM node:26-bookworm-slim AS ui-build
 WORKDIR /ui
 COPY ui/package.json ui/package-lock.json ./
 RUN npm ci
