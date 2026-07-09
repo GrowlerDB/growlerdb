@@ -40,5 +40,5 @@ http-body-util = "0.1"
 # The compaction-under-hydration regression test (task-184 slice 3) writes real parquet
 # fixture files — same major as growlerdb-source's pins.
 parquet = { version = "57", features = ["arrow"] }
-arrow-array = "57"
+arrow-array = "59"
 arrow-schema = "57"

@@ -12,7 +12,7 @@ thiserror.workspace = true
 iceberg = "0.9"
 iceberg-catalog-rest = "0.9"
 iceberg-storage-opendal = "0.9"
-arrow-array = "57"
+arrow-array = "59"
 arrow-schema = "57"
 # Direct parquet access for hydration's targeted point reads (task-184 / D30) — same major as
 # iceberg's pin, over the same FileIO; the iceberg scan API has no positional selection.
