@@ -18,7 +18,7 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
     <grpc.version>1.68.1</grpc.version>
-    <protobuf.version>4.28.3</protobuf.version>
+    <protobuf.version>4.35.1</protobuf.version>
     <!-- Prometheus client for the connector's own metrics (task-194 AC6): the ingest-side counters
          (per-trigger rows read/expected, per-shard acks, stream restarts, write retries, under-reads)
          that used to be printf-only — invisible once the container log rotated. Scraped off a tiny
