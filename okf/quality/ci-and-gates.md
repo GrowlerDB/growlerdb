@@ -25,9 +25,12 @@ The automated gates a change passes before merge — the quality process encoded
 
 ## How it runs
 
-Jobs are **path-filtered** (a docs-only PR doesn't compile Rust; the lint job runs unconditionally),
-on **self-hosted** runners, with sccache. The full E2E + Spark integration run nightly. See
-[CLI](/system/build.md) for `just check` (the local mirror).
+Jobs are **path-filtered** (a docs-only PR doesn't compile Rust; the lint job runs unconditionally).
+Runners split by trust ([D34](/system/decisions/d34-runner-safety.md)): **`pull_request` runs on
+GitHub-hosted** runners, while **`push` (main) and nightly run on the home-lab self-hosted** runners
+(sccache, persistent disk) — so untrusted fork-PR code never touches the home lab, and an org policy
+requires maintainer approval for any outside collaborator's run. The full E2E + Spark integration run
+nightly. See [CLI](/system/build.md) for `just check` (the local mirror).
 
 ## Notes
 
