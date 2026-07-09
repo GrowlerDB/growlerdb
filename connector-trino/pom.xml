@@ -16,7 +16,7 @@
     <maven.compiler.release>23</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
-    <trino.version>470</trino.version>
+    <trino.version>482</trino.version>
     <grpc.version>1.68.1</grpc.version>
     <protobuf.version>4.28.3</protobuf.version>
 
