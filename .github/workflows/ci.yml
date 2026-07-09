@@ -9,6 +9,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: CI only reads the repo (checkout). The restricted token deliberately can't reach
+# the API — the `changes` job diffs with git for exactly this reason.
+permissions:
+  contents: read
+
 env:
   # Incremental compilation only pays off across repeated local rebuilds;
   # on a fresh CI runner it just adds I/O overhead.
@@ -21,6 +26,10 @@ env:
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
 
+# Runner split (ADR d34 — runner safety for a public repo): pull_request runs on GitHub-hosted
+# runners (disposable, free for public repos); push (main) and nightly stay on the home-lab
+# self-hosted runners. A fork PR's code therefore never executes on the home lab, even if a
+# maintainer approves the run. `runs-on` below encodes this per job.
 jobs:
   # Path gate: decide which expensive jobs need to run for this change, so a UI-only PR doesn't pay
   # for the full Rust workspace test-compile (and a Rust-only PR skips the console build). Downstream
@@ -32,7 +41,7 @@ jobs:
   # the GitHub API, which this repo's restricted GITHUB_TOKEN can't do ("Resource not accessible by
   # integration"). git needs no API/token scope — just full history (fetch-depth: 0).
   changes:
-    runs-on: self-hosted
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'self-hosted' }}
     outputs:
       rust: ${{ steps.f.outputs.rust }}
       ui: ${{ steps.f.outputs.ui }}
@@ -68,7 +77,7 @@ jobs:
   build-test:
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
-    runs-on: self-hosted
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'self-hosted' }}
     # sccache wraps rustc and caches compiled artifacts on the runner's persistent disk — including
     # the workspace crates that Swatinem/rust-cache deliberately drops. Unchanged crates become cache
     # hits, so a Rust PR no longer recompiles the whole workspace from scratch (the ~16-min step).
@@ -118,7 +127,7 @@ jobs:
   license-audit:
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
-    runs-on: self-hosted
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'self-hosted' }}
     steps:
       - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -132,7 +141,7 @@ jobs:
   ui:
     needs: changes
     if: ${{ needs.changes.outputs.ui == 'true' }}
-    runs-on: self-hosted
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'self-hosted' }}
     defaults:
       run:
         working-directory: ui
@@ -168,7 +177,7 @@ jobs:
   e2e:
     needs: changes
     if: ${{ needs.changes.outputs.stack == 'true' }}
-    runs-on: self-hosted
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'self-hosted' }}
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_CACHE_SIZE: "12G"
@@ -222,7 +231,7 @@ jobs:
   # runners; linters are installed pinned in-job (no third-party lint actions to trust). Fast (~1 min),
   # so it runs unconditionally — a docs-only PR still gets linted.
   lint:
-    runs-on: self-hosted
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'self-hosted' }}
     steps:
       - uses: actions/checkout@v5
       # node for `npx markdownlint-cli2`; consistent toolchain with the rest of CI.
@@ -261,7 +270,7 @@ jobs:
   ci-gate:
     needs: [changes, build-test, license-audit, ui, e2e, lint]
     if: ${{ always() }}
-    runs-on: self-hosted
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'self-hosted' }}
     steps:
       - name: Require no CI job failed or was cancelled
         run: |
