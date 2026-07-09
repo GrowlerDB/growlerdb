@@ -1380,7 +1380,7 @@ dependencies = [
  "arrow-schema",
  "axum",
  "base64",
- "getrandom 0.2.17",
+ "getrandom 0.4.3",
  "growlerdb-backup",
  "growlerdb-controlplane",
  "growlerdb-core",

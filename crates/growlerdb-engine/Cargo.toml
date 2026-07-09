@@ -22,7 +22,7 @@ serde_json.workspace = true
 jsonwebtoken.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 sha2 = "0.10"
-getrandom = "0.2"
+getrandom = "0.4"
 base64 = "0.22"
 tonic.workspace = true
 tokio = { workspace = true, features = ["rt", "sync"] }
