@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "growlerdb.controlplane.fullname" . }}
+  labels:
+    {{- include "growlerdb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+spec:
+  # Headless: stable DNS for the (single-writer) registry; doubles as the StatefulSet serviceName.
+  clusterIP: None
+  selector:
+    {{- include "growlerdb.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+  ports:
+    - { name: grpc, port: {{ .Values.controlPlane.grpcPort }}, targetPort: grpc }
+    - { name: metrics, port: {{ .Values.controlPlane.metricsPort }}, targetPort: metrics }

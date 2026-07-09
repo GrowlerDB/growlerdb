@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "growlerdb.fullname" . }}-test-readyz
+  labels:
+    {{- include "growlerdb.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  containers:
+    - name: readyz
+      image: {{ include "growlerdb.image" . }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      # `helm test` probe: the gateway is ready and the Engine API answers a query.
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          set -e
+          curl -fsS "http://{{ include "growlerdb.gateway.fullname" . }}:{{ .Values.gateway.metricsPort }}/readyz"
+          curl -fsS -X POST "http://{{ include "growlerdb.gateway.fullname" . }}:{{ .Values.gateway.restPort }}/v1/search" \
+            -H 'content-type: application/json' -d '{"query":"*","limit":1}' >/dev/null
+          echo "growlerdb gateway ready and serving"

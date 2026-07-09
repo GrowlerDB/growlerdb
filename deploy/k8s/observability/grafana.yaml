@@ -1,0 +1,102 @@
+# Grafana + a labeled "GrowlerDB Scale Test" dashboard for the test cluster (task-183). The console's
+# baked SLI panels lack units/labels and omit the source-side + size metrics; this gives clearly
+# titled panels: ingest-into-Iceberg vs index-into-GrowlerDB (records/s + bytes/s), source & index
+# size, source→index lag, query vs hydration latency, stale-locator refresh rate, data-files +
+# compaction, and node/pod resource utilisation. Datasource = the in-cluster Prometheus.
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: grafana-datasources, namespace: growlerdb }
+data:
+  ds.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus:9090
+        isDefault: true
+      # Logs (task-234) — so pod logs are queryable in the same Grafana as the metrics, and a
+      # write-latency spike can be correlated with the node/connector log line that explains it.
+      - name: Loki
+        type: loki
+        access: proxy
+        url: http://loki:3100
+        isDefault: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: grafana-dashboard-provider, namespace: growlerdb }
+data:
+  provider.yaml: |
+    apiVersion: 1
+    providers:
+      - name: scale-test
+        folder: ""
+        type: file
+        options: { path: /var/lib/grafana/dashboards }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: grafana-dashboard-scale, namespace: growlerdb }
+data:
+  scale.json: |
+    {
+      "title": "GrowlerDB Scale Test", "uid": "gdb-scale", "schemaVersion": 39, "time": {"from":"now-1h","to":"now"}, "refresh": "10s",
+      "panels": [
+        {"id":1,"title":"Ingest into Iceberg (records/s)","type":"timeseries","gridPos":{"h":7,"w":12,"x":0,"y":0},"fieldConfig":{"defaults":{"unit":"rps"}},"targets":[{"expr":"deriv(growlerdb_source_records[2m])","legendFormat":"records/s"}]},
+        {"id":2,"title":"Ingest into Iceberg (bytes/s)","type":"timeseries","gridPos":{"h":7,"w":12,"x":12,"y":0},"fieldConfig":{"defaults":{"unit":"Bps"}},"targets":[{"expr":"deriv(growlerdb_source_bytes[2m])","legendFormat":"bytes/s"}]},
+        {"id":3,"title":"Index into GrowlerDB (docs/s)","type":"timeseries","gridPos":{"h":7,"w":12,"x":0,"y":7},"fieldConfig":{"defaults":{"unit":"ops"}},"targets":[{"expr":"sum(rate(growlerdb_ingested_docs_total[2m]))","legendFormat":"docs/s"}]},
+        {"id":4,"title":"Source → index lag (rows behind)","type":"timeseries","gridPos":{"h":7,"w":12,"x":12,"y":7},"fieldConfig":{"defaults":{"unit":"short"}},"targets":[{"expr":"max(growlerdb_source_records) - sum(growlerdb_index_docs)","legendFormat":"lag rows"}]},
+        {"id":5,"title":"Source size (rows)","type":"timeseries","gridPos":{"h":7,"w":12,"x":0,"y":14},"fieldConfig":{"defaults":{"unit":"short"}},"targets":[{"expr":"growlerdb_source_records","legendFormat":"source rows"}]},
+        {"id":6,"title":"Source vs total index size (bytes)","type":"timeseries","gridPos":{"h":7,"w":12,"x":12,"y":14},"fieldConfig":{"defaults":{"unit":"bytes"}},"targets":[{"expr":"growlerdb_source_bytes","legendFormat":"source bytes"},{"expr":"sum(growlerdb_index_bytes)","legendFormat":"index bytes (total)"}]},
+        {"id":7,"title":"Query latency (index lookup)","type":"timeseries","gridPos":{"h":7,"w":12,"x":0,"y":21},"fieldConfig":{"defaults":{"unit":"s"}},"targets":[{"expr":"histogram_quantile(0.50,sum(rate(growlerdb_query_duration_seconds_bucket[2m]))by(le))","legendFormat":"p50"},{"expr":"histogram_quantile(0.95,sum(rate(growlerdb_query_duration_seconds_bucket[2m]))by(le))","legendFormat":"p95"},{"expr":"histogram_quantile(0.99,sum(rate(growlerdb_query_duration_seconds_bucket[2m]))by(le))","legendFormat":"p99"}]},
+        {"id":8,"title":"Hydration latency (GetByKey)","type":"timeseries","gridPos":{"h":7,"w":12,"x":12,"y":21},"fieldConfig":{"defaults":{"unit":"s"}},"targets":[{"expr":"histogram_quantile(0.50,sum(rate(growlerdb_hydration_duration_seconds_bucket[2m]))by(le))","legendFormat":"p50"},{"expr":"histogram_quantile(0.95,sum(rate(growlerdb_hydration_duration_seconds_bucket[2m]))by(le))","legendFormat":"p95"},{"expr":"histogram_quantile(0.99,sum(rate(growlerdb_hydration_duration_seconds_bucket[2m]))by(le))","legendFormat":"p99"}]},
+        {"id":9,"title":"Hydration locators refreshed/s (invalidated by source compaction)","type":"timeseries","gridPos":{"h":7,"w":12,"x":0,"y":28},"fieldConfig":{"defaults":{"unit":"ops"}},"targets":[{"expr":"sum(rate(growlerdb_stale_locators_total[2m]))","legendFormat":"stale-locator refreshes/s"}]},
+        {"id":10,"title":"Source data files (drops = compaction)","type":"timeseries","gridPos":{"h":7,"w":12,"x":12,"y":28},"fieldConfig":{"defaults":{"unit":"short"}},"targets":[{"expr":"growlerdb_source_data_files","legendFormat":"data files"}]},
+        {"id":11,"title":"Node CPU cores used","type":"timeseries","gridPos":{"h":7,"w":12,"x":0,"y":35},"fieldConfig":{"defaults":{"unit":"short"}},"targets":[{"expr":"sum by(node)(rate(node_cpu_seconds_total{mode!=\"idle\"}[2m]))","legendFormat":"{{node}}"}]},
+        {"id":12,"title":"Pod memory (working set)","type":"timeseries","gridPos":{"h":7,"w":12,"x":12,"y":35},"fieldConfig":{"defaults":{"unit":"bytes"}},"targets":[{"expr":"sum by(pod)(container_memory_working_set_bytes{namespace=\"growlerdb\",pod=~\"gdb-.*\"})","legendFormat":"{{pod}}"}]},
+        {"id":13,"title":"Index size per shard (bytes)","type":"timeseries","gridPos":{"h":7,"w":24,"x":0,"y":42},"fieldConfig":{"defaults":{"unit":"bytes"}},"targets":[{"expr":"growlerdb_index_bytes","legendFormat":"{{pod}}"}]},
+        {"id":20,"title":"Convergence: source rows − index docs (→0)","type":"timeseries","gridPos":{"h":7,"w":12,"x":0,"y":49},"fieldConfig":{"defaults":{"unit":"short"}},"targets":[{"expr":"max(growlerdb_source_records) - sum(growlerdb_index_docs)","legendFormat":"rows behind"}]},
+        {"id":21,"title":"Stability — errors/s (query + background)","type":"timeseries","gridPos":{"h":7,"w":12,"x":12,"y":49},"fieldConfig":{"defaults":{"unit":"ops"}},"targets":[{"expr":"sum(rate(growlerdb_query_errors_total[2m]))","legendFormat":"query errors/s"},{"expr":"sum(rate(growlerdb_background_failures_total[2m]))","legendFormat":"background failures/s"}]},
+        {"id":22,"title":"Stability — pod restarts","type":"timeseries","gridPos":{"h":7,"w":12,"x":0,"y":56},"fieldConfig":{"defaults":{"unit":"short"}},"targets":[{"expr":"max by(pod)(kube_pod_container_status_restarts_total{namespace=\"growlerdb\"})","legendFormat":"{{pod}}"}]},
+        {"id":23,"title":"Stability — OOMKilled containers","type":"timeseries","gridPos":{"h":7,"w":12,"x":12,"y":56},"fieldConfig":{"defaults":{"unit":"short"}},"targets":[{"expr":"sum by(pod)(kube_pod_container_status_last_terminated_reason{namespace=\"growlerdb\",reason=\"OOMKilled\"})","legendFormat":"{{pod}}"}]},
+        {"id":24,"title":"Index size breakdown — stacked (term/postings/positions/fieldnorms=search / fast=cache / store / locator=lookup)","type":"timeseries","gridPos":{"h":8,"w":24,"x":0,"y":63},"fieldConfig":{"defaults":{"unit":"bytes","custom":{"stacking":{"mode":"normal"},"fillOpacity":30}}},"targets":[{"expr":"sum by(component)(growlerdb_index_bytes_component)","legendFormat":"{{component}}"}]},
+        {"id":25,"title":"Write latency (commit) — p50/95/99 [task-233: localizes an ingest ceiling to the commit path]","type":"timeseries","gridPos":{"h":7,"w":12,"x":0,"y":71},"fieldConfig":{"defaults":{"unit":"s"}},"targets":[{"expr":"histogram_quantile(0.50,sum(rate(growlerdb_write_duration_seconds_bucket[2m]))by(le))","legendFormat":"p50"},{"expr":"histogram_quantile(0.95,sum(rate(growlerdb_write_duration_seconds_bucket[2m]))by(le))","legendFormat":"p95"},{"expr":"histogram_quantile(0.99,sum(rate(growlerdb_write_duration_seconds_bucket[2m]))by(le))","legendFormat":"p99"}]},
+        {"id":26,"title":"Write queue depth (in-flight commits) — node-side backpressure","type":"timeseries","gridPos":{"h":7,"w":12,"x":12,"y":71},"fieldConfig":{"defaults":{"unit":"short"}},"targets":[{"expr":"max by(pod)(growlerdb_write_queue_depth)","legendFormat":"{{pod}}"}]},
+        {"id":27,"title":"Connector — rows read/s vs write-retries/s (ingest source rate vs backpressure)","type":"timeseries","gridPos":{"h":7,"w":24,"x":0,"y":78},"fieldConfig":{"defaults":{"unit":"ops"}},"targets":[{"expr":"sum(rate(growlerdb_connector_rows_read_total[2m]))","legendFormat":"rows read/s"},{"expr":"sum(rate(growlerdb_connector_write_retries_total[2m]))","legendFormat":"write-retries/s (backpressure)"}]},
+        {"id":28,"title":"Write latency BY PHASE — p95 (apply / location_sync / tantivy_commit / redb) [task-233/237: which phase eats the commit]","type":"timeseries","gridPos":{"h":7,"w":24,"x":0,"y":85},"fieldConfig":{"defaults":{"unit":"s"}},"targets":[{"expr":"histogram_quantile(0.95,sum by(phase,le)(rate(growlerdb_write_phase_duration_seconds_bucket[2m])))","legendFormat":"{{phase}} p95"}]}
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: grafana, namespace: growlerdb, labels: { app: grafana } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: grafana } }
+  template:
+    metadata: { labels: { app: grafana } }
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.4.0
+          env:
+            - { name: GF_AUTH_ANONYMOUS_ENABLED, value: "true" }
+            - { name: GF_AUTH_ANONYMOUS_ORG_ROLE, value: "Admin" }
+            - { name: GF_SECURITY_ADMIN_PASSWORD, value: "growlerdb" }
+          ports: [{ containerPort: 3000 }]
+          volumeMounts:
+            - { name: datasources, mountPath: /etc/grafana/provisioning/datasources }
+            - { name: dash-provider, mountPath: /etc/grafana/provisioning/dashboards }
+            - { name: dashboards, mountPath: /var/lib/grafana/dashboards }
+      volumes:
+        - { name: datasources, configMap: { name: grafana-datasources } }
+        - { name: dash-provider, configMap: { name: grafana-dashboard-provider } }
+        - { name: dashboards, configMap: { name: grafana-dashboard-scale, items: [{ key: scale.json, path: scale.json }] } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: grafana, namespace: growlerdb }
+spec:
+  selector: { app: grafana }
+  ports: [{ port: 3000, targetPort: 3000 }]

@@ -1,0 +1,20 @@
+[
+  {
+    "name": "text_title",
+    "weight": 3,
+    "body": { "query": { "match": { "title": "search engine" } }, "size": 0 }
+  },
+  {
+    "name": "text_body",
+    "weight": 3,
+    "body": { "query": { "match": { "text": "information retrieval" } }, "size": 0 }
+  },
+  {
+    "name": "topk_hydrated",
+    "weight": 2,
+    "body": {
+      "query": { "match": { "text": "apache iceberg" } },
+      "size": 20
+    }
+  }
+]

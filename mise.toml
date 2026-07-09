@@ -1,0 +1,9 @@
+[tools]
+# rustfmt + clippy ship with the toolchain so CI / `just setup` don't depend on a
+# separate `rustup` being on PATH (self-hosted runners may not have it).
+rust = { version = "stable", components = "rustfmt,clippy" }
+# protobuf compiler — required by tonic-build/prost-build (the gRPC wire layer).
+"asdf:paxosglobal/asdf-protoc" = "31.1"
+# Node — the UI build toolchain (Svelte SPA under ui/, task-45).
+node = "22"
+# `just` is a prerequisite (brew install just, or your package manager).

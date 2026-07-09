@@ -1,0 +1,25 @@
+# typos allowlist (task-158). Every entry below was flagged by `typos` but is NOT a typo — it's a
+# technical term or deliberate test fixture. Keeping the checker on catches *real* typos in new code.
+[default.extend-words]
+# "ANDed" (logical AND-ed) tokenizes to "Ded"
+Ded = "Ded"
+# "mis-reads" / "mis-answered" — the mis- prefix
+mis = "mis"
+# "MoR" — Iceberg merge-on-read
+mor = "mor"
+# "unparseable" — accepted variant of unparsable (also a Rust enum/error variant)
+unparseable = "unparseable"
+Unparseable = "Unparseable"
+# "RTO" — Recovery Time Objective (chaos/resilience docs)
+RTO = "RTO"
+# deliberate test fixtures: did-you-mean "bostom"→boston; "hel*" wildcard; index name "ptd";
+# short literal strings "fo"/"Fo" in query/parse tests
+bostom = "bostom"
+ptd = "ptd"
+hel = "hel"
+fo = "fo"
+Fo = "Fo"
+# "Referer" — the (in)famously misspelled but canonical HTTP request header (RFC 7231); the http_logs
+# scale workload has a `referer` field to match real access logs.
+referer = "referer"
+Referer = "Referer"

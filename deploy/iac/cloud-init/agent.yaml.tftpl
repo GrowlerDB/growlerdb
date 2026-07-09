@@ -1,0 +1,32 @@
+#cloud-config
+# Bootstraps a k3s agent (searcher/index node) that joins the server over the private network.
+runcmd:
+  - |
+    # Bring the private NIC up, lease its IP, then join k3s with --node-ip set to it so flannel/CoreDNS
+    # route over the private network (without this, k3s auto-detects the PUBLIC IP as the node IP and
+    # cross-node pod/service traffic + DNS break).
+    #
+    # Hetzner attaches the private network shortly after boot; on a straggler node (a boot-timing race,
+    # usually the last-created ones) enp7s0 comes up DOWN with no IP and cloud-init hangs forever
+    # (task-221). So ACTIVELY bring the link up + request DHCP with retries — don't passively poll — and
+    # fail LOUDLY on a bounded deadline instead of stalling indefinitely if the NIC genuinely can't come
+    # up. The proven manual rescue was `ip link set enp7s0 up; dhcpcd -4 enp7s0`; this automates it.
+    NIC=enp7s0
+    deadline=$(( $(date +%s) + 300 ))
+    until ip -4 addr show "$NIC" 2>/dev/null | grep -qE 'inet 10\.0\.0\.[0-9]+'; do
+      if [ "$(date +%s)" -ge "$deadline" ]; then
+        echo "FATAL: private NIC $NIC never got a 10.0.0.x lease after 300s — aborting join" >&2
+        exit 1
+      fi
+      echo "bringing up $NIC + requesting DHCP (waiting for private IP)"
+      ip link set "$NIC" up 2>/dev/null || true
+      dhcpcd -4 "$NIC" 2>/dev/null || dhclient -4 "$NIC" 2>/dev/null || true
+      sleep 3
+    done
+    PRIV=$(ip -4 addr show "$NIC" | grep -oE '10\.0\.0\.[0-9]+' | head -1)
+    curl -sfL https://get.k3s.io | \
+      INSTALL_K3S_CHANNEL="${k3s_channel}" \
+      K3S_URL="${server_url}" \
+      K3S_TOKEN="${k3s_token}" \
+      INSTALL_K3S_EXEC="agent --node-ip $PRIV --flannel-iface enp7s0" \
+      sh -

@@ -1,0 +1,122 @@
+# GrowlerDB parallel connector SET (task-196): W workers, each a full connector process owning a
+# disjoint shard group (worker i of W owns shards {s : s % W == i}) — horizontal ingest scale-out
+# over one table. Each worker filters the changelog executor-side to its owned rows, writes only
+# its shards (per-shard continuity guard holds: one writer per shard), and resumes from its OWN
+# group's lineage-min checkpoint. Scaling W up/down needs no coordination: the window-covering
+# guard (D31 refinement) makes regrouping plain resume-from-min.
+#
+# RUNBOOK
+#  - NEVER run this set and the single connector (connector.yaml) on the same table at once: two
+#    writers on one shard fail fast at the node (CHECKPOINT_GAP), loudly and safely. Migrate by
+#    scaling one to 0 first (either direction; resume comes from the nodes' checkpoints).
+#  - `--workers` MUST equal `spec.replicas` — one pod template guarantees a uniform value.
+#  - Keep `--max-commit-rows` uniform across the set (one pod template does).
+#  - `replicas` must be <= the shard count: an extra worker owns no shards and crash-loops with an
+#    actionable message (visible misconfig by design).
+#  - After a reshard, roll the whole set (routing is read at startup).
+apiVersion: v1
+kind: Service
+metadata:
+  name: growlerdb-connector-set
+  namespace: growlerdb
+  labels: { app: growlerdb-connector-set }
+spec:
+  clusterIP: None  # headless: only here to give the StatefulSet stable pod identity
+  selector: { app: growlerdb-connector-set }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: growlerdb-connector-set
+  namespace: growlerdb
+  labels: { app: growlerdb-connector-set }
+spec:
+  serviceName: growlerdb-connector-set
+  # W workers; each pod's ordinal is its worker id. Keep <= the index's shard count.
+  replicas: 2
+  podManagementPolicy: Parallel  # workers are independent; no ordered bring-up needed
+  selector:
+    matchLabels: { app: growlerdb-connector-set }
+  template:
+    metadata:
+      labels: { app: growlerdb-connector-set }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+        prometheus.io/path: "/metrics"
+    spec:
+      imagePullSecrets: [{ name: ghcr-pull }]
+      containers:
+        - name: connector
+          image: ghcr.io/growlerdb/growlerdb-connector:dev
+          imagePullPolicy: Always
+          env:
+            - { name: AWS_ACCESS_KEY_ID, value: minioadmin }
+            - { name: AWS_SECRET_ACCESS_KEY, value: minioadmin }
+            - { name: AWS_REGION, value: us-east-1 }
+            - { name: GROWLERDB_WRITE_DEADLINE_SECONDS, value: "8" }
+            - { name: GROWLERDB_METRICS_PORT, value: "9091" }
+            - { name: SPARK_SUBMIT_OPTS, value: "-Dsun.net.inetaddr.ttl=3 -Dsun.net.inetaddr.negative.ttl=1 -Dlog4j2.configurationFile=connector-log4j2.properties" }
+            # Worker id = the pod's ordinal (K8s >= 1.28 sets this label automatically).
+            - name: GROWLERDB_WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
+          ports:
+            - { name: metrics, containerPort: 9091 }
+          command: ["/opt/spark/bin/spark-submit"]
+          args:
+            - --master
+            - "local[4]"
+            # Each worker maps ~1/W of the rows (executor-side owned filter), so per-pod heap can
+            # run leaner than the single connector's 8g.
+            - --driver-memory
+            - 6g
+            - --conf
+            - spark.jars.ivy=/tmp/.ivy2
+            - --packages
+            - org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.10.0,org.apache.iceberg:iceberg-aws-bundle:1.10.0
+            - --conf
+            - spark.sql.catalog.stream=org.apache.iceberg.spark.SparkCatalog
+            - --conf
+            - spark.sql.catalog.stream.type=rest
+            - --conf
+            - spark.sql.catalog.stream.cache-enabled=false
+            - --conf
+            - spark.sql.catalog.stream.uri=http://polaris:8181/api/catalog
+            - --conf
+            - spark.sql.catalog.stream.warehouse=growlerdb
+            - --conf
+            - spark.sql.catalog.stream.credential=root:s3cr3t
+            - --conf
+            - spark.sql.catalog.stream.scope=PRINCIPAL_ROLE:ALL
+            - --conf
+            - spark.sql.catalog.stream.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+            - --conf
+            - spark.sql.catalog.stream.s3.endpoint=http://minio:9000
+            - --conf
+            - spark.sql.catalog.stream.s3.path-style-access=true
+            - --class
+            - io.growlerdb.connector.ConnectorApp
+            - /opt/growlerdb/connector.jar
+            - --catalog
+            - stream
+            - --table
+            - growlerdb.http_logs
+            - --identifier
+            - id
+            - --fields
+            - id,ts,clientip,request,status,size
+            - --nodes
+            - gdb-growlerdb-node-0.gdb-growlerdb-node-headless.growlerdb.svc.cluster.local:50051,gdb-growlerdb-node-1.gdb-growlerdb-node-headless.growlerdb.svc.cluster.local:50051,gdb-growlerdb-node-2.gdb-growlerdb-node-headless.growlerdb.svc.cluster.local:50051
+            - --control-plane
+            - gdb-growlerdb-controlplane:50071
+            - --index
+            - http_logs
+            # Set mode: MUST equal spec.replicas. Worker id arrives via GROWLERDB_WORKER_ID.
+            - --workers
+            - "2"
+            - --stream
+          resources:
+            requests: { cpu: "1", memory: 3Gi }
+            limits: { cpu: "4", memory: 8Gi }

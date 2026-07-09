@@ -1,0 +1,76 @@
+# Apache Polaris — the Iceberg REST catalog (the chart's iceberg.catalogUri defaults to
+# http://polaris:8181/api/catalog). Port of compose `polaris` + `polaris-bootstrap`.
+#
+# Init ordering is self-contained (no cross-resource depends_on): wait for Postgres, then run the
+# idempotent realm bootstrap (admin-tool image) as an init container, then start Polaris.
+#
+# NOTE: K8s rejects dotted env var names (C_IDENTIFIER rule), so the Quarkus config props the compose
+# stack sets as `polaris.persistence.type` / `quarkus.datasource.*` are given here in their
+# UPPERCASE_UNDERSCORE env form (Quarkus maps them identically). Validate on first apply.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: polaris
+  labels: { app: polaris }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: polaris }
+  template:
+    metadata:
+      labels: { app: polaris }
+    spec:
+      initContainers:
+        - name: wait-db
+          image: busybox:1.36
+          command: ["/bin/sh", "-c", "until nc -z polaris-db 5432; do echo waiting for polaris-db; sleep 2; done"]
+        - name: bootstrap
+          image: apache/polaris-admin-tool:latest
+          env:
+            - { name: POLARIS_PERSISTENCE_TYPE, value: relational-jdbc }
+            - { name: QUARKUS_DATASOURCE_DB_KIND, value: postgresql }
+            - { name: QUARKUS_DATASOURCE_USERNAME, valueFrom: { secretKeyRef: { name: polaris-db-creds, key: user } } }
+            - { name: QUARKUS_DATASOURCE_PASSWORD, valueFrom: { secretKeyRef: { name: polaris-db-creds, key: password } } }
+            - { name: QUARKUS_DATASOURCE_JDBC_URL, value: "jdbc:postgresql://polaris-db:5432/polaris" }
+          command: ["/bin/sh", "-c"]
+          args:
+            # Idempotent: the admin tool errors when the realm is already bootstrapped — treat that
+            # as success so pod restarts on the persistent metastore are no-ops (matches compose).
+            - |
+              out=$(java -jar /deployments/polaris-admin-tool.jar bootstrap -r POLARIS -c POLARIS,root,s3cr3t 2>&1)
+              echo "$out"
+              echo "$out" | grep -q "already been bootstrapped" && { echo "realm already bootstrapped - ok"; exit 0; }
+              echo "$out" | grep -q "Bootstrap completed successfully" && exit 0
+              exit 1
+      containers:
+        - name: polaris
+          image: apache/polaris:1.5.0
+          env:
+            - { name: AWS_REGION, value: us-east-1 }
+            - { name: AWS_ACCESS_KEY_ID, valueFrom: { secretKeyRef: { name: minio-creds, key: rootUser } } }
+            - { name: AWS_SECRET_ACCESS_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: rootPassword } } }
+            - { name: AWS_ENDPOINT_URL_S3, value: "http://minio:9000" }
+            - { name: POLARIS_PERSISTENCE_TYPE, value: relational-jdbc }
+            - { name: QUARKUS_DATASOURCE_DB_KIND, value: postgresql }
+            - { name: QUARKUS_DATASOURCE_USERNAME, valueFrom: { secretKeyRef: { name: polaris-db-creds, key: user } } }
+            - { name: QUARKUS_DATASOURCE_PASSWORD, valueFrom: { secretKeyRef: { name: polaris-db-creds, key: password } } }
+            - { name: QUARKUS_DATASOURCE_JDBC_URL, value: "jdbc:postgresql://polaris-db:5432/polaris" }
+          ports:
+            - { name: rest, containerPort: 8181 }
+            - { name: mgmt, containerPort: 8182 }
+          readinessProbe:
+            # Polaris serves a Quarkus health endpoint on the management port (8182).
+            httpGet: { path: /q/health/ready, port: mgmt }
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: polaris
+spec:
+  selector: { app: polaris }
+  ports:
+    - { name: rest, port: 8181, targetPort: rest }
+    - { name: mgmt, port: 8182, targetPort: mgmt }

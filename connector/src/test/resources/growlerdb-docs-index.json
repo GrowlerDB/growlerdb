@@ -1,0 +1,28 @@
+{
+  "name": "docs",
+  "source": {
+    "iceberg": {
+      "catalog": "growlerdb",
+      "table": "growlerdb.docs",
+      "scan": "CHANGELOG"
+    }
+  },
+  "key": {
+    "partition_fields": [],
+    "identifier_fields": [
+      "id"
+    ]
+  },
+  "fields": [
+    {
+      "path": "id",
+      "ty": "TEXT",
+      "analyzer": null
+    },
+    {
+      "path": "body",
+      "ty": "TEXT",
+      "analyzer": null
+    }
+  ]
+}

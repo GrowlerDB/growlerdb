@@ -1,0 +1,29 @@
+---
+type: Concept
+title: Sharded HA topology
+description: The multi-shard, multi-node distributed topology and its availability posture.
+tags: [deployment, ha, sharded, distributed]
+timestamp: 2026-07-04T14:22:00
+---
+
+# Sharded HA topology
+
+The genuinely distributed topology: a [gateway](/system/runtime/components/gateway.md) fronting the
+live [control plane](/system/runtime/components/control-plane.md), and a node StatefulSet with **one
+pod per shard**, spread by anti-affinity across nodes.
+
+## Availability posture
+
+Because searchers hold derived, rebuildable state, HA is met by **shards spread + PodDisruptionBudgets
++ PV self-heal**, with **honest partial results** during a shard's restart rather than a hard failure.
+Online [resharding](/system/distribution.md) and gateway hot-reload make topology changes non-disruptive.
+Ingest scales independently of the node topology via the connector-set
+([D32](/system/decisions/d32-parallel-ingest.md)): W worker pods each own a disjoint shard group,
+and a worker crash stalls only its own group's shards until the pod restarts and resumes.
+
+## Notes
+
+Zero-downtime per-shard **replicas** (windowed/multi-shard segment shipping) are future work — see
+[replicas](/product/functional/replicas.md) and
+[known limitations](/quality/known-limitations/index.md). Availability under fault is validated by
+[chaos drills](/quality/reliability.md).

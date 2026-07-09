@@ -1,0 +1,87 @@
+# Local dev stack
+
+GrowlerDB's runtime dependencies for development and tests:
+
+- **MinIO** — S3-compatible object storage (`:9000` API, `:9001` console; `minioadmin`/`minioadmin`).
+- **Apache Polaris** — Iceberg REST catalog (`:8181`).
+- **seed** — creates the sample `growlerdb.docs` Iceberg table (3 rows).
+
+## One-time host setup
+
+The catalog hands clients an S3 endpoint of `minio:9000` (the in-network name).
+For **host** clients/tests to reach object storage, map that name to localhost:
+
+```sh
+echo "127.0.0.1 minio" | sudo tee -a /etc/hosts
+```
+
+## Usage
+
+From the repo root:
+
+```sh
+just up      # MinIO + Polaris, bootstrap the `growlerdb` catalog, and seed growlerdb.docs
+just seed    # re-bootstrap the catalog + re-seed (stack already up)
+just down    # tear everything down (removes volumes)
+```
+
+`just up` runs, in order: `docker compose up` (minio/polaris) → `setup-polaris.sh`
+(creates the `growlerdb` catalog + grants admin to root) → the `seed` service
+(pyiceberg, in-network, writes `growlerdb.docs`).
+
+## Full stack — GrowlerDB + LGTM (Kubernetes alternative)
+
+The `stack` profile additionally runs **GrowlerDB itself** and a full observability stack —
+a single-host alternative to the Kubernetes deployment, and the environment integration tests
+run against.
+
+```sh
+just stack        # deps + catalog + seed, then control-plane + node + gateway + LGTM
+just stack-down   # tear it all down (removes volumes)
+```
+
+Services (all on the compose network; published to the host):
+
+| Service | Role | Host endpoint |
+|---|---|---|
+| **gateway** | public Engine API + the **console UI** | **console `http://localhost:8081`**, REST `/v1`, gRPC `:50061` |
+| **node** | builds + serves the `docs` index | gRPC `:50051`, health `:9102` |
+| **controlplane** | cluster index registry | gRPC `:50071`, health `:9101` |
+| **lgtm** | Grafana + Loki/Tempo/Mimir + OTLP | Grafana `http://localhost:3000`, OTLP `:4318` |
+
+Open the **console at http://localhost:8081** — the gateway serves the built Svelte UI
+(`--ui-dir`) and backs its screens: **Search** (`/v1/search` + hydration), **Indexes**
+(`--control-plane` proxy: `/v1/indexes`, `/v1/source:describe`), **Ingestion** (sync status:
+`/v1/ingestion` — source head vs. each shard's committed checkpoint), and **Observability** (native
+ECharts panels via `--prometheus` → the bundled Prometheus). Deep dashboards link to Grafana.
+
+The `node` runs `growlerdb serve … --register http://controlplane:50071 --advertise-addr
+http://node:50051`, so it **announces the `docs` index to the control-plane registry** — that's why
+it appears in the Indexes + Ingestion screens (a node-built index is otherwise invisible to the
+registry until something calls `CreateIndex`).
+
+- The GrowlerDB image is built from `deploy/Dockerfile` (multi-stage; `.dockerignore` keeps the
+  build context small). `just stack` builds it on first run.
+- Each GrowlerDB service is pointed at the in-network Polaris + MinIO via `GROWLERDB_*` env
+  (overriding `IcebergConfig`'s `localhost` defaults) and ships traces (OTLP/HTTP) to `lgtm`.
+- **Observability is pre-wired** (`lgtm/`, mounted into the otel-lgtm container): the bundled
+  OTel Collector scrapes each service's `/metrics` into Prometheus, and Grafana auto-loads the
+  **GrowlerDB SLIs** dashboard (`http://localhost:3000` → Dashboards) — query RED (rate/errors/
+  latency), ingestion throughput, and hydration latency + stale-locator rate. Traces land in
+  Tempo (search by service `growlerdb`). The error/ingestion/stale panels populate under the
+  matching traffic (failed queries / connector writes / locator refreshes).
+- Health/readiness (`/healthz`, `/readyz`) and Prometheus `/metrics` are on each service's
+  `--metrics-addr` port; Docker healthchecks gate `depends_on` (the gateway waits for a ready node).
+- Smoke test once up: `curl localhost:9103/readyz` (gateway ready), then a REST query through
+  the cluster: `curl -s localhost:8081/v1/search -d '{"query":"hello","limit":10}'`.
+
+## Notes / gotchas (learned the hard way)
+
+- **Named volume, not bind mount** for MinIO (Docker Desktop refuses to create
+  host bind-mount dirs in some setups).
+- **Polaris is INTERNAL** and writes the initial table metadata itself, so the
+  catalog's storage endpoint must be the in-network `minio:9000` — hence the
+  `/etc/hosts` line for host clients.
+- **Seed runs in-network** (the `seed` compose service) so it resolves `minio`.
+- In-memory Polaris metastore: state is wiped on `down`/restart; `just up`
+  re-bootstraps the catalog every time (idempotent).

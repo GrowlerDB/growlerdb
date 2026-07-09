@@ -1,0 +1,183 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.growlerdb</groupId>
+  <artifactId>growlerdb-connector</artifactId>
+  <version>0.0.0</version>
+  <packaging>jar</packaging>
+  <name>GrowlerDB Spark connector</name>
+  <description>JVM ingestion connector: reads the Iceberg changelog and writes DocOps to a GrowlerDB Node over gRPC.</description>
+
+  <properties>
+    <!-- Bytecode 17 (Spark 4.0's floor) so the jar runs in the Spark image's JDK,
+         regardless of whether the build toolchain is 21. -->
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+    <grpc.version>1.68.1</grpc.version>
+    <protobuf.version>4.28.3</protobuf.version>
+    <!-- Prometheus client for the connector's own metrics (task-194 AC6): the ingest-side counters
+         (per-trigger rows read/expected, per-shard acks, stream restarts, write retries, under-reads)
+         that used to be printf-only — invisible once the container log rotated. Scraped off a tiny
+         in-process HTTP server. simpleclient is small + shade-friendly. -->
+    <prometheus.version>0.16.0</prometheus.version>
+
+    <!-- Spark/Iceberg are `provided` (supplied by spark-submit); added with the
+         changelog read in task-63. Pinned here per the locked stack. -->
+    <spark.version>4.0.0</spark.version>
+    <scala.binary.version>2.13</scala.binary.version>
+    <iceberg.version>1.10.0</iceberg.version>
+
+    <!-- Heavy tests (in-JVM Spark, cross-process `growlerdb serve`) are tag-gated out of
+         the default build — like the Rust `#[ignore]` live tests. Run them with
+         `-Dtest.excludedGroups= -Dgroups=integration` (or `e2e`). -->
+    <test.excludedGroups>integration,e2e</test.excludedGroups>
+  </properties>
+
+  <dependencies>
+    <!-- gRPC client to the GrowlerDB Node Write service -->
+    <dependency>
+      <groupId>io.grpc</groupId>
+      <artifactId>grpc-netty-shaded</artifactId>
+      <version>${grpc.version}</version>
+      <scope>runtime</scope>
+    </dependency>
+    <dependency>
+      <groupId>io.grpc</groupId>
+      <artifactId>grpc-protobuf</artifactId>
+      <version>${grpc.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.grpc</groupId>
+      <artifactId>grpc-stub</artifactId>
+      <version>${grpc.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.google.protobuf</groupId>
+      <artifactId>protobuf-java</artifactId>
+      <version>${protobuf.version}</version>
+    </dependency>
+    <!-- javax.annotation.Generated, referenced by generated gRPC stubs on JDK 9+ -->
+    <dependency>
+      <groupId>org.apache.tomcat</groupId>
+      <artifactId>annotations-api</artifactId>
+      <version>6.0.53</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- Provided at runtime by spark-submit (task-63 adds the changelog read) -->
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-sql_${scala.binary.version}</artifactId>
+      <version>${spark.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-spark-runtime-4.0_${scala.binary.version}</artifactId>
+      <version>${iceberg.version}</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>io.prometheus</groupId>
+      <artifactId>simpleclient</artifactId>
+      <version>${prometheus.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.prometheus</groupId>
+      <artifactId>simpleclient_httpserver</artifactId>
+      <version>${prometheus.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>5.11.3</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <extensions>
+      <!-- Sets ${os.detected.classifier} for the protoc / grpc-java binaries. -->
+      <extension>
+        <groupId>kr.motd.maven</groupId>
+        <artifactId>os-maven-plugin</artifactId>
+        <version>1.7.1</version>
+      </extension>
+    </extensions>
+    <plugins>
+      <!-- Generate Java message + gRPC stubs from the shared growlerdb.v1 protos. -->
+      <plugin>
+        <groupId>org.xolstice.maven.plugins</groupId>
+        <artifactId>protobuf-maven-plugin</artifactId>
+        <version>0.6.1</version>
+        <configuration>
+          <protoSourceRoot>${project.basedir}/../crates/growlerdb-proto/proto</protoSourceRoot>
+          <protocArtifact>com.google.protobuf:protoc:${protobuf.version}:exe:${os.detected.classifier}</protocArtifact>
+          <pluginId>grpc-java</pluginId>
+          <pluginArtifact>io.grpc:protoc-gen-grpc-java:${grpc.version}:exe:${os.detected.classifier}</pluginArtifact>
+        </configuration>
+        <executions>
+          <execution>
+            <goals>
+              <goal>compile</goal>
+              <goal>compile-custom</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!-- Fat jar for spark-submit (excludes the `provided` Spark/Iceberg). -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.6.0</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals><goal>shade</goal></goals>
+            <configuration>
+              <transformers>
+                <!-- Merge META-INF/services across the bundled jars. Without this the multiple
+                     io.grpc.NameResolverProvider service files collide (last wins), dropping the
+                     `dns` resolver — so an in-network `host:port` channel fails with "Could not
+                     find a NameResolverProvider for dns:///". -->
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+              </transformers>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.5.2</version>
+        <configuration>
+          <excludedGroups>${test.excludedGroups}</excludedGroups>
+          <!-- Spark on JDK 17+ needs these module opens for its unsafe/reflective
+               access (Kryo, Arrow, Tungsten). Harmless for the light unit tests. -->
+          <argLine>
+            --add-opens=java.base/java.lang=ALL-UNNAMED
+            --add-opens=java.base/java.lang.invoke=ALL-UNNAMED
+            --add-opens=java.base/java.lang.reflect=ALL-UNNAMED
+            --add-opens=java.base/java.io=ALL-UNNAMED
+            --add-opens=java.base/java.net=ALL-UNNAMED
+            --add-opens=java.base/java.nio=ALL-UNNAMED
+            --add-opens=java.base/java.util=ALL-UNNAMED
+            --add-opens=java.base/java.util.concurrent=ALL-UNNAMED
+            --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED
+            --add-opens=java.base/sun.nio.ch=ALL-UNNAMED
+            --add-opens=java.base/sun.nio.cs=ALL-UNNAMED
+            --add-opens=java.base/sun.security.action=ALL-UNNAMED
+            --add-opens=java.base/sun.util.calendar=ALL-UNNAMED
+          </argLine>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

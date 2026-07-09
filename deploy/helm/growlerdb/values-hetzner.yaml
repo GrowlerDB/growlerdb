@@ -1,0 +1,70 @@
+# Hetzner k3s (cloud) — performance / scale cluster (task-55/79).
+# More shards for query parallelism + bigger node resources; gateway HPA for query concurrency;
+# OIDC auth (public) + a ServiceMonitor into Grafana. Pair with: helm install ... -f values-hetzner.yaml
+#
+# Same private GHCR image as the lab cluster (create the `ghcr-pull` secret in this namespace too):
+#   docker build -t ghcr.io/growlerdb/growlerdb:latest -f deploy/Dockerfile . && docker push ghcr.io/growlerdb/growlerdb:latest
+#   kubectl -n growlerdb create secret docker-registry ghcr-pull \
+#     --docker-server=ghcr.io --docker-username=<github-username> --docker-password=$CR_PAT_READONLY
+
+image:
+  repository: ghcr.io/growlerdb/growlerdb
+  tag: latest
+imagePullSecrets:
+  - name: ghcr-pull
+
+# Scale out: more shards = more query parallelism. Size to the cluster (≈1 shard per worker core
+# budget). One primary pod per shard; reads fan out across shards via the gateway.
+index:
+  name: docs
+  sourceTable: growlerdb.docs
+  shards: 6
+
+node:
+  # k3s rancher local-path provisioner (or set the Hetzner CSI block-storage class).
+  persistence:
+    storageClass: local-path
+    size: 50Gi
+  resources:
+    requests: { cpu: "1", memory: 2Gi }
+    limits: { cpu: "4", memory: 8Gi }
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 5 # of 6 shard pods
+
+controlPlane:
+  persistence:
+    storageClass: local-path
+
+gateway:
+  reloadSecs: 15
+  resources:
+    requests: { cpu: 250m, memory: 256Mi }
+    limits: { cpu: "2", memory: 1Gi }
+  # Scale the gateway with query concurrency.
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 70
+  # Public → require OIDC/JWT auth + RBAC. Set your issuer/audience.
+  auth:
+    oidc:
+      issuer: "https://CHANGEME/realms/growlerdb"
+      audience: "growlerdb"
+  ingress:
+    enabled: true
+    className: traefik # k3s default ingress
+    hosts:
+      - host: growlerdb.CHANGEME
+        paths:
+          - { path: /, pathType: Prefix }
+
+# Traces → your OTLP collector; scrape metrics via kube-prometheus-stack.
+observability:
+  otlpEndpoint: "" # e.g. http://alloy.monitoring:4318
+metrics:
+  serviceMonitor:
+    enabled: true
+    labels:
+      release: kube-prometheus-stack # match your operator's serviceMonitorSelector

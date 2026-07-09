@@ -1,0 +1,33 @@
+[package]
+name = "growlerdb-cli"
+description = "The GrowlerDB command-line interface (embedded mode)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "growlerdb"
+path = "src/main.rs"
+
+[dependencies]
+growlerdb-core.workspace = true
+growlerdb-controlplane.workspace = true
+growlerdb-engine.workspace = true
+growlerdb-index.workspace = true
+growlerdb-backup.workspace = true
+growlerdb-source.workspace = true
+growlerdb-proto.workspace = true
+growlerdb-telemetry.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tonic.workspace = true
+axum = "0.8"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
+
+[dev-dependencies]
+growlerdb-proto.workspace = true
+growlerdb-client.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }

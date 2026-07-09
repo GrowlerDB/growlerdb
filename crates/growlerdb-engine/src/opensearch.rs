@@ -1,0 +1,777 @@
+//! Optional **OpenSearch-compatible `_search` adapter** (task-50, [D4]). Translates a *documented
+//! subset* of the OpenSearch Query DSL into GrowlerDB's native query string (which parses to the
+//! canonical [`Query`](growlerdb_core::Query) AST), runs it through the [`Gateway`], and shapes the
+//! results as OpenSearch documents: `_id` synthesized from the **composite key**, `_source` filled
+//! by **PK hydration** ([`GetByKey`]). Read-path first — the native PK API stays primary; this is a
+//! thin migration/ecosystem convenience, mounted only when the gateway is started with
+//! `--opensearch`.
+//!
+//! The supported subset and its caveats are documented in `docs/opensearch-adapter.md`; anything
+//! outside it returns a clear error (`501` unsupported / `400` malformed) rather than silently
+//! mis-translating.
+//!
+//! [D4]: ../../../wiki/21-decisions.md
+//! [`GetByKey`]: crate::gateway::Gateway::get_by_key
+
+use std::sync::Arc;
+
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use axum::{Json, Router};
+use serde::Deserialize;
+use serde_json::{json, Map, Value as JsonValue};
+
+use growlerdb_proto::v1::{
+    self, value::Kind, Coordinates, GetByKeyRequest, SearchRequest, Sort as WireSort,
+};
+
+use crate::gateway::Gateway;
+use crate::rest::grpc_request;
+
+/// Build the OpenSearch-compatible router over the [`Gateway`]. Mount it alongside the `/v1`
+/// router when `--opensearch` is set.
+pub fn opensearch_router(gateway: Arc<Gateway>) -> Router {
+    Router::new()
+        .route("/{index}/_search", post(search_handler))
+        .route("/_search", post(search_all_handler))
+        .with_state(gateway)
+}
+
+// ---- translation (pure; unit-tested incl. `Query::parse` of the output) ----------------------
+
+/// Why a DSL request couldn't be served — surfaced as an OpenSearch-style error.
+#[derive(Debug, PartialEq)]
+pub struct AdapterError {
+    pub kind: &'static str, // "unsupported" | "bad_request"
+    pub reason: String,
+}
+
+impl AdapterError {
+    fn unsupported(reason: impl Into<String>) -> Self {
+        Self {
+            kind: "unsupported",
+            reason: reason.into(),
+        }
+    }
+    fn bad(reason: impl Into<String>) -> Self {
+        Self {
+            kind: "bad_request",
+            reason: reason.into(),
+        }
+    }
+}
+
+/// Query-string characters that are *structural* or *operators* and so can't sit bare in a value
+/// without changing the parse (grouping, ranges, phrases, wildcards, fuzzy, boost, field-retarget
+/// via `:`, the `&&`/`||`/`!` operators, or whitespace splitting the token). Everything else —
+/// including `- . _ + @ /` — is fine mid-value (ids, dates, UUIDs, decimals), per the parser.
+const SPECIAL: &[char] = &[
+    '(', ')', '{', '}', '[', ']', '^', '"', '~', '*', '?', ':', '\\', '&', '|', '!', ' ', '\t',
+    '\n',
+];
+
+/// A value that can sit bare after `field:` (a single, unescaped token). Anything with whitespace
+/// or a query-syntax metacharacter is rejected with a clear error rather than mis-encoded — the
+/// adapter is a documented subset, not a best-effort guesser.
+fn token(field: &str, value: &str) -> Result<String, AdapterError> {
+    if value.is_empty() {
+        return Err(AdapterError::bad(format!("empty value for `{field}`")));
+    }
+    if value.contains(SPECIAL) {
+        return Err(AdapterError::unsupported(format!(
+            "value `{value}` for `{field}` contains whitespace or query metacharacters; the adapter \
+             supports simple token values (ids, numbers, dates, enums) — use the native /v1/search \
+             for arbitrary text"
+        )));
+    }
+    Ok(value.to_string())
+}
+
+/// Render a JSON scalar (string/number/bool) as a query token. Objects/arrays/null are rejected.
+fn scalar_token(field: &str, v: &JsonValue) -> Result<String, AdapterError> {
+    let s = match v {
+        JsonValue::String(s) => s.clone(),
+        JsonValue::Number(n) => n.to_string(),
+        JsonValue::Bool(b) => b.to_string(),
+        _ => {
+            return Err(AdapterError::bad(format!(
+                "`{field}` value must be a string/number/bool"
+            )))
+        }
+    };
+    token(field, &s)
+}
+
+/// The single `{ field: spec }` of a leaf clause (e.g. `term`, `match`). Errors if not exactly one.
+fn one_field(obj: &JsonValue, clause: &str) -> Result<(String, JsonValue), AdapterError> {
+    let map = obj
+        .as_object()
+        .ok_or_else(|| AdapterError::bad(format!("`{clause}` must be an object")))?;
+    if map.len() != 1 {
+        return Err(AdapterError::bad(format!(
+            "`{clause}` must name exactly one field"
+        )));
+    }
+    let (k, v) = map.iter().next().unwrap();
+    Ok((k.clone(), v.clone()))
+}
+
+/// `match`/`term` accept either `{field: value}` or `{field: {query|value: ...}}` — pull the value.
+fn leaf_value<'a>(spec: &'a JsonValue, key: &str) -> &'a JsonValue {
+    spec.get(key).unwrap_or(spec)
+}
+
+/// Translate one DSL query clause into a Lucene query-string fragment. Recursive (for `bool`).
+pub fn translate_query(dsl: &JsonValue) -> Result<String, AdapterError> {
+    let obj = dsl
+        .as_object()
+        .ok_or_else(|| AdapterError::bad("query must be an object"))?;
+    if obj.len() != 1 {
+        return Err(AdapterError::bad(
+            "a query clause must have exactly one type",
+        ));
+    }
+    let (clause, body) = obj.iter().next().unwrap();
+    match clause.as_str() {
+        "match_all" => Ok("*:*".to_string()),
+
+        "term" => {
+            let (field, spec) = one_field(body, "term")?;
+            let tok = scalar_token(&field, leaf_value(&spec, "value"))?;
+            Ok(format!("{field}:{tok}"))
+        }
+
+        "terms" => {
+            let (field, spec) = one_field(body, "terms")?;
+            let arr = spec
+                .as_array()
+                .ok_or_else(|| AdapterError::bad("`terms` value must be an array"))?;
+            if arr.is_empty() {
+                return Err(AdapterError::bad("`terms` array must be non-empty"));
+            }
+            let toks = arr
+                .iter()
+                .map(|v| scalar_token(&field, v))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(format!("{field}:({})", toks.join(" OR ")))
+        }
+
+        "match" => {
+            let (field, spec) = one_field(body, "match")?;
+            let text = leaf_value(&spec, "query");
+            let text = text
+                .as_str()
+                .ok_or_else(|| AdapterError::bad("`match` query must be a string"))?;
+            // OpenSearch `match` analyzes + ORs the tokens; we OR the whitespace-split tokens and
+            // let the server analyze each (a token must be simple — see `token`).
+            let toks = text
+                .split_whitespace()
+                .map(|t| token(&field, t))
+                .collect::<Result<Vec<_>, _>>()?;
+            if toks.is_empty() {
+                return Err(AdapterError::bad("`match` query is empty"));
+            }
+            if toks.len() == 1 {
+                Ok(format!("{field}:{}", toks[0]))
+            } else {
+                Ok(format!("{field}:({})", toks.join(" OR ")))
+            }
+        }
+
+        "match_phrase" => {
+            let (field, spec) = one_field(body, "match_phrase")?;
+            let text = leaf_value(&spec, "query");
+            let text = text
+                .as_str()
+                .ok_or_else(|| AdapterError::bad("`match_phrase` query must be a string"))?;
+            if text.contains('"') || text.contains('\\') {
+                return Err(AdapterError::unsupported(
+                    "`match_phrase` text may not contain quotes or backslashes",
+                ));
+            }
+            Ok(format!("{field}:\"{text}\""))
+        }
+
+        "multi_match" => {
+            let q = body
+                .get("query")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| AdapterError::bad("`multi_match` needs a string `query`"))?;
+            let fields = body
+                .get("fields")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| AdapterError::bad("`multi_match` needs a `fields` array"))?;
+            if fields.is_empty() {
+                return Err(AdapterError::bad(
+                    "`multi_match` `fields` must be non-empty",
+                ));
+            }
+            // One analyzed token per field (whitespace text is rejected as a token, as above).
+            let mut parts = Vec::new();
+            for f in fields {
+                let f = f
+                    .as_str()
+                    .ok_or_else(|| AdapterError::bad("`multi_match` fields must be strings"))?;
+                parts.push(format!("{f}:{}", token(f, q)?));
+            }
+            Ok(format!("({})", parts.join(" OR ")))
+        }
+
+        "range" => {
+            let (field, spec) = one_field(body, "range")?;
+            translate_range(&field, &spec)
+        }
+
+        "bool" => translate_bool(body),
+
+        other => Err(AdapterError::unsupported(format!(
+            "query type `{other}` is not supported by the adapter (supported: match, match_phrase, \
+             multi_match, term, terms, range, bool, match_all)"
+        ))),
+    }
+}
+
+fn translate_range(field: &str, spec: &JsonValue) -> Result<String, AdapterError> {
+    let get = |k: &str| spec.get(k);
+    // Lower bound: gte (inclusive) or gt (exclusive); upper: lte / lt.
+    let (lower, lower_inc) = match (get("gte"), get("gt")) {
+        (Some(v), _) => (Some(scalar_token(field, v)?), true),
+        (None, Some(v)) => (Some(scalar_token(field, v)?), false),
+        (None, None) => (None, true),
+    };
+    let (upper, upper_inc) = match (get("lte"), get("lt")) {
+        (Some(v), _) => (Some(scalar_token(field, v)?), true),
+        (None, Some(v)) => (Some(scalar_token(field, v)?), false),
+        (None, None) => (None, true),
+    };
+    if lower.is_none() && upper.is_none() {
+        return Err(AdapterError::bad(format!(
+            "`range` on `{field}` needs at least one of gte/gt/lte/lt"
+        )));
+    }
+    let open = if lower_inc { '[' } else { '{' };
+    let close = if upper_inc { ']' } else { '}' };
+    let lo = lower.unwrap_or_default();
+    let hi = upper.unwrap_or_default();
+    Ok(format!("{field}:{open}{lo} TO {hi}{close}"))
+}
+
+fn translate_clauses(v: Option<&JsonValue>) -> Result<Vec<String>, AdapterError> {
+    let Some(v) = v else { return Ok(vec![]) };
+    // A clause list accepts a single object or an array of objects (OpenSearch allows both).
+    let items: Vec<&JsonValue> = match v {
+        JsonValue::Array(a) => a.iter().collect(),
+        JsonValue::Object(_) => vec![v],
+        _ => return Err(AdapterError::bad("bool clause must be an object or array")),
+    };
+    items.iter().map(|c| translate_query(c)).collect()
+}
+
+fn translate_bool(body: &JsonValue) -> Result<String, AdapterError> {
+    // `filter` is treated like `must` (a required conjunct) — the read-path adapter doesn't model
+    // the non-scoring distinction. `must`/`filter` AND together; `must_not` negates. `should` is
+    // honored for *matching* only when there is no must/filter (OpenSearch's default
+    // minimum_should_match); with a must/filter present it is scoring-only and not expressible in
+    // the query string, so it's dropped from the predicate (documented in the support matrix).
+    let must = translate_clauses(body.get("must"))?;
+    let filter = translate_clauses(body.get("filter"))?;
+    let should = translate_clauses(body.get("should"))?;
+    let must_not = translate_clauses(body.get("must_not"))?;
+
+    let mut required: Vec<String> = must.into_iter().chain(filter).map(group).collect();
+    if required.is_empty() && !should.is_empty() {
+        // No must/filter → at least one should must match.
+        let ored = should
+            .into_iter()
+            .map(group)
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        required.push(group(ored));
+    }
+    for mn in must_not {
+        required.push(format!("NOT {}", group(mn)));
+    }
+    if required.is_empty() {
+        // A purely-empty or must_not-only bool matches everything (then constrained by NOTs above).
+        return Ok("*:*".to_string());
+    }
+    Ok(required.join(" AND "))
+}
+
+/// Parenthesize a fragment unless it's already a single bare token (keeps the string readable and
+/// the precedence unambiguous when ANDed/ORed).
+fn group(frag: String) -> String {
+    if frag.starts_with('(') || !frag.contains(' ') {
+        frag
+    } else {
+        format!("({frag})")
+    }
+}
+
+/// Translate the OpenSearch `sort` clause to native sort keys. `_score` entries are dropped
+/// (native ranks by score by default); a bare string or `{field: "asc"|"desc"}` / `{field:
+/// {order}}` is accepted.
+pub fn translate_sort(sort: &JsonValue) -> Result<Vec<WireSort>, AdapterError> {
+    let items: Vec<&JsonValue> = match sort {
+        JsonValue::Array(a) => a.iter().collect(),
+        other => vec![other],
+    };
+    let mut out = Vec::new();
+    for item in items {
+        match item {
+            JsonValue::String(field) => {
+                if field != "_score" {
+                    out.push(WireSort {
+                        field: field.clone(),
+                        descending: false,
+                    });
+                }
+            }
+            JsonValue::Object(map) => {
+                let (field, spec) = map
+                    .iter()
+                    .next()
+                    .ok_or_else(|| AdapterError::bad("empty sort object"))?;
+                if field == "_score" {
+                    continue;
+                }
+                let order = match spec {
+                    JsonValue::String(s) => s.clone(),
+                    JsonValue::Object(o) => o
+                        .get("order")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("asc")
+                        .to_string(),
+                    _ => "asc".to_string(),
+                };
+                out.push(WireSort {
+                    field: field.clone(),
+                    descending: order == "desc",
+                });
+            }
+            _ => return Err(AdapterError::bad("sort entries must be strings or objects")),
+        }
+    }
+    Ok(out)
+}
+
+/// Synthesize an OpenSearch `_id` from the composite key: partition values then identifier values,
+/// joined by `#`. Deterministic and round-trippable-ish (informational; hydration uses the full
+/// coordinate, not this string).
+pub fn compose_id(coords: &Coordinates) -> String {
+    coords
+        .partition
+        .iter()
+        .chain(coords.identifier.iter())
+        .map(|f| f.value.as_ref().map(value_string).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("#")
+}
+
+fn value_string(v: &v1::Value) -> String {
+    match &v.kind {
+        Some(Kind::Str(s)) => s.clone(),
+        Some(Kind::Int(i)) => i.to_string(),
+        Some(Kind::Float(f)) => f.to_string(),
+        Some(Kind::Bool(b)) => b.to_string(),
+        // Canonical epoch micros (task-184), rendered like an Int.
+        Some(Kind::TsMicros(t)) => t.to_string(),
+        None => String::new(),
+    }
+}
+
+fn value_to_json(v: v1::Value) -> JsonValue {
+    match v.kind {
+        Some(Kind::Str(s)) => JsonValue::String(s),
+        Some(Kind::Int(i)) => json!(i),
+        Some(Kind::Float(f)) => json!(f),
+        Some(Kind::Bool(b)) => JsonValue::Bool(b),
+        // Canonical epoch micros (task-184), rendered like an Int.
+        Some(Kind::TsMicros(t)) => json!(t),
+        None => JsonValue::Null,
+    }
+}
+
+// ---- HTTP handlers ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+struct OsSearchBody {
+    #[serde(default)]
+    query: Option<JsonValue>,
+    #[serde(default)]
+    from: Option<u32>,
+    #[serde(default)]
+    size: Option<u32>,
+    #[serde(default)]
+    sort: Option<JsonValue>,
+}
+
+async fn search_all_handler(
+    state: State<Arc<Gateway>>,
+    headers: HeaderMap,
+    body: Option<Json<OsSearchBody>>,
+) -> Response {
+    run_search(state, headers, "_all".to_string(), body).await
+}
+
+async fn search_handler(
+    state: State<Arc<Gateway>>,
+    axum::extract::Path(index): axum::extract::Path<String>,
+    headers: HeaderMap,
+    body: Option<Json<OsSearchBody>>,
+) -> Response {
+    run_search(state, headers, index, body).await
+}
+
+async fn run_search(
+    State(gw): State<Arc<Gateway>>,
+    headers: HeaderMap,
+    index: String,
+    body: Option<Json<OsSearchBody>>,
+) -> Response {
+    let start = std::time::Instant::now();
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+
+    // Translate the DSL (absent query => match_all).
+    let query = match &body.query {
+        Some(q) => match translate_query(q) {
+            Ok(s) => s,
+            Err(e) => return adapter_error(e),
+        },
+        None => "*:*".to_string(),
+    };
+    let sort = match body.sort.as_ref().map(translate_sort).transpose() {
+        Ok(s) => s.unwrap_or_default(),
+        Err(e) => return adapter_error(e),
+    };
+
+    let req = grpc_request(
+        SearchRequest {
+            query,
+            limit: body.size.unwrap_or(10),
+            offset: body.from.unwrap_or(0),
+            sort,
+            search_after: Vec::new(),
+            collapse: String::new(),
+            pit_id: 0,
+            score_mode: v1::ScoreMode::ScoreLocal as i32,
+            window: 0,
+            // The adapter translates the DSL to a Lucene query string (task-90).
+            syntax: v1::QuerySyntax::Lucene as i32,
+            // Scope to the path's `{index}` (task-99); empty for `/_search` (the served index).
+            index: index.clone(),
+        },
+        &headers,
+    );
+
+    let resp = match gw.search(req).await {
+        Ok(r) => r.into_inner(),
+        Err(status) => return status_error(status),
+    };
+
+    // Hydrate `_source` for the page in one batch (PK lookup; columns empty = all fields).
+    let keys: Vec<Coordinates> = resp
+        .hits
+        .iter()
+        .filter_map(|h| h.coordinates.clone())
+        .collect();
+    let rows = if keys.is_empty() {
+        Vec::new()
+    } else {
+        let hreq = grpc_request(
+            GetByKeyRequest {
+                keys,
+                columns: Vec::new(),
+                window: 0,
+            },
+            &headers,
+        );
+        match gw.get_by_key(hreq).await {
+            Ok(r) => r.into_inner().rows,
+            // Hydration failure is non-fatal: return hits without `_source` rather than 500.
+            Err(_) => Vec::new(),
+        }
+    };
+
+    let mut hits = Vec::with_capacity(resp.hits.len());
+    let mut max_score = f64::MIN;
+    for (i, hit) in resp.hits.iter().enumerate() {
+        let coords = hit.coordinates.clone().unwrap_or_default();
+        let id = compose_id(&coords);
+        let source = rows
+            .get(i)
+            .map(|row| {
+                row.fields
+                    .clone()
+                    .into_iter()
+                    .filter_map(|f| f.value.map(|v| (f.name, value_to_json(v))))
+                    .collect::<Map<String, JsonValue>>()
+            })
+            .unwrap_or_default();
+        max_score = max_score.max(hit.score);
+        hits.push(json!({
+            "_index": index,
+            "_id": id,
+            "_score": hit.score,
+            "_source": source,
+        }));
+    }
+
+    let max_score = if hits.is_empty() {
+        JsonValue::Null
+    } else {
+        json!(max_score)
+    };
+    let took = start.elapsed().as_millis() as u64;
+    let body = json!({
+        "took": took,
+        "timed_out": false,
+        "_shards": {
+            "total": 1,
+            "successful": if resp.partial { 0 } else { 1 },
+            "skipped": 0,
+            "failed": if resp.partial { 1 } else { 0 },
+        },
+        "hits": {
+            "total": { "value": resp.total, "relation": "eq" },
+            "max_score": max_score,
+            "hits": hits,
+        },
+    });
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+fn adapter_error(e: AdapterError) -> Response {
+    let status = if e.kind == "unsupported" {
+        StatusCode::NOT_IMPLEMENTED
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    let body = json!({
+        "error": { "type": e.kind, "reason": e.reason },
+        "status": status.as_u16(),
+    });
+    (status, Json(body)).into_response()
+}
+
+fn status_error(status: tonic::Status) -> Response {
+    let code = match status.code() {
+        tonic::Code::InvalidArgument => StatusCode::BAD_REQUEST,
+        tonic::Code::NotFound => StatusCode::NOT_FOUND,
+        tonic::Code::PermissionDenied => StatusCode::FORBIDDEN,
+        tonic::Code::Unauthenticated => StatusCode::UNAUTHORIZED,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    let body = json!({
+        "error": { "type": "search_error", "reason": status.message() },
+        "status": code.as_u16(),
+    });
+    (code, Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use growlerdb_core::Query;
+    use serde_json::json;
+
+    /// Translate a DSL clause and assert it parses into the canonical native AST — the AC
+    /// "the `_search` DSL subset maps to the native AST", checked end-to-end.
+    fn xlate(dsl: serde_json::Value) -> String {
+        let s = translate_query(&dsl).expect("should translate");
+        Query::parse(&s).unwrap_or_else(|e| panic!("`{s}` should parse to the AST: {e}"));
+        s
+    }
+
+    #[test]
+    fn match_all_maps_to_match_all() {
+        // `*:*` is the universal match-all idiom; the parser maps it to the native `MatchAll` node
+        // (a cheap AllQuery), not a cost-guarded term scan.
+        let s = xlate(json!({ "match_all": {} }));
+        assert_eq!(s, "*:*");
+        assert_eq!(Query::parse(&s).unwrap(), Query::MatchAll);
+    }
+
+    #[test]
+    fn term_maps_to_term() {
+        // Both `{field: value}` and `{field: {value: ...}}` forms.
+        for dsl in [
+            json!({ "term": { "status": "active" } }),
+            json!({ "term": { "status": { "value": "active" } } }),
+        ] {
+            let s = xlate(dsl);
+            assert_eq!(s, "status:active");
+            assert_eq!(
+                Query::parse(&s).unwrap(),
+                Query::Term {
+                    field: Some("status".into()),
+                    value: "active".into()
+                }
+            );
+        }
+        // A numeric term renders its scalar.
+        assert_eq!(xlate(json!({ "term": { "age": 42 } })), "age:42");
+    }
+
+    #[test]
+    fn terms_maps_to_an_or_of_terms() {
+        let s = xlate(json!({ "terms": { "status": ["active", "pending"] } }));
+        assert_eq!(s, "status:(active OR pending)");
+    }
+
+    #[test]
+    fn match_single_and_multi_token() {
+        assert_eq!(
+            Query::parse(&xlate(json!({ "match": { "title": "hello" } }))).unwrap(),
+            Query::Term {
+                field: Some("title".into()),
+                value: "hello".into()
+            }
+        );
+        // multi-token OR; `{query: ...}` form.
+        let s = xlate(json!({ "match": { "title": { "query": "hello world" } } }));
+        assert_eq!(s, "title:(hello OR world)");
+    }
+
+    #[test]
+    fn match_phrase_maps_to_phrase() {
+        let s = xlate(json!({ "match_phrase": { "title": "hello world" } }));
+        assert_eq!(s, "title:\"hello world\"");
+        assert_eq!(
+            Query::parse(&s).unwrap(),
+            Query::Phrase {
+                field: Some("title".into()),
+                terms: vec!["hello".into(), "world".into()],
+                slop: 0
+            }
+        );
+    }
+
+    #[test]
+    fn range_bounds_and_inclusivity() {
+        let s = xlate(json!({ "range": { "age": { "gte": 18, "lt": 65 } } }));
+        assert_eq!(s, "age:[18 TO 65}");
+        assert_eq!(
+            Query::parse(&s).unwrap(),
+            Query::Range {
+                field: "age".into(),
+                lower: Some("18".into()),
+                lower_inclusive: true,
+                upper: Some("65".into()),
+                upper_inclusive: false,
+            }
+        );
+        // Open upper bound (exclusive lower via `gt`; absent upper renders inclusive-empty).
+        assert_eq!(
+            xlate(json!({ "range": { "age": { "gt": 18 } } })),
+            "age:{18 TO ]"
+        );
+    }
+
+    #[test]
+    fn multi_match_ors_across_fields() {
+        let s = xlate(json!({ "multi_match": { "query": "alice", "fields": ["name", "email"] } }));
+        assert_eq!(s, "(name:alice OR email:alice)");
+    }
+
+    #[test]
+    fn bool_must_filter_must_not() {
+        let s = xlate(json!({
+            "bool": {
+                "must": [{ "term": { "status": "active" } }],
+                "filter": [{ "range": { "age": { "gte": "18" } } }],
+                "must_not": [{ "term": { "deleted": "true" } }],
+            }
+        }));
+        assert_eq!(s, "status:active AND (age:[18 TO ]) AND NOT deleted:true");
+    }
+
+    #[test]
+    fn bool_should_only_ors() {
+        let s = xlate(json!({
+            "bool": { "should": [{ "term": { "a": "1" } }, { "term": { "b": "2" } }] }
+        }));
+        assert_eq!(s, "(a:1 OR b:2)");
+    }
+
+    #[test]
+    fn unsupported_clause_is_a_clear_error() {
+        let err = translate_query(&json!({ "fuzzy": { "x": "y" } })).unwrap_err();
+        assert_eq!(err.kind, "unsupported");
+        assert!(err.reason.contains("fuzzy"));
+    }
+
+    #[test]
+    fn common_value_charset_is_accepted() {
+        // Hyphens / dots / dates / decimals are common in ids and must round-trip to a Term.
+        for v in ["doc-2", "2024-01-01", "a_b.c", "1.5", "user@example.com"] {
+            let s = xlate(json!({ "term": { "id": v } }));
+            assert_eq!(s, format!("id:{v}"));
+            assert_eq!(
+                Query::parse(&s).unwrap(),
+                Query::Term {
+                    field: Some("id".into()),
+                    value: v.into()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_token_values_are_rejected() {
+        // Whitespace / metacharacters in a term value → clear unsupported error, not mis-encoding.
+        let err = translate_query(&json!({ "term": { "f": "a b" } })).unwrap_err();
+        assert_eq!(err.kind, "unsupported");
+        let err = translate_query(&json!({ "term": { "f": "a:b" } })).unwrap_err();
+        assert_eq!(err.kind, "unsupported");
+    }
+
+    #[test]
+    fn sort_translation() {
+        let sort = json!(["created_at", { "age": "desc" }, { "_score": "desc" }, { "name": { "order": "asc" } }]);
+        let out = translate_sort(&sort).unwrap();
+        assert_eq!(out.len(), 3); // _score dropped
+        assert_eq!(
+            out[0],
+            WireSort {
+                field: "created_at".into(),
+                descending: false
+            }
+        );
+        assert_eq!(
+            out[1],
+            WireSort {
+                field: "age".into(),
+                descending: true
+            }
+        );
+        assert_eq!(
+            out[2],
+            WireSort {
+                field: "name".into(),
+                descending: false
+            }
+        );
+    }
+
+    #[test]
+    fn compose_id_joins_partition_then_identifier() {
+        let coords = Coordinates {
+            partition: vec![v1::Field {
+                name: "tenant".into(),
+                value: Some(v1::Value {
+                    kind: Some(Kind::Int(42)),
+                }),
+            }],
+            identifier: vec![v1::Field {
+                name: "id".into(),
+                value: Some(v1::Value {
+                    kind: Some(Kind::Str("abc".into())),
+                }),
+            }],
+        };
+        assert_eq!(compose_id(&coords), "42#abc");
+    }
+}

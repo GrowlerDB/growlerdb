@@ -1,0 +1,52 @@
+# kube-state-metrics for the scale-test cluster (task-189): pod restarts, OOMKills, container
+# waiting reasons, PVC state -> the Stability dashboard row. Minimal single-replica deploy.
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: kube-state-metrics, namespace: growlerdb }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: growlerdb-kube-state-metrics }
+rules:
+  - apiGroups: [""]
+    resources: [pods, nodes, services, resourcequotas, replicationcontrollers, limitranges, persistentvolumeclaims, persistentvolumes, namespaces, endpoints]
+    verbs: [list, watch]
+  - apiGroups: [apps]
+    resources: [statefulsets, daemonsets, deployments, replicasets]
+    verbs: [list, watch]
+  - apiGroups: [batch]
+    resources: [cronjobs, jobs]
+    verbs: [list, watch]
+  - apiGroups: [autoscaling]
+    resources: [horizontalpodautoscalers]
+    verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: growlerdb-kube-state-metrics }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: growlerdb-kube-state-metrics }
+subjects:
+  - { kind: ServiceAccount, name: kube-state-metrics, namespace: growlerdb }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: kube-state-metrics, namespace: growlerdb, labels: { app: kube-state-metrics } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: kube-state-metrics } }
+  template:
+    metadata: { labels: { app: kube-state-metrics } }
+    spec:
+      serviceAccountName: kube-state-metrics
+      containers:
+        - name: kube-state-metrics
+          image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.13.0
+          ports: [{ containerPort: 8080, name: metrics }]
+          args: ["--namespaces=growlerdb"]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: kube-state-metrics, namespace: growlerdb, labels: { app: kube-state-metrics } }
+spec:
+  selector: { app: kube-state-metrics }
+  ports: [{ port: 8080, targetPort: 8080, name: metrics }]

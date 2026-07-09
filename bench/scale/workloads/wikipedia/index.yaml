@@ -1,0 +1,14 @@
+# Wikipedia: full-text on title + body, keyed by page id.
+name: wikipedia
+source:
+  iceberg:
+    catalog: growlerdb
+    table: growlerdb.wikipedia
+key:
+  identifier_fields: [id]
+mapping:
+  selection: EXPLICIT
+  fields:
+    - { path: id, type: KEYWORD }
+    - { path: title, type: TEXT }
+    - { path: text, type: TEXT }

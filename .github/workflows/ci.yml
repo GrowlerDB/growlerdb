@@ -1,0 +1,256 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Incremental compilation only pays off across repeated local rebuilds;
+  # on a fresh CI runner it just adds I/O overhead.
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  # No debuginfo in CI. For this dep set (arrow/parquet/iceberg/tantivy/tonic)
+  # debuginfo is the bulk of target/ size and link memory; dropping it keeps the
+  # space-constrained self-hosted runners from hitting ENOSPC while linking the
+  # workspace test binaries (the heaviest step). Tests don't need it.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  # Path gate: decide which expensive jobs need to run for this change, so a UI-only PR doesn't pay
+  # for the full Rust workspace test-compile (and a Rust-only PR skips the console build). Downstream
+  # jobs `if:` on these outputs. CI's own file matches every filter, so editing the workflow re-runs
+  # everything. (No branch-protection required checks on this repo, so a skipped job simply doesn't
+  # run — there's nothing waiting on it.)
+  #
+  # Computed with plain `git diff` rather than dorny/paths-filter: the latter lists changed files via
+  # the GitHub API, which this repo's restricted GITHUB_TOKEN can't do ("Resource not accessible by
+  # integration"). git needs no API/token scope — just full history (fetch-depth: 0).
+  changes:
+    runs-on: self-hosted
+    outputs:
+      rust: ${{ steps.f.outputs.rust }}
+      ui: ${{ steps.f.outputs.ui }}
+      stack: ${{ steps.f.outputs.stack }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: f
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          base="${BASE_SHA:-$BEFORE_SHA}"
+          # New branch / missing or unreachable base → can't diff; run everything to be safe.
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "no usable base ('$base') — running all jobs"
+            { echo "rust=true"; echo "ui=true"; echo "stack=true"; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed="$(git diff --name-only "$base" "$HEAD_SHA")"
+          echo "changed files:"; echo "$changed"
+          m() { printf '%s\n' "$changed" | grep -qE "$1"; }
+          rust=false; ui=false; stack=false
+          if m '^(crates/|Cargo\.(toml|lock)$|\.github/workflows/ci\.yml$)'; then rust=true; fi
+          if m '^(ui/|\.github/workflows/ci\.yml$)'; then ui=true; fi
+          if m '^(crates/|Cargo\.(toml|lock)$|deploy/compose/|\.github/workflows/ci\.yml$)'; then stack=true; fi
+          echo "=> rust=$rust ui=$ui stack=$stack"
+          { echo "rust=$rust"; echo "ui=$ui"; echo "stack=$stack"; } >> "$GITHUB_OUTPUT"
+
+  build-test:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: self-hosted
+    # sccache wraps rustc and caches compiled artifacts on the runner's persistent disk — including
+    # the workspace crates that Swatinem/rust-cache deliberately drops. Unchanged crates become cache
+    # hits, so a Rust PR no longer recompiles the whole workspace from scratch (the ~16-min step).
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_CACHE_SIZE: "12G"
+    steps:
+      - uses: actions/checkout@v5
+      # Installs protoc + node (and, where it works, rust) per mise.toml.
+      - uses: jdx/mise-action@v4
+      # mise's rust plugin wraps rustup and on some self-hosted runners silently
+      # leaves no usable `cargo` on PATH. Guarantee a stable toolchain (and repair
+      # the box) regardless of its prior state.
+      - name: Ensure Rust toolchain
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            . "$HOME/.cargo/env"
+          fi
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      # Rust-aware cache: understands target/ layout and keys on Cargo.lock so a
+      # broken lockfile can't poison the cache (vs the generic actions/cache).
+      - uses: Swatinem/rust-cache@v2
+      # Install sccache (the RUSTC_WRAPPER set above). Disk-backed cache persists across runs on the
+      # self-hosted box, so workspace-crate codegen is reused even though rust-cache drops it.
+      - uses: mozilla-actions/sccache-action@v0.0.6
+      # Surface disk headroom: a silent death in "Build tests" is usually ENOSPC.
+      - name: Disk free
+        run: df -h / "$HOME" "$RUNNER_TEMP" || true
+      # Fastest gate first — fail instantly on unformatted code (no dep resolution).
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Split compilation from execution: a failure here is a build error, not a
+      # failed assertion. --locked pins the exact Cargo.lock dependency tree.
+      - name: Build tests
+        run: cargo test --workspace --locked --no-run
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
+  license-audit:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans
+
+  # Console gate (Svelte SPA under ui/): type-check + unit tests + production build, then a
+  # Playwright E2E pass (task-92). The E2E is fully mocked at the network layer (e2e/mocks.ts),
+  # so it needs no live Engine/stack — fast and deterministic. Node-only: setup-node instead of
+  # the root mise toolchain so this job doesn't pull Rust/protoc it never uses.
+  ui:
+    needs: changes
+    if: ${{ needs.changes.outputs.ui == 'true' }}
+    runs-on: self-hosted
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Lint (eslint)
+        run: npm run lint
+      - name: Format check (prettier)
+        run: npm run format:check
+      - name: Type-check
+        run: npm run check
+      - name: Unit tests
+        run: npm test
+      - name: Build
+        run: npm run build
+      # Browser + its system libraries (apt, needs sudo — available on the self-hosted runners).
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+      - name: E2E (mocked API, no live stack)
+        run: npm run e2e
+
+  # Per-PR smoke: the walking-skeleton E2E (index → search → hydrate) against the real Compose stack
+  # (MinIO + Polaris + seeded growlerdb.docs), no mocks — the critical path must pass on every change.
+  # The rest of the E2E suite (sharded build, update/delete, locator self-heal) and the connector's
+  # heavy Spark integration/e2e run nightly (.github/workflows/nightly.yml) to keep per-PR fast.
+  e2e:
+    needs: changes
+    if: ${{ needs.changes.outputs.stack == 'true' }}
+    runs-on: self-hosted
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_CACHE_SIZE: "12G"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v4
+      # See build-test: guarantee a usable cargo on self-hosted runners.
+      - name: Ensure Rust toolchain
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            . "$HOME/.cargo/env"
+          fi
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+      - uses: mozilla-actions/sccache-action@v0.0.6
+      # The catalog vends an S3 endpoint of `minio:9000`; map it for host clients.
+      - name: Map minio hostname
+        run: echo "127.0.0.1 minio" | sudo tee -a /etc/hosts
+      - name: Bring up Compose stack + seed growlerdb.docs
+        run: |
+          # Force a clean slate. A run that crashed before its teardown can leave
+          # containers bound to a since-removed network; `compose down` then can't
+          # reconcile (it errors and bails), and the next `up` fails with "network
+          # not found". So down, then force-remove any leftover project containers
+          # and prune dangling networks directly before bringing the stack up.
+          docker compose -f deploy/compose/docker-compose.yml down -v --remove-orphans 2>/dev/null || true
+          docker ps -aq --filter 'label=com.docker.compose.project=growlerdb-dev' | xargs -r docker rm -f || true
+          docker network prune -f || true
+          docker compose -f deploy/compose/docker-compose.yml up -d minio createbuckets polaris
+          deploy/compose/setup-polaris.sh
+          docker compose -f deploy/compose/docker-compose.yml --profile seed up --build --exit-code-from seed seed
+      - name: Walking-skeleton E2E (smoke; full suite runs nightly)
+        run: cargo test -p growlerdb-engine --test e2e --locked -- --ignored --nocapture walking_skeleton_index_search_hydrate
+      - name: Stack logs (on failure)
+        if: failure()
+        run: docker compose -f deploy/compose/docker-compose.yml logs --no-color | tail -200
+      # Self-hosted runners reuse disk across runs; tear the stack down and reclaim
+      # the seed image / build cache so /work doesn't fill up (ENOSPC kills builds).
+      - name: Tear down stack
+        if: always()
+        run: |
+          docker compose -f deploy/compose/docker-compose.yml down -v --remove-orphans || true
+          docker image prune -f || true
+          docker builder prune -f || true
+
+  # Non-Rust lint gates (task-158): spelling, shell, workflows, YAML, Markdown — on every PR/push.
+  # Rust fmt + clippy are in build-test. One job (sequential steps) to avoid hogging the 3 self-hosted
+  # runners; linters are installed pinned in-job (no third-party lint actions to trust). Fast (~1 min),
+  # so it runs unconditionally — a docs-only PR still gets linted.
+  lint:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v5
+      # node for `npx markdownlint-cli2`; consistent toolchain with the rest of CI.
+      - uses: jdx/mise-action@v4
+      - name: Install linters (pinned)
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck yamllint
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) 1.7.12 "$RUNNER_TEMP"
+          curl -sSfL https://github.com/crate-ci/typos/releases/download/v1.48.0/typos-v1.48.0-x86_64-unknown-linux-musl.tar.gz | tar -xz -C "$RUNNER_TEMP"
+      - name: Spell check (typos)
+        run: |
+          "$RUNNER_TEMP/typos"
+      - name: Shell scripts (shellcheck)
+        run: |
+          git ls-files -z '*.sh' | xargs -0 -r shellcheck
+      - name: Workflows (actionlint)
+        run: |
+          "$RUNNER_TEMP/actionlint" -color
+      - name: YAML (yamllint)
+        run: |
+          yamllint .
+      - name: Markdown (markdownlint)
+        run: |
+          npx --yes markdownlint-cli2
+      - name: OKF conformance
+        run: |
+          ./okf/check.sh

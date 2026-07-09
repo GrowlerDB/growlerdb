@@ -1,0 +1,45 @@
+[
+  {
+    "name": "match_all_count",
+    "weight": 1,
+    "body": { "query": { "match_all": {} }, "size": 0 }
+  },
+  {
+    "name": "window_1day",
+    "weight": 4,
+    "_note": "A single day → the query prunes to ~1 window; the windowing payoff (skip the rest).",
+    "body": { "query": { "range": { "ts": { "gte": 893964000, "lte": 894050400 } } }, "size": 0 }
+  },
+  {
+    "name": "window_7day",
+    "weight": 3,
+    "_note": "A week → ~7 windows scanned, the corpus tail skipped.",
+    "body": { "query": { "range": { "ts": { "gte": 893964000, "lte": 894568800 } } }, "size": 0 }
+  },
+  {
+    "name": "term_status_in_window",
+    "weight": 3,
+    "body": { "query": { "bool": {
+      "must":   [{ "term": { "status": "200" } }],
+      "filter": [{ "range": { "ts": { "gte": 893964000, "lte": 894050400 } } }]
+    }}, "size": 0 }
+  },
+  {
+    "name": "text_request",
+    "weight": 2,
+    "body": { "query": { "match": { "request": "images" } }, "size": 0 }
+  },
+  {
+    "name": "topk_recent_hydrated",
+    "weight": 2,
+    "_note": "Top-20 recent matches sorted by event time — the log-tailing shape; sort favors hot windows.",
+    "body": {
+      "query": { "bool": {
+        "must":   [{ "match": { "request": "english" } }],
+        "filter": [{ "term": { "status": "200" } }]
+      }},
+      "size": 20,
+      "sort": [{ "ts": "desc" }]
+    }
+  }
+]

@@ -1,0 +1,36 @@
+# Headless service: stable per-pod DNS (`<pod>.<svc>.<ns>.svc`) for the node's --advertise-addr
+# and StatefulSet identity.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "growlerdb.node.fullname" . }}-headless
+  labels:
+    {{- include "growlerdb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "growlerdb.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+  ports:
+    - { name: grpc, port: {{ .Values.node.grpcPort }}, targetPort: grpc }
+    - { name: rest, port: {{ .Values.node.restPort }}, targetPort: rest }
+    - { name: metrics, port: {{ .Values.node.metricsPort }}, targetPort: metrics }
+---
+# Load-balanced ClusterIP: the gateway routes queries here, spreading across the index replicas.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "growlerdb.node.fullname" . }}
+  labels:
+    {{- include "growlerdb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "growlerdb.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+  ports:
+    - { name: grpc, port: {{ .Values.node.grpcPort }}, targetPort: grpc }
+    - { name: metrics, port: {{ .Values.node.metricsPort }}, targetPort: metrics }

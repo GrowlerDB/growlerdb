@@ -1,0 +1,39 @@
+[
+  {
+    "name": "match_all_count",
+    "weight": 1,
+    "body": { "query": { "match_all": {} }, "size": 0 }
+  },
+  {
+    "name": "term_status",
+    "weight": 3,
+    "body": { "query": { "term": { "status": "200" } }, "size": 0 }
+  },
+  {
+    "name": "range_time_window",
+    "weight": 3,
+    "body": { "query": { "range": { "ts": { "gte": 893964000, "lte": 894049200 } } }, "size": 0 }
+  },
+  {
+    "name": "text_request",
+    "weight": 3,
+    "body": { "query": { "match": { "request": "images" } }, "size": 0 }
+  },
+  {
+    "name": "cidr_clientip",
+    "weight": 2,
+    "body": { "query": { "term": { "clientip": "211.11.0.0/16" } }, "size": 0 }
+  },
+  {
+    "name": "topk_hydrated",
+    "weight": 2,
+    "body": {
+      "query": { "bool": {
+        "must":   [{ "match": { "request": "english" } }],
+        "filter": [{ "term": { "status": "200" } }]
+      }},
+      "size": 20,
+      "sort": [{ "ts": "desc" }]
+    }
+  }
+]

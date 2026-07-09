@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "growlerdb.fullname" . }}-config
+  labels:
+    {{- include "growlerdb.labels" . | nindent 4 }}
+data:
+  # Non-secret Iceberg/object-store connection config (Design 14: ConfigMaps for catalog endpoint).
+  catalogUri: {{ .Values.iceberg.catalogUri | quote }}
+  warehouse: {{ .Values.iceberg.warehouse | quote }}
+  s3Endpoint: {{ .Values.iceberg.s3Endpoint | quote }}
+  s3Region: {{ .Values.iceberg.s3Region | quote }}
+  {{- with .Values.iceberg.catalogScope }}
+  catalogScope: {{ . | quote }}
+  {{- end }}

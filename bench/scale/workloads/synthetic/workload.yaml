@@ -1,0 +1,11 @@
+# Fallback workload: a seeded, deterministic generator producing http_logs-shaped rows — runnable
+# without downloading the ~31GB public corpus (smoke tests, dev, or shapes the public workloads don't
+# cover). Same schema/queries as http_logs, so it exercises the identical paths.
+name: synthetic
+description: Seeded generator of http_logs-shaped events (no download; deterministic).
+index: index.yaml
+queries: queries.json
+corpus:
+  type: generate
+  module: corpus.py
+  table: growlerdb.synthetic

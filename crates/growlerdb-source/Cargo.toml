@@ -1,0 +1,25 @@
+[package]
+name = "growlerdb-source"
+description = "Source connectors for GrowlerDB (Apache Iceberg, and later Kafka/CDC)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+growlerdb-core.workspace = true
+thiserror.workspace = true
+iceberg = "0.9"
+iceberg-catalog-rest = "0.9"
+iceberg-storage-opendal = "0.9"
+arrow-array = "57"
+arrow-schema = "57"
+# Direct parquet access for hydration's targeted point reads (task-184 / D30) — same major as
+# iceberg's pin, over the same FileIO; the iceberg scan API has no positional selection.
+parquet = { version = "57", features = ["arrow", "async"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+futures = "0.3"
+
+[dev-dependencies]
+bytes = "1"
+tempfile.workspace = true

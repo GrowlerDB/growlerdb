@@ -1,0 +1,68 @@
+# microk8s (a 3-node cluster) — resilience / chaos cluster (task-115).
+# HA posture: a 3-shard index, one primary pod per shard spread across the 3 nodes; the gateway
+# fronts the live control-plane and hot-reloads; a lost shard/host serves honest partial results and
+# self-heals from its PV. Pair with: helm install ... -f values-microk8s.yaml
+#
+# Image lives in a private GHCR repo so all 3 nodes pull the same artifact (the built-in registry's
+# localhost:32000 only resolves on the node hosting it). Build/push + create the pull secret:
+#   echo $CR_PAT | docker login ghcr.io -u <github-username> --password-stdin
+#   docker build -t ghcr.io/growlerdb/growlerdb:dev -f deploy/Dockerfile . && docker push ghcr.io/growlerdb/growlerdb:dev
+#   kubectl -n growlerdb create secret docker-registry ghcr-pull \
+#     --docker-server=ghcr.io --docker-username=<github-username> --docker-password=$CR_PAT_READONLY
+
+image:
+  repository: ghcr.io/growlerdb/growlerdb
+  tag: dev
+  # `:dev` is a mutable tag — pull every (re)start so a fresh build is actually picked up (the chart
+  # default IfNotPresent reuses the node's cached image and silently serves the old UI/binary).
+  pullPolicy: Always
+imagePullSecrets:
+  - name: ghcr-pull
+
+# 3 shards → one primary pod per shard; anti-affinity (node.spreadReplicas, default true) puts each
+# on a different mini-PC, so losing one box drops at most one shard (partial results) and it self-heals.
+index:
+  name: docs
+  sourceTable: growlerdb.docs
+  shards: 3
+  # docs is partitioned by `site` at creation (generator), so the node auto-maps the composite key
+  # (partition=[site], identifier=[id]) — no explicit def needed.
+
+node:
+  persistence:
+    storageClass: microk8s-hostpath
+    size: 10Gi
+  # Of 3 shard pods, keep ≥2 up → at most one shard disrupted at a time on a node drain.
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 2
+
+controlPlane:
+  persistence:
+    storageClass: microk8s-hostpath
+
+gateway:
+  replicas: 2
+  reloadSecs: 10
+  # Console SLI panels: proxy /v1/stats → the cluster's Mimir (Prometheus-compatible) query API.
+  # (No Prometheus-Operator here, so metrics.serviceMonitor is moot — metrics reach Mimir via the
+  # cluster's scrape agent; panels stay empty until GrowlerDB's /metrics are scraped in.)
+  prometheusUrl: "http://<your-metrics-backend>/prometheus"
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  # Reach the console from the LAN without an Ingress controller. Home LAN → auth left open for the
+  # chaos drills; enable gateway.auth.oidc before exposing publicly.
+  service:
+    type: NodePort
+
+# Observability → an in-cluster OTLP collector (deploy grafana/otel-lgtm or alloy as `lgtm`), and a
+# ServiceMonitor if you run kube-prometheus-stack (microk8s `enable observability`).
+observability:
+  otlpEndpoint: "" # e.g. http://lgtm.observability:4318
+  # The console's "Open in Grafana" link. Set to your cluster's Grafana (NodePort/ingress), e.g.
+  # http://<node-ip>:3000 — NOT localhost. Empty ⇒ the link is hidden.
+  grafanaUrl: ""
+metrics:
+  serviceMonitor:
+    enabled: false # set true if the Prometheus-Operator CRD is present

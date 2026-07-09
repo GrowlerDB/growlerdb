@@ -1,0 +1,53 @@
+// GrowlerDB wire schema — shared types (Design 08). The proto is the canonical wire
+// form; breaking changes bump the package to growlerdb.v2 (D25).
+syntax = "proto3";
+
+package growlerdb.v1;
+
+// Java codegen for the connector (task-62); ignored by prost (Rust).
+option java_multiple_files = true;
+option java_package = "io.growlerdb.proto.v1";
+
+// A scalar field value (M1 subset). Mirrors growlerdb-core's Value.
+message Value {
+  oneof kind {
+    string str = 1;
+    int64 int = 2;
+    double float = 3;
+    bool bool = 4;
+    // A temporal instant (date or timestamp) as canonical epoch microseconds UTC
+    // (task-184). Mirrors growlerdb-core's Value::Ts.
+    int64 ts_micros = 5;
+  }
+}
+
+// One field of a composite key: dotted leaf path + value.
+message Field {
+  string name = 1;
+  Value value = 2;
+}
+
+// The composite document key (D5): partition fields ++ identifier fields.
+message Coordinates {
+  repeated Field partition = 1;
+  repeated Field identifier = 2;
+}
+
+// A position in the source stream that a committed index state reflects (D9).
+message SourceCheckpoint {
+  oneof kind {
+    int64 iceberg_snapshot = 1;
+  }
+  // The snapshot's Iceberg data sequence number — lineage-monotone along a branch
+  // (v2 tables), the only sound order over snapshot ids (which are random longs,
+  // task-205). 0/absent = unknown (legacy sender or a v1 table): receivers fall
+  // back to exact-match checkpoint semantics.
+  int64 iceberg_sequence_number = 2;
+}
+
+// Structured error detail accompanying a gRPC status (Design 08).
+message Error {
+  string code = 1;
+  string message = 2;
+  repeated string details = 3;
+}

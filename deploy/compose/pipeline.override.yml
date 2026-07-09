@@ -1,0 +1,20 @@
+# Compose override for the streaming demo (`just pipeline`), layered on docker-compose.yml. It makes
+# the node build + serve the Spark-fed `telemetry_stream` index instead of the default `docs`.
+#
+# This is a deterministic override (no shell-env interpolation), so EVERY compose command that
+# includes this file keeps the node on `telemetry_stream` — a plain `docker compose up` can't
+# accidentally flip it back. The pipeline producer services (redpanda/generator/sink/connector) live
+# in docker-compose.yml under the `pipeline` profile; `just pipeline` activates both.
+services:
+  node:
+    # Retry the initial build until the sink has created growlerdb.telemetry_stream — the node may
+    # start before the first reading lands, so this makes startup race-free.
+    command:
+      - >
+        until growlerdb index growlerdb.telemetry_stream --def /defs/telemetry-stream.yaml --name telemetry_stream;
+        do echo "waiting for source table growlerdb.telemetry_stream..."; sleep 3; done &&
+        growlerdb serve telemetry_stream --addr 0.0.0.0:50051 --rest-addr 0.0.0.0:8080 --metrics-addr 0.0.0.0:9102
+        --register http://controlplane:50071 --advertise-addr http://node:50051
+    volumes:
+      - node-data:/data
+      - ./pipeline:/defs:ro   # the telemetry-stream.yaml index def

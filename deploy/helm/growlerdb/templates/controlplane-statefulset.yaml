@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "growlerdb.controlplane.fullname" . }}
+  labels:
+    {{- include "growlerdb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+spec:
+  serviceName: {{ include "growlerdb.controlplane.fullname" . }}
+  replicas: {{ .Values.controlPlane.replicas }}
+  selector:
+    matchLabels:
+      {{- include "growlerdb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: control-plane
+  template:
+    metadata:
+      labels:
+        {{- include "growlerdb.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: control-plane
+    spec:
+      serviceAccountName: {{ include "growlerdb.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: control-plane
+          image: {{ include "growlerdb.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          args:
+            - control-plane
+            - --addr
+            - 0.0.0.0:{{ .Values.controlPlane.grpcPort }}
+            - --metrics-addr
+            - 0.0.0.0:{{ .Values.controlPlane.metricsPort }}
+          env:
+            {{- include "growlerdb.icebergEnv" . | nindent 12 }}
+            {{- include "growlerdb.observabilityEnv" . | nindent 12 }}
+          ports:
+            - { name: grpc, containerPort: {{ .Values.controlPlane.grpcPort }} }
+            - { name: metrics, containerPort: {{ .Values.controlPlane.metricsPort }} }
+          {{- include "growlerdb.probes" . | nindent 10 }}
+          resources: {{- toYaml .Values.controlPlane.resources | nindent 12 }}
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      {{- with .Values.controlPlane.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controlPlane.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controlPlane.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if not .Values.controlPlane.persistence.enabled }}
+      volumes:
+        - { name: data, emptyDir: {} }
+      {{- end }}
+  {{- if .Values.controlPlane.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: {{ .Values.controlPlane.persistence.accessModes | toJson }}
+        {{- with .Values.controlPlane.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.controlPlane.persistence.size | quote }}
+  {{- end }}

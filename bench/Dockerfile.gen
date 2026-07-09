@@ -1,0 +1,4 @@
+FROM python:3.12-slim
+RUN pip install --no-cache-dir "pyiceberg[pyarrow]>=0.7" numpy
+COPY gen_telemetry.py /gen_telemetry.py
+ENTRYPOINT ["python", "/gen_telemetry.py"]

@@ -1,0 +1,7 @@
+# Local preview of the docs site (the live site is built by GitHub Pages, no CI needed):
+#   cd docs && bundle install && bundle exec jekyll serve
+# Then open http://127.0.0.1:4000/growlerdb/
+source "https://rubygems.org"
+
+# Matches GitHub Pages' native build environment (includes jekyll + jekyll-remote-theme).
+gem "github-pages", group: :jekyll_plugins

@@ -1,0 +1,23 @@
+# cargo-deny configuration — the license-audit gate (keeps the dependency tree
+# to OSS licenses compatible with Apache-2.0 redistribution).
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",             # public-domain dedication (transitive deps)
+    "CDLA-Permissive-2.0", # permissive data license — webpki-roots (Mozilla CA bundle)
+]
+# add exceptions explicitly here if a needed crate uses another OSS license.
+
+[bans]
+multiple-versions = "warn"
+
+[advisories]
+version = 2

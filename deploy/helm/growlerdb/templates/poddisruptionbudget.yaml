@@ -1,0 +1,31 @@
+{{- if and .Values.node.podDisruptionBudget.enabled (gt (int .Values.index.shards) 1) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "growlerdb.node.fullname" . }}
+  labels:
+    {{- include "growlerdb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+spec:
+  minAvailable: {{ .Values.node.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "growlerdb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: node
+{{- end }}
+---
+{{- if and .Values.gateway.podDisruptionBudget.enabled (gt (int .Values.gateway.replicas) 1) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "growlerdb.gateway.fullname" . }}
+  labels:
+    {{- include "growlerdb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  minAvailable: {{ .Values.gateway.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "growlerdb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: gateway
+{{- end }}

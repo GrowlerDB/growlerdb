@@ -1,0 +1,38 @@
+# GrowlerDB index for the realistic http_logs access-log corpus (task-159). The SOURCE is rich (~17
+# fields — see corpus.py, which both bulk-loads and streams it), representative of a real CDN/app
+# log. The INDEX
+# holds only the SEARCHABLE subset plus a compact per-row hydration locator; the rich source-only
+# columns (host, query, protocol, session_id, tags) live in Iceberg and are hydrated on demand. So the
+# index is a realistic fraction of the source (unlike a thin corpus, where the fixed ~14 B/row locator
+# swamps a tiny row). request_id is a KEY-ONLY field: it identifies + hydrates rows (locator) but is
+# NOT indexed as a searchable term dictionary (a per-row UUID has no search value and would bloat the
+# inverted index). The three `fast: true` LONG fields (ts, response_time_ms, response_size) are
+# columnar-only by default (task-215) — range/sort/exact run on the fast field, so they contribute
+# no term-dict/postings bytes; compare growlerdb_index_bytes_component{component=~"term|postings"}
+# across runs to see the delta.
+name: http_logs
+source:
+  iceberg:
+    catalog: growlerdb
+    table: growlerdb.http_logs
+key:
+  identifier_fields: [request_id]
+mapping:
+  selection: EXPLICIT
+  fields:
+    - { path: ts, type: LONG, fast: true } # range / sort
+    - { path: method, type: KEYWORD }
+    - { path: status, type: KEYWORD }
+    # TEXT record levels (task-216): path and user_agent keep the default POSITION — quoted
+    # path search ("api v1 checkout" = this exact path, in order) and user-agent phrases
+    # ("Mobile Safari") are real log-search idioms, and the phrase_path/text_user_agent
+    # queries exercise them. referer is only ever token-searched (by domain/word), so it
+    # drops positions with record: FREQ — full BM25, no phrase support, smaller .pos.
+    - { path: path, type: TEXT }
+    - { path: user_agent, type: TEXT }
+    - { path: referer, type: TEXT, record: FREQ }
+    - { path: client_ip, type: IP } # CIDR queries
+    - { path: user_id, type: KEYWORD }
+    - { path: region, type: KEYWORD }
+    - { path: response_time_ms, type: LONG, fast: true } # range / sort
+    - { path: response_size, type: LONG, fast: true }

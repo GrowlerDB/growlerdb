@@ -1,0 +1,52 @@
+{{- if .Values.reconcile.enabled }}
+# Scheduled drift reconcile backstop (task-195). Runs `growlerdb reconcile <index> --control-plane`,
+# which reads the index's shard map + bucket owners from the registry and fans a shard-scoped
+# ReconcileIndex out to every shard's primary node. The nodes do the source read + repair (delete
+# stale, re-index missing) and emit growlerdb_drift_* metrics; this pod only orchestrates over gRPC,
+# so it needs no Iceberg creds — just the ephemeral work dir the embedded engine opens at startup.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "growlerdb.fullname" . }}-reconcile
+  labels:
+    {{- include "growlerdb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: reconcile
+spec:
+  schedule: {{ .Values.reconcile.schedule | quote }}
+  concurrencyPolicy: {{ .Values.reconcile.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.reconcile.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.reconcile.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ .Values.reconcile.backoffLimit }}
+      activeDeadlineSeconds: {{ .Values.reconcile.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "growlerdb.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: reconcile
+        spec:
+          restartPolicy: Never
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: reconcile
+              image: {{ include "growlerdb.image" . }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command: ["/bin/sh", "-c"]
+              args:
+                - >
+                  exec growlerdb reconcile {{ .Values.index.name }}
+                  --control-plane {{ include "growlerdb.controlplane.endpoint" . }}
+                  {{- if .Values.reconcile.full }} --full{{- end }}
+              env:
+                # The embedded engine opens a local store at startup (unused in cluster mode) — point
+                # it at the ephemeral work volume so a read-only rootfs / non-root user is fine.
+                - { name: GROWLERDB_DATA_DIR, value: /work/gdb }
+              volumeMounts:
+                - { name: work, mountPath: /work }
+              resources: {{- toYaml .Values.reconcile.resources | nindent 16 }}
+          volumes:
+            - { name: work, emptyDir: {} }
+{{- end }}

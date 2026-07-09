@@ -1,0 +1,18 @@
+# Same shape as the http_logs workload (id, ts, clientip, request, status, size) so the synthetic
+# fallback exercises identical query paths.
+name: synthetic
+source:
+  iceberg:
+    catalog: growlerdb
+    table: growlerdb.synthetic
+key:
+  identifier_fields: [id]
+mapping:
+  selection: EXPLICIT
+  fields:
+    - { path: id, type: KEYWORD }
+    - { path: ts, type: LONG, fast: true }
+    - { path: clientip, type: IP }
+    - { path: request, type: TEXT }
+    - { path: status, type: KEYWORD }
+    - { path: size, type: LONG, fast: true }

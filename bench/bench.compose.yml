@@ -1,0 +1,23 @@
+# Benchmark overlay (task-55): Trino (query the same Iceberg table directly) + Elasticsearch
+# (dual-index the same data) for a head-to-head vs GrowlerDB. Joins the running stack's network.
+networks:
+  default:
+    name: growlerdb-dev_default
+    external: true
+
+services:
+  trino:
+    image: trinodb/trino:470
+    container_name: bench-trino
+    volumes:
+      - ./trino/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
+    ports: ["8090:8080"]
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    container_name: bench-es
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+    ports: ["9200:9200"]

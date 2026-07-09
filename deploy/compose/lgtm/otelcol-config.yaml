@@ -1,0 +1,76 @@
+# otel-lgtm's default OTel Collector config, plus a scrape job for GrowlerDB's Prometheus
+# `/metrics` endpoints (task-40) — so the SLIs reach the bundled Prometheus → Grafana.
+# Mounted over /otel-lgtm/otelcol-config.yaml. Keep in sync with the image default on upgrade.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+        cors:
+          allowed_origins:
+            - http://*
+  prometheus/collector:
+    config:
+      scrape_configs:
+        - job_name: "opentelemetry-collector"
+          scrape_interval: 1s
+          static_configs:
+            - targets: ["127.0.0.1:8888"]
+        # GrowlerDB services expose Prometheus `/metrics` on their --metrics-addr ports.
+        # The collector (in the lgtm container) resolves these by compose-network DNS.
+        - job_name: "growlerdb"
+          scrape_interval: 5s
+          static_configs:
+            - targets: ["controlplane:9101", "node:9102", "gateway:9103"]
+        # Host CPU/mem/disk for the Observability "Runtime" panels (task-208.3).
+        - job_name: "node-exporter"
+          scrape_interval: 5s
+          static_configs:
+            - targets: ["node-exporter:9100"]
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+    path: "/ready"
+
+processors:
+  batch:
+
+exporters:
+  otlp_http/metrics:
+    endpoint: http://127.0.0.1:9090/api/v1/otlp
+    tls:
+      insecure: true
+  otlp_http/traces:
+    endpoint: http://127.0.0.1:4418
+    tls:
+      insecure: true
+  otlp_http/logs:
+    endpoint: http://127.0.0.1:3100/otlp
+    tls:
+      insecure: true
+  otlp/profiles:
+    endpoint: http://127.0.0.1:4040
+    tls:
+      insecure: true
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp_http/traces]
+    metrics:
+      receivers: [otlp, prometheus/collector]
+      processors: [batch]
+      exporters: [otlp_http/metrics]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp_http/logs]
+    profiles:
+      receivers: [otlp]
+      exporters: [otlp/profiles]

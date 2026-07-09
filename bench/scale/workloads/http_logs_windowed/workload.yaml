@@ -1,0 +1,18 @@
+# Time-windowed scale-test workload (task-159 temporal case): the same http_logs corpus, but the
+# source is Iceberg-partitioned by day and the index is windowed daily on `ts`. Run it alongside the
+# non-temporal `http_logs` to capture BOTH numbers — the temporal sweet spot (cold-tier + query
+# pruning) and the hash-routed design boundary. See okf/quality/scale-test-plan.md.
+#
+# The streaming generator advances a SYNTHETIC timeline (~LOGS_PER_DAY events per synthetic day, not
+# wall-clock), so day-windows form continuously as the run proceeds — most parked cold, a few hot.
+name: http_logs_windowed
+description: http_logs, daily-windowed — the temporal (windowed + cold-tier) case.
+index: index.yaml
+queries: queries.json
+corpus:
+  type: download
+  module: corpus.py
+  table: growlerdb.http_logs_windowed
+  # Same OSB http_logs corpus as `http_logs` (download separately; see README); the loader adds the
+  # identity `day` partition column (= @timestamp // 86400).
+  source: https://github.com/opensearch-project/opensearch-benchmark-workloads/tree/main/http_logs

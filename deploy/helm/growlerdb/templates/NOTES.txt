@@ -1,0 +1,47 @@
+GrowlerDB is installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Topology (Design 14 sharded cluster):
+  • control-plane  StatefulSet  {{ .Values.controlPlane.replicas }} replica(s)   — index registry (gRPC :{{ .Values.controlPlane.grpcPort }})
+  • node           StatefulSet  {{ .Values.index.shards }} shard pod(s)   — one per shard ordinal of "{{ .Values.index.name }}", on PVs
+  • gateway        Deployment   {{ if .Values.gateway.autoscaling.enabled }}{{ .Values.gateway.autoscaling.minReplicas }}–{{ .Values.gateway.autoscaling.maxReplicas }} (HPA){{ else }}{{ .Values.gateway.replicas }} replica(s){{ end }}   — public Engine API + console UI
+
+Pod-K builds shard K of "{{ .Values.index.name }}" from `{{ .Values.index.sourceTable }}` on first boot, serves that
+ordinal, and self-registers with the control plane; the gateway reads the live shard map from the
+control plane and fronts each shard's primary (hot-reloading on change).
+
+Watch it come up:
+  kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ include "growlerdb.controlplane.fullname" . }}
+  kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ include "growlerdb.node.fullname" . }}
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "growlerdb.gateway.fullname" . }}
+
+Reach the console + Engine API:
+{{- if .Values.gateway.ingress.enabled }}
+  Ingress:
+  {{- range .Values.gateway.ingress.hosts }}
+    http://{{ .host }}
+  {{- end }}
+{{- else }}
+  Port-forward the gateway (the console UI + REST API are on the same port):
+    kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "growlerdb.gateway.fullname" . }} 8080:{{ .Values.gateway.restPort }}
+  then open http://localhost:8080  (and the REST API at http://localhost:8080/v1/...).
+{{- end }}
+
+Verify the install:
+  helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
+{{- if and .Values.gateway.ingress.enabled (not .Values.gateway.auth.oidc.issuer) }}
+
+⚠ SECURITY: the gateway Ingress is enabled but authentication is OFF — the Engine API + console are
+  open to anyone who can reach the Ingress. Set gateway.auth.oidc.issuer + .audience to enable
+  OIDC/JWT auth + RBAC before exposing this publicly.
+{{- end }}
+{{- if .Values.observability.otlpEndpoint }}
+
+Traces export to {{ .Values.observability.otlpEndpoint }} (OTLP). Metrics are on each component's
+metrics port{{ if .Values.metrics.serviceMonitor.enabled }} and scraped via the ServiceMonitor{{ end }}.
+{{- end }}
+
+NOTE: this chart deploys control-plane + node + gateway. The index is partitioned into
+{{ .Values.index.shards }} shard(s), one primary pod each. Zero-downtime per-shard *replicas* are a
+follow-up (segment-shipping is single-shard only); HA today = shards spread across hosts + PDBs +
+fast self-heal from the PV — a lost shard serves honest partial results until it recovers. The
+streaming connector is an external Spark job, and compaction is in-process on the node.

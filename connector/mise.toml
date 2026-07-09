@@ -1,0 +1,9 @@
+# JVM toolchain for the Spark connector subproject (task-62).
+# Inherits rust + protoc from ../mise.toml; adds JDK 21 (Spark 4.0's target) + Maven, both
+# provisioned by mise so the build is runner-independent (the self-hosted CI runners don't ship
+# a system `mvn`; locally, `mise install` here gives you the same toolchain).
+[tools]
+java = "temurin-21"
+# asdf plugin, not the `maven` short name: mise's default aqua registry 400s for apache/maven,
+# whereas this plugin installs the Apache binary cleanly (same pattern as protoc in ../mise.toml).
+"asdf:mise-plugins/mise-maven" = "3.9.9"

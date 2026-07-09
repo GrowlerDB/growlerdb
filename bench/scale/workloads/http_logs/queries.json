@@ -1,0 +1,51 @@
+[
+  {
+    "name": "match_all_count",
+    "weight": 1,
+    "body": { "query": { "match_all": {} }, "size": 0 }
+  },
+  {
+    "name": "term_status",
+    "weight": 3,
+    "body": { "query": { "term": { "status": "200" } }, "size": 0 }
+  },
+  {
+    "name": "range_response_time",
+    "weight": 3,
+    "body": { "query": { "range": { "response_time_ms": { "gte": 500 } } }, "size": 0 }
+  },
+  {
+    "name": "text_user_agent",
+    "weight": 3,
+    "body": { "query": { "match": { "user_agent": "Mobile" } }, "size": 0 }
+  },
+  {
+    "name": "phrase_path",
+    "weight": 2,
+    "body": { "query": { "match_phrase": { "path": "api v1 checkout" } }, "size": 0 }
+  },
+  {
+    "name": "term_user_id",
+    "weight": 2,
+    "body": { "query": { "term": { "user_id": "user_02500" } }, "size": 0 }
+  },
+  {
+    "name": "cidr_client_ip",
+    "weight": 2,
+    "body": { "query": { "term": { "client_ip": "211.0.0.0/8" } }, "size": 0 }
+  },
+  {
+    "name": "topk_hydrated",
+    "weight": 2,
+    "body": {
+      "query": {
+        "bool": {
+          "must": [{ "match": { "user_agent": "Chrome" } }],
+          "filter": [{ "term": { "status": "200" } }]
+        }
+      },
+      "size": 20,
+      "sort": [{ "response_time_ms": "desc" }]
+    }
+  }
+]

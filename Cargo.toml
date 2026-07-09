@@ -1,0 +1,70 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/GrowlerDB/growlerdb"
+authors = ["GrowlerDB contributors"]
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_norway = "0.9"
+serde_json = "1"
+# Timestamp string parsing (task-112): RFC3339/ISO-8601 + date-only → canonical micros. No clock or
+# tz database needed (parsing only), so drop the default features (iana-time-zone/js-sys/wasm).
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+tracing = "0.1"
+jsonwebtoken = "9"
+# zstd-compression: the doc store defaults to zstd for NEW indexes (task-212) — unlike lz4 it
+# entropy-codes incompressible-to-lz4 literals (hex/UUID keys, high-entropy cached fields).
+# Existing indexes keep the compressor persisted in their meta.json.
+tantivy = { version = "0.26", features = ["zstd-compression"] }
+redb = "4"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tonic = { version = "0.14", features = ["tls-ring"] }
+tonic-prost = "0.14"
+prost = "0.14"
+tonic-prost-build = "0.14"
+# internal crates
+growlerdb-core = { path = "crates/growlerdb-core" }
+growlerdb-controlplane = { path = "crates/growlerdb-controlplane" }
+growlerdb-index = { path = "crates/growlerdb-index" }
+growlerdb-backup = { path = "crates/growlerdb-backup" }
+growlerdb-engine = { path = "crates/growlerdb-engine" }
+growlerdb-telemetry = { path = "crates/growlerdb-telemetry" }
+growlerdb-source = { path = "crates/growlerdb-source" }
+growlerdb-proto = { path = "crates/growlerdb-proto" }
+growlerdb-client = { path = "crates/growlerdb-client" }
+
+# Local dev/test builds: keep line tables (so panics/backtraces still show file:line) but drop the
+# heavy variable/type debuginfo that dominates `target/debug` size for this dep set
+# (arrow/parquet/iceberg/tantivy/tonic) — it can be the majority of each .rlib. Shrinks the on-disk
+# footprint substantially with backtraces intact; only step-through debugging loses locals. A
+# debugger session that needs full info can override: `CARGO_PROFILE_DEV_DEBUG=2 cargo build`.
+# (CI already forces DEBUG=0 via env, so this only affects local builds.)
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
+[profile.release]
+lto = "thin"
+
+# Lean profile for the container image (deploy/Dockerfile). Inherits release's optimization but
+# drops thin-LTO (its cross-crate intermediates are the bulk of the build's disk + time) and strips
+# the binary, so the in-Docker build is ~½ the wall-time and a fraction of the target footprint —
+# the 40 GB+ full-release build was the disk hog that overflowed the dev VM. More codegen units
+# parallelize compilation further. Runtime perf is within a few % — fine for a node/gateway image.
+[profile.dist]
+inherits = "release"
+lto = false
+strip = true
+codegen-units = 16

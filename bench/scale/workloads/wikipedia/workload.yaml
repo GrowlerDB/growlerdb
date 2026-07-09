@@ -1,0 +1,12 @@
+# Drop-in example: Wikipedia (English) — the canonical Lucene/Tantivy-family full-text corpus. Shows
+# that adding a dataset is a new workload directory, not a harness change. Corpus loader is a TODO
+# (download the enwiki dump and write {id,title,text} to Iceberg); index + queries are defined so the
+# contract is complete and `validate` passes.
+name: wikipedia
+description: English Wikipedia full-text corpus (drop-in example; corpus loader TODO).
+index: index.yaml
+queries: queries.json
+corpus:
+  type: download
+  table: growlerdb.wikipedia
+  source: https://dumps.wikimedia.org/enwiki/

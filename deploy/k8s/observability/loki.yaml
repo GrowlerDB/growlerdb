@@ -1,0 +1,136 @@
+# Log aggregation for the scale-test cluster (task-234): single-binary Loki + a Promtail DaemonSet
+# that ships every growlerdb-namespace pod's logs into it, wired as a Grafana datasource (grafana.yaml).
+# The Run-3 miss: the bundle had metrics but NO logs — `kubectl logs` only, per-pod, gone at teardown.
+# With this, connector/node/gateway/generator logs are queryable in the same Grafana as the metrics
+# (correlate a write-latency spike with the node's log), and exportable before `terraform destroy`
+# (task-235). Ephemeral storage (emptyDir) + short retention — this is a test bundle, not production.
+# Deploy: applied by scale-up.sh step 6 (`kubectl apply -f deploy/k8s/observability/`).
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: loki-config, namespace: growlerdb }
+data:
+  loki.yaml: |
+    auth_enabled: false
+    server:
+      http_listen_port: 3100
+      grpc_listen_port: 9095
+    common:
+      instance_addr: 127.0.0.1
+      path_prefix: /loki
+      storage:
+        filesystem:
+          chunks_directory: /loki/chunks
+          rules_directory: /loki/rules
+      replication_factor: 1
+      ring:
+        kvstore: { store: inmemory }
+    schema_config:
+      configs:
+        - from: 2024-01-01
+          store: tsdb
+          object_store: filesystem
+          schema: v13
+          index: { prefix: index_, period: 24h }
+    limits_config:
+      retention_period: 24h
+      reject_old_samples: false
+      allow_structured_metadata: true
+    query_range:
+      results_cache:
+        cache:
+          embedded_cache: { enabled: true, max_size_mb: 100 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: loki, namespace: growlerdb, labels: { app: loki } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: loki } }
+  template:
+    metadata: { labels: { app: loki } }
+    spec:
+      containers:
+        - name: loki
+          image: grafana/loki:3.3.0
+          args: ["-config.file=/etc/loki/loki.yaml"]
+          ports: [{ containerPort: 3100 }]
+          volumeMounts:
+            - { name: config, mountPath: /etc/loki }
+            - { name: data, mountPath: /loki }
+      volumes:
+        - { name: config, configMap: { name: loki-config } }
+        - { name: data, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: loki, namespace: growlerdb }
+spec:
+  selector: { app: loki }
+  ports: [{ port: 3100, targetPort: 3100 }]
+---
+# Promtail ships pod logs to Loki. The static path-glob tail needs NO k8s API access (no pod discovery),
+# so this SA carries no ClusterRole — just satisfies the DaemonSet's serviceAccountName. (Promtail is in
+# maintenance in favour of Grafana Alloy; fine for a test bundle — swap to Alloy if this graduates.)
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: promtail, namespace: growlerdb }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: promtail-config, namespace: growlerdb }
+data:
+  promtail.yaml: |
+    server:
+      http_listen_port: 9080
+      grpc_listen_port: 0
+    positions:
+      filename: /run/promtail/positions.yaml
+    clients:
+      - url: http://loki:3100/loki/api/v1/push
+    scrape_configs:
+      # Tail every growlerdb-namespace pod's container logs via a STATIC path glob + CRI parse, and
+      # extract the pod/container labels from the filename (task-236). NB: the kubernetes_sd `role: pod`
+      # relabel approach silently produced 0 active targets here (verified on kind, promtail 2.9.10 +
+      # 3.3.0); the static glob over the kubelet's on-disk CRI logs is the reliable pattern and needs no
+      # k8s API access. Path shape: /var/log/pods/<ns>_<pod>_<uid>/<container>/*.log.
+      - job_name: growlerdb-pods
+        static_configs:
+          - targets: [localhost]
+            labels:
+              job: growlerdb-pods
+              __path__: /var/log/pods/growlerdb_*/*/*.log
+        pipeline_stages:
+          - cri: {}   # containerd/CRI line format: <ts> <stream> <flags> <message>
+          - regex:
+              source: filename
+              expression: '/var/log/pods/[^_]+_(?P<pod>[^_]+)_[^/]+/(?P<container>[^/]+)/'
+          - labels:
+              pod: ''
+              container: ''
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: { name: promtail, namespace: growlerdb, labels: { app: promtail } }
+spec:
+  selector: { matchLabels: { app: promtail } }
+  template:
+    metadata: { labels: { app: promtail } }
+    spec:
+      serviceAccountName: promtail
+      tolerations:
+        - { operator: Exists }   # run on every node incl. any tainted ones
+      containers:
+        - name: promtail
+          image: grafana/promtail:3.3.0
+          args: ["-config.file=/etc/promtail/promtail.yaml"]
+          ports: [{ containerPort: 9080, name: http }]
+          volumeMounts:
+            - { name: config, mountPath: /etc/promtail }
+            - { name: run, mountPath: /run/promtail }
+            - { name: pods, mountPath: /var/log/pods, readOnly: true }
+            - { name: containers, mountPath: /var/log/containers, readOnly: true }
+      volumes:
+        - { name: config, configMap: { name: promtail-config } }
+        - { name: run, emptyDir: {} }
+        - { name: pods, hostPath: { path: /var/log/pods } }
+        - { name: containers, hostPath: { path: /var/log/containers } }

@@ -1,0 +1,141 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "growlerdb.node.fullname" . }}
+  labels:
+    {{- include "growlerdb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+spec:
+  serviceName: {{ include "growlerdb.node.fullname" . }}-headless
+  # One pod per shard: pod-K builds + serves ordinal K of the {{ .Values.index.shards }}-shard index.
+  replicas: {{ .Values.index.shards }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "growlerdb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: node
+  template:
+    metadata:
+      labels:
+        {{- include "growlerdb.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: node
+    spec:
+      serviceAccountName: {{ include "growlerdb.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: node
+          image: {{ include "growlerdb.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          # This pod's shard ordinal is its StatefulSet index (pod `…-K` → ordinal K). Build that
+          # shard's partition from the source on first boot only (the PV persists it across restarts),
+          # then serve it and self-register the ordinal with the control plane at this pod's stable
+          # DNS, so the gateway (which reads the live registry) fronts it and it appears in the
+          # Indexes + Ingestion screens (task-49/77).
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              {{- if .Values.index.windowed }}
+              # Windowed topology (task-219): nodes serve control-plane-ASSIGNED time-window shards, not
+              # a fixed hash ordinal. Each node starts EMPTY — `--define-only` (task-223) writes just
+              # index.json (the resolved def) and builds ZERO windows, so `serve` auto-detects windowing
+              # and serves an empty windowed index that grows only as the connector streams the windows
+              # the CP places here. WITHOUT --define-only a windowed build reads the source (already
+              # populated if the generator ran first) and batch-builds EVERY window on EVERY node —
+              # replicating windows across the pool and defeating placement. No --shards/--shard-ordinal.
+              if [ ! -f "/data/{{ .Values.index.name }}/index.json" ]; then
+                growlerdb index {{ .Values.index.sourceTable }} --name {{ .Values.index.name }} --define-only{{ if .Values.index.definition }} \
+                  --def /etc/growlerdb/index-def.yaml{{ end }}
+              fi
+              exec growlerdb serve {{ .Values.index.name }} \
+                --addr 0.0.0.0:{{ .Values.node.grpcPort }} \
+                --rest-addr 0.0.0.0:{{ .Values.node.restPort }} \
+                --metrics-addr 0.0.0.0:{{ .Values.node.metricsPort }} \
+                --compact-interval-secs {{ .Values.node.compactIntervalSecs }} \
+                --remap-interval-secs {{ .Values.node.remapIntervalSecs }} \
+                --register {{ include "growlerdb.controlplane.endpoint" . }} \
+                --advertise-addr "http://${POD_NAME}.{{ include "growlerdb.node.fullname" . }}-headless.${POD_NAMESPACE}.svc.cluster.local:{{ .Values.node.grpcPort }}"
+              {{- else }}
+              SHARD="${POD_NAME##*-}"
+              if [ ! -f "/data/{{ .Values.index.name }}/index.json" ]; then
+                growlerdb index {{ .Values.index.sourceTable }} --name {{ .Values.index.name }} \
+                  --shards {{ .Values.index.shards }} --shard-ordinal "$SHARD"{{ if .Values.index.definition }} \
+                  --def /etc/growlerdb/index-def.yaml{{ end }}
+              fi
+              exec growlerdb serve {{ .Values.index.name }} \
+                --shards {{ .Values.index.shards }} --shard-ordinal "$SHARD" \
+                --addr 0.0.0.0:{{ .Values.node.grpcPort }} \
+                --rest-addr 0.0.0.0:{{ .Values.node.restPort }} \
+                --metrics-addr 0.0.0.0:{{ .Values.node.metricsPort }} \
+                --compact-interval-secs {{ .Values.node.compactIntervalSecs }} \
+                --remap-interval-secs {{ .Values.node.remapIntervalSecs }} \
+                --register {{ include "growlerdb.controlplane.endpoint" . }} \
+                --advertise-addr "http://${POD_NAME}.{{ include "growlerdb.node.fullname" . }}-headless.${POD_NAMESPACE}.svc.cluster.local:{{ .Values.node.grpcPort }}"
+              {{- end }}
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            {{- include "growlerdb.icebergEnv" . | nindent 12 }}
+            {{- include "growlerdb.observabilityEnv" . | nindent 12 }}
+          ports:
+            - { name: grpc, containerPort: {{ .Values.node.grpcPort }} }
+            - { name: rest, containerPort: {{ .Values.node.restPort }} }
+            - { name: metrics, containerPort: {{ .Values.node.metricsPort }} }
+          {{- include "growlerdb.probes" . | nindent 10 }}
+          resources: {{- toYaml .Values.node.resources | nindent 12 }}
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            {{- if .Values.index.definition }}
+            - { name: index-def, mountPath: /etc/growlerdb, readOnly: true }
+            {{- end }}
+      {{- with .Values.node.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.node.affinity }}
+      affinity: {{- toYaml .Values.node.affinity | nindent 8 }}
+      {{- else if .Values.node.spreadReplicas }}
+      # Spread replicas across cluster nodes so losing one host doesn't take the shard down.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "growlerdb.selectorLabels" . | nindent 20 }}
+                    app.kubernetes.io/component: node
+      {{- end }}
+      {{- if or (not .Values.node.persistence.enabled) .Values.index.definition }}
+      volumes:
+        {{- if not .Values.node.persistence.enabled }}
+        - { name: data, emptyDir: {} }
+        {{- end }}
+        {{- if .Values.index.definition }}
+        - name: index-def
+          configMap:
+            name: {{ include "growlerdb.fullname" . }}-index-def
+        {{- end }}
+      {{- end }}
+  {{- if .Values.node.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: {{ .Values.node.persistence.accessModes | toJson }}
+        {{- with .Values.node.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.node.persistence.size | quote }}
+  {{- end }}

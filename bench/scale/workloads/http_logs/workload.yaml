@@ -1,0 +1,15 @@
+# Default scale-test workload: a realistic CDN/app **access-log** corpus — rich rows (~17 fields,
+# ~350-450 B/row: request_id, method, host, path, query, status, sizes, timings, client_ip,
+# user_agent, referer, user_id, session_id, region, tags), representative of production HTTP logs.
+# The rich source is what makes index:source ratios meaningful (a thin row is swamped by the fixed
+# per-doc locator). Streamed by deploy/k8s/streaming/generator.yaml. See okf/quality/scale-test-plan.md.
+name: http_logs
+description: Realistic HTTP access-log events (~17 fields) — log/event search workload.
+index: index.yaml
+queries: queries.json
+corpus:
+  type: generate
+  module: corpus.py
+  table: growlerdb.http_logs
+  # In-cluster runs stream via deploy/k8s/streaming/generator.yaml; corpus.py generates the same rich
+  # rows for the local Compose smoke / harness `load`.

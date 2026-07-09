@@ -1,0 +1,66 @@
+# Workload-generic streaming generator (task-214) — RENDERED, do not apply directly:
+#   python3 bench/scale/harness.py render <workload> --shards N   (or deploy/k8s/scale-up.sh)
+# The workload's own corpus.py is mounted from the ConfigMap below and its `stream()` runs —
+# the row recipe lives in exactly one place per workload (bench/scale/workloads/<name>/corpus.py),
+# shared with the harness's bulk `load`. BATCH rows/commit every SLEEP_S; relax SLEEP_S (30-60s)
+# with a big BATCH to crank ingest throughput (staged_run.py drives both via `kubectl set env`).
+# Workload-specific knobs (e.g. the windowed corpus's LOGS_PER_DAY) are plain env vars read by
+# corpus.py — add them with `kubectl set env deploy/growlerdb-generator`.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: growlerdb-workload-corpus
+  namespace: ${NAMESPACE}
+  labels: { app: growlerdb-generator }
+data:
+  corpus.py: |
+${CORPUS_PY}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: growlerdb-generator
+  namespace: ${NAMESPACE}
+  labels: { app: growlerdb-generator }
+spec:
+  # Parallelize ingest by running N generator pods (task-231): each pod's rows carry a unique `run`
+  # prefix (HOSTNAME + a random token, see corpus.py), so replicas produce DISJOINT ids with no
+  # collision — aggregate rows/s scales ~linearly with replicas (a single pod caps ~8.5k/s on the
+  # Run-3 cluster). Rendered by `harness.py render --generators N`.
+  replicas: ${GENERATORS}
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: growlerdb-generator }
+  template:
+    metadata:
+      labels: { app: growlerdb-generator }
+    spec:
+      imagePullSecrets: [{ name: ghcr-pull }]
+      volumes:
+        - name: workload-corpus
+          configMap: { name: growlerdb-workload-corpus }
+      containers:
+        - name: generator
+          image: ghcr.io/growlerdb/growlerdb-seed:dev
+          imagePullPolicy: Always
+          volumeMounts:
+            - { name: workload-corpus, mountPath: /workload }
+          command: ["python", "-c"]
+          args:
+            - |
+              import os, sys
+              sys.path.insert(0, "/workload")
+              import corpus
+              corpus.stream(table=os.environ["TABLE"],
+                            batch=int(os.environ["BATCH"]),
+                            sleep_s=int(os.environ["SLEEP_S"]))
+          env:
+            - { name: TABLE, value: "${TABLE}" }
+            - { name: BATCH, value: "10" }
+            - { name: SLEEP_S, value: "5" }
+            - { name: POLARIS_URI, value: "http://polaris:8181/api/catalog" }
+            - { name: POLARIS_CATALOG, value: "growlerdb" }
+            - { name: POLARIS_CREDENTIAL, value: "root:s3cr3t" }
+            - { name: AWS_ENDPOINT_URL_S3, value: "http://minio:9000" }
+            - { name: AWS_ACCESS_KEY_ID, value: "minioadmin" }
+            - { name: AWS_SECRET_ACCESS_KEY, value: "minioadmin" }

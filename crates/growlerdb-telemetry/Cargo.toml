@@ -1,0 +1,23 @@
+[package]
+name = "growlerdb-telemetry"
+description = "GrowlerDB observability: structured logging, metrics (SLIs), and health probes."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "fmt", "registry"] }
+tracing-opentelemetry = "0.33"
+opentelemetry = "0.32"
+opentelemetry_sdk = "0.32"
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+axum = "0.8"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

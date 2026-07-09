@@ -1,0 +1,92 @@
+name: scale-images
+
+# Build + push the scale-test/streaming images the run needs but `release.yml` only builds on a
+# *release*: the `growlerdb` **server** image (control-plane / node / gateway — one binary), the
+# `growlerdb-connector` (Spark changelog connector + Iceberg maintenance), and `growlerdb-seed` (the
+# corpus generator). `release.yml` still owns the signed, multi-arch, SBOM'd *released* server tags
+# (X.Y.Z / latest); THIS workflow builds a `:dev` (+ commit-SHA) server image from **merged main** so a
+# post-merge / pre-release scale run deploys the code under test instead of a stale `latest` (task-220).
+#
+# Runs on workflow_dispatch (before a scale run) and on pushes that touch server/connector/seed sources.
+# amd64 only: the Hetzner scale nodes (CCX) are amd64; keep it fast. Tags `:dev` (what the manifests
+# reference) + the commit SHA — always pin the SHA (or `:dev`) for a run, never a floating release tag.
+# The server build stamps `GROWLERDB_VERSION=dev-<sha>` so the deployed binary's `--version` /
+# `growlerdb serve` splash reports the exact code, which `scale-up.sh` prints as a verification.
+#
+# ONE-TIME GHCR SETUP: `GITHUB_TOKEN` is repo-scoped, so it can only push to packages *linked to this
+# repo*. The server image auto-links (its package name == the repo name), but `growlerdb-connector`
+# and `growlerdb-seed` have different names — so each package needs the repo granted Write once:
+# github.com/orgs/<org>/packages → the package → Package settings → "Manage Actions access" → add this
+# repo with role Write. Without it the push fails `403 Forbidden` even with `packages: write` below.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag (in addition to the commit SHA)"
+        default: "dev"
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "connector/**"
+      - "crates/growlerdb-proto/proto/**"
+      - "deploy/Dockerfile"
+      - "deploy/k8s/streaming/connector.Dockerfile"
+      - "deploy/compose/seed/**"
+      - ".github/workflows/scale-images.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The server (control-plane / node / gateway — one binary). `release.yml` builds the signed
+          # multi-arch RELEASED tags; this `:dev` build is what a post-merge scale run deploys so it
+          # runs the code under test, not a stale `latest` (task-220). Stamped with a dev version so
+          # the deployed `--version` is verifiable.
+          - name: server
+            image: growlerdb
+            file: deploy/Dockerfile
+            context: .
+            buildargs: GROWLERDB_VERSION=dev-${{ github.sha }}
+          - name: connector
+            image: growlerdb-connector
+            file: deploy/k8s/streaming/connector.Dockerfile
+            context: .
+          - name: seed
+            image: growlerdb-seed
+            file: deploy/compose/seed/Dockerfile
+            context: deploy/compose/seed
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lowercase owner
+        id: owner
+        run: echo "lc=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build + push ${{ matrix.image }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          platforms: linux/amd64
+          push: true
+          build-args: ${{ matrix.buildargs || '' }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ steps.owner.outputs.lc }}/${{ matrix.image }}:${{ github.event.inputs.tag || 'dev' }}
+            ${{ env.REGISTRY }}/${{ steps.owner.outputs.lc }}/${{ matrix.image }}:${{ github.sha }}
+          cache-from: type=gha,scope=scale-${{ matrix.name }}
+          cache-to: type=gha,scope=scale-${{ matrix.name }},mode=max

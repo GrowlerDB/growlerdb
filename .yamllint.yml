@@ -1,0 +1,23 @@
+# yamllint config (task-158). Lints compose, k8s, workflow, and Helm *values* YAML. Helm
+# templates are Go-templated ({{ ... }}) — not valid YAML — so they're ignored; the scale-run
+# `*.template.yaml` manifests are ${VAR}-substituted by the harness (a block-scalar body like
+# `${CORPUS_PY}` isn't valid standalone YAML) and are ignored for the same reason (task-214).
+# Relaxed baseline: purely-stylistic rules off, structural/correctness rules (key duplication,
+# syntax) stay on.
+extends: relaxed
+
+ignore: |
+  deploy/helm/*/templates/
+  deploy/k8s/streaming/*.template.yaml
+  target/
+  node_modules/
+  ui/dist/
+
+rules:
+  line-length: disable
+  indentation: disable
+  document-start: disable
+  truthy: disable
+  comments: disable
+  comments-indentation: disable
+  empty-lines: disable

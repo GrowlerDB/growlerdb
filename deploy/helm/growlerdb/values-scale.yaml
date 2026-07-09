@@ -1,0 +1,80 @@
+# Hetzner k3s SCALE TEST (task-159) — the in-cluster, self-contained variant of values-hetzner.
+#
+# Difference from values-hetzner: that file targets a PRODUCTION-style cloud (public OIDC auth,
+# Traefik ingress, an external kube-prometheus-stack via ServiceMonitor). The scale *test* runs the
+# deps in-cluster (deploy/k8s/deps) and scrapes with the bundled static Prometheus
+# (deploy/k8s/observability) — so it needs the opposite of all those. This file bakes in every
+# override the run needs, so the deploy is `helm install gdb deploy/helm/growlerdb -f
+# values-scale.yaml -n growlerdb` with NO `--set` flags. Driven by deploy/k8s/scale-up.sh.
+#
+# Prereqs (scale-up.sh does these): the `growlerdb` namespace, the `ghcr-pull` image secret, the deps
+# (MinIO/Polaris/Postgres) applied into this namespace, and the http_logs source table created by the
+# generator. See deploy/k8s/README.md.
+
+image:
+  repository: ghcr.io/growlerdb/growlerdb
+  tag: latest
+imagePullSecrets:
+  - name: ghcr-pull
+
+# The scale index: 6 shards (query parallelism; ≈1 shard per worker core). WORKLOAD-agnostic
+# (task-214): name / sourceTable / the explicit definition all come from the chosen workload's
+# bench/scale/workloads/<name>/ directory — deploy/k8s/scale-up.sh WORKLOAD=<name> passes them
+# (`--set index.name/sourceTable`, `--set-file index.definition=<workload>/index.yaml`). Deploy via
+# scale-up.sh, not bare helm — bare helm with this file alone falls back to the base `docs` index.
+index:
+  shards: 6
+
+# Dev credentials for the in-cluster deps — these are the SAME well-known values already committed in
+# deploy/k8s/deps/*.yaml (Polaris root:s3cr3t, MinIO minioadmin), not real secrets. A production
+# deploy uses credentials.existingSecret instead. The chart ships empty defaults on purpose; a
+# test-only values file is the right place to wire the test deps.
+credentials:
+  catalogCredential: "root:s3cr3t"
+  s3AccessKey: "minioadmin"
+  s3SecretKey: "minioadmin"
+
+node:
+  persistence:
+    storageClass: local-path # k3s rancher local-path provisioner
+    size: 50Gi
+  resources:
+    requests: { cpu: "1", memory: 2Gi }
+    limits: { cpu: "4", memory: 8Gi }
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 5 # of 6 shard pods
+
+controlPlane:
+  persistence:
+    storageClass: local-path
+
+gateway:
+  reloadSecs: 15
+  # Expose the OpenSearch-compatible `_search` read adapter — the bench/scale harness queries through
+  # it (`{gateway}/{index}/_search`). Off in the base chart; required for the run.
+  opensearch: true
+  # Wire the console's SLI panels + /v1/stats proxy to the bundled Prometheus (deploy/k8s/observability).
+  prometheusUrl: "http://prometheus:9090"
+  # No public auth for the test cluster — access is via `kubectl port-forward`, not an ingress.
+  # (auth.oidc.issuer intentionally unset → open mode.)
+  resources:
+    requests: { cpu: 250m, memory: 256Mi }
+    limits: { cpu: "2", memory: 1Gi }
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 70
+  # No ingress — reach the gateway/UI with `kubectl -n growlerdb port-forward svc/gdb-growlerdb-gateway 8081:8080`.
+  ingress:
+    enabled: false
+
+# The scale bundle scrapes with a STATIC Prometheus (deploy/k8s/observability/prometheus.yaml), not
+# the Prometheus-Operator — so no ServiceMonitor (its CRD isn't installed; enabling it fails the
+# install with "no matches for kind ServiceMonitor").
+metrics:
+  serviceMonitor:
+    enabled: false
+observability:
+  otlpEndpoint: ""

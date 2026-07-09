@@ -1,0 +1,20 @@
+# GrowlerDB in-cluster dependencies (lab/test): MinIO (S3) + Postgres + Apache Polaris (Iceberg REST
+# catalog) + the bucket/catalog bootstrap Jobs — a faithful port of the deploy/compose stack. Apply
+# into the same namespace as the GrowlerDB chart so the Service names `minio` / `polaris` / `polaris-db`
+# match the chart's iceberg.* defaults:
+#
+#   kubectl create namespace growlerdb
+#   kubectl -n growlerdb apply -k deploy/k8s/deps
+#
+# NOT hardened (dev credentials, single replicas) — for the home-lab / scale-test clusters, not prod.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Pin the namespace so `kubectl apply -k deploy/k8s/deps` always lands here even without `-n`
+# (otherwise it silently goes to the context's default namespace and the Service DNS names the chart
+# expects — `minio` / `polaris` — resolve to nothing). Create it first: `kubectl create namespace growlerdb`.
+namespace: growlerdb
+resources:
+  - minio.yaml
+  - postgres.yaml
+  - polaris.yaml
+  - catalog-setup.yaml

@@ -1,0 +1,169 @@
+// GrowlerDB wire schema — index **Admin** (Engine API, Design 01). Single-node, single
+// index per `growlerdb serve` for M2: describe (status/stats) the served index.
+// Create/Drop/List across indexes pair with the multi-index server (M3).
+syntax = "proto3";
+
+package growlerdb.v1;
+
+option java_multiple_files = true;
+option java_package = "io.growlerdb.proto.v1";
+
+// Describe an index. `index` empty ⇒ the index this server is serving; a name that
+// doesn't match the served index is NotFound (single-index server).
+message DescribeIndexRequest {
+  string index = 1;
+  // Time-window selector for distributed windowed routing (task-225): the Gateway fans a describe to
+  // every window and each WindowNode stamps its id here, so the receiving multiplexer dispatches to
+  // that window's shard and the Gateway sums the per-window stats. 0 (unset) on a single-shard node.
+  int64 window = 2;
+}
+
+// Status + stats of an index.
+message IndexStats {
+  string name = 1;
+  uint64 snapshot = 2;           // current monotonic commit snapshot (0 = no commits)
+  uint64 num_docs = 3;           // live indexed documents
+  uint64 generation_count = 4;   // live segment generations (compaction pressure)
+  string checkpoint = 5;         // source position reflected, e.g. "iceberg_snapshot:7"
+  uint64 size_bytes = 6;         // on-disk size of the shard's index dir (task-73 skew signal)
+  // Mapped DATE field names (task-101): the time columns a console time filter can range a query
+  // on; ranging the windowing field also prunes windows (task-81). Same for every shard of an index.
+  repeated string time_fields = 7;
+}
+
+message DescribeIndexResponse {
+  IndexStats stats = 1;
+  // Number of shards that failed to respond (Gateway-set; 0 = complete). When > 0 the
+  // aggregated stats under-count those shards — a flagged gap, never silent (task-67).
+  uint32 failed_shards = 2;
+  // Per-shard stats in shard order (Gateway-set; one entry per responding shard), so load skew
+  // across shards is observable — `num_docs`/`size_bytes` per shard (task-73). Single entry on a
+  // single-shard/embedded node.
+  repeated IndexStats per_shard = 3;
+}
+
+// Plan (and optionally apply) an **alter** of an index to a candidate definition (task-26).
+// `index` empty ⇒ the served index. The Node resolves `definition_yaml` against the source
+// schema and diffs it against the current definition. With `apply` unset it only plans
+// (detect + guide); with `apply` set it applies **in-place-only** changes (persists the new
+// definition) and rejects (FailedPrecondition) anything that needs a reindex.
+message AlterIndexRequest {
+  string index = 1;
+  string definition_yaml = 2;  // candidate index-definition YAML
+  bool apply = 3;              // false ⇒ dry-run plan; true ⇒ apply in-place changes
+}
+
+// The impact of an alter: whether it is a no-op, requires a full reindex (segments lack
+// the new shape), and the human-readable reasons / in-place changes that guide an operator.
+message AlterPlan {
+  bool is_noop = 1;
+  bool requires_reindex = 2;
+  repeated string reindex_reasons = 3;    // changes that force a rebuild
+  repeated string in_place_changes = 4;   // metadata-only changes safe to apply live
+}
+
+message AlterIndexResponse {
+  AlterPlan plan = 1;
+}
+
+// Reindex an index: rebuild it from the source and durably swap it live (task-30).
+// `index` empty ⇒ the served index.
+message ReindexIndexRequest {
+  string index = 1;
+  // Reshard filter (task-77): when `bucket_owners` is non-empty, the rebuild keeps only the docs
+  // **this** shard owns under that virtual-bucket map — i.e. the node re-derives its post-reshard
+  // shard from source, dropping buckets that moved to other shards. `shard_ordinal` is this node's
+  // ordinal in the new layout. Empty `bucket_owners` ⇒ a normal full reindex (every doc kept).
+  repeated uint32 bucket_owners = 2;
+  uint32 shard_ordinal = 3;
+}
+
+message ReindexIndexResponse {
+  uint64 doc_count = 1;   // documents in the rebuilt index
+  uint64 snapshot = 2;    // the rebuilt index's commit snapshot
+}
+
+// Reconcile the served shard against the source's current snapshot (task-195): the drift backstop
+// that both detects and repairs silently lost/orphaned rows regardless of cause. Shard-scoped like
+// a reshard reindex — `bucket_owners` + `shard_ordinal` restrict the comparison to the keys THIS
+// shard owns, so a reconcile on a sharded index never pulls another shard's keys into it (the
+// placement-destroying bug of the old CLI-only, `ShardId::single`, whole-table reconcile). Empty
+// `bucket_owners` ⇒ the whole index (single-shard / unsharded).
+message ReconcileIndexRequest {
+  string index = 1;
+  repeated uint32 bucket_owners = 2;
+  uint32 shard_ordinal = 3;
+  // Force a full row-level scan, bypassing the count-gate (task-198). The gate skips partitions whose
+  // source record-count already equals the index key-count — an exact TRIGGER, but equal counts can
+  // still hide compensating drift (a stale+missing pair, or duplicate PKs). A periodic `full` sweep
+  // catches that. Default (false) = count-gated.
+  bool full = 4;
+  // Return counts only — do NOT reconcile (task-198). The node reports its live index doc count
+  // (`index_count`) and the source table's total record count (`source_count` = table-wide
+  // `total-records`, metadata only). The cluster driver aggregates Σ `index_count` across shards and
+  // compares to `source_count` (the whole-index gate) to skip the expensive row-level reconcile
+  // entirely when the index is already in sync — routing-agnostic, so it covers hash-routed indexes
+  // the per-partition gate can't. No rows are read or written.
+  bool count_only = 5;
+}
+message ReconcileIndexResponse {
+  uint64 index_count = 1;   // live indexed docs (this shard's scope; whole shard in count_only mode)
+  uint64 source_count = 2;  // source docs this shard owns; table-wide total-records in count_only mode
+  uint64 stale = 3;         // indexed docs removed (absent from the source)
+  uint64 missing = 4;       // source docs re-indexed (absent from the index)
+  bool deletes_skipped = 5; // stale-delete skipped this cycle (concurrent ingest; task-195 guard)
+  uint64 partitions_scanned = 6; // partitions the count-gate found divergent + row-reconciled (task-198)
+  uint64 partitions_skipped = 7; // partitions the count-gate skipped as in-sync (task-198)
+}
+
+// Compact the served shard's segments (task-33/109). `index` empty ⇒ the served index. Reports the
+// live segment count before/after so the console can show the merge effect.
+message CompactIndexRequest {
+  string index = 1;
+}
+message CompactIndexResponse {
+  uint64 segments_before = 1;
+  uint64 segments_after = 2;
+}
+
+// Run a backup of the served shard to object storage (task-32/109). `index` empty ⇒ the served
+// index; `prefix` empty ⇒ the node's default. NOT_IMPLEMENTED when the node has no backup target.
+message BackupIndexRequest {
+  string index = 1;
+  string prefix = 2;
+}
+message BackupIndexResponse {
+  uint64 snapshot = 1;     // committed index snapshot the backup reflects
+  uint64 file_count = 2;
+  uint64 created_ms = 3;   // backup creation time (epoch ms)
+  string prefix = 4;       // object-storage prefix the backup was written to
+}
+
+// Read the last backup's status without downloading data (task-109).
+message BackupStatusRequest {
+  string index = 1;
+}
+message BackupStatusResponse {
+  bool configured = 1;     // node has an object-storage backup target
+  bool present = 2;        // a backup exists at the target
+  uint64 snapshot = 3;
+  uint64 created_ms = 4;
+  uint64 file_count = 5;
+}
+
+// Index administration over the served shard.
+service Admin {
+  // Status/stats of the served index.
+  rpc DescribeIndex(DescribeIndexRequest) returns (DescribeIndexResponse);
+  // Plan (detect + guide) an alter to a candidate definition; applies nothing.
+  rpc AlterIndex(AlterIndexRequest) returns (AlterIndexResponse);
+  // Rebuild the index from its source and durably swap it live.
+  rpc ReindexIndex(ReindexIndexRequest) returns (ReindexIndexResponse);
+  // Reconcile the served shard against the source and repair drift (task-195 backstop).
+  rpc ReconcileIndex(ReconcileIndexRequest) returns (ReconcileIndexResponse);
+  // Compact the served shard's segments (task-33/109).
+  rpc CompactIndex(CompactIndexRequest) returns (CompactIndexResponse);
+  // Run a backup to object storage / read the last backup's status (task-32/109).
+  rpc BackupIndex(BackupIndexRequest) returns (BackupIndexResponse);
+  rpc BackupStatus(BackupStatusRequest) returns (BackupStatusResponse);
+}

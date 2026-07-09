@@ -1,0 +1,20 @@
+[package]
+name = "growlerdb-backup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+growlerdb-core.workspace = true
+growlerdb-index.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true }
+# Object-storage transport: one API for S3/MinIO (production default) + a filesystem service
+# (local backup targets and tests). Already in the tree via iceberg-storage-opendal.
+opendal = { version = "0.55", features = ["services-s3", "services-fs"] }
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,184 @@
+# Scale-test observability bundle (task-183): a minimal Prometheus + node-exporter for the headless
+# test cluster (no kube-prometheus operator). Scrapes GrowlerDB app metrics (control-plane :9101,
+# node :9102, gateway :9103), the scale-test exporter (:9200), pod CPU/mem via the kubelet cAdvisor,
+# and node CPU/disk/net via node-exporter. Deploy: kubectl apply -f deploy/k8s/observability/
+# then set the chart's gateway.prometheusUrl=http://prometheus:9090 so the console SLI panels work.
+# Follow-ups (task-183): MinIO + connector JVM scrape, per-shard query latency.
+# Minimal Prometheus for the headless Hetzner test cluster: scrapes the GrowlerDB metrics ports so
+# the console's Observability/Ingestion SLI panels (gateway /v1/stats/* proxy) have a backend.
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: prometheus, namespace: growlerdb }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: growlerdb-prometheus }
+rules:
+  - apiGroups: [""]
+    resources: [pods, endpoints, services, nodes, nodes/proxy, nodes/metrics]
+    verbs: [get, list, watch]
+  - nonResourceURLs: ["/metrics", "/metrics/cadvisor"]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: growlerdb-prometheus }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: growlerdb-prometheus }
+subjects:
+  - { kind: ServiceAccount, name: prometheus, namespace: growlerdb }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: prometheus-config, namespace: growlerdb }
+data:
+  prometheus.yml: |
+    global: { scrape_interval: 10s }
+    scrape_configs:
+      - job_name: gdb-controlplane
+        kubernetes_sd_configs: [{ role: pod, namespaces: { names: [growlerdb] } }]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+            regex: control-plane
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_ip]
+            regex: (.+)
+            target_label: __address__
+            replacement: ${1}:9101
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+      - job_name: gdb-node
+        kubernetes_sd_configs: [{ role: pod, namespaces: { names: [growlerdb] } }]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+            regex: node
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_ip]
+            regex: (.+)
+            target_label: __address__
+            replacement: ${1}:9102
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+      - job_name: gdb-gateway
+        kubernetes_sd_configs: [{ role: pod, namespaces: { names: [growlerdb] } }]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+            regex: gateway
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_ip]
+            regex: (.+)
+            target_label: __address__
+            replacement: ${1}:9103
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+      # The Spark connector's own ingest-side metrics (task-194/183): rows_read/expected, under-reads,
+      # per-shard acks, stream restarts, write-retries by gRPC code, checkpoint. It exposes /metrics on
+      # :9091 (GROWLERDB_METRICS_PORT) and carries `app: growlerdb-connector`. Scraping this localizes
+      # an ingest-throughput ceiling to the connector vs the nodes (Run 3 found the nodes weren't
+      # CPU-bound, so the connector/commit path is the suspect — task-232).
+      - job_name: gdb-connector
+        kubernetes_sd_configs: [{ role: pod, namespaces: { names: [growlerdb] } }]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            regex: growlerdb-connector
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_ip]
+            regex: (.+)
+            target_label: __address__
+            replacement: ${1}:9091
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+      - job_name: gdb-exporter
+        kubernetes_sd_configs: [{ role: pod, namespaces: { names: [growlerdb] } }]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            regex: gdb-metrics-exporter
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_ip]
+            regex: (.+)
+            target_label: __address__
+            replacement: ${1}:9200
+      - job_name: cadvisor
+        scheme: https
+        tls_config: { insecure_skip_verify: true }
+        authorization: { credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token }
+        kubernetes_sd_configs: [{ role: node }]
+        relabel_configs:
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/${1}/proxy/metrics/cadvisor
+      - job_name: node-exporter
+        kubernetes_sd_configs: [{ role: pod, namespaces: { names: [growlerdb] } }]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            regex: node-exporter
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_ip]
+            regex: (.+)
+            target_label: __address__
+            replacement: ${1}:9100
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: node
+      - job_name: kube-state-metrics
+        kubernetes_sd_configs: [{ role: pod, namespaces: { names: [growlerdb] } }]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            regex: kube-state-metrics
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_ip]
+            regex: (.+)
+            target_label: __address__
+            replacement: ${1}:8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: prometheus, namespace: growlerdb, labels: { app: prometheus } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: prometheus } }
+  template:
+    metadata: { labels: { app: prometheus } }
+    spec:
+      serviceAccountName: prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.1.0
+          args: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=6h"]
+          ports: [{ containerPort: 9090 }]
+          volumeMounts: [{ name: config, mountPath: /etc/prometheus }]
+      volumes:
+        - { name: config, configMap: { name: prometheus-config } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: prometheus, namespace: growlerdb }
+spec:
+  selector: { app: prometheus }
+  ports: [{ port: 9090, targetPort: 9090 }]
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: { name: node-exporter, namespace: growlerdb, labels: { app: node-exporter } }
+spec:
+  selector: { matchLabels: { app: node-exporter } }
+  template:
+    metadata: { labels: { app: node-exporter } }
+    spec:
+      hostNetwork: true
+      hostPID: true
+      tolerations: [{ operator: Exists }]
+      containers:
+        - name: node-exporter
+          image: prom/node-exporter:v1.8.2
+          args: ["--path.rootfs=/host/root", "--path.procfs=/host/proc", "--path.sysfs=/host/sys"]
+          ports: [{ containerPort: 9100, hostPort: 9100 }]
+          volumeMounts:
+            - { name: proc, mountPath: /host/proc, readOnly: true }
+            - { name: sys, mountPath: /host/sys, readOnly: true }
+            - { name: root, mountPath: /host/root, readOnly: true, mountPropagation: HostToContainer }
+      volumes:
+        - { name: proc, hostPath: { path: /proc } }
+        - { name: sys, hostPath: { path: /sys } }
+        - { name: root, hostPath: { path: / } }

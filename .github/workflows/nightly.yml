@@ -1,0 +1,102 @@
+name: nightly
+
+# Heavy E2E kept off the per-PR path so PRs stay fast: the FULL Rust E2E suite (sharded build,
+# update/delete, locator self-heal — beyond ci.yml's per-PR walking-skeleton smoke) and the
+# connector's Spark **integration** + cross-process **e2e** (both excluded from the per-PR
+# `mvn verify`, so without this they'd have no CI at all). Runs nightly and on demand
+# (Actions → nightly → "Run workflow").
+on:
+  schedule:
+    - cron: "0 8 * * *" # ~nightly, 08:00 UTC
+  workflow_dispatch: {}
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  # No debuginfo in CI (the heavy dep set's debuginfo is the bulk of target/ + link memory; see ci.yml).
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  # Every #[ignore]d e2e test against the real Compose stack — not just the per-PR smoke.
+  e2e-full:
+    runs-on: self-hosted
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_CACHE_SIZE: "12G"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v4
+      # See ci.yml: guarantee a usable cargo on self-hosted runners.
+      - name: Ensure Rust toolchain
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            . "$HOME/.cargo/env"
+          fi
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+      - uses: mozilla-actions/sccache-action@v0.0.6
+      # The catalog vends an S3 endpoint of `minio:9000`; map it for host clients.
+      - name: Map minio hostname
+        run: echo "127.0.0.1 minio" | sudo tee -a /etc/hosts
+      - name: Bring up Compose stack + seed growlerdb.docs
+        run: |
+          # Clean slate (a crashed prior run can leave containers on a removed network; see ci.yml).
+          docker compose -f deploy/compose/docker-compose.yml down -v --remove-orphans 2>/dev/null || true
+          docker ps -aq --filter 'label=com.docker.compose.project=growlerdb-dev' | xargs -r docker rm -f || true
+          docker network prune -f || true
+          docker compose -f deploy/compose/docker-compose.yml up -d minio createbuckets polaris
+          deploy/compose/setup-polaris.sh
+          docker compose -f deploy/compose/docker-compose.yml --profile seed up --build --exit-code-from seed seed
+      - name: Full E2E suite (all ignored e2e tests)
+        run: cargo test -p growlerdb-engine --test e2e --locked -- --ignored --nocapture
+      - name: Stack logs (on failure)
+        if: failure()
+        run: docker compose -f deploy/compose/docker-compose.yml logs --no-color | tail -200
+      - name: Tear down stack
+        if: always()
+        run: |
+          docker compose -f deploy/compose/docker-compose.yml down -v --remove-orphans || true
+          docker image prune -f || true
+          docker builder prune -f || true
+
+  # Connector Spark **integration** (in-JVM, no cluster) + cross-process **e2e** (the JVM connector
+  # writes to the real `growlerdb serve` binary over gRPC). Both are @Tag-excluded from `mvn verify`,
+  # so they only ever run here.
+  connector-heavy:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v4
+      - name: Ensure Rust toolchain
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            . "$HOME/.cargo/env"
+          fi
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache Maven repository
+        uses: actions/cache@v5
+        with:
+          path: ~/.m2/repository
+          key: m2-${{ hashFiles('connector/pom.xml') }}
+          restore-keys: m2-
+      # The cross-process e2e drives the real binary; build it first (the test skips if it's absent).
+      - name: Build the growlerdb binary
+        run: cargo build -p growlerdb-cli --locked
+      - name: Connector integration + cross-process e2e (Spark, JDK 21)
+        working-directory: connector
+        run: |
+          mise install
+          mise exec -- mvn -B -q test -Dtest.excludedGroups= -Dgroups=integration
+          mise exec -- mvn -B -q test -Dtest.excludedGroups= -Dgroups=e2e -DGROWLERDB_BIN="$GITHUB_WORKSPACE/target/debug/growlerdb"

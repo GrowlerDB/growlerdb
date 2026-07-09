@@ -1,0 +1,21 @@
+/target
+**/*.rs.bk
+.DS_Store
+.env
+# Editor swap/backup files
+*.swp
+*.swo
+*~
+# Terraform local state + provider cache (never commit — may hold secrets, and the provider docs
+# under .terraform/ would trip markdownlint)
+.terraform/
+*.tfstate
+*.tfstate.*
+deploy/iac/terraform.tfvars
+/deploy/compose/data
+/data
+# Python bytecode (bench/ tooling + the scale-test harness)
+__pycache__/
+*.pyc
+# Rendered per-workload k8s manifests (task-214) — regenerate with `harness.py render <workload>`
+/bench/scale/.render/

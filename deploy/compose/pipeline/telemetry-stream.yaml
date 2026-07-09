@@ -1,0 +1,31 @@
+# Index definition for the streaming demo's `growlerdb.telemetry_stream` table. The node builds an
+# initial (empty/small) index from this, serves it, and the Spark connector then streams the
+# changelog into it. Fast fields drive sort/facets; cached fields render inline in the console; the
+# free-text `message` is the full-text field.
+name: telemetry_stream
+source:
+  iceberg:
+    catalog: growlerdb
+    table: growlerdb.telemetry_stream
+key:
+  # Composite key = partition field(s) + identifier (the original design). `site` partitions the
+  # source table, so it drives Partition routing (readings from a site co-locate on one shard) and
+  # prunes hydration point-lookups to that site's files. `id` uniquely identifies a reading within
+  # a site. A GetByKey coordinate therefore carries both `site` and `id`.
+  partition_fields: [site]
+  identifier_fields: [id]
+mapping:
+  selection: EXPLICIT
+  fields:
+    - { path: id, type: KEYWORD }
+    # `ts` is epoch-millis at the source (generator.py: int(time.time()*1000)); `format: epoch_ms`
+    # makes it a real timestamp (DATE, canonical micros) so the console time filter + range/sort
+    # work on it (task-112).
+    - { path: ts, format: epoch_ms, fast: true, cached: true }
+    - { path: device_id, type: KEYWORD, fast: true, cached: true }
+    - { path: site, type: KEYWORD, fast: true, cached: true }
+    - { path: subsystem, type: KEYWORD, cached: true }
+    - { path: metric, type: KEYWORD, fast: true, cached: true }
+    - { path: status, type: KEYWORD, fast: true, cached: true }
+    - { path: reading, type: LONG, fast: true, cached: true }
+    - { path: message, type: TEXT }

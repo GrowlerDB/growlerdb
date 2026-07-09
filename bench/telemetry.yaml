@@ -1,0 +1,23 @@
+# IoT telemetry benchmark index (task-55): full-text on `message` + keyword fields for filters, fast
+# LONG fields for time-range + reading value. The inverted index turns scans into lookups — the comparison point.
+name: telemetry
+source:
+  iceberg:
+    catalog: growlerdb
+    table: growlerdb.telemetry
+key:
+  identifier_fields: [id]
+mapping:
+  selection: EXPLICIT
+  fields:
+    - { path: id, type: KEYWORD }
+    - { path: ts, type: LONG, fast: true }
+    - { path: device_id, type: KEYWORD }
+    - { path: gateway, type: KEYWORD }
+    - { path: site, type: KEYWORD }
+    - { path: firmware, type: KEYWORD }
+    - { path: metric, type: KEYWORD }
+    - { path: subsystem, type: KEYWORD }
+    - { path: status, type: KEYWORD }
+    - { path: reading, type: LONG, fast: true }
+    - { path: message, type: TEXT }

@@ -1,0 +1,18 @@
+# Copy to terraform.tfvars (gitignored) and edit. The token comes from HCLOUD_TOKEN env, not here.
+
+# Admin access — RESTRICT this for a real run.
+# Provide EITHER ssh_public_key (a key to upload) OR existing_ssh_key_name (a key already in the
+# project). If your public key is already uploaded to Hetzner, use existing_ssh_key_name — supplying
+# it as ssh_public_key fails apply with "SSH key not unique" (409).
+ssh_public_key = "ssh-ed25519 AAAA... you@host"
+# existing_ssh_key_name = "my-existing-key"
+admin_ssh_cidr = "203.0.113.4/32"
+
+# Cluster shape (budget-pinned defaults; see the $200/run cap in okf/quality/scale-test-plan.md).
+node_count  = 4
+server_type = "ccx33"
+location    = "nbg1"
+
+# Run parameters (consumed by the Helm deploy + benchmark harness).
+shard_count = 6
+dataset     = "http_logs"

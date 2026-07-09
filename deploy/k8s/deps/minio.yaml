@@ -1,0 +1,86 @@
+# MinIO — S3-compatible object store for the Iceberg warehouse (the GrowlerDB chart's
+# iceberg.s3Endpoint defaults to http://minio:9000). Single replica on a PVC; dev credentials.
+# Port of the compose `minio` + `createbuckets` services. NOT hardened — for lab/test clusters.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-creds
+type: Opaque
+stringData:
+  rootUser: minioadmin
+  rootPassword: minioadmin
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  labels: { app: minio }
+spec:
+  replicas: 1
+  strategy: { type: Recreate } # single RWO volume — never two pods mounting it at once
+  selector:
+    matchLabels: { app: minio }
+  template:
+    metadata:
+      labels: { app: minio }
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:latest
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - { name: MINIO_ROOT_USER, valueFrom: { secretKeyRef: { name: minio-creds, key: rootUser } } }
+            - { name: MINIO_ROOT_PASSWORD, valueFrom: { secretKeyRef: { name: minio-creds, key: rootPassword } } }
+          ports:
+            - { name: s3, containerPort: 9000 }
+            - { name: console, containerPort: 9001 }
+          readinessProbe:
+            httpGet: { path: /minio/health/ready, port: s3 }
+            periodSeconds: 5
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: minio-data }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+spec:
+  selector: { app: minio }
+  ports:
+    - { name: s3, port: 9000, targetPort: s3 }
+    - { name: console, port: 9001, targetPort: console }
+---
+# One-shot: create the warehouse bucket (idempotent; `mc mb -p` is a no-op if it exists).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-createbuckets
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: minio/mc:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until mc alias set local http://minio:9000 minioadmin minioadmin; do
+                echo "waiting for minio..."; sleep 2;
+              done
+              mc mb -p local/growlerdb-warehouse
+              echo "buckets ready"

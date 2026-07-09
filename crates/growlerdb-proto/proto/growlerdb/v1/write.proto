@@ -1,0 +1,88 @@
+// GrowlerDB wire schema — the Node Write service (Design 02 write path / Design 06
+// JVM↔Rust boundary). The ingestion connector calls this to apply changelog
+// batches to a shard.
+syntax = "proto3";
+
+package growlerdb.v1;
+
+option java_multiple_files = true;
+option java_package = "io.growlerdb.proto.v1";
+
+import "growlerdb/v1/common.proto";
+
+// A document: its composite key + mapped field values.
+message Document {
+  Coordinates key = 1;
+  map<string, Value> fields = 2;
+}
+
+// A document paired with where its row lives in the source (for the locator).
+message LocatedDoc {
+  Document doc = 1;
+  string iceberg_file = 2;
+  uint64 row_position = 3;
+}
+
+// A single change, keyed by the composite key (a changelog reduces to these).
+message DocOp {
+  oneof op {
+    LocatedDoc upsert = 1;   // INSERT / UPDATE_AFTER
+    Coordinates delete = 2;  // DELETE / UPDATE_BEFORE
+  }
+}
+
+// A batch to commit: ordered ops + the checkpoint they bring the index to.
+message DocBatch {
+  repeated DocOp ops = 1;
+  SourceCheckpoint checkpoint = 2;  // the source position the shard reaches AFTER this batch
+  string batch_id = 3;  // idempotent-retry guard
+  // The source position this batch resumes FROM (the prior checkpoint, exclusive). Absent =
+  // from the start of the changelog. The Node's continuity guard (task-194) refuses a batch whose
+  // `from` doesn't equal the shard's current checkpoint (a lineage gap / regression / cross-wiring),
+  // so the checkpoint can't silently advance over unapplied data.
+  SourceCheckpoint from_checkpoint = 4;
+  // The connector's **resume floor** — the position it would restart the changelog read from (the
+  // MIN committed checkpoint across all shards). The connector will never resume before it, and it
+  // reads the changelog from it *exclusive*, so a batch at or below it can never be re-sent; the Node
+  // may drop the idempotent-replay records (`batch_id`s) for those batches to bound the local
+  // BATCH_KEYS store (task-204). Absent = no floor yet (a shard the connector has never resumed past),
+  // so nothing is pruned. Distinct from `from_checkpoint`, which is *this* window's start (per
+  // sub-batch and always >= the floor); the floor is the same for every sub-batch of a trigger.
+  SourceCheckpoint safe_checkpoint = 5;
+}
+
+message WriteRequest {
+  DocBatch batch = 1;
+}
+
+message WriteResponse {
+  uint64 snapshot = 1;  // the committed index snapshot
+}
+
+message GetCheckpointRequest {
+  // For a **windowed** node (task-219): the time window whose checkpoint to read, so the connector
+  // resumes each window independently. 0 (unset) means the node's single shard (the ordinal path);
+  // a windowed node given a window it doesn't serve returns an empty checkpoint (start from scratch).
+  int64 window = 1;
+}
+
+message GetCheckpointResponse {
+  // The source position the shard currently reflects. Absent until the first
+  // commit — the connector then starts from the beginning of the changelog.
+  SourceCheckpoint checkpoint = 1;
+  // The current committed index snapshot (0 before the first commit).
+  uint64 snapshot = 2;
+}
+
+// Applies changelog batches to a shard (adapts the in-process IndexWriter).
+service Write {
+  // Stage + atomically commit one batch (idempotent on batch_id). Backpressure
+  // surfaces as RESOURCE_EXHAUSTED rather than unbounded queueing.
+  rpc Write(WriteRequest) returns (WriteResponse);
+
+  // The checkpoint the shard has durably committed — the connector reads this on
+  // startup to resume exactly-once (the write+checkpoint commit atomically, so this
+  // never points past applied data; idempotent batch_id replay covers any in-flight
+  // retry at the boundary).
+  rpc GetCheckpoint(GetCheckpointRequest) returns (GetCheckpointResponse);
+}

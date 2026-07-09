@@ -1,0 +1,286 @@
+// GrowlerDB wire schema — the Node read API (Engine API, Design 01). The Search
+// service answers full-text/typed queries from the local index, returning ranked
+// document **coordinates** (the keys that hydrate back to Iceberg).
+syntax = "proto3";
+
+package growlerdb.v1;
+
+option java_multiple_files = true;
+option java_package = "io.growlerdb.proto.v1";
+
+import "growlerdb/v1/common.proto";
+
+// One sort key — a numeric/date fast field + direction (task-23).
+message Sort {
+  string field = 1;       // a numeric/date fast field
+  bool descending = 2;    // false = ascending
+}
+
+// One sort-key value of a hit (mirrors `growlerdb_core::SortValue`): the cell the
+// store/Gateway orders by. A doc lacking the field is `missing` (sorts last). Carried
+// on each `SearchHit` so the Gateway can merge field-sorted pages across shards
+// (task-29) — without it a cross-shard field sort has no values to order by.
+message SortValue {
+  oneof kind {
+    double num = 1;       // numeric/date (DATE = epoch micros)
+    string str = 2;       // KEYWORD, compared lexicographically
+    bool missing = 3;     // no value for this field (set true; sorts last)
+  }
+}
+
+// How the Gateway scores a multi-shard search (design/09). LOCAL (default) ranks each
+// shard by its own BM25 stats — correct-at-scale and the single-round-trip path.
+// GLOBAL requests exact global term statistics (two-phase). GLOBAL is not yet wired:
+// the field reserves the wire so enabling it later is non-breaking.
+enum ScoreMode {
+  SCORE_LOCAL = 0;        // per-shard BM25 (default)
+  SCORE_GLOBAL = 1;       // global term stats (reserved; not yet implemented)
+}
+
+// How the `query` string is parsed (task-22/task-90). Both grammars exist in core; the request
+// chooses. Default LUCENE keeps existing clients unchanged.
+enum QuerySyntax {
+  LUCENE = 0;            // Lucene syntax (default): AND/OR/NOT, &&/||, leading -
+  KQL = 1;              // Kibana Query Language: lowercase and/or/not
+}
+
+message SearchRequest {
+  string query = 1;       // Lucene/KQL query string (task-22)
+  uint32 limit = 2;       // page size (top-K)
+  uint32 offset = 3;      // from/size paging; ignored when search_after is set
+  // Sort keys, in priority order (earlier keys dominate; a composite-key
+  // tiebreaker is applied implicitly). Empty = rank by score, descending.
+  repeated Sort sort = 4;
+  // Opaque keyset cursor from a prior response's next_cursor (task-23): return
+  // the page strictly after it. Empty = first page. Requires a non-empty sort.
+  bytes search_after = 5;
+  // Field collapsing (task-23): collapse results to the top hit per distinct value
+  // of this fast field, with a per-hit group + count. Empty = no collapse. When
+  // set, requires a non-empty sort and ignores offset/search_after paging.
+  string collapse = 6;
+  // Point-in-time handle (task-65) from OpenPit: read against that frozen
+  // snapshot instead of the latest. 0 = read the latest committed state.
+  uint64 pit_id = 7;
+  // Multi-shard scoring mode (design/09). Default SCORE_LOCAL; SCORE_GLOBAL is
+  // reserved for the two-phase global-stats path and currently behaves as LOCAL.
+  ScoreMode score_mode = 8;
+  // Time-window selector for distributed windowed routing (task-82): the window id this
+  // request targets when a Node serves multiple windows over one endpoint. Gateway-set per
+  // scattered shard (see WindowNode); 0 = not windowed / single shard, ignored by a
+  // single-shard SearchService. Clients never set this.
+  int64 window = 9;
+  // Query-string grammar (task-90). Default LUCENE; KQL parses the same `query` with the KQL
+  // grammar. Only the search path honors it today (aggregate/export stay Lucene).
+  QuerySyntax syntax = 10;
+  // Target index name (task-99): scope the search to one named index. A serving Gateway fronts a
+  // single index; if this is non-empty and names a different index than the one served here, the
+  // Gateway answers NOT_FOUND rather than silently searching the wrong index. Empty = the index
+  // this endpoint serves (back-compat). Alias resolution is done client-side (alias → target).
+  string index = 11;
+}
+
+// One ranked hit: the document coordinates + its score (0 when sorted by a field).
+// For a collapsed search the hit is a group's top doc: `group` is the collapse
+// field's value and `group_count` the number of docs in that group.
+message SearchHit {
+  Coordinates coordinates = 1;
+  double score = 2;
+  Value group = 3;          // set only for collapsed results
+  uint64 group_count = 4;   // group size; 0 when not collapsed
+  // The hit's value for each request sort key, in order. Set for field-sorted
+  // searches (so the Gateway can merge across shards); empty when ranked by score.
+  repeated SortValue sort_values = 5;
+  // Cached display-field values returned **with the hit** (D23, task-86): the fields the index
+  // marks `cached`, so a results page renders document-like rows without a hydration round-trip.
+  // Empty when the index caches no display fields. The authoritative row is still GetByKey.
+  repeated Field fields = 6;
+}
+
+message SearchResponse {
+  repeated SearchHit hits = 1;
+  // Total documents matching the query (live count), NOT the page size — a 10k-match
+  // query with limit=10 reports total=10000. A Gateway sums it across shards for a true
+  // global total (task-68). For a collapsed search this is the number of groups on the page.
+  uint64 total = 2;
+  // Opaque cursor to fetch the next page via search_after (task-23). Empty when
+  // the query is unsorted or the page is empty (no more results).
+  bytes next_cursor = 3;
+  // Set by the Gateway when at least one shard failed to respond, so the page is
+  // incomplete — a down shard is a flagged gap, never a silent one (task-29).
+  bool partial = 4;
+  // Shards the Gateway actually queried for this response (a time/window filter prunes shards it
+  // can prove won't match, task-81), and `shards_total` the index's full shard count. The console
+  // shows a "scanned/total" ratio (task-133). Both 0 from a bare Node (no shard scope).
+  uint32 shards_scanned = 5;
+  uint32 shards_total = 6;
+}
+
+// Open a point-in-time snapshot (task-65): subsequent reads carrying the returned
+// pit_id observe that frozen state until ClosePit (or TTL expiry).
+message OpenPitRequest {}
+message OpenPitResponse {
+  uint64 pit_id = 1;     // opaque handle; echo into SearchRequest.pit_id / Export
+  uint64 snapshot = 2;   // the monotonic snapshot the PIT pinned
+}
+
+message ClosePitRequest { uint64 pit_id = 1; }
+message ClosePitResponse { bool closed = 1; }   // false if it was already gone
+
+// Stream a full result set at a consistent snapshot (task-65 scroll export): keyset
+// `search_after` paging under the hood, so no gaps/dupes even under concurrent writes.
+message ExportRequest {
+  string query = 1;            // Lucene/KQL query string
+  uint32 page_size = 2;        // hits per streamed page (0 ⇒ a server default)
+  repeated Sort sort = 3;      // required — defines the keyset order to scroll
+  // PIT to scroll. 0 ⇒ the server opens one for the export's duration and closes
+  // it at the end (a self-contained consistent export).
+  uint64 pit_id = 4;
+}
+
+// Run aggregations over the docs a query matches (task-24). `aggs` is a JSON object of
+// name → agg spec (externally-tagged `Agg`, e.g. `{"by_city": {"Terms": {"field": "city",
+// "size": 10}}}`); `results` is name → result JSON.
+message AggregateRequest {
+  string query = 1;   // Lucene/KQL query string
+  string aggs = 2;    // JSON object: name -> agg spec
+  // When set, the Node returns the **mergeable intermediate** result in `partial` (binary)
+  // instead of finalizing — the Gateway sets this to scatter, merge, then finalize.
+  bool partial = 3;
+  // Time-window selector for distributed windowed routing (task-82), mirroring
+  // SearchRequest.window: gateway-set per scattered window; 0 = not windowed,
+  // ignored by a single-shard node. Clients never set this.
+  int64 window = 4;
+}
+
+message AggregateResponse {
+  string results = 1;  // finalized JSON (name -> result); set when the request wasn't partial
+  bytes partial = 2;   // mergeable intermediate bytes; set when the request was partial
+  // Number of shards that failed to respond (Gateway-set; 0 = complete). When > 0 the
+  // merged aggregation under-counts those shards' docs — a flagged gap, never silent
+  // (task-67). Named distinctly because `partial` above is the mergeable-bytes channel.
+  uint32 failed_shards = 3;
+}
+
+// Read-side query service over a shard (adapts the in-process IndexReader).
+service Search {
+  // Execute a query string and return ranked coordinates + scores.
+  rpc Search(SearchRequest) returns (SearchResponse);
+  // Open / close a point-in-time snapshot for consistent reads + export.
+  rpc OpenPit(OpenPitRequest) returns (OpenPitResponse);
+  rpc ClosePit(ClosePitRequest) returns (ClosePitResponse);
+  // Stream every page of a result set at a consistent snapshot until exhausted.
+  rpc Export(ExportRequest) returns (stream SearchResponse);
+  // Aggregate over the docs a query matches.
+  rpc Aggregate(AggregateRequest) returns (AggregateResponse);
+  // Explain how a query scores one specific document (task-102): BM25 clause tree + analyzed terms.
+  rpc Explain(ExplainRequest) returns (ExplainResponse);
+}
+
+// Explain a single document's score for a query (task-102). Opt-in, per-hit: default search never
+// computes this. The coordinate names the doc; the gateway routes to its owning shard.
+message ExplainRequest {
+  string query = 1;             // Lucene/KQL query string
+  Coordinates coordinates = 2;  // the document to explain
+  QuerySyntax syntax = 3;       // grammar (Lucene default)
+  string index = 4;             // target index (task-99 scoping); empty = the served index
+}
+
+// One node of the BM25 score-explanation tree (mirrors Tantivy's `Explanation`): a description, the
+// score it contributes, and its sub-clauses.
+message ExplainClause {
+  string description = 1;
+  double score = 2;
+  repeated ExplainClause details = 3;
+}
+
+// The post-analyzer tokens a query searched for, per field (what was actually matched).
+message AnalyzedField {
+  string field = 1;
+  repeated string terms = 2;
+}
+
+// Per-stage timing breakdown for an explain (milliseconds).
+message ExplainTimings {
+  double index_ms = 1;      // index search: locate the doc + compute the explanation
+  double hydration_ms = 2;  // Iceberg row hydration for the doc (PK lookup)
+  double total_ms = 3;      // wall time at the gateway
+}
+
+message ExplainResponse {
+  bool found = 1;                   // false if the doc isn't in the index
+  bool matched = 2;                 // doc exists but does the query match it?
+  double score = 3;                 // total BM25 score (0 when unmatched)
+  ExplainClause detail = 4;         // the score-explanation tree (unset when unmatched)
+  repeated AnalyzedField analyzed = 5;
+  ExplainTimings timings = 6;
+  uint32 shards_scanned = 7;        // shards touched (1: only the owning shard)
+  uint32 shards_total = 8;          // shards in the index
+}
+
+// Hydrate search coordinates back to authoritative rows (the PK-lookup path): resolve
+// each key through the shard locator, then read the projected columns from Iceberg.
+message GetByKeyRequest {
+  repeated Coordinates keys = 1;   // document coordinates to hydrate
+  repeated string columns = 2;     // projection; empty = all source columns
+  // Time-window selector for distributed windowed routing (task-225): the Gateway broadcasts a
+  // hydration to every window (a key can live in any of them) and each WindowNode stamps its id here,
+  // so the receiving multiplexer dispatches to the right shard. 0 (unset) on a single-shard/ordinal node.
+  int64 window = 3;
+}
+
+// One hydrated row: the coordinates it was fetched for + its projected column values.
+message HydratedRow {
+  Coordinates key = 1;
+  repeated Field fields = 2;
+}
+
+message GetByKeyResponse {
+  repeated HydratedRow rows = 1;   // in request order; a missing key is an error
+  // Number of shards that failed to respond (Gateway-set; 0 = complete). A dropped
+  // shard means some requested keys were skipped — an incomplete hydration, never a
+  // silent "not found" (task-67). Complements SearchResponse.partial.
+  uint32 failed_shards = 2;
+}
+
+// Read-side key→row lookup over a shard + its Iceberg source.
+service Lookup {
+  // Resolve coordinates to authoritative rows (locator + Iceberg read).
+  rpc GetByKey(GetByKeyRequest) returns (GetByKeyResponse);
+}
+
+// Term suggestions over an indexed field's dictionary (task-25).
+enum SuggestKind {
+  PREFIX = 0;   // autocomplete: terms starting with `text`
+  FUZZY = 1;    // did-you-mean: terms within `max_edits` of `text`
+}
+
+message SuggestRequest {
+  string field = 1;        // an indexed TEXT/KEYWORD field
+  string text = 2;         // the prefix (PREFIX) or term (FUZZY)
+  uint32 limit = 3;        // max suggestions (0 ⇒ a server default)
+  SuggestKind kind = 4;    // PREFIX (default) or FUZZY
+  uint32 max_edits = 5;    // FUZZY edit distance (0 ⇒ default; clamped)
+  // Time-window selector for distributed windowed routing (task-82), mirroring
+  // SearchRequest.window: gateway-set per scattered window; 0 = not windowed,
+  // ignored by a single-shard SuggestService. Clients never set this.
+  int64 window = 6;
+}
+
+// One suggestion: the term and its (approximate) document frequency.
+message Suggestion {
+  string text = 1;
+  uint64 count = 2;
+}
+
+message SuggestResponse {
+  repeated Suggestion suggestions = 1;   // best first
+  // Number of shards that failed to respond (Gateway-set; 0 = complete). When > 0 the
+  // merged suggestions under-count those shards — a flagged gap, never silent (task-67).
+  uint32 failed_shards = 2;
+}
+
+// Term-suggestion service over a shard's indexed fields.
+service Suggest {
+  // Autocomplete (prefix) or did-you-mean (fuzzy) suggestions for a field.
+  rpc Suggest(SuggestRequest) returns (SuggestResponse);
+}

@@ -1,0 +1,467 @@
+// GrowlerDB wire schema — the **Control Plane** (task-28, Design 06): cluster-wide index
+// lifecycle over the registry. Lightweight, off the search/write hot path.
+syntax = "proto3";
+
+package growlerdb.v1;
+
+option java_multiple_files = true;
+option java_package = "io.growlerdb.proto.v1";
+
+// Create an index across the cluster: the Control Plane resolves `definition_yaml` against
+// its source schema and registers it (status `building`).
+message CreateIndexRequest {
+  string definition_yaml = 1;  // index-definition YAML (carries the name + source)
+}
+
+message CreateIndexResponse {
+  string name = 1;              // the registered index name
+  repeated string warnings = 2; // non-fatal resolution warnings (e.g. the PREDICATE
+                                // location strategy's honest-scope note, or an
+                                // equality-delete column outside the key)
+}
+
+// Drop a registered index.
+message DropIndexRequest {
+  string name = 1;
+}
+
+message DropIndexResponse {}
+
+// List all registered indexes.
+message ListIndexesRequest {}
+
+// A compact registry row.
+message IndexSummary {
+  string name = 1;
+  string status = 2;  // "building" | "active"
+}
+
+message ListIndexesResponse {
+  repeated IndexSummary indexes = 1;
+}
+
+// --- Aliases (task-52): a stable name pointing at one or more member indexes. Re-pointing an
+// alias is the atomic reindex-and-swap; a search over an alias fans out across its members.
+message SetAliasRequest {
+  string alias = 1;
+  repeated string targets = 2;  // member index names — replaces any existing set
+}
+message SetAliasResponse {}
+
+message DropAliasRequest {
+  string alias = 1;
+}
+message DropAliasResponse {}
+
+message ListAliasesRequest {}
+message AliasEntry {
+  string alias = 1;
+  repeated string targets = 2;  // member index names, sorted
+}
+message ListAliasesResponse {
+  repeated AliasEntry aliases = 1;
+}
+
+// A saved search (task-106): the full query state the console can restore, scoped to its owner. The
+// `state` is an opaque JSON blob the UI round-trips (index, filters, time range, sort, syntax); the
+// first-class fields are what the server scopes/sorts by.
+message SavedQuery {
+  string id = 1;           // server-assigned; stable handle for update/delete
+  string name = 2;         // human label
+  string owner = 3;        // verified subject that owns it (server-set)
+  string query = 4;        // the raw query string (display + fallback)
+  string state = 5;        // opaque JSON: the full search state to restore
+  bool shared = 6;         // workspace-visible (read-only to non-owners)
+  int64 created_at_ms = 7; // server-set on create
+}
+
+message ListSavedQueriesRequest {}
+message ListSavedQueriesResponse {
+  repeated SavedQuery queries = 1; // the caller's own + any shared, newest first
+}
+// Create (empty id) or update (existing id) a saved query for the authenticated subject.
+message SaveSavedQueryRequest {
+  SavedQuery query = 1;
+}
+message SaveSavedQueryResponse {
+  SavedQuery query = 1; // the stored row (id/owner/created_at filled in)
+}
+message DeleteSavedQueryRequest {
+  string id = 1;
+}
+message DeleteSavedQueryResponse {}
+
+// A local role binding (task-104): the roles an admin has granted `subject`, on top of any the
+// subject's token carries. The control plane merges these when authorizing.
+message RoleBinding {
+  string subject = 1;
+  repeated string roles = 2;
+}
+
+message ListUsersRequest {}
+message ListUsersResponse {
+  repeated RoleBinding users = 1; // subjects with a local binding, sorted
+}
+// Replace `subject`'s local roles (empty `roles` clears the binding). Admin-gated.
+message SetUserRolesRequest {
+  string subject = 1;
+  repeated string roles = 2;
+}
+message SetUserRolesResponse {
+  RoleBinding user = 1;
+}
+message ListRolesRequest {}
+message ListRolesResponse {
+  repeated string roles = 1; // the assignable role names (task-103 catalog)
+}
+
+// One per-index lifecycle event for the console's Activity tab (task-110).
+message ActivityEvent {
+  int64 ts_ms = 1;
+  string kind = 2;     // stable tag, e.g. index.created / alias.swapped / reshard.applied
+  string message = 3;  // human-readable
+}
+message ListActivityRequest {
+  string index = 1;
+  uint32 limit = 2;    // 0 = all retained
+}
+message ListActivityResponse {
+  repeated ActivityEvent events = 1; // newest first
+}
+
+// API-token metadata (task-105) — never includes the secret or its hash.
+message ApiTokenMeta {
+  string id = 1;
+  string label = 2;
+  string prefix = 3;       // display prefix, e.g. "gdb_live_a1b2"
+  repeated string roles = 4;
+  string owner = 5;
+  int64 created_at_ms = 6;
+}
+message CreateTokenRequest {
+  string label = 1;
+  repeated string roles = 2;
+}
+message CreateTokenResponse {
+  ApiTokenMeta token = 1;
+  string secret = 2; // the raw secret — shown ONCE, never stored
+}
+message ListTokensRequest {}
+message ListTokensResponse {
+  repeated ApiTokenMeta tokens = 1; // metadata only, newest first
+}
+message RevokeTokenRequest {
+  string id = 1;
+}
+message RevokeTokenResponse {}
+
+// How keys map to shards (mirrors `growlerdb_core::RoutingStrategy`). The Control Plane is the
+// single source of truth so writers (the connector) and readers (the Gateway) agree (task-69).
+enum RoutingStrategy {
+  ROUTING_HASH = 0;       // hash the full key (unpartitioned default)
+  ROUTING_PARTITION = 1;  // hash the partition fields (co-locate a partition)
+}
+
+// Fetch one index's routing config from the registry. The connector calls this at startup to
+// source its shard count + strategy from the same place the Gateway does, instead of guessing
+// from `--nodes` / `--partition` flags (task-69).
+message GetIndexRequest {
+  string name = 1;
+}
+
+// One field's resolved mapping (task-107): type, analyzer, columnar/cached flags, key role, and a
+// D23 block reason when the field can't be cached (sensitive or oversize).
+message FieldMapping {
+  string path = 1;
+  string type = 2;       // GrowlerDB type: TEXT | KEYWORD | LONG | DOUBLE | BOOL | DATE | IP
+  string analyzer = 3;   // TEXT only; empty otherwise
+  bool fast = 4;         // columnar fast field (sort/filter/aggregate)
+  bool cached = 5;       // value returned inline with the hit (D23)
+  bool pk = 6;           // identifier or partition key
+  string blocked = 7;    // D23 reason this field can't be cached ("" = not blocked)
+}
+
+// One shard's placement + coarse state for the console's Shards tab (task-108): the primary node
+// endpoint, replica endpoints, and whether it has a serving primary. For a windowed index `window`
+// names the time window; for an ordinal index it is 0 and `ordinal` is the shard.
+message ShardStatus {
+  uint32 ordinal = 1;
+  int64 window = 2;          // 0 for ordinal indexes; window id for windowed
+  string primary = 3;        // primary node endpoint ("" = unassigned)
+  repeated string replicas = 4;
+  string state = 5;          // "active" (primary assigned) | "building" (no primary yet)
+  // Event-time zone-map for a windowed shard (task-219): the live-CP gateway prunes a time-bounded
+  // query against `[event_min, event_max]` to skip windows that can't match. Meaningful only when
+  // `has_event_bounds`; always false/0 for an ordinal shard.
+  int64 event_min = 6;
+  int64 event_max = 7;
+  bool has_event_bounds = 8;
+}
+
+// The windowing config of a windowed index (task-219), carried on GetIndexResponse so a live-CP
+// gateway (and the connector) can build a window router without reading the registry file. Mirrors
+// `growlerdb_core::TimeWindowing`. Absent (message not set) for a non-windowed index.
+message WindowingConfig {
+  string field = 1;             // ingest-time field that places a doc in a window
+  string granularity = 2;       // "hourly" | "daily" | "weekly" (WindowGranularity, serde-lowercase)
+  string event_time_field = 3;  // event-time zone-map field ("" = none)
+  uint32 hot_windows = 4;       // most-recent windows kept hot (meaningful iff has_hot_windows)
+  bool has_hot_windows = 5;     // false = keep every window hot (no cold-tier parking)
+  // The window field's source TimeFormat (TimeFormat, serde snake_case: "epoch_seconds"/"epoch_millis"
+  // /"epoch_micros"/"epoch_nanos"/"rfc3339"/"date"), or "" for a native DATE already in canonical
+  // micros. The connector needs it to compute each row's window id byte-identically to the engine
+  // (task-219) — else it routes a row to the wrong window's node.
+  string field_format = 6;
+}
+
+message GetIndexResponse {
+  string name = 1;
+  string status = 2;             // "building" | "active"
+  uint32 shard_count = 3;        // number of shards in the index's shard map
+  RoutingStrategy routing = 4;   // resolved from the index definition
+  // Virtual-bucket map (task-77): `bucket_owners[b]` = the shard owning bucket `b`, length
+  // `NUM_BUCKETS`. **Empty ⇒ legacy `fnv % shard_count` routing** (every pre-bucket index). When
+  // present, writers and readers route `key → bucket → shard` through this exact table, so a
+  // reshard moves whole buckets instead of re-routing every key.
+  repeated uint32 bucket_owners = 5;
+  // Per-field resolved mapping (task-107): type/analyzer/fast/cached/PK + D23 block reason.
+  repeated FieldMapping fields = 6;
+  // Per-shard placement + state for the Shards tab (task-108): ordinal/window, primary + replicas.
+  repeated ShardStatus shard_status = 7;
+  // Windowing config for a windowed index (task-219): set iff this index is windowed, so a live-CP
+  // gateway can build a window router + prune. Absent for an ordinal index.
+  WindowingConfig windowing = 8;
+}
+
+// One bucket's reassignment in a reshard plan (task-77): which shard a bucket moves from/to.
+message BucketMove {
+  uint32 bucket = 1;
+  uint32 from_shard = 2;
+  uint32 to_shard = 3;
+}
+
+// Plan a reshard to `new_shard_count` (task-77): compute the bounded, balanced bucket→shard
+// reassignment **without applying it**. The returned move list is the migration work for the
+// online cutover (a later slice); planning is read-only and safe to call anytime.
+message PlanReshardRequest {
+  string index = 1;
+  uint32 new_shard_count = 2;
+}
+
+message PlanReshardResponse {
+  uint32 bucket_count = 1;          // NUM_BUCKETS (the fixed virtual-bucket count)
+  repeated BucketMove moved = 2;    // buckets whose owner changes (bounded ~1/N)
+}
+
+// Apply (execute) a **growth** reshard online (task-77): grow `index` to `new_shard_count` shards.
+// Growth-only — `BucketMap::reassign` moves buckets only onto the *new* shards, so existing shards
+// keep their data and reads stay correct throughout. The new shards (ordinals
+// `current_count..new_shard_count`, already registered via `RegisterServedIndex` with their ordinal)
+// are built from source filtered to their buckets, **then** the bucket map is committed atomically
+// (the cutover) — old shards are untouched until that instant, so there's no missing-read window.
+// After the cutover the old shards' now-dead buckets are trimmed (best-effort).
+message ApplyReshardRequest {
+  string index = 1;
+  uint32 new_shard_count = 2;
+}
+
+message ApplyReshardResponse {
+  uint32 bucket_count = 1;            // NUM_BUCKETS
+  repeated BucketMove moved = 2;      // buckets relocated to the new shards
+  repeated uint32 built_shards = 3;   // new shard ordinals built from source before the cutover
+  repeated uint32 trimmed_shards = 4; // old shard ordinals trimmed after the cutover (best-effort)
+}
+
+// **Skew relief** (task-77 AC4): move one bucket off a busy shard to a less-loaded one, *without* a
+// full reshard. Same shard count; the target shard is rebuilt to include the bucket, the map is
+// committed (cutover; the Gateway dedupes the brief overlap), then the source shard is trimmed. The
+// (bucket, to_shard) is the operator's choice, typically from `BucketMap::recommend_skew_move` over
+// the per-shard load the task-73 diagnostics report.
+message MoveBucketRequest {
+  string index = 1;
+  uint32 bucket = 2;     // the virtual bucket to relocate (0..NUM_BUCKETS)
+  uint32 to_shard = 3;   // the shard ordinal to move it to (an existing shard)
+}
+
+message MoveBucketResponse {
+  uint32 bucket = 1;
+  uint32 from_shard = 2; // the shard the bucket was moved off
+  uint32 to_shard = 3;
+}
+
+// Introspect a source table's schema from the Iceberg catalog — for the UI's create-index
+// form (task-47): list the columns + key hints so a user can pick ALL vs EXPLICIT mapping.
+message DescribeSourceRequest {
+  string table = 1;  // "namespace.table"
+}
+
+message SourceFieldInfo {
+  string path = 1;
+  string type = 2;  // string | long | double | bool | date | binary | other
+}
+
+message DescribeSourceResponse {
+  repeated SourceFieldInfo fields = 1;
+  repeated string partition_fields = 2;    // source-declared partition columns
+  repeated string identifier_fields = 3;   // source-declared identifier columns
+}
+
+// A serving node announces an index it builds + serves locally, so a node-built index
+// (`growlerdb index` + `serve`) becomes first-class in the cluster registry — discoverable by the
+// Gateway and the Ingestion screen — instead of being invisible until someone calls CreateIndex.
+// Idempotent: re-registering on restart re-points the shard map at the (possibly new) endpoint.
+// One time-window shard a node serves for a windowed index (task-81): its id plus the event-time
+// zone-map the gateway prunes against. Omitted (empty `windows`) for a non-windowed index, which
+// reports `shard_count` ordinal shards instead.
+message ServedWindow {
+  int64 window = 1;            // window id (epoch-ms of the window start)
+  int64 event_min = 2;         // event-time zone-map lower bound (meaningful iff has_event_bounds)
+  int64 event_max = 3;         // event-time zone-map upper bound
+  bool has_event_bounds = 4;   // false when the window has no event-time field / no docs yet
+}
+
+message RegisterServedIndexRequest {
+  string definition_json = 1;  // the node's resolved definition (its `index.json`)
+  string endpoint = 2;         // the node's routable gRPC endpoint, e.g. "http://node:50051"
+  uint32 shard_count = 3;      // total ordinal shards in the index (>= 1); ignored when windows is set
+  repeated ServedWindow windows = 4;  // for a windowed index: the windows this node serves (+ zone-maps)
+  // The ordinal shard(s) **this node** serves (task-77 multi-node sharding). Non-empty ⇒ assign
+  // only these ordinals to this endpoint, so node k can own only shard k of a `shard_count`-shard
+  // index. **Empty ⇒ this node serves all of `0..shard_count`** (the single-node default).
+  repeated uint32 shard_ordinals = 5;
+}
+
+message RegisterServedIndexResponse {
+  string name = 1;  // the registered index name
+}
+
+// A windowed node announces itself to the control-plane placement pool (task-219) — a liveness
+// heartbeat sent on startup and on an interval. The CP places each new time window on a live node
+// (fewest-loaded); a node that stops heartbeating past the TTL drops out of the pool and its windows
+// are re-placed on the next ResolveWindowOwner. This is the inverse of RegisterServedIndex: the CP
+// decides placement, rather than the node announcing what it already serves.
+message RegisterNodeRequest {
+  string index = 1;     // the windowed index this node can serve windows for
+  string endpoint = 2;  // the node's routable gRPC endpoint, e.g. "http://node:50051"
+}
+message RegisterNodeResponse {}
+
+// Resolve (assigning on first ask) the node that owns a time `window` of a windowed index (task-219):
+// the connector calls this with a row's computed window id to learn where to route the write.
+// Idempotent for a window already placed on a live node; an unassigned window — or one whose owner is
+// dead — is placed on the least-loaded live node and recorded.
+message ResolveWindowOwnerRequest {
+  string index = 1;
+  int64 window = 2;   // window id (epoch-ms of the window start)
+}
+message ResolveWindowOwnerResponse {
+  string endpoint = 1;  // the node that owns (or was just assigned) this window
+  bool created = 2;     // true iff this call made or moved the assignment
+}
+
+// Ingestion (sync) status for one or all indexes — what the Ingestion screen renders. GrowlerDB
+// has no separate "connector" entity: every index is kept in sync with exactly one Iceberg source
+// by changelog ingestion, so "ingestion status" = source head vs. the shards' committed checkpoint.
+message IngestionStatusRequest {
+  string index = 1;  // a single index, or empty for all registered indexes
+}
+
+// One shard's committed position (from its node's Write.GetCheckpoint) vs. the source.
+message ShardIngestion {
+  uint32 ordinal = 1;
+  string node = 2;                   // the shard primary's endpoint ("" if unassigned)
+  int64 committed_snapshot_id = 3;   // the source Iceberg snapshot this shard reflects (0 = none)
+  uint64 index_snapshot = 4;         // the shard's monotonic index snapshot
+  // "in_sync" | "behind" | "uninitialized" | "no_primary" | "unreachable" | "source_recreated"
+  //   | "unknown"  ("source_recreated" = the source table was dropped+recreated; the index is stale
+  //   and must be reindexed — task-114.)
+  string state = 5;
+  // How stale this shard's committed data is vs the source head, in ms (head_ts − committed_ts);
+  // 0 when in_sync/unknown. Powers the in_sync tolerance band so a healthy 1-snapshot lag doesn't
+  // flap behind↔in_sync, and lets the console show "behind by Ns" (task-137).
+  int64 lag_ms = 6;
+  // For a WINDOWED index (task-226): the time-window id this row represents (`ordinal` is 0/unused).
+  // 0 for an ordinal shard. Lets the console render "window" rows instead of "0 of 0 shards".
+  int64 window = 7;
+}
+
+// Per-index ingestion: its source binding + how far each shard is behind the source head.
+message IndexIngestion {
+  string name = 1;
+  string status = 2;               // "building" | "active"
+  string source_table = 3;         // the Iceberg table this index ingests from
+  RoutingStrategy routing = 4;
+  uint32 shard_count = 5;
+  int64 source_snapshot_id = 6;    // the source table's current Iceberg snapshot (0 = none)
+  int64 source_timestamp_ms = 7;   // commit time of that snapshot (epoch ms)
+  bool source_readable = 8;        // false if the source couldn't be read (lag is then "unknown")
+  repeated ShardIngestion shards = 9;
+}
+
+message IngestionStatusResponse {
+  repeated IndexIngestion items = 1;
+}
+
+// Cluster-wide index lifecycle over the registry (completes task-26's create/drop/list).
+service ControlPlane {
+  rpc CreateIndex(CreateIndexRequest) returns (CreateIndexResponse);
+  rpc DropIndex(DropIndexRequest) returns (DropIndexResponse);
+  rpc ListIndexes(ListIndexesRequest) returns (ListIndexesResponse);
+
+  rpc SetAlias(SetAliasRequest) returns (SetAliasResponse);
+  rpc DropAlias(DropAliasRequest) returns (DropAliasResponse);
+  rpc ListAliases(ListAliasesRequest) returns (ListAliasesResponse);
+  // Routing config (shard count + strategy + bucket map) for one index — the connector's source
+  // of truth.
+  rpc GetIndex(GetIndexRequest) returns (GetIndexResponse);
+  // Plan a reshard (task-77): the bounded bucket→shard reassignment to reach a new shard count,
+  // computed but not applied (the move list drives the online migration in a later slice).
+  rpc PlanReshard(PlanReshardRequest) returns (PlanReshardResponse);
+  // Execute a growth reshard online: build the new shards from source, commit the new bucket map
+  // at cutover, then trim the old shards (task-77). The deployed counterpart to PlanReshard.
+  rpc ApplyReshard(ApplyReshardRequest) returns (ApplyReshardResponse);
+  // Move one bucket off a busy shard to a quieter one online — skew relief without a reshard (task-77).
+  rpc MoveBucket(MoveBucketRequest) returns (MoveBucketResponse);
+  // Source-schema introspection for the create-index form (task-47).
+  rpc DescribeSource(DescribeSourceRequest) returns (DescribeSourceResponse);
+  // A serving node self-registers its locally-built index + shard assignment (task-49).
+  rpc RegisterServedIndex(RegisterServedIndexRequest) returns (RegisterServedIndexResponse);
+  // CP-driven windowed placement (task-219): a windowed node heartbeats into the placement pool
+  // (RegisterNode); the connector resolves each window's owning node (ResolveWindowOwner, placing on
+  // first ask).
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+  rpc ResolveWindowOwner(ResolveWindowOwnerRequest) returns (ResolveWindowOwnerResponse);
+  // Ingestion (sync) status: source head vs. each shard's committed checkpoint (task-49).
+  rpc IngestionStatus(IngestionStatusRequest) returns (IngestionStatusResponse);
+  // Saved searches (task-106): per-subject persisted query state. List returns the caller's own
+  // plus any shared; Save creates (empty id) or updates (own row); Delete removes an own row.
+  rpc ListSavedQueries(ListSavedQueriesRequest) returns (ListSavedQueriesResponse);
+  rpc SaveSavedQuery(SaveSavedQueryRequest) returns (SaveSavedQueryResponse);
+  rpc DeleteSavedQuery(DeleteSavedQueryRequest) returns (DeleteSavedQueryResponse);
+  // User & role management (task-104): list/assign local role bindings + the assignable role set.
+  // Admin-gated; the control plane merges bindings into a caller's roles when authorizing.
+  rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
+  rpc SetUserRoles(SetUserRolesRequest) returns (SetUserRolesResponse);
+  rpc ListRoles(ListRolesRequest) returns (ListRolesResponse);
+  // API tokens (task-105): issue (secret returned once), list (metadata), revoke. Admin-gated.
+  rpc CreateToken(CreateTokenRequest) returns (CreateTokenResponse);
+  rpc ListTokens(ListTokensRequest) returns (ListTokensResponse);
+  rpc RevokeToken(RevokeTokenRequest) returns (RevokeTokenResponse);
+  // Per-index activity / audit log (task-110): paged, newest-first read.
+  rpc ListActivity(ListActivityRequest) returns (ListActivityResponse);
+  // Built-in credential login (task-128): verify username/password against the local credential
+  // store and mint a short-lived session JWT. Unauthenticated (it *establishes* auth). Only
+  // functional when the deployment runs built-in auth (--builtin-auth); else UNIMPLEMENTED.
+  rpc Login(LoginRequest) returns (LoginResponse);
+}
+
+// Built-in login (task-128).
+message LoginRequest {
+  string username = 1;
+  string password = 2;
+}
+message LoginResponse {
+  string token = 1;          // a Bearer session JWT (HS256), validated by the gateway
+  int64 expires_at_ms = 2;   // when the token expires (epoch ms)
+  repeated string roles = 3; // the subject's effective roles (for the console to reflect)
+}

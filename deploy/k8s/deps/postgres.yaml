@@ -1,0 +1,61 @@
+# Postgres — the persistent relational-jdbc metastore for Polaris (port of compose `polaris-db`).
+# Without a persistent metastore Polaris keeps the catalog in memory and forgets every table on
+# restart, which silently orphans the index (task-114). A StatefulSet + PVC keeps it durable.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: polaris-db-creds
+type: Opaque
+stringData:
+  user: polaris
+  password: polaris
+  db: polaris
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: polaris-db
+spec:
+  clusterIP: None
+  selector: { app: polaris-db }
+  ports:
+    - { name: postgres, port: 5432, targetPort: 5432 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: polaris-db
+  labels: { app: polaris-db }
+spec:
+  serviceName: polaris-db
+  replicas: 1
+  selector:
+    matchLabels: { app: polaris-db }
+  template:
+    metadata:
+      labels: { app: polaris-db }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          env:
+            - { name: POSTGRES_USER, valueFrom: { secretKeyRef: { name: polaris-db-creds, key: user } } }
+            - { name: POSTGRES_PASSWORD, valueFrom: { secretKeyRef: { name: polaris-db-creds, key: password } } }
+            - { name: POSTGRES_DB, valueFrom: { secretKeyRef: { name: polaris-db-creds, key: db } } }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports:
+            - { name: postgres, containerPort: 5432 }
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "polaris", "-d", "polaris"] }
+            periodSeconds: 5
+            timeoutSeconds: 5
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi

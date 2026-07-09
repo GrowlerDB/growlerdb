@@ -1,0 +1,50 @@
+# Trino for the GrowlerDB-vs-Iceberg-alone comparison (task-186): queries the SAME Iceberg table
+# (growlerdb.http_logs) via the Polaris REST catalog + MinIO, so the same predicates can be timed as
+# table scans and compared to GrowlerDB's index+hydrate path at each storage milestone.
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: trino-catalog, namespace: growlerdb }
+data:
+  iceberg.properties: |
+    connector.name=iceberg
+    iceberg.catalog.type=rest
+    iceberg.rest-catalog.uri=http://polaris:8181/api/catalog
+    iceberg.rest-catalog.warehouse=growlerdb
+    iceberg.rest-catalog.security=OAUTH2
+    iceberg.rest-catalog.oauth2.credential=root:s3cr3t
+    iceberg.rest-catalog.oauth2.scope=PRINCIPAL_ROLE:ALL
+    iceberg.rest-catalog.vended-credentials-enabled=false
+    fs.native-s3.enabled=true
+    s3.endpoint=http://minio:9000
+    s3.region=us-east-1
+    s3.path-style-access=true
+    s3.aws-access-key=minioadmin
+    s3.aws-secret-key=minioadmin
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: trino, namespace: growlerdb, labels: { app: trino } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: trino } }
+  template:
+    metadata: { labels: { app: trino } }
+    spec:
+      containers:
+        - name: trino
+          image: trinodb/trino:468
+          ports: [{ containerPort: 8080 }]
+          resources:
+            requests: { cpu: "1", memory: 4Gi }
+            limits: { cpu: "3", memory: 6Gi }
+          volumeMounts:
+            - { name: catalog, mountPath: /etc/trino/catalog/iceberg.properties, subPath: iceberg.properties }
+      volumes:
+        - { name: catalog, configMap: { name: trino-catalog } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: trino, namespace: growlerdb }
+spec:
+  selector: { app: trino }
+  ports: [{ port: 8080, targetPort: 8080 }]

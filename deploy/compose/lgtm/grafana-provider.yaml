@@ -1,0 +1,11 @@
+# Grafana dashboard provider for GrowlerDB's SLI dashboards (task-40). Mounted alongside
+# otel-lgtm's own providers in /otel-lgtm/grafana/conf/provisioning/dashboards/ — additive,
+# loads every JSON under the configured path.
+apiVersion: 1
+
+providers:
+  - name: "GrowlerDB SLIs"
+    type: file
+    options:
+      path: /otel-lgtm/growlerdb-dashboards
+      foldersFromFilesStructure: false

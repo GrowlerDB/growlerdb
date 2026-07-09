@@ -1,0 +1,103 @@
+# Scale-test metrics exporter (task-159): the Iceberg/source-side signals GrowlerDB doesn't emit
+# natively (see task-182 for the engine-native ones). Reads the source table's snapshot summary +
+# history and the served doc count, and exposes Prometheus gauges so we can chart dataset size,
+# ingest throughput, source→index lag, and Iceberg-compaction events alongside query/hydration perf.
+# python + pyiceberg + prometheus_client, script from a ConfigMap (no image to build).
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: gdb-metrics-exporter, namespace: growlerdb }
+data:
+  exporter.py: |
+    import os, time, urllib.request, json
+    from prometheus_client import start_http_server, Gauge
+    from pyiceberg.catalog.rest import RestCatalog
+
+    TABLE = os.environ.get("SOURCE_TABLE", "growlerdb.http_logs")
+    INDEX = os.environ.get("INDEX", "http_logs")
+    GW = os.environ.get("GATEWAY_URL", "http://gdb-growlerdb-gateway:8080")
+    INTERVAL = int(os.environ.get("INTERVAL_SECONDS", "15"))
+
+    src_records = Gauge("gdb_source_records", "Rows in the Iceberg source table", ["table"])
+    src_bytes   = Gauge("gdb_source_bytes", "Total data-file bytes in the source table", ["table"])
+    src_files   = Gauge("gdb_source_data_files", "Data-file count (climbs between compactions)", ["table"])
+    idx_docs    = Gauge("gdb_index_docs", "Docs served by the index (cross-shard count)", ["index"])
+    lag_rows    = Gauge("gdb_source_index_lag_rows", "Source rows minus indexed docs", ["index"])
+    last_compact = Gauge("gdb_iceberg_last_compaction_timestamp_seconds", "Unix ts of the last replace (compaction) snapshot", ["table"])
+    compactions = Gauge("gdb_iceberg_compactions_total", "Count of replace (compaction) snapshots", ["table"])
+
+    def catalog():
+        return RestCatalog("gdb", uri=os.environ["POLARIS_URI"], warehouse=os.environ["POLARIS_CATALOG"],
+            credential=os.environ["POLARIS_CREDENTIAL"], scope="PRINCIPAL_ROLE:ALL",
+            **{"s3.endpoint": os.environ["AWS_ENDPOINT_URL_S3"], "s3.access-key-id": os.environ["AWS_ACCESS_KEY_ID"],
+               "s3.secret-access-key": os.environ["AWS_SECRET_ACCESS_KEY"], "s3.path-style-access": "true",
+               "header.X-Iceberg-Access-Delegation": ""})
+
+    def index_docs():
+        req = urllib.request.Request(f"{GW}/v1/search", method="POST",
+            data=json.dumps({"index": INDEX, "query": "*:*", "limit": 0}).encode(),
+            headers={"content-type": "application/json"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return int(json.loads(r.read()).get("total", 0))
+
+    def main():
+        start_http_server(9200)
+        cat = catalog()
+        while True:
+            try:
+                t = cat.load_table(TABLE)
+                snap = t.current_snapshot()
+                if snap:
+                    s = snap.summary
+                    recs = int(s.get("total-records", 0)); src_records.labels(TABLE).set(recs)
+                    src_bytes.labels(TABLE).set(int(s.get("total-files-size", 0)))
+                    src_files.labels(TABLE).set(int(s.get("total-data-files", 0)))
+                    replaces = [sn for sn in t.metadata.snapshots
+                                if "replace" in str(getattr(sn.summary, "operation", "")).lower()]
+                    compactions.labels(TABLE).set(len(replaces))
+                    if replaces:
+                        last_compact.labels(TABLE).set(max(sn.timestamp_ms for sn in replaces) / 1000.0)
+                    try:
+                        d = index_docs(); idx_docs.labels(INDEX).set(d)
+                        lag_rows.labels(INDEX).set(max(0, recs - d))
+                    except Exception as e:
+                        print("index query failed:", str(e)[:100], flush=True)
+            except Exception as e:
+                print("scrape error:", str(e)[:120], flush=True)
+            time.sleep(INTERVAL)
+
+    main()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: gdb-metrics-exporter, namespace: growlerdb, labels: { app: gdb-metrics-exporter } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: gdb-metrics-exporter } }
+  template:
+    metadata: { labels: { app: gdb-metrics-exporter } }
+    spec:
+      containers:
+        - name: exporter
+          image: python:3.12-slim
+          command: ["sh", "-c"]
+          args: ["pip install -q 'pyiceberg[s3fs,pyarrow]' prometheus_client && python /app/exporter.py"]
+          ports: [{ containerPort: 9200, name: metrics }]
+          env:
+            - { name: SOURCE_TABLE, value: "growlerdb.docs" }
+            - { name: INDEX, value: "docs" }
+            - { name: POLARIS_URI, value: "http://polaris:8181/api/catalog" }
+            - { name: POLARIS_CATALOG, value: "growlerdb" }
+            - { name: POLARIS_CREDENTIAL, value: "root:s3cr3t" }
+            - { name: AWS_ENDPOINT_URL_S3, value: "http://minio:9000" }
+            - { name: AWS_ACCESS_KEY_ID, value: "minioadmin" }
+            - { name: AWS_SECRET_ACCESS_KEY, value: "minioadmin" }
+          volumeMounts: [{ name: app, mountPath: /app }]
+      volumes:
+        - { name: app, configMap: { name: gdb-metrics-exporter } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: gdb-metrics-exporter, namespace: growlerdb, labels: { app: gdb-metrics-exporter } }
+spec:
+  selector: { app: gdb-metrics-exporter }
+  ports: [{ port: 9200, targetPort: 9200 }]

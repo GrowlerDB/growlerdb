@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "growlerdb.gateway.fullname" . }}
+  labels:
+    {{- include "growlerdb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  {{- if not .Values.gateway.autoscaling.enabled }}
+  replicas: {{ .Values.gateway.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "growlerdb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: gateway
+  template:
+    metadata:
+      labels:
+        {{- include "growlerdb.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: gateway
+    spec:
+      serviceAccountName: {{ include "growlerdb.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: gateway
+          image: {{ include "growlerdb.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          args:
+            - gateway
+            # Front the index's shards from the **live control-plane** registry (task-117): read the
+            # per-ordinal primaries + bucket map over gRPC and hot-reload on change — no shared
+            # registry file. `--control-plane` here drives both routing and the REST mgmt proxy.
+            - --control-plane
+            - {{ include "growlerdb.controlplane.endpoint" . }}
+            - --index
+            - {{ .Values.index.name | quote }}
+            - --reload-secs
+            - {{ .Values.gateway.reloadSecs | quote }}
+            - --addr
+            - 0.0.0.0:{{ .Values.gateway.grpcPort }}
+            - --rest-addr
+            - 0.0.0.0:{{ .Values.gateway.restPort }}
+            - --metrics-addr
+            - 0.0.0.0:{{ .Values.gateway.metricsPort }}
+            {{- if .Values.gateway.prometheusUrl }}
+            - --prometheus
+            - {{ .Values.gateway.prometheusUrl | quote }}
+            {{- end }}
+            {{- if .Values.gateway.ui.enabled }}
+            - --ui-dir
+            - {{ .Values.gateway.ui.dir | quote }}
+            {{- end }}
+            {{- with .Values.gateway.auth.oidc.issuer }}
+            - --oidc-issuer
+            - {{ . | quote }}
+            - --oidc-audience
+            - {{ required "gateway.auth.oidc.audience is required when an issuer is set" $.Values.gateway.auth.oidc.audience | quote }}
+            {{- end }}
+            {{- if .Values.gateway.opensearch }}
+            - --opensearch
+            {{- end }}
+          env:
+            {{- include "growlerdb.icebergEnv" . | nindent 12 }}
+            {{- include "growlerdb.observabilityEnv" . | nindent 12 }}
+            {{- with .Values.observability.grafanaUrl }}
+            # Only the gateway serves /v1/config, so the console's Grafana link lives here (task-140);
+            # keeping it off the node/control-plane pods avoids rolling them for a console-only value.
+            - name: GROWLERDB_GRAFANA_URL
+              value: {{ . | quote }}
+            {{- end }}
+          ports:
+            - { name: grpc, containerPort: {{ .Values.gateway.grpcPort }} }
+            - { name: http, containerPort: {{ .Values.gateway.restPort }} }
+            - { name: metrics, containerPort: {{ .Values.gateway.metricsPort }} }
+          {{- include "growlerdb.probes" . | nindent 10 }}
+          resources: {{- toYaml .Values.gateway.resources | nindent 12 }}
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - { name: data, emptyDir: {} }
+      {{- with .Values.gateway.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}

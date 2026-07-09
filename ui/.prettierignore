@@ -1,0 +1,9 @@
+node_modules
+dist
+dist-ssr
+test-results
+playwright-report
+blob-report
+package-lock.json
+*.jar
+src/ui-src.jar

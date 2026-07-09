@@ -1,0 +1,23 @@
+# Cached-fields variant (task-55 re-run): same as telemetry.yaml but display fields are `cached: true`
+# (D23) — returned with each hit, no hydration. This is the GrowlerDB equivalent of ES `_source`.
+name: telemetry_cached
+source:
+  iceberg:
+    catalog: growlerdb
+    table: growlerdb.telemetry
+key:
+  identifier_fields: [id]
+mapping:
+  selection: EXPLICIT
+  fields:
+    - { path: id, type: KEYWORD }
+    - { path: ts, type: LONG, fast: true, cached: true }
+    - { path: device_id, type: KEYWORD, cached: true }
+    - { path: gateway, type: KEYWORD, cached: true }
+    - { path: site, type: KEYWORD, cached: true }
+    - { path: firmware, type: KEYWORD, cached: true }
+    - { path: metric, type: KEYWORD, cached: true }
+    - { path: subsystem, type: KEYWORD, cached: true }
+    - { path: status, type: KEYWORD, cached: true }
+    - { path: reading, type: LONG, fast: true, cached: true }
+    - { path: message, type: TEXT, cached: true }

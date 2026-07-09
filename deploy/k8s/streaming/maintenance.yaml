@@ -1,0 +1,105 @@
+# Periodic Iceberg table maintenance for growlerdb.http_logs (task-126). The streaming generator commits a
+# tiny append every few seconds, so the source table accumulates thousands of small data files +
+# manifests — which slows *hydration* (search reads the authoritative rows from Iceberg via the
+# index's row locators; lots of tiny files + fat metadata = slow planning/opens). This CronJob runs
+# the standard Iceberg maintenance procedures via spark-sql against the Polaris catalog:
+#   - rewrite_data_files : compact small files into ~128MB files (the hydration win). SORTED by
+#       (ts, request_id) so rows cluster in the parquet row groups by time then key — a point lookup
+#       of a `request_id` prunes to a small run of row groups (task-145). The sort key MUST match the
+#       table's schema: http_logs is unpartitioned, hash-routed by `request_id` (no `site`/`id`).
+#       Aggressive: min-input-files=2, so any table with ≥2 small files is compacted every run.
+#   - rewrite_manifests  : compact the manifest list
+#   - expire_snapshots   : drop old snapshots + reclaim their now-unreferenced data files
+#   - remove_orphan_files: delete data/metadata files that NO snapshot references. expire_snapshots
+#       does not catch these — the sorted rewrite above uses partial-progress commits, whose
+#       superseded/partial-commit files become orphans that otherwise accumulate unbounded (they hit
+#       21GB of orphans on the home-lab before this was wired in — vs ~136MB of live data — and kept
+#       tipping the node into DiskPressure). It lists the data dir via the Hadoop FileSystem (not
+#       S3FileIO), which has no handler for MinIO's `s3://` scheme by default ("No FileSystem for
+#       scheme s3"), so we add hadoop-aws + an `fs.s3a` mapping. The interval (ORPHAN_OLDER_THAN_HOURS,
+#       default 24h — also Iceberg's minimum for the SQL procedure) stays safely older than the
+#       connector's near-head commit latency, so it never deletes a file a live append is mid-commit.
+#
+# Safe w.r.t. the index: a rewrite is a *replace* (non-append) snapshot, which the connector skips,
+# and GrowlerDB self-heals stale row locators on hydration (engine/hydrate.rs: refresh_locators).
+# Safe w.r.t. the connector's exactly-once resume: it stays near head, and expire keeps recent
+# snapshots (RETAIN_LAST + EXPIRE_OLDER_THAN_HOURS), so its checkpoint snapshot is never expired.
+#
+# Reuses the connector image (apache/spark:4.0.0 base); the Iceberg runtime is fetched via --packages
+# like the connector. Trigger an immediate run with:
+#   kubectl -n growlerdb create job --from=cronjob/growlerdb-iceberg-maintenance maint-now
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: growlerdb-iceberg-maintenance
+  namespace: growlerdb
+  labels: { app: growlerdb-maintenance }
+spec:
+  schedule: "17 * * * *"          # hourly, off the top of the hour to avoid thundering with other jobs
+  concurrencyPolicy: Forbid       # never overlap a rewrite with another
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 1800  # a run must finish within 30m or it's killed
+      template:
+        metadata:
+          labels: { app: growlerdb-maintenance }
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{ name: ghcr-pull }]
+          containers:
+            - name: maintenance
+              image: ghcr.io/growlerdb/growlerdb-connector:dev
+              imagePullPolicy: Always
+              env:
+                - { name: AWS_ACCESS_KEY_ID, value: minioadmin }
+                - { name: AWS_SECRET_ACCESS_KEY, value: minioadmin }
+                - { name: AWS_REGION, value: us-east-1 }
+                # Retention knobs — keep the connector's recent resume point safe. expire keeps the
+                # most-recent RETAIN_LAST snapshots and anything newer than EXPIRE_OLDER_THAN_HOURS.
+                - { name: EXPIRE_OLDER_THAN_HOURS, value: "1" }
+                - { name: RETAIN_LAST, value: "50" }
+                # Orphan-file GC window. >= Iceberg's 24h floor for the SQL procedure, and safely past
+                # the connector's near-head commit latency so GC never races a live append.
+                - { name: ORPHAN_OLDER_THAN_HOURS, value: "24" }
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  EXPIRE_TS=$(date -u -d "${EXPIRE_OLDER_THAN_HOURS} hours ago" +'%Y-%m-%d %H:%M:%S')
+                  ORPHAN_TS=$(date -u -d "${ORPHAN_OLDER_THAN_HOURS} hours ago" +'%Y-%m-%d %H:%M:%S')
+                  echo "maintenance: expire older_than=${EXPIRE_TS} retain_last=${RETAIN_LAST} orphans older_than=${ORPHAN_TS}"
+                  /opt/spark/bin/spark-sql \
+                    --master "local[2]" \
+                    --conf spark.jars.ivy=/tmp/.ivy2 \
+                    --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+                    --packages org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.10.0,org.apache.iceberg:iceberg-aws-bundle:1.10.0,org.apache.hadoop:hadoop-aws:3.4.1 \
+                    --conf spark.sql.catalog.stream=org.apache.iceberg.spark.SparkCatalog \
+                    --conf spark.sql.catalog.stream.type=rest \
+                    --conf spark.sql.catalog.stream.uri=http://polaris:8181/api/catalog \
+                    --conf spark.sql.catalog.stream.warehouse=growlerdb \
+                    --conf spark.sql.catalog.stream.credential=root:s3cr3t \
+                    --conf spark.sql.catalog.stream.scope=PRINCIPAL_ROLE:ALL \
+                    --conf spark.sql.catalog.stream.io-impl=org.apache.iceberg.aws.s3.S3FileIO \
+                    --conf spark.sql.catalog.stream.s3.endpoint=http://minio:9000 \
+                    --conf spark.sql.catalog.stream.s3.path-style-access=true \
+                    --conf spark.sql.catalog.stream.rest-metrics-reporting-enabled=false \
+                    --conf spark.hadoop.fs.s3.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
+                    --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
+                    --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000 \
+                    --conf spark.hadoop.fs.s3a.access.key=minioadmin \
+                    --conf spark.hadoop.fs.s3a.secret.key=minioadmin \
+                    --conf spark.hadoop.fs.s3a.path.style.access=true \
+                    --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \
+                    -e "
+                      CALL stream.system.rewrite_data_files(table => 'growlerdb.http_logs', strategy => 'sort', sort_order => 'ts ASC NULLS LAST, request_id ASC NULLS LAST', options => map('min-input-files','2','target-file-size-bytes','134217728','partial-progress.enabled','true','partial-progress.max-commits','10'));
+                      CALL stream.system.rewrite_manifests('growlerdb.http_logs');
+                      CALL stream.system.expire_snapshots(table => 'growlerdb.http_logs', older_than => TIMESTAMP '${EXPIRE_TS}', retain_last => ${RETAIN_LAST});
+                      CALL stream.system.remove_orphan_files(table => 'growlerdb.http_logs', older_than => TIMESTAMP '${ORPHAN_TS}');
+                    "
+              resources:
+                requests: { cpu: 500m, memory: 1Gi }
+                limits: { cpu: "2", memory: 3Gi }   # headroom for expire over a large snapshot backlog

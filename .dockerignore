@@ -1,0 +1,10 @@
+# Keep the Docker build context small + the image build hermetic.
+target/
+connector/target/
+clients/**/target/
+.git/
+**/*.md
+deploy/compose/seed/
+# UI is built inside the image (node stage); don't ship the local deps/output.
+**/node_modules
+ui/dist

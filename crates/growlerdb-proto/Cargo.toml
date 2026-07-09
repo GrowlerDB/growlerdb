@@ -1,0 +1,24 @@
+[package]
+name = "growlerdb-proto"
+description = "GrowlerDB gRPC wire schema (growlerdb.v1) — generated types + the growlerdb-core bridge."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+growlerdb-core.workspace = true
+thiserror.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+prost.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true
+# A vendored protoc so the build never needs a system protoc (cross containers ship an ancient
+# proto2-only one; CI/local vary). Used by build.rs when PROTOC isn't explicitly set.
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }

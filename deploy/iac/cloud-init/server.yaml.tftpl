@@ -1,0 +1,28 @@
+#cloud-config
+# Bootstraps the k3s server (control plane). Traefik is left enabled (k3s default) so the gateway
+# Ingress in values-hetzner works. Token + private IP are injected by Terraform.
+runcmd:
+  - |
+    # Bring the private NIC up + lease its IP before starting k3s (Hetzner attaches the private network
+    # shortly after boot; starting k3s first pins the wrong node IP). ACTIVELY bring the link up + DHCP
+    # with retries and a bounded, loud-failing deadline rather than passively polling, so a boot-timing
+    # straggler self-heals instead of hanging cloud-init forever (task-221).
+    NIC=enp7s0
+    deadline=$(( $(date +%s) + 300 ))
+    until ip -4 addr show "$NIC" 2>/dev/null | grep -q "${private_ip}"; do
+      if [ "$(date +%s)" -ge "$deadline" ]; then
+        echo "FATAL: private NIC $NIC never got ${private_ip} after 300s — aborting k3s server start" >&2
+        exit 1
+      fi
+      echo "bringing up $NIC + requesting DHCP (waiting for private IP ${private_ip})"
+      ip link set "$NIC" up 2>/dev/null || true
+      dhcpcd -4 "$NIC" 2>/dev/null || dhclient -4 "$NIC" 2>/dev/null || true
+      sleep 3
+    done
+    # Public IP so the kubeconfig/API cert is valid when reached over the internet.
+    PUB=$(curl -s http://169.254.169.254/hetzner/v1/metadata/public-ipv4)
+    curl -sfL https://get.k3s.io | \
+      INSTALL_K3S_CHANNEL="${k3s_channel}" \
+      K3S_TOKEN="${k3s_token}" \
+      INSTALL_K3S_EXEC="server --node-ip ${private_ip} --advertise-address ${private_ip} --flannel-iface enp7s0 --tls-san ${private_ip} --tls-san $PUB" \
+      sh -

@@ -1,0 +1,9 @@
+# Never commit state (may contain the k3s token), real tfvars, provider plugins, or the pulled kubeconfig.
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+terraform.tfvars
+*.auto.tfvars
+kubeconfig.yaml
+crash.log

@@ -1,0 +1,12 @@
+[package]
+name = "growlerdb-client"
+description = "First-party Rust client for the GrowlerDB Engine API (growlerdb.v1)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+growlerdb-proto.workspace = true
+tonic.workspace = true
+thiserror.workspace = true

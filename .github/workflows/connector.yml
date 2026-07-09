@@ -1,0 +1,44 @@
+name: connector
+
+# The JVM connector subprojects (Spark + Trino) — isolated from the Rust fast path: runs
+# only when a connector or the shared protos change.
+on:
+  push:
+    branches: [main]
+    paths: ["connector/**", "connector-trino/**", "crates/growlerdb-proto/proto/**", ".github/workflows/connector.yml"]
+  pull_request:
+    paths: ["connector/**", "connector-trino/**", "crates/growlerdb-proto/proto/**", ".github/workflows/connector.yml"]
+
+concurrency:
+  group: connector-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v4
+      - name: Cache Maven repository
+        uses: actions/cache@v5
+        with:
+          path: ~/.m2/repository
+          key: m2-${{ hashFiles('connector/pom.xml') }}
+          restore-keys: m2-
+      # Surface disk headroom — the self-hosted runners are space-constrained (see ci.yml).
+      - name: Disk free
+        run: df -h / "$HOME" "$RUNNER_TEMP" || true
+      # JDK 21 + Maven both come from mise (mise.toml), so this doesn't depend on the
+      # self-hosted runner shipping a system `mvn` (it doesn't).
+      - name: Build + test (Spark connector, JDK 21)
+        working-directory: connector
+        run: |
+          mise install
+          mise exec -- mvn -B -q verify
+      # The Trino connector is a separate module on JDK 23 (Trino 470's SPI bytecode) — its own
+      # mise.toml provisions the newer JDK, so `mise install` here picks it up independently.
+      - name: Build + test (Trino connector, JDK 23)
+        working-directory: connector-trino
+        run: |
+          mise install
+          mise exec -- mvn -B -q verify

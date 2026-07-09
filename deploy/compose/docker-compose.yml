@@ -1,0 +1,445 @@
+name: growlerdb-dev
+
+# Local dev/test dependencies for GrowlerDB: object storage (MinIO) + Iceberg REST
+# catalog (Apache Polaris). A seeded sample table is created by the `seed` profile.
+#
+# The `stack` profile additionally runs **GrowlerDB itself** (control-plane + node +
+# gateway) and a full **LGTM** observability stack — a single-host alternative to the
+# Kubernetes deployment, and the environment integration tests run against. See README.md.
+
+# --- shared bits for the GrowlerDB services (built from one image, one env block) -----
+x-growlerdb-image: &growlerdb-image
+  image: growlerdb-local:dev
+  build:
+    context: ../..
+    dockerfile: deploy/Dockerfile
+  # Self-heal (task-115): a crashed/OOM-killed control-plane, node, or gateway restarts instead of
+  # staying down — the Compose analogue of the k8s pods' implicit always-restart + liveness probes.
+  restart: unless-stopped
+
+x-growlerdb-env: &growlerdb-env
+  # Point the binary at the in-network Polaris + MinIO (overrides IcebergConfig defaults).
+  GROWLERDB_CATALOG_URI: http://polaris:8181/api/catalog
+  GROWLERDB_WAREHOUSE: growlerdb
+  GROWLERDB_CATALOG_CREDENTIAL: root:s3cr3t
+  GROWLERDB_S3_ENDPOINT: http://minio:9000
+  # Export traces (OTLP/HTTP) to the LGTM collector.
+  GROWLERDB_OTLP_ENDPOINT: http://lgtm:4318
+
+services:
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped   # object store self-heals (task-115)
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  createbuckets:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb -p local/growlerdb-warehouse &&
+      echo 'buckets ready'
+      "
+
+  # Iceberg REST catalog. Image/env are version-sensitive; verify on first bring-up.
+  # Persistent metastore for Polaris (relational-jdbc → Postgres). Without it Polaris keeps the
+  # catalog IN MEMORY and forgets every table on restart — which silently orphans the node's index
+  # (the index keeps doc keys from the dropped table → hydration "row not found"; see task-114).
+  # A volume-backed Postgres lets the catalog survive an accidental Polaris bounce.
+  polaris-db:
+    image: postgres:17-alpine
+    restart: unless-stopped   # catalog metastore self-heals (task-115)
+    environment:
+      POSTGRES_USER: polaris
+      POSTGRES_PASSWORD: polaris
+      POSTGRES_DB: polaris
+    volumes:
+      - polaris-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U polaris -d polaris"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # One-shot: bootstrap the POLARIS realm + root principal into the Postgres metastore, and must
+  # complete before the server serves. Compose re-runs one-shots on every `up`, and the admin tool
+  # errors (non-zero) when the metastore is already bootstrapped — so wrap it to treat that case as
+  # a no-op success, keeping restarts idempotent. (`$$` escapes `$` from compose interpolation.)
+  polaris-bootstrap:
+    image: apache/polaris-admin-tool:latest
+    depends_on:
+      polaris-db:
+        condition: service_healthy
+    environment:
+      polaris.persistence.type: relational-jdbc
+      quarkus.datasource.db-kind: postgresql
+      quarkus.datasource.username: polaris
+      quarkus.datasource.password: polaris
+      quarkus.datasource.jdbc.url: jdbc:postgresql://polaris-db:5432/polaris
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        out=$$(java -jar /deployments/polaris-admin-tool.jar bootstrap -r POLARIS -c POLARIS,root,s3cr3t 2>&1);
+        echo "$$out";
+        echo "$$out" | grep -q "already been bootstrapped" && { echo "realm already bootstrapped - ok"; exit 0; };
+        echo "$$out" | grep -q "Bootstrap completed successfully" && exit 0;
+        exit 1
+
+  polaris:
+    image: apache/polaris:latest
+    restart: unless-stopped   # catalog server self-heals; recovers automatically when it returns (task-115)
+    depends_on:
+      createbuckets:
+        condition: service_completed_successfully
+      polaris-db:
+        condition: service_healthy
+      polaris-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ENDPOINT_URL_S3: http://minio:9000
+      # Persistent relational-jdbc metastore (Postgres) — the catalog survives restarts, so a
+      # Polaris bounce no longer wipes the demo and orphans the index. Realm is bootstrapped into
+      # the DB by the polaris-bootstrap one-shot above.
+      polaris.persistence.type: relational-jdbc
+      quarkus.datasource.db-kind: postgresql
+      quarkus.datasource.username: polaris
+      quarkus.datasource.password: polaris
+      quarkus.datasource.jdbc.url: jdbc:postgresql://polaris-db:5432/polaris
+    ports:
+      - "8181:8181"   # Iceberg REST
+
+  # task-63: changelog read in Spark **local mode** against a temp Iceberg table
+  # (Hadoop catalog) — self-contained, no MinIO/Polaris. Runs the prebuilt fat jar
+  # (`cd connector && mise exec -- mvn package`) via spark-submit; the app creates a
+  # table, applies INSERT/UPDATE/DELETE, reads the changelog, and exits non-zero on
+  # mismatch — so `--exit-code-from spark` gives pass/fail. Enable with: --profile spark
+  spark:
+    profiles: ["spark"]
+    image: apache/spark:4.0.0
+    volumes:
+      - ../../connector/target/growlerdb-connector-0.0.0.jar:/opt/growlerdb/connector.jar:ro
+    entrypoint: ["/opt/spark/bin/spark-submit"]
+    command:
+      - --master
+      - "local[2]"
+      # Iceberg Spark runtime (the `provided` dep) — fetched into a writable ivy cache.
+      - --conf
+      - spark.jars.ivy=/tmp/.ivy2
+      - --packages
+      - org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.10.0
+      - --class
+      - io.growlerdb.connector.ChangelogReadApp
+      - /opt/growlerdb/connector.jar
+
+  # Creates the sample `growlerdb.docs` Iceberg table. Enable with: --profile seed
+  seed:
+    profiles: ["seed"]
+    build: ./seed
+    depends_on:
+      - polaris
+    environment:
+      POLARIS_URI: http://polaris:8181/api/catalog
+      POLARIS_CATALOG: growlerdb
+      POLARIS_CREDENTIAL: root:s3cr3t
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ENDPOINT_URL_S3: http://minio:9000
+
+  # --- `stack` profile: GrowlerDB + LGTM (the deployable cluster) -------------------
+  # Bring up with `just stack` (deps + catalog + seed must come first; the recipe
+  # sequences them). All three GrowlerDB services share one image + env (anchors above).
+
+  # Full LGTM observability stack in one image: Grafana (:3000) + OTLP receiver
+  # (:4317 gRPC / :4318 HTTP) → Loki / Tempo / Mimir(Prometheus). GrowlerDB ships OTLP here.
+  lgtm:
+    profiles: ["stack"]
+    image: grafana/otel-lgtm:latest
+    restart: unless-stopped   # observability stack self-heals (task-115)
+    ports:
+      - "3000:3000"   # Grafana UI (anonymous admin in this dev image)
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    volumes:
+      # Scrape GrowlerDB's /metrics into the bundled Prometheus, and pre-wire the SLI dashboard.
+      - ./lgtm/otelcol-config.yaml:/otel-lgtm/otelcol-config.yaml:ro
+      - ./lgtm/grafana-provider.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/growlerdb.yaml:ro
+      - ./lgtm/dashboards:/otel-lgtm/growlerdb-dashboards:ro
+      # Evaluate GrowlerDB SLI alerting rules server-side (task-111); fired alerts → /api/v1/alerts.
+      - ./lgtm/prometheus.yaml:/otel-lgtm/prometheus.yaml:ro
+      - ./lgtm/growlerdb-alert-rules.yml:/otel-lgtm/growlerdb-alert-rules.yml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # Host CPU / memory / disk for the Observability "Runtime" panels (task-208.3). Mounts the host
+  # /proc, /sys, and rootfs read-only so it reports real host metrics; the collector scrapes it into
+  # the bundled Prometheus alongside the GrowlerDB /metrics. Without it the Runtime CPU/mem/disk
+  # cards show a "needs the metrics stack" state.
+  node-exporter:
+    profiles: ["stack"]
+    image: prom/node-exporter:v1.8.2
+    restart: unless-stopped   # host-metrics exporter self-heals (task-115)
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/rootfs"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+
+  # Control Plane: the cluster index registry (gRPC :50071), health/metrics on :9101.
+  controlplane:
+    profiles: ["stack"]
+    <<: *growlerdb-image
+    command: ["control-plane", "--addr", "0.0.0.0:50071", "--metrics-addr", "0.0.0.0:9101"]
+    environment:
+      <<: *growlerdb-env
+    depends_on:
+      polaris:
+        condition: service_started
+    ports:
+      - "50071:50071"
+      - "9101:9101"
+    volumes:
+      - cp-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9101/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # Node: build the `docs` index from the seeded Iceberg table, then serve it (gRPC :50051,
+  # REST :8080), health/metrics on :9102. The `just stack` recipe seeds the table first.
+  # `--register` announces the served index to the control-plane registry (at its routable
+  # `--advertise-addr`), so it shows up in the Indexes + Ingestion screens (task-49).
+  node:
+    profiles: ["stack"]
+    <<: *growlerdb-image
+    entrypoint: ["/bin/sh", "-c"]
+    # Serves the seeded `docs` table. The streaming demo (`just pipeline`) layers
+    # pipeline.override.yml on top to serve `telemetry_stream` instead — see that file.
+    command:
+      - >
+        growlerdb index growlerdb.docs --name docs &&
+        growlerdb serve docs --addr 0.0.0.0:50051 --rest-addr 0.0.0.0:8080 --metrics-addr 0.0.0.0:9102
+        --register http://controlplane:50071 --advertise-addr http://node:50051
+    environment:
+      <<: *growlerdb-env
+    depends_on:
+      polaris:
+        condition: service_started
+      controlplane:
+        condition: service_healthy
+    ports:
+      - "50051:50051"
+      - "9102:9102"
+    volumes:
+      - node-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9102/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+
+  # Gateway: the public Engine API (gRPC :50061 + REST :8080→host 8081), fronting the node.
+  # health/metrics on :9103. This is the address clients hit.
+  gateway:
+    profiles: ["stack"]
+    <<: *growlerdb-image
+    command:
+      - "gateway"
+      - "--node-addr"
+      - "http://node:50051"
+      - "--addr"
+      - "0.0.0.0:50061"
+      - "--rest-addr"
+      - "0.0.0.0:8080"
+      - "--metrics-addr"
+      - "0.0.0.0:9103"
+      # Serve the console + back its Indexes / Observability screens (tasks 45-48).
+      - "--ui-dir"
+      - "/usr/share/growlerdb/ui"
+      - "--control-plane"
+      - "http://controlplane:50071"
+      - "--prometheus"
+      - "http://lgtm:9090"
+      # Optional OpenSearch-compatible `_search` adapter (task-50) — `<index>/_search`.
+      - "--opensearch"
+    environment:
+      <<: *growlerdb-env
+    depends_on:
+      node:
+        condition: service_healthy
+      controlplane:
+        condition: service_healthy
+    ports:
+      - "50061:50061"
+      - "8081:8080"   # REST Engine API + console (host 8081 to avoid the node's 8080)
+      - "9103:9103"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9103/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # ---- Streaming demo (profile `pipeline`, run via `just pipeline`) -------------------
+  # generator → Redpanda → sink → Iceberg → Spark connector → GrowlerDB index. Watch it land:
+  # ingest rate in Grafana (rate(growlerdb_ingested_docs_total)) + lag in the console Ingestion
+  # screen (source head − committed). See pipeline/README.md.
+
+  # Kafka-compatible broker (single binary, no ZooKeeper) — the stream transport.
+  redpanda:
+    profiles: ["pipeline"]
+    image: redpandadata/redpanda:latest
+    restart: unless-stopped   # stream broker self-heals (task-115)
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # Stage 1: synthesize IoT readings → Redpanda topic `telemetry`. Tune RATE (readings/sec).
+  generator:
+    profiles: ["pipeline"]
+    restart: on-failure
+    build: ./pipeline
+    command: ["python", "generator.py"]
+    environment:
+      KAFKA_BROKER: redpanda:9092
+      TOPIC: telemetry
+      RATE: "50"            # readings/sec — plenty to see the flow; raise for a heavier load
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  # Stage 2: Redpanda topic → micro-batch append into Iceberg `growlerdb.telemetry_stream`.
+  sink:
+    profiles: ["pipeline"]
+    restart: on-failure
+    build: ./pipeline
+    command: ["python", "sink.py"]
+    environment:
+      KAFKA_BROKER: redpanda:9092
+      TOPIC: telemetry
+      ICEBERG_TABLE: growlerdb.telemetry_stream
+      POLARIS_URI: http://polaris:8181/api/catalog
+      POLARIS_CATALOG: growlerdb
+      POLARIS_CREDENTIAL: root:s3cr3t
+      AWS_ENDPOINT_URL_S3: http://minio:9000
+      BATCH_SIZE: "500"
+      FLUSH_SECS: "5"       # fewer, larger Iceberg files → less small-file churn on MinIO
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      polaris:
+        condition: service_started
+
+  # Stage 3: Spark Structured Streaming — read the Iceberg changelog, write DocOps to the node's
+  # WriteService (resumes exactly-once from the node's committed checkpoint). Needs the connector
+  # fat jar built first: `cd connector && mvn -q -DskipTests package` (done by `just pipeline`).
+  connector:
+    profiles: ["pipeline"]
+    # The connector is a spark-submit job that exits if its streaming query errors. Auto-restart so
+    # a transient failure self-heals: on restart it re-reads the Node's committed checkpoint and
+    # resumes exactly-once, instead of leaving ingestion frozen while the source keeps growing.
+    restart: on-failure
+    image: apache/spark:4.0.0
+    volumes:
+      - ../../connector/target/growlerdb-connector-0.0.0.jar:/opt/growlerdb/connector.jar:ro
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+    entrypoint: ["/opt/spark/bin/spark-submit"]
+    command:
+      - --master
+      - "local[2]"
+      - --conf
+      - spark.jars.ivy=/tmp/.ivy2
+      - --packages
+      - org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.10.0,org.apache.iceberg:iceberg-aws-bundle:1.10.0
+      # Polaris REST catalog `stream` → MinIO via S3FileIO (own creds; no STS delegation).
+      - --conf
+      - spark.sql.catalog.stream=org.apache.iceberg.spark.SparkCatalog
+      - --conf
+      - spark.sql.catalog.stream.type=rest
+      # Don't cache table metadata: the long-running stream must see each new append's snapshot, or
+      # every trigger reads a stale "current snapshot" and finds nothing to commit.
+      - --conf
+      - spark.sql.catalog.stream.cache-enabled=false
+      - --conf
+      - spark.sql.catalog.stream.uri=http://polaris:8181/api/catalog
+      - --conf
+      - spark.sql.catalog.stream.warehouse=growlerdb
+      - --conf
+      - spark.sql.catalog.stream.credential=root:s3cr3t
+      - --conf
+      - spark.sql.catalog.stream.scope=PRINCIPAL_ROLE:ALL
+      - --conf
+      - spark.sql.catalog.stream.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+      - --conf
+      - spark.sql.catalog.stream.s3.endpoint=http://minio:9000
+      - --conf
+      - spark.sql.catalog.stream.s3.path-style-access=true
+      - --class
+      - io.growlerdb.connector.ConnectorApp
+      - /opt/growlerdb/connector.jar
+      # ConnectorApp args: stream the changelog into the node's WriteService.
+      - --catalog
+      - stream
+      - --table
+      - growlerdb.telemetry_stream
+      - --identifier
+      - id
+      - --fields
+      - id,ts,device_id,site,subsystem,metric,status,reading,message
+      - --node
+      - node:50051
+      - --control-plane
+      - controlplane:50071
+      - --index
+      - telemetry_stream
+      - --stream
+    depends_on:
+      node:
+        condition: service_healthy
+      sink:
+        condition: service_started
+
+volumes:
+  minio-data:
+  cp-data:
+  node-data:
+  polaris-db:
+  spark-ivy:

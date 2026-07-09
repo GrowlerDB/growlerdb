@@ -1,0 +1,225 @@
+# Default values for the GrowlerDB chart. Override with `-f my-values.yaml` or `--set`.
+# The cluster topology is Design 14: control-plane (registry) + node StatefulSet (searchers on
+# local PVs) + gateway Deployment (query routing + console UI).
+
+# -- The GrowlerDB image (built from deploy/Dockerfile — there is no public image yet, so build
+#    and push it to a registry you control, then point `image.repository` at it).
+image:
+  repository: growlerdb
+  tag: "" # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# Pod-level security context applied to every component (the image runs as uid 10001 already).
+podSecurityContext:
+  fsGroup: 10001
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+
+commonLabels: {}
+commonAnnotations: {}
+
+# ---- Iceberg source (the lakehouse GrowlerDB indexes) ----------------------------------------
+# Non-secret connection config goes in a ConfigMap; credentials go in a Secret (see `credentials`).
+iceberg:
+  catalogUri: "http://polaris:8181/api/catalog"
+  warehouse: "growlerdb"
+  catalogScope: ""
+  s3Endpoint: "http://minio:9000"
+  s3Region: "us-east-1"
+
+# Object-store + catalog credentials. Set these at install time (`--set`) or, preferably, point
+# `existingSecret` at a Secret you manage out-of-band (it must define the same keys). Defaults are
+# intentionally empty so a chart install never ships baked-in credentials; supply your own.
+credentials:
+  existingSecret: ""
+  catalogCredential: "" # Polaris client-id:secret, e.g. "client:secret"
+  s3AccessKey: ""
+  s3SecretKey: ""
+
+# ---- The index the nodes build + serve -------------------------------------------------------
+# The index is partitioned into `shards` ordinals (task-77 virtual-bucket sharding). The node
+# StatefulSet runs **one pod per shard** (pod-K builds + serves ordinal K from the source, on its own
+# PV), self-registers at its stable pod DNS, and the gateway reads the shard map from the live
+# control-plane (task-117) and fronts each shard's primary. `shards: 1` = a single-shard index.
+# NOTE: one primary pod per shard (write-correct for streaming). Zero-downtime per-shard *replicas*
+# are a follow-up — `serve --replica` segment-shipping is single-shard only, and a Service-fronted
+# replica set would diverge under streaming writes. HA today = shards spread across hosts + PDBs +
+# fast StatefulSet self-heal from the PV (a lost shard serves honest partial results until it recovers).
+index:
+  name: "docs"
+  sourceTable: "growlerdb.docs"
+  shards: 1
+  # Windowed topology (task-219): when true, the node StatefulSet serves a TIME-WINDOWED index —
+  # nodes start empty and serve control-plane-assigned windows (no `--shards`/`--shard-ordinal`), the
+  # connector streams each row to its window's owning node, and the gateway hot-reloads windows. The
+  # chart can't parse `definition`, so set this explicitly for a windowed workload. `shards` is then
+  # the node-pool size (placement targets), not a hash-shard count. Default false = hash sharding.
+  windowed: false
+  # By default the node AUTO-MAPS the Iceberg schema (every column, inferred type). That can't infer
+  # types the source doesn't carry — e.g. an `IP` field for CIDR queries, or `fast` fields required
+  # by sort/range. Set `definition` to a VERBATIM GrowlerDB index definition (the index.yaml format —
+  # name/source/key/mapping/windowing) to build from an explicit def instead (mounted as a ConfigMap,
+  # passed as `--def`); empty = auto-map. Pass a file with `--set-file index.definition=path/to/index.yaml`
+  # (task-214: deploy/k8s/scale-up.sh derives it from the workload). Its `name`/`source.iceberg.table`
+  # must agree with index.name / index.sourceTable above (those drive the StatefulSet/CLI args).
+  definition: ""
+
+# ---- Reconcile backstop (task-195) -----------------------------------------------------------
+# A scheduled drift reconcile: fan a shard-scoped `ReconcileIndex` out to every shard's node — the
+# systematic detector/repairer for silently lost/orphaned rows regardless of cause (the general-case
+# complement to the ingest-path guards, D31). Each node compares only the keys it owns, so it can't
+# pull another shard's keys into it. Emits `growlerdb_drift_stale_total` / `_missing_total`; alert on
+# a nonzero repair rate. Opt-in — enable once the index is populated and steadily ingesting.
+reconcile:
+  enabled: false
+  # Force a full row-level sweep (--full), bypassing the count-gate (task-198). Leave false for the
+  # cheap count-gated run; set true on a SEPARATE, less-frequent release/CronJob for the periodic deep
+  # sweep that catches drift equal counts can hide (compensating stale+missing, dup PKs, dropped
+  # partitions).
+  full: false
+  schedule: "23 * * * *"          # hourly, offset off the top of the hour (and off maintenance's :17)
+  concurrencyPolicy: Forbid       # never overlap two reconcile runs
+  activeDeadlineSeconds: 900      # a run must finish within 15m or it's killed
+  backoffLimit: 1
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: "1", memory: 512Mi }
+
+# ---- Observability (task-39/40) --------------------------------------------------------------
+# Every component serves Prometheus `/metrics` + `/healthz` + `/readyz` on its metrics port. Set an
+# OTLP collector base URL to also export traces (the binary reads `GROWLERDB_OTLP_ENDPOINT`); e.g. a
+# Grafana Alloy / OTel-LGTM receiver at `http://lgtm:4318`. Empty = metrics only, no trace export.
+observability:
+  otlpEndpoint: ""
+  # Grafana base URL the console's "Open in Grafana" link points at. Served to the SPA at runtime
+  # via /v1/config, so it reflects THIS deployment. Leave empty to hide the link (the console never
+  # falls back to a localhost default). e.g. http://grafana.monitoring or a NodePort/ingress URL.
+  grafanaUrl: ""
+
+# A Prometheus-Operator ServiceMonitor per component so kube-prometheus-stack scrapes the metrics
+# ports. Requires the `monitoring.coreos.com/v1` CRD on the cluster (enable only when present).
+metrics:
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {} # extra labels for the operator's `serviceMonitorSelector` (e.g. release: kube-prom)
+
+# ---- Control plane: the cluster index registry (gRPC) ----------------------------------------
+controlPlane:
+  replicas: 1 # the registry is single-writer; HA is a later milestone
+  grpcPort: 50071
+  metricsPort: 9101
+  persistence:
+    enabled: true
+    storageClass: ""
+    size: 1Gi
+    accessModes: ["ReadWriteOnce"]
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: "1", memory: 256Mi }
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# ---- Node: stateful searcher/index on a local PV ---------------------------------------------
+# The StatefulSet runs one pod per shard: replicas = `index.shards`, and pod-K serves ordinal K.
+node:
+  grpcPort: 50051
+  restPort: 8080
+  metricsPort: 9102
+  # Background maintenance cadences, in seconds (0 disables) — deploy config, not hidden binary
+  # defaults (task-214). `compactIntervalSecs` drives the auto-compaction tick: segments fuse /
+  # deletes purge when the CompactionPolicy thresholds trip, and the per-shard gauges
+  # (growlerdb_index_bytes[_component], growlerdb_index_docs, growlerdb_segments_live,
+  # growlerdb_index_deleted_docs — task-218) refresh on this tick, so it is also the metrics
+  # sampling cadence. `remapIntervalSecs` drives the D30 locator re-map poll after Iceberg
+  # compaction rewrites source files.
+  compactIntervalSecs: 60
+  remapIntervalSecs: 45
+  persistence:
+    enabled: true
+    # Local-NVMe is the intended class for the index store (Design 04/14). Set to your cluster's
+    # local/NVMe StorageClass; empty uses the cluster default.
+    storageClass: ""
+    size: 20Gi
+    accessModes: ["ReadWriteOnce"]
+  # Rebuild from the source on first boot only (the PV persists the built index across restarts).
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: "2", memory: 4Gi }
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  # Spread replicas across cluster nodes so a node loss doesn't take the whole shard.
+  spreadReplicas: true
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# ---- Gateway: public Engine API + console UI -------------------------------------------------
+gateway:
+  replicas: 2
+  grpcPort: 50061
+  restPort: 8080 # REST Engine API + the console UI, behind the Service
+  metricsPort: 9103
+  # Seconds between control-plane topology polls (task-77/117): the gateway reads the index's shard
+  # map from the live control-plane and hot-reloads on change (reshard cutover / a shard's primary
+  # moving) with no restart. 0 disables polling (topology fixed at startup).
+  reloadSecs: 15
+  # Serve the bundled console UI (the image ships it at /usr/share/growlerdb/ui).
+  ui:
+    enabled: true
+    dir: /usr/share/growlerdb/ui
+  # Optional Prometheus base URL — when set, the gateway proxies /v1/stats/* for the UI's SLI panels.
+  prometheusUrl: ""
+  # Authentication (task-35/36). The gateway is **open** unless an OIDC issuer is set: with it, the
+  # gateway validates `Authorization: Bearer` JWTs against the issuer's JWKS and enforces RBAC from
+  # the verified claims. Strongly recommended for any internet-reachable (e.g. Ingress) deployment.
+  auth:
+    oidc:
+      issuer: "" # e.g. https://keycloak.example/realms/growlerdb — empty = no auth (open)
+      audience: "" # expected `aud` claim (required when issuer is set)
+  # Expose the OpenSearch-compatible `_search` read adapter (task-50). Off by default.
+  opensearch: false
+  service:
+    type: ClusterIP
+    annotations: {}
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    hosts:
+      - host: growlerdb.local
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 75
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: "1", memory: 512Mi }
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}

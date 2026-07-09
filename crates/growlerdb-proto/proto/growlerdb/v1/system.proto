@@ -1,0 +1,32 @@
+// GrowlerDB wire schema — system service (health + version). Proves the gRPC
+// toolchain end to end; real services (Write, Engine API) add their own protos.
+syntax = "proto3";
+
+package growlerdb.v1;
+
+option java_multiple_files = true;
+option java_package = "io.growlerdb.proto.v1";
+
+service System {
+  // Liveness/readiness probe.
+  rpc Health(HealthRequest) returns (HealthResponse);
+  // Build/version info.
+  rpc Version(VersionRequest) returns (VersionResponse);
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  enum Status {
+    UNKNOWN = 0;
+    SERVING = 1;
+    NOT_SERVING = 2;
+  }
+  Status status = 1;
+}
+
+message VersionRequest {}
+
+message VersionResponse {
+  string version = 1;
+}
