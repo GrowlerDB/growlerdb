@@ -254,3 +254,31 @@ jobs:
       - name: OKF conformance
         run: |
           ./okf/check.sh
+
+  # Single required status check for branch protection. Succeeds iff every CI job that RAN passed —
+  # path-filtered jobs (build-test / license-audit / ui / e2e) are `skipped` on unrelated PRs, and
+  # skipped is fine, so a docs-only PR isn't deadlocked while a code PR still requires build-test/e2e.
+  ci-gate:
+    needs: [changes, build-test, license-audit, ui, e2e, lint]
+    if: ${{ always() }}
+    runs-on: self-hosted
+    steps:
+      - name: Require no CI job failed or was cancelled
+        run: |
+          set -euo pipefail
+          for r in \
+            "${{ needs.changes.result }}" \
+            "${{ needs.build-test.result }}" \
+            "${{ needs.license-audit.result }}" \
+            "${{ needs.ui.result }}" \
+            "${{ needs.e2e.result }}" \
+            "${{ needs.lint.result }}"; do
+            echo "result: $r"
+            case "$r" in
+              failure | cancelled)
+                echo "::error::a required CI job did not succeed"
+                exit 1
+                ;;
+            esac
+          done
+          echo "all CI jobs succeeded or were skipped"
