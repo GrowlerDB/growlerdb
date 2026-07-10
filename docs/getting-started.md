@@ -78,6 +78,8 @@ baked-in demo credential:
 | Username | `demo` |
 | Password | `demo` |
 
+![GrowlerDB console — the closed-mode sign-in gate shown before authentication; sign in with the demo credential](img/console-login.png)
+
 The `demo` user has the **reader + operator** roles (query + read index metadata; it can't create,
 drop, or ingest) and is **scoped to the `docs` and `catalog` indexes** — a token issued to it can only
 touch those two (per-index RBAC). Sign-in mints a short-lived session token the gateway validates on
@@ -136,10 +138,11 @@ GrowlerDB.
 
 ## 4. Explore in the console
 
-Open <http://localhost:8081>. Pick the **`docs`** index in the top-left selector, type a query, and
-hit **Search**:
+Open <http://localhost:8081>. Pick the **`catalog`** index in the top-left selector, type a query like
+`category:(guide OR reference)`, and hit **Search**. Each hit renders its **cached fields inline**
+(author, category, rating, title, views) — no drawer round-trip — with the matched terms highlighted:
 
-![GrowlerDB console — Search: body:search over the docs index returns two hits](img/console-search.png)
+![GrowlerDB console — Search: category:(guide OR reference) over the catalog index returns five hits, each showing cached fields inline with matched terms highlighted](img/console-search.png)
 
 > **Tip:** the top-left selector now switches between the **`docs`** and **`catalog`** indexes — pick
 > the one you want to query. In the console's Lucene box a bare word (`search`) queries that index's
