@@ -157,19 +157,18 @@ The **hits** column lists the exact `id`s expected against the seed data.
 | 2 | Default-field term (bare word → `body`) | `hydrate` | cat-02, cat-07 |
 | 3 | Phrase | `body:"system of record"` | cat-03 |
 | 4 | Keyword term (exact) | `category:reference` | cat-02, cat-05, cat-06 |
-| 5 | Set / OR group | `category:(guide OR reference)` | cat-01, cat-02, cat-05, cat-06, cat-10 |
+| 5 | Set / OR | `category:guide OR category:reference` | cat-01, cat-02, cat-05, cat-06, cat-10 |
 | 6 | Numeric range (LONG, open upper) | `views:[2000 TO *]` | cat-01, cat-02, cat-05, cat-10 |
 | 7 | Float range (DOUBLE, exclusive) | `rating:{4.5 TO 5.0}` | cat-01, cat-02, cat-07, cat-10 |
-| 8 | Date range (open upper) | `published:[2024-01-01 TO *]` | cat-01, cat-02, cat-04, cat-05, cat-09, cat-10 |
+| 8 | Date range (epoch-µs bounds) | `published:[1704067200000000 TO *]` | cat-01, cat-02, cat-04, cat-05, cat-09, cat-10 |
 | 9 | CIDR (IP field) | `server_ip:10.0.0.0/8` | cat-01, cat-02, cat-04, cat-06, cat-08, cat-10 |
 | 10 | Wildcard | `author:ca*` | cat-03, cat-07, cat-09 (author `carol`) |
 | 11 | Prefix (`category:ref*`) | `category:ref*` | cat-02, cat-05, cat-06 |
 | 12 | Fuzzy (edit distance 1) | `body:hydrat~1` | cat-02, cat-07 (matches `hydrate`) |
 | 13 | Boost (ranking only) | `body:search^2 OR body:iceberg` | cat-01, cat-02, cat-03, cat-07 (search-matching rows ranked higher) |
-| 14 | Bool field | `archived:true` | cat-03, cat-06, cat-08 |
-| 15 | NOT / `-` | `-archived:true` | the other 7: cat-01, cat-02, cat-04, cat-05, cat-07, cat-09, cat-10 |
-| 16 | Match-all | `*:*` | all 10 rows |
-| 17 | Regex (KEYWORD `id`) | `id:/cat-0[12]/` | cat-01, cat-02 |
+| 14 | NOT / `-` | `-category:reference` | the other 7: cat-01, cat-03, cat-04, cat-07, cat-08, cat-09, cat-10 |
+| 15 | Match-all | `*:*` | all 10 rows |
+| 16 | Regex (KEYWORD `id`) | `id:/cat-0[12]/` | cat-01, cat-02 |
 
 A few notes:
 
@@ -182,7 +181,11 @@ A few notes:
   cat-05, cat-07, cat-09. The IP field is explicit-only in the mapping (Iceberg has no IP type).
 - **#12 fuzzy / #13 boost.** Boost changes only the score, not the match set. Fuzzy `~1` allows one
   edit; `hydrat~1` still reaches `hydrate`.
-- **#15 NOT.** `-archived:true` and `NOT archived:true` are equivalent; both equal `archived:false`.
+- **#8 dates.** `published` is stored as canonical epoch-**microseconds**, so range bounds are micros
+  (`2024-01-01` = `1704067200000000`). Human-readable date bounds, and querying the `archived` **BOOL**
+  field, are known gaps (tracked in task-247) — the `archived` field is stored but not yet Lucene-queryable.
+- **#14 NOT.** `-category:reference` and `NOT category:reference` are equivalent — every doc except
+  the three `reference` ones.
 
 ### KQL
 
@@ -194,8 +197,8 @@ curl -s localhost:8081/v1/search -H 'content-type: application/json' \
   -d '{"index":"catalog","syntax":"kql","query":"category:guide or category:adr","limit":10}'
 ```
 
-→ cat-01, cat-09, cat-10 (same as the Lucene `category:(guide OR adr)`). Likewise
-`author:carol and not archived:true` → cat-07, cat-09.
+→ cat-01, cat-09, cat-10 (same as the Lucene `category:guide OR category:adr`). Likewise
+`author:carol and not category:concept` → cat-09.
 
 ## 5. Use the OpenSearch adapter (optional)
 
