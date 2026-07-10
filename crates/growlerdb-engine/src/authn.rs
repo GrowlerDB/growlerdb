@@ -33,7 +33,7 @@ use serde_json::Value as JsonValue;
 use sha2::{Digest as _, Sha256};
 use tonic::{Code, Request, Status};
 
-use crate::auth::{PRINCIPAL_KEY, ROLES_KEY, TENANT_KEY};
+use crate::auth::{INDEXES_KEY, PRINCIPAL_KEY, ROLES_KEY, TENANT_KEY};
 
 /// The request metadata key the credential is read from (HTTP `Authorization` header).
 const AUTHORIZATION_KEY: &str = "authorization";
@@ -50,6 +50,9 @@ pub struct Verified {
     pub tenant: Option<String>,
     /// Coarse roles from the configured roles claim (drives control-plane RBAC in task-36).
     pub roles: Vec<String>,
+    /// The caller's **index allowlist** from the configured `indexes` claim (task-240 per-index RBAC).
+    /// When non-empty the caller may only operate on these indexes; empty = unrestricted (back-compat).
+    pub indexes: Vec<String>,
     /// Human display name from the OIDC `name` claim, if present (task-103, for `GET /v1/me`).
     pub display_name: Option<String>,
     /// Email from the OIDC `email` claim, if present (task-103).
@@ -110,6 +113,7 @@ impl Authenticator for Anonymous {
             principal: "anonymous".to_string(),
             tenant: None,
             roles: Vec::new(),
+            indexes: Vec::new(),
             display_name: None,
             email: None,
             issued_at: None,
@@ -145,10 +149,11 @@ pub fn authenticate<T>(authn: &SharedAuthn, request: &mut Request<T>) -> Result<
 
     let meta = request.metadata_mut();
     // Drop caller-asserted identity before stamping the verified one — a forged
-    // `x-growlerdb-principal`/`-roles` must never survive to the seam.
+    // `x-growlerdb-principal`/`-roles`/`-indexes` must never survive to the seam.
     meta.remove(PRINCIPAL_KEY);
     meta.remove(TENANT_KEY);
     meta.remove(ROLES_KEY);
+    meta.remove(INDEXES_KEY);
     let principal = verified.principal.parse().map_err(|_| {
         Status::unauthenticated("authenticated principal is not a valid identifier")
     })?;
@@ -169,6 +174,14 @@ pub fn authenticate<T>(authn: &SharedAuthn, request: &mut Request<T>) -> Result<
             .map_err(|_| Status::unauthenticated("a role claim is not a valid header value"))?;
         meta.insert(ROLES_KEY, value);
     }
+    // The index allowlist scopes per-index RBAC (task-240); carry it comma-separated like roles so the
+    // authorization seam restricts the caller to these indexes.
+    if !verified.indexes.is_empty() {
+        let value = verified.indexes.join(",").parse().map_err(|_| {
+            Status::unauthenticated("an index allowlist entry is not a valid header value")
+        })?;
+        meta.insert(INDEXES_KEY, value);
+    }
     Ok(verified)
 }
 
@@ -183,6 +196,7 @@ pub fn strip_identity<T>(request: &mut Request<T>) {
     meta.remove(PRINCIPAL_KEY);
     meta.remove(TENANT_KEY);
     meta.remove(ROLES_KEY);
+    meta.remove(INDEXES_KEY);
 }
 
 /// Map an [`AuthnError`] to a gRPC `Unauthenticated` status carrying the structured wire
@@ -206,6 +220,9 @@ pub struct ClaimMapping {
     /// Claim carrying roles — a JSON array of strings or a space-delimited string
     /// (default `"roles"`).
     pub roles: String,
+    /// Claim carrying the caller's **index allowlist** for per-index RBAC (task-240) — a JSON array
+    /// of strings or a space-delimited string (default `"indexes"`). Absent/empty = unrestricted.
+    pub indexes: String,
 }
 
 impl Default for ClaimMapping {
@@ -213,6 +230,7 @@ impl Default for ClaimMapping {
         Self {
             tenant: "tenant".to_string(),
             roles: "roles".to_string(),
+            indexes: "indexes".to_string(),
         }
     }
 }
@@ -292,6 +310,12 @@ fn decode_and_map(
         .get(&mapping.roles)
         .map(claim_roles)
         .unwrap_or_default();
+    // Per-index RBAC allowlist (task-240): same list shape as roles (JSON array or space-delimited).
+    let indexes = claims
+        .extra
+        .get(&mapping.indexes)
+        .map(claim_roles)
+        .unwrap_or_default();
     // Standard OIDC profile claims for the console's identity (task-103); absent on minimal tokens.
     let display_name = claims.extra.get("name").and_then(claim_string);
     let email = claims.extra.get("email").and_then(claim_string);
@@ -300,6 +324,7 @@ fn decode_and_map(
         principal,
         tenant,
         roles,
+        indexes,
         display_name,
         email,
         issued_at,
@@ -484,6 +509,9 @@ pub struct KeyIdentity {
     pub tenant: Option<String>,
     /// Roles the key carries.
     pub roles: Vec<String>,
+    /// The key's **index allowlist** for per-index RBAC (task-240). Non-empty = scoped to these
+    /// indexes; empty = unrestricted (back-compat).
+    pub indexes: Vec<String>,
 }
 
 /// An in-memory store of issued API keys for programmatic clients, presented as
@@ -546,6 +574,7 @@ impl Authenticator for ApiKeyStore {
             principal: identity.principal,
             tenant: identity.tenant,
             roles: identity.roles,
+            indexes: identity.indexes,
             display_name: None,
             email: None,
             issued_at: None,
@@ -766,6 +795,9 @@ impl Authenticator for RegistryTokenAuthenticator {
             principal: token.owner,
             tenant: None,
             roles: token.roles,
+            // Registry API tokens carry no index allowlist today (unrestricted across indexes); the
+            // per-index allowlist (task-240) is delivered via a JWT `indexes` claim or a KeyIdentity.
+            indexes: Vec::new(),
             display_name: Some(token.label),
             email: None,
             issued_at: None,
@@ -883,6 +915,7 @@ mod tests {
         let authn = authn().with_claim_mapping(ClaimMapping {
             tenant: "org".to_string(),
             roles: "scope".to_string(),
+            indexes: "indexes".to_string(),
         });
         let verified = authn.authenticate(Some(&bearer(&token))).unwrap();
         assert_eq!(verified.tenant.as_deref(), Some("globex"));
@@ -1135,6 +1168,7 @@ mod tests {
             principal: principal.to_string(),
             tenant: tenant.map(str::to_string),
             roles: roles.iter().map(|r| r.to_string()).collect(),
+            indexes: Vec::new(),
         }
     }
 

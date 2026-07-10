@@ -243,6 +243,10 @@ impl ControlPlaneService {
             principal: Some(principal).filter(|p| !p.is_empty()),
             tenant,
             roles,
+            // Control-plane ops authorize by role/scope, not a resolved target index (task-240): the
+            // per-index allowlist is enforced on the Gateway read/write path. Index-agnostic here.
+            index: None,
+            allowed_indexes: Vec::new(),
         };
         self.auth.authorize(&ctx).map_err(|denied| {
             to_status(

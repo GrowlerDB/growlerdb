@@ -22,6 +22,11 @@ pub(crate) const TENANT_KEY: &str = "x-growlerdb-tenant";
 /// [AuthN layer](crate::authn) stamps these from validated token/key claims; an
 /// [RBAC policy](crate::rbac) maps them to operation scopes.
 pub(crate) const ROLES_KEY: &str = "x-growlerdb-roles";
+/// Metadata key carrying the caller's **index allowlist** (comma-separated) for per-index RBAC
+/// (task-240). The [AuthN layer](crate::authn) stamps this from a validated token's `indexes` claim;
+/// when non-empty, an [RBAC policy](crate::rbac) restricts the caller to those indexes, so a token
+/// scoped to index A cannot read index B. Empty/absent = unrestricted across indexes (back-compat).
+pub(crate) const INDEXES_KEY: &str = "x-growlerdb-indexes";
 
 /// What an [`AuthHook`] inspects: the RPC method and the principal/tenant the
 /// transport extracted from request metadata. `tenant` is the seam future query
@@ -37,6 +42,16 @@ pub struct AuthContext {
     /// The caller's verified roles (empty if none) — what an [RBAC policy](crate::rbac)
     /// maps to operation scopes.
     pub roles: Vec<String>,
+    /// The **resolved target index** of the request, if the caller is index-scoped (task-240
+    /// multi-index RBAC). `Some` when the [`Gateway`](crate::gateway::Gateway) resolved the request's
+    /// `index` field to a served index before authorizing; `None` for index-agnostic calls (cluster
+    /// ops, or an un-routed call). A [per-index policy](crate::rbac) uses this to deny a token valid
+    /// for one index from reading another.
+    pub index: Option<String>,
+    /// The caller's **index allowlist** from the token's `indexes` claim (task-240). When non-empty
+    /// the caller may only operate on these indexes; empty = unrestricted (back-compat). Enforced by
+    /// an [RBAC policy](crate::rbac) against `index`.
+    pub allowed_indexes: Vec<String>,
 }
 
 /// A denial returned by an [`AuthHook`] — carries a human-readable reason surfaced to
@@ -86,10 +101,24 @@ pub fn default_auth() -> SharedAuth {
 
 /// Build the [`AuthContext`] for `method` from a request's metadata, then run `auth`.
 /// Maps a denial to a `PermissionDenied` status. Services call this at the top of each
-/// RPC, before consuming the request.
+/// RPC, before consuming the request. Index-agnostic (`ctx.index = None`); the
+/// [`Gateway`](crate::gateway::Gateway) uses [`authorize_index`] to carry the resolved target index.
 pub fn authorize<T>(
     auth: &SharedAuth,
     method: &'static str,
+    request: &Request<T>,
+) -> Result<(), Status> {
+    authorize_index(auth, method, None, request)
+}
+
+/// As [`authorize`], but carrying the request's **resolved target index** (task-240 per-index RBAC):
+/// the [`Gateway`](crate::gateway::Gateway) resolves a read/write's `index` field to a served index,
+/// then authorizes against it so a [per-index policy](crate::rbac) can deny a token scoped to one
+/// index from operating on another. `index = None` behaves exactly like [`authorize`].
+pub fn authorize_index<T>(
+    auth: &SharedAuth,
+    method: &'static str,
+    index: Option<&str>,
     request: &Request<T>,
 ) -> Result<(), Status> {
     let meta = request.metadata();
@@ -98,20 +127,26 @@ pub fn authorize<T>(
             .and_then(|v| v.to_str().ok())
             .map(str::to_string)
     };
-    let roles = get(ROLES_KEY)
-        .map(|s| {
-            s.split(',')
-                .map(str::trim)
-                .filter(|r| !r.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+    let split_csv = |key: &str| -> Vec<String> {
+        get(key)
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|r| !r.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let roles = split_csv(ROLES_KEY);
+    let allowed_indexes = split_csv(INDEXES_KEY);
     let ctx = AuthContext {
         method,
         principal: get(PRINCIPAL_KEY),
         tenant: get(TENANT_KEY),
         roles,
+        index: index.map(str::to_string),
+        allowed_indexes,
     };
     auth.authorize(&ctx).map_err(|denied| {
         to_status(

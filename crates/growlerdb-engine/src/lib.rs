@@ -43,7 +43,7 @@ pub use control_service::ControlPlaneService;
 pub use engine::{DriftReport, Engine, IndexOutcome, SearchOutcome, SyncOutcome};
 pub use error::EngineError;
 pub use fence::{ReindexFence, ReindexGuard};
-pub use gateway::Gateway;
+pub use gateway::{Gateway, IndexRoute, RouteResolver, WindowRouting};
 pub use hydrate::{apply_live_file_bitmap, get_by_key, resolve_locators};
 pub use lookup_service::LookupService;
 pub use node::{LocalNode, Node, RemoteNode};

@@ -433,6 +433,14 @@ async fn run_search(
 ) -> Response {
     let start = std::time::Instant::now();
     let body = body.map(|Json(b)| b).unwrap_or_default();
+    // OpenSearch `_all` (from `/_search`) means "no specific index": route to the endpoint's default
+    // index (task-240). An empty `index` field triggers the Gateway's default/sole-index resolution
+    // (a multi-index endpoint with no default answers `InvalidArgument`).
+    let index = if index == "_all" {
+        String::new()
+    } else {
+        index
+    };
 
     // Translate the DSL (absent query => match_all).
     let query = match &body.query {
@@ -485,6 +493,8 @@ async fn run_search(
                 keys,
                 columns: Vec::new(),
                 window: 0,
+                // Hydrate against the same index the search resolved (task-240).
+                index: index.clone(),
             },
             &headers,
         );

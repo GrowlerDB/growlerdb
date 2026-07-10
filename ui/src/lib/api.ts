@@ -347,10 +347,18 @@ export interface Suggestion {
 
 /** Term suggestions for a field via `/v1/suggest` (task-25), used for query autocomplete (task-88).
  *  Returns `[]` on any failure rather than throwing — suggest is best-effort and is fail-closed on
- *  tenant-scoped indexes (403), so a missing dropdown must never break typing. */
-export async function suggest(field: string, text: string, limit = 8): Promise<Suggestion[]> {
+ *  tenant-scoped indexes (403), so a missing dropdown must never break typing. `index` scopes the
+ *  suggestion to a named index on a multi-index endpoint (task-240); empty = the default index. */
+export async function suggest(
+  field: string,
+  text: string,
+  limit = 8,
+  index?: string,
+): Promise<Suggestion[]> {
   try {
-    const res = await apiFetch('/v1/suggest', { field, text, limit });
+    const body: Record<string, unknown> = { field, text, limit };
+    if (index) body.index = index;
+    const res = await apiFetch('/v1/suggest', body);
     if (!res.ok) return [];
     return ((await res.json()) as { suggestions?: Suggestion[] }).suggestions ?? [];
   } catch {

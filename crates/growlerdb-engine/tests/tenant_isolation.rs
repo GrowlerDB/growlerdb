@@ -7,13 +7,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use growlerdb_core::ShardRouter;
 use growlerdb_core::{
     CommitBatch, CompositeKey, Document, IndexDefinition, IndexWriter, LocatedDoc,
     SourceCheckpoint, SourceField, SourceSchema, SourceType, Value,
 };
 use growlerdb_engine::{
-    AdminService, ApiKeyStore, Gateway, KeyIdentity, LocalNode, LookupService, SearchService,
-    ShardHandle, SuggestService,
+    AdminService, ApiKeyStore, Gateway, IndexRoute, KeyIdentity, LocalNode, LookupService, Node,
+    RouteResolver, SearchService, ShardHandle, SuggestService,
 };
 use growlerdb_index::{LocalIndexStore, ShardId};
 use growlerdb_proto::v1::SearchRequest;
@@ -24,6 +25,14 @@ use tonic::Request;
 /// acme (`a`, `c`) and globex (`b`) — fronted by an API-key authenticator. Returns the gateway and
 /// an issued key whose verified claim scopes it to `acme`.
 fn two_tenant_gateway(root: &std::path::Path) -> (Arc<Gateway>, String) {
+    let (node, apikeys, key) = two_tenant_node(root);
+    let gw = Arc::new(Gateway::new(node).with_authn(apikeys));
+    (gw, key)
+}
+
+/// The tenant-scoped Node + its API-key authenticator + a key scoped to `acme` — the shared build
+/// used by both the single-index gateway and the multi-index routing variant (task-240).
+fn two_tenant_node(root: &std::path::Path) -> (Arc<dyn Node>, Arc<ApiKeyStore>, String) {
     let src = SourceSchema::new(
         vec![
             SourceField::new("id", SourceType::String),
@@ -78,9 +87,9 @@ fn two_tenant_gateway(root: &std::path::Path) -> (Arc<Gateway>, String) {
         principal: "acme-reader".into(),
         tenant: Some("acme".into()),
         roles: vec!["viewer".into()],
+        indexes: Vec::new(),
     });
-    let gw = Arc::new(Gateway::new(node).with_authn(apikeys));
-    (gw, key)
+    (node, apikeys, key)
 }
 
 /// A search request authenticated by `api_key`, optionally carrying a (forged) caller-asserted
@@ -167,4 +176,52 @@ async fn an_unauthenticated_request_is_rejected_before_the_shard() {
         .insert("x-growlerdb-tenant", "acme".parse().unwrap());
     let err = gw.search(r).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
+}
+
+/// A [`RouteResolver`] that fronts the tenant-scoped node under index name `docs` (task-240).
+struct DocsResolver(Arc<dyn Node>);
+
+#[tonic::async_trait]
+impl RouteResolver for DocsResolver {
+    async fn resolve(&self, index: &str) -> Result<Option<Arc<IndexRoute>>, String> {
+        if index == "docs" {
+            Ok(Some(IndexRoute::new(
+                vec![self.0.clone()],
+                ShardRouter::hashed(1),
+                None,
+                Vec::new(),
+            )))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tenant_isolation_holds_through_multi_index_routing() {
+    // task-240: routing a request through a resolved per-index route must not weaken the engine-level
+    // tenant filter. The acme-scoped caller, even forging `x-growlerdb-tenant: globex` and widening
+    // the query, only ever sees acme's rows — the shard applies the mandatory tenant filter exactly
+    // as in the single-index path.
+    let tmp = tempfile::tempdir().unwrap();
+    let (node, apikeys, acme_key) = two_tenant_node(tmp.path());
+    let resolver = Arc::new(DocsResolver(node));
+    let gw = Arc::new(Gateway::multi_index(resolver, Some("docs".into())).with_authn(apikeys));
+
+    // Explicit `index: docs` + a forged globex header + a query matching every row.
+    let mut r = Request::new(SearchRequest {
+        query: "id:a OR id:b OR id:c".into(),
+        limit: 10,
+        index: "docs".into(),
+        ..Default::default()
+    });
+    let md = r.metadata_mut();
+    md.insert(
+        "authorization",
+        format!("ApiKey {acme_key}").parse().unwrap(),
+    );
+    md.insert("x-growlerdb-tenant", "globex".parse().unwrap());
+    let resp = gw.search(r).await.unwrap().into_inner();
+    assert_eq!(ids_of(&resp), vec!["a", "c"]); // globex's `b` never leaks through the route
+    assert_eq!(resp.total, 2);
 }

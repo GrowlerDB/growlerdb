@@ -123,6 +123,8 @@ impl Client {
                 keys,
                 columns,
                 window: 0,
+                // Single-index client: the endpoint's default index (task-240).
+                index: String::new(),
             })
             .await?
             .into_inner())
@@ -170,6 +172,8 @@ impl Client {
                 max_edits,
                 // The window selector is gateway-internal (task-82); a client never sets it.
                 window: 0,
+                // Single-index client: the endpoint's default index (task-240).
+                index: String::new(),
             })
             .await?
             .into_inner())

@@ -223,6 +223,7 @@ mod tests {
                 kind: SuggestKind::Prefix as i32,
                 max_edits: 0,
                 window: 0,
+                index: String::new(),
             }))
             .await
             .unwrap()
@@ -246,6 +247,7 @@ mod tests {
                 kind: SuggestKind::Fuzzy as i32,
                 max_edits: 1,
                 window: 0,
+                index: String::new(),
             }))
             .await
             .unwrap()
@@ -264,6 +266,7 @@ mod tests {
             kind: SuggestKind::Prefix as i32,
             max_edits: 0,
             window: 0,
+            index: String::new(),
         };
         // Empty field / empty text are rejected up front.
         for r in [req("", "ber"), req("city", "")] {

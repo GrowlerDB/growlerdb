@@ -1124,6 +1124,7 @@ mod tests {
                 aggs: r#"{"rank_stats": {"Stats": {"field": "rank"}}}"#.into(),
                 partial: false,
                 window: 0,
+                index: String::new(),
             }))
             .await
             .unwrap()
@@ -1148,6 +1149,7 @@ mod tests {
                 aggs: "{not valid".into(),
                 partial: false,
                 window: 0,
+                index: String::new(),
             }))
             .await
             .unwrap_err();
