@@ -22,11 +22,14 @@ mapping:
   fields:
     - { path: id, type: KEYWORD }
     - { path: body, type: TEXT, default_field: true }   # first TEXT field ⇒ the default search field
-    - { path: title, type: TEXT }
-    - { path: category, type: KEYWORD }
-    - { path: author, type: KEYWORD }
-    - { path: views, type: LONG, fast: true }
-    - { path: rating, type: DOUBLE, fast: true }
+    # `cached: true` returns these small, high-signal values WITH each hit (D23/task-86), so the
+    # console renders them inline (right of the PK, lighter font, query terms highlighted) without a
+    # hydration round-trip. `body` stays uncached — big text is hydrate-only (D23).
+    - { path: title, type: TEXT, cached: true }
+    - { path: category, type: KEYWORD, cached: true }
+    - { path: author, type: KEYWORD, cached: true }
+    - { path: views, type: LONG, fast: true, cached: true }
+    - { path: rating, type: DOUBLE, fast: true, cached: true }
     - { path: published, type: DATE, format: epoch_ms, fast: true }
     - { path: server_ip, type: IP }
     - { path: archived, type: BOOL, fast: true }

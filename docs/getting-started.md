@@ -200,6 +200,22 @@ curl -s localhost:8081/v1/search -H 'content-type: application/json' \
 → cat-01, cat-09, cat-10 (same as the Lucene `category:guide OR category:adr`). Likewise
 `author:carol and not category:concept` → cat-09.
 
+### Sort by a fast field
+
+`views`, `rating`, and `published` are **fast fields** (columnar) — sort, range, and aggregation use
+them. Sort by one instead of relevance:
+
+```sh
+curl -s localhost:8081/v1/search -H 'content-type: application/json' \
+  -d '{"index":"catalog","query":"*:*","sort":[{"field":"views","desc":true}],"limit":3}'
+```
+
+→ the three most-viewed: `cat-01` (4800), `cat-02` (3200), `cat-10` (2750).
+
+In the **console**, each result row shows the index's `cached` fields (here title, category, author,
+rating, views) inline to the right of the primary key — lighter font, with your query terms
+highlighted — so the valuable data is visible without opening the detail drawer.
+
 ## 5. Use the OpenSearch adapter (optional)
 
 The stack enables the [OpenSearch-compatible adapter](opensearch-adapter), so OpenSearch clients
