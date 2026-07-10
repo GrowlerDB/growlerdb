@@ -148,7 +148,43 @@ You get OpenSearch-shaped documents — `_id` from the key, `_source` hydrated f
 
 So an existing OpenSearch/Elasticsearch client can point at GrowlerDB unchanged.
 
-## 5. Tear down
+## 5. See the source in Iceberg with Trino (optional)
+
+GrowlerDB keeps **Iceberg as the system of record** and indexes it. To see that source data directly
+— and compare it with what GrowlerDB returns — bring up **Trino** (SQL over the *same* Polaris
+catalog + MinIO the seed wrote). It's gated behind the `trino` profile (Trino is a JVM, so it's not
+in the base stack):
+
+```sh
+docker compose -f deploy/compose/docker-compose.yml --profile trino up -d trino
+```
+
+Query the same tables GrowlerDB indexes (`iceberg.<namespace>.<table>`):
+
+```sh
+docker compose -f deploy/compose/docker-compose.yml exec trino \
+  trino --execute "SELECT id, title, body FROM iceberg.growlerdb.docs ORDER BY id"
+```
+
+```
+"doc-1","welcome","hello world, welcome to growlerdb"
+"doc-2","iceberg search","fast full text search over apache iceberg"
+"doc-3","hydration","search returns keys that hydrate authoritative rows"
+```
+
+Those are exactly the rows a GrowlerDB search hydrates — `body:iceberg` returns `doc-2` above, and
+here you can see the full row in Iceberg. You can also **add a row** straight to the lake:
+
+```sh
+docker compose -f deploy/compose/docker-compose.yml exec trino trino --execute \
+  "INSERT INTO iceberg.growlerdb.docs VALUES ('doc-4','trino insert','added to iceberg via trino sql')"
+```
+
+It's now in Iceberg; a GrowlerDB **reindex** (`POST /v1/index:reindex`) picks it up so the same search
+surfaces it — the full **source → index → search** loop, with Trino and GrowlerDB reading one source
+of truth.
+
+## 6. Tear down
 
 ```sh
 just stack-down

@@ -30,3 +30,9 @@ shared `growlerdb-local:dev` image **once** before starting the control-plane/no
 a same-tag parallel-build race on Docker's containerd store; `setup-polaris.sh` parses the Polaris
 token with `sed` (no python3 dependency). CI's `e2e` runs the engine in-process, so it doesn't
 exercise the `--profile stack` build path — this quickstart is what covers it.
+
+An optional **`trino` profile** (`just trino`) runs Trino over the *same* Polaris/MinIO Iceberg
+catalog the seed writes, so users can `SELECT` (and `INSERT`) the source rows GrowlerDB indexes and
+compare source vs. index — the "Iceberg is the system of record" story made tangible. Validated on a
+fresh VM (Trino reads and writes `iceberg.growlerdb.docs`); the config disables Polaris credential
+vending (`vended-credentials-enabled=false`) since MinIO can't vend STS.
