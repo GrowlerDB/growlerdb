@@ -165,9 +165,13 @@
     } catch {
       indexOptions = []; // no control plane fronted here → scope selector hidden; serve default
     }
-    // Restore the last chosen index (task-131), but only if it still exists.
+    // Restore the last chosen index (task-131), but only if it still exists. Otherwise default to the
+    // first served index (task-248): a multi-index endpoint rejects an index-less search, so the UI
+    // must never send one — pick a real index rather than show "index required". (Empty options = a
+    // single-index endpoint with no control plane fronted → leave '' to use the served default.)
     const savedIndex = read(SEARCH_INDEX_KEY);
     if (savedIndex && indexOptions.includes(savedIndex)) scopeIndex = savedIndex;
+    else if (indexOptions.length > 0) scopeIndex = indexOptions[0];
     await loadTimeFields();
     try {
       saved = await loadSavedSearches();

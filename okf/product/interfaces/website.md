@@ -31,6 +31,13 @@ a same-tag parallel-build race on Docker's containerd store; `setup-polaris.sh` 
 token with `sed` (no python3 dependency). CI's `e2e` runs the engine in-process, so it doesn't
 exercise the `--profile stack` build path — this quickstart is what covers it.
 
+The quickstart also seeds a second, richer demo index — **`catalog`** (10 rows, one field of every
+type) — served alongside `docs` and routed through the single `--all-indexes` gateway
+([Compose](/system/deployment/compose.md)). Its **query playground** section walks every Lucene/KQL
+operator (term, phrase, keyword, set, numeric/float/date range, CIDR, wildcard, prefix, fuzzy, boost,
+bool, `NOT`, match-all, regex) with the exact rows each returns. Because two indexes are served with no
+default, every REST search / `keys:get` names its `index`, and the console selector switches between them.
+
 An optional **`trino` profile** (`just trino`) runs Trino over the *same* Polaris/MinIO Iceberg
 catalog the seed writes, so users can `SELECT` (and `INSERT`) the source rows GrowlerDB indexes and
 compare source vs. index — the "Iceberg is the system of record" story made tangible. Validated on a
