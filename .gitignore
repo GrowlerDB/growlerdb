@@ -19,3 +19,4 @@ __pycache__/
 *.pyc
 # Rendered per-workload k8s manifests (task-214) — regenerate with `harness.py render <workload>`
 /bench/scale/.render/
+.claude/

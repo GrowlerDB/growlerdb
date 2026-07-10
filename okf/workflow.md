@@ -32,6 +32,10 @@ in the same PR — new capability → new/updated concept; changed component →
 links; new decision → an ADR under [`/system/decisions/`](/system/decisions/index.md). A change that
 leaves the OKF stale is incomplete.
 
+The **dated update history is the git log** (PR titles + commits) — *not* a shared in-repo log file.
+An append-only `log.md` was retired because every PR appended to it, forcing parallel PRs into serial
+rebase-and-rebuild; the pre-GA development narrative is archived in the sibling `backlog/`.
+
 **Enforcement.** A [PR template](https://github.com/GrowlerDB/growlerdb/blob/main/.github/PULL_REQUEST_TEMPLATE.md)
 carries an "OKF updated?" checklist item, `CONTRIBUTING.md` states the rule, and CI runs an **OKF
 conformance check** (`okf/check.sh` / `just okf-check` — every concept carries a non-empty `type`).
@@ -47,8 +51,7 @@ This bundle follows the [Open Knowledge Format](https://github.com/GoogleCloudPl
 - **`type` vocabulary** (keep the graph coherent): `Concept`, `Interface`, `Actor`, `Use Case`,
   `Feature`, `Requirement`, `Component`, `Dependency`, `Decision`, `Test Suite`, `Quality Attribute`,
   `Glossary`, `Process`.
-- **Reserved files** (no frontmatter): `index.md` (a curated listing of a directory's concepts) and
-  `log.md` (update history, newest first); pre-GA history is archived in `pre-ga-log.md`.
+- **Reserved files** (no frontmatter): `index.md` (a curated listing of a directory's concepts).
 - **Links** use **absolute bundle-relative** paths (e.g. `/system/runtime/node.md`) so they survive
   moves. A link asserts a relationship; the kind is conveyed by the surrounding prose. Link a feature
   to the component that implements it and to the decision that shaped it — the cross-links are what
