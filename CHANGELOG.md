@@ -6,7 +6,7 @@ All notable changes to GrowlerDB are documented here. The format is based on
 
 ## [Unreleased]
 
-This is the first release line — everything below is the initial GA surface.
+## [0.1.1] - 2026-07-09
 
 ### Security
 
@@ -15,6 +15,10 @@ This is the first release line — everything below is the initial GA surface.
   authorization-bypass advisory; the pure-Rust `rust_crypto` provider is selected explicitly), and
   ECharts `6.1` (console XSS advisory). A medium transitive `thrift` advisory (via `parquet`, in the
   own-data metadata-parse path) is tracked for the arrow/parquet 59 upgrade.
+
+## [0.1.0] - 2026-07-08
+
+The initial GA surface.
 
 ### Added
 
@@ -64,4 +68,6 @@ This is the first release line — everything below is the initial GA surface.
   into the image, chart `appVersion`, binaries, and CLI `--version` while the tree stays `0.0.0`;
   the image gets an immutable `X.Y.Z` plus moving `X.Y`/`X`/`latest`. See [RELEASING.md](RELEASING.md).
 
-[Unreleased]: https://github.com/GrowlerDB/growlerdb/commits/main
+[Unreleased]: https://github.com/GrowlerDB/growlerdb/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/GrowlerDB/growlerdb/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/GrowlerDB/growlerdb/releases/tag/v0.1.0
