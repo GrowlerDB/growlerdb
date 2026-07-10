@@ -163,6 +163,7 @@ services:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_ENDPOINT_URL_S3: http://minio:9000
+      AWS_REGION: us-east-1 # MinIO ignores it, but it silences pyiceberg's "unable to resolve region"
 
   # --- `stack` profile: GrowlerDB + LGTM (the deployable cluster) -------------------
   # Bring up with `just stack` (deps + catalog + seed must come first; the recipe

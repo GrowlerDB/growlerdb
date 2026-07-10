@@ -12,15 +12,39 @@ observability stack). Time: ~10 minutes, mostly the first image build.
 
 ## Prerequisites
 
-- **Docker** (with Compose v2) and [`just`](https://github.com/casey/just). Nothing else — the stack
-  runs entirely in containers.
-- **One `/etc/hosts` entry** so commands *you* run on the host (the `curl` hydration calls below) can
-  reach the in-container object storage by the name the stored file paths use:
-  ```sh
-  echo "127.0.0.1 minio" | sudo tee -a /etc/hosts
-  ```
-  (The console itself doesn't need this — it talks to the gateway, which reaches MinIO inside the
-  Compose network. It's only for host-side hydration.)
+You need **Docker with the Compose v2 plugin** and **[`just`](https://github.com/casey/just)** — the
+stack runs entirely in containers, so no language toolchains are required. Run it on a **Linux host
+or a VM, or macOS with Docker Desktop** — *not* inside a container (Docker bind mounts won't resolve
+there). **~4 GB RAM** is enough.
+
+### Ubuntu / Debian
+
+```sh
+sudo apt-get update
+sudo apt-get install -y docker.io docker-compose-v2 docker-buildx just git curl
+sudo systemctl enable --now docker
+# optional: run docker without sudo (log out/in afterwards)
+sudo usermod -aG docker "$USER"
+```
+
+### macOS
+
+```sh
+brew install --cask docker   # Docker Desktop — bundles Compose v2 + buildx; launch it once
+brew install just
+```
+
+### Then, on either OS — one `/etc/hosts` entry
+
+So the `curl` hydration calls *you* run on the host can reach the in-container object storage by the
+name the stored file paths use:
+
+```sh
+echo "127.0.0.1 minio" | sudo tee -a /etc/hosts
+```
+
+(The console doesn't need this — it talks to the gateway, which reaches MinIO inside the Compose
+network. It's only for host-side hydration.)
 
 ## 1. Bring up the full stack
 

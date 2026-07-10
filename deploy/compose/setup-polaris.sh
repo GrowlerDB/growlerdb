@@ -9,10 +9,12 @@ POLARIS="${POLARIS:-http://localhost:8181}"
 echo "waiting for Polaris OAuth endpoint..."
 TOK=""
 for _ in $(seq 1 60); do
+  # Parse the token with sed (no python3/jq dep — this runs on any minimal host). `curl -s` already
+  # swallows the expected connection-refused noise while Polaris boots; we don't mask parse errors.
   TOK=$(curl -s -X POST "$POLARIS/api/catalog/v1/oauth/tokens" \
     -d grant_type=client_credentials -d client_id=root -d client_secret=s3cr3t \
-    -d scope=PRINCIPAL_ROLE:ALL 2>/dev/null \
-    | python3 -c "import sys,json;print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null || true)
+    -d scope=PRINCIPAL_ROLE:ALL \
+    | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
   [ -n "$TOK" ] && break
   sleep 1
 done

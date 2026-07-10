@@ -152,7 +152,11 @@ stack:
     docker compose -f deploy/compose/docker-compose.yml up -d minio createbuckets polaris
     deploy/compose/setup-polaris.sh
     docker compose -f deploy/compose/docker-compose.yml --profile seed up --build --exit-code-from seed seed
-    docker compose -f deploy/compose/docker-compose.yml --profile stack up -d --build
+    # control-plane / node / gateway share one image (growlerdb-local:dev). `up --build` builds them
+    # in parallel and they race to name the same tag ("image already exists") on Docker's containerd
+    # store. Build the shared image ONCE, then start without --build.
+    docker compose -f deploy/compose/docker-compose.yml build node
+    docker compose -f deploy/compose/docker-compose.yml --profile stack up -d
 
 # tear the full stack (and volumes) down
 stack-down:
