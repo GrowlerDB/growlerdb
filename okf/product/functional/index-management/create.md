@@ -14,8 +14,10 @@ Define an index over an Iceberg table and build it. The definition chooses:
 - **Key** — the composite key (partition fields + identifier fields) for routing and hydration.
 - **Mapping** — which fields to index (all vs an explicit list), types/analyzers, and per-field
   [`cached`](/system/storage/data-model.md) (returned with hits) / **`fast`** (sortable/filterable) /
-  **`indexed`** (the inverted index; defaults **off** for fast numeric/date/IP fields, which the
-  columnar path serves — task-215) / TEXT-only **`record`** + **`fieldnorms`** (posting detail and
+  **`indexed`** (the inverted index; defaults **off** for fast numeric/date/BOOL/IP fields, which the
+  columnar path serves — task-215; a *term* filter like `archived:true` needs `indexed: true`, since
+  the columnar path answers ranges/sorts but has no postings to match a term) / TEXT-only **`record`**
+  + **`fieldnorms`** (posting detail and
   BM25 norms — task-216; see [data model](/system/storage/data-model.md)) flags; optionally a
   declared **timestamp** field and [windowing](/product/functional/windowing-time.md).
 - **Sharding** — shard count + routing.
