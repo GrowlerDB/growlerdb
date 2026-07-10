@@ -8,7 +8,8 @@ Indexes, Observability, Connectors) are built out in tasks 46–49.
 ## Layout
 
 - `src/App.svelte` — nav shell (skip link, keyboard-navigable nav, `main` landmark).
-- `src/routes/` — screen components (`Search` is minimal-functional; the rest are placeholders).
+- `src/routes/` — screen components (Search, Indexes, Ingestion, Observability are built out; a few
+  sub-panels, e.g. Settings → API tokens, are labeled placeholders in-UI).
 - `src/lib/auth.ts` — OIDC **authorization-code + PKCE** login; forwards the bearer token.
 - `src/lib/api.ts` — Engine API client; attaches `Authorization: Bearer <token>`.
 - `src/lib/i18n.ts` + `src/lib/locales/` — message catalog + `t()`; **no hardcoded strings**.
