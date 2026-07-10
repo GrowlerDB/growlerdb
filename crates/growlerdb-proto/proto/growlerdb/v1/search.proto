@@ -77,6 +77,43 @@ message SearchRequest {
   // Gateway answers NOT_FOUND rather than silently searching the wrong index. Empty = the index
   // this endpoint serves (back-compat). Alias resolution is done client-side (alias → target).
   string index = 11;
+  // Opt-in **server-side highlighting** (task-250): when set, each hit carries `highlight` —
+  // per-field fragments of the analyzed match (stemming/positions reflected). Off by default
+  // (highlighting reads stored text + runs a snippet generator, a per-hit cost). Unset ⇒ no
+  // highlights (the console falls back to its client-side term marker).
+  HighlightRequest highlight = 12;
+}
+
+// Server-side highlight options (task-250). Only analyzed **TEXT** fields whose text is available
+// (the field is `cached`/stored) can be highlighted; a requested field that is neither is skipped.
+message HighlightRequest {
+  // The TEXT fields to highlight. Empty = a sensible default: every analyzed TEXT field the index
+  // can highlight (cached/stored). Names that aren't highlightable TEXT fields are silently skipped.
+  repeated string fields = 1;
+  // Max fragments returned per field (0 ⇒ a server default). Bounded so a hit can't return an
+  // unbounded highlight payload.
+  uint32 max_fragments = 2;
+  // Approximate max characters per fragment (0 ⇒ a server default). The snippet window size.
+  uint32 fragment_size = 3;
+}
+
+// One matched fragment of a highlighted field, as XSS-safe **segments** rather than pre-marked
+// HTML (task-250): a client renders each segment's `text`, wrapping `marked` ones in `<mark>`/`<em>`
+// with no `innerHTML`. Mirrors the console's `Segment` shape so the wire and the client-side
+// fallback render identically.
+message HighlightSegment {
+  string text = 1;   // the literal text of this run
+  bool marked = 2;   // true ⇒ this run is a matched term (render inside a mark)
+}
+
+// A fragment: an ordered run of segments (matched + surrounding context).
+message HighlightFragment {
+  repeated HighlightSegment segments = 1;
+}
+
+// The highlighted fragments for one field.
+message HighlightField {
+  repeated HighlightFragment fragments = 1;
 }
 
 // One ranked hit: the document coordinates + its score (0 when sorted by a field).
@@ -94,6 +131,11 @@ message SearchHit {
   // marks `cached`, so a results page renders document-like rows without a hydration round-trip.
   // Empty when the index caches no display fields. The authoritative row is still GetByKey.
   repeated Field fields = 6;
+  // Server-side **highlights** (task-250): field name → matched fragments, present only when the
+  // request opted in via `SearchRequest.highlight`. Reflects the analyzed match (stemming/positions),
+  // unlike the console's client-side literal-term marker. Empty when highlighting wasn't requested
+  // or the hit had no matching fragment in any highlightable field.
+  map<string, HighlightField> highlight = 7;
 }
 
 message SearchResponse {

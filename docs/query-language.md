@@ -69,9 +69,16 @@ types are known.
 - **`collapse`** — collapse to the top hit per distinct value of a fast field, with a per-hit group
   count.
 - **`pit_id`** — read against a frozen point-in-time snapshot.
+- **`highlight`** — opt into **server-side highlighting**: each hit carries matched fragments per TEXT
+  field, reflecting the *analyzed* match (stemming, per-field analysis, phrase positions). Off by
+  default (a per-hit cost). `{}` uses the index's highlightable (`cached`) TEXT fields; `fields`,
+  `max_fragments`, and `fragment_size` name and bound the output. See
+  [Highlighting](rest-api#post-v1search).
 
 ## What a search returns
 
 Hits are **document coordinates** (the composite key) + a BM25 score — **not** documents. Fetch the
 authoritative rows from Iceberg by key with [`/v1/keys:get`](rest-api#post-v1keysget). `total` is a
-true cross-shard match count, and a `partial` flag is set if any shard was down.
+true cross-shard match count, and a `partial` flag is set if any shard was down. When the request opted
+into `highlight`, each hit also carries a `highlight` object (field → fragments → XSS-safe
+`{text, marked}` segments) of the analyzed match.

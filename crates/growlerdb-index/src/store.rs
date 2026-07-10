@@ -30,8 +30,9 @@ use std::time::{Duration, Instant};
 
 use growlerdb_core::{
     cmp_sort_value, durable, sort_has_score, Agg, CollapsedHit, CommitBatch, CompositeKey, DocOp,
-    Document, Hit, IndexReader, IndexWriter, Query, ResolvedIndex, RowLocator, SearchAfter,
-    SearchParams, ShardHits, Snapshot, Sort, SortOrder, SortValue, SourceCheckpoint, Value,
+    Document, Highlight, Hit, IndexReader, IndexWriter, Query, ResolvedIndex, RowLocator,
+    SearchAfter, SearchParams, ShardHits, Snapshot, Sort, SortOrder, SortValue, SourceCheckpoint,
+    Value,
 };
 use redb::{
     Database, MultimapTableDefinition, ReadTransaction, ReadableDatabase, ReadableMultimapTable,
@@ -2528,11 +2529,13 @@ impl Shard {
         sort: &[Sort],
         offset: usize,
         after: Option<&SearchAfter>,
+        highlight: Option<&Highlight>,
     ) -> Result<ValuedPage> {
-        self.page_in_values(&self.core, query, k, sort, offset, after)
+        self.page_in_values(&self.core, query, k, sort, offset, after, highlight)
     }
 
     /// [`search_page_values`](Self::search_page_values) against a PIT-frozen snapshot.
+    #[allow(clippy::too_many_arguments)]
     pub fn search_page_pit_values(
         &self,
         pit: u64,
@@ -2541,9 +2544,10 @@ impl Shard {
         sort: &[Sort],
         offset: usize,
         after: Option<&SearchAfter>,
+        highlight: Option<&Highlight>,
     ) -> Result<ValuedPage> {
         let (core, _) = self.pit(pit)?;
-        self.page_in_values(&core, query, k, sort, offset, after)
+        self.page_in_values(&core, query, k, sort, offset, after, highlight)
     }
 
     /// Total documents matching `query` (live; the single index excludes superseded/deleted) —
@@ -2571,7 +2575,7 @@ impl Shard {
         offset: usize,
         after: Option<&SearchAfter>,
     ) -> Result<(Vec<Hit>, Option<SearchAfter>)> {
-        let (page, next) = self.page_in_values(core, query, k, sort, offset, after)?;
+        let (page, next) = self.page_in_values(core, query, k, sort, offset, after, None)?;
         Ok((page.into_iter().map(|(hit, _)| hit).collect(), next))
     }
 
@@ -2580,6 +2584,7 @@ impl Shard {
     /// when `sort` is non-empty). [`page_in`](Self::page_in) strips the values for
     /// callers that don't need them; [`search_page_values`](Self::search_page_values)
     /// keeps them for the wire.
+    #[allow(clippy::too_many_arguments)]
     fn page_in_values(
         &self,
         core: &SegmentReader,
@@ -2588,8 +2593,18 @@ impl Shard {
         sort: &[Sort],
         offset: usize,
         after: Option<&SearchAfter>,
+        highlight: Option<&Highlight>,
     ) -> Result<ValuedPage> {
-        let page = self.page_with_values(core, query, k, sort, offset, after)?;
+        let mut page = self.page_with_values(core, query, k, sort, offset, after)?;
+        // Server-side highlighting (task-250): fill each hit's per-field fragments from the
+        // analyzed match, against the same reader that produced the page. Off unless opted in.
+        if let Some(hl) = highlight {
+            let mut hits: Vec<Hit> = page.iter().map(|(h, _)| h.clone()).collect();
+            core.highlight_hits(query, &mut hits, hl)?;
+            for ((hit, _), filled) in page.iter_mut().zip(hits) {
+                hit.highlight = filled.highlight;
+            }
+        }
         // No keyset cursor for an unsorted query, or for a `_score` sort (relevance isn't
         // a stable keyset key — task-66): those page by offset only.
         let next = if sort.is_empty() || sort_has_score(sort) {
@@ -2618,8 +2633,9 @@ impl Shard {
         k: usize,
         sort: &[Sort],
         collapse: &str,
+        highlight: Option<&Highlight>,
     ) -> Result<Vec<CollapsedHit>> {
-        self.collapsed_in(&self.core, query, k, sort, collapse)
+        self.collapsed_in(&self.core, query, k, sort, collapse, highlight)
     }
 
     /// [`search_collapsed`](Self::search_collapsed) against an open **PIT** — collapse
@@ -2631,9 +2647,10 @@ impl Shard {
         k: usize,
         sort: &[Sort],
         collapse: &str,
+        highlight: Option<&Highlight>,
     ) -> Result<Vec<CollapsedHit>> {
         let (core, _) = self.pit(pit)?;
-        self.collapsed_in(&core, query, k, sort, collapse)
+        self.collapsed_in(&core, query, k, sort, collapse, highlight)
     }
 
     /// Field collapsing against a specific reader — shared by the live and PIT paths.
@@ -2644,6 +2661,7 @@ impl Shard {
         k: usize,
         sort: &[Sort],
         collapse: &str,
+        highlight: Option<&Highlight>,
     ) -> Result<Vec<CollapsedHit>> {
         if sort.is_empty() {
             return Err(StoreError::Segment(IndexError::QueryType(
@@ -2671,7 +2689,7 @@ impl Shard {
                 }
             }
         }
-        Ok(order
+        let mut collapsed: Vec<CollapsedHit> = order
             .into_iter()
             .take(k)
             .map(|gk| {
@@ -2684,7 +2702,16 @@ impl Shard {
                     sort_values,
                 }
             })
-            .collect())
+            .collect();
+        // Server-side highlighting (task-250): fill each group's top hit against the same reader.
+        if let Some(hl) = highlight {
+            let mut hits: Vec<Hit> = collapsed.iter().map(|c| c.hit.clone()).collect();
+            core.highlight_hits(query, &mut hits, hl)?;
+            for (c, filled) in collapsed.iter_mut().zip(hits) {
+                c.hit.highlight = filled.highlight;
+            }
+        }
+        Ok(collapsed)
     }
 
     /// Gather the merged, liveness-filtered, fully-sorted page as `(hit, sort_values)`
@@ -2725,15 +2752,13 @@ impl Shard {
         Ok(hits.into_iter().skip(skip).take(k).collect())
     }
 
-    /// Top-`k` by score with a highlighted **snippet** of `field` per hit (task-25).
-    pub fn search_highlighted(
-        &self,
-        query: &Query,
-        k: usize,
-        field: &str,
-        max_chars: usize,
-    ) -> Result<Vec<(Hit, Option<String>)>> {
-        Ok(self.core.search_highlighted(query, k, field, max_chars)?)
+    /// Top-`k` by score with **server-side highlights** filled per hit (task-250): each returned
+    /// [`Hit`] carries `highlight` (field → matched fragments) for the requested highlightable TEXT
+    /// fields, reflecting the analyzed match. A thin wrapper over [`search_page_values`](
+    /// Self::search_page_values) with a highlight opt-in; used by tests and the highlight fast path.
+    pub fn search_highlighted(&self, query: &Query, k: usize, hl: &Highlight) -> Result<Vec<Hit>> {
+        let (page, _) = self.page_in_values(&self.core, query, k, &[], 0, None, Some(hl))?;
+        Ok(page.into_iter().map(|(hit, _)| hit).collect())
     }
 
     /// **Prefix autocomplete** (task-25): the top-`limit` indexed terms of `field`
@@ -3034,14 +3059,19 @@ impl IndexReader for Shard {
     fn search(&self, params: &SearchParams) -> Result<ShardHits> {
         // A keyset cursor takes precedence over `offset` (O(k) deep paging). The
         // next-page cursor is available via the concrete [`Shard::search_after`];
-        // the trait surface returns just the page.
-        let hits = match &params.search_after {
-            Some(after) => {
-                self.search_after(&params.query, params.k, &params.sort, Some(after))?
-                    .0
-            }
-            None => self.search_paged(&params.query, params.k, &params.sort, params.offset)?,
-        };
+        // the trait surface returns just the page. When a highlight opt-in is present
+        // (task-250), page through the values path so each hit carries its fragments.
+        let after = params.search_after.as_ref();
+        let (page, _) = self.page_in_values(
+            &self.core,
+            &params.query,
+            params.k,
+            &params.sort,
+            params.offset,
+            after,
+            params.highlight.as_ref(),
+        )?;
+        let hits: Vec<Hit> = page.into_iter().map(|(hit, _)| hit).collect();
         // `total` is the true match count (not the page size), consistent with the wire
         // `SearchResponse.total` and summable across shards (task-68).
         let total = self.search_count(&params.query)? as usize;
@@ -3688,7 +3718,9 @@ mod sort_tests {
         let all = Query::MatchAll;
         let rank_desc = [sort("rank", SortOrder::Desc)];
 
-        let groups = shard.search_collapsed(&all, 10, &rank_desc, "cat").unwrap();
+        let groups = shard
+            .search_collapsed(&all, 10, &rank_desc, "cat", None)
+            .unwrap();
         // Live by rank desc: d(blue,25), c(red,20), b(blue,10), a(red,5).
         // Groups in first-appearance order: blue (top d), red (top c). Counts 2/2.
         let summary: Vec<(String, String, usize)> = groups
@@ -3710,15 +3742,19 @@ mod sort_tests {
         );
 
         // top-k limits the number of groups, not the per-group count.
-        let one = shard.search_collapsed(&all, 1, &rank_desc, "cat").unwrap();
+        let one = shard
+            .search_collapsed(&all, 1, &rank_desc, "cat", None)
+            .unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].group, Value::from("blue"));
         assert_eq!(one[0].count, 2);
 
         // Collapsing on a non-fast field is a clear error.
-        assert!(shard.search_collapsed(&all, 10, &rank_desc, "id").is_err());
+        assert!(shard
+            .search_collapsed(&all, 10, &rank_desc, "id", None)
+            .is_err());
         // Collapse needs a sort key.
-        assert!(shard.search_collapsed(&all, 10, &[], "cat").is_err());
+        assert!(shard.search_collapsed(&all, 10, &[], "cat", None).is_err());
     }
 
     /// A shard with a KEYWORD-**fast** `name` field for string sorting, in two
@@ -4040,7 +4076,7 @@ mod pit_tests {
 
         // The PIT collapse sees the as-of-S groups: red top a@30 (count 1), blue b@10.
         let g = shard
-            .search_collapsed_pit(pit.id, &Query::MatchAll, 10, &rank_desc, "cat")
+            .search_collapsed_pit(pit.id, &Query::MatchAll, 10, &rank_desc, "cat", None)
             .unwrap();
         let summary: Vec<(String, String, usize)> = g
             .iter()
@@ -4063,7 +4099,7 @@ mod pit_tests {
         // A fresh collapse reflects the new world. Live by rank desc: c(red,99),
         // b(blue,10), a(green,5) → groups red(top c), blue(top b), green(top a).
         let fresh = shard
-            .search_collapsed(&Query::MatchAll, 10, &rank_desc, "cat")
+            .search_collapsed(&Query::MatchAll, 10, &rank_desc, "cat", None)
             .unwrap();
         let fresh_groups: Vec<(String, String)> = fresh
             .iter()
@@ -4142,20 +4178,57 @@ mod highlight_tests {
         )
         .unwrap();
 
+        // Marked-segment text of a hit's `body` highlight, joined for assertion.
+        let marked = |h: &Hit| -> Vec<String> {
+            h.highlight
+                .get("body")
+                .into_iter()
+                .flatten()
+                .flat_map(|frag| frag.segments.iter())
+                .filter(|s| s.marked)
+                .map(|s| s.text.clone())
+                .collect()
+        };
+
         let q = Query::parse("body:brown").unwrap();
-        let by_id: BTreeMap<String, Option<String>> = shard
-            .search_highlighted(&q, 10, "body", 100)
+        let hl = Highlight::new(vec!["body".into()], 0, 100);
+        let by_id: BTreeMap<String, Hit> = shard
+            .search_highlighted(&q, 10, &hl)
             .unwrap()
             .into_iter()
-            .map(|(h, s)| (h.key.get("id").unwrap().to_index_string(), s))
+            .map(|h| (h.key.get("id").unwrap().to_index_string(), h))
             .collect();
-        // a + b match "brown" across the two generations, each with a <b>-tagged snippet.
+        // a + b match "brown" across the two generations, each with "brown" marked in its snippet.
         assert_eq!(by_id.len(), 2);
-        assert!(by_id["a"].as_ref().unwrap().contains("<b>brown</b>"));
-        assert!(by_id["b"].as_ref().unwrap().contains("<b>brown</b>"));
+        assert_eq!(marked(&by_id["a"]), vec!["brown".to_string()]);
+        assert_eq!(marked(&by_id["b"]), vec!["brown".to_string()]);
+        // The un-marked context is preserved (XSS-safe segments, not HTML).
+        let has_context = by_id["a"].highlight["body"][0]
+            .segments
+            .iter()
+            .any(|s| !s.marked && s.text.contains("fox"));
+        assert!(has_context, "fragment keeps surrounding context");
 
-        // Highlighting a non-TEXT (keyword) field is a clear error.
-        assert!(shard.search_highlighted(&q, 10, "id", 100).is_err());
+        // Highlighting a non-TEXT (keyword) field is silently skipped, not an error.
+        let hl_kw = Highlight::new(vec!["id".into()], 0, 100);
+        let kw_hits = shard.search_highlighted(&q, 10, &hl_kw).unwrap();
+        assert!(kw_hits.iter().all(|h| h.highlight.is_empty()));
+
+        // An empty `fields` request defaults to the highlightable TEXT fields (here `body`).
+        let hl_default = Highlight::new(vec![], 0, 100);
+        let default_hits = shard.search_highlighted(&q, 10, &hl_default).unwrap();
+        assert!(default_hits
+            .iter()
+            .any(|h| h.highlight.contains_key("body")));
+
+        // An analyzed (stemmed-style folding) match still highlights: the query lowercases,
+        // so an uppercase query term marks the lowercased indexed token.
+        let q_upper = Query::parse("body:BROWN").unwrap();
+        let upper_hits = shard.search_highlighted(&q_upper, 10, &hl).unwrap();
+        assert!(
+            upper_hits.iter().any(|h| !marked(h).is_empty()),
+            "analyzed match highlights"
+        );
     }
 }
 
