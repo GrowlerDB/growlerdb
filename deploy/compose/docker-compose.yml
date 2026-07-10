@@ -264,6 +264,39 @@ services:
       timeout: 3s
       retries: 60
 
+  # Node (catalog): a SECOND index alongside `docs` (task-241) — builds the richer `growlerdb.catalog`
+  # table with catalog.yaml and serves+registers it (gRPC :50052, REST :8083, metrics :9104). The
+  # `--all-indexes` gateway routes `{"index":"catalog", ...}` requests here automatically — no gateway
+  # change needed. Demonstrates multi-index routing (task-240) end to end and backs the getting-started
+  # "query playground". Seed creates the table first (the `just stack` recipe seeds before this profile).
+  node-catalog:
+    profiles: ["stack"]
+    <<: *growlerdb-image
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        growlerdb index growlerdb.catalog --def /catalog.yaml --name catalog &&
+        growlerdb serve catalog --addr 0.0.0.0:50052 --rest-addr 0.0.0.0:8083 --metrics-addr 0.0.0.0:9104
+        --register http://controlplane:50071 --advertise-addr http://node-catalog:50052
+    environment:
+      <<: *growlerdb-env
+    depends_on:
+      polaris:
+        condition: service_started
+      controlplane:
+        condition: service_healthy
+    ports:
+      - "50052:50052"
+      - "9104:9104"
+    volumes:
+      - node-catalog-data:/data
+      - ./catalog.yaml:/catalog.yaml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9104/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+
   # Gateway: the public Engine API (gRPC :50061 + REST :8080→host 8081), fronting the node.
   # health/metrics on :9103. This is the address clients hit.
   gateway:
@@ -294,6 +327,11 @@ services:
       <<: *growlerdb-env
     depends_on:
       node:
+        condition: service_healthy
+      # Wait for the catalog node too so both demo indexes (docs + catalog) are registered by the
+      # time the gateway is up — the `--all-indexes` gateway routes lazily, so this only makes the
+      # getting-started query playground deterministic on first bring-up.
+      node-catalog:
         condition: service_healthy
       controlplane:
         condition: service_healthy
@@ -468,5 +506,6 @@ volumes:
   minio-data:
   cp-data:
   node-data:
+  node-catalog-data:
   polaris-db:
   spark-ivy:

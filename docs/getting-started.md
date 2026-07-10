@@ -54,11 +54,18 @@ From the repo root:
 just stack
 ```
 
-This builds the GrowlerDB image, brings up MinIO + Polaris, **seeds a sample `growlerdb.docs`
-Iceberg table** (3 rows), then starts the control plane, a node, the gateway, and Grafana/LGTM.
-The node builds the `docs` index from the table, serves it, and registers with the control plane.
+This builds the GrowlerDB image, brings up MinIO + Polaris, **seeds two sample Iceberg tables** —
+`growlerdb.docs` (3 rows) and the richer `growlerdb.catalog` (10 rows) — then starts the control
+plane, **two nodes**, the gateway, and Grafana/LGTM. One node builds the `docs` index, the other the
+`catalog` index; both serve and register with the control plane, and the single `--all-indexes`
+gateway routes each request to its named index (multi-index routing).
 
 When it settles, the **console** is at <http://localhost:8081> and Grafana at <http://localhost:3000>.
+
+> **Two indexes now, so every request names one.** With more than one index served, the gateway can't
+> guess a default: search / `keys:get` requests must include `"index":"docs"` or `"index":"catalog"`,
+> and the console's top-left selector switches between them. (Omitting `index` returns
+> `index required; endpoint serves 2 indexes`.)
 
 ## 2. Your first search (REST)
 
@@ -66,7 +73,7 @@ The gateway serves the Engine API at `:8081`. Search returns ranked **document c
 
 ```sh
 curl -s localhost:8081/v1/search -H 'content-type: application/json' \
-  -d '{"query":"title:iceberg","limit":5}'
+  -d '{"index":"docs","query":"title:iceberg","limit":5}'
 ```
 
 You get the matching keys + scores — no row contents, just the **coordinates**:
@@ -84,7 +91,7 @@ Now hydrate the authoritative row from Iceberg by that key:
 
 ```sh
 curl -s localhost:8081/v1/keys:get -H 'content-type: application/json' \
-  -d '{"keys":[{"identifier":[{"name":"id","value":"doc-2"}]}]}'
+  -d '{"index":"docs","keys":[{"identifier":[{"name":"id","value":"doc-2"}]}]}'
 ```
 
 ```json
@@ -107,9 +114,10 @@ hit **Search**:
 
 ![GrowlerDB console — Search: body:search over the docs index returns two hits](img/console-search.png)
 
-> **Tip:** in the console's Lucene box a bare word (`search`) queries the index's *default* field —
-> qualify it with a field, e.g. `body:search` or `title:iceberg`, to match. Click a hit to hydrate
-> the full row in the drawer.
+> **Tip:** the top-left selector now switches between the **`docs`** and **`catalog`** indexes — pick
+> the one you want to query. In the console's Lucene box a bare word (`search`) queries that index's
+> *default* field — qualify it with a field, e.g. `body:search` or `title:iceberg`, to match. Click a
+> hit to hydrate the full row in the drawer.
 
 - **Search & Explore** — run queries, inspect hits, hydrate rows in the drawer, export JSON/CSV.
 - **Indexes** — every index with docs / shards / sync lag / backup state; **Create index** points at
@@ -122,7 +130,74 @@ hit **Search**:
 
   ![GrowlerDB console — Observability: live SLIs, query-latency chart, and SLI cards](img/console-observability.png)
 
-## 4. Use the OpenSearch adapter (optional)
+## 4. Query playground (the `catalog` index)
+
+The second seeded index, **`catalog`**, is a 10-row catalog of GrowlerDB concepts with a field of
+every type — text (`title`, `body`), keyword (`id`, `category`, `author`), numeric (`views` LONG,
+`rating` DOUBLE), a `published` DATE, a `server_ip` IP, and an `archived` BOOL. It's built for
+trying out the [query language](reference): every operator below returns a small, known result.
+
+Because two indexes are served, **name the index in every request**:
+
+```sh
+curl -s localhost:8081/v1/search -H 'content-type: application/json' \
+  -d '{"index":"catalog","query":"body:hydrate","limit":10}'
+```
+
+That returns the two rows whose `body` mentions *hydrate* — `cat-02` and `cat-07`.
+
+### Lucene operators
+
+Each row below is a `query` you can drop into the request above (`{"index":"catalog","query":"…","limit":10}`).
+The **hits** column lists the exact `id`s expected against the seed data.
+
+| # | Operator | `query` | Expected hits (`id`) |
+|---|----------|---------|----------------------|
+| 1 | Term (field) | `body:iceberg` | cat-01, cat-03 |
+| 2 | Default-field term (bare word → `body`) | `hydrate` | cat-02, cat-07 |
+| 3 | Phrase | `body:"system of record"` | cat-03 |
+| 4 | Keyword term (exact) | `category:reference` | cat-02, cat-05, cat-06 |
+| 5 | Set / OR group | `category:(guide OR reference)` | cat-01, cat-02, cat-05, cat-06, cat-10 |
+| 6 | Numeric range (LONG, open upper) | `views:[2000 TO *]` | cat-01, cat-02, cat-05, cat-10 |
+| 7 | Float range (DOUBLE, exclusive) | `rating:{4.5 TO 5.0}` | cat-01, cat-02, cat-07, cat-10 |
+| 8 | Date range (open upper) | `published:[2024-01-01 TO *]` | cat-01, cat-02, cat-04, cat-05, cat-09, cat-10 |
+| 9 | CIDR (IP field) | `server_ip:10.0.0.0/8` | cat-01, cat-02, cat-04, cat-06, cat-08, cat-10 |
+| 10 | Wildcard | `author:ca*` | cat-03, cat-07, cat-09 (author `carol`) |
+| 11 | Prefix (`category:ref*`) | `category:ref*` | cat-02, cat-05, cat-06 |
+| 12 | Fuzzy (edit distance 1) | `body:hydrat~1` | cat-02, cat-07 (matches `hydrate`) |
+| 13 | Boost (ranking only) | `body:search^2 OR body:iceberg` | cat-01, cat-02, cat-03, cat-07 (search-matching rows ranked higher) |
+| 14 | Bool field | `archived:true` | cat-03, cat-06, cat-08 |
+| 15 | NOT / `-` | `-archived:true` | the other 7: cat-01, cat-02, cat-04, cat-05, cat-07, cat-09, cat-10 |
+| 16 | Match-all | `*:*` | all 10 rows |
+| 17 | Regex (KEYWORD `id`) | `id:/cat-0[12]/` | cat-01, cat-02 |
+
+A few notes:
+
+- **#2 default field.** A bare term queries `body` because `body` is the first TEXT field in the
+  `catalog` mapping (the engine's default search field is the first analyzed text field). `title` is
+  also TEXT but must be qualified (`title:reference` → cat-02, cat-06).
+- **#5 sets and #7 exclusive range.** `{ }` is exclusive, `[ ]` inclusive — mix them per bound,
+  e.g. `views:[1000 TO 2000]` → cat-03, cat-07.
+- **#9 CIDR.** `server_ip:192.168.1.0/24` narrows to cat-03, cat-05; `192.168.0.0/16` → cat-03,
+  cat-05, cat-07, cat-09. The IP field is explicit-only in the mapping (Iceberg has no IP type).
+- **#12 fuzzy / #13 boost.** Boost changes only the score, not the match set. Fuzzy `~1` allows one
+  edit; `hydrat~1` still reaches `hydrate`.
+- **#15 NOT.** `-archived:true` and `NOT archived:true` are equivalent; both equal `archived:false`.
+
+### KQL
+
+Send `"syntax":"kql"` to use **KQL** instead of Lucene — the difference is lowercase `and` / `or` /
+`not` operators (field/range/`*` syntax is the same):
+
+```sh
+curl -s localhost:8081/v1/search -H 'content-type: application/json' \
+  -d '{"index":"catalog","syntax":"kql","query":"category:guide or category:adr","limit":10}'
+```
+
+→ cat-01, cat-09, cat-10 (same as the Lucene `category:(guide OR adr)`). Likewise
+`author:carol and not archived:true` → cat-07, cat-09.
+
+## 5. Use the OpenSearch adapter (optional)
 
 The stack enables the [OpenSearch-compatible adapter](opensearch-adapter), so OpenSearch clients
 work against the same data:
@@ -148,7 +223,7 @@ You get OpenSearch-shaped documents — `_id` from the key, `_source` hydrated f
 
 So an existing OpenSearch/Elasticsearch client can point at GrowlerDB unchanged.
 
-## 5. See the source in Iceberg with Trino (optional)
+## 6. See the source in Iceberg with Trino (optional)
 
 GrowlerDB keeps **Iceberg as the system of record** and indexes it. To see that source data directly
 — and compare it with what GrowlerDB returns — bring up **Trino** (SQL over the *same* Polaris
@@ -184,7 +259,7 @@ It's now in Iceberg; a GrowlerDB **reindex** (`POST /v1/index:reindex`) picks it
 surfaces it — the full **source → index → search** loop, with Trino and GrowlerDB reading one source
 of truth.
 
-## 6. Tear down
+## 7. Tear down
 
 ```sh
 just stack-down
@@ -194,8 +269,12 @@ just stack-down
 
 - **First `just stack` is slow (~10 min).** It compiles the GrowlerDB image once; subsequent starts
   reuse the cached image and take seconds.
-- **Search returns `0 results` in the console.** Select the **`docs`** index (top-left) and qualify the
-  term with a field — `body:search`, not a bare `search` (a bare term only matches the default field).
+- **Search returns `0 results` in the console.** Select the right index (**`docs`** or **`catalog`**,
+  top-left) and qualify the term with a field — `body:search`, not a bare `search` (a bare term only
+  matches the default field).
+- **REST search/`keys:get` returns `index required; endpoint serves 2 indexes`.** The stack now serves
+  two indexes, so the gateway can't pick a default — add `"index":"docs"` or `"index":"catalog"` to
+  the request body.
 - **`keys:get` / hydration errors on the host** (`nodename nor servname` / connection refused): add the
   `127.0.0.1 minio` `/etc/hosts` entry from Prerequisites — host-side hydration reads object storage by
   that name.

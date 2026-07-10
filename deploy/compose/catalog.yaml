@@ -1,0 +1,32 @@
+# A rich (non-windowed) demo index over the seeded `growlerdb.catalog` table (task-241) — one row per
+# GrowlerDB concept, exercising every field type so the getting-started "query playground" can show
+# every Lucene/KQL operator against known data. Build + serve+register:
+#   growlerdb index growlerdb.catalog --def catalog.yaml --name catalog
+#   growlerdb serve catalog --addr 0.0.0.0:50052 --rest-addr 0.0.0.0:8083 --register http://controlplane:50071
+# The `--all-indexes` gateway (task-240) routes `{"index":"catalog", ...}` requests here automatically.
+#
+# NB on the default search field: the engine's default field is the *first analyzed TEXT field in
+# field order* (there is no `default_field` flag in the mapping schema — an unknown key is parsed and
+# ignored). `body` is therefore listed before `title` so a bare term like `hydrate` hits `body`. The
+# `default_field: true` marker on `body` documents that intent; it is accepted-and-ignored, so the
+# ordering is what actually makes it the default.
+name: catalog
+source:
+  iceberg:
+    catalog: growlerdb
+    table: growlerdb.catalog
+key:
+  identifier_fields: [id]
+mapping:
+  selection: EXPLICIT
+  fields:
+    - { path: id, type: KEYWORD }
+    - { path: body, type: TEXT, default_field: true }   # first TEXT field ⇒ the default search field
+    - { path: title, type: TEXT }
+    - { path: category, type: KEYWORD }
+    - { path: author, type: KEYWORD }
+    - { path: views, type: LONG, fast: true }
+    - { path: rating, type: DOUBLE, fast: true }
+    - { path: published, type: DATE, format: epoch_ms, fast: true }
+    - { path: server_ip, type: IP }
+    - { path: archived, type: BOOL, fast: true }
