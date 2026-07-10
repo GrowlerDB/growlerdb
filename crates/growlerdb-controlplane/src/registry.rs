@@ -160,6 +160,12 @@ struct RegistryFile {
     /// IdP. Defaulted for older registry files.
     #[serde(default)]
     credentials: BTreeMap<String, String>,
+    /// Per-subject **index allowlist** for built-in login (task-244, extending task-240): `subject →
+    /// allowed index names`. When a subject has a binding, their minted session JWT carries these as
+    /// the `indexes` claim, so per-index RBAC restricts them to exactly this set. Absent/empty =
+    /// unrestricted (the pre-task-244 default). Defaulted for older registry files.
+    #[serde(default)]
+    index_bindings: BTreeMap<String, Vec<String>>,
 }
 
 /// A persisted API token (task-105): long-lived programmatic credential. Only the secret's hash is
@@ -356,6 +362,10 @@ pub struct Registry {
     /// Built-in local credentials (task-128): `subject → argon2 PHC hash`. Lock order is **last**,
     /// after `tokens` (indexes → aliases → saved_queries → role_bindings → tokens → credentials).
     credentials: RwLock<BTreeMap<String, String>>,
+    /// Per-subject index allowlist for built-in login (task-244): `subject → allowed index names`.
+    /// Threaded into the session JWT's `indexes` claim so per-index RBAC (task-240) restricts the
+    /// subject. Lock order is **after `credentials`** (… → credentials → index_bindings).
+    index_bindings: RwLock<BTreeMap<String, Vec<String>>>,
     /// Per-index activity log (task-110): `index → events`, bounded + append-only. Persisted to a
     /// **separate** `activity.json` (non-critical, lossy-on-corruption) so the registry's atomic
     /// envelope stays small. Lock is independent (acquired last).
@@ -405,19 +415,20 @@ impl Registry {
         lock.try_lock_exclusive()
             .map_err(|_| RegistryError::Locked(lock_path))?;
 
-        let (indexes, aliases, saved_queries, role_bindings, tokens, credentials) = if path.exists()
-        {
-            load(&path)?
-        } else {
-            (
-                BTreeMap::new(),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                BTreeMap::new(),
-            )
-        };
+        let (indexes, aliases, saved_queries, role_bindings, tokens, credentials, index_bindings) =
+            if path.exists() {
+                load(&path)?
+            } else {
+                (
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                )
+            };
         // Activity log sidecar (task-110): best-effort — a missing/corrupt log starts empty rather
         // than failing registry startup (it's an audit convenience, not catalog state).
         let activity_path = path.with_file_name("activity.json");
@@ -448,6 +459,7 @@ impl Registry {
             token_by_hash: RwLock::new(token_by_hash),
             next_token: std::sync::atomic::AtomicU64::new(0),
             credentials: RwLock::new(credentials),
+            index_bindings: RwLock::new(index_bindings),
             activity: RwLock::new(activity),
             activity_path,
             activity_flush: std::sync::Mutex::new(ActivityFlush::default()),
@@ -514,6 +526,18 @@ impl Registry {
         self.credentials.write().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn read_index_bindings(&self) -> RwLockReadGuard<'_, BTreeMap<String, Vec<String>>> {
+        self.index_bindings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write_index_bindings(&self) -> RwLockWriteGuard<'_, BTreeMap<String, Vec<String>>> {
+        self.index_bindings
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Snapshot every core map under brief read locks and write the registry file **off any data
     /// lock** (task-151 / F10). A mutation applies its change in memory, releases its write lock, then
     /// calls this — so routing reads (`resolve`/`shard_map`/`get`/`list`) never block on the fsync,
@@ -533,6 +557,7 @@ impl Registry {
             role_bindings: self.read_bindings().clone(),
             tokens: self.read_tokens().clone(),
             credentials: self.read_credentials().clone(),
+            index_bindings: self.read_index_bindings().clone(),
         };
         let json = serde_json::to_vec_pretty(&file)?;
         growlerdb_core::durable::write_keeping_prev(&self.path, &json)?;
@@ -756,6 +781,49 @@ impl Registry {
         Ok(())
     }
 
+    /// The index allowlist bound to `subject` for built-in login (task-244) — threaded into the
+    /// session JWT's `indexes` claim so per-index RBAC (task-240) restricts them. Empty (no binding)
+    /// = unrestricted across indexes. Empty for an unknown/empty subject.
+    pub fn indexes_for(&self, subject: &str) -> Vec<String> {
+        if subject.is_empty() {
+            return Vec::new();
+        }
+        self.read_index_bindings()
+            .get(subject)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Set (replace) `subject`'s index allowlist (task-244). Empty `indexes` removes the binding
+    /// (making the subject unrestricted). Entries are de-duplicated and order-stable; an empty
+    /// `subject` is rejected. Like a role change, this bumps the subject's session epoch so an
+    /// outstanding token minted with the old scope is superseded and they re-authenticate.
+    pub fn set_user_indexes(&self, subject: &str, indexes: Vec<String>) -> Result<()> {
+        if subject.trim().is_empty() {
+            return Err(RegistryError::SavedQueryNotFound("(empty subject)".into()));
+        }
+        let mut deduped: Vec<String> = Vec::new();
+        for i in indexes {
+            let i = i.trim().to_string();
+            if !i.is_empty() && !deduped.contains(&i) {
+                deduped.push(i);
+            }
+        }
+        {
+            // Hold only `index_bindings` — persist_snapshot re-reads every map off-lock (B5/F10).
+            let mut bindings = self.write_index_bindings();
+            if deduped.is_empty() {
+                bindings.remove(subject);
+            } else {
+                bindings.insert(subject.to_string(), deduped);
+            }
+        }
+        self.persist_snapshot()?;
+        // A scope change takes effect immediately: supersede outstanding sessions (like a role change).
+        self.revoke_sessions(subject);
+        Ok(())
+    }
+
     /// All API tokens (task-105), newest first. The caller strips the `hash` before returning to a
     /// client — only metadata leaves the control plane.
     pub fn list_tokens(&self) -> Vec<ApiToken> {
@@ -850,6 +918,12 @@ impl Registry {
     /// on first closed-mode boot.
     pub fn has_credentials(&self) -> bool {
         !self.read_credentials().is_empty()
+    }
+
+    /// Whether `subject` has a built-in credential (task-244) — lets a seeder be idempotent about a
+    /// single account (e.g. the demo user) without clobbering an operator-changed password on restart.
+    pub fn has_credential(&self, subject: &str) -> bool {
+        self.read_credentials().contains_key(subject)
     }
 
     /// Look up a token by its secret's `hash` (task-105) — used by the authenticator on every
@@ -1389,6 +1463,7 @@ type LoadedRegistry = (
     BTreeMap<String, Vec<String>>,
     BTreeMap<String, ApiToken>,
     BTreeMap<String, String>,
+    BTreeMap<String, Vec<String>>,
 );
 
 fn load(path: &std::path::Path) -> Result<LoadedRegistry> {
@@ -1401,6 +1476,7 @@ fn load(path: &std::path::Path) -> Result<LoadedRegistry> {
             f.role_bindings,
             f.tokens,
             f.credentials,
+            f.index_bindings,
         ))
     }
     match std::fs::read(path)
@@ -1530,6 +1606,8 @@ mod tests {
             reg.set_alias("d", ["docs"]).unwrap(); // aliases
             reg.set_user_roles("alice", vec!["admin".into()]).unwrap(); // role_bindings
             reg.set_credential("alice", "pw").unwrap(); // credentials
+            reg.set_user_indexes("alice", vec!["docs".into(), "catalog".into()])
+                .unwrap(); // index_bindings (task-244)
         }
         let reg2 = Registry::open(&path).unwrap();
         assert!(reg2.get("docs").is_some(), "index survived");
@@ -1544,6 +1622,38 @@ mod tests {
             "binding survived"
         );
         assert!(reg2.verify_credential("alice", "pw"), "credential survived");
+        assert_eq!(
+            reg2.indexes_for("alice"),
+            vec!["docs".to_string(), "catalog".to_string()],
+            "index binding survived"
+        );
+    }
+
+    #[test]
+    fn index_bindings_scope_a_subject_and_revoke_sessions_on_change() {
+        // task-244: a subject's index allowlist is de-duplicated, revokes outstanding sessions on
+        // change (so a re-scoped session must re-authenticate), and clears when set empty.
+        let dir = tempfile::tempdir().unwrap();
+        let reg = Registry::open(dir.path().join("registry.json")).unwrap();
+        assert!(
+            reg.indexes_for("demo").is_empty(),
+            "no binding = unrestricted"
+        );
+        reg.set_user_indexes("demo", vec!["docs".into(), "docs".into(), "catalog".into()])
+            .unwrap();
+        assert_eq!(
+            reg.indexes_for("demo"),
+            vec!["docs".to_string(), "catalog".to_string()],
+            "de-duplicated, order-stable"
+        );
+        let epoch = reg.session_epoch("demo");
+        assert!(
+            epoch > 0,
+            "a scope change bumps the session epoch (task-147 / B4)"
+        );
+        // Clearing the allowlist removes the binding (subject becomes unrestricted again).
+        reg.set_user_indexes("demo", vec![]).unwrap();
+        assert!(reg.indexes_for("demo").is_empty());
     }
 
     fn resolved(name: &str) -> ResolvedIndex {

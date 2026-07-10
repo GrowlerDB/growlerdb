@@ -22,6 +22,18 @@ Authenticate to obtain a session the gateway trusts. Two modes:
 available, so the [console](/product/interfaces/ui.md) shows the right login gate. Open mode serves
 anonymously; closed mode gates every request.
 
+A built-in session may also be **scoped to a set of indexes**: the control plane binds an index
+allowlist to a subject and stamps it into the minted session token's `indexes` claim, so per-index
+RBAC restricts that session to exactly those indexes (see
+[RBAC & tenancy](/product/functional/rbac-and-tenancy.md)). Absent = unrestricted across indexes.
+
+## The demo
+
+The Compose demo (`just stack`) runs **authenticated, not open**: the gateway enforces built-in login
+and the control plane mints session tokens. A well-known `demo` / `demo` credential — roles
+`reader` + `operator`, scoped to the demo indexes (`docs`, `catalog`) — lets the walkthrough show
+login and per-index scoping working end to end. It is a demo credential, not a production account.
+
 ## Notes
 
 Login is rate-limited and the timing is constant to avoid a username-enumeration oracle. See

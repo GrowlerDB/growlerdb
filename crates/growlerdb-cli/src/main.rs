@@ -416,6 +416,15 @@ enum Command {
         /// with `--oidc-issuer`; requires `--auth-secret` (shared with the gateway).
         #[arg(long, conflicts_with = "oidc_issuer", requires = "auth_secret")]
         builtin_auth: bool,
+        /// Login-only mode (task-244, the `just stack` demo): enable the `/v1/login` RPC (mint session
+        /// JWTs) and seed the demo/admin users, but leave the control plane's OWN authorization **open**
+        /// — so the enforcement point is the gateway (`--builtin-auth`) on the public data plane, while
+        /// the internal node/gateway control-plane RPCs (registration, shard-map reads) stay reachable
+        /// without a service credential. Unlike `--builtin-auth`, this does NOT gate the control plane;
+        /// it only turns on token minting. Requires `--auth-secret`; mutually exclusive with
+        /// `--builtin-auth` / `--oidc-issuer`.
+        #[arg(long, conflicts_with_all = ["oidc_issuer", "builtin_auth"], requires = "auth_secret")]
+        login_secret: bool,
         /// Shared HMAC secret for built-in session JWTs — must match the gateway's. Env:
         /// `GROWLERDB_AUTH_SECRET`.
         #[arg(long, env = "GROWLERDB_AUTH_SECRET")]
@@ -784,6 +793,7 @@ async fn main() -> anyhow::Result<()> {
             oidc_issuer,
             oidc_audience,
             builtin_auth,
+            login_secret,
             auth_secret,
             admin_user,
             admin_password,
@@ -795,6 +805,7 @@ async fn main() -> anyhow::Result<()> {
                 oidc_issuer,
                 oidc_audience,
                 builtin_auth,
+                login_secret,
                 auth_secret,
                 admin_user,
                 admin_password,
@@ -3444,6 +3455,72 @@ fn spawn_windowed_registration(
     });
 }
 
+/// Seed the built-in users on first closed-mode / login boot (task-128/244). Idempotent:
+/// - the **admin** (role `admin`) is seeded only if the registry has NO credentials yet, with the
+///   supplied password or a generated one printed once;
+/// - a **demo** user is seeded when `GROWLERDB_DEMO_USER` is set (the `just stack` demo) and it
+///   doesn't already exist — a well-known, index-scoped credential so the walkthrough SHOWS login +
+///   per-index RBAC (task-240), not open access. Roles `reader, operator` (query + read metadata +
+///   ops read; NOT admin/write) and an `indexes` allowlist (default `docs,catalog`) that the minted
+///   session JWT carries so the gateway restricts the demo user to exactly those indexes.
+///
+/// Shared by the `--builtin-auth` (closed) and `--login-secret` (demo, login-only) control-plane
+/// modes so both establish the same accounts.
+fn seed_builtin_users(
+    registry: &growlerdb_controlplane::Registry,
+    admin_user: &str,
+    admin_password: Option<String>,
+) -> anyhow::Result<()> {
+    if !registry.has_credentials() {
+        let password = admin_password.unwrap_or_else(|| {
+            // No password supplied → generate a strong one and print it ONCE.
+            let p = growlerdb_engine::mint_api_token().0;
+            println!("control plane: seeded admin `{admin_user}` with a generated password:");
+            println!("    {p}");
+            println!(
+                "control plane: (set --admin-password / GROWLERDB_ADMIN_PASSWORD to choose one)"
+            );
+            p
+        });
+        registry
+            .set_credential(admin_user, &password)
+            .map_err(|e| anyhow::anyhow!("seeding admin credential: {e}"))?;
+        registry
+            .set_user_roles(admin_user, vec!["admin".to_string()])
+            .map_err(|e| anyhow::anyhow!("seeding admin roles: {e}"))?;
+        println!("control plane: seeded built-in admin user `{admin_user}` (role: admin)");
+    }
+    if let Ok(demo_user) = std::env::var("GROWLERDB_DEMO_USER") {
+        let demo_user = demo_user.trim().to_string();
+        if !demo_user.is_empty() && !registry.has_credential(&demo_user) {
+            let demo_password =
+                std::env::var("GROWLERDB_DEMO_PASSWORD").unwrap_or_else(|_| "demo".to_string());
+            let demo_roles = vec!["reader".to_string(), "operator".to_string()];
+            let demo_indexes: Vec<String> = std::env::var("GROWLERDB_DEMO_INDEXES")
+                .unwrap_or_else(|_| "docs,catalog".to_string())
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            registry
+                .set_credential(&demo_user, &demo_password)
+                .map_err(|e| anyhow::anyhow!("seeding demo credential: {e}"))?;
+            registry
+                .set_user_roles(&demo_user, demo_roles.clone())
+                .map_err(|e| anyhow::anyhow!("seeding demo roles: {e}"))?;
+            registry
+                .set_user_indexes(&demo_user, demo_indexes.clone())
+                .map_err(|e| anyhow::anyhow!("seeding demo index scope: {e}"))?;
+            println!(
+                "control plane: seeded demo user `{demo_user}` (roles: {}; indexes: {})",
+                demo_roles.join(", "),
+                demo_indexes.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Run the Control Plane: serve the index registry (create / drop / list) over gRPC,
 /// persisted at `{data_dir}/registry.json`.
 #[allow(clippy::too_many_arguments)]
@@ -3454,6 +3531,7 @@ async fn control_plane(
     oidc_issuer: Option<String>,
     oidc_audience: Option<String>,
     builtin_auth: bool,
+    login_secret: bool,
     auth_secret: Option<String>,
     admin_user: String,
     admin_password: Option<String>,
@@ -3501,26 +3579,10 @@ async fn control_plane(
     } else if builtin_auth {
         // Built-in (no external IdP) closed mode (task-128): the /v1/login RPC mints session JWTs
         // from the registry credential store; the control plane validates them (+ API tokens) and
-        // enforces RBAC. Seed an initial admin on first boot so the deployment is reachable.
+        // enforces RBAC. Seed the built-in users on first boot so the deployment is reachable.
         let secret = auth_secret
             .ok_or_else(|| anyhow::anyhow!("--auth-secret is required with --builtin-auth"))?;
-        if !registry.has_credentials() {
-            let password = admin_password.unwrap_or_else(|| {
-                // No password supplied → generate a strong one and print it ONCE.
-                let p = growlerdb_engine::mint_api_token().0;
-                println!("control plane: seeded admin `{admin_user}` with a generated password:");
-                println!("    {p}");
-                println!("control plane: (set --admin-password / GROWLERDB_ADMIN_PASSWORD to choose one)");
-                p
-            });
-            registry
-                .set_credential(&admin_user, &password)
-                .map_err(|e| anyhow::anyhow!("seeding admin credential: {e}"))?;
-            registry
-                .set_user_roles(&admin_user, vec!["admin".to_string()])
-                .map_err(|e| anyhow::anyhow!("seeding admin roles: {e}"))?;
-            println!("control plane: seeded built-in admin user `{admin_user}` (role: admin)");
-        }
+        seed_builtin_users(&registry, &admin_user, admin_password)?;
         let tokens = Arc::new(growlerdb_engine::RegistryTokenAuthenticator::new(
             registry.clone(),
         ));
@@ -3543,6 +3605,22 @@ async fn control_plane(
         )
         .with_authn(chain)
         .with_session_secret(secret.into_bytes())
+    } else if login_secret {
+        // Login-only mode (task-244, the `just stack` demo): mint session JWTs via `/v1/login` and
+        // seed the built-in users, but leave the control plane's OWN authorization **open**. The
+        // enforcement point is the gateway (`--builtin-auth`) on the public data plane; the control
+        // plane stays reachable for the internal node/gateway RPCs (registration, shard-map reads)
+        // that carry no service credential. This does NOT gate the control plane — it only turns on
+        // token minting — so it is not a regression from the open control plane, just login on top.
+        let secret = auth_secret
+            .ok_or_else(|| anyhow::anyhow!("--auth-secret is required with --login-secret"))?;
+        seed_builtin_users(&registry, &admin_user, admin_password)?;
+        println!(
+            "control plane: login enabled (/v1/login mints session JWTs) — authorization OPEN \
+             (enforcement is at the gateway); internal registration stays reachable"
+        );
+        growlerdb_engine::ControlPlaneService::new(registry, IcebergConfig::from_env())
+            .with_session_secret(secret.into_bytes())
     } else {
         eprintln!("control plane: WARNING authorization disabled (no --oidc-issuer / --builtin-auth); it is open");
         growlerdb_engine::ControlPlaneService::new(registry, IcebergConfig::from_env())
