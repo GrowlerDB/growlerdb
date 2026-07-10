@@ -30,6 +30,11 @@ mapping:
     - { path: author, type: KEYWORD, cached: true }
     - { path: views, type: LONG, fast: true, cached: true }
     - { path: rating, type: DOUBLE, fast: true, cached: true }
+    # `fast: true` builds a columnar store for range/sort/aggregate; a DATE range like
+    # `published:[2024-01-01 TO *]` scans it. Term matching is separate: it needs the inverted
+    # index (`indexed: true`) — which TEXT/KEYWORD get by default but numeric/BOOL/DATE do not.
     - { path: published, type: DATE, format: epoch_ms, fast: true }
     - { path: server_ip, type: IP }
-    - { path: archived, type: BOOL, fast: true }
+    # `indexed: true` so the BOOL *term* filter `archived:true` (playground #14/#15) has postings to
+    # match — a `fast`-only BOOL is range/sortable but not term-queryable, so the filter would be empty.
+    - { path: archived, type: BOOL, indexed: true }

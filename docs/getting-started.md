@@ -184,35 +184,38 @@ The **hits** column lists the exact `id`s expected against the seed data.
 | 2 | Default-field term (bare word → `body`) | `hydrate` | cat-02, cat-07 |
 | 3 | Phrase | `body:"system of record"` | cat-03 |
 | 4 | Keyword term (exact) | `category:reference` | cat-02, cat-05, cat-06 |
-| 5 | Set / OR | `category:guide OR category:reference` | cat-01, cat-02, cat-05, cat-06, cat-10 |
+| 5 | Set / OR (grouped) | `category:(guide OR reference)` | cat-01, cat-02, cat-05, cat-06, cat-10 |
 | 6 | Numeric range (LONG, open upper) | `views:[2000 TO *]` | cat-01, cat-02, cat-05, cat-10 |
 | 7 | Float range (DOUBLE, exclusive) | `rating:{4.5 TO 5.0}` | cat-01, cat-02, cat-07, cat-10 |
-| 8 | Date range (epoch-µs bounds) | `published:[1704067200000000 TO *]` | cat-01, cat-02, cat-04, cat-05, cat-09, cat-10 |
+| 8 | Date range (ISO-date bounds) | `published:[2024-01-01 TO *]` | cat-01, cat-02, cat-04, cat-05, cat-09, cat-10 |
 | 9 | CIDR (IP field) | `server_ip:10.0.0.0/8` | cat-01, cat-02, cat-04, cat-06, cat-08, cat-10 |
 | 10 | Wildcard | `author:ca*` | cat-03, cat-07, cat-09 (author `carol`) |
 | 11 | Prefix (`category:ref*`) | `category:ref*` | cat-02, cat-05, cat-06 |
 | 12 | Fuzzy (edit distance 1) | `body:hydrat~1` | cat-02, cat-07 (matches `hydrate`) |
 | 13 | Boost (ranking only) | `body:search^2 OR body:iceberg` | cat-01, cat-02, cat-03, cat-07 (search-matching rows ranked higher) |
-| 14 | NOT / `-` | `-category:reference` | the other 7: cat-01, cat-03, cat-04, cat-07, cat-08, cat-09, cat-10 |
-| 15 | Match-all | `*:*` | all 10 rows |
-| 16 | Regex (KEYWORD `id`) | `id:/cat-0[12]/` | cat-01, cat-02 |
+| 14 | BOOL term | `archived:true` | cat-03, cat-06, cat-08 |
+| 15 | NOT / `-` | `-archived:true` | the other 7: cat-01, cat-02, cat-04, cat-05, cat-07, cat-09, cat-10 |
+| 16 | Match-all | `*:*` | all 10 rows |
+| 17 | Regex (KEYWORD `id`) | `id:/cat-0[12]/` | cat-01, cat-02 |
 
 A few notes:
 
 - **#2 default field.** A bare term queries `body` because `body` is the first TEXT field in the
   `catalog` mapping (the engine's default search field is the first analyzed text field). `title` is
   also TEXT but must be qualified (`title:reference` → cat-02, cat-06).
-- **#5 sets and #7 exclusive range.** `{ }` is exclusive, `[ ]` inclusive — mix them per bound,
-  e.g. `views:[1000 TO 2000]` → cat-03, cat-07.
+- **#5 grouped set and #7 exclusive range.** `category:(guide OR reference)` groups two terms on one
+  field — the same match set as writing `category:guide OR category:reference` out in full. `{ }` is
+  exclusive, `[ ]` inclusive — mix them per bound, e.g. `views:[1000 TO 2000]` → cat-03, cat-07.
 - **#9 CIDR.** `server_ip:192.168.1.0/24` narrows to cat-03, cat-05; `192.168.0.0/16` → cat-03,
   cat-05, cat-07, cat-09. The IP field is explicit-only in the mapping (Iceberg has no IP type).
 - **#12 fuzzy / #13 boost.** Boost changes only the score, not the match set. Fuzzy `~1` allows one
   edit; `hydrat~1` still reaches `hydrate`.
-- **#8 dates.** `published` is stored as canonical epoch-**microseconds**, so range bounds are micros
-  (`2024-01-01` = `1704067200000000`). Human-readable date bounds, and querying the `archived` **BOOL**
-  field, are known gaps (tracked in task-247) — the `archived` field is stored but not yet Lucene-queryable.
-- **#14 NOT.** `-category:reference` and `NOT category:reference` are equivalent — every doc except
-  the three `reference` ones.
+- **#8 dates.** `published` is a DATE field, so range bounds accept an **ISO-8601 date string**
+  (`2024-01-01`) *or* the equivalent epoch-**microseconds** (`1704067200000000`) — both resolve to the
+  same canonical instant, so `published:[2024-01-01 TO *]` and `published:[1704067200000000 TO *]`
+  return the same rows.
+- **#14 BOOL / #15 NOT.** `archived:true` matches the three archived rows; the negation `-archived:true`
+  (≡ `NOT archived:true`) returns the other seven. `-` and `NOT` are equivalent.
 
 ### KQL
 
@@ -294,18 +297,89 @@ docker compose -f deploy/compose/docker-compose.yml exec trino \
 ```
 
 Those are exactly the rows a GrowlerDB search hydrates — `body:iceberg` returns `doc-2` above, and
-here you can see the full row in Iceberg. You can also **add a row** straight to the lake:
+here you can see the full row in Iceberg. The next section uses this Trino connection to run the full
+**insert → reindex → search** loop.
+
+## 8. The full cycle: add a document, then find it
+
+Iceberg is the source of truth, so a new row **starts in the lake** and GrowlerDB catches up by
+**reindexing from source**. This section walks the whole loop against the richer `catalog` index
+(section 5): insert `cat-11` via Trino SQL, reindex, then search for it.
+
+### Insert a row via Trino
+
+With Trino up (section 7), insert one row into `iceberg.growlerdb.catalog` — a value for every
+column, matching the table's types (`views` BIGINT, `rating` DOUBLE, `published` epoch-**ms** BIGINT,
+`archived` BOOLEAN, the rest VARCHAR):
 
 ```sh
 docker compose -f deploy/compose/docker-compose.yml exec trino trino --execute \
-  "INSERT INTO iceberg.growlerdb.docs VALUES ('doc-4','trino insert','added to iceberg via trino sql')"
+  "INSERT INTO iceberg.growlerdb.catalog VALUES ('cat-11','Trino Insert Roundtrip','insert a row through trino then reindex growlerdb to make it searchable end to end','tutorial','alice',BIGINT '1234',DOUBLE '4.5',BIGINT '1719792000000','10.0.5.11',false)"
 ```
 
-It's now in Iceberg; a GrowlerDB **reindex** (`POST /v1/index:reindex`) picks it up so the same search
-surfaces it — the full **source → index → search** loop, with Trino and GrowlerDB reading one source
-of truth.
+`1719792000000` is `2024-07-01` in epoch-milliseconds (the `published` field's `format: epoch_ms`).
+The row is now in Iceberg — a Trino `SELECT ... WHERE id = 'cat-11'` shows it immediately — **but the
+`catalog` index doesn't know about it yet**. A search for it still returns nothing until we reindex.
 
-## 8. Tear down
+### Reindex the `catalog` index (needs the admin token)
+
+GrowlerDB rebuilds an index from its source with `POST /v1/index:reindex {"index":"catalog"}`. This is
+an **Admin-scoped** operation: in [`rbac.rs`](https://github.com/GrowlerDB/growlerdb/blob/main/crates/growlerdb-engine/src/rbac.rs)
+`scope_for_method` maps `ReindexIndex → Scope::Admin`, and the **`demo` user holds only `reader` +
+`operator`** (Search, IndexRead, Ops — *not* Admin). So the demo token **cannot** reindex; it gets a
+`403` (`` `ReindexIndex` requires the `admin` scope ``). Use the built-in **admin** user instead.
+
+The control plane seeds an `admin` user on first boot and, since no password is set in the demo env,
+**prints a generated one once** in its logs. Grab it, then log in as `admin` for an admin-scoped token:
+
+```sh
+# The admin password, printed once at first startup:
+docker compose -f deploy/compose/docker-compose.yml logs controlplane | grep -A1 'generated password'
+
+# Mint an admin token (same /v1/login endpoint, admin credential):
+ADMIN_TOKEN=$(curl -s localhost:8081/v1/login -H 'content-type: application/json' \
+  -d '{"username":"admin","password":"<paste-the-printed-password>"}' | jq -r .token)
+```
+
+Now reindex `catalog` with the admin bearer — GrowlerDB re-reads the Iceberg table (all 11 rows) and
+durably swaps the rebuilt index in:
+
+```sh
+curl -s localhost:8081/v1/index:reindex -H 'content-type: application/json' \
+  -H "authorization: Bearer $ADMIN_TOKEN" -d '{"index":"catalog"}'
+```
+
+```json
+{ "doc_count": 11, "snapshot": "…" }
+```
+
+`doc_count: 11` confirms the new row was picked up.
+
+### Search for the new row
+
+Back with the ordinary demo `$TOKEN` (reader is enough to query), search for a term unique to `cat-11`
+— its `body` is the only one mentioning *trino*:
+
+```sh
+curl -s localhost:8081/v1/search -H 'content-type: application/json' -H "authorization: Bearer $TOKEN" \
+  -d '{"index":"catalog","query":"body:trino","limit":5}'
+```
+
+```json
+{ "hits": [ { "coordinates": { "identifier": [{ "name": "id", "value": "cat-11" }] }, "score": 0.9 } ],
+  "total": 1, "shards_scanned": 1, "shards_total": 1 }
+```
+
+`cat-11` now appears — the full **insert (Trino) → reindex (from source) → search** loop, with Trino
+and GrowlerDB reading one source of truth. Hydrate it with `keys:get` (section 3) to see every column.
+
+> **Continuous sync instead of manual reindex.** Reindex is a full rebuild you trigger by hand. For a
+> table that changes continuously, GrowlerDB reads the Iceberg **changelog** and ingests incrementally
+> — the streaming demo (`just pipeline`) wires generator → Redpanda → Iceberg → connector → index so
+> new rows appear without a reindex. Watch it on the console's **Observability → Ingestion** screen and
+> in `deploy/compose/pipeline/README.md`.
+
+## 9. Tear down
 
 ```sh
 just stack-down
