@@ -438,6 +438,30 @@ services:
       sink:
         condition: service_started
 
+  # Trino — query the Iceberg tables directly with SQL to see the source data GrowlerDB indexes and
+  # compare source vs. index (task-242). Reads the same Polaris catalog + MinIO the seed writes. Heavy
+  # (JVM), so it's gated behind the `trino` profile: `docker compose --profile trino up -d trino`,
+  # then `docker compose exec trino trino` and `SELECT * FROM iceberg.growlerdb.docs;`.
+  trino:
+    profiles: ["trino"]
+    image: trinodb/trino:470
+    depends_on:
+      polaris:
+        condition: service_started
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./trino/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
+    ports:
+      - "8082:8080" # Trino REST/UI on host 8082 (8081 is the GrowlerDB gateway)
+    healthcheck:
+      # /v1/info answers before the query engine is ready; wait for "starting":false so
+      # `depends_on` doesn't hand users a "server is still initializing" error.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/v1/info | grep -q '\"starting\":false'"]
+      interval: 5s
+      timeout: 3s
+      retries: 40
+
 volumes:
   minio-data:
   cp-data:
