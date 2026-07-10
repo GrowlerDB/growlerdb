@@ -26,7 +26,9 @@ callers use the **Lucene-style string** (the default for `/v1/search`'s `query`)
 | Default-field term | `iceberg` | Term against the index's default text field. |
 | Phrase | `title:"iceberg search"` | Ordered tokens; add slop with `~2`. |
 | Boolean | `a AND b`, `a OR b`, `NOT c`, `-c` | Combine clauses; `()` groups. |
-| Range | `age:[18 TO 65]` | `[` `]` inclusive, `{` `}` exclusive; mix freely; `*`/empty = unbounded. |
+| Field-grouped set | `category:(guide OR reference)` | The field prefix distributes over the group — equivalent to `category:guide OR category:reference` (works with `AND`/implicit-AND too). |
+| Bool term | `archived:true`, `active:false` | Exact match on a `BOOL` field. |
+| Range | `age:[18 TO 65]`, `published:[2024-01-01 TO *]` | `[` `]` inclusive, `{` `}` exclusive; mix freely; `*`/empty = unbounded. On a `DATE` field a bound is epoch **micros** or an **ISO-8601 / RFC3339** date (`2024-01-01`, `2024-01-01T00:00:00Z`). |
 | Wildcard | `device_id:sensor-*`, `code:??x` | `*` (many) / `?` (one). A leading `*` is cost-guarded. |
 | Fuzzy | `name:jon~1` | Edit distance 0–2 (`~` alone = 2). |
 | Prefix | `path:/var/*` | Literal prefix match. |
