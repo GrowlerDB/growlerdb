@@ -31,9 +31,12 @@ A summary of GrowlerDB's security design:
   `tenant_field = <verified claim>` filter ANDed in; no query structure (`OR`, nested bool) can
   widen past it, and a missing claim is denied. The same scope is enforced across search, hydration
   (post-filtered against the authoritative Iceberg value), aggregation, and export; suggest fails
-  closed on a tenant-scoped index. The search path is verified end-to-end in
-  `crates/growlerdb-engine/tests/tenant_isolation.rs`; the other paths are covered by their service
-  tests.
+  closed on a tenant-scoped index. **Every read path is verified end-to-end** in
+  `crates/growlerdb-engine/tests/tenant_isolation.rs` — search, aggregation, hydration, and export
+  each proving a forged tenant header / widening query can't widen past the filter and a missing
+  claim is denied, and suggest failing closed. The one part that needs a live Iceberg catalog — the
+  authoritative-value drop that discards a hydrated row belonging to another tenant — is verified as
+  a unit in `lookup_service.rs`.
 - **Encryption.** In transit via TLS/mTLS; at rest via encrypted volumes + bucket encryption
   (deployment-provided).
 
