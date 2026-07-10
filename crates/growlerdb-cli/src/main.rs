@@ -344,6 +344,13 @@ enum Command {
         /// union of its members' shards. Each shard's `NodeId` is its gRPC endpoint.
         #[arg(long)]
         index: Option<String>,
+        /// Front **every** registered index over one endpoint (task-240 multi-index routing): each
+        /// request routes to its named index's shard-set, resolved lazily from `--control-plane` on
+        /// first use and hot-reloaded independently. Mutually exclusive with `--index`; requires
+        /// `--control-plane`. Readiness flips when the control plane is reachable, not when an index
+        /// resolves. Per-index RBAC still applies (a token scoped to index A can't read index B).
+        #[arg(long, conflicts_with = "index", requires = "control_plane")]
+        all_indexes: bool,
         /// Address to serve the Engine API over gRPC (`host:port`).
         #[arg(long, default_value = "127.0.0.1:50061")]
         addr: String,
@@ -738,6 +745,7 @@ async fn main() -> anyhow::Result<()> {
             node_addr,
             registry,
             index,
+            all_indexes,
             addr,
             rest_addr,
             oidc_issuer,
@@ -754,6 +762,7 @@ async fn main() -> anyhow::Result<()> {
                 node_addr: node_addr.as_deref(),
                 registry: registry.as_deref(),
                 index: index.as_deref(),
+                all_indexes,
                 addr: &addr,
                 rest_addr: &rest_addr,
                 oidc_issuer: oidc_issuer.as_deref(),
@@ -1954,6 +1963,8 @@ struct GatewayConfig<'a> {
     node_addr: Option<&'a str>,
     registry: Option<&'a str>,
     index: Option<&'a str>,
+    /// Front every registered index over one endpoint (task-240). Mutually exclusive with `index`.
+    all_indexes: bool,
     addr: &'a str,
     rest_addr: &'a str,
     oidc_issuer: Option<&'a str>,
@@ -1981,6 +1992,7 @@ async fn gateway(cfg: GatewayConfig<'_>) -> anyhow::Result<()> {
         node_addr,
         registry,
         index,
+        all_indexes,
         addr,
         rest_addr,
         oidc_issuer,
@@ -2029,57 +2041,80 @@ async fn gateway(cfg: GatewayConfig<'_>) -> anyhow::Result<()> {
         Option<tonic::transport::ClientTlsConfig>,
         WindowFingerprint,
     )> = None;
-    let (gw, routed_to) = match (registry, index, node_addr) {
-        (Some(registry), Some(index), _) => {
-            let gw = gateway_from_registry(registry, index, node_tls.clone()).await?;
-            let desc = format!("index `{index}` ({} shard(s))", gw.shard_count());
-            let windowed = growlerdb_controlplane::Registry::open(registry)
-                .ok()
-                .and_then(|r| r.get(index))
-                .is_some_and(|e| e.definition.windowing.is_some());
-            if reload_secs > 0 && !windowed {
-                reload = Some((registry.to_string(), index.to_string(), node_tls.clone()));
+    let (gw, routed_to) = if all_indexes {
+        // Multi-index (task-240): front EVERY registered index over one endpoint, resolving each
+        // named index lazily from the live control-plane on first use and hot-reloading each
+        // independently. Readiness (below) is the control plane's reachability — we don't block boot
+        // on any one index resolving, so a fresh cluster with no indexes yet still serves.
+        let cp = control_plane.ok_or_else(|| {
+            anyhow::anyhow!(
+                "--all-indexes requires --control-plane (the live registry to route from)"
+            )
+        })?;
+        // Wait until the control plane is reachable (task-142): up but /readyz not-ready meanwhile,
+        // rather than crash-looping when rolled alongside the control-plane.
+        wait_for_control_plane(cp).await;
+        let resolver = std::sync::Arc::new(CpRouteResolver {
+            cp: cp.to_string(),
+            node_tls: node_tls.clone(),
+            reload_secs,
+        });
+        let gw = growlerdb_engine::Gateway::multi_index(resolver, None);
+        (gw, format!("all indexes via control-plane {cp}"))
+    } else {
+        match (registry, index, node_addr) {
+            (Some(registry), Some(index), _) => {
+                let gw = gateway_from_registry(registry, index, node_tls.clone()).await?;
+                let desc = format!("index `{index}` ({} shard(s))", gw.shard_count());
+                let windowed = growlerdb_controlplane::Registry::open(registry)
+                    .ok()
+                    .and_then(|r| r.get(index))
+                    .is_some_and(|e| e.definition.windowing.is_some());
+                if reload_secs > 0 && !windowed {
+                    reload = Some((registry.to_string(), index.to_string(), node_tls.clone()));
+                }
+                (gw, desc)
             }
-            (gw, desc)
-        }
-        // Sharded routing from the **live control-plane** over gRPC (no registry file) — the
-        // distributed/Kubernetes path (task-77): the control-plane and gateway are separate pods,
-        // so there's no shared registry.json to read.
-        (None, Some(index), _) => {
-            let cp = control_plane.ok_or_else(|| {
+            // Sharded routing from the **live control-plane** over gRPC (no registry file) — the
+            // distributed/Kubernetes path (task-77): the control-plane and gateway are separate pods,
+            // so there's no shared registry.json to read.
+            (None, Some(index), _) => {
+                let cp = control_plane.ok_or_else(|| {
                 anyhow::anyhow!(
                     "--index without --registry requires --control-plane (the live registry to route from)"
                 )
             })?;
-            let (gw, reload) = gateway_from_control_plane(cp, index, node_tls.clone()).await;
-            let desc = format!(
-                "index `{index}` ({} shard(s)) via control-plane {cp}",
-                gw.shard_count()
-            );
-            // Wire the reload matching the index kind (task-219): ordinal → swap_routing; windowed →
-            // swap_windowed (so runtime-created windows are picked up).
-            if reload_secs > 0 {
-                match reload {
-                    CpReload::Ordinal(fp) => {
-                        reload_cp = Some((cp.to_string(), index.to_string(), node_tls.clone(), fp));
-                    }
-                    CpReload::Windowed(fp) => {
-                        reload_cp_windowed =
-                            Some((cp.to_string(), index.to_string(), node_tls.clone(), fp));
+                let (gw, reload) = gateway_from_control_plane(cp, index, node_tls.clone()).await;
+                let desc = format!(
+                    "index `{index}` ({} shard(s)) via control-plane {cp}",
+                    gw.shard_count()
+                );
+                // Wire the reload matching the index kind (task-219): ordinal → swap_routing; windowed →
+                // swap_windowed (so runtime-created windows are picked up).
+                if reload_secs > 0 {
+                    match reload {
+                        CpReload::Ordinal(fp) => {
+                            reload_cp =
+                                Some((cp.to_string(), index.to_string(), node_tls.clone(), fp));
+                        }
+                        CpReload::Windowed(fp) => {
+                            reload_cp_windowed =
+                                Some((cp.to_string(), index.to_string(), node_tls.clone(), fp));
+                        }
                     }
                 }
+                (gw, desc)
             }
-            (gw, desc)
-        }
-        (_, _, Some(node_addr)) => {
-            let node = connect_node(node_addr, node_tls).await?;
-            (
-                growlerdb_engine::Gateway::new(Arc::new(node)),
-                format!("Node {node_addr}"),
-            )
-        }
-        _ => {
-            anyhow::bail!("provide --node-addr, --registry + --index, or --control-plane + --index")
+            (_, _, Some(node_addr)) => {
+                let node = connect_node(node_addr, node_tls).await?;
+                (
+                    growlerdb_engine::Gateway::new(Arc::new(node)),
+                    format!("Node {node_addr}"),
+                )
+            }
+            _ => {
+                anyhow::bail!("provide --node-addr, --registry + --index, --control-plane + --index, or --all-indexes")
+            }
         }
     };
 
@@ -2728,6 +2763,189 @@ async fn gateway_from_control_plane(
         },
     )
     .await
+}
+
+/// Wait (unboundedly, task-142) until the control-plane at `cp` accepts a gRPC connection, so a
+/// `--all-indexes` gateway rolled alongside the control-plane stays up (not-ready) rather than
+/// crash-looping. Multi-index readiness is CP reachability, *not* any one index resolving.
+async fn wait_for_control_plane(cp: &str) {
+    let mut warned = false;
+    retry_until_ok(
+        || async {
+            growlerdb_proto::ControlPlaneClient::connect(cp.to_string())
+                .await
+                .map(|_| ())
+                .map_err(|e| anyhow::anyhow!("connecting to control plane `{cp}`: {e}"))
+        },
+        std::time::Duration::from_secs(GW_CP_STARTUP_INTERVAL_SECS),
+        |n, e| {
+            if !warned {
+                eprintln!(
+                    "gateway: waiting for control-plane {cp} ({e}); retrying — up but /readyz not-ready"
+                );
+                warned = true;
+            } else if n % 6 == 0 {
+                eprintln!("gateway: still waiting for control-plane {cp} (attempt {n})");
+            }
+        },
+    )
+    .await
+}
+
+/// A [`RouteResolver`](growlerdb_engine::RouteResolver) that resolves a named index into an
+/// [`IndexRoute`](growlerdb_engine::IndexRoute) from the live control-plane (task-240 multi-index
+/// routing): fetch its `GetIndex`, connect a Node per shard (ordinal or windowed), and — if
+/// `reload_secs > 0` — spawn a per-index hot-reloader so a reshard / new window is picked up with no
+/// restart. Closes over the CP endpoint + node TLS so one resolver serves every index the gateway
+/// fronts.
+struct CpRouteResolver {
+    cp: String,
+    node_tls: Option<tonic::transport::ClientTlsConfig>,
+    reload_secs: u64,
+}
+
+#[tonic::async_trait]
+impl growlerdb_engine::RouteResolver for CpRouteResolver {
+    async fn resolve(
+        &self,
+        index: &str,
+    ) -> Result<Option<std::sync::Arc<growlerdb_engine::IndexRoute>>, String> {
+        let mut client = growlerdb_proto::ControlPlaneClient::connect(self.cp.clone())
+            .await
+            .map_err(|e| format!("connecting to control plane `{}`: {e}", self.cp))?;
+        let resp = match client
+            .get_index(growlerdb_proto::v1::GetIndexRequest {
+                name: index.to_string(),
+            })
+            .await
+        {
+            Ok(r) => r.into_inner(),
+            // A NOT_FOUND is "no such index" (→ Ok(None), negative-cached by the Gateway); any other
+            // status is a transient failure the Gateway surfaces as Unavailable (retried next request).
+            Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
+            Err(status) => {
+                return Err(format!("GetIndex(`{index}`): {}", status.message()));
+            }
+        };
+
+        if resp.windowing.is_some() {
+            let (nodes, windowing, descriptors, _fp) =
+                resolve_windowed_routing_cp(index, &resp, self.node_tls.clone())
+                    .await
+                    .map_err(|e| e.to_string())?;
+            let route = growlerdb_engine::IndexRoute::new(
+                nodes,
+                growlerdb_core::ShardRouter::hashed(descriptors.len().max(1) as u32),
+                Some(growlerdb_engine::WindowRouting::new(windowing, descriptors)),
+                Vec::new(),
+            );
+            if self.reload_secs > 0 {
+                spawn_index_route_reloader(
+                    route.clone(),
+                    self.cp.clone(),
+                    index.to_string(),
+                    self.node_tls.clone(),
+                    self.reload_secs,
+                    true,
+                );
+            }
+            Ok(Some(route))
+        } else {
+            let (nodes, router, _fp) =
+                connect_sharded_from_get_index(index, &resp, self.node_tls.clone())
+                    .map_err(|e| e.to_string())?;
+            // The live-CP path carries no partition-field pruning hints (as the single-index live-CP
+            // gateway also doesn't) — correct, just fans out instead of pruning (task-199/240).
+            let route = growlerdb_engine::IndexRoute::new(nodes, router, None, Vec::new());
+            if self.reload_secs > 0 {
+                spawn_index_route_reloader(
+                    route.clone(),
+                    self.cp.clone(),
+                    index.to_string(),
+                    self.node_tls.clone(),
+                    self.reload_secs,
+                    false,
+                );
+            }
+            Ok(Some(route))
+        }
+    }
+}
+
+/// Poll the control-plane every `secs` and **hot-reload** one multi-index route's topology (task-240):
+/// the per-index analog of [`spawn_control_plane_reloader`], but swapping an
+/// [`IndexRoute`](growlerdb_engine::IndexRoute) in place rather than the whole gateway. `windowed`
+/// selects the swap kind (windows vs ordinal shards). A read error keeps the current topology (an
+/// outage must not blank a route).
+fn spawn_index_route_reloader(
+    route: std::sync::Arc<growlerdb_engine::IndexRoute>,
+    cp: String,
+    index: String,
+    node_tls: Option<tonic::transport::ClientTlsConfig>,
+    secs: u64,
+    windowed: bool,
+) {
+    tokio::spawn(async move {
+        let mut client: Option<growlerdb_proto::ControlPlaneClient<tonic::transport::Channel>> =
+            None;
+        tokio::time::sleep(jittered(std::time::Duration::from_secs(secs), 0.5)).await;
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
+        tick.tick().await; // the immediate first tick is the startup state
+        loop {
+            tick.tick().await;
+            if client.is_none() {
+                match growlerdb_proto::ControlPlaneClient::connect(cp.clone()).await {
+                    Ok(c) => client = Some(c),
+                    Err(e) => {
+                        eprintln!("gateway: route reloader reconnect to {cp} failed: {e}");
+                        growlerdb_telemetry::sli::background_failure("route-reload");
+                        continue;
+                    }
+                }
+            }
+            let c = client.as_mut().expect("client present");
+            let resp = match c
+                .get_index(growlerdb_proto::v1::GetIndexRequest {
+                    name: index.clone(),
+                })
+                .await
+            {
+                Ok(r) => r.into_inner(),
+                Err(e) => {
+                    eprintln!(
+                        "gateway: GetIndex(`{index}`) failed (keeping current route): {}",
+                        e.message()
+                    );
+                    growlerdb_telemetry::sli::background_failure("route-reload");
+                    client = None;
+                    continue;
+                }
+            };
+            if windowed {
+                match resolve_windowed_routing_cp(&index, &resp, node_tls.clone()).await {
+                    Ok((nodes, windowing, descriptors, _fp)) => {
+                        route.swap_windowed(nodes, windowing, descriptors);
+                        growlerdb_telemetry::sli::background_success("route-reload");
+                    }
+                    Err(e) => {
+                        eprintln!("gateway: windowed route read failed (keeping current): {e}");
+                        growlerdb_telemetry::sli::background_failure("route-reload");
+                    }
+                }
+            } else {
+                match connect_sharded_from_get_index(&index, &resp, node_tls.clone()) {
+                    Ok((nodes, router, _fp)) => {
+                        route.swap(nodes, router);
+                        growlerdb_telemetry::sli::background_success("route-reload");
+                    }
+                    Err(e) => {
+                        eprintln!("gateway: route topology read failed (keeping current): {e}");
+                        growlerdb_telemetry::sli::background_failure("route-reload");
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Retry `attempt` with a fixed `interval` backoff **until it succeeds**, returning its value;

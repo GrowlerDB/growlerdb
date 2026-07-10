@@ -32,9 +32,9 @@
 //! [task-30]: ../../../design/06-service-architecture.md
 //! [task-29]: ../../../design/06-service-architecture.md
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use growlerdb_core::{
     cmp_sort_value, Agg, CompositeKey, Query, SearchAfter, ShardRouter, SortOrder, SortValue,
@@ -97,12 +97,38 @@ fn fanout_semaphore(max: usize) -> Arc<tokio::sync::Semaphore> {
 /// Routes Engine-API calls to one [`Node`] per shard. Holds `dyn Node`s, so routing is
 /// identical whether the Nodes are in-process (embedded) or remote (distributed). A
 /// [`ShardRouter`] decides which shard owns a key (for [`get_by_key`](Self::get_by_key)).
+///
+/// **Multi-index** (task-240): a Gateway can front *many* indexes at once. Each named index has its
+/// own [`IndexRoute`] (its shard-set + router + partition fields, each independently hot-reloadable),
+/// stored in `routes` keyed by resolved index name. A request names its target index; the Gateway
+/// [`resolve_route`](Self::resolve_route)s it at entry and operates on that route. Built via the
+/// single-index constructors ([`new`](Self::new)/[`sharded`](Self::sharded)/…) the Gateway holds one
+/// static route (`single`) and behaves byte-for-byte as before; built via
+/// [`multi_index`](Self::multi_index) with a [`RouteResolver`] it lazily resolves each named index
+/// through the control plane on first use.
 #[derive(Clone)]
 pub struct Gateway {
-    /// The shard set + key router, behind a swap so a running Gateway can **hot-reload** its
-    /// topology after a reshard cutover (task-77): [`swap_routing`](Self::swap_routing) installs a
-    /// new `(shards, router)` atomically; each request reads a snapshot via [`routing`](Self::routing).
-    routing: Arc<std::sync::RwLock<Arc<RoutingState>>>,
+    /// The single static route, when the Gateway was built via a single-index constructor
+    /// (`new`/`sharded`/`windowed`/…). Present iff `resolver` is `None`. Every read routes to it;
+    /// `served_index` (below) still gates the request's `index` field. Its inner swap cell keeps
+    /// [`swap_routing`](Self::swap_routing)/[`swap_windowed`](Self::swap_windowed) working exactly as
+    /// before (task-77 hot-reload).
+    single: Option<Arc<IndexRoute>>,
+    /// Lazily-populated per-index routes for a **multi-index** Gateway (task-240): resolved-index-name
+    /// → its [`IndexRoute`]. Empty in single-index mode. Populated on first request for an index via
+    /// `resolver`, then hot-reloaded by a per-index reloader the resolver spawns.
+    routes: Arc<std::sync::RwLock<HashMap<String, Arc<IndexRoute>>>>,
+    /// Resolves a named index into an [`IndexRoute`] (fetch its `GetIndex`, connect nodes). `Some`
+    /// only in multi-index mode; drives lazy population of `routes`. `None` = single-index (static).
+    resolver: Option<Arc<dyn RouteResolver>>,
+    /// Brief negative cache of index names the resolver reported as absent (task-240): name → when it
+    /// was cached. A flood of requests for a nonexistent index shouldn't hammer the control plane; a
+    /// `NOT_FOUND` is remembered for [`NEGATIVE_CACHE_TTL`] before we ask the CP again.
+    missing: Arc<std::sync::RwLock<HashMap<String, Instant>>>,
+    /// The index a request with an **empty** `index` field resolves to (task-240). `Some` = that
+    /// index; `None` = no default (empty `index` errors unless exactly one index is served — see
+    /// [`resolve_route`](Self::resolve_route)). In single-index mode this is the served index name.
+    default_index: Option<String>,
     limits: GatewayLimits,
     authn: Option<SharedAuthn>,
     /// Built-in (no-IdP) password login is available (task-128) — advertised on `/v1/config` so the
@@ -110,19 +136,115 @@ pub struct Gateway {
     password_login: bool,
     authz: Option<SharedAuth>,
     cold: Option<ColdTier>,
-    /// The index name this Gateway serves (task-99). A `SearchRequest.index` that's non-empty and
-    /// names a *different* index is answered `NOT_FOUND` instead of silently searching this one.
-    /// `None` (the default, and all tests) means "serve any request" — no index scoping.
+    /// The index name this Gateway serves (task-99), in **single-index** mode. A request whose `index`
+    /// is non-empty and names a *different* index is answered `NOT_FOUND` instead of silently searching
+    /// this one. `None` (the default, and all tests) means "serve any request" — no index scoping. In
+    /// multi-index mode this is unused (scoping is per-`routes` membership).
     served_index: Option<String>,
-    /// The index's **keyword** partition-key fields, for search fan-out pruning (task-199). When a
-    /// search AND-pins all of them to values, every matching key routes to a single shard, so the
-    /// query goes there instead of broadcasting. Empty (default) = no pruning (hash-routed, or a
-    /// partition field isn't keyword — a non-keyword type could route a string value to the wrong
-    /// shard and drop results, so only keyword partitions are eligible).
-    partition_fields: Vec<String>,
     /// Bounds concurrent per-shard RPCs across all scatter-gathers (task-199) — see
     /// [`GatewayLimits::max_concurrent_fanout`].
     fanout: Arc<tokio::sync::Semaphore>,
+}
+
+/// How long a `NOT_FOUND` from the [`RouteResolver`] is remembered before the control plane is asked
+/// again (task-240 negative cache): short, so an index created moments ago becomes queryable quickly,
+/// but long enough that a burst of requests for a bad name doesn't storm the control plane.
+const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5);
+
+/// One index's routing on a [`Gateway`] (task-240): the shard-set + key router (+ optional windowed
+/// descriptors) behind the same hot-swap cell single-index gateways have always used, plus that
+/// index's keyword partition fields for fan-out pruning. A multi-index Gateway holds one per served
+/// index; a single-index Gateway holds exactly one (its `single`). Cloneable-cheap (`Arc` inner).
+pub struct IndexRoute {
+    /// The shard set + key router, behind a swap so a running route can **hot-reload** its topology
+    /// after a reshard cutover (task-77): [`swap`](Self::swap) installs a new `(shards, router)`
+    /// atomically; each request reads a snapshot via [`routing`](Self::routing).
+    routing: std::sync::RwLock<Arc<RoutingState>>,
+    /// This index's **keyword** partition-key fields, for search fan-out pruning (task-199). When a
+    /// search AND-pins all of them to values, every matching key routes to a single shard, so the
+    /// query goes there instead of broadcasting. Empty = no pruning.
+    partition_fields: Vec<String>,
+}
+
+impl IndexRoute {
+    /// A route over a shard set + router (+ optional windowed descriptors) and its keyword partition
+    /// fields. `partition_fields` should be only keyword-typed partitions (the caller filters them).
+    pub fn new(
+        shards: Vec<Arc<dyn Node>>,
+        router: ShardRouter,
+        window_routing: Option<WindowRouting>,
+        partition_fields: Vec<String>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            routing: std::sync::RwLock::new(Arc::new(RoutingState {
+                shards,
+                router,
+                window_routing,
+            })),
+            partition_fields,
+        })
+    }
+
+    /// A snapshot of this route's current routing (`Arc` clone), consistent across a concurrent swap.
+    fn routing(&self) -> Arc<RoutingState> {
+        self.routing
+            .read()
+            .expect("routing lock not poisoned")
+            .clone()
+    }
+
+    /// **Hot-reload** this route's ordinal topology (task-77): atomically replace shard set + router.
+    /// Skips an empty/count-mismatched swap (keeps the current servable topology), like the Gateway
+    /// method it backs.
+    pub fn swap(&self, shards: Vec<Arc<dyn Node>>, router: ShardRouter) {
+        if shards.is_empty() || router.shards() as usize != shards.len() {
+            eprintln!(
+                "gateway: ignoring an invalid routing swap ({} shards, router covers {}) — keeping current topology",
+                shards.len(),
+                router.shards()
+            );
+            return;
+        }
+        *self.routing.write().expect("routing lock not poisoned") = Arc::new(RoutingState {
+            shards,
+            router,
+            window_routing: None,
+        });
+    }
+
+    /// **Hot-swap** this route's windowed window set (task-219). Skips an empty/mismatched swap.
+    pub fn swap_windowed(
+        &self,
+        shards: Vec<Arc<dyn Node>>,
+        windowing: TimeWindowing,
+        windows: Vec<(i64, Option<(i64, i64)>)>,
+    ) {
+        if shards.is_empty() || shards.len() != windows.len() {
+            eprintln!(
+                "gateway: ignoring an invalid windowed swap ({} shards, {} window descriptors) — keeping current topology",
+                shards.len(),
+                windows.len()
+            );
+            return;
+        }
+        let router = ShardRouter::hashed(shards.len() as u32);
+        *self.routing.write().expect("routing lock not poisoned") = Arc::new(RoutingState {
+            shards,
+            router,
+            window_routing: Some(WindowRouting { windowing, windows }),
+        });
+    }
+}
+
+/// Resolves a named index into an [`IndexRoute`] for a **multi-index** Gateway (task-240): fetch the
+/// index's shard map (e.g. a control-plane `GetIndex`), connect a [`Node`] per shard, and build the
+/// route (with a per-index hot-reloader wired to its [`IndexRoute::swap`]). Returns `Ok(None)` when
+/// the index doesn't exist (→ `NOT_FOUND`, negative-cached), `Err` on a transient failure (→ the
+/// caller surfaces `Unavailable`, not cached, so it retries).
+#[tonic::async_trait]
+pub trait RouteResolver: Send + Sync {
+    /// Resolve `index` into its route, or `Ok(None)` if no such index is registered.
+    async fn resolve(&self, index: &str) -> Result<Option<Arc<IndexRoute>>, String>;
 }
 
 /// The Gateway's hot-swappable routing: one [`Node`] per shard + the [`ShardRouter`] that places
@@ -131,7 +253,7 @@ pub struct Gateway {
 /// **new window** (task-219 dynamic windowed ingest) — swaps in a new one. Keeping `window_routing`
 /// *inside* the swap cell (rather than a fixed Gateway field) is what lets a running windowed gateway
 /// learn a new window's id + zone-map atomically with its node, via [`swap_windowed`](Gateway::swap_windowed).
-struct RoutingState {
+pub struct RoutingState {
     shards: Vec<Arc<dyn Node>>,
     router: ShardRouter,
     /// `Some` on a windowed gateway; `None` on hash/partition. Aligned 1:1 with `shards`.
@@ -143,10 +265,18 @@ struct RoutingState {
 /// time-filtered search to the windows that can match before scatter-gather. `None` on a normal
 /// (hash/partition) Gateway.
 #[derive(Clone)]
-struct WindowRouting {
+pub struct WindowRouting {
     windowing: TimeWindowing,
     /// `(window id, event zone-map)` for `shards[i]`.
     windows: Vec<(i64, Option<(i64, i64)>)>,
+}
+
+impl WindowRouting {
+    /// A windowed routing descriptor (task-240): the [`TimeWindowing`] config + per-shard
+    /// `(window id, event zone-map)`, for building an [`IndexRoute`] over a windowed index.
+    pub fn new(windowing: TimeWindowing, windows: Vec<(i64, Option<(i64, i64)>)>) -> Self {
+        Self { windowing, windows }
+    }
 }
 
 /// Collect `field → value` for [`Query::Term`] leaves that are **ANDed** (in `must`/`filter`,
@@ -210,74 +340,94 @@ pub struct WindowStatus {
 }
 
 impl Gateway {
-    /// Assemble a Gateway from its routing + the optional features (the shared constructor body).
+    /// Assemble a single-index Gateway from its routing + the optional features (the shared
+    /// constructor body). Holds one static [`IndexRoute`]; multi-index gateways use
+    /// [`multi_index`](Self::multi_index) instead.
     fn with_routing(
         shards: Vec<Arc<dyn Node>>,
         router: ShardRouter,
         window_routing: Option<WindowRouting>,
     ) -> Self {
         Self {
-            routing: Arc::new(std::sync::RwLock::new(Arc::new(RoutingState {
-                shards,
-                router,
-                window_routing,
-            }))),
+            single: Some(IndexRoute::new(shards, router, window_routing, Vec::new())),
+            routes: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            resolver: None,
+            missing: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            default_index: None,
             limits: GatewayLimits::default(),
             authn: None,
             password_login: false,
             authz: None,
             cold: None,
             served_index: None,
-            partition_fields: Vec::new(),
             fanout: fanout_semaphore(GatewayLimits::default().max_concurrent_fanout),
         }
     }
 
-    /// Declare the index's **keyword** partition-key fields so a search that pins them prunes its
-    /// fan-out to the owning shard (task-199). Pass only keyword-typed partition fields — the caller
-    /// (the sharded serve path) filters them from the resolved definition; a non-keyword partition
-    /// field is omitted so pruning never routes a mistyped value to the wrong shard.
+    /// A **multi-index** Gateway (task-240): serves *many* indexes over one endpoint, resolving each
+    /// named index lazily through `resolver` (typically a control-plane `GetIndex` builder) and
+    /// hot-reloading each independently. A request with an empty `index` uses `default_index` (or, if
+    /// `None` and exactly one index has been resolved, that one; else `InvalidArgument`). Readiness is
+    /// the control plane's reachability, not any one index resolving.
+    pub fn multi_index(resolver: Arc<dyn RouteResolver>, default_index: Option<String>) -> Self {
+        Self {
+            single: None,
+            routes: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            resolver: Some(resolver),
+            missing: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            default_index,
+            limits: GatewayLimits::default(),
+            authn: None,
+            password_login: false,
+            authz: None,
+            cold: None,
+            served_index: None,
+            fanout: fanout_semaphore(GatewayLimits::default().max_concurrent_fanout),
+        }
+    }
+
+    /// Declare the (single) index's **keyword** partition-key fields so a search that pins them prunes
+    /// its fan-out to the owning shard (task-199). Pass only keyword-typed partition fields — the
+    /// caller (the sharded serve path) filters them from the resolved definition; a non-keyword
+    /// partition field is omitted so pruning never routes a mistyped value to the wrong shard. Only
+    /// meaningful in single-index mode; multi-index routes carry their own partition fields.
     pub fn with_partition_fields(mut self, fields: Vec<String>) -> Self {
-        self.partition_fields = fields;
+        if let Some(single) = &self.single {
+            self.single = Some(IndexRoute::new(
+                single.routing().shards.clone(),
+                single.routing().router.clone(),
+                single.routing().window_routing.clone(),
+                fields,
+            ));
+        }
         self
     }
 
-    /// A snapshot of the current routing (shards + router) — an `Arc` clone, so an in-flight request
-    /// keeps a consistent view across a concurrent [`swap_routing`](Self::swap_routing).
-    fn routing(&self) -> Arc<RoutingState> {
-        self.routing
-            .read()
-            .expect("routing lock not poisoned")
-            .clone()
+    /// The single static [`IndexRoute`] — present iff this is a single-index Gateway. Every
+    /// single-index handler resolves to this.
+    fn single(&self) -> &Arc<IndexRoute> {
+        self.single
+            .as_ref()
+            .expect("single-index gateway has a static route")
     }
 
-    /// **Hot-reload** the topology (task-77): atomically replace the shard set + router, e.g. after a
-    /// reshard cutover the control plane committed a new bucket map and added nodes. In-flight
+    /// A snapshot of the single-index route's current routing (`Arc` clone). Only valid in
+    /// single-index mode (the swap methods below back the CLI reloaders that operate on `self.single`).
+    fn routing(&self) -> Arc<RoutingState> {
+        self.single().routing()
+    }
+
+    /// **Hot-reload** the (single) topology (task-77): atomically replace the shard set + router, e.g.
+    /// after a reshard cutover the control plane committed a new bucket map and added nodes. In-flight
     /// requests finish against their snapshot; subsequent ones route through the new topology. The
     /// router's shard count must match the node count. (Ordinal indexes only — not windowed.)
     pub fn swap_routing(&self, shards: Vec<Arc<dyn Node>>, router: ShardRouter) {
-        // Never install an empty or count-mismatched routing state (task-153 / L3): the read paths
-        // index `shards[0]` / `shards[owner]`, so an empty set would turn every request into an
-        // index-out-of-bounds panic in release. Skip the swap and keep the current (servable)
-        // topology — the reloader retries next tick.
-        if shards.is_empty() || router.shards() as usize != shards.len() {
-            eprintln!(
-                "gateway: ignoring an invalid routing swap ({} shards, router covers {}) — keeping current topology",
-                shards.len(),
-                router.shards()
-            );
-            return;
-        }
-        *self.routing.write().expect("routing lock not poisoned") = Arc::new(RoutingState {
-            shards,
-            router,
-            window_routing: None,
-        });
+        self.single().swap(shards, router);
     }
 
-    /// **Hot-swap** a windowed gateway's window set (task-219 dynamic windowed ingest): atomically
-    /// install a new `(shards, window descriptors)` so a running windowed gateway can serve a
-    /// **newly-created** window (or an updated zone-map) without a restart — the windowed analog of
+    /// **Hot-swap** the (single) windowed gateway's window set (task-219 dynamic windowed ingest):
+    /// atomically install a new `(shards, window descriptors)` so a running windowed gateway can serve
+    /// a **newly-created** window (or an updated zone-map) without a restart — the windowed analog of
     /// [`swap_routing`]. `windows` aligns 1:1 with `shards` (one `(window id, event zone-map)` each);
     /// the key router is regenerated as `hashed(n)` (windowed fan-out never key-routes). In-flight
     /// requests finish against their snapshot. Skips an empty/mismatched swap, like `swap_routing`.
@@ -287,20 +437,108 @@ impl Gateway {
         windowing: TimeWindowing,
         windows: Vec<(i64, Option<(i64, i64)>)>,
     ) {
-        if shards.is_empty() || shards.len() != windows.len() {
-            eprintln!(
-                "gateway: ignoring an invalid windowed swap ({} shards, {} window descriptors) — keeping current topology",
-                shards.len(),
-                windows.len()
-            );
-            return;
+        self.single().swap_windowed(shards, windowing, windows);
+    }
+
+    /// Resolve a request's target `index` field to the [`IndexRoute`] that answers it (task-240) — the
+    /// per-request routing decision every read/write handler makes at entry.
+    ///
+    /// The empty-index rule: an empty `index` uses `default_index` if set; else, if exactly one index
+    /// is currently served (a lone `single` route, or a single resolved multi-index route with no
+    /// resolver ambiguity), that one; else `InvalidArgument` ("index required; endpoint serves N
+    /// indexes"). A non-empty `index` names its target directly.
+    ///
+    /// Single-index mode preserves task-99 scoping exactly: a non-empty name that differs from the
+    /// served index is `NOT_FOUND`; empty or the served name resolves to the static route. Multi-index
+    /// mode resolves the named index through the `resolver` (lazily populating `routes` and spawning
+    /// that index's hot-reloader), negative-caching a `NOT_FOUND` briefly.
+    async fn resolve_route(&self, index: &str) -> Result<Arc<IndexRoute>, Status> {
+        let want = index.trim();
+        // ---- Single-index (static) mode: byte-for-byte task-99 behavior. --------------------------
+        if let Some(single) = &self.single {
+            if let Some(served) = &self.served_index {
+                if !want.is_empty() && want != served {
+                    return Err(Status::not_found(format!(
+                        "index `{want}` is not served by this endpoint (serving `{served}`)"
+                    )));
+                }
+            }
+            return Ok(single.clone());
         }
-        let router = ShardRouter::hashed(shards.len() as u32);
-        *self.routing.write().expect("routing lock not poisoned") = Arc::new(RoutingState {
-            shards,
-            router,
-            window_routing: Some(WindowRouting { windowing, windows }),
-        });
+
+        // ---- Multi-index mode: resolve the named index (empty → default / sole). ------------------
+        let target = if !want.is_empty() {
+            want.to_string()
+        } else if let Some(def) = &self.default_index {
+            def.clone()
+        } else {
+            // No default: only unambiguous if exactly one index is currently served.
+            let routes = self.routes.read().expect("routes lock not poisoned");
+            if routes.len() == 1 {
+                return Ok(routes.values().next().expect("one route").clone());
+            }
+            return Err(Status::invalid_argument(format!(
+                "index required; endpoint serves {} indexes",
+                routes.len()
+            )));
+        };
+
+        // Fast path: already resolved.
+        if let Some(route) = self
+            .routes
+            .read()
+            .expect("routes lock not poisoned")
+            .get(&target)
+            .cloned()
+        {
+            return Ok(route);
+        }
+
+        // Negative cache: recently reported absent → NOT_FOUND without touching the control plane.
+        if let Some(at) = self
+            .missing
+            .read()
+            .expect("missing lock not poisoned")
+            .get(&target)
+            .copied()
+        {
+            if at.elapsed() < NEGATIVE_CACHE_TTL {
+                return Err(Status::not_found(format!(
+                    "index `{target}` is not served by this endpoint"
+                )));
+            }
+        }
+
+        let resolver = self
+            .resolver
+            .as_ref()
+            .expect("multi-index gateway has a resolver");
+        match resolver.resolve(&target).await {
+            Ok(Some(route)) => {
+                // Insert (another concurrent request may have won the race — keep the first).
+                let mut routes = self.routes.write().expect("routes lock not poisoned");
+                let route = routes.entry(target.clone()).or_insert(route).clone();
+                self.missing
+                    .write()
+                    .expect("missing lock not poisoned")
+                    .remove(&target);
+                Ok(route)
+            }
+            Ok(None) => {
+                self.missing
+                    .write()
+                    .expect("missing lock not poisoned")
+                    .insert(target.clone(), Instant::now());
+                Err(Status::not_found(format!(
+                    "index `{target}` is not served by this endpoint"
+                )))
+            }
+            // A transient failure (control plane down, node unreachable) is Unavailable, NOT cached —
+            // the next request retries rather than being stuck on a stale miss.
+            Err(e) => Err(Status::unavailable(format!(
+                "resolving index `{target}`: {e}"
+            ))),
+        }
     }
 
     /// A single-shard Gateway fronting `node` (requests forward verbatim).
@@ -348,37 +586,37 @@ impl Gateway {
         Self::with_routing(shards, router, Some(WindowRouting { windowing, windows }))
     }
 
-    /// The shards a search must touch. Normally every shard; for a windowed Gateway, only the
+    /// The shards a search must touch on `route`. Normally every shard; for a windowed route, only the
     /// windows whose id + event zone-map overlap the query's time range (task-81). A query that
     /// doesn't parse or carries no relevant range bound prunes nothing (fans out to all) — pruning
     /// only ever *removes* windows that provably can't match, so results never change.
-    fn target_shards(&self, body: &SearchRequest) -> Vec<Arc<dyn Node>> {
+    fn target_shards(route: &IndexRoute, body: &SearchRequest) -> Vec<Arc<dyn Node>> {
         // Partition-prune (task-199): on a non-windowed, partition-routed index, a search that
         // AND-pins every (keyword) partition field can only match keys owned by one shard — route
         // there instead of broadcasting to all. Correct because Partition routing depends solely on
         // the partition (the identifier is dropped), so no matching key lives on another shard.
-        let rs = self.routing();
+        let rs = route.routing();
         if rs.window_routing.is_none() {
-            if let Some(ord) = self.partition_prune(&body.query, &rs) {
+            if let Some(ord) = Self::partition_prune(route, &body.query, &rs) {
                 return vec![rs.shards[ord].clone()];
             }
         }
-        self.windows_matching(&body.query)
+        Self::windows_matching(&rs, &body.query)
     }
 
-    /// The single shard a search must touch when its filter AND-pins **all** the index's keyword
+    /// The single shard a search must touch when its filter AND-pins **all** of `route`'s keyword
     /// partition fields — else `None` (fan out). Builds the pinned partition into a [`CompositeKey`]
     /// and routes it (reusing the same [`ShardRouter`] as [`get_by_key`](Self::get_by_key)).
-    fn partition_prune(&self, query_str: &str, rs: &RoutingState) -> Option<usize> {
-        if self.partition_fields.is_empty() {
+    fn partition_prune(route: &IndexRoute, query_str: &str, rs: &RoutingState) -> Option<usize> {
+        if route.partition_fields.is_empty() {
             return None;
         }
         let query = Query::parse(query_str).ok()?;
         let mut pinned: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
-        collect_and_pins(&query, &self.partition_fields, &mut pinned);
+        collect_and_pins(&query, &route.partition_fields, &mut pinned);
         // Every partition field must be pinned, else the partition isn't determined → fan out.
-        let partition: Vec<(String, Value)> = self
+        let partition: Vec<(String, Value)> = route
             .partition_fields
             .iter()
             .map(|f| pinned.remove(f).map(|v| (f.clone(), Value::Str(v))))
@@ -387,15 +625,12 @@ impl Gateway {
         (ord < rs.shards.len()).then_some(ord)
     }
 
-    /// The shards a `query_str` must touch (shared by search and aggregate, task-82): all shards on a
-    /// normal Gateway; on a windowed Gateway only the windows whose id + event zone-map overlap the
-    /// query's time range. An unparseable / unfiltered query prunes nothing. Pruning only removes
-    /// windows that can't match, so a windowed aggregate over a time range gives the same result as
-    /// scanning all windows — just cheaper.
-    fn windows_matching(&self, query_str: &str) -> Vec<Arc<dyn Node>> {
-        // One snapshot: shards + window descriptors move together under the swap (task-219), so a
-        // concurrent new-window swap can't zip a stale shard set against fresh descriptors.
-        let rs = self.routing();
+    /// The shards a `query_str` must touch on routing snapshot `rs` (shared by search and aggregate,
+    /// task-82): all shards on a normal route; on a windowed route only the windows whose id + event
+    /// zone-map overlap the query's time range. An unparseable / unfiltered query prunes nothing.
+    /// Pruning only removes windows that can't match, so a windowed aggregate over a time range gives
+    /// the same result as scanning all windows — just cheaper.
+    fn windows_matching(rs: &RoutingState, query_str: &str) -> Vec<Arc<dyn Node>> {
         let Some(wr) = &rs.window_routing else {
             return rs.shards.clone();
         };
@@ -422,7 +657,10 @@ impl Gateway {
     /// named index and trust it won't be silently answered by the wrong one. Without this the Gateway
     /// ignores `SearchRequest.index` (serves every request, pre-task-99 behavior).
     pub fn serving(mut self, index: impl Into<String>) -> Self {
-        self.served_index = Some(index.into());
+        let name = index.into();
+        // The served index also becomes the empty-`index` default, so a bare request resolves to it.
+        self.default_index = Some(name.clone());
+        self.served_index = Some(name);
         self
     }
 
@@ -497,24 +735,36 @@ impl Gateway {
         })
     }
 
-    /// The Gateway trust boundary for `method`: authenticate `req` (rewriting its identity
-    /// metadata to the verified principal/tenant/roles) and then authorize it against the
-    /// installed policy. Each step is a no-op when not configured, so an unsecured Gateway is
-    /// unchanged.
-    fn guard<T>(&self, method: &'static str, req: &mut Request<T>) -> Result<(), Status> {
+    /// Authenticate + authorize + **resolve the target route** for a read/write `method` in one step
+    /// (task-240): guards the request against the target index (so per-index RBAC sees it), then hands
+    /// back the [`IndexRoute`] the handler operates on. `index` is the request's `index` field.
+    ///
+    /// Order: **authn → authz(target index) → resolve**. Authenticating first stamps the verified
+    /// identity; authorizing *before* resolution means a token whose allowlist forbids the index is
+    /// `PermissionDenied` without a control-plane round-trip and without revealing whether the index
+    /// exists (no shard is ever touched for a denied index). The authz target is the request's explicit
+    /// name, or — when empty — the endpoint's default index (so an allowlist still binds the default).
+    async fn guard_and_resolve<T>(
+        &self,
+        method: &'static str,
+        index: &str,
+        req: &mut Request<T>,
+    ) -> Result<Arc<IndexRoute>, Status> {
         match &self.authn {
             Some(authn) => {
                 crate::authn::authenticate(authn, req)?;
             }
-            // Open gateway (no authenticator): strip any caller-asserted identity so a forged
-            // `x-growlerdb-tenant`/`-principal`/`-roles` can't be trusted — tenant scoping then
-            // fails closed for a tenant-scoped index (task-147 / F2).
             None => crate::authn::strip_identity(req),
         }
         if let Some(authz) = &self.authz {
-            crate::auth::authorize(authz, method, req)?;
+            let target = if index.trim().is_empty() {
+                self.default_index.as_deref()
+            } else {
+                Some(index.trim())
+            };
+            crate::auth::authorize_index(authz, method, target, req)?;
         }
-        Ok(())
+        self.resolve_route(index).await
     }
 
     /// The **verified identity** of the caller of `req`, for `GET /v1/me` (task-103). Authenticates
@@ -538,9 +788,14 @@ impl Gateway {
         self.authn.is_some()
     }
 
-    /// Number of shards this Gateway fronts.
+    /// Number of shards this Gateway fronts for its single index. In multi-index mode (task-240) there
+    /// is no single shard count (each resolved index has its own), so this reports `0` — callers that
+    /// log a shard count use it only for the single-index CLI paths.
     pub fn shard_count(&self) -> usize {
-        self.routing().shards.len()
+        match &self.single {
+            Some(single) => single.routing().shards.len(),
+            None => 0,
+        }
     }
 
     /// Run a search. Single-shard: forward verbatim. Multi-shard: scatter to every shard,
@@ -563,21 +818,12 @@ impl Gateway {
         &self,
         mut req: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
-        // Authenticate at the boundary (if configured) and replace caller-asserted identity with
-        // the verified one before any routing — the shards must only ever see a trusted identity.
-        self.guard("Search", &mut req)?;
-        // Per-index scoping (task-99): if this Gateway serves a named index, a request that names a
-        // *different* index is a routing mistake — answer NOT_FOUND rather than silently searching
-        // the index we do serve. Empty `index` means "the index served here". Alias resolution is
-        // done client-side (the console maps an alias to its target index before calling).
-        if let Some(served) = &self.served_index {
-            let want = req.get_ref().index.trim();
-            if !want.is_empty() && want != served {
-                return Err(Status::not_found(format!(
-                    "index `{want}` is not served by this endpoint (serving `{served}`)"
-                )));
-            }
-        }
+        // Authenticate + resolve the target index + authorize against it (task-99 scoping, task-240
+        // multi-index routing + per-index RBAC), all before any routing — the shards must only ever
+        // see a trusted identity, and a request naming an index this endpoint doesn't serve is
+        // NOT_FOUND rather than silently answered by the wrong one. Empty `index` = the default index.
+        let index = req.get_ref().index.clone();
+        let route = self.guard_and_resolve("Search", &index, &mut req).await?;
         // Page-fetch ceiling (task-72): reject a huge `offset + limit` at the boundary before any
         // shard builds the page — an unbounded `limit` is an easy OOM/DoS (S shards × a giant
         // page, buffered + sorted at the Gateway). Applies to single- and multi-shard alike.
@@ -590,8 +836,8 @@ impl Gateway {
         }
         // Target shards: all of them, or — for a windowed index — only the windows whose time
         // range can match (task-81 pruning). A time filter outside every window matches nothing.
-        let shards_total = self.shard_count() as u32;
-        let shards = self.target_shards(req.get_ref());
+        let shards_total = route.routing().shards.len() as u32;
+        let shards = Self::target_shards(&route, req.get_ref());
         if shards.is_empty() {
             // A time filter that prunes every window matches nothing — 0 shards scanned, but the
             // index still has `shards_total` (so the console shows e.g. "0/64", not a blank).
@@ -629,7 +875,9 @@ impl Gateway {
         // Collapse folds groups across shards on its own scatter/merge path — it ignores
         // offset/keyset paging, so it doesn't share the offset-merge logic below.
         if !body.collapse.is_empty() {
-            return self.search_collapsed_merge(&shards, meta, body).await;
+            return self
+                .search_collapsed_merge(&shards, shards_total, meta, body)
+                .await;
         }
 
         // Offset-merge (design/09 §9): a shard can't apply the *global* offset, so ask each for
@@ -762,6 +1010,7 @@ impl Gateway {
     async fn search_collapsed_merge(
         &self,
         shards: &[Arc<dyn Node>],
+        shards_total: u32,
         meta: tonic::metadata::MetadataMap,
         body: SearchRequest,
     ) -> Result<Response<SearchResponse>, Status> {
@@ -832,7 +1081,7 @@ impl Gateway {
             next_cursor: Vec::new(),
             partial: failed > 0,
             shards_scanned: total_shards as u32,
-            shards_total: self.shard_count() as u32,
+            shards_total,
         }))
     }
 
@@ -842,8 +1091,11 @@ impl Gateway {
         &self,
         mut req: Request<SuggestRequest>,
     ) -> Result<Response<SuggestResponse>, Status> {
-        self.guard("Suggest", &mut req)?;
-        let rs = self.routing();
+        // Resolve the target index (task-240): suggest now honors `SuggestRequest.index`, so a
+        // multi-index endpoint suggests over the named index (and per-index RBAC applies).
+        let index = req.get_ref().index.clone();
+        let route = self.guard_and_resolve("Suggest", &index, &mut req).await?;
+        let rs = route.routing();
         if rs.shards.len() == 1 {
             return rs.shards[0].suggest(req).await;
         }
@@ -895,8 +1147,10 @@ impl Gateway {
         &self,
         mut req: Request<GetByKeyRequest>,
     ) -> Result<Response<GetByKeyResponse>, Status> {
-        self.guard("GetByKey", &mut req)?;
-        let rs = self.routing();
+        // Resolve the target index (task-240): hydration now honors `GetByKeyRequest.index`.
+        let index = req.get_ref().index.clone();
+        let route = self.guard_and_resolve("GetByKey", &index, &mut req).await?;
+        let rs = route.routing();
         if rs.shards.len() == 1 {
             return rs.shards[0].get_by_key(req).await;
         }
@@ -921,7 +1175,8 @@ impl Gateway {
                     GetByKeyRequest {
                         keys: body.keys.clone(),
                         columns: body.columns.clone(),
-                        window: 0, // stamped per-shard by the WindowNode
+                        index: String::new(), // already routed to this index's shard (task-240)
+                        window: 0,            // stamped per-shard by the WindowNode
                     },
                 );
                 let permit = self.fanout.clone();
@@ -983,6 +1238,7 @@ impl Gateway {
                 GetByKeyRequest {
                     keys,
                     columns: body.columns.clone(),
+                    index: String::new(), // already routed to this index's shard (task-240)
                     window: 0,
                 },
             );
@@ -1017,16 +1273,9 @@ impl Gateway {
         &self,
         mut req: Request<ExplainRequest>,
     ) -> Result<Response<ExplainResponse>, Status> {
-        self.guard("Search", &mut req)?;
-        // Per-index scoping (task-99): reject a request naming a different index than we serve.
-        if let Some(served) = &self.served_index {
-            let want = req.get_ref().index.trim();
-            if !want.is_empty() && want != served {
-                return Err(Status::not_found(format!(
-                    "index `{want}` is not served by this endpoint (serving `{served}`)"
-                )));
-            }
-        }
+        // Resolve the target index (task-99 scoping + task-240 routing/RBAC), authorized as a read.
+        let index = req.get_ref().index.clone();
+        let route = self.guard_and_resolve("Search", &index, &mut req).await?;
         let started = std::time::Instant::now();
         let coord =
             req.get_ref().coordinates.clone().ok_or_else(|| {
@@ -1034,7 +1283,7 @@ impl Gateway {
             })?;
         let meta = req.metadata().clone();
 
-        let rs = self.routing();
+        let rs = route.routing();
         let owner = if rs.shards.len() == 1 {
             0
         } else {
@@ -1046,7 +1295,8 @@ impl Gateway {
         resp.shards_total = rs.shards.len() as u32;
 
         // Best-effort hydration timing — the authoritative row the console shows alongside the
-        // explanation (forwarding auth metadata so a tenant-scoped read still resolves).
+        // explanation (forwarding auth metadata so a tenant-scoped read still resolves). Carry the
+        // resolved index so the internal hydration routes to the same index (task-240).
         let gk = Request::from_parts(
             meta,
             Extensions::default(),
@@ -1054,6 +1304,7 @@ impl Gateway {
                 keys: vec![coord],
                 columns: Vec::new(),
                 window: 0,
+                index: index.clone(),
             },
         );
         let h0 = std::time::Instant::now();
@@ -1078,9 +1329,13 @@ impl Gateway {
         &self,
         mut req: Request<AggregateRequest>,
     ) -> Result<Response<AggregateResponse>, Status> {
-        self.guard("Aggregate", &mut req)?;
+        // Resolve the target index (task-240): aggregate now honors `AggregateRequest.index`.
+        let index = req.get_ref().index.clone();
+        let route = self
+            .guard_and_resolve("Aggregate", &index, &mut req)
+            .await?;
         {
-            let rs = self.routing();
+            let rs = route.routing();
             if rs.shards.len() == 1 {
                 return rs.shards[0].aggregate(req).await;
             }
@@ -1101,7 +1356,7 @@ impl Gateway {
         // Windowed: prune to the windows whose time range can match the query (task-82); non-windowed
         // keeps every shard. A windowed query filtered beyond *all* windows prunes to none → a real,
         // empty aggregation (zero counts), not a failure.
-        let shards = self.windows_matching(&body.query);
+        let shards = Self::windows_matching(&route.routing(), &body.query);
         let total_shards = shards.len();
         if total_shards == 0 {
             let results = tokio::task::spawn_blocking(move || {
@@ -1129,6 +1384,7 @@ impl Gateway {
                 AggregateRequest {
                     query: body.query.clone(),
                     aggs: body.aggs.clone(),
+                    index: String::new(), // already routed to this index's shard (task-240)
                     partial: true,
                     window: 0, // a WindowNode stamps the real selector; ignored otherwise
                 },
@@ -1172,8 +1428,12 @@ impl Gateway {
         &self,
         mut req: Request<DescribeIndexRequest>,
     ) -> Result<Response<DescribeIndexResponse>, Status> {
-        self.guard("DescribeIndex", &mut req)?;
-        let rs = self.routing();
+        // Resolve the target index (task-240): describe now routes by `DescribeIndexRequest.index`.
+        let index = req.get_ref().index.clone();
+        let route = self
+            .guard_and_resolve("DescribeIndex", &index, &mut req)
+            .await?;
+        let rs = route.routing();
         if rs.shards.len() == 1 {
             return rs.shards[0].describe_index(req).await;
         }
@@ -1235,8 +1495,11 @@ impl Gateway {
         &self,
         mut req: Request<ReindexIndexRequest>,
     ) -> Result<Response<ReindexIndexResponse>, Status> {
-        self.guard("ReindexIndex", &mut req)?;
-        let rs = self.routing();
+        let index = req.get_ref().index.clone();
+        let route = self
+            .guard_and_resolve("ReindexIndex", &index, &mut req)
+            .await?;
+        let rs = route.routing();
         if rs.shards.len() != 1 {
             return Err(Status::unimplemented(format!(
                 "reindex over a {}-shard gateway is not supported; reindex each shard's Node \
@@ -1256,8 +1519,11 @@ impl Gateway {
         &self,
         mut req: Request<AlterIndexRequest>,
     ) -> Result<Response<AlterIndexResponse>, Status> {
-        self.guard("AlterIndex", &mut req)?;
-        let rs = self.routing();
+        let index = req.get_ref().index.clone();
+        let route = self
+            .guard_and_resolve("AlterIndex", &index, &mut req)
+            .await?;
+        let rs = route.routing();
         if rs.shards.len() != 1 {
             return Err(Status::unimplemented(format!(
                 "alter over a {}-shard gateway is not supported; alter each shard's Node directly \
@@ -1274,8 +1540,11 @@ impl Gateway {
         &self,
         mut req: Request<CompactIndexRequest>,
     ) -> Result<Response<CompactIndexResponse>, Status> {
-        self.guard("CompactIndex", &mut req)?;
-        let rs = self.routing();
+        let index = req.get_ref().index.clone();
+        let route = self
+            .guard_and_resolve("CompactIndex", &index, &mut req)
+            .await?;
+        let rs = route.routing();
         if rs.shards.len() != 1 {
             return Err(Status::unimplemented(format!(
                 "compact over a {}-shard gateway is not supported; compact each shard's Node directly",
@@ -1290,8 +1559,11 @@ impl Gateway {
         &self,
         mut req: Request<BackupIndexRequest>,
     ) -> Result<Response<BackupIndexResponse>, Status> {
-        self.guard("BackupIndex", &mut req)?;
-        let rs = self.routing();
+        let index = req.get_ref().index.clone();
+        let route = self
+            .guard_and_resolve("BackupIndex", &index, &mut req)
+            .await?;
+        let rs = route.routing();
         if rs.shards.len() != 1 {
             return Err(Status::unimplemented(format!(
                 "backup over a {}-shard gateway is not supported; back up each shard's Node directly",
@@ -1306,8 +1578,11 @@ impl Gateway {
         &self,
         mut req: Request<BackupStatusRequest>,
     ) -> Result<Response<BackupStatusResponse>, Status> {
-        self.guard("BackupStatus", &mut req)?;
-        let rs = self.routing();
+        let index = req.get_ref().index.clone();
+        let route = self
+            .guard_and_resolve("BackupStatus", &index, &mut req)
+            .await?;
+        let rs = route.routing();
         rs.shards[0].backup_status(req).await
     }
 }
@@ -2008,6 +2283,7 @@ mod tests {
             window: 0,
             keys,
             columns: Vec::new(),
+            index: String::new(),
         }))
         .await
         .unwrap();
@@ -2169,7 +2445,8 @@ mod tests {
         let router = ShardRouter::partitioned(2);
         let gw =
             layout_gateway(&dirs, &[], router.clone()).with_partition_fields(vec!["region".into()]);
-        let rs = gw.routing();
+        let route = gw.single().clone();
+        let rs = route.routing();
 
         // A search pinning the partition field routes to exactly the shard the router picks — the
         // same routing get_by_key would use for a key with that partition.
@@ -2179,19 +2456,22 @@ mod tests {
                 Vec::new(),
             )) as usize;
             assert_eq!(
-                gw.partition_prune(&format!("region:{region}"), &rs),
+                Gateway::partition_prune(&route, &format!("region:{region}"), &rs),
                 Some(owner)
             );
             // Pinned via an AND clause alongside another predicate — still routable.
             assert_eq!(
-                gw.partition_prune(&format!("region:{region} AND body:x"), &rs),
+                Gateway::partition_prune(&route, &format!("region:{region} AND body:x"), &rs),
                 Some(owner)
             );
         }
         // No partition pin → fan out (None).
-        assert_eq!(gw.partition_prune("body:x", &rs), None);
+        assert_eq!(Gateway::partition_prune(&route, "body:x", &rs), None);
         // Partition field only under OR (should) doesn't pin every match → fan out.
-        assert_eq!(gw.partition_prune("region:us OR body:x", &rs), None);
+        assert_eq!(
+            Gateway::partition_prune(&route, "region:us OR body:x", &rs),
+            None
+        );
 
         // target_shards reflects it: a pinned search hits one shard, an unpinned one all.
         let pinned = SearchRequest {
@@ -2202,8 +2482,8 @@ mod tests {
             query: "body:x".into(),
             ..Default::default()
         };
-        assert_eq!(gw.target_shards(&pinned).len(), 1);
-        assert_eq!(gw.target_shards(&unpinned).len(), 2);
+        assert_eq!(Gateway::target_shards(&route, &pinned).len(), 1);
+        assert_eq!(Gateway::target_shards(&route, &unpinned).len(), 2);
     }
 
     #[test]
@@ -2211,8 +2491,9 @@ mod tests {
         // Without with_partition_fields (or on a hash index), pruning never engages — fan out.
         let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
         let gw = layout_gateway(&dirs, &[], growlerdb_core::ShardRouter::partitioned(2));
-        let rs = gw.routing();
-        assert_eq!(gw.partition_prune("region:us", &rs), None);
+        let route = gw.single().clone();
+        let rs = route.routing();
+        assert_eq!(Gateway::partition_prune(&route, "region:us", &rs), None);
     }
 
     async fn all_ids(gw: &Gateway, limit: u32) -> Vec<String> {
@@ -2364,6 +2645,7 @@ mod tests {
                 aggs: r#"{"by_cat": {"Terms": {"field": "cat", "size": 10}}}"#.into(),
                 partial: false,
                 window: 0,
+                index: String::new(),
             }))
             .await
             .unwrap()
@@ -3023,6 +3305,7 @@ mod tests {
                 window: 0,
                 keys,
                 columns: Vec::new(),
+                index: String::new(),
             }))
             .await
             .unwrap()
@@ -3047,6 +3330,7 @@ mod tests {
                 window: 0,
                 keys: vec![bad],
                 columns: Vec::new(),
+                index: String::new(),
             }))
             .await
             .unwrap_err();
@@ -3066,6 +3350,7 @@ mod tests {
                 aggs: r#"{"by_cat": {"Terms": {"field": "cat", "size": 10}}}"#.into(),
                 partial: false,
                 window: 0,
+                index: String::new(),
             }))
             .await
             .unwrap()
@@ -3608,5 +3893,260 @@ mod tests {
         assert!(Gateway::sharded(vec![node("a"), node("b")])
             .cold_status()
             .is_none());
+    }
+
+    // ---- Multi-index routing (task-240) -----------------------------------------------
+
+    /// A Node whose `search`/`describe` report a fixed index tag, so a test can tell *which* index's
+    /// route answered a request. `describe` echoes the tag as the stats name; `search` returns one hit
+    /// whose id is the tag.
+    struct TaggedNode(&'static str);
+
+    #[tonic::async_trait]
+    impl Node for TaggedNode {
+        async fn search(
+            &self,
+            _: Request<SearchRequest>,
+        ) -> Result<Response<SearchResponse>, Status> {
+            use growlerdb_proto::v1::{value::Kind, Coordinates, Field, SearchHit, Value};
+            Ok(Response::new(SearchResponse {
+                hits: vec![SearchHit {
+                    coordinates: Some(Coordinates {
+                        partition: vec![],
+                        identifier: vec![Field {
+                            name: "id".into(),
+                            value: Some(Value {
+                                kind: Some(Kind::Str(self.0.into())),
+                            }),
+                        }],
+                    }),
+                    score: 1.0,
+                    group: None,
+                    group_count: 0,
+                    sort_values: Vec::new(),
+                    fields: vec![],
+                }],
+                total: 1,
+                ..Default::default()
+            }))
+        }
+        async fn suggest(
+            &self,
+            _: Request<SuggestRequest>,
+        ) -> Result<Response<SuggestResponse>, Status> {
+            Err(Status::unimplemented("suggest"))
+        }
+        async fn get_by_key(
+            &self,
+            _: Request<GetByKeyRequest>,
+        ) -> Result<Response<GetByKeyResponse>, Status> {
+            Err(Status::unimplemented("get_by_key"))
+        }
+        async fn describe_index(
+            &self,
+            _: Request<DescribeIndexRequest>,
+        ) -> Result<Response<DescribeIndexResponse>, Status> {
+            Ok(Response::new(DescribeIndexResponse {
+                stats: Some(IndexStats {
+                    name: self.0.into(),
+                    ..Default::default()
+                }),
+                failed_shards: 0,
+                per_shard: Vec::new(),
+            }))
+        }
+    }
+
+    /// A resolver backed by a fixed name → tag map: index `name` resolves to a one-shard route over a
+    /// [`TaggedNode`] echoing `tag`; an unknown name is `Ok(None)` (→ NOT_FOUND). Records how many
+    /// times it was asked to resolve each name, so a test can prove routes are cached (resolved once).
+    struct MapResolver {
+        map: std::collections::HashMap<&'static str, &'static str>,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[tonic::async_trait]
+    impl RouteResolver for MapResolver {
+        async fn resolve(&self, index: &str) -> Result<Option<Arc<IndexRoute>>, String> {
+            self.calls.lock().unwrap().push(index.to_string());
+            match self.map.get(index) {
+                Some(tag) => Ok(Some(IndexRoute::new(
+                    vec![Arc::new(TaggedNode(tag)) as Arc<dyn Node>],
+                    ShardRouter::hashed(1),
+                    None,
+                    Vec::new(),
+                ))),
+                None => Ok(None),
+            }
+        }
+    }
+
+    fn multi_gw() -> (Gateway, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let resolver = Arc::new(MapResolver {
+            map: std::collections::HashMap::from([("a", "index-a"), ("b", "index-b")]),
+            calls: calls.clone(),
+        });
+        (Gateway::multi_index(resolver, None), calls)
+    }
+
+    fn describe(index: &str) -> Request<DescribeIndexRequest> {
+        Request::new(DescribeIndexRequest {
+            window: 0,
+            index: index.into(),
+        })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_index_routes_each_request_to_its_named_index() {
+        let (gw, calls) = multi_gw();
+        // Each named index is answered by its own route.
+        let a = gw.describe_index(describe("a")).await.unwrap().into_inner();
+        assert_eq!(a.stats.unwrap().name, "index-a");
+        let b = gw.describe_index(describe("b")).await.unwrap().into_inner();
+        assert_eq!(b.stats.unwrap().name, "index-b");
+        // A search routes by index too.
+        let hit = gw
+            .search(Request::new(SearchRequest {
+                query: "x".into(),
+                limit: 1,
+                index: "b".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(id_of(&hit.hits[0]), "index-b");
+        // Each distinct index was resolved once (routes are cached, not re-resolved per request).
+        let repeat = gw.describe_index(describe("a")).await.unwrap().into_inner();
+        assert_eq!(repeat.stats.unwrap().name, "index-a");
+        let resolved = calls.lock().unwrap().clone();
+        assert_eq!(resolved.iter().filter(|n| *n == "a").count(), 1);
+        assert_eq!(resolved.iter().filter(|n| *n == "b").count(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_index_unknown_index_is_not_found() {
+        let (gw, _) = multi_gw();
+        let err = gw.describe_index(describe("nope")).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        // A second request for the same unknown index is served from the negative cache (still NF).
+        let err2 = gw.describe_index(describe("nope")).await.unwrap_err();
+        assert_eq!(err2.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_index_empty_index_without_a_default_is_invalid_argument() {
+        // With no default and >1 index served, an empty `index` can't be disambiguated. Resolve both
+        // first so the map holds two routes, then a bare request is InvalidArgument.
+        let (gw, _) = multi_gw();
+        gw.describe_index(describe("a")).await.unwrap();
+        gw.describe_index(describe("b")).await.unwrap();
+        let err = gw.describe_index(describe("")).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("index required"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_index_empty_index_uses_the_default() {
+        // A multi-index gateway with a default resolves an empty `index` to it.
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let resolver = Arc::new(MapResolver {
+            map: std::collections::HashMap::from([("a", "index-a"), ("b", "index-b")]),
+            calls,
+        });
+        let gw = Gateway::multi_index(resolver, Some("a".into()));
+        let resp = gw.describe_index(describe("")).await.unwrap().into_inner();
+        assert_eq!(resp.stats.unwrap().name, "index-a");
+    }
+
+    // ---- Per-index RBAC + tenant isolation through multi-index (task-240) --------------
+
+    /// An authenticator that admits any credential as `alice` with fixed roles + an index allowlist —
+    /// exercises per-index RBAC end to end (the allowlist stamped into metadata, read back by authz).
+    struct ScopedAuthn {
+        roles: Vec<String>,
+        indexes: Vec<String>,
+    }
+    impl crate::authn::Authenticator for ScopedAuthn {
+        fn authenticate(
+            &self,
+            authorization: Option<&str>,
+        ) -> Result<crate::authn::Verified, crate::authn::AuthnError> {
+            authorization.ok_or(crate::authn::AuthnError::Missing)?;
+            Ok(crate::authn::Verified {
+                principal: "alice".to_string(),
+                roles: self.roles.clone(),
+                indexes: self.indexes.clone(),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn per_index_rbac_denies_a_token_scoped_to_another_index() {
+        // A reader whose token allows only index `a`: search `a` is allowed, `b` is PermissionDenied —
+        // the resolved target index is checked against the allowlist before any shard is touched.
+        let authn: SharedAuthn = Arc::new(ScopedAuthn {
+            roles: vec!["reader".into()],
+            indexes: vec!["a".into()],
+        });
+        let (gw, _) = multi_gw();
+        let gw = gw
+            .with_authn(authn)
+            .with_authz(Arc::new(crate::rbac::RbacPolicy::with_default_roles()));
+
+        let search = |index: &str| {
+            Request::new(SearchRequest {
+                query: "x".into(),
+                limit: 1,
+                index: index.into(),
+                ..Default::default()
+            })
+        };
+        // Allowed index → the request reaches the (tagged) shard and answers. (ScopedAuthn requires a
+        // non-empty credential, so a Bearer header is set.)
+        let mut req_a = search("a");
+        req_a
+            .metadata_mut()
+            .insert("authorization", "Bearer t".parse().unwrap());
+        assert_eq!(
+            id_of(&gw.search(req_a).await.unwrap().into_inner().hits[0]),
+            "index-a"
+        );
+        // A different index the token doesn't allow → PermissionDenied, shard untouched.
+        let mut req_b = search("b");
+        req_b
+            .metadata_mut()
+            .insert("authorization", "Bearer t".parse().unwrap());
+        let err = gw.search(req_b).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn per_index_rbac_unrestricted_token_reaches_any_index() {
+        // A token with no index allowlist (empty) may reach any resolved index (back-compat).
+        let authn: SharedAuthn = Arc::new(ScopedAuthn {
+            roles: vec!["reader".into()],
+            indexes: Vec::new(),
+        });
+        let (gw, _) = multi_gw();
+        let gw = gw
+            .with_authn(authn)
+            .with_authz(Arc::new(crate::rbac::RbacPolicy::with_default_roles()));
+        for (ix, tag) in [("a", "index-a"), ("b", "index-b")] {
+            let mut req = Request::new(SearchRequest {
+                query: "x".into(),
+                limit: 1,
+                index: ix.into(),
+                ..Default::default()
+            });
+            req.metadata_mut()
+                .insert("authorization", "Bearer t".parse().unwrap());
+            assert_eq!(
+                id_of(&gw.search(req).await.unwrap().into_inner().hits[0]),
+                tag
+            );
+        }
     }
 }

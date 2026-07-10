@@ -150,6 +150,10 @@ message AggregateRequest {
   // SearchRequest.window: gateway-set per scattered window; 0 = not windowed,
   // ignored by a single-shard node. Clients never set this.
   int64 window = 4;
+  // Target index name (task-240 multi-index routing): scope the aggregation to one named index on
+  // a multi-index Gateway. Empty = the endpoint's default/only index (back-compat). Mirrors
+  // SearchRequest.index; an unknown index on a serving Gateway answers NOT_FOUND.
+  string index = 5;
 }
 
 message AggregateResponse {
@@ -226,6 +230,10 @@ message GetByKeyRequest {
   // hydration to every window (a key can live in any of them) and each WindowNode stamps its id here,
   // so the receiving multiplexer dispatches to the right shard. 0 (unset) on a single-shard/ordinal node.
   int64 window = 3;
+  // Target index name (task-240 multi-index routing): scope the hydration to one named index on a
+  // multi-index Gateway. Empty = the endpoint's default/only index (back-compat). Mirrors
+  // SearchRequest.index; an unknown index on a serving Gateway answers NOT_FOUND.
+  string index = 4;
 }
 
 // One hydrated row: the coordinates it was fetched for + its projected column values.
@@ -264,6 +272,10 @@ message SuggestRequest {
   // SearchRequest.window: gateway-set per scattered window; 0 = not windowed,
   // ignored by a single-shard SuggestService. Clients never set this.
   int64 window = 6;
+  // Target index name (task-240 multi-index routing): scope the suggestion to one named index on a
+  // multi-index Gateway. Empty = the endpoint's default/only index (back-compat). Mirrors
+  // SearchRequest.index; an unknown index on a serving Gateway answers NOT_FOUND.
+  string index = 7;
 }
 
 // One suggestion: the term and its (approximate) document frequency.

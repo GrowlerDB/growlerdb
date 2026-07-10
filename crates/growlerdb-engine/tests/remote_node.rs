@@ -194,6 +194,7 @@ async fn gateway_propagates_node_errors_over_the_wire() {
             }],
         }],
         columns: vec![],
+        index: String::new(),
     };
     let err = gw.get_by_key(Request::new(missing)).await.unwrap_err();
     assert_eq!(err.code(), Code::NotFound);

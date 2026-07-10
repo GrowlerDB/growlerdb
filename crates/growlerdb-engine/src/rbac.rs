@@ -183,6 +183,20 @@ impl AuthHook for RbacPolicy {
                 ctx.method
             )));
         };
+        // Per-index RBAC (task-240): a token carrying an index allowlist may only touch those indexes.
+        // Enforced *before* the scope check, and only when the request resolved to a concrete target
+        // index (`ctx.index`) — cluster/admin ops that don't name an index (`index = None`) are gated
+        // by scope alone. An empty allowlist = unrestricted (back-compat: existing tokens keep working).
+        if !ctx.allowed_indexes.is_empty() {
+            if let Some(target) = &ctx.index {
+                if !ctx.allowed_indexes.iter().any(|i| i == target) {
+                    return Err(AuthDenied::new(format!(
+                        "index `{target}` is not in the caller's allowed indexes ({})",
+                        ctx.allowed_indexes.join(", ")
+                    )));
+                }
+            }
+        }
         if self.grants(&ctx.roles, required) {
             return Ok(());
         }
@@ -208,6 +222,26 @@ mod tests {
             principal: Some("alice".to_string()),
             tenant: None,
             roles: roles.iter().map(|r| r.to_string()).collect(),
+            index: None,
+            allowed_indexes: Vec::new(),
+        }
+    }
+
+    /// An [`AuthContext`] scoped to a resolved target `index` with an `allowed` index allowlist —
+    /// exercises per-index RBAC (task-240).
+    fn ctx_index(
+        method: &'static str,
+        roles: &[&str],
+        index: Option<&str>,
+        allowed: &[&str],
+    ) -> AuthContext {
+        AuthContext {
+            method,
+            principal: Some("alice".to_string()),
+            tenant: None,
+            roles: roles.iter().map(|r| r.to_string()).collect(),
+            index: index.map(str::to_string),
+            allowed_indexes: allowed.iter().map(|i| i.to_string()).collect(),
         }
     }
 
@@ -334,5 +368,66 @@ mod tests {
     fn an_empty_policy_denies_everyone() {
         let policy = RbacPolicy::new();
         assert!(policy.authorize(&ctx("Search", &["viewer"])).is_err());
+    }
+
+    #[test]
+    fn per_index_allowlist_denies_a_token_scoped_to_another_index() {
+        // task-240: a reader whose token allows only index `a` may search `a` but NOT `b`.
+        let policy = RbacPolicy::with_default_roles();
+        // Allowed index → permitted (role still grants the scope).
+        assert!(policy
+            .authorize(&ctx_index("Search", &["reader"], Some("a"), &["a"]))
+            .is_ok());
+        // A different index → denied even though the role grants Search.
+        let err = policy
+            .authorize(&ctx_index("Search", &["reader"], Some("b"), &["a"]))
+            .unwrap_err();
+        assert!(err.reason.contains("not in the caller's allowed indexes"));
+        assert!(err.reason.contains('b'));
+    }
+
+    #[test]
+    fn per_index_allowlist_permits_any_listed_index() {
+        let policy = RbacPolicy::with_default_roles();
+        for ix in ["a", "b"] {
+            assert!(
+                policy
+                    .authorize(&ctx_index("Search", &["reader"], Some(ix), &["a", "b"]))
+                    .is_ok(),
+                "index {ix} should be allowed"
+            );
+        }
+        assert!(policy
+            .authorize(&ctx_index("Search", &["reader"], Some("c"), &["a", "b"]))
+            .is_err());
+    }
+
+    #[test]
+    fn empty_allowlist_is_unrestricted_across_indexes() {
+        // Back-compat: a token with no index allowlist may touch any resolved index.
+        let policy = RbacPolicy::with_default_roles();
+        assert!(policy
+            .authorize(&ctx_index("Search", &["reader"], Some("anything"), &[]))
+            .is_ok());
+    }
+
+    #[test]
+    fn index_agnostic_calls_skip_the_allowlist() {
+        // A call that resolved no target index (index = None) is gated by scope alone — the allowlist
+        // check only applies to index-scoped operations.
+        let policy = RbacPolicy::with_default_roles();
+        assert!(policy
+            .authorize(&ctx_index("Search", &["reader"], None, &["a"]))
+            .is_ok());
+    }
+
+    #[test]
+    fn per_index_allowlist_still_requires_the_scope() {
+        // The allowlist is additive to (not a replacement for) the role→scope check: a reader allowed
+        // on `a` still cannot administer it.
+        let policy = RbacPolicy::with_default_roles();
+        assert!(policy
+            .authorize(&ctx_index("CreateIndex", &["reader"], Some("a"), &["a"]))
+            .is_err());
     }
 }

@@ -1291,6 +1291,7 @@ async fn facets_handler(
                 aggs,
                 partial: false,
                 window: 0,
+                index: dto.index.clone(),
             },
             &headers,
         );
@@ -1645,6 +1646,9 @@ struct FacetsDto {
     /// Max buckets per field (0 ⇒ a server default).
     #[serde(default)]
     size: u32,
+    /// Target index name (task-240). Empty = the endpoint's default index.
+    #[serde(default)]
+    index: String,
 }
 
 #[derive(Serialize)]
@@ -1817,6 +1821,10 @@ struct SuggestDto {
     fuzzy: bool,
     #[serde(default)]
     max_edits: u32,
+    /// Target index name (task-240). Empty = the endpoint's default index. Lets the console's
+    /// autocomplete suggest over the selected index on a multi-index endpoint.
+    #[serde(default)]
+    index: String,
 }
 
 impl SuggestDto {
@@ -1833,6 +1841,7 @@ impl SuggestDto {
             max_edits: self.max_edits,
             // The window selector is gateway-internal (task-82); a client request never sets it.
             window: 0,
+            index: self.index,
         }
     }
 }
@@ -1945,6 +1954,9 @@ struct GetByKeyDto {
     keys: Vec<CoordinatesDto>,
     #[serde(default)]
     columns: Vec<String>,
+    /// Target index name (task-240). Empty = the endpoint's default index.
+    #[serde(default)]
+    index: String,
 }
 
 impl GetByKeyDto {
@@ -1958,6 +1970,7 @@ impl GetByKeyDto {
             keys,
             columns: self.columns,
             window: 0,
+            index: self.index,
         })
     }
 }

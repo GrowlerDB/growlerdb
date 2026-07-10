@@ -319,6 +319,7 @@ mod tests {
                 window: 0,
                 keys: vec![coord("present")],
                 columns: vec![],
+                index: String::new(),
             }))
             .await
             .unwrap_err();
@@ -336,6 +337,7 @@ mod tests {
                 window: 0,
                 keys: vec![coord("missing")],
                 columns: vec![],
+                index: String::new(),
             }))
             .await
             .unwrap_err();
@@ -359,6 +361,7 @@ mod tests {
                 window: 0,
                 keys: vec![bad],
                 columns: vec![],
+                index: String::new(),
             }))
             .await
             .unwrap_err();
@@ -453,6 +456,7 @@ mod tests {
                 window: 0,
                 keys: vec![coord("missing")],
                 columns: vec![],
+                index: String::new(),
             }))
             .await
             .unwrap_err();
@@ -481,6 +485,7 @@ mod tests {
                 window: 0,
                 keys: vec![coord("present")],
                 columns: vec![],
+                index: String::new(),
             }))
             .await
             .unwrap_err();

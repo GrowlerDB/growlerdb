@@ -203,7 +203,8 @@
     }
     const seq = ++acSeq;
     acTimer = setTimeout(async () => {
-      const results = await suggest(token.field, token.prefix);
+      // Scope autocomplete to the selected index on a multi-index endpoint (task-240).
+      const results = await suggest(token.field, token.prefix, 8, scopeIndex || undefined);
       if (seq !== acSeq) return; // a newer keystroke superseded this request
       completions = results;
       acActive = -1;

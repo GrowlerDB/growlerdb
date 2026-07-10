@@ -271,8 +271,10 @@ services:
     <<: *growlerdb-image
     command:
       - "gateway"
-      - "--node-addr"
-      - "http://node:50051"
+      # Front EVERY registered index over one endpoint (task-240 multi-index routing): each request
+      # routes to its named index's shards, resolved lazily from the control-plane and hot-reloaded
+      # per index. Per-index RBAC still applies. Replaces the old single-Node `--node-addr` wiring.
+      - "--all-indexes"
       - "--addr"
       - "0.0.0.0:50061"
       - "--rest-addr"
