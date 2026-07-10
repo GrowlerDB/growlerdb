@@ -16,8 +16,11 @@ the **Lucene-style** string (the default `query` on [`/v1/search`](/product/inte
 
 ## String forms (Lucene)
 
-Term (`status:active`), default-field term (`iceberg`), phrase (`"iceberg search"~2`), boolean
-(`a AND b`, `NOT c`, `()`), range (`age:[18 TO 65]`, `{` `}` exclusive, `*` unbounded), wildcard
+Term (`status:active`; on a `BOOL` field an exact `archived:true`/`false`), default-field term
+(`iceberg`), phrase (`"iceberg search"~2`), boolean (`a AND b`, `NOT c`, `()`), field-grouped set
+(`category:(guide OR reference)` distributes the field over the group → `category:guide OR
+category:reference`), range (`age:[18 TO 65]`, `{` `}` exclusive, `*` unbounded; a `DATE` bound is
+epoch **micros** or an **ISO-8601 / RFC3339** date, `published:[2024-01-01 TO *]`), wildcard
 (`sensor-*`, `?`; a leading `*` is cost-guarded), fuzzy (`jon~1`), prefix, regex (`/ab.*/`), CIDR
 (`ip:10.0.0.0/8`, requires an `IP` field), boost (`^2`), match-all (`*:*`).
 

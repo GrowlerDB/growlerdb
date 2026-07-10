@@ -155,9 +155,62 @@ impl TimeFormat {
     }
 }
 
+/// Parse a **query range bound** on a DATE field to canonical **epoch micros**. The index stores
+/// DATE columns as canonical micros, so a raw integer is accepted verbatim; for authoring
+/// convenience a bound may also be written as an **ISO-8601 / RFC3339** datetime (`2024-01-01T00:00:00Z`,
+/// offset-aware) or a bare `YYYY-MM-DD` calendar date (taken at UTC midnight). Returns `None` if the
+/// string is none of these — the caller turns that into a loud query-type error.
+pub fn parse_date_query_bound(s: &str) -> Option<i64> {
+    let s = s.trim();
+    // Canonical micros: a bare integer is the stored unit — accept it verbatim (keeps existing
+    // epoch-micros queries working).
+    if let Ok(micros) = s.parse::<i64>() {
+        return Some(micros);
+    }
+    // RFC3339 / ISO-8601 datetime carrying an offset.
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.timestamp_micros());
+    }
+    // Bare calendar date `YYYY-MM-DD` at UTC midnight.
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Some(
+            d.and_hms_opt(0, 0, 0)
+                .expect("midnight is a valid time")
+                .and_utc()
+                .timestamp_micros(),
+        );
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn date_query_bounds_accept_micros_rfc3339_and_bare_dates() {
+        // Raw canonical micros pass through unchanged.
+        assert_eq!(
+            parse_date_query_bound("1782691200000000"),
+            Some(1_782_691_200_000_000)
+        );
+        // A bare `YYYY-MM-DD` lands on UTC midnight.
+        assert_eq!(
+            parse_date_query_bound("2026-06-29"),
+            Some(1_782_691_200_000_000)
+        );
+        // An RFC3339 datetime (offset-aware) → the same UTC micros.
+        assert_eq!(
+            parse_date_query_bound("2026-06-29T00:00:00Z"),
+            Some(1_782_691_200_000_000)
+        );
+        assert_eq!(
+            parse_date_query_bound("2026-06-29T02:00:00+02:00"),
+            Some(1_782_691_200_000_000)
+        );
+        // Garbage is a loud `None`.
+        assert_eq!(parse_date_query_bound("not-a-date"), None);
+    }
 
     #[test]
     fn integer_epochs_convert_to_canonical_micros() {
