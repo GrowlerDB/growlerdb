@@ -25,6 +25,11 @@ x-growlerdb-env: &growlerdb-env
   GROWLERDB_S3_ENDPOINT: http://minio:9000
   # Export traces (OTLP/HTTP) to the LGTM collector.
   GROWLERDB_OTLP_ENDPOINT: http://lgtm:4318
+  # Built-in authN for the demo (task-244): the control-plane mints HS256 session JWTs via
+  # `/v1/login` and the gateway validates them with this SAME shared secret. This is a DEMO secret,
+  # deliberately baked in so `just stack` demonstrates real login + per-index RBAC (task-240) — NOT a
+  # production credential. Rotate/replace it (and set your own demo password) for any real deployment.
+  GROWLERDB_AUTH_SECRET: demo-stack-hs256-secret-change-me
 
 services:
   minio:
@@ -214,9 +219,22 @@ services:
   controlplane:
     profiles: ["stack"]
     <<: *growlerdb-image
-    command: ["control-plane", "--addr", "0.0.0.0:50071", "--metrics-addr", "0.0.0.0:9101"]
+    # `--login-secret` (task-244): enable the `/v1/login` RPC (mints session JWTs from the registry
+    # credential store) and seed the built-in users, but keep the control plane's OWN authorization
+    # OPEN — the enforcement point is the gateway (`--builtin-auth`) on the public data plane, so the
+    # internal node/gateway control-plane RPCs (registration, shard-map reads), which carry no service
+    # credential, stay reachable. The demo user is seeded via the env below.
+    command: ["control-plane", "--addr", "0.0.0.0:50071", "--metrics-addr", "0.0.0.0:9101", "--login-secret"]
     environment:
       <<: *growlerdb-env
+      # Demo login (task-244): a well-known baked-in credential, scoped to exactly the two demo indexes
+      # so per-index RBAC (task-240) is EXERCISED, not bypassed. Seeded on first boot only.
+      #   user `demo` / password `demo`, roles [reader, operator], indexes [docs, catalog].
+      # Change these for any non-demo use. (The initial `admin` user is still seeded with a generated,
+      # printed-once password — see the control-plane logs.)
+      GROWLERDB_DEMO_USER: demo
+      GROWLERDB_DEMO_PASSWORD: demo
+      GROWLERDB_DEMO_INDEXES: docs,catalog
     depends_on:
       polaris:
         condition: service_started
@@ -304,6 +322,10 @@ services:
     <<: *growlerdb-image
     command:
       - "gateway"
+      # Built-in authN (task-128/244): validate the HS256 session JWTs the control-plane's `/v1/login`
+      # mints, using the shared GROWLERDB_AUTH_SECRET, and enforce RBAC + per-index scoping. The console
+      # learns this via `/v1/config` and shows a login form (not open mode).
+      - "--builtin-auth"
       # Front EVERY registered index over one endpoint (task-240 multi-index routing): each request
       # routes to its named index's shards, resolved lazily from the control-plane and hot-reloaded
       # per index. Per-index RBAC still applies. Replaces the old single-Node `--node-addr` wiring.

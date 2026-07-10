@@ -973,10 +973,14 @@ impl ControlPlane for ControlPlaneService {
         self.login_throttle.record_success(&req.username);
         growlerdb_telemetry::sli::login("success");
         let roles = self.registry.roles_for(&req.username);
+        // Per-index scope (task-244): if the subject has an index binding, stamp it into the token's
+        // `indexes` claim so per-index RBAC (task-240) restricts them; empty = unrestricted.
+        let indexes = self.registry.indexes_for(&req.username);
         let token = crate::authn::mint_session_jwt(
             secret,
             &req.username,
             &roles,
+            &indexes,
             crate::authn::BUILTIN_SESSION_ISSUER,
             crate::authn::BUILTIN_SESSION_AUDIENCE,
             crate::authn::BUILTIN_SESSION_TTL_SECS,

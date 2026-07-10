@@ -715,6 +715,11 @@ pub const BUILTIN_SESSION_TTL_SECS: u64 = 12 * 3600;
 struct SessionClaims<'a> {
     sub: &'a str,
     roles: &'a [String],
+    /// The subject's **index allowlist** (task-244) — the same `indexes` claim shape the gateway's
+    /// per-index RBAC reads (task-240). Omitted when empty (unrestricted across indexes), so a token
+    /// for an unscoped subject is byte-for-byte the pre-task-244 session token.
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    indexes: &'a [String],
     iss: &'a str,
     aud: &'a str,
     exp: u64,
@@ -726,14 +731,19 @@ struct SessionClaims<'a> {
 }
 
 /// Mint a short-lived HS256 **session JWT** for built-in (no external IdP) closed mode (task-128).
-/// Carries the verified `subject` + `roles`, signed with the deployment's shared `secret`, expiring
-/// in `ttl_secs`. The gateway accepts it via [`JwtAuthenticator::from_hs256_secret`]`(secret, issuer,
-/// audience)` — which already checks `exp`, so the TTL needs no extra revocation store. (Logout is
-/// client-side token drop; global invalidation is rotating the secret — see task-128 notes.)
+/// Carries the verified `subject` + `roles` (+ an optional `indexes` allowlist for per-index RBAC,
+/// task-244), signed with the deployment's shared `secret`, expiring in `ttl_secs`. The gateway
+/// accepts it via [`JwtAuthenticator::from_hs256_secret`]`(secret, issuer, audience)` — which already
+/// checks `exp`, so the TTL needs no extra revocation store. (Logout is client-side token drop;
+/// global invalidation is rotating the secret — see task-128 notes.)
+// Each argument is a distinct, security-relevant claim (subject / roles / index scope / iss / aud /
+// ttl / name); a struct would only rename them, so keep the explicit signature.
+#[allow(clippy::too_many_arguments)]
 pub fn mint_session_jwt(
     secret: &[u8],
     subject: &str,
     roles: &[String],
+    indexes: &[String],
     issuer: &str,
     audience: &str,
     ttl_secs: u64,
@@ -742,6 +752,7 @@ pub fn mint_session_jwt(
     let claims = SessionClaims {
         sub: subject,
         roles,
+        indexes,
         iss: issuer,
         aud: audience,
         exp: get_current_timestamp() + ttl_secs,
@@ -822,6 +833,7 @@ mod tests {
             SECRET,
             "alice",
             &roles,
+            &[],
             ISSUER,
             AUDIENCE,
             3600,
@@ -835,11 +847,32 @@ mod tests {
         assert_eq!(v.principal, "alice");
         assert_eq!(v.roles, roles);
         assert_eq!(v.display_name.as_deref(), Some("Alice"));
+        // No index allowlist → unrestricted across indexes (back-compat).
+        assert!(v.indexes.is_empty());
         // A token signed with a different secret is rejected.
         let other = JwtAuthenticator::from_hs256_secret(b"different-secret", ISSUER, AUDIENCE);
         assert!(other
             .authenticate(Some(&format!("Bearer {token}")))
             .is_err());
+    }
+
+    #[test]
+    fn session_jwt_carries_the_index_allowlist_claim() {
+        // task-244: a scoped demo session must surface its `indexes` claim so per-index RBAC (task-240)
+        // restricts the subject to exactly those indexes.
+        let roles = vec!["reader".to_string(), "operator".to_string()];
+        let indexes = vec!["docs".to_string(), "catalog".to_string()];
+        let token = mint_session_jwt(
+            SECRET, "demo", &roles, &indexes, ISSUER, AUDIENCE, 3600, None,
+        )
+        .unwrap();
+        let authn = JwtAuthenticator::from_hs256_secret(SECRET, ISSUER, AUDIENCE);
+        let v = authn
+            .authenticate(Some(&format!("Bearer {token}")))
+            .unwrap();
+        assert_eq!(v.principal, "demo");
+        assert_eq!(v.roles, roles);
+        assert_eq!(v.indexes, indexes);
     }
 
     /// Sign `claims` as an HS256 JWT with [`SECRET`].

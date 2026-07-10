@@ -67,12 +67,39 @@ When it settles, the **console** is at <http://localhost:8081> and Grafana at <h
 > and the console's top-left selector switches between them. (Omitting `index` returns
 > `index required; endpoint serves 2 indexes`.)
 
-## 2. Your first search (REST)
+## 2. Log in
+
+The demo runs **authenticated** (not open) so you can see GrowlerDB's built-in login and per-index
+access control. Open <http://localhost:8081> and you'll get a **login form** — sign in with the
+baked-in demo credential:
+
+| Field | Value |
+|---|---|
+| Username | `demo` |
+| Password | `demo` |
+
+The `demo` user has the **reader + operator** roles (query + read index metadata; it can't create,
+drop, or ingest) and is **scoped to the `docs` and `catalog` indexes** — a token issued to it can only
+touch those two (per-index RBAC). Sign-in mints a short-lived session token the gateway validates on
+every request.
+
+> A deliberately well-known **demo credential** — not a production account (change it via the demo
+> auth env in `deploy/compose/docker-compose.yml`).
+
+To call the REST API you need that token. Fetch one from the (unauthenticated) login endpoint and keep
+it in a shell variable — the `curl` examples below send it as `-H "authorization: Bearer $TOKEN"`:
+
+```sh
+TOKEN=$(curl -s localhost:8081/v1/login -H 'content-type: application/json' \
+  -d '{"username":"demo","password":"demo"}' | jq -r .token)
+```
+
+## 3. Your first search (REST)
 
 The gateway serves the Engine API at `:8081`. Search returns ranked **document coordinates**:
 
 ```sh
-curl -s localhost:8081/v1/search -H 'content-type: application/json' \
+curl -s localhost:8081/v1/search -H 'content-type: application/json' -H "authorization: Bearer $TOKEN" \
   -d '{"index":"docs","query":"title:iceberg","limit":5}'
 ```
 
@@ -90,7 +117,7 @@ You get the matching keys + scores — no row contents, just the **coordinates**
 Now hydrate the authoritative row from Iceberg by that key:
 
 ```sh
-curl -s localhost:8081/v1/keys:get -H 'content-type: application/json' \
+curl -s localhost:8081/v1/keys:get -H 'content-type: application/json' -H "authorization: Bearer $TOKEN" \
   -d '{"index":"docs","keys":[{"identifier":[{"name":"id","value":"doc-2"}]}]}'
 ```
 
@@ -107,7 +134,7 @@ curl -s localhost:8081/v1/keys:get -H 'content-type: application/json' \
 That round-trip — **search returns keys, keys hydrate to rows from the lake** — is the core of
 GrowlerDB.
 
-## 3. Explore in the console
+## 4. Explore in the console
 
 Open <http://localhost:8081>. Pick the **`docs`** index in the top-left selector, type a query, and
 hit **Search**:
@@ -130,7 +157,7 @@ hit **Search**:
 
   ![GrowlerDB console — Observability: live SLIs, query-latency chart, and SLI cards](img/console-observability.png)
 
-## 4. Query playground (the `catalog` index)
+## 5. Query playground (the `catalog` index)
 
 The second seeded index, **`catalog`**, is a 10-row catalog of GrowlerDB concepts with a field of
 every type — text (`title`, `body`), keyword (`id`, `category`, `author`), numeric (`views` LONG,
@@ -140,7 +167,7 @@ trying out the [query language](reference): every operator below returns a small
 Because two indexes are served, **name the index in every request**:
 
 ```sh
-curl -s localhost:8081/v1/search -H 'content-type: application/json' \
+curl -s localhost:8081/v1/search -H 'content-type: application/json' -H "authorization: Bearer $TOKEN" \
   -d '{"index":"catalog","query":"body:hydrate","limit":10}'
 ```
 
@@ -193,7 +220,7 @@ Send `"syntax":"kql"` to use **KQL** instead of Lucene — the difference is low
 `not` operators (field/range/`*` syntax is the same):
 
 ```sh
-curl -s localhost:8081/v1/search -H 'content-type: application/json' \
+curl -s localhost:8081/v1/search -H 'content-type: application/json' -H "authorization: Bearer $TOKEN" \
   -d '{"index":"catalog","syntax":"kql","query":"category:guide or category:adr","limit":10}'
 ```
 
@@ -206,7 +233,7 @@ curl -s localhost:8081/v1/search -H 'content-type: application/json' \
 them. Sort by one instead of relevance:
 
 ```sh
-curl -s localhost:8081/v1/search -H 'content-type: application/json' \
+curl -s localhost:8081/v1/search -H 'content-type: application/json' -H "authorization: Bearer $TOKEN" \
   -d '{"index":"catalog","query":"*:*","sort":[{"field":"views","desc":true}],"limit":3}'
 ```
 
@@ -216,13 +243,13 @@ In the **console**, each result row shows the index's `cached` fields (here titl
 rating, views) inline to the right of the primary key — lighter font, with your query terms
 highlighted — so the valuable data is visible without opening the detail drawer.
 
-## 5. Use the OpenSearch adapter (optional)
+## 6. Use the OpenSearch adapter (optional)
 
 The stack enables the [OpenSearch-compatible adapter](opensearch-adapter), so OpenSearch clients
 work against the same data:
 
 ```sh
-curl -s localhost:8081/docs/_search -H 'content-type: application/json' \
+curl -s localhost:8081/docs/_search -H 'content-type: application/json' -H "authorization: Bearer $TOKEN" \
   -d '{"query":{"match":{"body":"search"}},"size":5}'
 ```
 
@@ -242,7 +269,7 @@ You get OpenSearch-shaped documents — `_id` from the key, `_source` hydrated f
 
 So an existing OpenSearch/Elasticsearch client can point at GrowlerDB unchanged.
 
-## 6. See the source in Iceberg with Trino (optional)
+## 7. See the source in Iceberg with Trino (optional)
 
 GrowlerDB keeps **Iceberg as the system of record** and indexes it. To see that source data directly
 — and compare it with what GrowlerDB returns — bring up **Trino** (SQL over the *same* Polaris
@@ -278,7 +305,7 @@ It's now in Iceberg; a GrowlerDB **reindex** (`POST /v1/index:reindex`) picks it
 surfaces it — the full **source → index → search** loop, with Trino and GrowlerDB reading one source
 of truth.
 
-## 7. Tear down
+## 8. Tear down
 
 ```sh
 just stack-down
