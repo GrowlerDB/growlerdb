@@ -181,16 +181,7 @@ impl Lookup for LookupService {
 
         let mut rows = result.rows;
         if let (Some(field), Some(claim)) = (&tenant_field, &tenant) {
-            // Drop rows that aren't the caller's tenant — omitted silently (not an error), so a
-            // forged coordinate can't even confirm another tenant's row exists.
-            rows.retain(|r| {
-                r.fields.get(field).map(|v| v.to_index_string()).as_deref() == Some(claim.as_str())
-            });
-            if added_tenant_col {
-                for r in &mut rows {
-                    r.fields.remove(field);
-                }
-            }
+            enforce_tenant_post_hydration(&mut rows, field, claim, added_tenant_col);
         }
 
         // Hydration SLI (task-39): latency + stale-locator count + keys requested vs found (the
@@ -205,6 +196,27 @@ impl Lookup for LookupService {
             rows: rows.into_iter().map(to_wire_row).collect(),
             failed_shards: 0, // a Node serves one shard; the Gateway sets this on merge
         }))
+    }
+}
+
+/// **Tenant post-filter** (task-38 / task-246): drop every hydrated row whose authoritative Iceberg
+/// `tenant_field` value isn't the caller's verified `claim`, so a forged/guessed coordinate can never
+/// hydrate another tenant's row — the tenant field is decoupled from the key, so enforcement happens
+/// *after* the source read against the row's real value (not the searched-for key). A dropped row is
+/// omitted silently (not an error), so the caller can't even confirm the foreign row exists. When the
+/// tenant column was added to the projection only to enforce this (`added_tenant_col`), it's stripped
+/// from the surviving rows so the caller sees exactly the columns it asked for.
+fn enforce_tenant_post_hydration(
+    rows: &mut Vec<HydratedRow>,
+    field: &str,
+    claim: &str,
+    added_tenant_col: bool,
+) {
+    rows.retain(|r| r.fields.get(field).map(|v| v.to_index_string()).as_deref() == Some(claim));
+    if added_tenant_col {
+        for r in rows {
+            r.fields.remove(field);
+        }
     }
 }
 
@@ -490,5 +502,54 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    /// A hydrated row carrying an authoritative tenant value.
+    fn hydrated(id: &str, tenant: &str) -> HydratedRow {
+        let key = CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]);
+        let mut fields = BTreeMap::new();
+        fields.insert("id".to_string(), Value::from(id));
+        fields.insert("tenant".to_string(), Value::from(tenant));
+        HydratedRow { key, fields }
+    }
+
+    /// The authoritative-value post-filter (task-246): rows hydrated from Iceberg are dropped unless
+    /// their real `tenant` value matches the caller's verified claim — a forged coordinate that
+    /// resolves to another tenant's row is silently omitted, never returned. This is the drop the
+    /// end-to-end `tenant_isolation.rs` cases assert the boundary of (the row read itself needs a live
+    /// catalog); here we prove the filter itself on hydrated rows without one.
+    #[test]
+    fn post_hydration_filter_drops_foreign_tenant_rows() {
+        // acme asked for its own row `a` and (via a forged coordinate) globex's `b`; both hydrate,
+        // but only acme's survives the authoritative-value filter.
+        let mut rows = vec![hydrated("a", "acme"), hydrated("b", "globex")];
+        enforce_tenant_post_hydration(&mut rows, "tenant", "acme", false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].fields["id"].to_index_string(), "a");
+        // Not projected-in, so the tenant column stays on the surviving row.
+        assert_eq!(rows[0].fields["tenant"].to_index_string(), "acme");
+    }
+
+    #[test]
+    fn post_hydration_filter_strips_the_added_tenant_column() {
+        // When the tenant column was added to the projection only to enforce the filter, it's removed
+        // from the surviving rows so the caller sees exactly the columns it requested.
+        let mut rows = vec![hydrated("a", "acme"), hydrated("b", "globex")];
+        enforce_tenant_post_hydration(&mut rows, "tenant", "acme", true);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].fields["id"].to_index_string(), "a");
+        assert!(
+            !rows[0].fields.contains_key("tenant"),
+            "added column stripped"
+        );
+    }
+
+    #[test]
+    fn post_hydration_filter_drops_everything_for_a_foreign_only_result() {
+        // A coordinate that resolves solely to another tenant's row yields an empty result — the
+        // caller can't even confirm the foreign row exists.
+        let mut rows = vec![hydrated("b", "globex")];
+        enforce_tenant_post_hydration(&mut rows, "tenant", "acme", false);
+        assert!(rows.is_empty());
     }
 }

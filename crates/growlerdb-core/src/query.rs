@@ -519,6 +519,20 @@ impl Parser {
                 else {
                     unreachable!()
                 };
+                // Field-grouped set: `field:(a OR b [OR c])` distributes the field prefix over the
+                // group (→ `field:a OR field:b`). The lexer splits at `(`, so a bare `field:` term
+                // (identifier + trailing `:`, no value) lands here immediately before the group's
+                // `LParen`; parse the group and stamp the field onto its field-less leaves.
+                if let Some(field) = field_prefix(t) {
+                    if matches!(
+                        self.tokens.get(self.pos + 1).map(|s| &s.tok),
+                        Some(Tok::LParen)
+                    ) {
+                        self.pos += 1; // consume the `field:` term; `LParen` is next
+                        let group = self.parse_clause()?;
+                        return Ok(apply_field_prefix(group, &field));
+                    }
+                }
                 let query = atom_to_query(t, *start)?;
                 self.pos += 1;
                 Ok(query)
@@ -571,6 +585,116 @@ fn split_field(atom: &str) -> (Option<String>, &str) {
         }
     }
     (None, atom)
+}
+
+/// Recognize a bare `field:` prefix token (a valid identifier followed by a trailing `:` and
+/// nothing else) — the lexer emits this immediately before a `(` in `field:(a OR b)`. Returns the
+/// field name, or `None` if the atom isn't a lone field prefix.
+fn field_prefix(atom: &str) -> Option<String> {
+    let field = atom.strip_suffix(':')?;
+    let ident = !field.is_empty()
+        && field
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.');
+    ident.then(|| field.to_string())
+}
+
+/// Distribute a `field:` prefix over a parsed group (`field:(a OR b)` → `field:a OR field:b`),
+/// stamping the field onto every field-less leaf. Leaves that already carry a field (e.g. an inner
+/// `other:x`) keep it; `Bool`/`Boost` recurse into their children.
+fn apply_field_prefix(query: Query, field: &str) -> Query {
+    let set = |f: &mut Option<String>| {
+        if f.is_none() {
+            *f = Some(field.to_string());
+        }
+    };
+    match query {
+        Query::Term {
+            field: mut f,
+            value,
+        } => {
+            set(&mut f);
+            Query::Term { field: f, value }
+        }
+        Query::Match {
+            field: mut f,
+            text,
+            op,
+        } => {
+            set(&mut f);
+            Query::Match { field: f, text, op }
+        }
+        Query::Phrase {
+            field: mut f,
+            terms,
+            slop,
+        } => {
+            set(&mut f);
+            Query::Phrase {
+                field: f,
+                terms,
+                slop,
+            }
+        }
+        Query::Prefix {
+            field: mut f,
+            prefix,
+        } => {
+            set(&mut f);
+            Query::Prefix { field: f, prefix }
+        }
+        Query::Wildcard {
+            field: mut f,
+            pattern,
+        } => {
+            set(&mut f);
+            Query::Wildcard { field: f, pattern }
+        }
+        Query::Fuzzy {
+            field: mut f,
+            value,
+            distance,
+        } => {
+            set(&mut f);
+            Query::Fuzzy {
+                field: f,
+                value,
+                distance,
+            }
+        }
+        Query::Regex {
+            field: mut f,
+            pattern,
+        } => {
+            set(&mut f);
+            Query::Regex { field: f, pattern }
+        }
+        Query::Bool {
+            must,
+            should,
+            must_not,
+            filter,
+        } => {
+            let map = |qs: Vec<Query>| {
+                qs.into_iter()
+                    .map(|q| apply_field_prefix(q, field))
+                    .collect()
+            };
+            Query::Bool {
+                must: map(must),
+                should: map(should),
+                must_not: map(must_not),
+                filter: map(filter),
+            }
+        }
+        Query::Boost { query, boost } => Query::Boost {
+            query: Box::new(apply_field_prefix(*query, field)),
+            boost,
+        },
+        // MatchAll and the leaves that already require a field (Terms/Exists/Range/IpCidr) can't be
+        // produced field-less inside a group, so they pass through unchanged.
+        other => other,
+    }
 }
 
 /// Strip a trailing `^<number>` boost factor (not inside a `/regex/`).
@@ -814,6 +938,45 @@ mod tests {
                     term(None, "c"),
                 ],
                 should: vec![],
+                must_not: vec![],
+                filter: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn field_grouped_set_distributes_the_prefix() {
+        // `field:(a OR b)` must parse identically to `field:a OR field:b` — the field prefix
+        // distributes over the group (task-247 / issue 3).
+        assert_eq!(
+            Query::parse("category:(guide OR reference)").unwrap(),
+            Query::parse("category:guide OR category:reference").unwrap()
+        );
+        // Three-way, and the inner leaves all carry the field.
+        assert_eq!(
+            Query::parse("category:(a OR b OR c)").unwrap(),
+            Query::Bool {
+                must: vec![],
+                should: vec![
+                    term(Some("category"), "a"),
+                    term(Some("category"), "b"),
+                    term(Some("category"), "c"),
+                ],
+                must_not: vec![],
+                filter: vec![],
+            }
+        );
+        // Implicit-AND group distributes too.
+        assert_eq!(
+            Query::parse("category:(a b)").unwrap(),
+            Query::parse("category:a AND category:b").unwrap()
+        );
+        // A leaf inside the group that already names a field keeps its own field.
+        assert_eq!(
+            Query::parse("category:(a OR other:b)").unwrap(),
+            Query::Bool {
+                must: vec![],
+                should: vec![term(Some("category"), "a"), term(Some("other"), "b")],
                 must_not: vec![],
                 filter: vec![],
             }
