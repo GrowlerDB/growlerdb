@@ -285,6 +285,7 @@
         syntax,
         index: scopeIndex || undefined,
         sort: sortKeys,
+        highlight: true, // server-side highlights (task-250); falls back to client marking when absent
       });
       if (seq !== searchSeq) return; // a newer search started — discard this stale response
       elapsedMs = Math.round(performance.now() - t0);
@@ -345,6 +346,7 @@
         index: scopeIndex || undefined,
         sort: sortKeys,
         cursor,
+        highlight: true, // keep highlights on "Load more" pages consistent (task-250)
       });
       if (seq !== searchSeq) return; // a new search replaced these results — don't append a stale page
       hits = [...hits, ...(res.hits ?? [])];
@@ -443,13 +445,18 @@
   }
 
   /** Decompose a hit's cached fields (task-133) into a right-aligned timestamp, a highlighted
-   *  snippet, and the remaining fields as chips (timestamp + snippet sources removed). */
+   *  snippet, and the remaining fields as chips (timestamp + snippet sources removed). When the
+   *  server returned highlights for the snippet field (task-250), prefer its first fragment's
+   *  segments over the client-side term marker. */
   function rowParts(hit: SearchHit) {
     const ts = pickTimestamp(hit.fields, timeFields);
     const snippet = pickSnippet(hit.fields, new Set(ts ? [ts.name] : []));
     const used = new Set([ts?.name, snippet?.name].filter((n): n is string => !!n));
     const chips = fieldEntries(hit).filter(([name]) => !used.has(name));
-    return { ts, snippet, chips };
+    // Server highlight for the snippet field, if present: its first (best) fragment's segments.
+    const hlField = snippet?.name;
+    const serverSegments = hlField ? hit.highlight?.[hlField]?.[0] : undefined;
+    return { ts, snippet, chips, serverSegments };
   }
 </script>
 
@@ -686,7 +693,13 @@
                     {/if}
                   </span>
                   {#if parts.snippet}
-                    <span class="snippet"><Highlighted text={parts.snippet.value} {terms} /></span>
+                    <span class="snippet"
+                      ><Highlighted
+                        text={parts.snippet.value}
+                        {terms}
+                        segments={parts.serverSegments}
+                      /></span
+                    >
                   {/if}
                   {#if parts.chips.length > 0}
                     <span class="fields">

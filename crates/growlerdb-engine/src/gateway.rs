@@ -1804,6 +1804,7 @@ mod tests {
                     group_count: 0,
                     sort_values: Vec::new(),
                     fields: vec![],
+                    highlight: Default::default(),
                 })
                 .collect::<Vec<_>>();
             let total = hits.len() as u64;
@@ -2082,6 +2083,7 @@ mod tests {
                             kind: Some(sort_value::Kind::Num(*v)),
                         })
                         .collect(),
+                    highlight: Default::default(),
                 })
                 .collect::<Vec<_>>();
             Ok(Response::new(SearchResponse {
@@ -2719,6 +2721,7 @@ mod tests {
                     group_count: 0,
                     sort_values: Vec::new(),
                     fields: vec![],
+                    highlight: Default::default(),
                 })
                 .collect::<Vec<_>>();
             Ok(Response::new(SearchResponse {
@@ -2893,6 +2896,7 @@ mod tests {
                     sort_values: vec![WireSortValue {
                         kind: Some(sort_value::Kind::Num(*rank)),
                     }],
+                    highlight: Default::default(),
                 })
                 .collect::<Vec<_>>();
             Ok(Response::new(SearchResponse {
@@ -3011,6 +3015,7 @@ mod tests {
                     sort_values: vec![growlerdb_proto::v1::SortValue {
                         kind: Some(sort_value::Kind::Num(*rank)),
                     }],
+                    highlight: Default::default(),
                 })
                 .collect::<Vec<_>>();
             Ok(Response::new(SearchResponse {
@@ -3925,6 +3930,7 @@ mod tests {
                     group_count: 0,
                     sort_values: Vec::new(),
                     fields: vec![],
+                    highlight: Default::default(),
                 }],
                 total: 1,
                 ..Default::default()

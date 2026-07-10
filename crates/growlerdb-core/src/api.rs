@@ -170,6 +170,67 @@ pub struct Hit {
     /// marked `cached`/stored in the index, so a page renders without hydration.
     /// Empty when the index caches no display fields.
     pub fields: std::collections::BTreeMap<String, Value>,
+    /// **Server-side highlights** (task-250): field name → matched fragments, populated only
+    /// when the search opted in ([`SearchParams::highlight`]). Reflects the analyzed match
+    /// (stemming/positions), unlike a client-side literal-term marker. Empty otherwise.
+    pub highlight: std::collections::BTreeMap<String, Vec<HighlightFragment>>,
+}
+
+/// One matched **fragment** of a highlighted field (task-250): an ordered run of
+/// [segments](HighlightSegment) — matched terms and their surrounding context. Carried as
+/// segments (not pre-marked HTML) so a client renders `<mark>` with no `innerHTML`/XSS.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HighlightFragment {
+    /// The segments of this fragment, in order.
+    pub segments: Vec<HighlightSegment>,
+}
+
+/// One run within a [fragment](HighlightFragment): a stretch of text and whether it is a
+/// matched term (rendered inside a `<mark>`/`<em>`) or surrounding context.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HighlightSegment {
+    /// The literal text of this run.
+    pub text: String,
+    /// True ⇒ this run is a matched term (render it marked).
+    pub marked: bool,
+}
+
+/// Server-side highlight options (task-250): which analyzed **TEXT** fields to snippet and the
+/// per-hit bounds. Set on [`SearchParams::highlight`] to opt in; unset ⇒ no highlights.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Highlight {
+    /// TEXT fields to highlight. Empty = a sensible default: every highlightable (analyzed +
+    /// stored) TEXT field. Non-highlightable names are silently skipped.
+    pub fields: Vec<String>,
+    /// Max fragments per field (bounds the per-hit payload).
+    pub max_fragments: usize,
+    /// Approximate max characters per fragment (the snippet window size).
+    pub fragment_size: usize,
+}
+
+/// Default max fragments returned per highlighted field (task-250) — a bounded payload.
+pub const DEFAULT_HIGHLIGHT_MAX_FRAGMENTS: usize = 3;
+/// Default approximate characters per highlight fragment (task-250) — the snippet window.
+pub const DEFAULT_HIGHLIGHT_FRAGMENT_SIZE: usize = 150;
+
+impl Highlight {
+    /// A highlight request over `fields` (empty = the default highlightable set). A
+    /// `max_fragments`/`fragment_size` of 0 means "use the default".
+    pub fn new(fields: Vec<String>, max_fragments: usize, fragment_size: usize) -> Self {
+        Self {
+            fields,
+            max_fragments: if max_fragments == 0 {
+                DEFAULT_HIGHLIGHT_MAX_FRAGMENTS
+            } else {
+                max_fragments
+            },
+            fragment_size: if fragment_size == 0 {
+                DEFAULT_HIGHLIGHT_FRAGMENT_SIZE
+            } else {
+                fragment_size
+            },
+        }
+    }
 }
 
 /// Which columns [hydration](RowLocator) returns from the authoritative row.
@@ -432,6 +493,10 @@ pub struct SearchParams {
     /// Keyset cursor: return the page strictly after this point in the total order.
     /// When set, `offset` is ignored and `sort` must be non-empty.
     pub search_after: Option<SearchAfter>,
+    /// **Highlight** opt-in (task-250): when `Some`, each returned [`Hit`] carries per-field
+    /// [`highlight`](Hit::highlight) fragments of the analyzed match. `None` = no highlights
+    /// (the default; highlighting is an extra per-hit cost).
+    pub highlight: Option<Highlight>,
 }
 
 impl SearchParams {
@@ -443,7 +508,14 @@ impl SearchParams {
             sort: Vec::new(),
             offset: 0,
             search_after: None,
+            highlight: None,
         }
+    }
+
+    /// Opt into [server-side highlighting](Highlight) (task-250) for this search.
+    pub fn with_highlight(mut self, highlight: Highlight) -> Self {
+        self.highlight = Some(highlight);
+        self
     }
 
     /// Parse `query` (Lucene/KQL grammar) and search top-`k` (by score, no offset).

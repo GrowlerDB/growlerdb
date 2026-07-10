@@ -40,7 +40,33 @@ impl Node for CaptureNode {
         &self,
         req: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
-        *self.seen_query.lock().unwrap() = req.into_inner().query;
+        let inner = req.into_inner();
+        *self.seen_query.lock().unwrap() = inner.query.clone();
+        // Echo a highlight fragment back only when the request opted in (task-250), so the HTTP test
+        // can assert both that the `highlight` clause was forwarded and that it renders in the response.
+        let highlight = if inner.highlight.is_some() {
+            let mut m = std::collections::HashMap::new();
+            m.insert(
+                "title".to_string(),
+                growlerdb_proto::v1::HighlightField {
+                    fragments: vec![growlerdb_proto::v1::HighlightFragment {
+                        segments: vec![
+                            growlerdb_proto::v1::HighlightSegment {
+                                text: "an ".into(),
+                                marked: false,
+                            },
+                            growlerdb_proto::v1::HighlightSegment {
+                                text: "iceberg".into(),
+                                marked: true,
+                            },
+                        ],
+                    }],
+                },
+            );
+            m
+        } else {
+            Default::default()
+        };
         Ok(Response::new(SearchResponse {
             hits: vec![SearchHit {
                 coordinates: Some(Coordinates {
@@ -58,6 +84,7 @@ impl Node for CaptureNode {
                 group_count: 0,
                 sort_values: vec![],
                 fields: vec![],
+                highlight,
             }],
             total: 1,
             next_cursor: vec![],
@@ -151,6 +178,50 @@ async fn search_translates_dsl_and_shapes_documents() {
     assert_eq!(hit["_score"], 1.5);
     assert_eq!(hit["_source"]["title"], "hello");
     assert_eq!(hit["_source"]["age"], 30);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn highlight_clause_produces_a_highlight_object() -> Result<(), Box<dyn std::error::Error>> {
+    // A `highlight` clause opts the search into server-side highlighting (task-250); the response
+    // carries a standard OpenSearch `highlight` object with `<em>`-marked, HTML-escaped fragments.
+    let node = CaptureNode {
+        seen_query: Arc::new(Mutex::new(String::new())),
+    };
+    let app = opensearch_router(Arc::new(Gateway::new(Arc::new(node))));
+
+    let (status, body) = post(
+        app,
+        "/telemetry/_search",
+        json!({
+            "query": { "match": { "title": "iceberg" } },
+            "highlight": { "fields": { "title": {} } }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let hit = &body["hits"]["hits"][0];
+    assert_eq!(hit["highlight"]["title"][0], "an <em>iceberg</em>");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_highlight_clause_omits_the_highlight_object() {
+    // Without a `highlight` clause the response carries no `highlight` (off by default, task-250).
+    let node = CaptureNode {
+        seen_query: Arc::new(Mutex::new(String::new())),
+    };
+    let app = opensearch_router(Arc::new(Gateway::new(Arc::new(node))));
+
+    let (status, body) = post(
+        app,
+        "/telemetry/_search",
+        json!({ "query": { "match": { "title": "iceberg" } } }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["hits"]["hits"][0].get("highlight").is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

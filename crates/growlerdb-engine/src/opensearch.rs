@@ -24,7 +24,8 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value as JsonValue};
 
 use growlerdb_proto::v1::{
-    self, value::Kind, Coordinates, GetByKeyRequest, SearchRequest, Sort as WireSort,
+    self, value::Kind, Coordinates, GetByKeyRequest, HighlightField, HighlightRequest,
+    SearchRequest, Sort as WireSort,
 };
 
 use crate::gateway::Gateway;
@@ -357,6 +358,74 @@ pub fn translate_sort(sort: &JsonValue) -> Result<Vec<WireSort>, AdapterError> {
     Ok(out)
 }
 
+/// Translate an OpenSearch `highlight` clause into the native [`HighlightRequest`] (task-250). We
+/// map the field set and the two bounds we support — `number_of_fragments` → `max_fragments` and
+/// `fragment_size` → `fragment_size` (top-level or per-field; a per-field value wins). Everything
+/// else in the OpenSearch highlight DSL (custom tags, `type`, `order`, …) is ignored: GrowlerDB
+/// emits XSS-safe segments the client marks, so pre/post tags don't apply. An empty/absent `fields`
+/// map highlights the default set (the index's highlightable TEXT fields).
+pub fn translate_highlight(clause: &JsonValue) -> HighlightRequest {
+    let obj = clause.as_object();
+    let top_u32 = |key: &str| -> u32 {
+        obj.and_then(|o| o.get(key))
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0) as u32
+    };
+    let (mut max_fragments, mut fragment_size) =
+        (top_u32("number_of_fragments"), top_u32("fragment_size"));
+    let mut fields = Vec::new();
+    if let Some(fmap) = obj
+        .and_then(|o| o.get("fields"))
+        .and_then(JsonValue::as_object)
+    {
+        for (name, spec) in fmap {
+            fields.push(name.clone());
+            // A per-field override wins over the top-level default.
+            if let Some(v) = spec.get("number_of_fragments").and_then(JsonValue::as_u64) {
+                max_fragments = v as u32;
+            }
+            if let Some(v) = spec.get("fragment_size").and_then(JsonValue::as_u64) {
+                fragment_size = v as u32;
+            }
+        }
+    }
+    HighlightRequest {
+        fields,
+        max_fragments,
+        fragment_size,
+    }
+}
+
+/// Render a wire [`HighlightField`]'s fragments to the OpenSearch response shape (task-250): a
+/// vector of strings, one per fragment, with `marked` segments wrapped in `<em>…</em>` (the
+/// OpenSearch default tag) and all text HTML-escaped so the fragment is safe to render.
+fn highlight_field_html(field: &HighlightField) -> Vec<String> {
+    field
+        .fragments
+        .iter()
+        .map(|frag| {
+            let mut s = String::new();
+            for seg in &frag.segments {
+                if seg.marked {
+                    s.push_str("<em>");
+                    s.push_str(&html_escape(&seg.text));
+                    s.push_str("</em>");
+                } else {
+                    s.push_str(&html_escape(&seg.text));
+                }
+            }
+            s
+        })
+        .collect()
+}
+
+/// Minimal HTML entity escaping for highlight fragment text (`&`, `<`, `>`).
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /// Synthesize an OpenSearch `_id` from the composite key: partition values then identifier values,
 /// joined by `#`. Deterministic and round-trippable-ish (informational; hydration uses the full
 /// coordinate, not this string).
@@ -406,6 +475,10 @@ struct OsSearchBody {
     size: Option<u32>,
     #[serde(default)]
     sort: Option<JsonValue>,
+    /// OpenSearch highlight clause (task-250): `{ "fields": { "body": {} } }`. Present ⇒ the search
+    /// opts into server-side highlighting and the response carries a per-hit `highlight` object.
+    #[serde(default)]
+    highlight: Option<JsonValue>,
 }
 
 async fn search_all_handler(
@@ -454,6 +527,9 @@ async fn run_search(
         Ok(s) => s.unwrap_or_default(),
         Err(e) => return adapter_error(e),
     };
+    // Translate the OpenSearch `highlight` clause (task-250) into the native opt-in. Present ⇒ the
+    // response carries a per-hit `highlight` object of matched fragments.
+    let highlight = body.highlight.as_ref().map(translate_highlight);
 
     let req = grpc_request(
         SearchRequest {
@@ -470,6 +546,7 @@ async fn run_search(
             syntax: v1::QuerySyntax::Lucene as i32,
             // Scope to the path's `{index}` (task-99); empty for `/_search` (the served index).
             index: index.clone(),
+            highlight,
         },
         &headers,
     );
@@ -521,12 +598,26 @@ async fn run_search(
             })
             .unwrap_or_default();
         max_score = max_score.max(hit.score);
-        hits.push(json!({
+        let mut doc = json!({
             "_index": index,
             "_id": id,
             "_score": hit.score,
             "_source": source,
-        }));
+        });
+        // Server-side highlights (task-250): render the segment fragments into the OpenSearch
+        // `highlight` shape — field → array of `<em>`-marked fragment strings. Only present when
+        // the request carried a `highlight` clause and a field actually matched.
+        if !hit.highlight.is_empty() {
+            let hl: Map<String, JsonValue> = hit
+                .highlight
+                .iter()
+                .map(|(field, hf)| (field.clone(), json!(highlight_field_html(hf))))
+                .collect();
+            if let Some(obj) = doc.as_object_mut() {
+                obj.insert("highlight".to_string(), JsonValue::Object(hl));
+            }
+        }
+        hits.push(doc);
     }
 
     let max_score = if hits.is_empty() {
@@ -783,5 +874,47 @@ mod tests {
             }],
         };
         assert_eq!(compose_id(&coords), "42#abc");
+    }
+
+    #[test]
+    fn highlight_clause_maps_fields_and_bounds() {
+        // `fields` + top-level bounds; a per-field bound overrides the top-level one (task-250).
+        let req = translate_highlight(&json!({
+            "number_of_fragments": 2,
+            "fields": { "body": { "fragment_size": 80 }, "title": {} }
+        }));
+        assert!(req.fields.contains(&"body".to_string()));
+        assert!(req.fields.contains(&"title".to_string()));
+        assert_eq!(req.max_fragments, 2);
+        assert_eq!(req.fragment_size, 80);
+
+        // An empty highlight clause ⇒ default fields (none named) and default (0) bounds.
+        let empty = translate_highlight(&json!({}));
+        assert!(empty.fields.is_empty());
+        assert_eq!(empty.max_fragments, 0);
+        assert_eq!(empty.fragment_size, 0);
+    }
+
+    #[test]
+    fn highlight_field_renders_em_marked_and_escaped_html() {
+        // Marked segments wrap in `<em>`; all text is HTML-escaped so a `<script>` can't inject.
+        let field = HighlightField {
+            fragments: vec![v1::HighlightFragment {
+                segments: vec![
+                    v1::HighlightSegment {
+                        text: "a <b>".into(),
+                        marked: false,
+                    },
+                    v1::HighlightSegment {
+                        text: "brown".into(),
+                        marked: true,
+                    },
+                ],
+            }],
+        };
+        assert_eq!(
+            highlight_field_html(&field),
+            vec!["a &lt;b&gt;<em>brown</em>".to_string()]
+        );
     }
 }

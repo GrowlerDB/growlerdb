@@ -18,9 +18,10 @@ use std::ops::Bound;
 use std::path::Path;
 
 use growlerdb_core::{
-    sort_has_score, CompositeKey, DocBatch, Document, FieldType, Hit, LocationStrategy, MatchOp,
-    Query, ResolvedField, ResolvedIndex, SearchAfter, Sort, SortOrder, SortValue, TextRecord,
-    TimeFormat, Value as GValue, SCORE_SORT_KEY,
+    sort_has_score, CompositeKey, DocBatch, Document, FieldType, Highlight, HighlightFragment,
+    HighlightSegment, Hit, LocationStrategy, MatchOp, Query, ResolvedField, ResolvedIndex,
+    SearchAfter, Sort, SortOrder, SortValue, TextRecord, TimeFormat, Value as GValue,
+    SCORE_SORT_KEY,
 };
 use tantivy::aggregation::agg_req::Aggregations;
 use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
@@ -827,6 +828,7 @@ impl SegmentReader {
                     key,
                     score: if by_score { score } else { 0.0 },
                     fields: self.cached_fields(&doc),
+                    highlight: Default::default(),
                 },
                 sort_values,
             ));
@@ -893,6 +895,7 @@ impl SegmentReader {
                     key,
                     score,
                     fields: self.cached_fields(&doc),
+                    highlight: Default::default(),
                 },
                 sort_values,
             ));
@@ -900,57 +903,85 @@ impl SegmentReader {
         Ok(out)
     }
 
-    /// Execute `query` (top-`k` by score) and, for each hit, generate a highlighted
-    /// **snippet** of `field` (task-25) — matched terms wrapped in `<b>…</b>`, capped
-    /// at `max_chars`. The snippet is `None` when the doc has no matching fragment.
-    /// `field` must be an analyzed **TEXT** field that is **cached** (`STORED`) so its
-    /// text is available to highlight.
-    pub fn search_highlighted(
-        &self,
-        query: &Query,
-        k: usize,
-        field: &str,
-        max_chars: usize,
-    ) -> Result<Vec<(Hit, Option<String>)>> {
-        let tantivy_query = self.build(query)?;
-        if k == 0 {
-            return Ok(Vec::new());
+    /// The set of **highlightable** TEXT field names given a highlight request (task-250): the
+    /// requested `fields`, or — when the request lists none — every analyzed TEXT field the index
+    /// stores (`cached`), in schema order. A requested field that isn't an analyzed, stored TEXT
+    /// field is silently dropped (highlighting is best-effort; a non-highlightable name shouldn't
+    /// fail the search). Returns each name paired with its Tantivy [`Field`].
+    fn highlightable_fields(&self, requested: &[String]) -> Vec<(String, Field)> {
+        let schema = self.index.schema();
+        let is_highlightable = |field: Field| -> bool {
+            let entry = schema.get_field_entry(field);
+            entry.name() != KEY_FIELD
+                && entry.is_stored()
+                && matches!(field_kind(&schema, field), Some(true))
+        };
+        if requested.is_empty() {
+            schema
+                .fields()
+                .filter(|(field, _)| is_highlightable(*field))
+                .map(|(field, entry)| (entry.name().to_string(), field))
+                .collect()
+        } else {
+            requested
+                .iter()
+                .filter_map(|name| {
+                    let field = schema.get_field(name).ok()?;
+                    is_highlightable(field).then(|| (name.clone(), field))
+                })
+                .collect()
         }
-        let (hl_field, is_text) = self.resolve_field(Some(field))?;
-        if !is_text {
-            return Err(IndexError::QueryType(format!(
-                "highlight requires an analyzed TEXT field, got `{field}`"
-            )));
-        }
-        let searcher = self.reader.searcher();
-        let mut generator = tantivy::snippet::SnippetGenerator::create(
-            &searcher,
-            tantivy_query.as_ref(),
-            hl_field,
-        )?;
-        generator.set_max_num_chars(max_chars);
+    }
 
-        let key_field = self.index.schema().get_field(KEY_FIELD)?;
-        let top = searcher.search(
-            tantivy_query.as_ref(),
-            &TopDocs::with_limit(k).order_by_score(),
-        )?;
-        let mut out = Vec::with_capacity(top.len());
-        for (score, address) in top {
-            let doc: TantivyDocument = searcher.doc(address)?;
-            let key = stored_key(&doc, key_field)?;
-            let snippet = generator.snippet_from_doc(&doc);
-            let highlight = (!snippet.fragment().is_empty()).then(|| snippet.to_html());
-            out.push((
-                Hit {
-                    key,
-                    score,
-                    fields: self.cached_fields(&doc),
-                },
-                highlight,
-            ));
+    /// Fill each hit's per-field [`highlight`](Hit::highlight) from the **analyzed match**
+    /// (task-250): for every requested highlightable TEXT field, build a Tantivy
+    /// [`SnippetGenerator`](tantivy::snippet::SnippetGenerator) for `query` and snippet the hit's
+    /// own **cached** text, converting the highlighted byte ranges to XSS-safe
+    /// [segments](HighlightSegment). Bounded by `hl.fragment_size` (the snippet window). Fields with
+    /// no matching fragment for a hit are simply absent from its map.
+    ///
+    /// Cost: one `SnippetGenerator` per requested field (built once here, reused across the page)
+    /// plus one snippet per (hit, field). Only runs when the request opted in — off by default.
+    pub fn highlight_hits(&self, query: &Query, hits: &mut [Hit], hl: &Highlight) -> Result<()> {
+        let fields = self.highlightable_fields(&hl.fields);
+        if fields.is_empty() || hits.is_empty() {
+            return Ok(());
         }
-        Ok(out)
+        let tantivy_query = self.build(query)?;
+        let searcher = self.reader.searcher();
+        // Build a generator per field once; each snippets the per-hit cached text.
+        let mut generators = Vec::with_capacity(fields.len());
+        for (name, field) in &fields {
+            let mut gen = tantivy::snippet::SnippetGenerator::create(
+                &searcher,
+                tantivy_query.as_ref(),
+                *field,
+            )?;
+            gen.set_max_num_chars(hl.fragment_size);
+            generators.push((name.clone(), gen));
+        }
+        for hit in hits.iter_mut() {
+            for (name, gen) in &generators {
+                // Highlight the field's cached text on the hit — no doc re-fetch. A field
+                // without cached text on this hit has nothing to snippet.
+                let Some(GValue::Str(text)) = hit.fields.get(name) else {
+                    continue;
+                };
+                let snippet = gen.snippet(text);
+                if snippet.is_empty() {
+                    continue;
+                }
+                let fragment = snippet_to_fragment(snippet.fragment(), snippet.highlighted());
+                if !fragment.segments.is_empty() {
+                    // A single best fragment per field (a solid first version); `max_fragments`
+                    // caps the vec so the wire shape can carry more later without a break.
+                    let mut frags = vec![fragment];
+                    frags.truncate(hl.max_fragments.max(1));
+                    hit.highlight.insert(name.clone(), frags);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// **Prefix autocomplete** (task-25): the indexed terms of `field` that start with
@@ -1203,6 +1234,7 @@ impl SegmentReader {
                     key,
                     score: 0.0,
                     fields: self.cached_fields(&doc),
+                    highlight: Default::default(),
                 },
                 group,
                 sort_values,
@@ -1918,6 +1950,42 @@ fn field_kind(schema: &Schema, field: Field) -> Option<bool> {
             .map(|o| o.tokenizer() == "default"),
         _ => None,
     }
+}
+
+/// Convert a Tantivy snippet — a `fragment` string plus `highlighted` byte ranges into it — to an
+/// XSS-safe [`HighlightFragment`] of alternating context / matched [segments](HighlightSegment)
+/// (task-250). Overlapping ranges are collapsed first (Tantivy can emit adjacent/overlapping hits),
+/// and the fragment carries no HTML — the client wraps `marked` segments in `<mark>` itself.
+fn snippet_to_fragment(
+    fragment: &str,
+    highlighted: &[std::ops::Range<usize>],
+) -> HighlightFragment {
+    let mut segments = Vec::new();
+    let mut cursor = 0usize;
+    for range in tantivy::snippet::collapse_overlapped_ranges(highlighted) {
+        // Skip a malformed/out-of-order range rather than panic on a bad slice.
+        if range.start < cursor || range.end > fragment.len() || range.start >= range.end {
+            continue;
+        }
+        if range.start > cursor {
+            segments.push(HighlightSegment {
+                text: fragment[cursor..range.start].to_string(),
+                marked: false,
+            });
+        }
+        segments.push(HighlightSegment {
+            text: fragment[range.clone()].to_string(),
+            marked: true,
+        });
+        cursor = range.end;
+    }
+    if cursor < fragment.len() {
+        segments.push(HighlightSegment {
+            text: fragment[cursor..].to_string(),
+            marked: false,
+        });
+    }
+    HighlightFragment { segments }
 }
 
 /// The first analyzed TEXT field in schema order (the default search field).

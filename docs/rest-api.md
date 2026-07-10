@@ -41,6 +41,32 @@ authoritative row is still `/v1/keys:get`.
 Also accepts `search_after` (keyset cursor), `collapse` (fast field), and `pit_id`. See
 [Query language](query-language).
 
+**Highlighting** (opt-in) — set `"highlight"` to have each hit carry a `highlight` object of matched
+fragments per field, reflecting the *analyzed* match (stemming, per-field analysis, phrase positions).
+Off by default (a per-hit cost). `"highlight": {}` highlights the index's default highlightable TEXT
+(`cached`) fields; name fields and/or bound the output with `fields` / `max_fragments` / `fragment_size`:
+
+```sh
+curl -s localhost:8081/v1/search -H 'content-type: application/json' -d '{
+  "query": "title:iceberg", "limit": 10,
+  "highlight": { "fields": ["title"], "max_fragments": 1, "fragment_size": 150 }
+}'
+```
+```json
+{ "hits": [ { "coordinates": { "identifier": [ { "name": "id", "value": "doc-2" } ] },
+             "score": 1.0,
+             "fields": { "title": "Iceberg internals" },
+             "highlight": { "title": [ [ { "text": "", "marked": false },
+                                          { "text": "Iceberg", "marked": true },
+                                          { "text": " internals", "marked": false } ] ] } } ],
+  "total": 1 }
+```
+
+Highlights are `field → fragments → segments`, where each segment is an XSS-safe `{text, marked}` run
+(no HTML) — a `marked` run is a matched term, rendered inside `<mark>`. A field with no matching fragment
+(and a non-highlightable field name) is simply absent. The `highlight` object is omitted entirely when
+the request didn't opt in.
+
 An **omitted or `0` `limit` returns a bounded page** (default 10), not the whole result set — for a
 full scan use the keyset `search_after` scroll, not an unbounded page. When a shard fails to respond
 the response carries `"partial": true` (and `/v1/suggest`, `/v1/keys:get` carry `"failed_shards": N`)

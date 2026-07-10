@@ -5,13 +5,14 @@
 //!
 //! [Design 01]: ../../../design/01-engine-api.md
 
-use growlerdb_core::{Agg, CompositeKey, Query, SearchAfter, Sort, SortOrder};
+use growlerdb_core::{Agg, CompositeKey, Highlight, Query, SearchAfter, Sort, SortOrder};
 use growlerdb_index::{IndexError, Shard, StoreError};
 use growlerdb_proto::v1::{
     AggregateRequest, AggregateResponse, AnalyzedField, ClosePitRequest, ClosePitResponse,
     Error as WireError, ExplainClause, ExplainRequest, ExplainResponse, ExplainTimings,
-    ExportRequest, Field, OpenPitRequest, OpenPitResponse, QuerySyntax, SearchHit, SearchRequest,
-    SearchResponse,
+    ExportRequest, Field, HighlightField, HighlightFragment as WireHighlightFragment,
+    HighlightSegment as WireHighlightSegment, OpenPitRequest, OpenPitResponse, QuerySyntax,
+    SearchHit, SearchRequest, SearchResponse,
 };
 use growlerdb_proto::{to_status, Search, SearchServer};
 use tokio_stream::wrappers::ReceiverStream;
@@ -117,6 +118,11 @@ impl Search for SearchService {
         }
         let collapse = req.collapse;
         let pit_id = req.pit_id;
+        // Server-side highlighting opt-in (task-250): present only when the client asked for it.
+        // Non-highlightable field names are dropped downstream, not rejected here.
+        let highlight = req
+            .highlight
+            .map(|h| Highlight::new(h.fields, h.max_fragments as usize, h.fragment_size as usize));
 
         // Collapse needs a sort to define each group's "top"; reject early & clearly.
         if !collapse.is_empty() && sort.is_empty() {
@@ -129,12 +135,13 @@ impl Search for SearchService {
         // filter from the verified claim — the caller can neither read nor widen past it.
         let query = tenant_scope(&shard, query, tenant.as_deref())?;
         let resp = tokio::task::spawn_blocking(move || {
+            let hl = highlight.as_ref();
             if !collapse.is_empty() {
                 // Collapse honors a pit_id (frozen snapshot) just like the paged path.
                 let groups = if pit_id == 0 {
-                    shard.search_collapsed(&query, k, &sort, &collapse)?
+                    shard.search_collapsed(&query, k, &sort, &collapse, hl)?
                 } else {
-                    shard.search_collapsed_pit(pit_id, &query, k, &sort, &collapse)?
+                    shard.search_collapsed_pit(pit_id, &query, k, &sort, &collapse, hl)?
                 };
                 return Ok(SearchResponse {
                     total: groups.len() as u64,
@@ -149,6 +156,7 @@ impl Search for SearchService {
                             // order collapse groups across shards (task-68).
                             sort_values: g.sort_values.iter().map(Into::into).collect(),
                             fields: hit_fields(&g.hit.fields),
+                            highlight: hit_highlight(&g.hit.highlight),
                         })
                         .collect(),
                     next_cursor: Vec::new(),
@@ -159,9 +167,17 @@ impl Search for SearchService {
             }
             // A pit_id reads against that frozen snapshot; 0 reads the latest.
             let (hits, next) = if pit_id == 0 {
-                shard.search_page_values(&query, k, &sort, offset, after.as_ref())?
+                shard.search_page_values(&query, k, &sort, offset, after.as_ref(), hl)?
             } else {
-                shard.search_page_pit_values(pit_id, &query, k, &sort, offset, after.as_ref())?
+                shard.search_page_pit_values(
+                    pit_id,
+                    &query,
+                    k,
+                    &sort,
+                    offset,
+                    after.as_ref(),
+                    hl,
+                )?
             };
             // `total` is the true match count (read against the same snapshot), not the page
             // size, so a Gateway can sum it across shards for a global total (task-68).
@@ -352,6 +368,8 @@ impl Search for SearchService {
                     &sort,
                     0,
                     cursor.as_ref(),
+                    // Export streams full result sets; highlighting is a search-page feature (task-250).
+                    None,
                 ) {
                     Ok((hits, next)) => {
                         if hits.is_empty() {
@@ -494,6 +512,8 @@ fn page_response(
                 sort_values: sort_values.iter().map(Into::into).collect(),
                 // Cached display fields (D23/task-86) render the page without hydration.
                 fields: hit_fields(&h.fields),
+                // Server-side highlights (task-250); empty unless the request opted in.
+                highlight: hit_highlight(&h.highlight),
             })
             .collect(),
         next_cursor: next.map(encode_cursor).unwrap_or_default(),
@@ -501,6 +521,33 @@ fn page_response(
         // A bare Node has no shard scope; the Gateway stamps scanned/total (task-133).
         ..Default::default()
     }
+}
+
+/// Map a core [`Hit`](growlerdb_core::Hit)'s server-side highlights (task-250) to the wire
+/// `map<string, HighlightField>`: each field's fragments as XSS-safe segment runs. Empty when the
+/// search didn't opt in or no field had a matching fragment.
+fn hit_highlight(
+    highlight: &std::collections::BTreeMap<String, Vec<growlerdb_core::HighlightFragment>>,
+) -> std::collections::HashMap<String, HighlightField> {
+    highlight
+        .iter()
+        .map(|(field, frags)| {
+            let fragments = frags
+                .iter()
+                .map(|f| WireHighlightFragment {
+                    segments: f
+                        .segments
+                        .iter()
+                        .map(|s| WireHighlightSegment {
+                            text: s.text.clone(),
+                            marked: s.marked,
+                        })
+                        .collect(),
+                })
+                .collect();
+            (field.clone(), HighlightField { fragments })
+        })
+        .collect()
 }
 
 /// The cached display fields (D23) of a core [`Hit`](growlerdb_core::Hit) as wire [`Field`]s — the
@@ -1251,5 +1298,125 @@ mod tests {
         let svc = tenant_service(tmp.path());
         let err = svc.search(tenant_req("id:a", None)).await.unwrap_err();
         assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    /// A `docs` shard with a **cached** TEXT `body` field, for highlight tests (task-250).
+    fn highlight_service(root: &std::path::Path) -> SearchService {
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("body", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        let idx = IndexDefinition::from_yaml(
+            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD }, { path: body, type: TEXT, cached: true } ] }\n",
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+        let shard = LocalIndexStore::open(root)
+            .unwrap()
+            .create_shard(&ShardId::single("docs"), &idx)
+            .unwrap();
+        let mk = |id: &str, body: &str| {
+            let key = CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]);
+            let mut f = BTreeMap::new();
+            f.insert("id".to_string(), Value::from(id));
+            f.insert("body".to_string(), Value::from(body));
+            LocatedDoc {
+                doc: Document::new(key, f),
+                iceberg_file: "f".into(),
+                row_position: 0,
+            }
+        };
+        IndexWriter::write(
+            &shard,
+            &CommitBatch::from_upserts(
+                vec![mk("a", "the quick brown fox jumps")],
+                SourceCheckpoint::iceberg(1),
+                "b1",
+            ),
+        )
+        .unwrap();
+        SearchService::new(std::sync::Arc::new(shard))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn highlight_is_off_by_default_and_marks_the_matched_term_when_requested() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = highlight_service(tmp.path());
+
+        // Off by default: no `highlight` in the request ⇒ no per-hit highlights.
+        let resp = svc
+            .search(Request::new(SearchRequest {
+                query: "body:brown".into(),
+                limit: 10,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.hits.len(), 1);
+        assert!(
+            resp.hits[0].highlight.is_empty(),
+            "highlighting is off unless requested"
+        );
+
+        // Opt in: the `body` fragment marks "brown" and keeps surrounding context, as segments.
+        let resp = svc
+            .search(Request::new(SearchRequest {
+                query: "body:brown".into(),
+                limit: 10,
+                highlight: Some(growlerdb_proto::v1::HighlightRequest {
+                    fields: vec!["body".into()],
+                    max_fragments: 0,
+                    fragment_size: 0,
+                }),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let hl = &resp.hits[0].highlight;
+        let field = hl.get("body").expect("body highlighted");
+        let frag = &field.fragments[0];
+        let marked: Vec<&str> = frag
+            .segments
+            .iter()
+            .filter(|s| s.marked)
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(marked, vec!["brown"]);
+        // XSS-safe: context segments carry raw text (no HTML), e.g. the neighbouring "fox".
+        assert!(frag
+            .segments
+            .iter()
+            .any(|s| !s.marked && s.text.contains("fox")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn highlight_analyzed_match_marks_the_lowercased_token() {
+        // The analyzer lowercases, so an uppercase query term still marks the indexed token —
+        // the highlight reflects the *analyzed* match, not the literal query text.
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = highlight_service(tmp.path());
+        let resp = svc
+            .search(Request::new(SearchRequest {
+                query: "body:BROWN".into(),
+                limit: 10,
+                highlight: Some(growlerdb_proto::v1::HighlightRequest::default()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        // Empty `fields` defaults to the highlightable TEXT fields (here `body`).
+        let field = resp.hits[0]
+            .highlight
+            .get("body")
+            .expect("body highlighted");
+        assert!(field.fragments[0].segments.iter().any(|s| s.marked));
     }
 }

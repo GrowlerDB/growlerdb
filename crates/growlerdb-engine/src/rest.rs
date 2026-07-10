@@ -1693,6 +1693,10 @@ struct SearchDto {
     /// rejects a name that doesn't match the index it fronts (`404`).
     #[serde(default)]
     index: String,
+    /// Opt into **server-side highlighting** (task-250). Present ⇒ each hit carries a `highlight`
+    /// object of matched fragments per field. Absent (the default) ⇒ no highlights (a per-hit cost).
+    #[serde(default)]
+    highlight: Option<HighlightDto>,
 }
 
 #[derive(Deserialize)]
@@ -1700,6 +1704,18 @@ struct SortDto {
     field: String,
     #[serde(default)]
     desc: bool,
+}
+
+/// Server-side highlight options over REST (task-250). All fields optional: an empty `fields` list
+/// highlights the index's default highlightable TEXT fields; `0`/omitted bounds use server defaults.
+#[derive(Deserialize)]
+struct HighlightDto {
+    #[serde(default)]
+    fields: Vec<String>,
+    #[serde(default)]
+    max_fragments: u32,
+    #[serde(default)]
+    fragment_size: u32,
 }
 
 /// Page size for a REST search that omits (or sends `0` for) `limit`. `limit = 0` on the wire still
@@ -1746,6 +1762,12 @@ impl SearchDto {
             // Per-index scoping (task-99): pass the target index through; the serving Gateway
             // validates it. Empty means "the index served here".
             index: self.index,
+            // Server-side highlighting opt-in (task-250); absent ⇒ no highlights.
+            highlight: self.highlight.map(|h| v1::HighlightRequest {
+                fields: h.fields,
+                max_fragments: h.max_fragments,
+                fragment_size: h.fragment_size,
+            }),
         }
     }
 }
@@ -1781,6 +1803,19 @@ struct HitDto {
     group: Option<JsonValue>,
     #[serde(skip_serializing_if = "is_zero")]
     group_count: u64,
+    /// **Server-side highlights** (task-250): field → fragments → XSS-safe `{text, marked}`
+    /// segments of the analyzed match. Present only when the request opted in and a field matched;
+    /// the console renders `marked` segments in `<mark>`. Omitted otherwise.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    highlight: Map<String, JsonValue>,
+}
+
+/// One XSS-safe highlight segment over REST (task-250): a run of text and whether it is a matched
+/// term. Mirrors the console's `Segment` shape so the wire and the client-side fallback render alike.
+#[derive(Serialize)]
+struct SegmentDto {
+    text: String,
+    marked: bool,
 }
 
 impl From<v1::SearchResponse> for SearchRespDto {
@@ -1805,6 +1840,7 @@ impl From<v1::SearchResponse> for SearchRespDto {
                         .collect(),
                     group: h.group.map(value_to_json),
                     group_count: h.group_count,
+                    highlight: highlight_to_json(h.highlight),
                 })
                 .collect(),
         }
@@ -2094,6 +2130,34 @@ fn value_to_json(v: v1::Value) -> JsonValue {
         Some(Kind::TsMicros(t)) => json!(t),
         None => JsonValue::Null,
     }
+}
+
+/// Convert the wire `map<string, HighlightField>` (task-250) to the REST highlight object: field →
+/// fragments → `[{text, marked}]` segment runs. Skips empty (no-highlight) input.
+fn highlight_to_json(
+    highlight: std::collections::HashMap<String, v1::HighlightField>,
+) -> Map<String, JsonValue> {
+    highlight
+        .into_iter()
+        .map(|(field, hf)| {
+            let fragments: Vec<JsonValue> = hf
+                .fragments
+                .into_iter()
+                .map(|frag| {
+                    let segs: Vec<SegmentDto> = frag
+                        .segments
+                        .into_iter()
+                        .map(|s| SegmentDto {
+                            text: s.text,
+                            marked: s.marked,
+                        })
+                        .collect();
+                    json!(segs)
+                })
+                .collect();
+            (field, JsonValue::Array(fragments))
+        })
+        .collect()
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -2673,6 +2737,7 @@ mod tests {
             group_count: 0,
             sort_values: vec![],
             fields,
+            highlight: Default::default(),
         };
         let resp = |hits| {
             serde_json::to_value(SearchRespDto::from(v1::SearchResponse {

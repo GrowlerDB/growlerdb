@@ -53,12 +53,26 @@ export interface Coordinates {
   identifier?: KeyField[];
 }
 
+/** One XSS-safe highlight segment (task-250): a run of text and whether it is a matched term.
+ *  Mirrors {@link import('./highlight').Segment} so server + client-side highlights render alike. */
+export interface HighlightSegment {
+  text: string;
+  marked: boolean;
+}
+
+/** Server-side highlights for a hit (task-250): field name → fragments → segment runs. Present only
+ *  when the search opted in (`highlight` in the request) and a field actually matched. */
+export type HitHighlight = Record<string, HighlightSegment[][]>;
+
 export interface SearchHit {
   coordinates?: Coordinates;
   score?: number;
   /** Cached display fields returned with the hit (D23/task-86), so a results page renders
    *  document-like rows without hydration. Absent when the index caches no display fields. */
   fields?: Record<string, unknown>;
+  /** Server-side highlights (task-250): field → matched fragments (each a list of `{text, marked}`
+   *  segments), reflecting the analyzed match. Absent unless the search requested highlighting. */
+  highlight?: HitHighlight;
 }
 
 export interface SearchResponse {
@@ -96,6 +110,9 @@ export interface SearchOptions {
   sort?: SortKey[];
   /** `search_after` keyset cursor from a prior response's `next_cursor` (deep paging). */
   cursor?: string;
+  /** Opt into server-side highlighting (task-250). `true` = default highlightable TEXT fields;
+   *  an object names fields and/or bounds. Omitted = no highlights (the client-side marker is used). */
+  highlight?: boolean | { fields?: string[]; max_fragments?: number; fragment_size?: number };
 }
 
 /** Run a query through the Engine `/v1/search` endpoint. Supports per-index scoping, field sort,
@@ -112,6 +129,10 @@ export async function search(query: string, opts: SearchOptions = {}): Promise<S
     body.sort = opts.sort.map((s) => ({ field: s.field, desc: s.desc ?? true }));
   }
   if (opts.cursor) body.search_after = opts.cursor;
+  // Opt into server-side highlighting (task-250): `true` sends an empty object (default fields);
+  // an object passes fields/bounds through. Omitted ⇒ no `highlight` key (highlighting off).
+  if (opts.highlight === true) body.highlight = {};
+  else if (opts.highlight && typeof opts.highlight === 'object') body.highlight = opts.highlight;
   const res = await apiFetch('/v1/search', body);
   if (!res.ok) throw new Error(`search failed (${res.status})`);
   return res.json();

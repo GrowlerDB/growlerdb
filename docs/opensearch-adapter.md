@@ -66,6 +66,11 @@ same auth + tenant scoping as the native API.
 - **`from` / `size`** → offset / page size (default `size` = 10).
 - **`sort`** → native sort keys. Accepts `"field"`, `{ "field": "asc"|"desc" }`, and
   `{ "field": { "order": ... } }`. `_score` entries are dropped (native ranks by score by default).
+- **`highlight`** → opt into server-side highlighting. `fields` (the map keys) names the TEXT fields
+  to highlight; `number_of_fragments` → max fragments per field and `fragment_size` → the fragment
+  window (top-level or per-field, a per-field value winning). Each hit then carries a standard
+  OpenSearch `highlight` object (`field → ["…<em>term</em>…"]`, HTML-escaped). Custom pre/post tags,
+  `type`, and `order` are ignored — GrowlerDB emits `<em>`-marked, escaped fragments.
 - **`query`** absent → match-all.
 
 ## Caveats (documented limitations, not bugs)

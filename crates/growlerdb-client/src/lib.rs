@@ -208,6 +208,7 @@ pub struct SearchQuery {
     pit_id: u64,
     search_after: Vec<u8>,
     index: String,
+    highlight: Option<growlerdb_proto::v1::HighlightRequest>,
 }
 
 impl SearchQuery {
@@ -258,6 +259,23 @@ impl SearchQuery {
         self
     }
 
+    /// Opt into **server-side highlighting** (task-250): the hits carry matched fragments per field.
+    /// `fields` empty ⇒ the index's default highlightable TEXT fields; the bounds accept 0 for the
+    /// server defaults. Off unless called (highlighting is a per-hit cost).
+    pub fn highlight(
+        mut self,
+        fields: Vec<String>,
+        max_fragments: u32,
+        fragment_size: u32,
+    ) -> Self {
+        self.highlight = Some(growlerdb_proto::v1::HighlightRequest {
+            fields,
+            max_fragments,
+            fragment_size,
+        });
+        self
+    }
+
     /// Keyset cursor from a prior response's `next_cursor` (deep paging).
     pub fn after(mut self, cursor: Vec<u8>) -> Self {
         self.search_after = cursor;
@@ -282,6 +300,8 @@ impl From<SearchQuery> for SearchRequest {
             // Lucene grammar; the SDK can expose a KQL option later (task-90).
             syntax: growlerdb_proto::v1::QuerySyntax::Lucene as i32,
             index: q.index,
+            // Server-side highlighting opt-in (task-250); None ⇒ off.
+            highlight: q.highlight,
         }
     }
 }
