@@ -22,3 +22,11 @@ tiering, and GA criteria/readiness.
 
 Publishing the site (Pages) and pointing the domain is part of going public — see the GA-release work.
 Deep design/system knowledge lives here in the OKF; the website is the user-facing docs surface.
+
+The **getting-started** quickstart is validated end-to-end on a fresh box (Ubuntu 24.04 + macOS):
+newcomers need only **Docker + Compose v2 + `just`** (dual-OS prereqs), on a **host or VM — not a
+container** (Docker bind mounts don't resolve there), with **~4 GB RAM**. `just stack` builds the
+shared `growlerdb-local:dev` image **once** before starting the control-plane/node/gateway, avoiding
+a same-tag parallel-build race on Docker's containerd store; `setup-polaris.sh` parses the Polaris
+token with `sed` (no python3 dependency). CI's `e2e` runs the engine in-process, so it doesn't
+exercise the `--profile stack` build path — this quickstart is what covers it.
