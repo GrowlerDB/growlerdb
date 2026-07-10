@@ -1400,7 +1400,19 @@ impl SegmentReader {
                 // `[value TO value]`. (A genuinely unknown field still falls through to the text path
                 // below and errors as `UnknownField`.)
                 if let Some(name) = field.as_deref() {
-                    if let Ok((_, ftype)) = self.resolve_typed_field(name) {
+                    if let Ok((f, ftype)) = self.resolve_typed_field(name) {
+                        // BOOL is exact-match, but Tantivy's `RangeQuery` rejects a `Bool` term
+                        // ("Expected term with u64, i64, f64 or date"), so a `[true TO true]` range
+                        // errors. Build the `TermQuery` directly instead.
+                        if let TvFieldType::Bool(_) = ftype {
+                            let b = value.parse::<bool>().map_err(|_| {
+                                IndexError::QueryType(format!("bad bool value `{value}`"))
+                            })?;
+                            return Ok(Box::new(TermQuery::new(
+                                Term::from_field_bool(f, b),
+                                IndexRecordOption::Basic,
+                            )));
+                        }
                         if !matches!(ftype, TvFieldType::Str(_)) {
                             return self.build(&Query::Range {
                                 field: name.to_string(),
@@ -1794,9 +1806,15 @@ fn range_term(field: Field, ftype: &TvFieldType, v: &str) -> Result<Term> {
         TvFieldType::I64(_) => Term::from_field_i64(field, v.parse().map_err(|_| bad("integer"))?),
         TvFieldType::F64(_) => Term::from_field_f64(field, v.parse().map_err(|_| bad("float"))?),
         TvFieldType::Bool(_) => Term::from_field_bool(field, v.parse().map_err(|_| bad("bool"))?),
+        // A DATE bound is canonical epoch micros, but for authoring convenience it may also be
+        // written as an ISO-8601 / RFC3339 datetime (`2024-01-01T00:00:00Z`) or a bare `YYYY-MM-DD`
+        // date (UTC midnight); a raw integer stays epoch micros.
         TvFieldType::Date(_) => Term::from_field_date(
             field,
-            DateTime::from_timestamp_micros(v.parse().map_err(|_| bad("date (epoch micros)"))?),
+            DateTime::from_timestamp_micros(
+                growlerdb_core::timestamp::parse_date_query_bound(v)
+                    .ok_or_else(|| bad("date (epoch micros or ISO-8601)"))?,
+            ),
         ),
         TvFieldType::Str(_) => Term::from_field_text(field, v),
         TvFieldType::IpAddr(_) => {
@@ -2031,6 +2049,48 @@ mapping:
         assert_eq!(reader.num_docs(), 2);
         // The analyzed text path still works alongside the typed columns.
         assert_eq!(reader.search(&q("body:brown"), 10).unwrap().len(), 2);
+
+        // BOOL term match (task-247 / issue 1): `active:true`/`active:false` must select the right
+        // doc without erroring (previously Internal "Expected term with u64/i64/f64/date, got Bool").
+        assert_eq!(reader.search(&q("active:true"), 10).unwrap().len(), 1);
+        assert_eq!(reader.search(&q("active:false"), 10).unwrap().len(), 1);
+
+        // DATE range with an ISO-8601 bound (task-247 / issue 2): both docs are 2023-11-14
+        // (1_700_000_000_000_000 micros). An ISO date-string bound must be accepted and select them;
+        // it must match the equivalent epoch-micros bound exactly.
+        assert_eq!(
+            reader
+                .search(&q("when:[2023-01-01 TO *]"), 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            reader
+                .search(&q("when:[2023-01-01T00:00:00Z TO *]"), 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        // A window that ends before the docs' date excludes them (ISO upper bound).
+        assert_eq!(
+            reader
+                .search(&q("when:[* TO 2023-01-01]"), 10)
+                .unwrap()
+                .len(),
+            0
+        );
+        // The ISO-date bound resolves to the same set as the raw epoch-micros bound.
+        assert_eq!(
+            reader
+                .search(&q("when:[1700000000000000 TO *]"), 10)
+                .unwrap()
+                .len(),
+            reader
+                .search(&q("when:[2023-11-14 TO *]"), 10)
+                .unwrap()
+                .len(),
+        );
     }
 
     #[test]
@@ -2375,6 +2435,26 @@ mapping:
             }),
             vec![1, 2]
         );
+    }
+
+    #[test]
+    fn field_grouped_or_set_matches_end_to_end() {
+        // task-247 / issue 3: `field:(a OR b)` used to return 0 hits (the `field:` prefix wasn't
+        // distributed over the group). It must now match the union, identically to the expanded
+        // `field:a OR field:b`.
+        let dir = tempfile::tempdir().unwrap();
+        let r = reader_over_batch(dir.path());
+        // body: 1="…fox…", 2="…dog…", 3="…cats". `fox OR cats` → docs 1, 3.
+        assert_eq!(
+            ids(&r.search(&q("body:(fox OR cats)"), 10).unwrap()),
+            vec![1, 3]
+        );
+        assert_eq!(
+            ids(&r.search(&q("body:(fox OR cats)"), 10).unwrap()),
+            ids(&r.search(&q("body:fox OR body:cats"), 10).unwrap()),
+        );
+        // KEYWORD set membership via a grouped OR on the exact `id` field → docs 1, 3.
+        assert_eq!(ids(&r.search(&q("id:(1 OR 3)"), 10).unwrap()), vec![1, 3]);
     }
 
     #[test]
