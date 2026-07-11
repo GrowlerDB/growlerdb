@@ -11,7 +11,10 @@ use axum::http::{Request as HttpRequest, StatusCode};
 use axum::Router;
 use growlerdb_controlplane::Registry;
 use growlerdb_core::{IndexDefinition, ResolvedIndex, SourceField, SourceSchema, SourceType};
-use growlerdb_engine::{rest, ControlPlaneService, RbacPolicy};
+use growlerdb_engine::{
+    mint_session_jwt, rest, ControlPlaneService, JwtAuthenticator, RbacPolicy,
+    BUILTIN_SESSION_AUDIENCE, BUILTIN_SESSION_ISSUER, BUILTIN_SESSION_TTL_SECS,
+};
 use growlerdb_proto::{ControlPlaneClient, ControlPlaneServer};
 use growlerdb_source::IcebergConfig;
 use tokio::net::TcpListener;
@@ -49,6 +52,67 @@ async fn control_app(seed: &[&str], root: &std::path::Path) -> Router {
             .serve_with_incoming(TcpListenerStream::new(listener)),
     );
 
+    let endpoint = format!("http://{addr}");
+    for _ in 0..50 {
+        if let Ok(client) = ControlPlaneClient::connect(endpoint.clone()).await {
+            return rest::control_router(client);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("control plane never came up");
+}
+
+/// Shared deployment secret the test authenticator validates bearer tokens against. The control
+/// plane must verify identity itself over the REST→gRPC hop — caller-asserted `x-growlerdb-*`
+/// headers are no longer forwarded — so tests carry identity in a signed bearer, not a header.
+const TEST_SECRET: &[u8] = b"control-rest-test-secret";
+
+/// A signed session bearer for `subject` carrying `roles` — the verified identity the control
+/// plane's authenticator stamps into request metadata.
+fn bearer(subject: &str, roles: &[&str]) -> String {
+    let roles: Vec<String> = roles.iter().map(|r| r.to_string()).collect();
+    let jwt = mint_session_jwt(
+        TEST_SECRET,
+        subject,
+        &roles,
+        &[],
+        BUILTIN_SESSION_ISSUER,
+        BUILTIN_SESSION_AUDIENCE,
+        BUILTIN_SESSION_TTL_SECS,
+        None,
+    )
+    .unwrap();
+    format!("Bearer {jwt}")
+}
+
+/// A `control_router` wired to a Control Plane that authenticates the forwarded bearer itself
+/// (`with_authn`) — the sound model, since nothing between the REST handler and the control plane
+/// stamps identity. `enforce_rbac` also installs the RBAC policy for admin-gated routes.
+async fn authn_control_app(root: &std::path::Path, enforce_rbac: bool) -> Router {
+    let registry = Arc::new(Registry::open(root.join("registry.json")).unwrap());
+    let authn = Arc::new(JwtAuthenticator::from_hs256_secret(
+        TEST_SECRET,
+        BUILTIN_SESSION_ISSUER,
+        BUILTIN_SESSION_AUDIENCE,
+    ));
+    let svc = if enforce_rbac {
+        ControlPlaneService::with_auth(
+            registry,
+            IcebergConfig::local(),
+            Arc::new(RbacPolicy::with_default_roles()),
+        )
+    } else {
+        ControlPlaneService::new(registry, IcebergConfig::local())
+    }
+    .with_authn(authn);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(
+        Server::builder()
+            .add_service(ControlPlaneServer::new(svc))
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
     let endpoint = format!("http://{addr}");
     for _ in 0..50 {
         if let Ok(client) = ControlPlaneClient::connect(endpoint.clone()).await {
@@ -136,12 +200,12 @@ async fn ingestion_status_over_rest() {
 async fn saved_queries_persist_per_subject_with_sharing() {
     // Saved searches are scoped to the verified subject; `shared` makes one workspace-visible.
     let tmp = tempfile::tempdir().unwrap();
-    let app = control_app(&[], tmp.path()).await;
+    let app = authn_control_app(tmp.path(), false).await;
 
     let list = |who: &str| {
         HttpRequest::builder()
             .uri("/v1/saved-queries")
-            .header("x-growlerdb-principal", who)
+            .header("authorization", bearer(who, &[]))
             .body(Body::empty())
             .unwrap()
     };
@@ -151,7 +215,7 @@ async fn saved_queries_persist_per_subject_with_sharing() {
         .method("POST")
         .uri("/v1/saved-queries")
         .header("content-type", "application/json")
-        .header("x-growlerdb-principal", "alice")
+        .header("authorization", bearer("alice", &[]))
         .body(Body::from(
             r#"{"name":"critical","query":"status:critical","state":"{\"index\":\"telemetry\"}"}"#,
         ))
@@ -175,7 +239,7 @@ async fn saved_queries_persist_per_subject_with_sharing() {
     let bob_del = HttpRequest::builder()
         .method("DELETE")
         .uri(format!("/v1/saved-queries/{id}"))
-        .header("x-growlerdb-principal", "bob")
+        .header("authorization", bearer("bob", &[]))
         .body(Body::empty())
         .unwrap();
     assert_eq!(
@@ -188,7 +252,7 @@ async fn saved_queries_persist_per_subject_with_sharing() {
         .method("PUT")
         .uri(format!("/v1/saved-queries/{id}"))
         .header("content-type", "application/json")
-        .header("x-growlerdb-principal", "alice")
+        .header("authorization", bearer("alice", &[]))
         .body(Body::from(
             r#"{"name":"critical","query":"status:critical","shared":true}"#,
         ))
@@ -205,7 +269,7 @@ async fn saved_queries_persist_per_subject_with_sharing() {
     let del = HttpRequest::builder()
         .method("DELETE")
         .uri(format!("/v1/saved-queries/{id}"))
-        .header("x-growlerdb-principal", "alice")
+        .header("authorization", bearer("alice", &[]))
         .body(Body::empty())
         .unwrap();
     assert_eq!(
@@ -217,46 +281,18 @@ async fn saved_queries_persist_per_subject_with_sharing() {
         .contains("critical"));
 }
 
-/// A `control_router` wired to a Control Plane that **enforces RBAC**. No authenticator,
-/// so it trusts the gateway-stamped `x-growlerdb-principal`/`x-growlerdb-roles` metadata + merges
-/// local role bindings — exactly the embedded-behind-a-gateway model.
-async fn control_app_rbac(root: &std::path::Path) -> Router {
-    let registry = Arc::new(Registry::open(root.join("registry.json")).unwrap());
-    let svc = ControlPlaneService::with_auth(
-        registry,
-        IcebergConfig::local(),
-        Arc::new(RbacPolicy::with_default_roles()),
-    );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(
-        Server::builder()
-            .add_service(ControlPlaneServer::new(svc))
-            .serve_with_incoming(TcpListenerStream::new(listener)),
-    );
-    let endpoint = format!("http://{addr}");
-    for _ in 0..50 {
-        if let Ok(client) = ControlPlaneClient::connect(endpoint.clone()).await {
-            return rest::control_router(client);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    panic!("control plane never came up");
-}
-
 #[tokio::test]
 async fn user_management_is_admin_gated_and_bindings_merge() {
     // Only admins manage users, and a granted role takes effect on the subject's next call.
     let tmp = tempfile::tempdir().unwrap();
-    let app = control_app_rbac(tmp.path()).await;
+    let app = authn_control_app(tmp.path(), true).await;
 
-    let set_roles = |caller: &str, caller_roles: &str, subject: &str, body: &str| {
+    let set_roles = |caller: &str, caller_roles: &[&str], subject: &str, body: &str| {
         HttpRequest::builder()
             .method("PUT")
             .uri(format!("/v1/users/{subject}/roles"))
             .header("content-type", "application/json")
-            .header("x-growlerdb-principal", caller)
-            .header("x-growlerdb-roles", caller_roles)
+            .header("authorization", bearer(caller, caller_roles))
             .body(Body::from(body.to_string()))
             .unwrap()
     };
@@ -266,7 +302,7 @@ async fn user_management_is_admin_gated_and_bindings_merge() {
         .clone()
         .oneshot(set_roles(
             "rita",
-            "reader",
+            &["reader"],
             "bob",
             r#"{"roles":["operator"]}"#,
         ))
@@ -279,7 +315,7 @@ async fn user_management_is_admin_gated_and_bindings_merge() {
         .clone()
         .oneshot(set_roles(
             "ada",
-            "admin",
+            &["admin"],
             "bob",
             r#"{"roles":["operator"]}"#,
         ))
@@ -290,16 +326,15 @@ async fn user_management_is_admin_gated_and_bindings_merge() {
     // GET /v1/users (admin) shows the new binding.
     let list = HttpRequest::builder()
         .uri("/v1/users")
-        .header("x-growlerdb-principal", "ada")
-        .header("x-growlerdb-roles", "admin")
+        .header("authorization", bearer("ada", &["admin"]))
         .body(Body::empty())
         .unwrap();
     let body = text(app.clone().oneshot(list).await.unwrap()).await;
     assert!(body.contains("bob") && body.contains("operator"));
 
-    // Binding merge: grant carol `admin`; now carol — with NO token roles, only a stamped principal —
-    // can manage users on her next call (the binding grants admin).
-    let grant = set_roles("ada", "admin", "carol", r#"{"roles":["admin"]}"#);
+    // Binding merge: grant carol `admin`; now carol — with a verified token carrying NO roles —
+    // can manage users on her next call (the local binding grants admin).
+    let grant = set_roles("ada", &["admin"], "carol", r#"{"roles":["admin"]}"#);
     assert_eq!(
         app.clone().oneshot(grant).await.unwrap().status(),
         StatusCode::OK
@@ -308,7 +343,7 @@ async fn user_management_is_admin_gated_and_bindings_merge() {
         .method("PUT")
         .uri("/v1/users/dave/roles")
         .header("content-type", "application/json")
-        .header("x-growlerdb-principal", "carol") // no roles header at all
+        .header("authorization", bearer("carol", &[])) // no roles in the token
         .body(Body::from(r#"{"roles":["reader"]}"#))
         .unwrap();
     assert_eq!(
@@ -319,8 +354,7 @@ async fn user_management_is_admin_gated_and_bindings_merge() {
     // GET /v1/roles lists the assignable catalog.
     let roles = HttpRequest::builder()
         .uri("/v1/roles")
-        .header("x-growlerdb-principal", "ada")
-        .header("x-growlerdb-roles", "admin")
+        .header("authorization", bearer("ada", &["admin"]))
         .body(Body::empty())
         .unwrap();
     let body = text(app.clone().oneshot(roles).await.unwrap()).await;
@@ -331,15 +365,14 @@ async fn user_management_is_admin_gated_and_bindings_merge() {
 async fn api_tokens_create_list_revoke_admin_gated() {
     // Tokens are admin-gated; the secret is returned once and never listed.
     let tmp = tempfile::tempdir().unwrap();
-    let app = control_app_rbac(tmp.path()).await;
+    let app = authn_control_app(tmp.path(), true).await;
 
     // A reader cannot create tokens.
     let reader = HttpRequest::builder()
         .method("POST")
         .uri("/v1/tokens")
         .header("content-type", "application/json")
-        .header("x-growlerdb-principal", "rita")
-        .header("x-growlerdb-roles", "reader")
+        .header("authorization", bearer("rita", &["reader"]))
         .body(Body::from(r#"{"label":"ci","roles":["reader"]}"#))
         .unwrap();
     assert_eq!(
@@ -352,8 +385,7 @@ async fn api_tokens_create_list_revoke_admin_gated() {
         .method("POST")
         .uri("/v1/tokens")
         .header("content-type", "application/json")
-        .header("x-growlerdb-principal", "ada")
-        .header("x-growlerdb-roles", "admin")
+        .header("authorization", bearer("ada", &["admin"]))
         .body(Body::from(r#"{"label":"ci-pipeline","roles":["reader"]}"#))
         .unwrap();
     let resp = app.clone().oneshot(create).await.unwrap();
@@ -366,8 +398,7 @@ async fn api_tokens_create_list_revoke_admin_gated() {
     // List (admin) returns metadata only — label + prefix, never the secret or hash.
     let list = HttpRequest::builder()
         .uri("/v1/tokens")
-        .header("x-growlerdb-principal", "ada")
-        .header("x-growlerdb-roles", "admin")
+        .header("authorization", bearer("ada", &["admin"]))
         .body(Body::empty())
         .unwrap();
     let body = text(app.clone().oneshot(list).await.unwrap()).await;
@@ -381,8 +412,7 @@ async fn api_tokens_create_list_revoke_admin_gated() {
     let revoke = HttpRequest::builder()
         .method("DELETE")
         .uri(format!("/v1/tokens/{id}"))
-        .header("x-growlerdb-principal", "ada")
-        .header("x-growlerdb-roles", "admin")
+        .header("authorization", bearer("ada", &["admin"]))
         .body(Body::empty())
         .unwrap();
     assert_eq!(

@@ -167,7 +167,17 @@ impl ControlPlaneService {
     }
 
     /// Wrap as a mountable tonic [`ControlPlaneServer`].
+    ///
+    /// # Panics
+    /// Fails closed at wiring time if an authorizing policy is installed without an authenticator:
+    /// the control plane would then enforce roles against caller-asserted (forgeable) metadata, so a
+    /// forged admin role would escalate. A misconfiguration to catch before serving, not at runtime.
     pub fn into_server(self) -> ControlPlaneServer<Self> {
+        assert!(
+            !(self.authn.is_none() && self.auth.is_authorizing()),
+            "control plane installed an authorizing policy without an authenticator: \
+             identity would be caller-asserted and forgeable — install an authenticator",
+        );
         ControlPlaneServer::new(self)
     }
 
@@ -255,14 +265,11 @@ impl ControlPlaneService {
     }
 }
 
-/// The verified subject that owns saved queries: the authenticated principal, or `""` (anonymous)
-/// on an open gateway — in which case the console keeps queries in localStorage instead.
-fn subject_of<T>(req: &Request<T>) -> String {
-    req.metadata()
-        .get(auth::PRINCIPAL_KEY)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_string()
+/// The verified subject that owns saved queries: the [gated](Self::gate) principal, or `""`
+/// (anonymous) on an open gateway — in which case the console keeps queries in localStorage
+/// instead. Taken from the authorized context, never a re-read of caller-asserted metadata.
+fn subject_of(ctx: &AuthContext) -> String {
+    ctx.principal.clone().unwrap_or_default()
 }
 
 /// Build per-field [`FieldMapping`]s for the console's Mapping tab from the resolved definition:
@@ -1013,8 +1020,8 @@ impl ControlPlane for ControlPlaneService {
         &self,
         request: Request<ListSavedQueriesRequest>,
     ) -> Result<Response<ListSavedQueriesResponse>, Status> {
-        self.gate("ListSavedQueries", &request)?;
-        let owner = subject_of(&request);
+        let ctx = self.gate("ListSavedQueries", &request)?;
+        let owner = subject_of(&ctx);
         let queries = self
             .registry
             .list_saved_queries(&owner)
@@ -1028,8 +1035,8 @@ impl ControlPlane for ControlPlaneService {
         &self,
         request: Request<SaveSavedQueryRequest>,
     ) -> Result<Response<SaveSavedQueryResponse>, Status> {
-        self.gate("SaveSavedQuery", &request)?;
-        let owner = subject_of(&request);
+        let ctx = self.gate("SaveSavedQuery", &request)?;
+        let owner = subject_of(&ctx);
         let q = request
             .into_inner()
             .query
@@ -1052,8 +1059,8 @@ impl ControlPlane for ControlPlaneService {
         &self,
         request: Request<DeleteSavedQueryRequest>,
     ) -> Result<Response<DeleteSavedQueryResponse>, Status> {
-        self.gate("DeleteSavedQuery", &request)?;
-        let owner = subject_of(&request);
+        let ctx = self.gate("DeleteSavedQuery", &request)?;
+        let owner = subject_of(&ctx);
         self.registry
             .delete_saved_query(&request.into_inner().id, &owner)
             .map_err(registry_status)?;

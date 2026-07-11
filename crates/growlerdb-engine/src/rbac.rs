@@ -174,6 +174,10 @@ pub fn check_assignable(caller_roles: &[String], requested_roles: &[String]) -> 
 }
 
 impl AuthHook for RbacPolicy {
+    fn is_authorizing(&self) -> bool {
+        true
+    }
+
     fn authorize(&self, ctx: &AuthContext) -> Result<(), AuthDenied> {
         let Some(required) = scope_for_method(ctx.method) else {
             // Fail closed: an unmapped method is denied rather than silently allowed.

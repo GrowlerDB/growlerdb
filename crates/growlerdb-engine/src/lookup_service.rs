@@ -21,6 +21,11 @@ use crate::error::EngineError;
 use crate::hydrate;
 use crate::shard_handle::ShardHandle;
 
+/// Hard ceiling on the number of coordinates a single `GetByKey` may request. A Node is directly
+/// reachable in distributed mode, so it must self-defend against an unbounded batch that would
+/// pin locate/hydrate work. Enforced at the Gateway too, before any fan-out.
+pub(crate) const MAX_KEYS: usize = 1_000;
+
 /// A `Lookup` service over one shard and its Iceberg source. Hydration is async (an
 /// Iceberg read); the locator resolution that precedes it is a quick redb read. Every
 /// RPC consults the [auth hook](SharedAuth) (no-op by default) first.
@@ -81,6 +86,18 @@ impl Lookup for LookupService {
         auth::authorize(&self.auth, "GetByKey", &request)?;
         let tenant = auth::tenant_of(&request);
         let req = request.into_inner();
+
+        // Bound the batch before any locate/hydrate: an unbounded key list would build an
+        // arbitrarily large working set from a single request.
+        if req.keys.len() > MAX_KEYS {
+            return Err(to_status(
+                Code::InvalidArgument,
+                WireError::new(
+                    "INVALID_ARGUMENT",
+                    format!("keys ({}) exceeds the maximum ({MAX_KEYS})", req.keys.len()),
+                ),
+            ));
+        }
 
         // Decode coordinates → composite keys.
         let mut keys: Vec<CompositeKey> = Vec::with_capacity(req.keys.len());
@@ -371,6 +388,24 @@ mod tests {
             .get_by_key(Request::new(GetByKeyRequest {
                 window: 0,
                 keys: vec![bad],
+                columns: vec![],
+                index: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn over_limit_batch_is_rejected_before_any_locate() {
+        let tmp = tempfile::tempdir().unwrap();
+        // DenyAll would fire first, so use the default (allow) auth to prove the size cap gates.
+        let svc = service(tmp.path(), default_auth());
+        let keys = (0..=MAX_KEYS).map(|i| coord(&i.to_string())).collect();
+        let err = svc
+            .get_by_key(Request::new(GetByKeyRequest {
+                window: 0,
+                keys,
                 columns: vec![],
                 index: String::new(),
             }))
