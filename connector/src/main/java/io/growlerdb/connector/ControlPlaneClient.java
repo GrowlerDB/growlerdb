@@ -5,8 +5,11 @@ import io.growlerdb.proto.v1.GetIndexRequest;
 import io.growlerdb.proto.v1.GetIndexResponse;
 import io.growlerdb.proto.v1.ResolveWindowOwnerRequest;
 import io.growlerdb.proto.v1.ResolveWindowOwnerResponse;
+import io.grpc.ClientInterceptor;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
+import io.grpc.Metadata;
+import io.grpc.stub.MetadataUtils;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -18,13 +21,30 @@ import java.util.concurrent.TimeUnit;
  */
 public final class ControlPlaneClient implements AutoCloseable {
 
+  /** Metadata key carrying the shared service token — matches the Rust control plane's. */
+  private static final Metadata.Key<String> SERVICE_TOKEN_KEY =
+      Metadata.Key.of("x-growlerdb-service-token", Metadata.ASCII_STRING_MARSHALLER);
+
   private final ManagedChannel channel;
   private final ControlPlaneGrpc.ControlPlaneBlockingStub stub;
 
-  /** Connect to the Control Plane at {@code host:port} (plaintext; TLS/auth not yet supported). */
+  /**
+   * Connect to the Control Plane at {@code host:port} (plaintext). When {@code GROWLERDB_SERVICE_TOKEN}
+   * is set, every call carries it as the {@code x-growlerdb-service-token} header so a closed control
+   * plane authenticates the connector; unset ⇒ no header (open dev). TLS to the control plane is not
+   * yet wired here.
+   */
   public ControlPlaneClient(String host, int port) {
     this.channel = ManagedChannelBuilder.forTarget("dns:///" + host + ":" + port).usePlaintext().build();
-    this.stub = ControlPlaneGrpc.newBlockingStub(channel);
+    ControlPlaneGrpc.ControlPlaneBlockingStub s = ControlPlaneGrpc.newBlockingStub(channel);
+    String token = System.getenv("GROWLERDB_SERVICE_TOKEN");
+    if (token != null && !token.isEmpty()) {
+      Metadata md = new Metadata();
+      md.put(SERVICE_TOKEN_KEY, token);
+      ClientInterceptor interceptor = MetadataUtils.newAttachHeadersInterceptor(md);
+      s = s.withInterceptors(interceptor);
+    }
+    this.stub = s;
   }
 
   /** The registry's routing config for {@code index} (shard count + strategy, + windowing config). */
