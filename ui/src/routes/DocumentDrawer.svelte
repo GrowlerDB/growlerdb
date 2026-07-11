@@ -14,6 +14,7 @@
     type QuerySyntax,
   } from '../lib/api';
   import Highlighted from './Highlighted.svelte';
+  import { fieldTerms, type ScopedTerms } from '../lib/highlight';
   import Drawer from '../lib/components/Drawer.svelte';
   import Tabs from '../lib/components/Tabs.svelte';
   import Icon from '../lib/components/Icon.svelte';
@@ -21,13 +22,13 @@
 
   let {
     hit,
-    terms,
+    scoped,
     query = '',
     syntax = 'lucene',
     onClose,
   }: {
     hit: SearchHit;
-    terms: string[];
+    scoped: ScopedTerms;
     query?: string;
     syntax?: QuerySyntax;
     onClose: () => void;
@@ -94,7 +95,7 @@
           <dt>{name}</dt>
           <dd>
             {#if typeof value === 'string'}
-              <Highlighted text={value} {terms} />
+              <Highlighted text={value} terms={fieldTerms(scoped, name)} />
             {:else}
               {JSON.stringify(value)}
             {/if}

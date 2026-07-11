@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { queryTerms, highlightSegments } from './highlight';
+import { queryTerms, queryTermsByField, fieldTerms, highlightSegments } from './highlight';
 
 describe('queryTerms', () => {
   it('strips field prefixes, operators, and quotes', () => {
@@ -13,6 +13,42 @@ describe('queryTerms', () => {
 
   it('de-duplicates case-insensitively', () => {
     expect(queryTerms('Iceberg iceberg ICEBERG')).toEqual(['iceberg']);
+  });
+});
+
+describe('queryTermsByField', () => {
+  it('scopes a field term to its field, not others', () => {
+    expect(queryTermsByField('category:guide')).toEqual({
+      fields: { category: ['guide'] },
+      bare: [],
+    });
+  });
+
+  it('distributes a grouped set across the field', () => {
+    expect(queryTermsByField('category:(guide OR reference)')).toEqual({
+      fields: { category: ['guide', 'reference'] },
+      bare: [],
+    });
+  });
+
+  it('keeps bare (default-field) terms separate from qualified ones', () => {
+    expect(queryTermsByField('hydrate title:iceberg')).toEqual({
+      fields: { title: ['iceberg'] },
+      bare: ['hydrate'],
+    });
+  });
+
+  it('ignores negated clauses and ranges', () => {
+    expect(queryTermsByField('-archived:true')).toEqual({ fields: {}, bare: [] });
+    expect(queryTermsByField('published:[2024-01-01 TO *]')).toEqual({ fields: {}, bare: [] });
+  });
+
+  it('fieldTerms returns a field its own terms plus bare terms, and unnamed fields get only bare', () => {
+    const scoped = queryTermsByField('category:(guide OR reference)');
+    expect(fieldTerms(scoped, 'category')).toEqual(['guide', 'reference']);
+    expect(fieldTerms(scoped, 'title')).toEqual([]); // title was never queried ⇒ nothing to mark
+    const withBare = queryTermsByField('hydrate');
+    expect(fieldTerms(withBare, 'body')).toEqual(['hydrate']);
   });
 });
 

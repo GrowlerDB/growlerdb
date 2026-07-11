@@ -13,10 +13,11 @@
     type QuerySyntax,
     type SortKey,
     type FacetGroup,
+    type HighlightSegment,
   } from '../lib/api';
   import { currentFieldToken, withCompletion } from '../lib/autocomplete';
-  import { queryTerms } from '../lib/highlight';
-  import { pickTimestamp, pickSnippet } from '../lib/results';
+  import { queryTermsByField, fieldTerms, type ScopedTerms } from '../lib/highlight';
+  import { formatEpochMicros } from '../lib/results';
   import Highlighted from './Highlighted.svelte';
   import { toJson, toCsv, download } from '../lib/export';
   import { read, persist } from '../lib/prefs';
@@ -46,7 +47,7 @@
   let query = $state('');
   let syntax = $state<QuerySyntax>('lucene');
   let lastQuery = $state('');
-  let terms = $state<string[]>([]);
+  let scoped = $state<ScopedTerms>({ fields: {}, bare: [] });
   let hits = $state<SearchHit[]>([]);
   let total = $state(0);
   let partial = $state(false);
@@ -297,7 +298,7 @@
       cursor = res.next_cursor;
       offset = sorted ? 0 : from;
       lastQuery = eq; // the effective query (base + filters + time) — used by the drawer's Explain
-      terms = queryTerms(eq);
+      scoped = queryTermsByField(eq);
       searched = true;
       void refreshFacets(eq, hits, seq);
     } catch (err) {
@@ -445,24 +446,35 @@
 
   let pageEnd = $derived(Math.min(offset + hits.length, total));
 
-  /** Cached display fields of a hit (task-86), as [name, value] pairs for inline rendering. */
-  function fieldEntries(hit: SearchHit): [string, string][] {
-    return Object.entries(hit.fields ?? {}).map(([k, v]) => [k, String(v)]);
-  }
+  /** Column set for the results table (task-86): every cached field name across the page, in
+   *  first-seen order — so every row is the same shape (score · id · one cell per field). */
+  let columns = $derived.by(() => {
+    const order: string[] = [];
+    const seen = new Set<string>();
+    for (const h of hits) {
+      for (const k of Object.keys(h.fields ?? {})) {
+        if (!seen.has(k)) {
+          seen.add(k);
+          order.push(k);
+        }
+      }
+    }
+    return order;
+  });
 
-  /** Decompose a hit's cached fields (task-133) into a right-aligned timestamp, a highlighted
-   *  snippet, and the remaining fields as chips (timestamp + snippet sources removed). When the
-   *  server returned highlights for the snippet field (task-250), prefer its first fragment's
-   *  segments over the client-side term marker. */
-  function rowParts(hit: SearchHit) {
-    const ts = pickTimestamp(hit.fields, timeFields);
-    const snippet = pickSnippet(hit.fields, new Set(ts ? [ts.name] : []));
-    const used = new Set([ts?.name, snippet?.name].filter((n): n is string => !!n));
-    const chips = fieldEntries(hit).filter(([name]) => !used.has(name));
-    // Server highlight for the snippet field, if present: its first (best) fragment's segments.
-    const hlField = snippet?.name;
-    const serverSegments = hlField ? hit.highlight?.[hlField]?.[0] : undefined;
-    return { ts, snippet, chips, serverSegments };
+  /** Header label for the identifier column — the index's key field name (fallback `id`). */
+  let keyLabel = $derived(hits[0]?.coordinates?.identifier?.[0]?.name ?? 'id');
+
+  /** One cell's display value: DATE/time-field columns render as formatted UTC (task-133); every
+   *  other field renders its raw cached value, preferring the server highlight fragment when the
+   *  gateway returned one for this field (task-250), else client-side term marking. */
+  function cellText(hit: SearchHit, col: string): { text: string; segments?: HighlightSegment[] } {
+    const raw = hit.fields?.[col];
+    if (timeFields.includes(col)) {
+      const formatted = formatEpochMicros(raw);
+      if (formatted) return { text: formatted };
+    }
+    return { text: String(raw ?? ''), segments: hit.highlight?.[col]?.[0] };
   }
 </script>
 
@@ -685,42 +697,54 @@
           </div>
         {/if}
 
-        <ul class="results">
-          {#each hits as hit, i (hitId(hit) + ':' + i)}
-            {@const parts = rowParts(hit)}
-            <li>
-              <button class="hit" onclick={() => (selected = hit)}>
-                <span class="score mono">{hit.score?.toFixed(3) ?? '—'}</span>
-                <span class="hit-body">
-                  <span class="hit-top">
-                    <span class="id mono">{hitId(hit)}</span>
-                    {#if parts.chips.length > 0}
-                      <!-- Cached fields fill the space right of the id on the primary row, clipped
-                           on overflow rather than wrapping to new lines (task-86 inline display). -->
-                      <span class="fields">
-                        {#each parts.chips as [name, value] (name)}
-                          <span class="field"><b>{name}</b>{value}</span>
-                        {/each}
-                      </span>
-                    {/if}
-                    {#if parts.ts}
-                      <time class="hit-ts mono" title={parts.ts.name}>{parts.ts.display}</time>
-                    {/if}
-                  </span>
-                  {#if parts.snippet}
-                    <span class="snippet"
-                      ><Highlighted
-                        text={parts.snippet.value}
-                        {terms}
-                        segments={parts.serverSegments}
-                      /></span
-                    >
-                  {/if}
-                </span>
-              </button>
-            </li>
-          {/each}
-        </ul>
+        {#if hits.length > 0}
+          <!-- Results as a fixed-layout datatable (task-86): one row per hit, one cell per cached
+               field, so the layout is uniform across rows. Cells clip on overflow — never wrap. -->
+          <div class="results">
+            <!-- Fixed layout so cells clip uniformly; a min-width floor per field column means many
+                 columns scroll horizontally rather than squeezing to nothing (rows never wrap). -->
+            <table class="hits-table" style="min-width: {13.5 + columns.length * 7}rem">
+              <thead>
+                <tr>
+                  <th class="c-score">{t('search.score')}</th>
+                  <th class="c-id">{keyLabel}</th>
+                  {#each columns as col (col)}
+                    <th>{col}</th>
+                  {/each}
+                </tr>
+              </thead>
+              <tbody>
+                {#each hits as hit, i (hitId(hit) + ':' + i)}
+                  <tr
+                    class="hit"
+                    role="button"
+                    tabindex="0"
+                    onclick={() => (selected = hit)}
+                    onkeydown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        selected = hit;
+                      }
+                    }}
+                  >
+                    <td class="score mono">{hit.score?.toFixed(3) ?? '—'}</td>
+                    <td class="id mono">{hitId(hit)}</td>
+                    {#each columns as col (col)}
+                      {@const cell = cellText(hit, col)}
+                      <td title={cell.text}
+                        ><Highlighted
+                          text={cell.text}
+                          terms={fieldTerms(scoped, col)}
+                          segments={cell.segments}
+                        /></td
+                      >
+                    {/each}
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        {/if}
 
         {#if sorted}
           <!-- Keyset (search_after) scroll: forward-only, no offset (stable across shards, task-99). -->
@@ -853,7 +877,7 @@
   {#key selected}
     <DocumentDrawer
       hit={selected}
-      {terms}
+      {scoped}
       query={lastQuery}
       {syntax}
       onClose={() => (selected = null)}
@@ -1264,97 +1288,68 @@
   }
 
   .results {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-  .hit {
-    display: flex;
-    align-items: baseline;
-    gap: 0.75rem;
-    width: 100%;
-    text-align: left;
-    background: var(--panel);
+    overflow-x: auto;
+    overflow-y: hidden;
     border: 1px solid var(--line);
     border-radius: 8px;
-    padding: var(--cell, 9px 12px);
-    cursor: pointer;
-    color: inherit;
-    font: inherit;
+    background: var(--panel);
   }
-  .hit:hover {
-    border-color: var(--line-strong);
+  .hits-table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+    font-size: 0.9em;
+  }
+  .hits-table th,
+  .hits-table td {
+    text-align: left;
+    padding: 8px 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    border-bottom: 1px solid var(--line);
+  }
+  .hits-table tbody tr:last-child td {
+    border-bottom: none;
+  }
+  .hits-table thead th {
+    color: var(--text-3);
+    font-weight: 500;
+    font-size: 0.85em;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    border-bottom-color: var(--line-strong);
+  }
+  /* Score + id are fixed-width; the remaining field columns share the rest evenly. */
+  .hits-table .c-score {
+    width: 4.5rem;
+  }
+  .hits-table .c-id {
+    width: 9rem;
+  }
+  .hit {
+    display: table-row;
+    cursor: pointer;
+  }
+  .hit:hover td {
     background: var(--accent-weakest);
   }
-  .hit .score {
+  .hit:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+  .hit td.score {
     color: var(--accent);
-    font-size: 0.85em;
-    min-width: 3.2em;
-    flex-shrink: 0;
   }
-  .hit-body {
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-    min-width: 0;
-  }
-  .hit-top {
-    display: flex;
-    align-items: baseline;
-    gap: 0.9rem;
-    min-width: 0;
-  }
-  .hit .id {
+  .hit td.id {
     font-weight: 600;
     color: var(--text);
-    white-space: nowrap;
-    flex-shrink: 0;
   }
-  .hit-ts {
-    color: var(--text-3);
-    font-size: 0.82em;
-    flex-shrink: 0;
-  }
-  .snippet {
-    color: var(--text-2);
-    font-size: 0.9em;
-    line-height: 1.4;
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    line-clamp: 2;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
-  }
-  .snippet :global(mark) {
+  .hits-table :global(mark) {
     background: var(--accent-weak, rgba(255, 214, 0, 0.28));
     color: inherit;
     border-radius: 2px;
     padding: 0 1px;
-  }
-  .hit .fields {
-    display: flex;
-    flex-wrap: nowrap;
-    flex: 1 1 0;
-    min-width: 0;
-    gap: 0.9rem;
-    overflow: hidden;
-    color: var(--text-2);
-    font-size: 0.9em;
-  }
-  .hit .field {
-    white-space: nowrap;
-    flex-shrink: 0;
-  }
-  .hit .field b {
-    color: var(--text-3);
-    font-weight: 500;
-    margin-right: 0.3rem;
-  }
-  .hit .field b::after {
-    content: '';
   }
 
   .pager {
