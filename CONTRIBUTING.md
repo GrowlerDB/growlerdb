@@ -2,16 +2,16 @@
 
 Thanks for your interest in GrowlerDB! Contributions are welcome.
 
-## Developer Certificate of Origin (DCO)
+## Contributor License Agreement (CLA)
 
-GrowlerDB uses the [DCO](https://developercertificate.org/) — **not** a CLA. Sign off
-every commit to certify you wrote it (or have the right to submit it):
+GrowlerDB uses a **license-grant CLA** (adapted from the Apache ICLA — see [`CLA.md`](CLA.md)).
+The first time you open a pull request, the CLA-assistant bot comments with a one-time signing
+link; your PR can merge once you've signed.
 
-```sh
-git commit -s -m "your message"
-```
-
-This appends a `Signed-off-by:` trailer with your name and email.
+**Why a CLA, and why this one.** GrowlerDB is open source under **AGPL-3.0** (see [`LICENSE`](LICENSE)).
+The CLA lets **GrowlerDB LLC** keep the project sustainable by also offering commercial/OEM licenses.
+It is a **license grant, not an assignment — you keep the copyright to your contribution.** GrowlerDB
+LLC commits to keeping the core AGPL-3.0 open source.
 
 ## Dev setup
 
