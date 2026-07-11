@@ -141,3 +141,30 @@ The gateway is **open** unless you enable AuthN. Options:
 `tenant_field = <verified claim>` filter ANDed in — no query (`OR`, nested bool) can widen past it,
 and a request with no verified claim is denied. RBAC maps verified roles to operation scopes
 (viewer / index-admin / operator / service).
+
+### Service credentials & internal transport {#service-credentials}
+
+The **control plane** serves the internal, service-to-service RPCs — index registration, shard-map
+reads, window placement (`RegisterServedIndex`, `RegisterNode`, `ResolveWindowOwner`, `GetIndex`,
+…). These are a separate layer from the user-facing gateway auth above: they authenticate *cluster
+services* (node, gateway, connector), not end users.
+
+- **`GROWLERDB_SERVICE_TOKEN`** (or `growlerdb control-plane --service-token <token>`) — a shared
+  secret gating every control-plane RPC. When set, the control plane rejects any call whose
+  `x-growlerdb-service-token` metadata doesn't match (a constant-time comparison) with
+  `UNAUTHENTICATED`, so only services holding the token can reach the internal RPCs. **When unset the
+  control plane is open** — the bare local-dev default, so `just` and a loopback control plane work
+  with no configuration. This is enforced regardless of the user-auth mode, so it closes the internal
+  RPCs even under `--login-secret` (where user authorization is intentionally open).
+
+  Every service that dials the control plane reads the same `GROWLERDB_SERVICE_TOKEN` and attaches it
+  automatically: the node and gateway (their control-plane clients) and the connector
+  (`ResolveWindowOwner` / `GetIndex`). Set the same value everywhere in the mesh. The `just stack`
+  demo sets a shared `-change-me` token so its control plane is closed by default.
+
+- **Control-plane TLS** — the control plane can serve over TLS (and mTLS): `growlerdb control-plane
+  --tls-cert <pem> --tls-key <pem> --tls-client-ca <pem>` (the same TLS flags as `serve`/`gateway`).
+  It is **optional and off by default** (the loopback demo doesn't need it). When enabled, clients
+  dial it over TLS by setting `GROWLERDB_CP_TLS_CA` (PEM CA verifying the control-plane's server
+  certificate); add `GROWLERDB_CP_TLS_CERT` / `GROWLERDB_CP_TLS_KEY` for a client identity (mTLS) and
+  `GROWLERDB_CP_TLS_DOMAIN` (default `localhost`) for the expected server SAN. Unset ⇒ plaintext.

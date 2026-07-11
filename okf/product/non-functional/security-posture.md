@@ -8,7 +8,9 @@ timestamp: 2026-07-04T14:22:00
 
 # Security & compliance
 
-- **Encryption** in transit ([TLS/mTLS](/product/functional/auth/mtls.md)) and at rest.
+- **Encryption** in transit ([TLS/mTLS](/product/functional/auth/mtls.md)) and at rest. The
+  [control plane](/system/runtime/components/control-plane.md)'s internal RPCs can additionally be
+  gated with a shared service credential and served over TLS.
 - **Cached-field policy** — sensitive fields are never cached, so they are only ever retrieved through
   governed [hydration](/product/functional/hydration.md).
 - **Tenant isolation** enforced (see [tenancy](/product/non-functional/tenancy.md)).

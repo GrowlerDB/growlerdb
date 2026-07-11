@@ -15,6 +15,8 @@ pub mod v1 {
     include!(concat!(env!("OUT_DIR"), "/growlerdb.v1.rs"));
 }
 
+pub mod service_token;
+
 pub use v1::admin_server::{Admin, AdminServer};
 pub use v1::control_plane_client::ControlPlaneClient;
 pub use v1::control_plane_server::{ControlPlane, ControlPlaneServer};
