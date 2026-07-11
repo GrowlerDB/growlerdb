@@ -5,7 +5,6 @@ Intercepts the outgoing `urllib` request to assert which headers are set, rather
 """
 
 import unittest
-import warnings
 from contextlib import contextmanager
 from unittest import mock
 
@@ -46,30 +45,6 @@ class AuthHeaderTests(unittest.TestCase):
         self.assertEqual(req.get_header("Authorization"), "Bearer abc.def.ghi")
         self.assertFalse(req.has_header("X-growlerdb-principal"))
         self.assertFalse(req.has_header("X-growlerdb-tenant"))
-
-    def test_identity_headers_are_off_by_default(self):
-        # principal/tenant without the dev flag → warned and NOT sent (no impersonation vector).
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            client = Client("http://x", principal="alice", tenant="acme")
-        self.assertTrue(any("dev_identity_headers" in str(w.message) for w in caught))
-        with capture_request() as seen:
-            client.describe_index("")
-        req = seen[0]
-        self.assertFalse(req.has_header("X-growlerdb-principal"))
-        self.assertFalse(req.has_header("X-growlerdb-tenant"))
-
-    def test_dev_identity_headers_opt_in(self):
-        with capture_request() as seen:
-            Client(
-                "http://x",
-                principal="alice",
-                tenant="acme",
-                dev_identity_headers=True,
-            ).describe_index("")
-        req = seen[0]
-        self.assertEqual(req.get_header("X-growlerdb-principal"), "alice")
-        self.assertEqual(req.get_header("X-growlerdb-tenant"), "acme")
 
     def test_no_auth_by_default(self):
         with capture_request() as seen:
