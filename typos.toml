@@ -1,5 +1,11 @@
 # typos allowlist. Every entry below was flagged by `typos` but is NOT a typo — it's a
 # technical term or deliberate test fixture. Keeping the checker on catches *real* typos in new code.
+
+[files]
+# Generated diagram sources carry random element IDs and base64 font data that tokenize into
+# false positives; the prose lives in README/OKF, which are checked.
+extend-exclude = ["*.excalidraw", "docs/img/architecture.svg"]
+
 [default.extend-words]
 # "ANDed" (logical AND-ed) tokenizes to "Ded"
 Ded = "Ded"
