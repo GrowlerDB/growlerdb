@@ -14,7 +14,7 @@
 **Open-source text search engine over Apache Iceberg** (and other datastores).
 
 [![CI](https://github.com/GrowlerDB/growlerdb/actions/workflows/ci.yml/badge.svg)](https://github.com/GrowlerDB/growlerdb/actions/workflows/ci.yml)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/GrowlerDB/growlerdb?sort=semver)](https://github.com/GrowlerDB/growlerdb/releases)
 
 📖 **Documentation: <https://growlerdb.github.io/growlerdb/>** — [Getting started](https://growlerdb.github.io/growlerdb/getting-started) · [Install & run modes](https://growlerdb.github.io/growlerdb/install) · [Configuration](https://growlerdb.github.io/growlerdb/configuration) · [API reference](https://growlerdb.github.io/growlerdb/reference)
@@ -141,5 +141,6 @@ Full docs are the **GitHub Pages site at <https://growlerdb.github.io/growlerdb/
 
 ## License & contributing
 
-Apache-2.0 (see [LICENSE](LICENSE)). Contributions are by **DCO sign-off** —
-see [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md).
+AGPL-3.0-only (see [LICENSE](LICENSE)); a commercial license is available for uses that cannot accept
+AGPL. Contributions are by **DCO sign-off** — see [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[Code of Conduct](CODE_OF_CONDUCT.md).

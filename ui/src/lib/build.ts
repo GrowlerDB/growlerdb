@@ -3,5 +3,5 @@
 export const build = {
   version: (import.meta.env.VITE_GROWLERDB_VERSION as string | undefined) ?? 'dev',
   mode: 'embedded',
-  license: 'Apache-2.0',
+  license: 'AGPL-3.0',
 } as const;
