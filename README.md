@@ -95,14 +95,23 @@ Bring up the **whole stack** (GrowlerDB + MinIO + Polaris + LGTM), which seeds a
 just stack          # build + start everything (needs Docker + just); ~10 min on first build
 ```
 
-Then search it (results are **document keys**, which hydrate to the authoritative rows in Iceberg):
+Open the console at **<http://localhost:8081>**, sign in with **`demo` / `demo`**, and search from
+the UI.
+
+Prefer the API? The demo runs with built-in auth, so log in for a session token, then search the
+seeded `docs` index (results are **document keys**, which hydrate to the authoritative rows in
+Iceberg):
 
 ```sh
-curl -s localhost:8081/v1/search -H 'content-type: application/json' \
-  -d '{"query":"title:iceberg","limit":5}'
+token=$(curl -s localhost:8081/v1/login -H 'content-type: application/json' \
+  -d '{"username":"demo","password":"demo"}' | jq -r .token)
+
+curl -s localhost:8081/v1/search -H "authorization: Bearer $token" \
+  -H 'content-type: application/json' \
+  -d '{"index":"docs","query":"title:iceberg","limit":5}'
 ```
 
-…and open the console at **<http://localhost:8081>**. Tear it all down with `just stack-down`.
+Tear it all down with `just stack-down`.
 
 👉 Full walkthrough (first search → hydrate → console → OpenSearch adapter):
 **[getting-started tutorial](https://growlerdb.github.io/growlerdb/getting-started)**.
