@@ -15,7 +15,7 @@ tantivy.workspace = true
 redb.workspace = true
 # Read-through object-storage serving of cold time-window shards. `blocking` gives a sync
 # operator (its own background runtime) for tantivy's synchronous Directory reads.
-opendal = { version = "0.55", features = ["services-fs", "services-s3", "blocking"] }
+opendal = { version = "0.58", features = ["services-fs", "services-s3", "blocking"] }
 # Binary serde for the mergeable intermediate-aggregation partial (its HLL/t-digest
 # sketches use non-string map keys that JSON can't represent).
 postcard = { version = "1", features = ["use-std"] }

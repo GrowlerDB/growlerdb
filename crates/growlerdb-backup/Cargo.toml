@@ -14,7 +14,7 @@ thiserror.workspace = true
 tokio = { workspace = true }
 # Object-storage transport: one API for S3/MinIO (production default) + a filesystem service
 # (local backup targets and tests). Already in the tree via iceberg-storage-opendal.
-opendal = { version = "0.55", features = ["services-s3", "services-fs"] }
+opendal = { version = "0.58", features = ["services-s3", "services-fs"] }
 
 [dev-dependencies]
 tempfile.workspace = true
