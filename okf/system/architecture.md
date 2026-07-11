@@ -11,6 +11,8 @@ timestamp: 2026-07-04T14:22:00
 GrowlerDB is a small set of cooperating components over Apache Iceberg + object storage. The core
 engine is Rust; the ingestion connector and SQL adapters are JVM; the two meet over **gRPC**.
 
+![GrowlerDB architecture — ingest path (data → Iceberg → Spark connector → index nodes building Tantivy segments) and query path (client → gateway scatter-gather → nodes → hydrate keys back to authoritative Iceberg rows), with the control plane as routing truth and OpenTelemetry to the LGTM stack](../../docs/img/architecture.png)
+
 ## Components
 
 - **[Control plane](/system/runtime/components/control-plane.md)** — lightweight registry (indexes,

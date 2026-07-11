@@ -31,6 +31,28 @@ full-text index of your Iceberg data. Search returns the matching **primary keys
 > backup/restore + replica segment-shipping, and an external security review. See
 > [docs/ga-criteria.md](docs/ga-criteria.md).
 
+## Architecture
+
+![GrowlerDB architecture — your data lands in Apache Iceberg (the system of record); the Spark Structured Streaming connector reads the Iceberg changelog and streams batches to index nodes that build Tantivy segments; a client query hits the gateway, which scatter-gathers across shard nodes and hydrates the ranked keys back to authoritative Iceberg rows](docs/img/architecture.png)
+
+GrowlerDB sits between your **Apache Iceberg** tables and your users. Iceberg stays the **system of
+record**; GrowlerDB maintains a fast, derived full-text index and resolves matches back to the
+authoritative rows.
+
+**Ingest / write path** — ① your pipelines (Spark, Flink, streaming, batch ETL) land data in Iceberg
+· ② the **Connector** (Spark Structured Streaming) reads the Iceberg changelog · ③ it streams
+document batches over gRPC to **index nodes**, which build local **Tantivy** segments with a **redb**
+locator (key → `(file, row position)`).
+
+**Query / read path** — ④ a client (Console, SDK, or the OpenSearch `_search` adapter) calls the
+**Gateway** · ⑤ the Gateway scatter-gathers across shard **nodes** and merges the top-K into ranked
+**document coordinates** (primary keys) · ⑥ `keys:get` **hydrates** those coordinates to authoritative
+rows via targeted point-reads back from Iceberg · ⑦ merged, hydrated results return to the client.
+
+The **Control Plane** is the routing source of truth (nodes register; the Gateway resolves shards),
+and every service emits **OpenTelemetry** to the bundled **LGTM** stack (Grafana · Prometheus · Loki ·
+Tempo). Editable diagram source: [`docs/img/architecture.excalidraw`](docs/img/architecture.excalidraw).
+
 ## Features
 
 - **Search over Iceberg** — index a source table; search returns document keys that **hydrate to
