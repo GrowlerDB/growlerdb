@@ -1,5 +1,5 @@
-// Pure helpers for rendering a search result row (task-133): pick a timestamp + a snippet field
-// out of a hit's cached display fields (task-86). Kept pure + tested so Search.svelte stays markup.
+// Pure helpers for rendering a search result row: pick a timestamp + a snippet field out of a
+// hit's cached display fields. Kept pure + tested so Search.svelte stays markup.
 
 /** Conventionally-named free-text fields, preferred as the snippet source when present. */
 const SNIPPET_NAMES = [
@@ -18,7 +18,7 @@ const MAX_SNIPPET = 200;
 /** Below this length an unnamed string is treated as a keyword/id (a chip), not free-text snippet. */
 const MIN_SNIPPET = 24;
 
-/** Format an epoch-**micros** value (task-112 canonical unit) as a stable UTC `YYYY-MM-DD HH:MM:SS`
+/** Format an epoch-**micros** value (the canonical unit) as a stable UTC `YYYY-MM-DD HH:MM:SS`
  *  string. Returns null for anything that isn't a finite number in a plausible range. */
 export function formatEpochMicros(v: unknown): string | null {
   if (typeof v !== 'number' || !Number.isFinite(v)) return null;

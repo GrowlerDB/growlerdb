@@ -1,4 +1,4 @@
-//! **mTLS between internal services** (task-35 slice 5): stand up the Node's gRPC services on a
+//! **mTLS between internal services**: stand up the Node's gRPC services on a
 //! tonic server configured for mutual TLS, then prove a [`RemoteNode`] connects only when it
 //! presents a client certificate signed by the cluster CA — an anonymous (no-client-cert) peer
 //! is rejected at the handshake, before any RPC. Uses throwaway test certs under

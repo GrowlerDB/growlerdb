@@ -18,7 +18,7 @@ GrowlerDB is **never** responsible for maintaining the source table — compacti
 and orphan cleanup are the user's job, outside GrowlerDB ([D30](/system/decisions/d30-layered-locator.md)).
 Its job is **observability**: emit gauges that let an operator *diagnose* that the source wants
 maintenance. It never runs that maintenance itself. This closes
-[scale ceiling #2](/quality/known-limitations/scale-ceilings.md) (task-197): the deliverable is
+[scale ceiling #2](/quality/known-limitations/scale-ceilings.md): the deliverable is
 diagnostic metrics, not doing the work.
 
 ## The gauges

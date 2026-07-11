@@ -5,10 +5,10 @@
 //! index per commit). Updates/deletes are **Tantivy-native**: an upsert deletes the
 //! prior doc by `enc(key)` then adds the new one; a delete removes it by key. The
 //! searcher therefore excludes superseded/deleted docs natively — no merge-on-read
-//! liveness filter — and the Compactor (task-33) fuses small segments via
+//! liveness filter — and the Compactor fuses small segments via
 //! `IndexWriter::merge`, physically purging the deletes.
 //!
-//! **Crash safety** (D30 layered locator, task-184): the dense location array
+//! **Crash safety** (D30 layered locator): the dense location array
 //! (`location.arr`) is appended/patched and **fsynced first**; then the Tantivy commit
 //! is made durable; then a redb write txn updates the checkpoint, the batch record,
 //! and any new file-table interns. A crash between the array fsync and the Tantivy
@@ -51,7 +51,7 @@ use crate::segment::{
     ExplainHit, IndexError, IndexSchema, SegmentReader, TantivySegmentCore, WRITER_HEAP_BYTES,
 };
 
-/// `expect` message for a write attempted on a read-only **cold** shard (task-80) — a programming
+/// `expect` message for a write attempted on a read-only **cold** shard — a programming
 /// error: cold shards are served only on the read path (the gateway never routes writes to them).
 const COLD_READONLY: &str = "write attempted on a read-only cold shard";
 
@@ -68,10 +68,10 @@ type ValuedPage = (Vec<(Hit, Vec<SortValue>)>, Option<SearchAfter>);
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// `batch_id` → commit snapshot; idempotent-retry guard (the presence of the key, not the
 /// value, is what dedup consults). Pruned once a batch falls at/below the connector's
-/// resume floor and can never be re-sent (task-204, keyed through [`BATCH_CKPT`]).
+/// resume floor and can never be re-sent (keyed through [`BATCH_CKPT`]).
 const BATCH_KEYS: TableDefinition<&str, u64> = TableDefinition::new("batch_keys");
 /// Prune index over [`BATCH_KEYS`]: the checkpoint's **Iceberg sequence number** → the
-/// `batch_id`s committed at it (task-204; re-keyed by task-196). A **multimap** because many
+/// `batch_id`s committed at it. A **multimap** because many
 /// batches can share a checkpoint (an empty-window advance records a `batch_id` under the head
 /// it jumped to, and multiple sub-batches of one trigger can end at the same snapshot). Lets
 /// the write path **range-delete** every `batch_id` whose checkpoint sits at/below the
@@ -80,15 +80,14 @@ const BATCH_KEYS: TableDefinition<&str, u64> = TableDefinition::new("batch_keys"
 /// `BATCH_KEYS` insert, so the two never diverge.
 ///
 /// The key **must be lineage-ordered** for the range prune to be sound; snapshot ids are
-/// random longs (task-205), so the pre-task-196 index — keyed by raw snapshot id — could
+/// random longs, so an index keyed by raw snapshot id could
 /// range-delete records for batches still ahead of the floor (including the one inserted in
-/// the same txn). [`migrate_batch_index`](LocalIndexStore::migrate_batch_index) clears the
+/// the same txn). [`migrate_batch_index`](LocalIndexStore::migrate_batch_index) clears any
 /// misordered generation once at open (safe: with the window-covering continuity guard these
 /// records are belt-and-braces, not correctness). A batch whose checkpoint carries no
-/// sequence number gets no entry here and is simply never pruned (bounded over-retention,
-/// same stance as pre-task-204 rows).
+/// sequence number gets no entry here and is simply never pruned (bounded over-retention).
 const BATCH_CKPT: MultimapTableDefinition<i64, &str> = MultimapTableDefinition::new("batch_ckpt");
-/// **Interned data-file table** (D30 location layer, task-184 slice 2): dense
+/// **Interned data-file table** (D30 location layer): dense
 /// `file_id: u32` → Iceberg data-file path. `location.arr` entries carry the u32; the
 /// shard keeps an in-memory bidirectional map (path→id to intern at commit, id→path to
 /// resolve at hydration), loaded from here at open. New interns commit in the
@@ -96,7 +95,7 @@ const BATCH_CKPT: MultimapTableDefinition<i64, &str> = MultimapTableDefinition::
 /// unpersisted id, which is benign (unreachable; the batch replay re-interns and
 /// re-patches).
 const FILES: TableDefinition<u32, &str> = TableDefinition::new("files");
-/// **Dead-file bitmap** (D30 `coordinates` strategy, task-184 slice 3): the set of
+/// **Dead-file bitmap** (D30 `coordinates` strategy): the set of
 /// interned `file_id`s whose data file an Iceberg rewrite (`replace` snapshot) removed
 /// from the live table. Kept as a small **parallel key-set table** rather than widening
 /// the [`FILES`] value to `(path, dead)`: the `FILES` rows stay immutable (interned
@@ -112,12 +111,12 @@ const DEAD_FILES: TableDefinition<u32, ()> = TableDefinition::new("dead_files");
 const META_CHECKPOINT: &str = "checkpoint";
 const META_SNAPSHOT: &str = "snapshot";
 
-/// Max documents applied per Tantivy commit inside one [`Shard::commit_staged`] (task-237). A large
+/// Max documents applied per Tantivy commit inside one [`Shard::commit_staged`]. A large
 /// source snapshot lands as one big batch; without a bound it becomes one giant segment whose
-/// apply+fsync is O(batch) (~4.5s @150k rows in profiling). Bounding it caps per-commit cost and
+/// apply+fsync is O(batch) (~4.5s @150k rows). Bounding it caps per-commit cost and
 /// makes early docs searchable mid-batch, while the checkpoint still advances once per batch. Env
 /// `GROWLERDB_WRITE_COMMIT_CHUNK` overrides; `0` disables (commit the whole batch at once). Default
-/// ~25k ≈ ~1s/commit at the measured rate — a balance of commit latency vs segment count (more, smaller
+/// ~25k ≈ ~1s/commit — a balance of commit latency vs segment count (more, smaller
 /// segments mean more compaction work). Read once.
 fn commit_chunk_docs() -> usize {
     static CHUNK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -128,22 +127,22 @@ fn commit_chunk_docs() -> usize {
             .unwrap_or(25_000)
     })
 }
-/// Marker that [`BATCH_CKPT`] is keyed by sequence number (task-196). Absent while any
-/// pre-task-196 rows might exist ⇒ the misordered generation is cleared once at open.
+/// Marker that [`BATCH_CKPT`] is keyed by sequence number. Absent while any
+/// misordered rows might exist ⇒ that generation is cleared once at open.
 const META_BATCH_CKPT_ORDER: &str = "batch_ckpt_order";
-/// Event-time zone-map bounds (i64 LE) for a windowed shard (task-81).
+/// Event-time zone-map bounds (i64 LE) for a windowed shard.
 const META_EVENT_MIN: &str = "event_min";
 const META_EVENT_MAX: &str = "event_max";
-/// The source Iceberg `table-uuid` this index was built from — its lineage anchor (task-114). A
+/// The source Iceberg `table-uuid` this index was built from — its lineage anchor. A
 /// mismatch with the live table means the source was recreated and the index is stale.
 const META_SOURCE_UUID: &str = "source_uuid";
 
-/// Filename of the cold-park marker dropped in a parked window-shard dir (task-80). Public so the
-/// backup/pre-warm layer can drop it when promoting a window back to hot (task-83).
+/// Filename of the cold-park marker dropped in a parked window-shard dir. Public so the
+/// backup/pre-warm layer can drop it when promoting a window back to hot.
 pub const COLD_MARKER: &str = "cold.json";
 
-/// Marker left in a window-shard dir when its Tantivy bulk has been **parked** to object storage
-/// (task-80). The `aux.redb` stays local beside it; the index is served read-through from
+/// Marker left in a window-shard dir when its Tantivy bulk has been **parked** to object storage.
+/// The `aux.redb` stays local beside it; the index is served read-through from
 /// `object_prefix` (see [`open_cold_shard`](LocalIndexStore::open_cold_shard)). Its presence is how
 /// discovery tells a **cold** window from a **hot** one (which has a local `index/` dir instead).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,23 +157,23 @@ pub struct ColdMarker {
     pub event_max: Option<i64>,
     /// The committed snapshot this cold copy reflects.
     pub snapshot: u64,
-    /// Object key of the precomputed **hotcache** sidecar (task-83), or `None` if one wasn't built.
+    /// Object key of the precomputed **hotcache** sidecar, or `None` if one wasn't built.
     /// When present, [`open_cold_shard`](LocalIndexStore::open_cold_shard) preloads it so the cold
     /// open needs zero object round-trips.
     #[serde(default)]
     pub hotcache_key: Option<String>,
-    /// Object key of the **split bundle** (task-83) — the window's index files concatenated into one
+    /// Object key of the **split bundle** — the window's index files concatenated into one
     /// object — or `None` if unbundled. When present, cold reads issue ranged GETs against this one
     /// object instead of one object per file.
     #[serde(default)]
     pub bundle_key: Option<String>,
-    /// Object key of the bundle's [`BundleLayout`](crate::bundle::BundleLayout) manifest (task-83),
+    /// Object key of the bundle's [`BundleLayout`](crate::bundle::BundleLayout) manifest,
     /// paired with `bundle_key`.
     #[serde(default)]
     pub bundle_manifest_key: Option<String>,
 }
 
-/// Cap on concurrently-open point-in-time handles per shard (task-65). Each held
+/// Cap on concurrently-open point-in-time handles per shard. Each held
 /// [`ReadView`] pins a redb read version (retained pages until it closes), so the cap
 /// bounds worst-case space amplification from a burst of *active* handles —
 /// complementing [`expire_pits`](Shard::expire_pits), which only reaps *idle* ones.
@@ -205,17 +204,17 @@ pub enum StoreError {
     /// cap bounds redb space amplification from many concurrently-held read versions.
     #[error("too many open point-in-time handles (max {0}); close some first")]
     TooManyPits(usize),
-    /// A windowed-write was requested for an index without `windowing` in its definition (task-81).
+    /// A windowed-write was requested for an index without `windowing` in its definition.
     #[error("index `{0}` is not windowed (its definition has no `windowing`)")]
     NotWindowed(String),
-    /// Opening a cold shard's object-storage directory failed (task-80).
+    /// Opening a cold shard's object-storage directory failed.
     #[error("cold store: {0}")]
     Cold(String),
-    /// The source read that streams a reindex rebuild failed (task-76). The detail is the
+    /// The source read that streams a reindex rebuild failed. The detail is the
     /// underlying `growlerdb-source` error, stringified to keep this crate independent of it.
     #[error("source read: {0}")]
     Source(String),
-    /// A batch's `from` checkpoint doesn't continue from the shard's current checkpoint (task-194):
+    /// A batch's `from` checkpoint doesn't continue from the shard's current checkpoint:
     /// the connector is trying to apply a window that doesn't pick up exactly where this shard left
     /// off — a lineage gap, a checkpoint regression, or a cross-wired sub-batch. Refused so the
     /// shard never "overwrites its checkpoint forward" over unapplied data (the structural silent-loss
@@ -235,7 +234,7 @@ pub struct ReconcileDelete {
     pub deleted: usize,
     /// The stale-delete was **skipped** because the shard's checkpoint advanced during the source
     /// scan (a concurrent ingest committed) — deleting could have dropped a legitimately newer row
-    /// (task-195 TOCTOU guard). Missing-repair still ran; the next reconcile retries the deletes.
+    /// (TOCTOU guard). Missing-repair still ran; the next reconcile retries the deletes.
     pub skipped_concurrent_write: bool,
 }
 
@@ -274,8 +273,8 @@ redb_from!(
     redb::CommitError,
 );
 
-/// Identifies one shard (a node-local index partition). M0 uses a single shard; a windowed index
-/// (task-81) addresses shards by time-window id instead of ordinal.
+/// Identifies one shard (a node-local index partition). A single-shard index uses one shard; a
+/// windowed index addresses shards by time-window id instead of ordinal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShardId {
     /// Index name.
@@ -288,7 +287,7 @@ pub struct ShardId {
 }
 
 impl ShardId {
-    /// A single-shard id for `index` (shard 0) — the M0 default.
+    /// A single-shard id for `index` (shard 0).
     pub fn single(index: impl Into<String>) -> Self {
         Self {
             index: index.into(),
@@ -297,7 +296,7 @@ impl ShardId {
         }
     }
 
-    /// A **time-window** shard id for `index` at window-start `window` (task-81).
+    /// A **time-window** shard id for `index` at window-start `window`.
     pub fn window(index: impl Into<String>, window: i64) -> Self {
         Self {
             index: index.into(),
@@ -343,7 +342,7 @@ impl LocalIndexStore {
         self.create_shard(id, index)
     }
 
-    /// Open a **cold** window shard **read-through** (task-80): its Tantivy index is served from
+    /// Open a **cold** window shard **read-through**: its Tantivy index is served from
     /// object storage under `prefix` in `op` (via [`ObjectDirectory`] + the shared range `cache`),
     /// while its `aux.redb` (locator + event-time zone-map) stays **local** under `aux_dir` — kept
     /// in the cold footprint when the index bulk was parked. The shard is **read-only** (no writer);
@@ -369,9 +368,9 @@ impl LocalIndexStore {
         // synchronous open path, same as the ObjectDirectory reads themselves).
         let bop =
             opendal::blocking::Operator::new(op).map_err(|e| StoreError::Cold(e.to_string()))?;
-        // Precomputed hotcache (task-83): one GET preloads the structural reads so opening the window
+        // Precomputed hotcache: one GET preloads the structural reads so opening the window
         // issues zero further object round-trips. Missing/unreadable OR an unrecognized/incompatible
-        // sidecar (task-150 / F5) → fall back to plain read-through (cold-but-correct), never fail the
+        // sidecar → fall back to plain read-through (cold-but-correct), never fail the
         // open on a stale hotcache.
         if let Some(key) = hotcache_key {
             match bop.read(key) {
@@ -387,7 +386,7 @@ impl LocalIndexStore {
                 Err(e) => return Err(StoreError::Cold(e.to_string())),
             }
         }
-        // Split bundle (task-83): read the small layout manifest, then serve every file read as a
+        // Split bundle: read the small layout manifest, then serve every file read as a
         // ranged GET of the one bundle object instead of one object per file.
         if let Some((bundle_key, manifest_key)) = bundle {
             let manifest = bop
@@ -424,7 +423,7 @@ impl LocalIndexStore {
     }
 
     /// The cold-park [`ColdMarker`] for window `w` of `index`, or `None` if the window is **hot**
-    /// (still local) or absent (task-80). Discovery uses this to tell hot windows (local `index/`)
+    /// (still local) or absent. Discovery uses this to tell hot windows (local `index/`)
     /// from cold ones (parked: this marker + its event zone-map for pruning).
     pub fn cold_marker(&self, index: &str, w: i64) -> Result<Option<ColdMarker>> {
         let path = self
@@ -443,14 +442,14 @@ impl LocalIndexStore {
             .join(COLD_MARKER)
     }
 
-    /// The canonical on-disk directory for `id` — e.g. for a free-disk precheck before a reindex
-    /// (task-71). The directory may not exist yet.
+    /// The canonical on-disk directory for `id` — e.g. for a free-disk precheck before a reindex.
+    /// The directory may not exist yet.
     pub fn shard_path(&self, id: &ShardId) -> PathBuf {
         self.root.join(id.rel_path())
     }
 
-    /// The existing time-window ids for `index` — its `w<window>` shard directories, ascending
-    /// (task-81). Empty when the index has no window shards yet.
+    /// The existing time-window ids for `index` — its `w<window>` shard directories, ascending.
+    /// Empty when the index has no window shards yet.
     pub fn window_shards(&self, index: &str) -> Result<Vec<i64>> {
         let dir = self.root.join(index);
         let mut windows = Vec::new();
@@ -473,7 +472,7 @@ impl LocalIndexStore {
         Ok(windows)
     }
 
-    /// Apply a [`CommitBatch`] to a **windowed** index (task-81): route upserts to per-window
+    /// Apply a [`CommitBatch`] to a **windowed** index: route upserts to per-window
     /// shards by ingest-time (creating windows as needed), widen each window's event-time
     /// zone-map, and **broadcast deletes** to every existing window (only the owner has the key —
     /// rare for the append-mostly sources windowing targets). Returns the window ids upserted to.
@@ -483,7 +482,7 @@ impl LocalIndexStore {
             .windowing
             .as_ref()
             .ok_or_else(|| StoreError::NotWindowed(index.name.clone()))?;
-        // The window/event fields are DATEs (task-116); a `format`-declared one carries its source
+        // The window/event fields are DATEs; a `format`-declared one carries its source
         // unit (e.g. `epoch_ms`), so pass each field's format to normalize values to canonical micros
         // before bucketing — matching the unit the index/range path stores.
         let format_of = |name: &str| {
@@ -521,7 +520,7 @@ impl LocalIndexStore {
         Ok(written)
     }
 
-    /// Search a **windowed** index (task-81): prune to the window shards a time-filtered `query` can
+    /// Search a **windowed** index: prune to the window shards a time-filtered `query` can
     /// match — by ingest-window id (cheap, *before* opening the shard) then by each survivor's
     /// event-time zone-map — search only those, and merge the global top-`k` by score (ties broken
     /// by encoded key, matching the gateway's cross-shard merge). A query without a relevant range
@@ -563,9 +562,9 @@ impl LocalIndexStore {
     /// Build (or open) the shard rooted at an explicit `dir` — the shared core of
     /// [`create_shard`](Self::create_shard) and [`reindex`](Self::reindex) (which
     /// builds a staging shard at a sibling path).
-    /// One-time re-key of the batch-idempotency prune index (task-196): pre-task-196
-    /// [`BATCH_CKPT`] rows are keyed by raw snapshot id — a random long, so the range prune
-    /// over them is misordered (task-205: it could drop records for batches still ahead of
+    /// One-time re-key of the batch-idempotency prune index: misordered
+    /// [`BATCH_CKPT`] rows keyed by raw snapshot id — a random long, so the range prune
+    /// over them is unsound (it could drop records for batches still ahead of
     /// the floor). Ordering can't be recovered from the stored key, so the old generation —
     /// both the prune index and the [`BATCH_KEYS`] records it indexes — is cleared once and
     /// the [`META_BATCH_CKPT_ORDER`] marker set. Safe: under the window-covering continuity
@@ -637,7 +636,7 @@ impl LocalIndexStore {
         })
     }
 
-    /// **Reindex** a shard durably (task-30): build a fresh replacement at a staging sibling
+    /// **Reindex** a shard durably: build a fresh replacement at a staging sibling
     /// directory, populate it via `populate` (e.g. a full read from the source), then
     /// atomically swap it into place and reopen it at the canonical path. Returns the
     /// promoted shard so the caller can install it in its `ShardHandle`.
@@ -648,7 +647,7 @@ impl LocalIndexStore {
     /// the next open. The retired shard's in-flight readers/PITs keep their files alive via
     /// open-fd inode refs, so removing the backup is safe.
     ///
-    /// **Crash durability (task-70):** before the swap, the staging contents are fsynced and a
+    /// **Crash durability:** before the swap, the staging contents are fsynced and a
     /// durable `*.commit` marker is written. The marker's presence is the promise that staging
     /// is fully durable and safe to promote, so [`recover_reindex`] can roll a completed-but-
     /// unswapped reindex forward and a torn (pre-commit) one back — without ever deleting the
@@ -707,7 +706,7 @@ impl LocalIndexStore {
     }
 
     /// Resolve an interrupted [`reindex`](Self::reindex) for `id` — call before opening the
-    /// shard at startup. Keyed off the durable `*.commit` marker (task-70):
+    /// shard at startup. Keyed off the durable `*.commit` marker:
     ///
     /// * **marker present** ⇒ the staged index was fully durable, so roll the promotion
     ///   **forward**: ensure the canonical path holds the new (staging) index, then drop the
@@ -763,7 +762,7 @@ impl LocalIndexStore {
 }
 
 /// Marker file contents written once staging is durable, signalling a reindex is safe to
-/// promote on recovery (task-70). Any non-empty payload works; the *presence* is the signal.
+/// promote on recovery. Any non-empty payload works; the *presence* is the signal.
 const REINDEX_COMMIT_MARKER: &[u8] = b"reindex-committed\n";
 
 /// The in-memory **bidirectional file-intern map** over the redb [`FILES`] table (D30
@@ -775,7 +774,7 @@ struct FileIntern {
     path_to_id: HashMap<String, u32>,
     id_to_path: HashMap<u32, String>,
     /// Interned ids flagged **dead** (the file was rewritten away by an Iceberg
-    /// `replace`) — the in-memory view of the [`DEAD_FILES`] table (task-184 slice 3).
+    /// `replace`) — the in-memory view of the [`DEAD_FILES`] table.
     dead: HashSet<u32>,
 }
 
@@ -824,7 +823,7 @@ impl FileIntern {
 }
 
 /// Total size in bytes of the files under `dir` (recursive); 0 if absent/unreadable. Best-effort
-/// disk-usage for the per-shard size signal (task-73).
+/// disk-usage for the per-shard size signal.
 fn dir_size_bytes(dir: &Path) -> u64 {
     let mut total = 0;
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -840,8 +839,7 @@ fn dir_size_bytes(dir: &Path) -> u64 {
     total
 }
 
-/// A shard's on-disk index size split by component (task-182; inverted-index sub-split task-218) —
-/// see [`Shard::index_size_breakdown`]. The inverted index is reported by its Tantivy file kind so
+/// A shard's on-disk index size split by component — see [`Shard::index_size_breakdown`]. The inverted index is reported by its Tantivy file kind so
 /// storage work (dropping positions, fast-only numerics, compact key terms) is attributable to the
 /// structure it actually shrinks, not a lump "inverted" total.
 #[derive(Debug, Clone, Copy, Default)]
@@ -879,7 +877,7 @@ impl IndexSizeBreakdown {
     }
 }
 
-/// The outcome of one [`Shard::remap_locations`] pass (task-184 slice 3): how many
+/// The outcome of one [`Shard::remap_locations`] pass: how many
 /// slots were re-pointed at the rewritten rows' new locations, and why the rest were
 /// (safely) skipped.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -906,7 +904,7 @@ fn build_aggregations(aggs: &[(String, Agg)]) -> Result<Aggregations> {
         let body = match agg {
             Agg::Terms { field, size } => {
                 // `show_term_doc_count_error` surfaces Tantivy's `doc_count_error_upper_bound` as
-                // an accuracy signal (task-75): cross-shard top-N is exact only within Tantivy's
+                // an accuracy signal: cross-shard top-N is exact only within Tantivy's
                 // implicit `size×10` over-fetch window — a globally-top term below that window on
                 // several shards would otherwise be silently folded into `sum_other_doc_count`.
                 serde_json::json!({
@@ -964,13 +962,13 @@ fn finalize_aggregations(
 }
 
 /// **Merge** per-shard [`aggregate_partial`](Shard::aggregate_partial) results into one
-/// finalized `name → result` map (the Gateway's cross-shard aggregation merge, task-29):
+/// finalized `name → result` map (the Gateway's cross-shard aggregation merge):
 /// deserialize each partial's intermediate results, `merge_fruits` them, then finalize. Empty
 /// input ⇒ an empty map.
 ///
 /// The **additive** aggregations — `terms` (summed bucket counts), `stats`, `range`,
 /// `date_histogram` — merge **exactly** across shards. **`cardinality` (HLL) and `percentiles`
-/// (DDSketch)** are **approximate but correctly merged** (task-75): `merge_fruits` unions the
+/// (DDSketch)** are **approximate but correctly merged**: `merge_fruits` unions the
 /// deserialized sketches (`HllUnion` / `DDSketch::merge`), so a cross-shard distinct/percentile
 /// carries only the sketch's own error — it is NOT under-counted. (Verified by
 /// `cross_shard_cardinality_and_percentiles_match_single_shard`: the merged HLL equals a single
@@ -994,7 +992,7 @@ pub fn merge_aggregations(
     }
 }
 
-/// Live fragmentation signals that drive **health-driven auto-compaction** (task-33): how many
+/// Live fragmentation signals that drive **health-driven auto-compaction**: how many
 /// segments the shard has and how much delete debt they carry, read from committed segment metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionHealth {
@@ -1017,7 +1015,7 @@ impl CompactionHealth {
     }
 }
 
-/// When a shard is fragmented enough to be worth compacting (task-33): too many segments, or too
+/// When a shard is fragmented enough to be worth compacting: too many segments, or too
 /// much delete debt. Pure of any scheduling — a serving loop reads [`Shard::compaction_health`] on a
 /// timer and calls [`reason_to_compact`](Self::reason_to_compact); a `Some` triggers
 /// [`Shard::compact`].
@@ -1027,7 +1025,7 @@ pub struct CompactionPolicy {
     pub min_segments: u64,
     /// Compact once deleted-but-unpurged docs reach this fraction of all docs (`0.0`–`1.0`).
     pub max_deleted_ratio: f64,
-    /// Max segments merged **per bounded pass** (task-200). Compaction never merges the whole shard
+    /// Max segments merged **per bounded pass**. Compaction never merges the whole shard
     /// at once — each pass merges up to this many *similar-sized* segments and releases the writer
     /// lock, so a single merge is O(a size tier), not O(shard), and ingest interleaves between passes.
     pub merge_factor: usize,
@@ -1045,18 +1043,18 @@ impl Default for CompactionPolicy {
     }
 }
 
-/// Size ratio between compaction tiers (task-200): segments whose live-doc counts are within this
+/// Size ratio between compaction tiers: segments whose live-doc counts are within this
 /// factor are the "same size" and merge together; a merged group jumps to the next tier. Bounds
 /// segment count to ~`merge_factor` per tier × `log_TIER_RATIO(shard docs)`.
 const TIER_RATIO: u64 = 4;
 
-/// Max bounded passes one [`compact`](Shard::compact) call runs before returning (task-200). Each
+/// Max bounded passes one [`compact`](Shard::compact) call runs before returning. Each
 /// pass merges one tier group under the lock, then releases it; the cap keeps a single call from
 /// monopolizing the shard when a huge backlog needs many passes — the next poll continues.
 const MAX_COMPACTION_PASSES: usize = 32;
 
 /// The bounded group of segments to merge this pass — the **smallest size tier that has ≥2
-/// segments**, up to `merge_factor` of them (task-200). Cheapest merges first; each group is
+/// segments**, up to `merge_factor` of them. Cheapest merges first; each group is
 /// same-tier so the merge output is bounded to one tier's size, never the whole shard. Returns
 /// `< 2` ids when nothing should merge (each segment is a lone size → already tiered). Pure, so the
 /// tiering is unit-tested without a live index.
@@ -1112,7 +1110,7 @@ impl CompactionPolicy {
     }
 }
 
-/// Access-driven pre-warm policy (task-83): promote a **cold** (read-through) window back to a local
+/// Access-driven pre-warm policy: promote a **cold** (read-through) window back to a local
 /// hot shard once it sees at least `min_accesses` reads within a sampling interval — a window getting
 /// sustained traffic stops paying cold-tier latency. Pure of scheduling: a serving loop samples each
 /// cold window's [`ShardHandle`](../../growlerdb_engine/struct.ShardHandle.html) access delta on a
@@ -1137,8 +1135,8 @@ impl PreWarmPolicy {
     }
 }
 
-/// A **sealed segment** of a shard's index — the immutable unit of backup (task-32) and
-/// replica shipping (task-31). Returned by [`Shard::sealed_segments`]; its [`files`] are
+/// A **sealed segment** of a shard's index — the immutable unit of backup and
+/// replica shipping. Returned by [`Shard::sealed_segments`]; its [`files`] are
 /// relative to [`Shard::index_dir`] and content-stable once sealed, so backups dedupe
 /// unchanged segments and replicas open the bytes without re-indexing.
 ///
@@ -1160,7 +1158,7 @@ pub struct SealedSegment {
     pub files: Vec<PathBuf>,
 }
 
-/// A consistent on-disk snapshot of a shard, captured for backup (task-32): the snapshot/
+/// A consistent on-disk snapshot of a shard, captured for backup: the snapshot/
 /// checkpoint it reflects and the files written under the staging dir.
 #[derive(Debug, Clone)]
 pub struct BackupSnapshot {
@@ -1195,17 +1193,17 @@ pub struct Shard {
     /// writer; the lock also serializes commits). Created with [`NoMergePolicy`] once at
     /// open so segments accumulate per commit and only [`compact`](Shard::compact) merges
     /// them — avoiding a per-writer-creation race with the default merge policy. **`None` for a
-    /// read-only cold shard** ([`open_cold_shard`](LocalIndexStore::open_cold_shard), task-80): its
+    /// read-only cold shard** ([`open_cold_shard`](LocalIndexStore::open_cold_shard)): its
     /// tantivy index is served read-through from object storage, which can't be written.
     writer: Option<Mutex<tantivy::IndexWriter>>,
-    /// Open **point-in-time** handles (task-65): each holds a pinned Tantivy
+    /// Open **point-in-time** handles: each holds a pinned Tantivy
     /// [`SegmentReader`] snapshot (its segment ref-counting keeps the files alive
     /// through compaction) + a redb read txn (as-of-`S` locator/snapshot). Bounded by
     /// [TTL expiry](Shard::expire_pits) + [`MAX_OPEN_PITS`].
     pits: Mutex<HashMap<u64, PitEntry>>,
     /// Monotonic source of opaque PIT ids.
     next_pit: AtomicU64,
-    /// Max docs per Tantivy commit inside [`commit_staged`](Shard::commit_staged) (task-237). Set from
+    /// Max docs per Tantivy commit inside [`commit_staged`](Shard::commit_staged). Set from
     /// [`commit_chunk_docs`] (env) at open; tests set it directly. `0` ⇒ commit the whole batch at once.
     commit_chunk: usize,
     /// Test-only recorder of the commit's durability ordering (array fsync → Tantivy
@@ -1261,8 +1259,8 @@ impl ReadView {
 /// marks a batch whose `batch_id` was already committed (an idempotent no-op).
 pub struct StagedRef {
     checkpoint: SourceCheckpoint,
-    /// The window's resume point — drives the continuity decision, re-taken at commit
-    /// (task-207). `None` = a bootstrap batch (from the start of the changelog).
+    /// The window's resume point — drives the continuity decision, re-taken at commit.
+    /// `None` = a bootstrap batch (from the start of the changelog).
     from_checkpoint: Option<SourceCheckpoint>,
     batch_id: String,
     /// `(enc(key), document, locator)` for each upserted doc.
@@ -1270,7 +1268,7 @@ pub struct StagedRef {
     /// `enc(key)` of deleted docs.
     deletes: Vec<Vec<u8>>,
     already_applied: bool,
-    /// The connector's resume floor for this batch's trigger (task-204): the idempotency
+    /// The connector's resume floor for this batch's trigger: the idempotency
     /// records for batches at/below it can never be re-sent, so the commit prunes them.
     /// `None` = no floor supplied (prune nothing). Same value across a trigger's sub-batches.
     safe_checkpoint: Option<SourceCheckpoint>,
@@ -1285,8 +1283,7 @@ impl StagedRef {
 }
 
 /// The continuity decision for one batch against a shard's committed checkpoint
-/// ([`Shard::continuity`], task-196 — the window-covering relaxation of the task-194
-/// exact-match guard).
+/// ([`Shard::continuity`] — the window-covering relaxation of the exact-match guard).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Continuity {
     /// The window strictly extends this shard: apply fully and advance. Rows at/behind the
@@ -1302,23 +1299,22 @@ enum Continuity {
 }
 
 impl Shard {
-    /// The **checkpoint-continuity guard** (task-194, relaxed to window-covering by task-196):
-    /// decide what a batch whose window is `(from, end]` means for a shard sitting at
-    /// `current`.
+    /// The **checkpoint-continuity guard** (window-covering): decide what a batch whose window
+    /// is `(from, end]` means for a shard sitting at `current`.
     ///
     /// With lineage order available ([`SourceCheckpoint::lineage_cmp`], Iceberg sequence
     /// numbers): `end ≤ current` ⇒ [`NoOp`](Continuity::NoOp) (idempotent replay — never
     /// regress); `from ≤ current < end` ⇒ [`Apply`](Continuity::Apply) (the window covers the
     /// shard's position; the overlap re-applies committed ops byte-identically, content-safe);
     /// `from > current` ⇒ [`Gap`](Continuity::Gap) — advancing would overwrite the checkpoint
-    /// forward over unapplied data, the structural silent-loss window task-194 closed. A
+    /// forward over unapplied data, the structural silent-loss window this guard closes. A
     /// bootstrap batch (`from = None`) covers from the start of the changelog, i.e. `from =
     /// -∞` — which also closes the old unconditional bootstrap bypass: a stale bootstrap
     /// window now no-ops instead of regressing the checkpoint.
     ///
-    /// Without order on the pair (a legacy checkpoint with no sequence number, task-205 —
-    /// snapshot ids are random longs and must not be compared numerically): fall back to the
-    /// task-194 exact semantics — same position ⇒ `NoOp`, `from` at the shard's position ⇒
+    /// Without order on the pair (a legacy checkpoint with no sequence number —
+    /// snapshot ids are random longs and must not be compared numerically): fall back to
+    /// exact semantics — same position ⇒ `NoOp`, `from` at the shard's position ⇒
     /// `Apply`, else `Gap`; `from = None` keeps its legacy exemption.
     fn continuity(
         current: Option<&SourceCheckpoint>,
@@ -1352,7 +1348,7 @@ impl Shard {
                     Some(Ordering::Greater) | None => Continuity::Gap,
                 },
             },
-            // End incomparable with current: legacy exact-match semantics (task-194).
+            // End incomparable with current: legacy exact-match semantics.
             None => match from {
                 None => Continuity::Apply,
                 Some(f) if f.same_position(current) => Continuity::Apply,
@@ -1369,13 +1365,13 @@ impl Shard {
     /// The continuity guard runs here **advisorily** (fail fast, before any staging work)
     /// and again **authoritatively** in [`commit_staged`](Self::commit_staged) under the
     /// writer mutex — this read of the current checkpoint is lock-free, so a concurrent
-    /// writer could move it between stage and commit (task-207).
+    /// writer could move it between stage and commit.
     pub fn stage_batch(&self, batch: &CommitBatch) -> Result<StagedRef> {
         let already_applied = self.batch_snapshot(&batch.batch_id)?.is_some();
         if already_applied {
-            // Idempotent replay (task-194 observability): the connector re-sent a batch this shard
-            // already committed — benign, but a rising rate is the "retry storm / boundary re-read"
-            // signal the printf-only logs used to hide. Counted here where it's detected.
+            // Idempotent replay: the connector re-sent a batch this shard already committed —
+            // benign, but a rising rate is the "retry storm / boundary re-read" signal.
+            // Counted here where it's detected.
             metrics::counter!("growlerdb_dedup_hits_total").increment(1);
         }
 
@@ -1390,7 +1386,7 @@ impl Shard {
                 Continuity::NoOp => stage_noop = true, // stage no content; commit re-decides
                 Continuity::Gap => {
                     // A rejected gap is a correctness event — count it so an alert can fire on
-                    // any nonzero rate, not just find it in (rotatable) logs (task-194).
+                    // any nonzero rate, not just find it in (rotatable) logs.
                     metrics::counter!("growlerdb_checkpoint_gap_total").increment(1);
                     return Err(StoreError::CheckpointGap {
                         from: format!("{:?}", batch.from_checkpoint),
@@ -1447,7 +1443,7 @@ impl Shard {
     /// interns. A crash between the two commits re-applies the batch on resume —
     /// idempotent on the key (delete-then-add), so exactly-once holds.
     ///
-    /// The D30 layered locator (task-184) adds a step *before* the Tantivy commit:
+    /// The D30 layered locator adds a step *before* the Tantivy commit:
     /// each upsert resolves a **locator ID** — reusing (and patching in place) the id
     /// of the key's live doc when one exists, else appending a fresh `location.arr`
     /// slot — attaches it to the doc as the `_locid` fast field, and the array is
@@ -1459,7 +1455,7 @@ impl Shard {
     /// re-applies the batch. **Deletes never touch the array** — a deleted doc's slot
     /// just becomes unreachable (12 B leaked until store compaction).
     ///
-    /// A **`PREDICATE`** index (D30 location strategies, task-184) stores **no
+    /// A **`PREDICATE`** index (D30 location strategies) stores **no
     /// location data at all**: no file interns, no `location.arr` appends, and the
     /// `_locid` fast field — kept in the schema for uniformity — is never populated.
     /// The commit collapses to the plain two-phase Tantivy-then-redb ordering.
@@ -1470,7 +1466,7 @@ impl Shard {
             .expect(COLD_READONLY)
             .lock()
             .expect("writer not poisoned");
-        // Authoritative continuity decision (task-207): the stage-time check ran lock-free,
+        // Authoritative continuity decision: the stage-time check ran lock-free,
         // so a concurrent writer may have advanced this shard between stage and commit —
         // both could have passed the advisory guard against the same `current`, and blindly
         // committing here would let the later one REGRESS the checkpoint over the earlier
@@ -1506,12 +1502,12 @@ impl Shard {
 
         let live: Vec<&StagedRef> = apply.iter().copied().filter(|s| s.has_content()).collect();
         if live.is_empty() {
-            // No document work — but an empty batch still advances the source checkpoint (task-194).
-            // A trigger window that routed no rows to this shard used to leave its checkpoint behind,
-            // so shards drifted: the connector's single cursor moved on while lagging shards stayed
-            // put, which inflated the min-checkpoint resume re-read AND breaks the continuity guard.
-            // Advancing here keeps every shard in lockstep at the head. Redb-only (no new index
-            // snapshot): record the batch ids for idempotent replay and move the checkpoint.
+            // No document work — but an empty batch still advances the source checkpoint.
+            // A trigger window that routes no rows to this shard must not leave its checkpoint
+            // behind, or shards drift: the connector's single cursor moves on while lagging shards
+            // stay put, which inflates the min-checkpoint resume re-read AND breaks the continuity
+            // guard. Advancing here keeps every shard in lockstep at the head. Redb-only (no new
+            // index snapshot): record the batch ids for idempotent replay and move the checkpoint.
             let snapshot = self.current_snapshot()?;
             if let Some(last) = apply.last() {
                 let txn = self.db.begin_write()?;
@@ -1523,7 +1519,7 @@ impl Shard {
                     )?;
                 }
                 // Record the batch ids (idempotent replay) and prune any that fell at/below the
-                // connector's resume floor (task-204).
+                // connector's resume floor.
                 Self::record_and_prune_batches(&txn, &apply, snapshot)?;
                 txn.commit()?;
                 self.trace("redb_checkpoint_advance");
@@ -1543,24 +1539,24 @@ impl Shard {
         // see uncommitted docs, so a key upserted twice across staged batches must
         // reuse its in-commit id (patch), not append a second slot.
         let mut seen: HashMap<&[u8], u64> = HashMap::new();
-        // Per-phase write latency (task-233 follow-up): break the commit into apply / location_sync /
+        // Per-phase write latency: break the commit into apply / location_sync /
         // tantivy_commit / redb so a high `growlerdb_write_duration_seconds` is attributable to a
-        // phase. Profiling saw p99 ~9.5s under 300k-row snapshots but couldn't localize it —
-        // `trace()` is a test-only no-op in prod. All O(batch), so this also shows the batch-size lever.
+        // phase. `trace()` is a test-only no-op in prod. All O(batch), so this also shows the
+        // batch-size lever.
         let phase_secs = |name: &'static str, secs: f64| {
             metrics::histogram!("growlerdb_write_phase_duration_seconds", "phase" => name)
                 .record(secs);
         };
-        // Bound each Tantivy commit to `chunk` docs (task-237). A large source snapshot arrives as one
-        // large batch; committing it whole builds ONE giant segment — apply + fsync are O(batch) (the
-        // profiling measured ~4.5s @150k rows). Instead, flush every `chunk` docs: each flush
+        // Bound each Tantivy commit to `chunk` docs. A large source snapshot arrives as one
+        // large batch; committing it whole builds ONE giant segment — apply + fsync are O(batch)
+        // (~4.5s @150k rows). Instead, flush every `chunk` docs: each flush
         // runs the D30 durability order (array synced → writer committed → searcher reloaded), so its
         // docs become searchable immediately, and the redb **checkpoint still advances exactly once at
         // the end** (below). This preserves the exact crash invariant — intermediate commits leave the
         // index ahead of the un-advanced checkpoint, and a crash before the redb txn replays the whole
         // batch idempotently (delete-then-add by key + deterministic file-intern re-allocation) — and
         // touches neither the continuity guard nor the checkpoint format. `chunk == 0` disables
-        // (one commit, the pre-task-237 behaviour). The `seen`/`new_files`/intern state carries across
+        // (one commit). The `seen`/`new_files`/intern state carries across
         // chunks: a key first seen in an earlier chunk is found via `seen` (or, post-reload, via
         // `live_loc_id`) and patched in place, so cross-chunk upserts still reuse one slot.
         let chunk = self.commit_chunk;
@@ -1603,7 +1599,7 @@ impl Shard {
                         new_files.push((file_id, locator.iceberg_file.clone()));
                     }
                     // Reuse the key's live locator id (pre-commit term lookup, ~1 µs
-                    // warm — prior profiling spike) and patch its slot in place, keeping
+                    // warm) and patch its slot in place, keeping
                     // the array O(live keys); append only for a genuinely new key.
                     // An insert *after a delete* of the same key finds no live doc and
                     // appends a NEW id — the old slot stays orphaned.
@@ -1665,7 +1661,7 @@ impl Shard {
             meta.insert(META_SNAPSHOT, snapshot.to_le_bytes().as_slice())?;
         }
         // Record each committed batch id (idempotent replay) and prune any now at/below the
-        // connector's resume floor — those batches can never be re-sent (task-204).
+        // connector's resume floor — those batches can never be re-sent.
         Self::record_and_prune_batches(&txn, &apply, snapshot)?;
         txn.commit()?;
         self.trace("redb_commit");
@@ -1675,7 +1671,7 @@ impl Shard {
 
     /// The comparable key the [`BATCH_CKPT`] prune index is ordered by — the checkpoint's
     /// **lineage-monotone Iceberg sequence number**. Snapshot ids are random longs, so a
-    /// numeric range over them is meaningless (task-205 — the pre-task-196 key could prune
+    /// numeric range over them is meaningless (a snapshot-id key could prune
     /// the record inserted in the same txn). `None` (legacy sender / v1 table) ⇒ the record
     /// is not indexed and never pruned: bounded over-retention, the safe direction.
     fn checkpoint_key(cp: &SourceCheckpoint) -> Option<i64> {
@@ -1684,16 +1680,16 @@ impl Shard {
 
     /// Record every committed batch's `batch_id` in `BATCH_KEYS` (the idempotent-replay guard) and
     /// index it under its checkpoint in [`BATCH_CKPT`], then drop every idempotency record at or
-    /// below the connector's resume floor — the batches that can never be re-sent (task-204). Runs
+    /// below the connector's resume floor — the batches that can never be re-sent. Runs
     /// inside the caller's redb write txn so the two tables never diverge across a crash. The caller
     /// must not hold `BATCH_KEYS`/`BATCH_CKPT` open when calling.
     ///
     /// **Soundness.** `safe_checkpoint` is the connector's resume floor — the min committed
     /// checkpoint across all shards, which it reads the changelog from *exclusive* and never resumes
     /// before (it is monotonic; every shard is already at or past it). So no batch with checkpoint
-    /// `<= floor` — in **lineage order** (sequence numbers, task-205; both the index key and the
+    /// `<= floor` — in **lineage order** (sequence numbers; both the index key and the
     /// floor comparison use it, never the random snapshot id) — can be re-derived and re-sent.
-    /// And since the window-covering guard (task-196) no-ops a replay by *position*, a dropped
+    /// And since the window-covering guard no-ops a replay by *position*, a dropped
     /// record can never turn a benign replay into a spurious `CheckpointGap` even if the floor
     /// were wrong — the records are an optimization, the guard is the correctness.
     /// `None` (no floor, or a floor with no sequence number) prunes nothing. When several staged
@@ -1710,7 +1706,7 @@ impl Shard {
             for s in committed {
                 batches.insert(s.batch_id.as_str(), snapshot)?;
                 // Only sequence-numbered checkpoints are indexed for pruning: the key must
-                // be lineage-ordered for the range delete to be sound (task-205).
+                // be lineage-ordered for the range delete to be sound.
                 if let Some(seq) = Self::checkpoint_key(&s.checkpoint) {
                     ckpt.insert(seq, s.batch_id.as_str())?;
                 }
@@ -1728,7 +1724,7 @@ impl Shard {
 
     /// Range-delete every `batch_id` whose checkpoint is `<= floor` from both the [`BATCH_CKPT`]
     /// prune index and `BATCH_KEYS`. `floor` is the connector's resume floor, so a pruned batch can
-    /// never be re-sent (task-204). O(pruned), not O(table): usually 0 (the floor only advances as
+    /// never be re-sent. O(pruned), not O(table): usually 0 (the floor only advances as
     /// the laggiest shard catches up), and each prune touches only the newly-safe tail.
     fn prune_batches_at_or_below(txn: &redb::WriteTransaction, floor: i64) -> Result<()> {
         let mut ckpt = txn.open_multimap_table(BATCH_CKPT)?;
@@ -1766,7 +1762,7 @@ impl Shard {
     /// single-writer by construction: it takes no commits).
     pub fn refresh_locators(&self, entries: &[(CompositeKey, RowLocator)]) -> Result<()> {
         // A PREDICATE index has no location layer to refresh — the pruned key scan
-        // *is* its read path, so a re-found row is not a "stale locator" (task-184).
+        // *is* its read path, so a re-found row is not a "stale locator".
         // (Would be a natural no-op anyway: no live doc carries a `_locid` value.)
         if self.schema.location_strategy() == growlerdb_core::LocationStrategy::Predicate {
             return Ok(());
@@ -1819,7 +1815,7 @@ impl Shard {
         Ok(())
     }
 
-    /// Mark interned data files **dead** (task-184 slice 3): the files were removed
+    /// Mark interned data files **dead**: the files were removed
     /// from the live table by an Iceberg rewrite, so every location slot still pointing
     /// at them is stale. Persists to the [`DEAD_FILES`] table **before** updating the
     /// in-memory set, so a flag ever observed by a reader is already durable (a crash
@@ -1856,7 +1852,7 @@ impl Shard {
     /// Whether `path` is an interned data file flagged **dead** (rewritten away) — the
     /// live-file bitmap the hydration path consults at locator resolution: a locator
     /// pointing into a dead file skips the doomed parquet point read and goes straight
-    /// to the pass-2 fallback (task-184 slice 3). A never-interned path is not dead.
+    /// to the pass-2 fallback. A never-interned path is not dead.
     pub fn file_is_dead(&self, path: &str) -> bool {
         let files = self.files.lock().expect("file intern not poisoned");
         files
@@ -1878,7 +1874,7 @@ impl Shard {
     /// The interned data-file paths **not** flagged dead — the shard's view of which
     /// source files its slots may still point at. The re-map poller diffs this against
     /// the table's current plan: an interned live file absent from the plan means a
-    /// rewrite happened (task-184 slice 3).
+    /// rewrite happened.
     pub fn interned_live_files(&self) -> Vec<String> {
         let files = self.files.lock().expect("file intern not poisoned");
         files
@@ -1889,7 +1885,7 @@ impl Shard {
             .collect()
     }
 
-    /// **Compaction re-map** (task-184 slice 3, D30 `coordinates` strategy): bulk-patch
+    /// **Compaction re-map** (D30 `coordinates` strategy): bulk-patch
     /// location slots after an Iceberg rewrite, from the rewritten rows' `(key, new
     /// location)` pairs (column-projected out of the replace snapshot's *added* files).
     /// Callers mark the disappeared files dead ([`mark_files_dead`](Self::mark_files_dead))
@@ -1906,7 +1902,7 @@ impl Shard {
     /// residual window.)
     ///
     /// Entries are **sorted by encoded key** before lookup (term-dictionary locality —
-    /// ~1M key-sorted lookups/s warm, prior profiling spike) and processed in bounded
+    /// ~1M key-sorted lookups/s warm) and processed in bounded
     /// chunks: the writer lock is taken per chunk and released between chunks, so a
     /// large re-map never blocks ingest or hydration refresh for its full duration.
     /// Each chunk mirrors [`refresh_locators`](Self::refresh_locators)' durability
@@ -1978,7 +1974,7 @@ impl Shard {
         Ok(stats)
     }
 
-    /// **Partition-scoped reconciliation** (task-15) — the equality-delete fallback
+    /// **Partition-scoped reconciliation** — the equality-delete fallback
     /// for a non-key predicate ([equality deletes](../../../wiki/06-ingestion.md)).
     /// Given the keys a fresh source scan found **live** in `partition`, drop every
     /// indexed doc in that partition whose key is absent. Bounded to the partition
@@ -1986,7 +1982,7 @@ impl Shard {
     ///
     /// `expected_checkpoint` is the shard's checkpoint captured **before** the source scan that
     /// produced `live_keys`; the stale-delete only runs if the shard hasn't advanced since (the
-    /// TOCTOU guard, task-195). `None` disables the guard for callers with no concurrent writer.
+    /// TOCTOU guard). `None` disables the guard for callers with no concurrent writer.
     ///
     /// Removing the keys from the index (native Tantivy delete) hides the docs
     /// immediately. An empty `partition` reconciles the whole index.
@@ -2023,7 +2019,7 @@ impl Shard {
             .lock()
             .expect("writer not poisoned");
 
-        // TOCTOU guard (task-195): `live_keys` came from a source snapshot read *before* this lock.
+        // TOCTOU guard: `live_keys` came from a source snapshot read *before* this lock.
         // If a concurrent ingest committed during that read, a key it just added is live in the index
         // but absent from `live_keys` — so it looks "stale" and we'd delete a legitimately newer row
         // (and the checkpoint-continuity guard means the connector won't re-send it, so the wrong
@@ -2053,7 +2049,7 @@ impl Shard {
     }
 
     /// The number of **live** indexed keys — optionally scoped to a `partition`
-    /// prefix. The cheap half of a drift check (task-18).
+    /// prefix. The cheap half of a drift check.
     ///
     /// D30: counted from the `_keyenc` term dictionary over the partition's raw-bytes
     /// prefix range, with a per-term liveness probe (postings + alive bitset). We use
@@ -2082,14 +2078,14 @@ impl Shard {
 
     /// Open a fresh, consistent [`ReadView`] of the shard metadata — one redb read
     /// transaction (MVCC snapshot). All read paths route through a view so a single
-    /// search observes one consistent snapshot; **task-65** holds one open for a PIT.
+    /// search observes one consistent snapshot; a PIT holds one open.
     pub fn read_view(&self) -> Result<ReadView> {
         Ok(ReadView {
             txn: self.db.begin_read()?,
         })
     }
 
-    /// Open a **point-in-time** handle (task-65): capture the current [`ReadView`] and
+    /// Open a **point-in-time** handle: capture the current [`ReadView`] and
     /// hold it so every read against the returned [`Pit`] observes that one snapshot —
     /// unchanged by later commits/updates/deletes — until [`close_pit`](Self::close_pit)
     /// (or [TTL expiry](Self::expire_pits)). The pin is **Tantivy segment ref-counting**:
@@ -2188,19 +2184,19 @@ impl Shard {
             .len() as u64)
     }
 
-    /// **Compact** the shard (task-33): fuse all current segments into one via Tantivy's
+    /// **Compact** the shard: fuse all current segments into one via Tantivy's
     /// `merge`, which **physically purges** superseded/deleted docs and improves both
     /// matching and cache locality. Atomic and **non-disruptive to readers** — in-flight
     /// searches (and open PITs) keep reading the segments they opened; the merge is visible
     /// only to new searches, and Tantivy keeps the old segment files until those readers
     /// release them (so PITs are safe by construction). A no-op when ≤1 segment.
     pub fn compact(&self, policy: &CompactionPolicy) -> Result<()> {
-        // Bounded, lock-releasing compaction (task-200): each pass merges one **size tier** (up to
+        // Bounded, lock-releasing compaction: each pass merges one **size tier** (up to
         // `merge_factor` similar-sized segments) under the writer lock, then RELEASES it before the
         // next pass — so a single lock-hold is O(a tier), never O(shard), and ingest commits
-        // interleave between passes. The old code merged *every* segment in one lock-held call, whose
-        // cost grew with shard size and shed-stormed the connector (the documented compaction I/O
-        // storm). Repeats up to `MAX_COMPACTION_PASSES`; the poll re-runs to drain any remainder.
+        // interleave between passes. Merging every segment in one lock-held call would grow with
+        // shard size and shed-storm the connector. Repeats up to `MAX_COMPACTION_PASSES`; the poll
+        // re-runs to drain any remainder.
         for _ in 0..MAX_COMPACTION_PASSES {
             let mut writer = self
                 .writer
@@ -2238,7 +2234,7 @@ impl Shard {
         Ok(())
     }
 
-    /// Current [`CompactionHealth`] signals (task-33) — segment count + delete debt, summed from the
+    /// Current [`CompactionHealth`] signals — segment count + delete debt, summed from the
     /// committed segment metadata. A serving loop reads this on a timer and consults a
     /// [`CompactionPolicy`] to decide whether to [`compact`](Self::compact).
     pub fn compaction_health(&self) -> Result<CompactionHealth> {
@@ -2251,15 +2247,14 @@ impl Shard {
     }
 
     /// The shard's Tantivy index directory — the root that [`SealedSegment::files`] paths
-    /// resolve against. The backup (task-32) and replica (task-31) layers read segment
-    /// bytes from here.
-    /// The tenant-scoping field (task-38), if this shard's index is tenant-scoped. Reads
+    /// resolve against. The backup and replica layers read segment bytes from here.
+    /// The tenant-scoping field, if this shard's index is tenant-scoped. Reads
     /// inject a mandatory `tenant_field = <verified claim>` filter; `None` = not scoped.
     pub fn tenant_field(&self) -> Option<&str> {
         self.schema.tenant_field()
     }
 
-    /// The index's **location strategy** (D30, task-184): `COORDINATES` (per-row
+    /// The index's **location strategy** (D30): `COORDINATES` (per-row
     /// location data in the layered locator) or `PREDICATE` (store-less — hydration
     /// re-finds rows by a pruned key scan). The engine's hydration path branches on
     /// this, and the re-map loop is never spawned for a `PREDICATE` index.
@@ -2267,8 +2262,8 @@ impl Shard {
         self.schema.location_strategy()
     }
 
-    /// The mapped DATE field names (task-101) — the time columns a console time filter can range a
-    /// query on; a query ranging the windowing field additionally prunes windows (task-81).
+    /// The mapped DATE field names — the time columns a console time filter can range a
+    /// query on; a query ranging the windowing field additionally prunes windows.
     pub fn date_fields(&self) -> Vec<String> {
         self.schema
             .date_fields()
@@ -2281,7 +2276,7 @@ impl Shard {
         &self.index_dir
     }
 
-    /// The shard's full on-disk index footprint in bytes (task-182 / task-218) — every component of
+    /// The shard's full on-disk index footprint in bytes — every component of
     /// [`index_size_breakdown`](Self::index_size_breakdown) summed, i.e. the Tantivy files **plus**
     /// the locator layers (`location.arr` + `aux.redb`). Used by the serving loop to emit
     /// `growlerdb_index_bytes`; computed from the breakdown so the total gauge and the per-component
@@ -2290,7 +2285,7 @@ impl Shard {
         self.index_size_breakdown().total()
     }
 
-    /// On-disk index size broken into components (task-182; finer inverted split task-218), so the
+    /// On-disk index size broken into components, so the
     /// index:source ratio can be attributed to the structure that drives it — term dictionaries vs
     /// postings vs positions vs fieldnorms vs the **fast-field cache** vs the **doc store** vs the
     /// **hydration locator** — rather than a lump total. Tantivy files are classified by extension;
@@ -2331,8 +2326,8 @@ impl Shard {
     }
 
     /// Total on-disk size of the shard, in bytes — a per-shard skew/health signal exposed via
-    /// `DescribeIndex` (task-73). Same computation as [`index_size_bytes`](Self::index_size_bytes)
-    /// (task-218), so the API-reported size and the `growlerdb_index_bytes` gauge agree.
+    /// `DescribeIndex`. Same computation as [`index_size_bytes`](Self::index_size_bytes),
+    /// so the API-reported size and the `growlerdb_index_bytes` gauge agree.
     /// Best-effort: unreadable entries count as 0.
     pub fn size_bytes(&self) -> u64 {
         self.index_size_bytes()
@@ -2340,7 +2335,7 @@ impl Shard {
 
     /// Enumerate the shard's **sealed segments** — the immutable, committed segments of
     /// the single index, each with its on-disk files (relative to [`index_dir`]). This is
-    /// the shipping/backup unit (task-31/32): a sealed segment's files are content-stable
+    /// the shipping/backup unit: a sealed segment's files are content-stable
     /// (every file name embeds the content/opstamp, so a commit that re-deletes within a
     /// segment writes a *new* `.del` file rather than mutating one). Backup therefore
     /// uploads incrementally — unchanged segments dedupe by file name — and replicas pull
@@ -2379,7 +2374,7 @@ impl Shard {
             .collect())
     }
 
-    /// Snapshot the shard's committed state into `staging` for backup (task-32). Taken under the
+    /// Snapshot the shard's committed state into `staging` for backup. Taken under the
     /// writer lock so no commit/compaction races: the live segment files, the `aux.redb` store,
     /// and (when present) the `index.json` definition. Segment files are **hard-linked** when
     /// `staging` shares the filesystem (instant, and the link keeps the bytes alive even if a
@@ -2448,13 +2443,13 @@ impl Shard {
         self.search_paged(query, k, &[], 0)
     }
 
-    /// **Explain** `query`'s score for the document with composite key `key` (task-102).
+    /// **Explain** `query`'s score for the document with composite key `key`.
     pub fn explain(&self, query: &Query, key: &CompositeKey) -> Result<ExplainHit> {
         Ok(self.core.explain(query, &key.encode())?)
     }
 
     /// Search across all live generations with multi-key fast-field `sort` and
-    /// `offset` (from/size paging), returning the merged page of `k` hits (task-23).
+    /// `offset` (from/size paging), returning the merged page of `k` hits.
     ///
     /// **Merge-on-read:** a hit from generation `g` is dropped unless
     /// `key_to_doc[key] == g`, so superseded (updated) and deleted docs never surface.
@@ -2552,7 +2547,7 @@ impl Shard {
 
     /// Total documents matching `query` (live; the single index excludes superseded/deleted) —
     /// the search response's `total`, distinct from the returned page size. A Gateway sums these
-    /// across shards for a true global match count (task-68).
+    /// across shards for a true global match count.
     pub fn search_count(&self, query: &Query) -> Result<u64> {
         Ok(self.core.count(query)?)
     }
@@ -2596,7 +2591,7 @@ impl Shard {
         highlight: Option<&Highlight>,
     ) -> Result<ValuedPage> {
         let mut page = self.page_with_values(core, query, k, sort, offset, after)?;
-        // Server-side highlighting (task-250): fill each hit's per-field fragments from the
+        // Server-side highlighting: fill each hit's per-field fragments from the
         // analyzed match, against the same reader that produced the page. Off unless opted in.
         if let Some(hl) = highlight {
             let mut hits: Vec<Hit> = page.iter().map(|(h, _)| h.clone()).collect();
@@ -2606,7 +2601,7 @@ impl Shard {
             }
         }
         // No keyset cursor for an unsorted query, or for a `_score` sort (relevance isn't
-        // a stable keyset key — task-66): those page by offset only.
+        // a stable keyset key): those page by offset only.
         let next = if sort.is_empty() || sort_has_score(sort) {
             None
         } else {
@@ -2618,7 +2613,7 @@ impl Shard {
         Ok((page, next))
     }
 
-    /// **Field collapsing** ([collapse](growlerdb_core::SearchParams), task-23): reduce
+    /// **Field collapsing** ([collapse](growlerdb_core::SearchParams)): reduce
     /// the result set to one entry per distinct value of `collapse` — the **top hit**
     /// of each group (by the `sort` order) plus the group's **member count** — and
     /// return the top-`k` groups (ordered by their top hit). `sort` must be non-empty.
@@ -2676,7 +2671,7 @@ impl Shard {
         // Fold into groups, preserving first-appearance order; count every member. The first
         // entry seen for a group is its top hit (entries are sorted by the sort tuple above), so
         // its sort values represent the group — carried out so a Gateway can order groups across
-        // shards (task-68).
+        // shards.
         let mut order: Vec<String> = Vec::new();
         let mut groups: HashMap<String, (Hit, Value, Vec<SortValue>, usize)> = HashMap::new();
         for (hit, group, sort_values) in entries {
@@ -2703,7 +2698,7 @@ impl Shard {
                 }
             })
             .collect();
-        // Server-side highlighting (task-250): fill each group's top hit against the same reader.
+        // Server-side highlighting: fill each group's top hit against the same reader.
         if let Some(hl) = highlight {
             let mut hits: Vec<Hit> = collapsed.iter().map(|c| c.hit.clone()).collect();
             core.highlight_hits(query, &mut hits, hl)?;
@@ -2734,7 +2729,7 @@ impl Shard {
         //
         // A `_score` key needs the exact scan EXCEPT a sole `_score desc`, whose window
         // is just `order_by_score` (efficient + correct); `_score asc` (lowest first)
-        // can't come from the descending score window, so it scans too (task-66).
+        // can't come from the descending score window, so it scans too.
         let score_asc_primary =
             sort.len() == 1 && sort[0].is_score() && sort[0].order == SortOrder::Asc;
         let mut hits = if sort.len() > 1 || score_asc_primary {
@@ -2752,7 +2747,7 @@ impl Shard {
         Ok(hits.into_iter().skip(skip).take(k).collect())
     }
 
-    /// Top-`k` by score with **server-side highlights** filled per hit (task-250): each returned
+    /// Top-`k` by score with **server-side highlights** filled per hit: each returned
     /// [`Hit`] carries `highlight` (field → matched fragments) for the requested highlightable TEXT
     /// fields, reflecting the analyzed match. A thin wrapper over [`search_page_values`](
     /// Self::search_page_values) with a highlight opt-in; used by tests and the highlight fast path.
@@ -2761,7 +2756,7 @@ impl Shard {
         Ok(page.into_iter().map(|(hit, _)| hit).collect())
     }
 
-    /// **Prefix autocomplete** (task-25): the top-`limit` indexed terms of `field`
+    /// **Prefix autocomplete**: the top-`limit` indexed terms of `field`
     /// starting with `prefix`, ordered by descending document frequency (ties broken
     /// by term, ascending). Merges the per-generation term dictionaries, summing
     /// frequencies for a term seen in several generations.
@@ -2790,7 +2785,7 @@ impl Shard {
         Ok(ranked)
     }
 
-    /// **Did-you-mean** (task-25): the top-`limit` indexed terms of `field` within edit
+    /// **Did-you-mean**: the top-`limit` indexed terms of `field` within edit
     /// distance `max_dist` of `term` (excluding `term` itself), ranked by **closeness**
     /// (edit distance ascending) then **frequency** (descending), ties broken by term.
     /// Merges the per-generation term dictionaries. Returns `(term, doc_freq)`.
@@ -2829,7 +2824,7 @@ impl Shard {
     }
 
     /// Run search-support **aggregations** over the docs matching `query`, returning
-    /// each named result as JSON (task-24). Liveness-correct for free: the single
+    /// each named result as JSON. Liveness-correct for free: the single
     /// index's searcher already excludes superseded/deleted docs (Tantivy deletes).
     pub fn aggregate(
         &self,
@@ -2919,7 +2914,7 @@ impl Shard {
         self.read_view()?.snapshot()
     }
 
-    /// The event-time zone-map `[min, max]` this (windowed) shard has seen (task-81), or `None`
+    /// The event-time zone-map `[min, max]` this (windowed) shard has seen, or `None`
     /// if it carries no event-time stats. The gateway prunes a window whose `[min, max]` can't
     /// overlap an event-time query filter.
     pub fn event_bounds(&self) -> Result<Option<(i64, i64)>> {
@@ -2932,7 +2927,7 @@ impl Shard {
         }
     }
 
-    /// **Widen** this shard's event-time zone-map to include `[min, max]` (task-81). A no-op when
+    /// **Widen** this shard's event-time zone-map to include `[min, max]`. A no-op when
     /// both bounds are `None` (e.g. a batch with no event-time values). Late events naturally
     /// widen the bound, which is what keeps them findable by event-time queries.
     pub fn set_event_bounds(&self, min: Option<i64>, max: Option<i64>) -> Result<()> {
@@ -2953,7 +2948,7 @@ impl Shard {
         Ok(())
     }
 
-    /// The source Iceberg `table-uuid` this index was built from (task-114), or `None` for an index
+    /// The source Iceberg `table-uuid` this index was built from, or `None` for an index
     /// built before lineage was recorded (so the guard simply can't check it — never a false alarm).
     pub fn source_uuid(&self) -> Result<Option<String>> {
         Ok(self
@@ -2961,7 +2956,7 @@ impl Shard {
             .map(|b| String::from_utf8_lossy(&b).into_owned()))
     }
 
-    /// Anchor this index to its source's `table-uuid` (task-114), recorded at build/reindex so a
+    /// Anchor this index to its source's `table-uuid`, recorded at build/reindex so a
     /// later `serve` can detect a recreated source. Idempotent — re-recording the same uuid is fine.
     pub fn set_source_uuid(&self, uuid: &str) -> Result<()> {
         let txn = self.db.begin_write()?;
@@ -3059,8 +3054,8 @@ impl IndexReader for Shard {
     fn search(&self, params: &SearchParams) -> Result<ShardHits> {
         // A keyset cursor takes precedence over `offset` (O(k) deep paging). The
         // next-page cursor is available via the concrete [`Shard::search_after`];
-        // the trait surface returns just the page. When a highlight opt-in is present
-        // (task-250), page through the values path so each hit carries its fragments.
+        // the trait surface returns just the page. When a highlight opt-in is present,
+        // page through the values path so each hit carries its fragments.
         let after = params.search_after.as_ref();
         let (page, _) = self.page_in_values(
             &self.core,
@@ -3073,7 +3068,7 @@ impl IndexReader for Shard {
         )?;
         let hits: Vec<Hit> = page.into_iter().map(|(hit, _)| hit).collect();
         // `total` is the true match count (not the page size), consistent with the wire
-        // `SearchResponse.total` and summable across shards (task-68).
+        // `SearchResponse.total` and summable across shards.
         let total = self.search_count(&params.query)? as usize;
         Ok(ShardHits { hits, total })
     }
@@ -3148,7 +3143,7 @@ mod sort_tests {
             .collect()
     }
 
-    // --- task-237: chunked commit -------------------------------------------------------------
+    // --- chunked commit -------------------------------------------------------------
     fn chunk_shard(tmp: &std::path::Path, chunk: usize) -> Shard {
         let src = SourceSchema::new(
             vec![
@@ -3166,7 +3161,7 @@ mod sort_tests {
         .unwrap();
         let store = LocalIndexStore::open(tmp).unwrap();
         let mut shard = store.create_shard(&ShardId::single("docs"), &idx).unwrap();
-        shard.commit_chunk = chunk; // force intra-batch chunk commits (task-237)
+        shard.commit_chunk = chunk; // force intra-batch chunk commits
         shard
     }
 
@@ -3300,8 +3295,8 @@ mod sort_tests {
     }
 
     #[test]
-    fn fast_only_long_matches_indexed_long_and_is_smaller(/* task-215 */) {
-        // Two shards over the same docs: `rank` fast-only (the task-215 default for a fast
+    fn fast_only_long_matches_indexed_long_and_is_smaller() {
+        // Two shards over the same docs: `rank` fast-only (the default for a fast
         // field) vs `rank` fast **and** inverted-indexed (`indexed: true`). Every query shape
         // the engine routes at a numeric field must return identical results — Tantivy serves
         // range/exact/sort/exists from the columnar store when the field is fast — and the
@@ -3442,7 +3437,7 @@ mod sort_tests {
 
     /// A shard whose docs all match `body:alpha` but with different term frequencies
     /// (same field length, so BM25 is monotonic in `tf`): `b` (tf 3) > `c` (tf 2) > `a`
-    /// (tf 1). `grp` ties `a`/`b` so a `_score` tiebreaker is observable. (task-66)
+    /// (tf 1). `grp` ties `a`/`b` so a `_score` tiebreaker is observable.
     fn scored_shard(tmp: &std::path::Path) -> Shard {
         let src = SourceSchema::new(
             vec![
@@ -3855,7 +3850,7 @@ mod sort_tests {
 
 #[cfg(test)]
 mod pit_tests {
-    //! `ReadView` is the seam strict point-in-time reads (task-65) are built on: a
+    //! `ReadView` is the seam strict point-in-time reads are built on: a
     //! held view must keep observing one frozen snapshot regardless of later commits.
     use super::*;
     use growlerdb_core::{
@@ -4473,7 +4468,7 @@ mod agg_tests {
 
     #[test]
     fn cross_shard_cardinality_and_percentiles_match_single_shard() {
-        // Settles the "under-merge" question (task-75): merging two shards' sketch partials must
+        // Settles the "under-merge" question: merging two shards' sketch partials must
         // match a single shard over all the data within the sketch's error bound — i.e. the
         // cross-shard merge is *approximate but correct*, not silently under-counted.
         let make = |lo: i64, hi: i64| -> Vec<(String, String, i64, i64)> {
@@ -4936,16 +4931,16 @@ mapping:
         );
     }
 
-    /// task-204: a `safe_checkpoint` (the connector's resume floor) prunes every idempotency record
+    /// A `safe_checkpoint` (the connector's resume floor) prunes every idempotency record
     /// at/below it — but only those; records above the floor stay so a resume-driven replay still
-    /// dedups. Without a floor, nothing is pruned (the pre-task-204 behavior).
+    /// dedups. Without a floor, nothing is pruned.
     #[test]
     fn safe_checkpoint_prunes_batch_ids_at_or_below_the_resume_floor() {
         let tmp = tempfile::tempdir().unwrap();
         let shard = open_empty(tmp.path());
 
-        // Checkpoints carry their sequence number (task-196): the prune index is keyed by
-        // it — a floor without one prunes nothing (snapshot ids are unordered, task-205).
+        // Checkpoints carry their sequence number: the prune index is keyed by
+        // it — a floor without one prunes nothing (snapshot ids are unordered).
         // These tests use seq == id for readability.
         let ordered = |cp: i64| SourceCheckpoint::iceberg_ordered(cp, cp);
         let commit = |id: i64, cp: i64, from: Option<i64>, safe: Option<i64>| {
@@ -5007,8 +5002,8 @@ mapping:
         );
     }
 
-    /// task-196: the continuity decision matrix — window-covering with sequence numbers,
-    /// exact-match (task-194) fallback without them.
+    /// The continuity decision matrix — window-covering with sequence numbers,
+    /// exact-match fallback without them.
     #[test]
     fn continuity_decision_matrix() {
         let ord = SourceCheckpoint::iceberg_ordered;
@@ -5051,7 +5046,7 @@ mapping:
             c(Some(&ord(900, 2)), Some(&ord(999, 1)), &ord(50, 3)),
             Continuity::Apply
         );
-        // Legacy (no sequence numbers): exact task-194 semantics.
+        // Legacy (no sequence numbers): exact semantics.
         assert_eq!(
             c(Some(&plain(20)), Some(&plain(20)), &plain(30)),
             Continuity::Apply
@@ -5067,7 +5062,7 @@ mapping:
         );
     }
 
-    /// task-206: recovery after a partial fan-out + head advance no longer wedges. A re-send
+    /// Recovery after a partial fan-out + head advance no longer wedges. A re-send
     /// whose window COVERS the shard's checkpoint (from behind it, end past it, by sequence
     /// number) applies under a NEW batch id instead of tripping `CheckpointGap`; a stale
     /// replay ending at the shard's position no-ops without regressing.
@@ -5129,7 +5124,7 @@ mapping:
         assert_eq!(shard.current_snapshot().unwrap(), before);
     }
 
-    /// **task-194 regression** — the microk8s silent-loss signature, reproduced at the node guard:
+    /// The silent-loss signature, reproduced at the node guard:
     /// one connector trigger's writes land on *some* shards but not others while the checkpoint
     /// advances. Three shards start caught up at `R`; trigger 1 `(R → H1]` lands on shard 0 only
     /// (shards 1 & 2 "missed" their writes — the compaction-race loss); trigger 2 `(H1 → H2]`, which
@@ -5214,7 +5209,7 @@ mapping:
         }
     }
 
-    /// task-207: the continuity guard is re-decided at COMMIT under the writer mutex. Two
+    /// The continuity guard is re-decided at COMMIT under the writer mutex. Two
     /// batches staged against the same `current` can no longer both advance blindly — the
     /// staged-earlier/committed-later one resolves by position (NoOp here; Gap in the legacy
     /// no-sequence flavor), never a silent checkpoint regression.
@@ -5257,7 +5252,7 @@ mapping:
                 .unwrap();
             shard.commit_staged(&[long]).unwrap();
             assert_eq!(shard.current_checkpoint().unwrap(), Some(ord(30, 3)));
-            // The pre-task-207 code committed `short` blindly: checkpoint regressed 30 → 20.
+            // Committing `short` blindly would regress the checkpoint 30 → 20.
             shard.commit_staged(&[short]).unwrap();
             assert_eq!(
                 shard.current_checkpoint().unwrap(),
@@ -5310,8 +5305,8 @@ mapping:
         }
     }
 
-    /// task-205: pruning orders by sequence number, never by the random snapshot id. The
-    /// pre-task-196 numeric range could delete the record inserted in the SAME txn whenever
+    /// Pruning orders by sequence number, never by the random snapshot id. A
+    /// numeric range over snapshot ids could delete the record inserted in the SAME txn whenever
     /// the new checkpoint's id happened to sort below the floor's id (~50% per boundary).
     #[test]
     fn prune_orders_by_sequence_not_snapshot_id() {
@@ -5361,7 +5356,7 @@ mapping:
         );
     }
 
-    /// task-204: the empty-batch checkpoint advance (task-194's redb-only path) prunes too — its
+    /// The empty-batch checkpoint advance (the redb-only path) prunes too — its
     /// `safe_checkpoint` reaches the same helper as a document commit.
     #[test]
     fn empty_batch_advance_also_prunes() {
@@ -5532,7 +5527,7 @@ mapping:
         assert!(locs[1].is_none());
     }
 
-    // ---- D30 layered locator store layers (task-184) ------------------------------
+    // ---- D30 layered locator store layers ------------------------------
 
     #[test]
     fn ingest_carries_loc_ids_and_fills_the_array() {
@@ -5569,7 +5564,7 @@ mapping:
     }
 
     #[test]
-    fn record_freq_matches_position_results_and_sheds_positions(/* task-216 */) {
+    fn record_freq_matches_position_results_and_sheds_positions() {
         // Two shards over the same docs: `body` at the default `record: POSITION` vs
         // `record: FREQ`. Term/match results AND scores are identical (BM25 needs freqs +
         // fieldnorms, both present); a phrase query works on POSITION and fails with the
@@ -5657,7 +5652,7 @@ mapping:
     }
 
     #[test]
-    fn stored_key_round_trips_through_a_real_shard(/* task-212 */) {
+    fn stored_key_round_trips_through_a_real_shard() {
         // Hit identity is the stored `enc(key)` bytes decoded back — assert the full
         // write→search→decode loop over realistic hex-string keys (the scale-run shape),
         // and that hydration's get_by_key resolves the same rows.
@@ -5705,7 +5700,7 @@ mapping:
     }
 
     #[test]
-    fn size_breakdown_components_are_populated_and_reconcile(/* task-218 */) {
+    fn size_breakdown_components_are_populated_and_reconcile() {
         let tmp = tempfile::tempdir().unwrap();
         let shard = open_committed(tmp.path());
 
@@ -5865,7 +5860,7 @@ mapping:
         );
     }
 
-    // ---- PREDICATE location strategy (task-184 / D30) --------------------------------
+    // ---- PREDICATE location strategy (D30) --------------------------------
 
     /// The `index()` fixture with `location_strategy: PREDICATE` — store-less hydration.
     fn predicate_index() -> ResolvedIndex {
@@ -6015,7 +6010,7 @@ mapping:
         assert_eq!(loc.get(2).unwrap(), Some((1, 0)));
     }
 
-    // ---- D30 layered read path (task-184) -------------------------------------------
+    // ---- D30 layered read path -------------------------------------------
 
     #[test]
     fn layered_locate_end_to_end_ingest_update_delete() {
@@ -6175,7 +6170,7 @@ mapping:
         );
     }
 
-    // ---- D30 live-file bitmap + compaction re-map (task-184 slice 3) ---------------
+    // ---- D30 live-file bitmap + compaction re-map ---------------
 
     #[test]
     fn dead_file_flags_persist_across_reopen_and_ignore_unknown_paths() {
@@ -6362,7 +6357,7 @@ mapping:
             .create_shard(&ShardId::single("docs"), &index())
             .unwrap();
         // A fresh shard has no recorded lineage → the guard can't (and won't) check it: never a
-        // false alarm on a pre-task-114 index.
+        // false alarm on an index with no recorded lineage.
         assert_eq!(shard.source_uuid().unwrap(), None);
         // Recording the source table-uuid round-trips; re-recording (e.g. on reindex) is idempotent.
         shard.set_source_uuid("aaaaaaaa-1111").unwrap();
@@ -6406,8 +6401,7 @@ mapping:
 
     #[test]
     fn second_commit_appends_a_segment_searchable_alongside_the_first() {
-        // The M1 capability: two distinct commits accumulate; both are searchable
-        // and the locator merges (M0 would have replaced the first).
+        // Two distinct commits accumulate; both are searchable and the locator merges.
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalIndexStore::open(tmp.path()).unwrap();
         let shard = store
@@ -6471,7 +6465,7 @@ mapping:
         assert_eq!(shard.current_snapshot().unwrap(), 0);
     }
 
-    // ---- partition-scoped reconciliation (task-15, equality-delete fallback) ----
+    // ---- partition-scoped reconciliation (equality-delete fallback) ----
 
     /// An index keyed by (partition `region`, identifier `id`).
     fn partitioned_index() -> ResolvedIndex {
@@ -6578,7 +6572,7 @@ mapping:
 
     #[test]
     fn reconcile_skips_deletes_when_checkpoint_advanced_during_scan() {
-        // TOCTOU guard (task-195): if the shard's checkpoint advanced since the source scan that
+        // TOCTOU guard: if the shard's checkpoint advanced since the source scan that
         // produced the live-key set, a concurrently-ingested key would look "stale" — so the guard
         // skips the deletes rather than dropping a legitimately newer row.
         let tmp = tempfile::tempdir().unwrap();
@@ -7150,7 +7144,7 @@ mod reindex_tests {
         assert_eq!(reopened.num_docs().unwrap(), 2);
     }
 
-    // --- crash-window recovery (task-70): hand-build each on-disk state and assert recovery ---
+    // --- crash-window recovery: hand-build each on-disk state and assert recovery ---
 
     fn tag_dir(dir: &Path, tag: &str) {
         std::fs::create_dir_all(dir).unwrap();
@@ -7250,7 +7244,7 @@ mod window_store_tests {
     };
     use std::collections::BTreeMap;
 
-    const DAY: i64 = 86_400_000_000; // one day in **micros** (the canonical window scale, task-116)
+    const DAY: i64 = 86_400_000_000; // one day in **micros** (the canonical window scale)
 
     fn events_index() -> ResolvedIndex {
         let src = SourceSchema::new(

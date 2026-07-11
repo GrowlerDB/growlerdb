@@ -1,5 +1,5 @@
 <script lang="ts">
-  // An anchored popover (task-93): the time filter, user menu, etc. Positioned from a trigger's
+  // An anchored popover: the time filter, user menu, etc. Positioned from a trigger's
   // bounding rect (pure math in `lib/popover.ts`), with a full-screen click-away overlay. Escape
   // closes. Pass the trigger element as `anchor`; render content in the default slot.
   import type { Snippet } from 'svelte';

@@ -1,20 +1,17 @@
-//! **Durable atomic file writes** ([task-70]): the shared primitive for the metadata writers
+//! **Durable atomic file writes**: the shared primitive for the metadata writers
 //! (the [registry](../../growlerdb-controlplane), a Node's `index.json`, …). A plain
 //! `write(tmp)` + `rename` only prevents *torn reads while the process is up* — on power loss or
 //! a kernel crash the data or the rename itself can be lost. [`write`] closes that gap: it
 //! fsyncs the temp file, renames it over the target, then fsyncs the parent directory so both
 //! the bytes and the rename are durable.
-//!
-//! [task-70]: ../../../backlog/tasks/task-70%20-%20Durable%20persistence%20and%20crash%20recovery.md
 
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Per-call nonce source, so concurrent writers never collide on a fixed temp name (the old
-/// `path.tmp` gave no margin). Process id + a monotonic counter is unique without needing a
-/// clock or RNG.
+/// Per-call nonce source, so concurrent writers never collide on a fixed temp name. Process id
+/// + a monotonic counter is unique without needing a clock or RNG.
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Atomically and **durably** write `bytes` to `path`: write a uniquely-named temp sibling,
@@ -47,7 +44,7 @@ pub fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
     // fsync the directory so the rename (the new dir entry) is itself durable. NOTE: the rename
     // already succeeded here, so the new contents are *visible* — a failure at this last step means
-    // only that the directory entry isn't confirmed durable across a power loss (task-153 / I15). The
+    // only that the directory entry isn't confirmed durable across a power loss. The
     // write is idempotent, so a caller should treat this as "written, durability unconfirmed" (safe to
     // retry) rather than "not written" (roll back). Wrap the error with that context so it's
     // distinguishable from a genuine write failure in logs.
@@ -79,11 +76,10 @@ pub fn prev_path(path: &Path) -> PathBuf {
 
 /// Like [`write`], but first preserves the current contents of `path` (if any) as a durable
 /// `.prev` sibling — a last-known-good copy a reader can fall back to if the freshly-written
-/// file is later found corrupt (e.g. silent disk corruption), instead of hard-failing startup
-/// (task-70).
+/// file is later found corrupt (e.g. silent disk corruption), instead of hard-failing startup.
 ///
-/// The `.prev` is rolled with a **hardlink** (O(1)), not a full byte copy (task-202): a large
-/// `registry.json` was copied in full on every mutation. `.prev` is linked to the *current* inode;
+/// The `.prev` is rolled with a **hardlink** (O(1)), not a full byte copy of a large
+/// `registry.json` on every mutation. `.prev` is linked to the *current* inode;
 /// the atomic [`write`] below rebinds `path`'s name to a *new* inode, so `.prev` keeps the old
 /// content while `path` gets the new — and `path` is never absent, so this stays crash-safe and the
 /// recovery path is unchanged. Falls back to a byte copy on filesystems without hardlinks.

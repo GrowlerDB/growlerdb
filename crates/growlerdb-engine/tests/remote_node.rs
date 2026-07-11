@@ -1,4 +1,4 @@
-//! The **distributed half of the Gateway/Node seam** (task-30 B1): stand up the Node's
+//! The **distributed half of the Gateway/Node seam**: stand up the Node's
 //! Search/Suggest/Lookup/Admin gRPC services on a real tonic server, point a
 //! [`RemoteNode`] at it over a channel, and drive a [`Gateway`] through it — proving that
 //! routing, results, and error/auth propagation all hold across a network hop (the same

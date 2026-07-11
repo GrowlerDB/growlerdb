@@ -1,4 +1,4 @@
-# Workload-generic streaming generator (task-214) — RENDERED, do not apply directly:
+# Workload-generic streaming generator — RENDERED, do not apply directly:
 #   python3 bench/scale/harness.py render <workload> --shards N   (or deploy/k8s/scale-up.sh)
 # The workload's own corpus.py is mounted from the ConfigMap below and its `stream()` runs —
 # the row recipe lives in exactly one place per workload (bench/scale/workloads/<name>/corpus.py),
@@ -23,10 +23,9 @@ metadata:
   namespace: ${NAMESPACE}
   labels: { app: growlerdb-generator }
 spec:
-  # Parallelize ingest by running N generator pods (task-231): each pod's rows carry a unique `run`
-  # prefix (HOSTNAME + a random token, see corpus.py), so replicas produce DISJOINT ids with no
-  # collision — aggregate rows/s scales ~linearly with replicas (a single pod caps ~8.5k/s on the
-  # Run-3 cluster). Rendered by `harness.py render --generators N`.
+  # Parallelize ingest by running N generator pods: each pod's rows carry a unique `run` prefix
+  # (HOSTNAME + a random token, see corpus.py), so replicas produce DISJOINT ids with no collision —
+  # aggregate rows/s scales ~linearly with replicas. Rendered by `harness.py render --generators N`.
   replicas: ${GENERATORS}
   strategy: { type: Recreate }
   selector:

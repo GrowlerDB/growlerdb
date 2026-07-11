@@ -1,5 +1,5 @@
 # Provisions a Hetzner k3s cluster for the scale test: one k3s server + (node_count-1) agents on a
-# private network, behind a firewall, with local-NVMe nodes. Parameterized + destroy-able (task-159).
+# private network, behind a firewall, with local-NVMe nodes. Parameterized + destroy-able.
 # k3s is bootstrapped via cloud-init; the workload is then deployed with the Helm chart and driven by
 # the benchmark harness (bench/scale/). See okf/quality/scale-test-plan.md.
 

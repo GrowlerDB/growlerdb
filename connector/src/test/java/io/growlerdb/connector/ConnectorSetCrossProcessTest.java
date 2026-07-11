@@ -21,7 +21,7 @@ import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 /**
- * The parallel connector set against REAL {@code growlerdb serve} shards (task-196): two workers,
+ * The parallel connector set against REAL {@code growlerdb serve} shards: two workers,
  * each owning one of two sharded Nodes (`--shards 2 --shard-ordinal k`), ingest one table in
  * parallel over the real Write gRPC — per-shard continuity guard, sequence-stamped checkpoints,
  * dedup and pruning all live. Covers: parallel commit with skewed worker triggers, checkpoint

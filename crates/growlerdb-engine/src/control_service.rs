@@ -1,11 +1,8 @@
-//! The **Control Plane** gRPC service ([task-28], Design 06) — cluster-wide index lifecycle
-//! over the [`Registry`](growlerdb_controlplane::Registry): create / drop / list (completing
-//! task-26's lifecycle). `CreateIndex` resolves the candidate definition against its source
-//! schema before registering it (status `building`); the registry mutations are durable.
-//! Lightweight and off the search/write hot path. Every RPC consults the
-//! [auth hook](SharedAuth) first.
-//!
-//! [task-28]: ../../../design/06-service-architecture.md
+//! The **Control Plane** gRPC service — cluster-wide index lifecycle over the
+//! [`Registry`](growlerdb_controlplane::Registry): create / drop / list. `CreateIndex` resolves
+//! the candidate definition against its source schema before registering it (status `building`);
+//! the registry mutations are durable. Lightweight and off the search/write hot path. Every RPC
+//! consults the [auth hook](SharedAuth) first.
 
 use std::sync::Arc;
 
@@ -42,7 +39,7 @@ use tonic::{Code, Request, Response, Status};
 use crate::auth::{self, default_auth, AuthContext, SharedAuth};
 use crate::authn::SharedAuthn;
 
-/// Consecutive failures before an account is locked out (task-147 / B3).
+/// Consecutive failures before an account is locked out.
 const LOGIN_FAILURES_BEFORE_LOCKOUT: u32 = 5;
 /// Base lockout window; doubles per failure past the threshold, capped at [`LOGIN_LOCKOUT_MAX_SECS`].
 const LOGIN_LOCKOUT_BASE_SECS: u64 = 1;
@@ -52,8 +49,8 @@ const MAX_CONCURRENT_LOGINS: usize = 8;
 /// Cap on tracked accounts, so a username-spray can't grow the throttle map unbounded.
 const MAX_TRACKED_ACCOUNTS: usize = 10_000;
 
-/// Per-account login throttle (task-147 / B3): tracks consecutive failures and locks an account for
-/// an exponentially-growing window, plus a global concurrency permit. A locked account skips the
+/// Per-account login throttle: tracks consecutive failures and locks an account for an
+/// exponentially-growing window, plus a global concurrency permit. A locked account skips the
 /// (CPU-heavy) Argon2 verify entirely, so online guessing is rate-limited and the unauthenticated
 /// CPU-exhaustion amplifier is closed. Keyed by the *submitted* username (existing or not), so it
 /// leaks no account existence.
@@ -122,16 +119,16 @@ pub struct ControlPlaneService {
     registry: Arc<Registry>,
     iceberg: IcebergConfig,
     auth: SharedAuth,
-    /// Optional authenticator (task-104): when set, the control plane validates the forwarded bearer
-    /// itself (rather than trusting gateway-stamped metadata) before authorizing — needed so local
-    /// role bindings are merged against a *verified* subject. `None` keeps the pre-task-104 behavior
-    /// (trust the gateway-stamped principal/roles).
+    /// Optional authenticator: when set, the control plane validates the forwarded bearer itself
+    /// (rather than trusting gateway-stamped metadata) before authorizing — needed so local role
+    /// bindings are merged against a *verified* subject. `None` trusts the gateway-stamped
+    /// principal/roles.
     authn: Option<SharedAuthn>,
-    /// Built-in login signing key (task-128): `Some` enables the `Login` RPC, which verifies a
-    /// password against the registry credential store and mints an HS256 session JWT signed with
-    /// this secret (the gateway validates it with the same secret). `None` ⇒ login is `UNIMPLEMENTED`.
+    /// Built-in login signing key: `Some` enables the `Login` RPC, which verifies a password against
+    /// the registry credential store and mints an HS256 session JWT signed with this secret (the
+    /// gateway validates it with the same secret). `None` ⇒ login is `UNIMPLEMENTED`.
     session_secret: Option<Vec<u8>>,
-    /// Shared login throttle (task-147 / B3) — `Arc` so the per-connection clones share lockout state.
+    /// Shared login throttle — `Arc` so the per-connection clones share lockout state.
     login_throttle: Arc<LoginThrottle>,
 }
 
@@ -154,16 +151,16 @@ impl ControlPlaneService {
         }
     }
 
-    /// Install an [authenticator](crate::authn) so the control plane validates the bearer itself
-    /// (task-104) — required for role-binding enforcement that doesn't trust forwarded identity.
+    /// Install an [authenticator](crate::authn) so the control plane validates the bearer itself —
+    /// required for role-binding enforcement that doesn't trust forwarded identity.
     pub fn with_authn(mut self, authn: SharedAuthn) -> Self {
         self.authn = Some(authn);
         self
     }
 
-    /// Enable built-in credential login (task-128): the `Login` RPC verifies a password against the
-    /// registry credential store and mints a session JWT signed with `secret`. Without this, `Login`
-    /// returns `UNIMPLEMENTED`.
+    /// Enable built-in credential login: the `Login` RPC verifies a password against the registry
+    /// credential store and mints a session JWT signed with `secret`. Without this, `Login` returns
+    /// `UNIMPLEMENTED`.
     pub fn with_session_secret(mut self, secret: Vec<u8>) -> Self {
         self.session_secret = Some(secret);
         self
@@ -174,10 +171,10 @@ impl ControlPlaneService {
         ControlPlaneServer::new(self)
     }
 
-    /// Authorize `method` for the caller of `request` (task-104). Resolves the caller's identity —
-    /// validating the bearer when an [authenticator](Self::with_authn) is set, else trusting the
-    /// gateway-stamped principal/roles — then **merges the subject's local role bindings** before
-    /// the policy check. So an admin granting a role takes effect on that subject's next call.
+    /// Authorize `method` for the caller of `request`. Resolves the caller's identity — validating
+    /// the bearer when an [authenticator](Self::with_authn) is set, else trusting the gateway-stamped
+    /// principal/roles — then **merges the subject's local role bindings** before the policy check.
+    /// So an admin granting a role takes effect on that subject's next call.
     fn gate<T>(&self, method: &'static str, request: &Request<T>) -> Result<AuthContext, Status> {
         let meta = request.metadata();
         let hdr = |k: &str| {
@@ -195,9 +192,9 @@ impl ControlPlaneService {
                             WireError::new("UNAUTHENTICATED", e.to_string()),
                         )
                     })?;
-                // Session revocation (task-147 / B4): reject a token minted before the subject's
-                // session epoch — set when their roles change or credential is removed. Forces
-                // re-authentication with the current roles rather than riding a stale embedded set.
+                // Session revocation: reject a token minted before the subject's session epoch —
+                // set when their roles change or credential is removed. Forces re-authentication
+                // with the current roles rather than riding a stale embedded set.
                 // Compared at second granularity (`iat` is floored seconds; the epoch is ms): since
                 // floor is monotonic, a token minted at-or-after the epoch is never wrongly rejected —
                 // at worst a token from the same second as the change survives <1s.
@@ -232,7 +229,7 @@ impl ControlPlaneService {
                 )
             }
         };
-        // Merge admin-managed local role bindings (task-104), keyed by the verified subject.
+        // Merge admin-managed local role bindings, keyed by the verified subject.
         for r in self.registry.roles_for(&principal) {
             if !roles.contains(&r) {
                 roles.push(r);
@@ -243,8 +240,8 @@ impl ControlPlaneService {
             principal: Some(principal).filter(|p| !p.is_empty()),
             tenant,
             roles,
-            // Control-plane ops authorize by role/scope, not a resolved target index (task-240): the
-            // per-index allowlist is enforced on the Gateway read/write path. Index-agnostic here.
+            // Control-plane ops authorize by role/scope, not a resolved target index: the per-index
+            // allowlist is enforced on the Gateway read/write path. Index-agnostic here.
             index: None,
             allowed_indexes: Vec::new(),
         };
@@ -258,8 +255,8 @@ impl ControlPlaneService {
     }
 }
 
-/// The verified subject that owns saved queries (task-106): the authenticated principal, or `""`
-/// (anonymous) on an open gateway — in which case the console keeps queries in localStorage instead.
+/// The verified subject that owns saved queries: the authenticated principal, or `""` (anonymous)
+/// on an open gateway — in which case the console keeps queries in localStorage instead.
 fn subject_of<T>(req: &Request<T>) -> String {
     req.metadata()
         .get(auth::PRINCIPAL_KEY)
@@ -268,8 +265,8 @@ fn subject_of<T>(req: &Request<T>) -> String {
         .to_string()
 }
 
-/// Build per-field [`FieldMapping`]s for the console's Mapping tab (task-107) from the resolved
-/// definition: type / analyzer / fast / cached, key role, and the D23 reason a field can't be cached.
+/// Build per-field [`FieldMapping`]s for the console's Mapping tab from the resolved definition:
+/// type / analyzer / fast / cached, key role, and the reason a field can't be cached.
 fn field_mappings(def: &ResolvedIndex) -> Vec<FieldMapping> {
     use growlerdb_core::FieldType::{Bool, Date, Double, Ip, Keyword, Long, Text};
     let is_pk = |path: &str| {
@@ -288,7 +285,7 @@ fn field_mappings(def: &ResolvedIndex) -> Vec<FieldMapping> {
                 Date => "DATE",
                 Ip => "IP",
             };
-            // D23: a field that can't be cached — sensitive (never) or big text (over the cap).
+            // A field that can't be cached — sensitive (never) or big text (over the cap).
             let blocked = if f.sensitive {
                 "sensitive (D23)".to_string()
             } else if f
@@ -312,12 +309,12 @@ fn field_mappings(def: &ResolvedIndex) -> Vec<FieldMapping> {
         .collect()
 }
 
-/// Per-shard placement + coarse state for the console's Shards tab (task-108): the control-plane
-/// shard map (primary + replicas per ordinal, or per window for a windowed index). A shard with an
-/// assigned primary is `active`; one still awaiting assignment is `building`.
+/// Per-shard placement + coarse state for the console's Shards tab: the control-plane shard map
+/// (primary + replicas per ordinal, or per window for a windowed index). A shard with an assigned
+/// primary is `active`; one still awaiting assignment is `building`.
 fn shard_statuses(entry: &IndexEntry) -> Vec<ShardStatus> {
-    // `bounds` is the window's event-time zone-map (task-219) — carried so the live-CP gateway can
-    // prune; `None`/absent for an ordinal shard.
+    // `bounds` is the window's event-time zone-map — carried so the live-CP gateway can prune;
+    // `None`/absent for an ordinal shard.
     let from =
         |ordinal: u32, window: i64, a: &ShardAssignment, bounds: Option<(i64, i64)>| ShardStatus {
             ordinal,
@@ -342,7 +339,7 @@ fn shard_statuses(entry: &IndexEntry) -> Vec<ShardStatus> {
             .collect()
     } else {
         // Windowed index: one cell per time window (oldest first), ordinal is its position; carry the
-        // per-window event-time zone-map so a live-CP windowed gateway can prune (task-219).
+        // per-window event-time zone-map so a live-CP windowed gateway can prune.
         entry
             .windows
             .iter()
@@ -352,8 +349,8 @@ fn shard_statuses(entry: &IndexEntry) -> Vec<ShardStatus> {
     }
 }
 
-/// The windowing config carried on `GetIndexResponse` (task-219): `Some` iff the index is windowed,
-/// so a live-CP gateway can build a window router + prune without reading the registry file. Mirrors
+/// The windowing config carried on `GetIndexResponse`: `Some` iff the index is windowed, so a
+/// live-CP gateway can build a window router + prune without reading the registry file. Mirrors
 /// `growlerdb_core::TimeWindowing`.
 fn windowing_config(def: &ResolvedIndex) -> Option<WindowingConfig> {
     use growlerdb_core::WindowGranularity::{Daily, Hourly, Weekly};
@@ -369,7 +366,7 @@ fn windowing_config(def: &ResolvedIndex) -> Option<WindowingConfig> {
         hot_windows: w.hot_windows.map(|n| n as u32).unwrap_or(0),
         has_hot_windows: w.hot_windows.is_some(),
         // The window field's format, so the connector normalizes each row's window value to canonical
-        // micros exactly as the engine does (task-219). "" = a native DATE already in micros.
+        // micros exactly as the engine does. "" = a native DATE already in micros.
         field_format: def
             .fields
             .iter()
@@ -381,8 +378,8 @@ fn windowing_config(def: &ResolvedIndex) -> Option<WindowingConfig> {
     })
 }
 
-/// A [`TimeFormat`](growlerdb_core::TimeFormat) as its serde snake_case wire name (task-219) — what
-/// the connector maps back to a normalization when computing a row's window id.
+/// A [`TimeFormat`](growlerdb_core::TimeFormat) as its serde snake_case wire name — what the
+/// connector maps back to a normalization when computing a row's window id.
 fn time_format_str(f: growlerdb_core::TimeFormat) -> &'static str {
     use growlerdb_core::TimeFormat::*;
     match f {
@@ -395,7 +392,7 @@ fn time_format_str(f: growlerdb_core::TimeFormat) -> &'static str {
     }
 }
 
-/// API-token → wire metadata (task-105): never includes the hash or secret.
+/// API-token → wire metadata: never includes the hash or secret.
 fn token_meta(t: ApiToken) -> ApiTokenMeta {
     ApiTokenMeta {
         id: t.id,
@@ -464,8 +461,8 @@ fn registry_status(e: RegistryError) -> Status {
     }
 }
 
-/// The control plane's wall clock in epoch ms — the authority for windowed-node heartbeat liveness
-/// (task-219), so a node's own (possibly skewed) clock never decides whether it's in the pool.
+/// The control plane's wall clock in epoch ms — the authority for windowed-node heartbeat liveness,
+/// so a node's own (possibly skewed) clock never decides whether it's in the pool.
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -473,9 +470,9 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// A planned **growth** reshard (task-77): the new bucket map plus which shards to (re)build from
-/// source before the cutover and which to trim after it. `(ordinal, endpoint)` pairs name the node
-/// serving each shard.
+/// A planned **growth** reshard: the new bucket map plus which shards to (re)build from source
+/// before the cutover and which to trim after it. `(ordinal, endpoint)` pairs name the node serving
+/// each shard.
 struct GrowthReshard {
     /// The bucket map to commit at the cutover.
     map: BucketMap,
@@ -489,8 +486,7 @@ struct GrowthReshard {
 /// Plan a growth reshard, or reject it. Growth-only so existing shards keep their data and reads
 /// stay correct: `reassign` must move buckets **only onto new shards** (`to >= current_count`), and
 /// every ordinal `0..new_count` must already have a serving node (the new shards registered with
-/// their ordinal, task-77 slice 3c-c). Pure over the plan + shard map, so it's unit-tested without
-/// a cluster.
+/// their ordinal). Pure over the plan + shard map, so it's unit-tested without a cluster.
 fn plan_growth_reshard(
     reassignment: &Reassignment,
     shard_map: &BTreeMap<u32, ShardAssignment>,
@@ -544,9 +540,9 @@ fn plan_growth_reshard(
     })
 }
 
-/// Drive a **filtered reindex** on the node serving one shard (task-77): connect its Admin gRPC and
-/// rebuild the shard from source keeping only the buckets it owns under `owners`. The per-node data
-/// step of a reshard, reusing the write-fenced reindex (slice 3b).
+/// Drive a **filtered reindex** on the node serving one shard: connect its Admin gRPC and rebuild
+/// the shard from source keeping only the buckets it owns under `owners`. The per-node data step of
+/// a reshard, reusing the write-fenced reindex.
 async fn reindex_shard_on_node(
     endpoint: &str,
     index: &str,
@@ -599,7 +595,7 @@ impl ControlPlane for ControlPlaneService {
             .map_err(|e| Status::invalid_argument(format!("definition does not resolve: {e}")))?;
         // Surface non-fatal resolution warnings in the response *and* the log — e.g. the
         // `PREDICATE` location strategy's honest-scope note (hydration latency depends on
-        // the source layout; task-184 / D30), or an equality-delete reconcile fallback.
+        // the source layout), or an equality-delete reconcile fallback.
         let warnings = resolved.warnings.clone();
         for w in &warnings {
             eprintln!("create index `{name}`: warning: {w}");
@@ -634,7 +630,7 @@ impl ControlPlane for ControlPlaneService {
             .get(&name)
             .ok_or_else(|| registry_status(RegistryError::NotFound(name.clone())))?;
         // Routing config the connector must match: shard count from the shard map, strategy
-        // resolved from the definition (the same source the Gateway's router uses) — task-69.
+        // resolved from the definition (the same source the Gateway's router uses).
         let routing = match entry.definition.routing_strategy() {
             growlerdb_core::RoutingStrategy::Hash => WireRouting::RoutingHash,
             growlerdb_core::RoutingStrategy::Partition => WireRouting::RoutingPartition,
@@ -644,14 +640,14 @@ impl ControlPlane for ControlPlaneService {
             status: status_str(entry.status).to_string(),
             shard_count: entry.shards.len() as u32,
             routing: routing as i32,
-            // Empty ⇒ legacy routing (task-77); present ⇒ writers/readers route through this map.
+            // Empty ⇒ legacy routing; present ⇒ writers/readers route through this map.
             bucket_owners: entry.bucket_owners.clone(),
-            // Per-field mapping for the console's Mapping tab (task-107).
+            // Per-field mapping for the console's Mapping tab.
             fields: field_mappings(&entry.definition),
-            // Per-shard placement for the Shards tab (task-108).
+            // Per-shard placement for the Shards tab.
             shard_status: shard_statuses(&entry),
-            // Windowing config for a windowed index (task-219) — lets a live-CP gateway build a
-            // window router + prune; `None` for an ordinal index.
+            // Windowing config for a windowed index — lets a live-CP gateway build a window router +
+            // prune; `None` for an ordinal index.
             windowing: windowing_config(&entry.definition),
         }))
     }
@@ -663,7 +659,7 @@ impl ControlPlane for ControlPlaneService {
         self.gate("PlanReshard", &request)?;
         let req = request.into_inner();
         // Read-only: compute the bounded bucket→shard reassignment to reach the new count without
-        // applying it. The move list is the migration work for the online cutover (task-77).
+        // applying it. The move list is the migration work for the online cutover.
         let plan = self
             .registry
             .plan_reshard(&req.index, req.new_shard_count)
@@ -700,7 +696,7 @@ impl ControlPlane for ControlPlaneService {
             .ok_or_else(|| registry_status(RegistryError::NotFound(req.index.clone())))?;
         // The count the data is **currently routed over** — the stored bucket map's shard count, not
         // the registered-node count (which already includes the new shards). A legacy index has no
-        // map; its first reshard adopts a balanced map over its current shard count (task-77).
+        // map; its first reshard adopts a balanced map over its current shard count.
         let current_count = self
             .registry
             .bucket_map(&req.index)
@@ -734,7 +730,7 @@ impl ControlPlane for ControlPlaneService {
             }
         }
 
-        // Record the reshard on the index's activity log (task-135) — a material lifecycle event,
+        // Record the reshard on the index's activity log — a material lifecycle event,
         // alongside index.created / alias.swapped. (Per-document ingestion is intentionally not
         // logged here; the Activity tab is the index's lifecycle/admin audit trail.)
         self.registry.record_activity(
@@ -887,7 +883,7 @@ impl ControlPlane for ControlPlaneService {
         self.registry
             .set_alias(&req.alias, req.targets)
             .map_err(registry_status)?;
-        // Record on each target so the alias swap shows in that index's activity (task-110).
+        // Record on each target so the alias swap shows in that index's activity.
         for target in &targets {
             self.registry.record_activity(
                 target,
@@ -928,7 +924,7 @@ impl ControlPlane for ControlPlaneService {
         Ok(Response::new(ListActivityResponse { events }))
     }
 
-    /// Built-in credential login (task-128): verify the password against the registry store and mint
+    /// Built-in credential login: verify the password against the registry store and mint
     /// a session JWT. **Unauthenticated** — it establishes auth, so no `gate()`. `UNIMPLEMENTED` when
     /// the deployment isn't running built-in auth (no signing secret configured).
     async fn login(
@@ -944,7 +940,7 @@ impl ControlPlane for ControlPlaneService {
         if req.username.is_empty() {
             return Err(Status::invalid_argument("username is required"));
         }
-        // Rate-limit online guessing (task-147 / B3): a locked account is rejected *before* the
+        // Rate-limit online guessing: a locked account is rejected *before* the
         // CPU-heavy Argon2 verify, so lockout also caps the unauthenticated CPU cost.
         if let Some(remaining) = self.login_throttle.locked_for(&req.username) {
             growlerdb_telemetry::sli::login("locked");
@@ -961,7 +957,7 @@ impl ControlPlane for ControlPlaneService {
                 return Err(Status::unavailable("login is busy; retry shortly"));
             }
         };
-        // Constant-ish failure: an unknown subject and a wrong password are indistinguishable (I10).
+        // Constant-ish failure: an unknown subject and a wrong password are indistinguishable.
         if !self
             .registry
             .verify_credential(&req.username, &req.password)
@@ -973,8 +969,8 @@ impl ControlPlane for ControlPlaneService {
         self.login_throttle.record_success(&req.username);
         growlerdb_telemetry::sli::login("success");
         let roles = self.registry.roles_for(&req.username);
-        // Per-index scope (task-244): if the subject has an index binding, stamp it into the token's
-        // `indexes` claim so per-index RBAC (task-240) restricts them; empty = unrestricted.
+        // Per-index scope: if the subject has an index binding, stamp it into the token's
+        // `indexes` claim so per-index RBAC restricts them; empty = unrestricted.
         let indexes = self.registry.indexes_for(&req.username);
         let token = crate::authn::mint_session_jwt(
             secret,
@@ -1087,7 +1083,7 @@ impl ControlPlane for ControlPlaneService {
         if req.subject.trim().is_empty() {
             return Err(Status::invalid_argument("subject is required"));
         }
-        // Prevent privilege escalation (task-147 / F3): a caller can only assign roles that are
+        // Prevent privilege escalation: a caller can only assign roles that are
         // assignable and whose scopes it already holds.
         crate::rbac::check_assignable(&ctx.roles, &req.roles).map_err(|reason| {
             to_status(
@@ -1129,7 +1125,7 @@ impl ControlPlane for ControlPlaneService {
         if req.label.trim().is_empty() {
             return Err(Status::invalid_argument("a token needs a label"));
         }
-        // Prevent privilege escalation (task-147 / F3): a token can't carry roles/scopes the
+        // Prevent privilege escalation: a token can't carry roles/scopes the
         // minting caller doesn't already hold.
         crate::rbac::check_assignable(&ctx.roles, &req.roles).map_err(|reason| {
             to_status(
@@ -1149,7 +1145,7 @@ impl ControlPlane for ControlPlaneService {
             roles: req.roles,
             owner,
             created_at_ms: 0,    // the registry stamps this on create
-            expires_at_ms: None, // no expiry by default (B13); a request-supplied TTL is a follow-up
+            expires_at_ms: None, // no expiry by default
         };
         let token = self.registry.create_token(token).map_err(registry_status)?;
         Ok(Response::new(CreateTokenResponse {
@@ -1200,7 +1196,7 @@ impl ControlPlane for ControlPlaneService {
         let name = resolved.name.clone();
         let shard_count = req.shard_count.max(1);
 
-        // Classify by the DEFINITION, not by whether `windows` is populated (task-219): a windowed
+        // Classify by the DEFINITION, not by whether `windows` is populated: a windowed
         // node that starts **empty** (streaming-first — it creates windows on first write) still
         // reports zero windows, and must register as a *windowed* entry so `ResolveWindowOwner` can
         // place windows on it — not be misclassified as an ordinal single-shard index.
@@ -1211,7 +1207,7 @@ impl ControlPlane for ControlPlaneService {
             self.registry.create(resolved).map_err(registry_status)?;
         }
         if !is_windowed {
-            // Ordinal shard map. A node serving specific ordinals (task-77 multi-node sharding)
+            // Ordinal shard map. A node serving specific ordinals
             // claims only those; otherwise (single-node default) it claims all 0..count.
             let owned: Vec<u32> = if req.shard_ordinals.is_empty() {
                 (0..shard_count).collect()
@@ -1225,12 +1221,12 @@ impl ControlPlane for ControlPlaneService {
                     )));
                 }
             }
-            // One persist for all this node's ordinals (task-202), not one rewrite per ordinal.
+            // One persist for all this node's ordinals, not one rewrite per ordinal.
             self.registry
                 .assign_primaries(&name, &owned, req.endpoint.clone())
                 .map_err(registry_status)?;
         } else {
-            // Windowed (task-81/219): place each served window on this node and record its event-time
+            // Windowed: place each served window on this node and record its event-time
             // zone-map so the gateway can prune. `windows` may be empty (an empty streaming node) —
             // the entry still exists + activates below so placement can proceed.
             for w in &req.windows {
@@ -1257,7 +1253,7 @@ impl ControlPlane for ControlPlaneService {
         if req.index.is_empty() || req.endpoint.is_empty() {
             return Err(Status::invalid_argument("index and endpoint are required"));
         }
-        // A liveness heartbeat into the CP placement pool (task-219); the CP stamps its own clock so a
+        // A liveness heartbeat into the CP placement pool; the CP stamps its own clock so a
         // skewed node clock can't fake liveness. In-memory only — no persist.
         self.registry
             .register_node(&req.index, &req.endpoint, now_ms());
@@ -1306,7 +1302,7 @@ impl ControlPlane for ControlPlaneService {
 impl ControlPlaneService {
     /// Build the per-index ingestion status for `names` (source head vs each shard's committed
     /// checkpoint) AND export the `growlerdb_ingest_lag_ms` / `growlerdb_shards_up|total` gauges
-    /// (task-143). Gate-free so both the `IngestionStatus` RPC and the background metrics sampler
+    /// Gate-free so both the `IngestionStatus` RPC and the background metrics sampler
     /// ([`spawn_ingestion_metrics_sampler`](Self::spawn_ingestion_metrics_sampler)) reuse it.
     async fn collect_ingestion(&self, names: Vec<String>) -> Vec<IndexIngestion> {
         // One catalog connection for all source-head reads. Best-effort: if the source can't be
@@ -1321,7 +1317,7 @@ impl ControlPlaneService {
             let Source::Iceberg(src) = &entry.definition.source;
             let source_table = src.table.clone();
             // A windowed index has no ordinal shards — its placement lives in the `windows` map, so the
-            // ingestion probe iterates windows instead (task-226).
+            // ingestion probe iterates windows instead.
             let windowed = entry.definition.windowing.is_some();
             let routing = match entry.definition.routing_strategy() {
                 growlerdb_core::RoutingStrategy::Hash => WireRouting::RoutingHash,
@@ -1337,7 +1333,7 @@ impl ControlPlaneService {
                 None => (0, 0, false),
             };
             // Snapshot id → commit-timestamp, to measure how far behind each shard's committed
-            // checkpoint is in wall-clock terms (task-137). Best-effort: empty map ⇒ lag unknown.
+            // checkpoint is in wall-clock terms. Best-effort: empty map ⇒ lag unknown.
             let snapshot_ts = match &reader {
                 Some(r) => r
                     .snapshot_timestamps(&source_table)
@@ -1346,7 +1342,7 @@ impl ControlPlaneService {
                 None => std::collections::HashMap::new(),
             };
 
-            // Source-health gauges (task-197): diagnose a source that wants Iceberg maintenance
+            // Source-health gauges: diagnose a source that wants Iceberg maintenance
             // (small files / long snapshot history slow GrowlerDB's O(files) query path). Read from
             // snapshot metadata only — best-effort, so a failed read just skips this tick's sample.
             if let Some(r) = &reader {
@@ -1360,7 +1356,7 @@ impl ControlPlaneService {
                         h.snapshots,
                     );
                 }
-                // Partition skew (task-208.2): one `current_plan` (manifest read, then cached) per
+                // Partition skew: one `current_plan` (manifest read, then cached) per
                 // index — O(indexes), same order as the per-index metadata this loop already does.
                 // Only emitted for identity-partitioned sources; best-effort.
                 if let Ok(Some(skew)) = r.partition_skew(&source_table).await {
@@ -1369,14 +1365,14 @@ impl ControlPlaneService {
             }
 
             // Each shard's committed checkpoint, via its primary's Write.GetCheckpoint — fetched
-            // CONCURRENTLY (task-202). The old serial loop did one fresh connect + RPC per shard in
-            // sequence, so at hundreds of shards a single sample took hundreds of round-trips and fell
+            // CONCURRENTLY. A serial loop would do one fresh connect + RPC per shard in sequence, so
+            // at hundreds of shards a single sample would take hundreds of round-trips and fall
             // behind its own cadence. A bounded JoinSet runs them in parallel; the state/lag math is
             // then a cheap synchronous pass.
             let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(SHARD_POLL_CONCURRENCY));
             let mut set = tokio::task::JoinSet::new();
             // Probe the index's shard set: ordinal shards, or the **time windows** for a windowed index
-            // (task-226) — its `shards` map is empty, its `windows` map holds the placement. `ordinal`
+            // — its `shards` map is empty, its `windows` map holds the placement. `ordinal`
             // and `window` are 0 for the axis that doesn't apply; the row carries the one that does.
             if windowed {
                 for (window, wa) in &entry.windows {
@@ -1444,7 +1440,7 @@ impl ControlPlaneService {
                 });
             }
 
-            // Export the ingestion-lag + shard-availability gauges (task-143) so the Observability
+            // Export the ingestion-lag + shard-availability gauges so the Observability
             // grid, Grafana, and alerts can see them. `up` = shards with a reachable primary; lag =
             // the worst shard's wall-clock staleness.
             let lag_ms = shards.iter().map(|s| s.lag_ms).max().unwrap_or(0);
@@ -1475,7 +1471,7 @@ impl ControlPlaneService {
     }
 
     /// Spawn a background task that recomputes the ingestion-lag + shard-availability gauges
-    /// (task-143) every `interval_secs`, independent of any console poll — so Prometheus always
+    /// every `interval_secs`, independent of any console poll — so Prometheus always
     /// scrapes a fresh value even when nobody has the Ingestion page open. Cheap: it reuses the
     /// same source-head read the `IngestionStatus` RPC does. Returns immediately.
     pub fn spawn_ingestion_metrics_sampler(&self, interval_secs: u64) {
@@ -1492,26 +1488,26 @@ impl ControlPlaneService {
     }
 }
 
-/// In_sync tolerance for the Ingestion view (task-137): a shard within this much wall-clock lag of
+/// In_sync tolerance for the Ingestion view: a shard within this much wall-clock lag of
 /// the source head still reads `in_sync`. A live source commits a fresh snapshot every few seconds,
 /// so a healthy connector is always momentarily a snapshot behind; without a tolerance the badge
 /// flaps in_sync↔behind. Generous enough to absorb normal pipeline latency, small enough to surface
 /// a genuine backlog.
 const INGESTION_LAG_TOLERANCE_MS: i64 = 15_000;
 
-/// Max concurrent per-shard `GetCheckpoint` probes in one ingestion sample (task-202). Bounds the
-/// fan-out so a many-shard index doesn't open every connection at once, while still turning the old
-/// serial hundreds-of-round-trips sweep into a handful of parallel batches.
+/// Max concurrent per-shard `GetCheckpoint` probes in one ingestion sample. Bounds the
+/// fan-out so a many-shard index doesn't open every connection at once, while still collapsing
+/// a serial hundreds-of-round-trips sweep into a handful of parallel batches.
 const SHARD_POLL_CONCURRENCY: usize = 32;
 
-/// One shard's concurrent checkpoint probe (task-202): `(ordinal, primary endpoint, checkpoint or
+/// One shard's concurrent checkpoint probe: `(ordinal, primary endpoint, checkpoint or
 /// error state)` — `Ok((committed_snapshot, index_snapshot))`, or `Err(state)` for no-primary /
 /// unreachable / source-recreated.
 // (ordinal, window, node-endpoint, checkpoint result). `window` is 0 for an ordinal shard; `ordinal`
-// is 0 for a windowed index's window (task-226).
+// is 0 for a windowed index's window.
 type ShardProbe = (u32, i64, String, Result<(i64, u64), &'static str>);
 
-/// Classify a shard's ingestion `state` + its `lag_ms` vs the source head (task-137). `in_sync` when
+/// Classify a shard's ingestion `state` + its `lag_ms` vs the source head. `in_sync` when
 /// the shard has committed the head, or is within `tolerance_ms` of it (measured as a wall-clock
 /// delta `head_ts − committed_ts` — Iceberg snapshot ids are random, so an id delta is meaningless).
 /// A committed snapshot no longer in the source history (`committed_ts == None`, e.g. expired by
@@ -1554,12 +1550,12 @@ async fn shard_checkpoint(endpoint: &str, window: i64) -> Result<(i64, u64), &'s
         .await
         .map_err(|_| "unreachable")?;
     let resp = client
-        // `window` selects the time-window shard on a windowed node (task-226); 0 on an ordinal node,
+        // `window` selects the time-window shard on a windowed node; 0 on an ordinal node,
         // which ignores it.
         .get_checkpoint(GetCheckpointRequest { window })
         .await
         // A node serving a stale index over a recreated source refuses the checkpoint with
-        // FAILED_PRECONDITION (task-114) — surface that as a distinct `source_recreated` state, not
+        // FAILED_PRECONDITION — surface that as a distinct `source_recreated` state, not
         // a generic transport `unreachable`.
         .map_err(|s| {
             if s.code() == tonic::Code::FailedPrecondition {
@@ -1576,7 +1572,7 @@ async fn shard_checkpoint(endpoint: &str, window: i64) -> Result<(i64, u64), &'s
     Ok((committed, resp.snapshot))
 }
 
-/// Render a coarse source type for the wire (the create-form introspection, task-47).
+/// Render a coarse source type for the wire (the create-form introspection).
 fn source_type_str(ty: growlerdb_core::SourceType) -> &'static str {
     use growlerdb_core::SourceType::*;
     match ty {
@@ -1677,7 +1673,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn builtin_login_mints_a_session_token_the_gateway_accepts() {
-        // task-128: /v1/login verifies a credential and mints an HS256 session JWT validatable by the
+        // /v1/login verifies a credential and mints an HS256 session JWT validatable by the
         // gateway's JwtAuthenticator with the same secret.
         let tmp = tempfile::tempdir().unwrap();
         let registry = Arc::new(Registry::open(tmp.path().join("registry.json")).unwrap());
@@ -1733,7 +1729,7 @@ mod tests {
 
     #[test]
     fn login_throttle_locks_after_repeated_failures() {
-        // task-147 / B3: an account is unlocked until it crosses the failure threshold, then locked
+        // An account is unlocked until it crosses the failure threshold, then locked
         // for a positive window; a success clears it.
         let t = LoginThrottle::new();
         for _ in 0..LOGIN_FAILURES_BEFORE_LOCKOUT - 1 {
@@ -1754,7 +1750,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn role_change_revokes_outstanding_sessions() {
-        // task-147 / B4: a session JWT minted before a subject's roles change (which bumps the
+        // A session JWT minted before a subject's roles change (which bumps the
         // session epoch) is rejected by the control-plane gate, forcing re-authentication.
         use jsonwebtoken::{encode, get_current_timestamp, Algorithm, EncodingKey, Header};
         let tmp = tempfile::tempdir().unwrap();
@@ -1847,7 +1843,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn get_index_returns_rich_field_mapping() {
-        // task-107: per-field type/analyzer/fast/cached/PK + a D23 block reason.
+        // Per-field type/analyzer/fast/cached/PK + a block reason.
         let tmp = tempfile::tempdir().unwrap();
         let svc = service(tmp.path());
         let src = SourceSchema::new(
@@ -1881,7 +1877,7 @@ mod tests {
         assert!(f("city").fast);
         assert!(f("body").cached);
         assert_eq!(f("body").r#type, "TEXT");
-        // A sensitive field can't be cached (D23) → a block reason, not cached.
+        // A sensitive field can't be cached → a block reason, not cached.
         assert!(!f("ssn").cached);
         assert!(f("ssn").blocked.contains("sensitive"));
     }
@@ -1908,10 +1904,10 @@ mod tests {
         assert_eq!(resp.shard_count, 2);
         assert_eq!(resp.routing, WireRouting::RoutingHash as i32);
         assert_eq!(resp.status, "building");
-        // Legacy index ⇒ no bucket map vended (task-77).
+        // Legacy index ⇒ no bucket map vended.
         assert!(resp.bucket_owners.is_empty());
 
-        // Per-shard placement (task-108): primary + replica + active state.
+        // Per-shard placement: primary + replica + active state.
         let s0 = resp.shard_status.iter().find(|s| s.ordinal == 0).unwrap();
         assert_eq!(s0.primary, "node-a");
         assert_eq!(s0.replicas, vec!["node-a2".to_string()]);
@@ -1937,7 +1933,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn get_index_carries_windowing_config_and_event_bounds() {
-        // task-219: a live-CP gateway needs the windowing config + per-window event zone-map on the
+        // A live-CP gateway needs the windowing config + per-window event zone-map on the
         // wire so it can build a window router and prune time-filtered queries.
         let tmp = tempfile::tempdir().unwrap();
         let svc = service(tmp.path());
@@ -1989,7 +1985,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn cp_driven_window_placement_via_rpc() {
-        // task-219: nodes heartbeat into the pool (RegisterNode), the connector resolves each window's
+        // Nodes heartbeat into the pool (RegisterNode), the connector resolves each window's
         // owner (ResolveWindowOwner, placing on first ask), and GetIndex reflects the placement.
         let tmp = tempfile::tempdir().unwrap();
         let svc = service(tmp.path());
@@ -2233,7 +2229,7 @@ mod tests {
         let svc = service(tmp.path());
         let def_json = serde_json::to_string(&resolved("docs")).unwrap();
 
-        // Two nodes each register **one** ordinal of a 2-shard index (task-77 multi-node sharding).
+        // Two nodes each register **one** ordinal of a 2-shard index.
         for (ord, ep) in [(0u32, "http://node-a:50051"), (1u32, "http://node-b:50051")] {
             svc.register_served_index(Request::new(RegisterServedIndexRequest {
                 definition_json: def_json.clone(),
@@ -2428,7 +2424,7 @@ mod tests {
         let svc = service(tmp.path());
 
         // A windowed index has no ordinal shards — its placement lives in the `windows` map. The
-        // ingestion feed must report those windows (task-226), not the old "0 of 0 shards".
+        // ingestion feed must report those windows, not "0 of 0 shards".
         svc.registry.create(resolved_windowed("wdocs")).unwrap();
         svc.registry
             .assign_window("wdocs", 86_400_000_000, "http://127.0.0.1:1")

@@ -1,4 +1,4 @@
-# Hetzner k3s SCALE TEST (task-159) — the in-cluster, self-contained variant of values-hetzner.
+# Hetzner k3s SCALE TEST — the in-cluster, self-contained variant of values-hetzner.
 #
 # Difference from values-hetzner: that file targets a PRODUCTION-style cloud (public OIDC auth,
 # Traefik ingress, an external kube-prometheus-stack via ServiceMonitor). The scale *test* runs the
@@ -17,8 +17,8 @@ image:
 imagePullSecrets:
   - name: ghcr-pull
 
-# The scale index: 6 shards (query parallelism; ≈1 shard per worker core). WORKLOAD-agnostic
-# (task-214): name / sourceTable / the explicit definition all come from the chosen workload's
+# The scale index: 6 shards (query parallelism; ≈1 shard per worker core). WORKLOAD-agnostic:
+# name / sourceTable / the explicit definition all come from the chosen workload's
 # bench/scale/workloads/<name>/ directory — deploy/k8s/scale-up.sh WORKLOAD=<name> passes them
 # (`--set index.name/sourceTable`, `--set-file index.definition=<workload>/index.yaml`). Deploy via
 # scale-up.sh, not bare helm — bare helm with this file alone falls back to the base `docs` index.

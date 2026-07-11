@@ -1,7 +1,7 @@
 <script lang="ts">
-  // Settings (task-98, console revamp): Appearance · Connection · Users & roles · API tokens · About.
-  // Appearance + Connection + About are live; Users & roles is real for admins (task-104); API
-  // tokens (task-105) is a PLANNED placeholder.
+  // Appearance · Connection · Users & roles · API tokens · About.
+  // Appearance + Connection + About are live; Users & roles is real for admins; API
+  // tokens is a PLANNED placeholder.
   import { t } from '../lib/i18n';
   import {
     theme,
@@ -35,11 +35,11 @@
   const user = $derived($identity);
   const isAdmin = $derived(user?.roles?.includes('admin') ?? false);
 
-  // User & role management (task-104) — loaded + editable only for admins.
+  // User & role management — loaded + editable only for admins.
   let users = $state<RoleBinding[]>([]);
   let roleCatalog = $state<string[]>([]);
   let newSubject = $state('');
-  let newRoles = $state<Set<string>>(new Set(['reader'])); // roles to grant a new user (task-127)
+  let newRoles = $state<Set<string>>(new Set(['reader'])); // roles to grant a new user
   let usersErr = $state('');
   let usersLoaded = false;
 
@@ -89,10 +89,10 @@
     }
   }
 
-  // API tokens (task-105) — admin-only.
+  // API tokens — admin-only.
   let tokens = $state<ApiTokenMeta[]>([]);
   let newTokenLabel = $state('');
-  let newTokenRoles = $state<Set<string>>(new Set(['reader'])); // roles for a new token (task-127)
+  let newTokenRoles = $state<Set<string>>(new Set(['reader'])); // roles for a new token
   let newSecret = $state(''); // the just-issued secret, shown once
   let tokensErr = $state('');
   let tokensLoaded = false;
@@ -448,7 +448,7 @@
     flex: 1;
     min-width: 0;
   }
-  /* Role picker on add-user / new-token (task-127) — checkboxes from the assignable-role catalog. */
+  /* Role picker on add-user / new-token — checkboxes from the assignable-role catalog. */
   .role-pick {
     display: flex;
     flex-wrap: wrap;

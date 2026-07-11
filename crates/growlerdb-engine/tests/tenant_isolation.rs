@@ -1,13 +1,12 @@
-//! **End-to-end tenant isolation** (GA criterion, task-58; per-read-path coverage, task-246). The
-//! per-seam pieces are unit-tested — the authn boundary drops forged identity headers ([`authn`]),
-//! search injects a mandatory tenant filter, hydration refuses a missing claim. This test composes
-//! them **through the `Gateway`**: a real two-tenant index + an API-key authenticator, proving a
-//! caller scoped to one tenant can never read another's rows — even while spoofing the tenant header
-//! or widening the query.
+//! **End-to-end tenant isolation** (GA criterion). The per-seam pieces are unit-tested — the authn
+//! boundary drops forged identity headers ([`authn`]), search injects a mandatory tenant filter,
+//! hydration refuses a missing claim. This test composes them **through the `Gateway`**: a real
+//! two-tenant index + an API-key authenticator, proving a caller scoped to one tenant can never read
+//! another's rows — even while spoofing the tenant header or widening the query.
 //!
-//! task-246 broadens the end-to-end coverage from search alone to **every read path** the mandatory
-//! tenant filter governs, so SECURITY.md's "verified" claim is backed by direct coverage:
-//! - **search** — the original cases (forged header / widening clause / unauthenticated).
+//! Coverage spans **every read path** the mandatory tenant filter governs, so SECURITY.md's
+//! "verified" claim is backed by direct coverage:
+//! - **search** — forged header / widening clause / unauthenticated.
 //! - **aggregate** — a tenant-scoped aggregation counts only the caller's docs; a forged header can't
 //!   widen it and an unauthenticated one is rejected.
 //! - **hydration (`get_by_key`)** — a missing verified claim fails closed with `PermissionDenied`
@@ -72,7 +71,7 @@ fn issue_key(apikeys: &ApiKeyStore, principal: &str, tenant: Option<&str>) -> St
 }
 
 /// The tenant-scoped Node + its API-key authenticator + a key scoped to `acme` — the shared build
-/// used by both the single-index gateway and the multi-index routing variant (task-240).
+/// used by both the single-index gateway and the multi-index routing variant.
 fn two_tenant_node(root: &std::path::Path) -> (Arc<dyn Node>, Arc<ApiKeyStore>, String) {
     let src = SourceSchema::new(
         vec![
@@ -82,8 +81,8 @@ fn two_tenant_node(root: &std::path::Path) -> (Arc<dyn Node>, Arc<ApiKeyStore>, 
         vec![],
         vec!["id".into()],
     );
-    // `tenant` is a fast field so the aggregate cases (task-246) can terms-bucket on it; this doesn't
-    // change search/hydration behaviour, it only makes the column aggregatable.
+    // `tenant` is a fast field so the aggregate cases can terms-bucket on it; this doesn't change
+    // search/hydration behaviour, it only makes the column aggregatable.
     let idx = IndexDefinition::from_yaml(
         "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\ntenant_field: tenant\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD }, { path: tenant, type: KEYWORD, fast: true } ] }\n",
     )
@@ -375,7 +374,7 @@ async fn an_unauthenticated_request_is_rejected_before_the_shard() {
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
 }
 
-/// A [`RouteResolver`] that fronts the tenant-scoped node under index name `docs` (task-240).
+/// A [`RouteResolver`] that fronts the tenant-scoped node under index name `docs`.
 struct DocsResolver(Arc<dyn Node>);
 
 #[tonic::async_trait]
@@ -396,8 +395,8 @@ impl RouteResolver for DocsResolver {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tenant_isolation_holds_through_multi_index_routing() {
-    // task-240: routing a request through a resolved per-index route must not weaken the engine-level
-    // tenant filter. The acme-scoped caller, even forging `x-growlerdb-tenant: globex` and widening
+    // Routing a request through a resolved per-index route must not weaken the engine-level tenant
+    // filter. The acme-scoped caller, even forging `x-growlerdb-tenant: globex` and widening
     // the query, only ever sees acme's rows — the shard applies the mandatory tenant filter exactly
     // as in the single-index path.
     let tmp = tempfile::tempdir().unwrap();
@@ -423,7 +422,7 @@ async fn tenant_isolation_holds_through_multi_index_routing() {
     assert_eq!(resp.total, 2);
 }
 
-// ---- Aggregate (task-246) ------------------------------------------------------------------------
+// ---- Aggregate -----------------------------------------------------------------------------------
 
 /// A terms/stats aggregation over a tenant-scoped index sees only the caller's docs: the injected
 /// `AND tenant:acme` binds before the agg runs, so acme's count is 2 (`a`,`c`), never globex's `b`.
@@ -505,7 +504,7 @@ async fn aggregation_cannot_widen_and_denies_the_unauthenticated() {
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
 }
 
-// ---- Hydration / get_by_key (task-246) -----------------------------------------------------------
+// ---- Hydration / get_by_key ----------------------------------------------------------------------
 
 /// Hydration on a tenant-scoped index **fails closed on a missing verified claim** (a key whose API
 /// key carries no tenant) — `PermissionDenied`, *before* any Iceberg connect — and rejects the
@@ -547,7 +546,7 @@ async fn hydration_fails_closed_without_a_verified_tenant_claim() {
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
 }
 
-// ---- Export (task-246) ---------------------------------------------------------------------------
+// ---- Export --------------------------------------------------------------------------------------
 
 /// Export is a Node-only streaming scroll (not Gateway-routed), and it applies the **same** tenant
 /// scope as search: on a tenant-scoped index only the caller's rows stream out, even when the query
@@ -584,7 +583,7 @@ async fn tenant_scoped_export_requires_a_verified_claim() {
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
 }
 
-// ---- Suggest (task-246) --------------------------------------------------------------------------
+// ---- Suggest -------------------------------------------------------------------------------------
 
 /// Suggest **fails closed** on a tenant-scoped index: term-dictionary suggestions scan a field across
 /// all docs and aren't yet tenant-filtered, so serving them would leak other tenants' terms. The

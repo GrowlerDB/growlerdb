@@ -1,6 +1,6 @@
 """Generate a realistic HTTP access-log corpus into Iceberg for the scale test.
 
-Rich rows (~17 fields, ~350-450 B/row). This one module is BOTH corpus entry points (task-214):
+Rich rows (~17 fields, ~350-450 B/row). This one module is BOTH corpus entry points:
 `load()` bulk-writes for the local Compose smoke / `harness.py load`, and `stream()` is the
 in-cluster continuous generator — the generic k8s generator Deployment mounts this file and runs
 it, so the row recipe lives in exactly one place. `load` is seeded (`BENCH_SEED`) so runs are
@@ -103,7 +103,7 @@ def _ip_gen():
 
 def _rows(n, ts_offset, gen_ip):
     """One batch of rich access-log rows — the single row recipe both `load` (bulk) and
-    `stream` (continuous k8s generator) draw from (task-214 unification)."""
+    `stream` (continuous k8s generator) draw from."""
     return {
         "request_id": [uuid.uuid4().hex for _ in range(n)],
         "ts": [BASE_TS + ts_offset + i for i in range(n)],
@@ -151,8 +151,8 @@ def load(table="growlerdb.http_logs", fraction=1.0):
 
 
 def stream(table="growlerdb.http_logs", batch=10, sleep_s=5):
-    """Append `batch` rows every `sleep_s` forever — the in-cluster streaming generator
-    (task-214): the generic k8s generator Deployment mounts this module and calls this.
+    """Append `batch` rows every `sleep_s` forever — the in-cluster streaming generator:
+    the generic k8s generator Deployment mounts this module and calls this.
     Creates the table if absent (never drops — a restart resumes the stream) and prints
     `created <table>` once, the readiness gate deploy/k8s/scale-up.sh waits on."""
     import pyarrow as pa

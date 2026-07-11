@@ -1,7 +1,6 @@
 <script lang="ts">
-  // Self-serve help affordance (task-208): a small ⓘ button that opens a Popover describing a
-  // metric/panel — what it is, and (optionally) what an elevated value means. Keeps the cards
-  // themselves clean; the product questions live in this help text, not as on-card chrome.
+  // Self-serve help affordance: a small ⓘ button that opens a Popover describing a metric/panel —
+  // what it is, and (optionally) what an elevated value means. Keeps the cards themselves clean.
   import Popover from './Popover.svelte';
 
   let {

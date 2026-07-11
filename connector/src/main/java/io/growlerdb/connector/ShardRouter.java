@@ -8,7 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 /**
- * JVM port of {@code growlerdb_core::ShardRouter} (task-29): map a composite key
+ * JVM port of {@code growlerdb_core::ShardRouter}: map a composite key
  * ({@link Coordinates}) to a shard ordinal in {@code [0, shards)}. The connector uses this
  * to <b>place writes</b> on the same shard the Gateway's reader routes a key lookup to — so
  * a document is written where it will later be searched.
@@ -30,7 +30,7 @@ public final class ShardRouter implements java.io.Serializable {
   }
 
   /**
-   * Number of <b>virtual buckets</b> (task-77) — mirrors Rust {@code routing::NUM_BUCKETS}. Keys
+   * Number of <b>virtual buckets</b> — mirrors Rust {@code routing::NUM_BUCKETS}. Keys
    * hash into {@code [0, NUM_BUCKETS)} and a {@code bucket→shard} map assigns owners, so resharding
    * moves whole buckets instead of re-routing every key. Must match the Rust constant exactly.
    */
@@ -38,7 +38,7 @@ public final class ShardRouter implements java.io.Serializable {
 
   private final int shards;
   private final Strategy strategy;
-  /** Bucket→shard owners for a bucketed router (task-77); {@code null} ⇒ legacy {@code fnv % shards}. */
+  /** Bucket→shard owners for a bucketed router; {@code null} ⇒ legacy {@code fnv % shards}. */
   private final int[] bucketOwners;
 
   public ShardRouter(int shards, Strategy strategy) {
@@ -68,7 +68,7 @@ public final class ShardRouter implements java.io.Serializable {
   }
 
   /**
-   * A <b>bucketed</b> router (task-77): keys hash to a bucket, {@code bucketOwners[bucket]} names
+   * A <b>bucketed</b> router: keys hash to a bucket, {@code bucketOwners[bucket]} names
    * its shard. Mirrors Rust {@code ShardRouter::bucketed}; {@code bucketOwners} comes from the
    * registry's {@link io.growlerdb.proto.v1 bucket map} (length must be {@link #NUM_BUCKETS}).
    */
@@ -105,8 +105,8 @@ public final class ShardRouter implements java.io.Serializable {
   }
 
   /**
-   * The <b>bucket</b> ({@code [0, NUM_BUCKETS)}) a key hashes to under this router's strategy
-   * (task-77) — independent of placement. Mirrors Rust {@code ShardRouter::bucket}.
+   * The <b>bucket</b> ({@code [0, NUM_BUCKETS)}) a key hashes to under this router's strategy —
+   * independent of placement. Mirrors Rust {@code ShardRouter::bucket}.
    */
   public int bucket(Coordinates key) {
     return (int) Long.remainderUnsigned(fnv1a(strategyBytes(key)), NUM_BUCKETS);
@@ -174,7 +174,7 @@ public final class ShardRouter implements java.io.Serializable {
         pushBytes(out, new byte[] {(byte) (v.getBool() ? 1 : 0)});
       }
       case TS_MICROS -> {
-        // Canonical epoch micros (task-184) — same 8-byte LE shape as INT, under tag 5,
+        // Canonical epoch micros — same 8-byte LE shape as INT, under tag 5,
         // mirroring Rust's `Value::Ts` arm in `push_value`.
         out.write(5);
         pushBytes(out, longLe(v.getTsMicros()));

@@ -18,12 +18,11 @@ import java.util.OptionalLong;
 import org.junit.jupiter.api.Test;
 
 /**
- * Resume-from-min across shards orders checkpoints by <b>lineage</b> (Iceberg sequence numbers,
- * task-196), never by the raw snapshot id — ids are random longs, so the old {@code Math.min}
- * picked the wrong shard about half the time two shards diverged (task-205: a permanent
- * {@code CHECKPOINT_GAP} stall). Node-reported sequences win; the table's own {@link
- * SnapshotLineage} backfills legacy stored checkpoints; only a snapshot unknown everywhere
- * degrades to the numeric fallback.
+ * Resume-from-min across shards orders checkpoints by <b>lineage</b> (Iceberg sequence numbers),
+ * never by the raw snapshot id — ids are random longs, so a numeric {@code Math.min} picks the
+ * wrong shard about half the time two shards diverge (a permanent {@code CHECKPOINT_GAP} stall).
+ * Node-reported sequences win; the table's own {@link SnapshotLineage} backfills legacy stored
+ * checkpoints; only a snapshot unknown everywhere degrades to the numeric fallback.
  */
 class ShardedWriteClientResumeTest {
 
@@ -36,7 +35,7 @@ class ShardedWriteClientResumeTest {
           clientOver(
               servers,
               at(900, 2), // mid
-              at(50, 3), // ahead (numerically smallest — the old Math.min picked this, wrongly)
+              at(50, 3), // ahead (numerically smallest — a numeric min would pick this, wrongly)
               at(700, 1)); // the actual laggard
       assertEquals(700L, client.checkpointSnapshotId(), "lineage min, not numeric min");
       client.close();
@@ -88,7 +87,7 @@ class ShardedWriteClientResumeTest {
     }
   }
 
-  /** Unknown everywhere (expired + never stamped): the pre-existing numeric fallback, warned. */
+  /** Unknown everywhere (expired + never stamped): the numeric fallback, warned. */
   @Test
   void unknownSequencesDegradeToTheNumericFallback() throws IOException, InterruptedException {
     List<Server> servers = new ArrayList<>();

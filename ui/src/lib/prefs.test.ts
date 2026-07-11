@@ -46,7 +46,7 @@ describe('prefs theme', () => {
   });
 });
 
-describe('prefs accent + density (task-93)', () => {
+describe('prefs accent + density', () => {
   it('default to blue / compact, honoring a stored choice', async () => {
     const a = await import('./prefs');
     expect(get(a.accent)).toBe('blue');

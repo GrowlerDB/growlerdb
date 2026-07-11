@@ -1,6 +1,6 @@
-# Trino for the GrowlerDB-vs-Iceberg-alone comparison (task-186): queries the SAME Iceberg table
+# Trino for the GrowlerDB-vs-Iceberg-alone comparison: queries the SAME Iceberg table
 # (growlerdb.http_logs) via the Polaris REST catalog + MinIO, so the same predicates can be timed as
-# table scans and compared to GrowlerDB's index+hydrate path at each storage milestone.
+# table scans and compared to GrowlerDB's index+hydrate path.
 apiVersion: v1
 kind: ConfigMap
 metadata: { name: trino-catalog, namespace: growlerdb }

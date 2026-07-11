@@ -1,7 +1,7 @@
-//! Source connectors for GrowlerDB. M0: an Iceberg batch reader (current snapshot,
+//! Source connectors for GrowlerDB: an Iceberg batch reader (current snapshot,
 //! append-only — no delete handling) that tracks each batch's source data file
 //! and starting row position, so the index can build a primary-key locator for
-//! hydration (task-5 / task-8).
+//! hydration.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -55,13 +55,13 @@ pub enum SourceError {
     #[error(transparent)]
     Iceberg(#[from] iceberg::Error),
 
-    /// A targeted parquet point read failed (task-184 / D30 — hydration pass 1 reads parquet
-    /// directly for row-group + row-selection scoping; see [`point_read`]).
+    /// A targeted parquet point read failed (hydration pass 1 reads parquet directly for
+    /// row-group + row-selection scoping; see [`point_read`]).
     #[error(transparent)]
     Parquet(#[from] parquet::errors::ParquetError),
 
     /// A locator referenced a data file absent from the current table plan
-    /// (e.g. compacted away — a stale locator; full verify-and-fall-back is M1).
+    /// (e.g. compacted away — a stale locator).
     #[error("data file not found in current table plan: {0}")]
     FileNotFound(String),
 
@@ -74,8 +74,8 @@ pub enum SourceError {
         position: u64,
     },
 
-    /// The streamed-read sink (the caller's per-chunk write) failed (task-84). Carries the caller's
-    /// error rendered as a string, so the source crate needn't depend on the engine's error type.
+    /// The streamed-read sink (the caller's per-chunk write) failed. Carries the caller's error
+    /// rendered as a string, so the source crate needn't depend on the engine's error type.
     #[error("sink: {0}")]
     Sink(String),
 }
@@ -186,7 +186,7 @@ impl ReadResult {
     }
 }
 
-/// Docs per chunk for the streamed read (task-84): bounds peak memory while keeping the per-chunk
+/// Docs per chunk for the streamed read: bounds peak memory while keeping the per-chunk
 /// commit count (and thus segment count) reasonable. ~50k telemetry docs ≈ a few MB.
 const STREAM_CHUNK: usize = 50_000;
 
@@ -194,20 +194,20 @@ const STREAM_CHUNK: usize = 50_000;
 pub struct IcebergReader {
     catalog: RestCatalog,
     /// Snapshot-pinned plan cache for [hydration](Self::hydrate)'s pass-1 unpredicated
-    /// current-snapshot plan (task-184 / D30): only effective when the reader itself is
-    /// long-lived — hold it via [`SharedReader`] rather than connecting per call.
+    /// current-snapshot plan: only effective when the reader itself is long-lived — hold it
+    /// via [`SharedReader`] rather than connecting per call.
     plans: PlanCache<Arc<Vec<FileScanTask>>>,
 }
 
 impl IcebergReader {
     /// Connect to the catalog described by `cfg`.
     pub async fn connect(cfg: &IcebergConfig) -> Result<Self> {
-        // Object-store retry (task-154): `OpenDalStorageFactory` wraps every operator it builds —
-        // including this S3 path — in an opendal `RetryLayer` internally (iceberg-storage-opendal
-        // 0.9.1), so the source read path (scans + hydration) already retries transient 5xx/SlowDown.
-        // No separate layer is attached here. The built-in uses opendal's default retry (3 attempts,
-        // no jitter) vs the backup path's tuned `with_max_times(4).with_jitter()`; matching that would
-        // need a hand-rolled StorageFactory, judged not worth it for a single-reader-per-index source.
+        // Object-store retry: `OpenDalStorageFactory` wraps every operator it builds — including
+        // this S3 path — in an opendal `RetryLayer` internally, so the source read path (scans +
+        // hydration) already retries transient 5xx/SlowDown. No separate layer is attached here.
+        // The built-in uses opendal's default retry (3 attempts, no jitter); a tuned
+        // `with_max_times(4).with_jitter()` would need a hand-rolled StorageFactory, judged not
+        // worth it for a single-reader-per-index source.
         let catalog = RestCatalogBuilder::default()
             .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
                 configured_scheme: "s3".to_string(),
@@ -221,7 +221,7 @@ impl IcebergReader {
         })
     }
 
-    /// Read a table's current snapshot (append-only — M0), returning each batch
+    /// Read a table's current snapshot (append-only), returning each batch
     /// tagged with its source data file and starting row position.
     ///
     /// `table` is a dotted identifier, e.g. `growlerdb.docs`.
@@ -243,7 +243,7 @@ impl IcebergReader {
 
     /// The source table's **current snapshot** — its id and commit timestamp (epoch ms) —
     /// read from table metadata only (no scan). This is the cheap "source head" the Ingestion
-    /// view (task-49) compares each shard's committed checkpoint against. Returns `(0, 0)` when
+    /// view compares each shard's committed checkpoint against. Returns `(0, 0)` when
     /// the table has no snapshots yet.
     pub async fn current_snapshot(&self, table: &str) -> Result<(i64, i64)> {
         let ident = TableIdent::from_strs(table.split('.'))?;
@@ -256,7 +256,7 @@ impl IcebergReader {
 
     /// The current snapshot's `(id, sequence-number)` from table metadata only (no scan), or
     /// `None` when the table has no snapshots. The sequence number is the lineage-monotone
-    /// order over snapshots (task-196) — snapshot ids are random longs and carry none.
+    /// order over snapshots — snapshot ids are random longs and carry none.
     pub async fn current_snapshot_ordered(&self, table: &str) -> Result<Option<(i64, i64)>> {
         let ident = TableIdent::from_strs(table.split('.'))?;
         let tbl = self.catalog.load_table(&ident).await?;
@@ -267,7 +267,7 @@ impl IcebergReader {
     }
 
     /// Every snapshot's `(id → commit-timestamp-ms)`, from table metadata only (no scan). The
-    /// Ingestion view (task-137) looks up a shard's committed snapshot to measure how far *behind*
+    /// Ingestion view looks up a shard's committed snapshot to measure how far *behind*
     /// the source head it is in wall-clock terms — Iceberg snapshot ids are random, not sequential,
     /// so an id delta is meaningless; a time delta is what's comparable.
     pub async fn snapshot_timestamps(
@@ -286,25 +286,22 @@ impl IcebergReader {
     /// The source table's **Iceberg `table-uuid`** — the stable identity of *this* table, distinct
     /// from its name. A drop+recreate (or an in-memory catalog reset) mints a new uuid even at the
     /// same name, so comparing the build-time uuid recorded in the index to the live one detects a
-    /// **recreated source** whose rows the index no longer matches — the lineage guard (task-114).
+    /// **recreated source** whose rows the index no longer matches — the lineage guard.
     pub async fn table_uuid(&self, table: &str) -> Result<String> {
         let ident = TableIdent::from_strs(table.split('.'))?;
         let tbl = self.catalog.load_table(&ident).await?;
         Ok(tbl.metadata().uuid().to_string())
     }
 
-    /// **Append fast-path** ([D9] / task-18): read only the data files **added
-    /// since** `since_snapshot` — for opt-in immutable/append-only tables, the cheap
-    /// incremental scan (no delete/update handling). Files already present at
-    /// `since_snapshot` are skipped; `None` reads the whole current snapshot (the
-    /// initial backfill). Returns the located batches plus the current snapshot id
-    /// they bring the index up to.
+    /// **Append fast-path**: read only the data files **added since** `since_snapshot` —
+    /// for opt-in immutable/append-only tables, the cheap incremental scan (no delete/update
+    /// handling). Files already present at `since_snapshot` are skipped; `None` reads the whole
+    /// current snapshot (the initial backfill). Returns the located batches plus the current
+    /// snapshot id they bring the index up to.
     ///
     /// Correct for append-only tables (files are only added). It is **not** safe on a
     /// table with deletes/rewrites — those need [changelog mode](IcebergReader);
     /// hence the fast path is opt-in per [`ScanMode::AppendFastPath`].
-    ///
-    /// [D9]: ../../../wiki/21-decisions.md
     pub async fn read_appended_since(
         &self,
         table: &str,
@@ -356,8 +353,7 @@ impl IcebergReader {
 
     /// Read a table's [`SourceSchema`] — its top-level leaf fields plus the key
     /// hints (partition + identifier field names) GrowlerDB derives the composite key
-    /// from. Nested flattening is deferred to M2; struct/list/map leaves map to
-    /// [`SourceType::Other`].
+    /// from. Struct/list/map leaves map to [`SourceType::Other`].
     ///
     /// `table` is a dotted identifier, e.g. `growlerdb.docs`.
     pub async fn read_source_schema(&self, table: &str) -> Result<SourceSchema> {
@@ -390,8 +386,8 @@ impl IcebergReader {
     /// valid]): resolve `(key, locator)` pairs to authoritative rows.
     ///
     /// For each request the located `(file, position)` is read — a **targeted parquet point
-    /// read** ([`point_read`], task-184 / D30) that fetches only the row group(s) holding the
-    /// requested positions instead of streaming the file from row 0 — and **verified**: the
+    /// read** ([`point_read`]) that fetches only the row group(s) holding the requested positions
+    /// instead of streaming the file from row 0 — and **verified**: the
     /// row's key must match the requested key. If the locator is **stale** (the file was
     /// rewritten away, the position is out of range, or the row no longer carries that key),
     /// GrowlerDB **falls back** to a partition-scoped scan of the current snapshot to re-find
@@ -401,8 +397,8 @@ impl IcebergReader {
     /// omitted).
     ///
     /// A request may carry **no locator** (`None`) — a *known-stale* key whose locator points
-    /// into a file the index has flagged dead (the live-file bitmap, task-184 slice 3): it
-    /// skips the doomed pass-1 point read entirely and goes straight to the fallback (whose
+    /// into a file the index has flagged dead (the live-file bitmap): it skips the doomed pass-1
+    /// point read entirely and goes straight to the fallback (whose
     /// result refreshes the slot).
     ///
     /// [Flow 2]: ../../../design/07-data-flows.md
@@ -418,8 +414,8 @@ impl IcebergReader {
         }
         // One catalog REST call to learn the current snapshot; the pass-1 unpredicated plan
         // (manifest-list + manifest GETs) is then reused from the snapshot-pinned cache while
-        // the snapshot is unchanged, and replanned (replacing the entry) once it advances
-        // (task-184 / D30). Pass 2 below is per-request-predicated and stays uncached.
+        // the snapshot is unchanged, and replanned (replacing the entry) once it advances.
+        // Pass 2 below is per-request-predicated and stays uncached.
         let (tbl, tasks, plan_cache_hit) = self.load_and_plan(table).await?;
         let file_io = tbl.file_io().clone();
 
@@ -429,7 +425,7 @@ impl IcebergReader {
         let any_stale = resolved.iter().any(Option::is_none);
 
         // Pass 2 — fallback: re-resolve stale rows by scanning the current snapshot. To keep this
-        // cheap (task-145) we push an equality predicate over the stale keys' partition + identifier
+        // cheap we push an equality predicate over the stale keys' partition + identifier
         // fields, so Iceberg prunes to the relevant partitions/files instead of reading the whole
         // table — the point of declaring partition fields. Correctness doesn't depend on the
         // predicate: every candidate row is re-verified against the exact key below, so a superset
@@ -446,7 +442,7 @@ impl IcebergReader {
             let predicate = key_predicate(tbl.metadata().current_schema(), &stale_keys);
             let (partition_names, identifier_names) = key_field_names(&requests[0].0);
             // Only the stale keys are re-resolved, and the scan streams with early-exit — so even the
-            // unfiltered (`None` predicate) path is bounded in memory and cost (task-150 / F8).
+            // unfiltered (`None` predicate) path is bounded in memory and cost.
             let wanted: HashSet<Vec<u8>> = stale_keys.iter().map(|k| k.encode()).collect();
             let (index, duplicates) = match scan_stale_index(
                 &tbl,
@@ -514,7 +510,7 @@ impl IcebergReader {
     /// The table's **current-snapshot plan** — snapshot id, file-scan tasks, and the
     /// `FileIO` to read them with — served from the same snapshot-pinned [`PlanCache`]
     /// hydration uses (one catalog call; manifest reads only on snapshot advance). The
-    /// compaction re-map poller (task-184 slice 3) diffs its live data-file set against
+    /// compaction re-map poller diffs its live data-file set against
     /// the index's interned files each tick, so the steady-state poll costs one REST
     /// call and a cache hit. Observing table metadata is read-only — it imposes nothing
     /// on the source.
@@ -530,8 +526,7 @@ impl IcebergReader {
 
     /// Read a table's current snapshot and map every row to a [`LocatedDoc`] —
     /// the composite key + indexed fields (per `index`) plus the row's source
-    /// location (data file + position) for the locator. The M0 write path: full
-    /// snapshot, append-only.
+    /// location (data file + position) for the locator. Full snapshot, append-only.
     pub async fn read_documents(
         &self,
         table: &str,
@@ -549,7 +544,7 @@ impl IcebergReader {
         Ok(DocumentBatch { docs, snapshot_id })
     }
 
-    /// The `total-records` the current snapshot's summary reports, if present (task-85). Lets a
+    /// The `total-records` the current snapshot's summary reports, if present. Lets a
     /// build catch the case where it read **0 documents from a non-empty table** — a stale/broken
     /// read (e.g. a delete-in-history that the changelog read mishandles) — instead of silently
     /// committing an empty index.
@@ -564,12 +559,12 @@ impl IcebergReader {
         }))
     }
 
-    /// Cheap **source-health** signals for the Ingestion/Observability view (task-197), read from
-    /// table metadata only — **no scan**. GrowlerDB reads O(files) on the query path (scan planning
+    /// Cheap **source-health** signals for the Ingestion/Observability view, read from table
+    /// metadata only — **no scan**. GrowlerDB reads O(files) on the query path (scan planning
     /// and hydration), so a source that accumulates small files or a long snapshot history silently
     /// slows GrowlerDB down with nothing pointing at the real cause. These gauges let operators
     /// *diagnose* that; the remedy (Iceberg compaction / `expire_snapshots`) stays the user's, never
-    /// GrowlerDB's (D30 — GrowlerDB never manages the source table).
+    /// GrowlerDB's — GrowlerDB never manages the source table.
     ///
     /// Everything comes from the current snapshot's `summary` (the `total-*` properties an Iceberg
     /// writer populates by convention) plus the retained-snapshot count — one catalog load, no
@@ -601,7 +596,7 @@ impl IcebergReader {
         })
     }
 
-    /// A cheap **partition-skew** ratio for the source's current snapshot (task-208.2): the largest
+    /// A cheap **partition-skew** ratio for the source's current snapshot: the largest
     /// identity partition's record count over the mean across partitions, from manifest metadata
     /// ([`partition_record_counts`] — no row reads). `1.0` means partitions are evenly sized; a
     /// higher value means one partition is a hotspot (lopsided ingest / a hot key). Returns `None`
@@ -622,7 +617,7 @@ impl IcebergReader {
         Ok((mean > 0.0).then_some(max as f64 / mean))
     }
 
-    /// **Streamed** full-snapshot read (task-84): map the current snapshot to documents and hand
+    /// **Streamed** full-snapshot read: map the current snapshot to documents and hand
     /// them to `sink` in **bounded chunks** (≈[`STREAM_CHUNK`] docs), reading one data file at a
     /// time, so peak memory is independent of table size — a table larger than RAM can be indexed
     /// (the non-streamed [`read_documents`](Self::read_documents) buffers the whole table). Returns
@@ -680,7 +675,7 @@ impl IcebergReader {
     /// Map only the rows from files matching `partition` (an identity-partition tuple as
     /// [`partition_record_counts`] reports it) to documents, streamed in bounded chunks — the
     /// **partition-scoped** read the count-gate uses to reconcile only a divergent partition without
-    /// scanning the whole table (task-198). Reads exactly the data files whose partition equals
+    /// scanning the whole table. Reads exactly the data files whose partition equals
     /// `partition`; returns `(snapshot_id, docs_read)`.
     pub async fn read_documents_in_partition<F>(
         &self,
@@ -738,7 +733,7 @@ impl IcebergReader {
     }
 
     /// Map only the rows from files **appended since** `since_snapshot` to documents
-    /// (the append fast-path's document read, task-18). `since_snapshot = None` is a
+    /// (the append fast-path's document read). `since_snapshot = None` is a
     /// full backfill. The returned `snapshot_id` is the current snapshot the index is
     /// brought up to (the new checkpoint). See [`read_appended_since`](Self::read_appended_since).
     pub async fn read_documents_appended_since(
@@ -756,7 +751,7 @@ impl IcebergReader {
     }
 }
 
-/// Cheap **source-health** signals ([`IcebergReader::source_health`], task-197) — all read from
+/// Cheap **source-health** signals ([`IcebergReader::source_health`]) — all read from
 /// the current snapshot's summary + the retained-snapshot count, no scan. Diagnostic only: they
 /// tell an operator the *source* table wants Iceberg maintenance (compaction / `expire_snapshots`),
 /// which stays the user's responsibility, outside GrowlerDB.
@@ -881,7 +876,7 @@ pub struct HydrationResult {
     /// was freshly planned (`Some(false)`), or no planning happened at all (`None` — an
     /// empty request). Feeds the `growlerdb_plan_cache_{hits,misses}_total` counters.
     pub plan_cache_hit: Option<bool>,
-    /// **Duplicate primary keys** the key scan detected (task-184): extra distinct
+    /// **Duplicate primary keys** the key scan detected: extra distinct
     /// source rows matching an already-matched key. The result stays deterministic —
     /// per key, the row with the **highest `(file, position)`** among the scanned rows
     /// wins (see [`index_batch`]) — but a duplicate means the source table holds more
@@ -892,11 +887,11 @@ pub struct HydrationResult {
 /// Pass 1 of [hydration](IcebergReader::hydrate): resolve each request's `(file, position)` and
 /// **verify** the row's key, returning per-request `Some(full row)` or `None` (stale — the caller
 /// falls back). Requests are coalesced by file; within a file one parquet footer read serves all
-/// requested positions via a **targeted point read** ([`point_read`], task-184 / D30) — the row
-/// group(s) holding the positions plus a `RowSelection` to the exact rows, instead of streaming
-/// the file from row 0. A file absent from `tasks` (rewritten away) yields `None` for all its
-/// positions, and a request with **no locator** (known-stale via the live-file bitmap, task-184
-/// slice 3) is `None` without any read at all.
+/// requested positions via a **targeted point read** ([`point_read`]) — the row group(s) holding
+/// the positions plus a `RowSelection` to the exact rows, instead of streaming the file from row
+/// 0. A file absent from `tasks` (rewritten away) yields `None` for all its positions, and a
+/// request with **no locator** (known-stale via the live-file bitmap) is `None` without any read
+/// at all.
 async fn resolve_pass1(
     file_io: &iceberg::io::FileIO,
     tasks: &[FileScanTask],
@@ -912,10 +907,10 @@ async fn resolve_pass1(
             .or_default()
             .push(loc.row_position);
     }
-    // Index the plan by data-file path once (O(files)) so the per-file lookup below is O(1). The
-    // old `tasks.iter().find` per requested file was O(files × requested-files), which — at the
-    // large small-file counts a continuously-appended table accumulates between compactions —
-    // dominates hydration planning (scale-ceilings audit).
+    // Index the plan by data-file path once (O(files)) so the per-file lookup below is O(1). A
+    // linear `tasks.iter().find` per requested file would be O(files × requested-files), which —
+    // at the large small-file counts a continuously-appended table accumulates between
+    // compactions — dominates hydration planning.
     let by_path: HashMap<&str, &FileScanTask> = tasks
         .iter()
         .map(|t| (t.data_file_path.as_str(), t))
@@ -956,8 +951,8 @@ async fn resolve_pass1(
 
 /// The streaming pass-1 read, kept for **delete-bearing files** (see [`resolve_pass1`]): the
 /// iceberg Arrow reader applies the file's delete files while streaming from row 0, stopping past
-/// `max(positions)` rather than reading the whole file (task-150 / B8). Returns `position → full
-/// row`; out-of-range positions are simply absent.
+/// `max(positions)` rather than reading the whole file. Returns `position → full row`;
+/// out-of-range positions are simply absent.
 async fn stream_file_rows(
     file_io: iceberg::io::FileIO,
     task: FileScanTask,
@@ -1019,7 +1014,7 @@ fn extract_full_rows(
     result
 }
 
-/// Extract every column of `batch` at `row` as a field map (M0 scalar subset).
+/// Extract every column of `batch` at `row` as a field map (scalar subset).
 fn full_row(batch: &RecordBatch, row: usize) -> BTreeMap<String, Value> {
     let schema = batch.schema();
     let mut fields = BTreeMap::new();
@@ -1061,12 +1056,12 @@ fn key_field_names(key: &CompositeKey) -> (Vec<String>, Vec<String>) {
 /// Scan a table's current snapshot (optionally pruned by `predicate`) into located batches — the
 /// hydration-fallback read. Reuses the already-loaded [`Table`] so no extra catalog round-trip.
 /// Stream the current snapshot (optionally pruned by `predicate`) and index **only** the `wanted`
-/// stale keys → `(full row, fresh locator)`, stopping as soon as they're all found (task-150 / F8).
-/// Bounds both memory and cost: batches are processed one at a time (never the whole snapshot in
-/// RAM, unlike the old `scan_table` + full `scan_by_key`), and the result map is capped at the stale
-/// set — critical when `predicate` is `None` (a DATE key / type mismatch) forces an unfiltered scan.
+/// stale keys → `(full row, fresh locator)`, stopping as soon as they're all found. Bounds both
+/// memory and cost: batches are processed one at a time (never the whole snapshot in RAM), and the
+/// result map is capped at the stale set — critical when `predicate` is `None` (a DATE key / type
+/// mismatch) forces an unfiltered scan.
 ///
-/// Also returns the number of **duplicate PKs** seen (task-184; see [`index_batch`]).
+/// Also returns the number of **duplicate PKs** seen (see [`index_batch`]).
 /// Note the early exit bounds detection too: once every wanted key has a match the
 /// scan stops, so a duplicate lurking in a not-yet-scanned file goes unreported —
 /// detection is honest within what the scan read, not a full-table uniqueness audit.
@@ -1113,7 +1108,7 @@ async fn scan_stale_index(
 }
 
 /// Build an `OR`-of-`AND` equality predicate over the partition + identifier fields of `keys`, so a
-/// hydration fallback prunes the Iceberg scan to the partitions/files that can hold them (task-145).
+/// hydration fallback prunes the Iceberg scan to the partitions/files that can hold them.
 ///
 /// Datums are typed to match the source schema; any field whose type can't be mapped safely (a
 /// value/column-type mismatch, or a timestamp that can't be an exact DATE) makes the whole
@@ -1143,7 +1138,7 @@ fn key_predicate(schema: &IcebergSchema, keys: &[&CompositeKey]) -> Option<Predi
 const MICROS_PER_DAY: i64 = 86_400_000_000;
 
 /// The identity-partition tuple of a data file, in partition-spec order, or `None` when it can't be
-/// safely extracted (task-198): no partition/spec, a **non-identity** transform (`day`/`bucket`/…),
+/// safely extracted: no partition/spec, a **non-identity** transform (`day`/`bucket`/…),
 /// a temporal/float/decimal partition column (whose literal encoding we won't risk mis-mapping to the
 /// index key form), a null partition value, or a type mismatch. Metadata only — no row reads. Used to
 /// group files by partition for the count-gate and to scope a partition read; anything it can't
@@ -1182,11 +1177,11 @@ fn identity_partition_of(task: &FileScanTask) -> Option<Vec<(String, Value)>> {
 }
 
 /// One identity partition's tuple (`field → value`, in spec order) paired with its source record
-/// count summed from manifest metadata (task-198 count-gate).
+/// count summed from manifest metadata (the count-gate).
 pub type PartitionCount = (Vec<(String, Value)>, u64);
 
 /// Per-partition source record counts from file **metadata** (manifest `record_count`), grouped by
-/// identity partition — the cheap detection half of the count-gate (task-198), zero row reads. Each
+/// identity partition — the cheap detection half of the count-gate, zero row reads. Each
 /// entry is `(partition tuple, Σ record_count)`. Returns `None` if the table isn't cleanly
 /// identity-partitioned (any file whose partition can't be [extracted](identity_partition_of), or any
 /// missing `record_count`) so the caller reconciles the whole shard instead. An empty table is
@@ -1216,7 +1211,7 @@ fn value_to_datum(schema: &IcebergSchema, name: &str, value: &Value) -> Option<D
         (PrimitiveType::Long, Value::Int(i)) => Some(Datum::long(*i)),
         (PrimitiveType::Int, Value::Int(i)) => i32::try_from(*i).ok().map(Datum::int),
         (PrimitiveType::Boolean, Value::Bool(b)) => Some(Datum::bool(*b)),
-        // Temporal keys (task-184): `Ts` is canonical epoch micros UTC. A DATE column only gets a
+        // Temporal keys: `Ts` is canonical epoch micros UTC. A DATE column only gets a
         // predicate when the micros are an exact UTC-midnight day — a lossy division could build a
         // predicate that *excludes* the matching row, and `None` is the safe unfiltered read.
         (PrimitiveType::Date, Value::Ts(micros)) if micros % MICROS_PER_DAY == 0 => {
@@ -1230,10 +1225,10 @@ fn value_to_datum(schema: &IcebergSchema, name: &str, value: &Value) -> Option<D
 
 /// Index the rows of one `batch` whose composite key is in `wanted` → `enc(key) → (full row, fresh
 /// locator)`, for the verify-and-fall-back re-find. Filtering to `wanted` (the stale keys) is what
-/// bounds the fallback's memory (task-150 / F8) — an unfiltered scan of a large snapshot no longer
-/// materializes an entry per row. `start_row` is the batch's absolute offset within `data_file`.
+/// bounds the fallback's memory — an unfiltered scan of a large snapshot doesn't materialize an
+/// entry per row. `start_row` is the batch's absolute offset within `data_file`.
 ///
-/// **Duplicate-PK detection** (task-184): a second distinct source row matching an
+/// **Duplicate-PK detection**: a second distinct source row matching an
 /// already-matched key means the table holds >1 row for a "unique" key. Each extra row
 /// counts toward the returned total (→ `growlerdb_duplicate_pks_total`) and emits a
 /// [rate-limited warning](warn_duplicate_pk) naming the key. The result stays
@@ -1348,7 +1343,7 @@ fn warn_duplicate_pk(key: &CompositeKey, winner: &RowLocator, loser: &RowLocator
     true
 }
 
-/// Extract a scalar [`Value`] from an Arrow array at `row` (M0 scalar subset).
+/// Extract a scalar [`Value`] from an Arrow array at `row` (scalar subset).
 /// `None` for nulls and unsupported (nested/decimal/binary) types.
 fn array_value(array: &dyn Array, row: usize) -> Option<Value> {
     if array.is_null(row) {
@@ -1372,7 +1367,7 @@ fn array_value(array: &dyn Array, row: usize) -> Option<Value> {
         DataType::UInt32 => get!(UInt32Array).map(|a| Value::Int(a.value(row) as i64)),
         DataType::Float32 => get!(Float32Array).map(|a| Value::Float(a.value(row) as f64)),
         DataType::Float64 => get!(Float64Array).map(|a| Value::Float(a.value(row))),
-        // Temporal columns normalize to canonical **epoch micros UTC** (`Value::Ts`, task-184).
+        // Temporal columns normalize to canonical **epoch micros UTC** (`Value::Ts`).
         // Arrow timestamps store the instant since the epoch regardless of the tz annotation
         // (the tz is display metadata), so any tz normalizes the same way.
         DataType::Date32 => {
@@ -1389,7 +1384,7 @@ fn array_value(array: &dyn Array, row: usize) -> Option<Value> {
             get!(TimestampMicrosecondArray).map(|a| Value::Ts(a.value(row)))
         }
         // Nanos → micros floors (div_euclid, consistent with `TimeFormat::EpochNanos`) — sub-µs
-        // precision is truncated; micros is the canonical unit (task-112).
+        // precision is truncated; micros is the canonical unit.
         DataType::Timestamp(TimeUnit::Nanosecond, _) => {
             get!(TimestampNanosecondArray).map(|a| Value::Ts(a.value(row).div_euclid(1_000)))
         }
@@ -1399,12 +1394,11 @@ fn array_value(array: &dyn Array, row: usize) -> Option<Value> {
 
 /// Build a [`SourceSchema`] from an Arrow schema and pre-resolved key hints.
 ///
-/// **Nested struct fields flatten to dotted leaf paths** (`actor.user`, task-20):
+/// **Nested struct fields flatten to dotted leaf paths** (`actor.user`):
 /// a `Struct` is recursed into and each leaf becomes a `SourceField` at its dotted
 /// path with the leaf's coarse [`SourceType`]. List/Map values are scalar-valued in
 /// GrowlerDB's wire form today, so their elements are not flattened (the field maps
-/// to [`SourceType::Other`] and isn't extracted) — array/map value flattening awaits
-/// multi-valued fields.
+/// to [`SourceType::Other`] and isn't extracted).
 pub fn arrow_schema_to_source(
     arrow: &Schema,
     partition_fields: Vec<String>,
@@ -1448,7 +1442,7 @@ fn nested_value(batch: &RecordBatch, path: &str, row: usize) -> Option<Value> {
     array_value(array, row)
 }
 
-/// Map an Arrow data type onto GrowlerDB's coarse [`SourceType`] (M0 subset).
+/// Map an Arrow data type onto GrowlerDB's coarse [`SourceType`].
 fn arrow_type_to_source(dt: &DataType) -> SourceType {
     use DataType::*;
     match dt {
@@ -1464,9 +1458,8 @@ fn arrow_type_to_source(dt: &DataType) -> SourceType {
 
 #[cfg(test)]
 pub(crate) mod test_util {
-    //! Shared parquet fixture for the point-read tests (task-184 / D30): a real multi-row-group
-    //! `docs` file on local disk, read back through the same opendal `FileIO` stack production
-    //! uses (`fs` scheme — as the ignored MoR fixture test does).
+    //! Shared parquet fixture for the point-read tests: a real multi-row-group `docs` file on
+    //! local disk, read back through the same opendal `FileIO` stack production uses (`fs` scheme).
     use std::sync::Arc;
 
     use arrow_array::{Int64Array, RecordBatch, StringArray};
@@ -1525,7 +1518,7 @@ mod tests {
 
     use iceberg::spec::{NestedField, PartitionSpec, Struct, Type};
 
-    /// An identity `PartitionSpec` on `site` over [`ice_schema`] (task-198 count-gate tests).
+    /// An identity `PartitionSpec` on `site` over [`ice_schema`] (count-gate tests).
     fn site_spec() -> PartitionSpec {
         PartitionSpec::builder(Arc::new(ice_schema()))
             .add_partition_field("site", "site", Transform::Identity)
@@ -1651,7 +1644,7 @@ mod tests {
     }
 
     /// A temporal source schema `day:Date (partition), ts:Timestamp, tstz:Timestamptz, id:String`
-    /// for the temporal-key predicate tests (task-184).
+    /// for the temporal-key predicate tests.
     fn temporal_ice_schema() -> IcebergSchema {
         IcebergSchema::builder()
             .with_fields([
@@ -1702,7 +1695,7 @@ mod tests {
     #[test]
     fn key_predicate_prunes_on_temporal_keys() {
         // A date-partitioned, timestamp-identified key builds a real predicate — the
-        // hydration fallback prunes instead of scanning the whole table (task-184).
+        // hydration fallback prunes instead of scanning the whole table.
         let schema = temporal_ice_schema();
         let k = ckey(
             vec![("day", Value::Ts(20_625 * MICROS_PER_DAY))],
@@ -1866,7 +1859,7 @@ mod tests {
         }
     }
 
-    /// Hydration pass 1 over **real parquet files** (task-184 / D30): a batch mixing two files
+    /// Hydration pass 1 over **real parquet files**: a batch mixing two files
     /// resolves via targeted point reads and comes back in **input order**; a wrong-key position
     /// (phantom), an out-of-range position, and a rewritten-away file all verify-fail to `None`
     /// (→ the pass-2 fallback, unchanged) and are **omitted** from the assembled rows.
@@ -1917,7 +1910,7 @@ mod tests {
     }
 
     /// The hydration hot path composed with the snapshot-pinned [`PlanCache`] over **real
-    /// parquet files** (task-184 / D30): two hydrates at the same snapshot run exactly one
+    /// parquet files**: two hydrates at the same snapshot run exactly one
     /// planning pass; an appended file (snapshot advance) forces a fresh plan whose rows
     /// then resolve correctly — the cached stale plan alone could not see them.
     #[tokio::test]
@@ -1991,8 +1984,7 @@ mod tests {
     #[test]
     fn index_batch_indexes_only_wanted_keys_for_fallback() {
         // A stale locator (wrong file/position) is re-found by key from a scan — and only the wanted
-        // (stale) keys are indexed, so an unfiltered fallback scan doesn't materialize every row
-        // (task-150 / F8).
+        // (stale) keys are indexed, so an unfiltered fallback scan doesn't materialize every row.
         let batch = docs_batches()[0].clone(); // ids 10, 11 in data/x at rows 0, 1
         let wanted: HashSet<Vec<u8>> = [key_id(11).encode()].into_iter().collect();
         let mut index = HashMap::new();
@@ -2021,7 +2013,7 @@ mod tests {
     }
 
     #[test]
-    fn index_batch_detects_duplicate_pks_deterministically(/* task-184 */) {
+    fn index_batch_detects_duplicate_pks_deterministically() {
         // A fixture with a GENUINE duplicate key: id 11 appears on three distinct rows
         // (twice in data/x, once more in data/y), id 10 once. The scan must count each
         // extra row, warn (rate-limited), keep the deterministic winner — highest
@@ -2136,7 +2128,7 @@ mod tests {
 
     #[test]
     fn index_batch_refinds_a_temporal_key_for_fallback() {
-        // A timestamp-keyed row is re-found by key (task-184): the Arrow timestamp column extracts
+        // A timestamp-keyed row is re-found by key: the Arrow timestamp column extracts
         // to `Value::Ts` (canonical micros) whose encoding matches a wanted key built from `Ts` —
         // so the verify-and-fall-back path no longer silently drops temporal key fields.
         use arrow_array::TimestampMicrosecondArray;
@@ -2381,14 +2373,13 @@ mod tests {
         }
     }
 
-    /// task-85 regression (no stack): read a **real Spark merge-on-read** table off local disk via
-    /// `StaticTable` and assert iceberg-rust 0.9.1 honors its history delete *correctly*. The table
-    /// is `append(r0..r4) → DELETE r2 (writes a positional delete file) → append(r5..r9)`, so the
+    /// Regression (no stack): read a **real Spark merge-on-read** table off local disk via
+    /// `StaticTable` and assert iceberg-rust honors its history delete *correctly*. The table is
+    /// `append(r0..r4) → DELETE r2 (writes a positional delete file) → append(r5..r9)`, so the
     /// current snapshot has **9** live rows; a correct reader returns 9 (not 10 — that would mean a
-    /// deleted row was resurrected, the bug the reverted `strip_source_deletes` hardening caused;
-    /// not 0 — the "mis-scoped history delete" the benchmark was wrongly blamed on, which does not
-    /// reproduce here). pyiceberg can't produce this shape (copy-on-write writes no delete file),
-    /// which is why the prior pyiceberg fixture could not exercise the delete path at all.
+    /// deleted row was resurrected; not 0 — a mis-scoped history delete). pyiceberg can't produce
+    /// this shape (copy-on-write writes no delete file), so a pyiceberg fixture couldn't exercise
+    /// the delete path at all.
     ///
     /// Generate the fixture first (Spark, in `connector/`):
     ///   `T85_WAREHOUSE=/tmp/t85wh mvn test -Dgroups=fixturegen -Dtest.excludedGroups= \
@@ -2420,7 +2411,7 @@ mod tests {
             .try_collect()
             .await
             .unwrap();
-        // Honor source deletes (production behavior after reverting strip_source_deletes).
+        // Honor source deletes (production behavior).
         let batches = read_tasks(tbl.file_io().clone(), tasks, &HashSet::new())
             .await
             .expect("read");

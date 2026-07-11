@@ -1,4 +1,4 @@
-//! The **metrics proxy** (task-48): `/v1/stats/*` on the gateway forwards to a Prometheus-
+//! The **metrics proxy**: `/v1/stats/*` on the gateway forwards to a Prometheus-
 //! compatible backend so the UI's SLI panels query same-origin (no CORS). Point `stats_router`
 //! at a stub upstream and check the path + query string are forwarded and the body passes
 //! through unchanged.
@@ -40,7 +40,7 @@ async fn stub_prometheus() -> String {
 }
 
 /// A stub Prometheus whose `/api/v1/alerts` returns a firing, a pending, and an inactive alert
-/// in the real Prometheus shape — to exercise the `/v1/alerts` normalizer (task-111).
+/// in the real Prometheus shape — to exercise the `/v1/alerts` normalizer.
 async fn stub_prometheus_alerts() -> String {
     let app = Router::new().route(
         "/api/v1/alerts",

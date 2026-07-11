@@ -1,7 +1,7 @@
 <script lang="ts">
-  // The document drawer (task-95): a slide-in panel with Fields / Explain / JSON tabs. Fields
-  // hydrates the authoritative Iceberg row by key (GetByKey, governed). JSON shows the search hit.
-  // Explain (task-102) calls the engine for the real BM25 score tree + timings, loaded on demand.
+  // Slide-in panel with Fields / Explain / JSON tabs. Fields hydrates the authoritative
+  // Iceberg row by key (GetByKey, governed). JSON shows the search hit. Explain calls the
+  // engine for the real BM25 score tree + timings, loaded on demand.
   import { onMount } from 'svelte';
   import { t } from '../lib/i18n';
   import {
@@ -39,7 +39,7 @@
   let error = $state('');
   let tab = $state('fields');
 
-  // Explain is computed lazily the first time its tab is opened (opt-in, per-hit; task-102).
+  // Explain is computed lazily the first time its tab is opened (opt-in, per-hit).
   let exp = $state<ExplainResult | null>(null);
   let explaining = $state(false);
   let explainErr = $state('');

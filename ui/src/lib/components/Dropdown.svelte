@@ -1,5 +1,5 @@
 <script lang="ts">
-  // Styled dropdown button (design-QA T5): replaces bare native <select>s on the chrome with a
+  // Styled dropdown button: replaces bare native <select>s on the chrome with a
   // button that matches the field styling (mono uppercase label + selected value + caret) and a
   // Popover listbox. Keyboard-operable: Enter/Space/ArrowDown open; arrows move; Enter/click select;
   // Escape closes (via Popover). `value` is bindable.

@@ -5,8 +5,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import org.junit.jupiter.api.Test;
 
 /**
- * The connector metrics (task-194 AC6) count the ingest-side signals that used to be printf-only.
- * Counters are process-global (Prometheus default registry), so assert on deltas rather than
+ * The connector metrics count the ingest-side signals. Counters are process-global (Prometheus
+ * default registry), so assert on deltas rather than
  * absolute values — other tests in the JVM may have touched them.
  */
 class ConnectorMetricsTest {

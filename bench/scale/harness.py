@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dataset-agnostic scale-test harness (task-159).
+"""Dataset-agnostic scale-test harness.
 
 A *workload* is a self-contained directory under `workloads/<name>/` defined by three things — the
 OpenSearch-Benchmark "workload" contract (see okf/quality/scale-test-plan.md):
@@ -219,7 +219,7 @@ def cmd_run(args):
     cmd_query(args)
 
 
-# --- k8s deploy rendering (task-214) --------------------------------------------------------------
+# --- k8s deploy rendering -------------------------------------------------------------------------
 
 STREAMING_DIR = Path(__file__).resolve().parents[2] / "deploy" / "k8s" / "streaming"
 
@@ -303,12 +303,12 @@ def main():
         p.add_argument("--fraction", type=float, default=1.0)
         p.add_argument("--out", default="scale-report.json")
         p.set_defaults(fn=cmd_run if name == "run" else cmd_query)
-    p = sub.add_parser("render", help="render the k8s streaming manifests for a workload (task-214)")
+    p = sub.add_parser("render", help="render the k8s streaming manifests for a workload")
     p.add_argument("workload")
     p.add_argument("--shards", type=int, default=6, help="shard count (--nodes list size)")
     p.add_argument("--namespace", default="growlerdb")
     p.add_argument("--generators", type=int, default=1,
-                   help="generator pod replicas — parallelize ingest (task-231; disjoint ids per pod)")
+                   help="generator pod replicas — parallelize ingest (disjoint ids per pod)")
     p.add_argument("--out", default=None, help="output dir (default bench/scale/.render/<workload>/)")
     p.set_defaults(fn=cmd_render)
     args = ap.parse_args()

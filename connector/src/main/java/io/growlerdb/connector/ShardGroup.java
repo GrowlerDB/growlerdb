@@ -4,7 +4,7 @@ import java.util.SortedSet;
 import java.util.TreeSet;
 
 /**
- * Deterministic shard-group assignment for the parallel connector set (task-196): worker
+ * Deterministic shard-group assignment for the parallel connector set: worker
  * {@code i} of {@code W} owns the shards {@code {s : s % W == i}}. Every shard has exactly one
  * owner, so the Node's per-shard continuity guard needs no writer identity — a worker's
  * checkpoint namespace <i>is</i> its group. Pure math: the same (workerId, workers, shards)

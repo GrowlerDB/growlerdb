@@ -1,4 +1,4 @@
-//! [`ShardHandle`] — a live, **swappable** handle to a Node's shard ([task-30] B1, the
+//! [`ShardHandle`] — a live, **swappable** handle to a Node's shard (the
 //! reindex foundation). Every Node service reads the current shard through
 //! [`current`](ShardHandle::current); a reindex atomically replaces it with
 //! [`swap`](ShardHandle::swap). A request that already loaded the `Arc<Shard>` keeps reading
@@ -8,8 +8,6 @@
 //! Backed by an `RwLock<Arc<Shard>>`: reads only clone the `Arc` under a brief read lock,
 //! and swaps are rare, so the lock is not a contention point (a lock-free `arc-swap` would
 //! be an over-optimization here).
-//!
-//! [task-30]: ../../../design/06-service-architecture.md
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -19,7 +17,7 @@ use growlerdb_index::Shard;
 /// Shared inner state: the swappable shard plus a search counter.
 struct Inner {
     shard: RwLock<Arc<Shard>>,
-    /// Searches served (task-83 pre-warm signal, corrected in task-153 / I3). Bumped **only** by the
+    /// Searches served — the pre-warm signal. Bumped **only** by the
     /// search path via [`record_search`](ShardHandle::record_search) — NOT by every `current()`,
     /// which every service (suggest/lookup/admin/health) calls, so the promotion decision reflects
     /// real query load rather than incidental access.
@@ -53,13 +51,13 @@ impl ShardHandle {
             .clone()
     }
 
-    /// Record one search against this shard — the pre-warm signal (task-153 / I3). Called by the
+    /// Record one search against this shard — the pre-warm signal. Called by the
     /// search path only, so a cold window is promoted for real query load, not describe/health traffic.
     pub fn record_search(&self) {
         self.0.searches.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Total searches served since this handle was created (task-83 pre-warm). Monotonic; the
+    /// Total searches served since this handle was created (the pre-warm signal). Monotonic; the
     /// pre-warm loop watches its delta over time.
     pub fn search_count(&self) -> u64 {
         self.0.searches.load(Ordering::Relaxed)
@@ -174,7 +172,7 @@ mod tests {
 
     #[test]
     fn only_record_search_moves_the_prewarm_signal() {
-        // task-153 / I3: the pre-warm signal counts SEARCHES, not every `current()` — so incidental
+        // The pre-warm signal counts SEARCHES, not every `current()` — so incidental
         // access (describe/health/suggest) doesn't promote a cold window.
         let tmp = tempfile::tempdir().unwrap();
         let handle = ShardHandle::new(shard_with(tmp.path(), &["1"]));

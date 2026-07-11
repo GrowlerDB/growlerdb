@@ -15,13 +15,12 @@ import java.util.function.Supplier;
 /**
  * Thin client to a GrowlerDB read endpoint's {@code Search} gRPC service — a Node or, more usually,
  * a Gateway ({@code growlerdb gateway --index}, which fans the query across shards/windows). Powers
- * the Trino {@code growlerdb_search} table function (task-51): run a boolean query, get matching
- * keys + scores back to JOIN against the Iceberg table. Mirrors the Spark connector's SearchClient.
+ * the Trino {@code growlerdb_search} table function: run a boolean query, get matching keys + scores
+ * back to JOIN against the Iceberg table. Mirrors the Spark connector's SearchClient.
  *
- * <p><b>Resilience (task-152 / F12):</b> a wedged endpoint must not hang the Trino split thread
- * forever. Like the Spark connector, the channel sets keepalive + a large inbound cap, every call
- * carries a per-call deadline, and transient transport failures are retried with backoff (a read is
- * idempotent).
+ * <p><b>Resilience:</b> a wedged endpoint must not hang the Trino split thread forever. The channel
+ * sets keepalive + a large inbound cap, every call carries a per-call deadline, and transient
+ * transport failures are retried with backoff (a read is idempotent).
  */
 public final class SearchClient implements AutoCloseable {
 

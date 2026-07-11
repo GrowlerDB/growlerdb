@@ -10,7 +10,7 @@ of the [Compose stack](../compose). Two worked configs ship as
 > The dependency manifests are dev-grade (single replicas, demo credentials) — for the lab/test
 > clusters, not production. Polaris-on-K8s is version-sensitive; validate on first apply (below).
 
-## Scale test (task-159) — one command
+## Scale test — one command
 
 For the Hetzner scale test the whole sequence below is automated by
 [`scale-up.sh`](scale-up.sh) against [`values-scale.yaml`](../helm/growlerdb/values-scale.yaml) (the
@@ -150,7 +150,7 @@ for **Grafana Agent** (static mode) — append to its `metrics.configs`, remote-
 ```
 
 Then restart the agent. The `namespace: growlerdb` label matters: the console health pill scopes to
-GrowlerDB's own targets by namespace (task-120), so a **shared** Prometheus/Mimir scraping other apps
+GrowlerDB's own targets by namespace, so a **shared** Prometheus/Mimir scraping other apps
 doesn't drag the pill to "Down". (`up{namespace="growlerdb"}` should then return your components.)
 
 > The console UI bundle is baked into the image. After changing UI behaviour (or with a mutable `:dev`
@@ -158,14 +158,14 @@ doesn't drag the pill to "Down". (`up{namespace="growlerdb"}` should then return
 
 ## 7. Cluster-specific
 
-- **microk8s — resilience drills (task-115):** with `index.shards: 3` spread across the 3 mini-PCs,
+- **microk8s — resilience drills:** with `index.shards: 3` spread across the 3 nodes,
   exercise self-heal and honest degradation:
   - `kubectl -n growlerdb delete pod gdb-growlerdb-node-1` → that shard returns partial results, then
     the StatefulSet recovers it from its PV; the gateway hot-reloads as it re-registers.
   - Drain a node (`kubectl drain <node>`) → the PDB keeps ≥2 shards serving; search stays up (partial).
   - Kill Polaris (`kubectl -n growlerdb delete pod -l app=polaris`) → search continues, hydration/
     ingestion pause and resume when it returns (the persistent Postgres metastore means no catalog loss).
-- **Hetzner — scale/load (task-55/79):** drive concurrent search load (the bench harness), watch the
+- **Hetzner — scale/load:** drive concurrent search load (the bench harness), watch the
   gateway HPA scale and the per-shard latency in Grafana (ServiceMonitor → Prometheus). Cold-tier +
   hydration throughput per the bench plan.
 

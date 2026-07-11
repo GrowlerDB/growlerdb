@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# Exact-count-at-drain convergence gate for the streaming stack (task-194 AC7). The old drill was
-# lag-based + a manual "compare index total to source ROW count" — but the silent 6-row loss showed
-# two holes: (1) lag reaching ~0 doesn't prove convergence (an under-read window advances the cursor
-# with the rows never applied), and (2) comparing to the raw row count is wrong when the generator
-# re-emits duplicate ids (they collapse last-write-wins in the index, so index < source rows even with
-# no loss). This gate closes both: it drains, then asserts the index doc count equals the source's
+# Exact-count-at-drain convergence gate for the streaming stack. Lag-based checks have two holes:
+# (1) lag reaching ~0 doesn't prove convergence (an under-read window advances the cursor with the
+# rows never applied), and (2) comparing to the raw row count is wrong when the generator re-emits
+# duplicate ids (they collapse last-write-wins in the index, so index < source rows even with no
+# loss). This gate closes both: it drains, then asserts the index doc count equals the source's
 # DISTINCT-id count exactly. Optionally it runs Iceberg maintenance (compaction) CONCURRENTLY first,
-# to exercise the changelog-read-vs-compaction race that detonated the loss.
+# to exercise the changelog-read-vs-compaction race.
 #
 # Usage:
 #   convergence-gate.sh [--with-maintenance] [--namespace growlerdb] [--index http_logs]

@@ -1,10 +1,10 @@
-//! The **AuthN core** (task-35, M4): validate a caller's bearer credential into a
+//! The **AuthN core**: validate a caller's bearer credential into a
 //! *verified* identity ([`Verified`]) that the [auth seam](crate::auth) can trust.
 //!
-//! The M2 [auth seam](crate::auth) reads the principal/tenant straight off request
+//! The bare [auth seam](crate::auth) reads the principal/tenant straight off request
 //! metadata — convenient, but any caller can assert any identity. AuthN closes that gap:
 //! an [`Authenticator`] turns the raw `Authorization` header into a `Verified` identity
-//! derived from a **validated** credential, which a later slice stamps into the request
+//! derived from a **validated** credential, stamped into the request
 //! (replacing, never trusting, caller-asserted headers).
 //!
 //! Authenticators: [`JwtAuthenticator`] (a fixed key — HS256/RS256 PEM, for simple/test
@@ -15,7 +15,7 @@
 //! credentials and yields an anonymous identity, so dev and the existing suite stay open
 //! until a deployment opts in. [`authenticate`] is the transport entry point the
 //! [`Gateway`](crate::gateway::Gateway) calls to verify a request and stamp the trusted
-//! identity. mTLS (service-to-service) is the remaining slice; see `backlog/docs/m4-plan.md`.
+//! identity.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
@@ -48,23 +48,23 @@ pub struct Verified {
     pub principal: String,
     /// The tenant the caller is scoped to, from the configured tenant claim, if present.
     pub tenant: Option<String>,
-    /// Coarse roles from the configured roles claim (drives control-plane RBAC in task-36).
+    /// Coarse roles from the configured roles claim (drives control-plane RBAC).
     pub roles: Vec<String>,
-    /// The caller's **index allowlist** from the configured `indexes` claim (task-240 per-index RBAC).
-    /// When non-empty the caller may only operate on these indexes; empty = unrestricted (back-compat).
+    /// The caller's **index allowlist** from the configured `indexes` claim (per-index RBAC).
+    /// When non-empty the caller may only operate on these indexes; empty = unrestricted.
     pub indexes: Vec<String>,
-    /// Human display name from the OIDC `name` claim, if present (task-103, for `GET /v1/me`).
+    /// Human display name from the OIDC `name` claim, if present (for `GET /v1/me`).
     pub display_name: Option<String>,
-    /// Email from the OIDC `email` claim, if present (task-103).
+    /// Email from the OIDC `email` claim, if present.
     pub email: Option<String>,
     /// The token's `iat` (issued-at, epoch seconds), if present — lets the control plane reject a
-    /// session minted before a subject's roles were changed/revoked (task-147 / B4).
+    /// session minted before a subject's roles were changed/revoked.
     pub issued_at: Option<u64>,
 }
 
 impl Verified {
     /// The identity on an **open** gateway (no authenticator): no principal, no roles. The console's
-    /// `GET /v1/me` returns this as the "not signed in" shape (task-103).
+    /// `GET /v1/me` returns this as the "not signed in" shape.
     pub fn anonymous() -> Self {
         Self::default()
     }
@@ -103,7 +103,7 @@ pub trait Authenticator: Send + Sync {
 
 /// The default no-op authenticator: ignores any credential and returns an anonymous
 /// identity. Authentication is opt-in; until a deployment installs a real authenticator
-/// the gateway stays open (as it was pre-M4).
+/// the gateway stays open.
 #[derive(Debug, Clone, Default)]
 pub struct Anonymous;
 
@@ -138,8 +138,8 @@ pub fn default_authn() -> SharedAuthn {
 /// an identity this layer vouched for. A failure maps to `Unauthenticated`.
 ///
 /// Called only when a deployment has installed an authenticator; with none, the request
-/// passes through untouched (the pre-M4 internal-trust behavior). Returns the [`Verified`]
-/// identity for callers that need the roles directly (e.g. control-plane RBAC, task-36).
+/// passes through untouched (internal-trust behavior). Returns the [`Verified`]
+/// identity for callers that need the roles directly (e.g. control-plane RBAC).
 pub fn authenticate<T>(authn: &SharedAuthn, request: &mut Request<T>) -> Result<Verified, Status> {
     let authorization = request
         .metadata()
@@ -174,7 +174,7 @@ pub fn authenticate<T>(authn: &SharedAuthn, request: &mut Request<T>) -> Result<
             .map_err(|_| Status::unauthenticated("a role claim is not a valid header value"))?;
         meta.insert(ROLES_KEY, value);
     }
-    // The index allowlist scopes per-index RBAC (task-240); carry it comma-separated like roles so the
+    // The index allowlist scopes per-index RBAC; carry it comma-separated like roles so the
     // authorization seam restricts the caller to these indexes.
     if !verified.indexes.is_empty() {
         let value = verified.indexes.join(",").parse().map_err(|_| {
@@ -188,7 +188,7 @@ pub fn authenticate<T>(authn: &SharedAuthn, request: &mut Request<T>) -> Result<
 /// Drop any caller-asserted identity metadata (`x-growlerdb-principal`/`-tenant`/`-roles`) from a
 /// request. Used on an **open** gateway (no authenticator), where nothing verifies these headers —
 /// without this, a client could forge `x-growlerdb-tenant` and read across tenants on a
-/// tenant-scoped index (task-147 / F2). Leaving them stripped makes tenant scoping fail closed
+/// tenant-scoped index. Leaving them stripped makes tenant scoping fail closed
 /// (no verified tenant → the scoped index denies), which is the honest behaviour: a tenant-scoped
 /// index can't be safely served without authentication.
 pub fn strip_identity<T>(request: &mut Request<T>) {
@@ -220,7 +220,7 @@ pub struct ClaimMapping {
     /// Claim carrying roles — a JSON array of strings or a space-delimited string
     /// (default `"roles"`).
     pub roles: String,
-    /// Claim carrying the caller's **index allowlist** for per-index RBAC (task-240) — a JSON array
+    /// Claim carrying the caller's **index allowlist** for per-index RBAC — a JSON array
     /// of strings or a space-delimited string (default `"indexes"`). Absent/empty = unrestricted.
     pub indexes: String,
 }
@@ -310,13 +310,13 @@ fn decode_and_map(
         .get(&mapping.roles)
         .map(claim_roles)
         .unwrap_or_default();
-    // Per-index RBAC allowlist (task-240): same list shape as roles (JSON array or space-delimited).
+    // Per-index RBAC allowlist: same list shape as roles (JSON array or space-delimited).
     let indexes = claims
         .extra
         .get(&mapping.indexes)
         .map(claim_roles)
         .unwrap_or_default();
-    // Standard OIDC profile claims for the console's identity (task-103); absent on minimal tokens.
+    // Standard OIDC profile claims for the console's identity; absent on minimal tokens.
     let display_name = claims.extra.get("name").and_then(claim_string);
     let email = claims.extra.get("email").and_then(claim_string);
     let issued_at = claims.extra.get("iat").and_then(|v| v.as_u64());
@@ -509,8 +509,8 @@ pub struct KeyIdentity {
     pub tenant: Option<String>,
     /// Roles the key carries.
     pub roles: Vec<String>,
-    /// The key's **index allowlist** for per-index RBAC (task-240). Non-empty = scoped to these
-    /// indexes; empty = unrestricted (back-compat).
+    /// The key's **index allowlist** for per-index RBAC. Non-empty = scoped to these
+    /// indexes; empty = unrestricted.
     pub indexes: Vec<String>,
 }
 
@@ -702,40 +702,39 @@ struct RawClaims {
     extra: BTreeMap<String, JsonValue>,
 }
 
-/// Fixed `iss`/`aud` + TTL for built-in session JWTs (task-128). The control-plane mints with these
+/// Fixed `iss`/`aud` + TTL for built-in session JWTs. The control-plane mints with these
 /// and the gateway validates with the same, so they must agree — they're constants, not config.
 pub const BUILTIN_SESSION_ISSUER: &str = "growlerdb";
 pub const BUILTIN_SESSION_AUDIENCE: &str = "growlerdb-console";
 /// Session lifetime — short, since logout is client-side and there's no per-session revocation yet.
 pub const BUILTIN_SESSION_TTL_SECS: u64 = 12 * 3600;
 
-/// Claims for a built-in **session JWT** (task-128). Subject + roles + the standard `iss`/`aud`/`exp`
+/// Claims for a built-in **session JWT**. Subject + roles + the standard `iss`/`aud`/`exp`
 /// so the existing [`JwtAuthenticator`] (HS256) validates it like any bearer; `name` feeds `/v1/me`.
 #[derive(Serialize)]
 struct SessionClaims<'a> {
     sub: &'a str,
     roles: &'a [String],
-    /// The subject's **index allowlist** (task-244) — the same `indexes` claim shape the gateway's
-    /// per-index RBAC reads (task-240). Omitted when empty (unrestricted across indexes), so a token
-    /// for an unscoped subject is byte-for-byte the pre-task-244 session token.
+    /// The subject's **index allowlist** — the same `indexes` claim shape the gateway's
+    /// per-index RBAC reads. Omitted when empty (unrestricted across indexes).
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     indexes: &'a [String],
     iss: &'a str,
     aud: &'a str,
     exp: u64,
     /// Issued-at (epoch seconds) — the control plane compares this against the subject's session
-    /// epoch to reject sessions minted before a role change/revocation (task-147 / B4).
+    /// epoch to reject sessions minted before a role change/revocation.
     iat: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<&'a str>,
 }
 
-/// Mint a short-lived HS256 **session JWT** for built-in (no external IdP) closed mode (task-128).
-/// Carries the verified `subject` + `roles` (+ an optional `indexes` allowlist for per-index RBAC,
-/// task-244), signed with the deployment's shared `secret`, expiring in `ttl_secs`. The gateway
+/// Mint a short-lived HS256 **session JWT** for built-in (no external IdP) closed mode.
+/// Carries the verified `subject` + `roles` (+ an optional `indexes` allowlist for per-index RBAC),
+/// signed with the deployment's shared `secret`, expiring in `ttl_secs`. The gateway
 /// accepts it via [`JwtAuthenticator::from_hs256_secret`]`(secret, issuer, audience)` — which already
 /// checks `exp`, so the TTL needs no extra revocation store. (Logout is client-side token drop;
-/// global invalidation is rotating the secret — see task-128 notes.)
+/// global invalidation is rotating the secret.)
 // Each argument is a distinct, security-relevant claim (subject / roles / index scope / iss / aud /
 // ttl / name); a struct would only rename them, so keep the explicit signature.
 #[allow(clippy::too_many_arguments)]
@@ -767,7 +766,7 @@ pub fn mint_session_jwt(
     .map_err(|e| AuthnError::Invalid(e.to_string()))
 }
 
-/// Mint a fresh API-token secret + its stored hash (task-105). The secret (`gdb_live_<random>`) is
+/// Mint a fresh API-token secret + its stored hash. The secret (`gdb_live_<random>`) is
 /// returned **once**; only the hash is persisted by the control plane.
 pub fn mint_api_token() -> (String, String) {
     let raw = format!("gdb_live_{}", generate_secret());
@@ -780,7 +779,7 @@ pub fn hash_api_token(raw: &str) -> String {
     digest(raw)
 }
 
-/// An [`Authenticator`] backed by the control-plane registry's API tokens (task-105): an
+/// An [`Authenticator`] backed by the control-plane registry's API tokens: an
 /// `Authorization: ApiKey <secret>` is hashed and looked up; a revoked/unknown token fails. The
 /// token's stored roles become the verified roles. Chain with a JWT authenticator (which handles
 /// `Bearer`) via [`ChainAuthenticator`] so a gateway accepts both.
@@ -806,8 +805,8 @@ impl Authenticator for RegistryTokenAuthenticator {
             principal: token.owner,
             tenant: None,
             roles: token.roles,
-            // Registry API tokens carry no index allowlist today (unrestricted across indexes); the
-            // per-index allowlist (task-240) is delivered via a JWT `indexes` claim or a KeyIdentity.
+            // Registry API tokens carry no index allowlist (unrestricted across indexes); the
+            // per-index allowlist is delivered via a JWT `indexes` claim or a KeyIdentity.
             indexes: Vec::new(),
             display_name: Some(token.label),
             email: None,
@@ -827,7 +826,7 @@ mod tests {
 
     #[test]
     fn session_jwt_round_trips_through_the_hs256_authenticator() {
-        // task-128: a login-minted session token must validate as a normal Bearer JWT.
+        // A login-minted session token must validate as a normal Bearer JWT.
         let roles = vec!["admin".to_string(), "reader".to_string()];
         let token = mint_session_jwt(
             SECRET,
@@ -858,7 +857,7 @@ mod tests {
 
     #[test]
     fn session_jwt_carries_the_index_allowlist_claim() {
-        // task-244: a scoped demo session must surface its `indexes` claim so per-index RBAC (task-240)
+        // A scoped demo session must surface its `indexes` claim so per-index RBAC
         // restricts the subject to exactly those indexes.
         let roles = vec!["reader".to_string(), "operator".to_string()];
         let indexes = vec!["docs".to_string(), "catalog".to_string()];
@@ -1069,7 +1068,7 @@ mod tests {
 
     #[test]
     fn strip_identity_drops_all_caller_asserted_headers() {
-        // task-147 / F2: on an open gateway (no authenticator) the caller's identity headers must be
+        // On an open gateway (no authenticator) the caller's identity headers must be
         // dropped so a forged tenant can't be trusted; tenant scoping then fails closed.
         let mut req = Request::new(());
         req.metadata_mut()
@@ -1227,7 +1226,7 @@ mod tests {
 
     #[test]
     fn registry_token_authenticator_validates_then_rejects_a_revoked_token() {
-        // task-105: a registry-backed authenticator validates a live API token by its hash and
+        // A registry-backed authenticator validates a live API token by its hash and
         // resolves its roles; a revoked token fails authentication.
         let tmp = tempfile::tempdir().unwrap();
         let reg = std::sync::Arc::new(

@@ -1,4 +1,4 @@
-"""Dual-index growlerdb.telemetry into Elasticsearch for the benchmark (task-55): read the Iceberg table,
+"""Dual-index growlerdb.telemetry into Elasticsearch for the benchmark: read the Iceberg table,
 bulk-index with a telemetry-appropriate mapping (message=text, the rest keyword/long). Stdlib HTTP only.
 """
 import json

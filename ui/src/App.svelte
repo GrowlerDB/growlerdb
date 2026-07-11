@@ -16,29 +16,29 @@
   import Settings from './routes/Settings.svelte';
   import Popover from './lib/components/Popover.svelte';
   import StatusDot from './lib/components/StatusDot.svelte';
-  // Observability pulls in ECharts (its hero charts); lazy-load it so the heavy chart lib is only
-  // fetched when that screen is opened (keeps the initial bundle small).
+  // Observability pulls in ECharts; lazy-load it so the heavy chart lib is only fetched when that
+  // screen is opened (keeps the initial bundle small).
 
   const config = loadConfig();
   let authed = $state(isAuthenticated());
-  // Closed vs open mode (task-127): the server advertises whether auth is required via /v1/config.
-  // When required and the caller isn't signed in, the app is replaced by the login gate.
+  // Closed vs open mode: the server advertises whether auth is required via /v1/config. When
+  // required and the caller isn't signed in, the app is replaced by the login gate.
   let authRequired = $state(false);
-  // Built-in username/password login available (task-128) → the gate shows a credential form.
+  // Built-in username/password login available → the gate shows a credential form.
   let passwordLogin = $state(false);
   let showHelp = $state(false);
   let menuOpen = $state(false);
   let menuBtn = $state<HTMLElement | null>(null);
   const localeOptions = locales();
-  // The verified identity from GET /v1/me (task-103) — server truth, loaded on mount.
+  // The verified identity from GET /v1/me — server truth, loaded on mount.
   const user = $derived($identity);
-  // Closed mode + not signed in → gate the app behind login (task-127).
+  // Closed mode + not signed in → gate the app behind login.
   const gated = $derived(authRequired && !user?.authenticated);
 
-  // Mirror the persisted design-system prefs (theme + accent + density) onto <html> (task-91/93).
+  // Mirror the persisted design-system prefs (theme + accent + density) onto <html>.
   applyPrefs();
 
-  // Retro pixel "G" brand glyph (from the design mockup): a 7×7 bitmap rendered as a 4px CSS grid.
+  // Retro pixel "G" brand glyph: a 7×7 bitmap rendered as a 4px CSS grid.
   // 0 = off, 1 = lit (--accent), 2 = lit at 50% (the glyph's softened corners). Decorative.
   const BRAND_G = ['0211110', '1100011', '1100000', '1100211', '1100011', '1100011', '0111210']
     .join('')
@@ -51,7 +51,7 @@
     { route: '/settings', key: 'nav.settings' },
   ];
 
-  // Header health pill (task-94): one reactive Health → dot tone + label, pulsing when healthy.
+  // Header health pill: one reactive Health → dot tone + label, pulsing when healthy.
   const HEALTH: Record<Health, { tone: 'ok' | 'warn' | 'muted'; key: string; pulse: boolean }> = {
     ok: { tone: 'ok', key: 'cluster.health.ok', pulse: true },
     warn: { tone: 'warn', key: 'cluster.health.warn', pulse: false },
@@ -60,7 +60,7 @@
   };
   const health = $derived(HEALTH[$clusterHealth]);
 
-  // Global keyboard shortcuts (task-91): the handler is a pure mapper; we perform its action.
+  // Global keyboard shortcuts: the handler is a pure mapper; we perform its action.
   const shortcut = createShortcutHandler();
   function onKeydown(event: KeyboardEvent) {
     const action = shortcut(event);
@@ -96,8 +96,8 @@
   ];
 
   let stopHealth: (() => void) | undefined;
-  // An expired/revoked token surfaces as a 401 from apiFetch (task-127): drop the session and
-  // re-check identity → in closed mode the gate reappears and the user re-authenticates.
+  // An expired/revoked token surfaces as a 401 from apiFetch: drop the session and re-check
+  // identity → in closed mode the gate reappears and the user re-authenticates.
   async function onUnauthorized() {
     authed = false;
     await refreshIdentity();
@@ -116,7 +116,7 @@
         console.error(err);
       }
     }
-    // Load the verified identity (task-103) — server truth for the header + Settings.
+    // Load the verified identity — server truth for the header + Settings.
     await refreshIdentity();
   });
   onDestroy(() => {
@@ -142,8 +142,8 @@
     navigate(route);
   }
 
-  // The username shown beside the avatar in the top bar (design-QA T4). Mirrors the menu's identity
-  // line: the verified name/subject when signed in, else the anon/open-mode label.
+  // The username shown beside the avatar in the top bar. Mirrors the menu's identity line: the
+  // verified name/subject when signed in, else the anon/open-mode label.
   function userLabel(u: typeof user): string {
     if (u?.authenticated) return u.display_name || u.subject;
     return authRequired ? t('menu.anon') : t('menu.openMode');
@@ -154,8 +154,8 @@
 
 <a href="#main" class="skip-link">{t('app.skipToContent')}</a>
 
-<!-- Per-item nav glyphs (design-QA T4) — copied from the mockup's <nav> (search / list / down-arrow /
-     bars / sliders). Decorative; the adjacent label carries the accessible name. -->
+<!-- Per-item nav glyphs (search / list / down-arrow / bars / sliders). Decorative; the adjacent
+     label carries the accessible name. -->
 {#snippet navGlyph(route: Route)}
   {#if route === '/'}
     <svg
@@ -382,7 +382,7 @@
     gap: 0.5rem;
     font-weight: 700;
     letter-spacing: 0.01em;
-    /* It's now a link to home (task-129) — keep the header's text styling, add a pointer + focus. */
+    /* A link to home — keep the header's text styling, add a pointer + focus. */
     color: inherit;
     text-decoration: none;
     cursor: pointer;

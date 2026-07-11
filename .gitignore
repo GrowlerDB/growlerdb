@@ -17,6 +17,6 @@ deploy/iac/terraform.tfvars
 # Python bytecode (bench/ tooling + the scale-test harness)
 __pycache__/
 *.pyc
-# Rendered per-workload k8s manifests (task-214) — regenerate with `harness.py render <workload>`
+# Rendered per-workload k8s manifests — regenerate with `harness.py render <workload>`
 /bench/scale/.render/
 .claude/

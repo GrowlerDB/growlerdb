@@ -1,6 +1,6 @@
 # Postgres — the persistent relational-jdbc metastore for Polaris (port of compose `polaris-db`).
 # Without a persistent metastore Polaris keeps the catalog in memory and forgets every table on
-# restart, which silently orphans the index (task-114). A StatefulSet + PVC keeps it durable.
+# restart, which silently orphans the index. A StatefulSet + PVC keeps it durable.
 apiVersion: v1
 kind: Secret
 metadata:

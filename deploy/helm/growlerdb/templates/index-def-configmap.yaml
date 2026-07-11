@@ -1,7 +1,7 @@
 {{- if .Values.index.definition }}
-# Explicit index definition (task-209; verbatim since task-214): the workload's index.yaml passed
-# through UNCHANGED (`--set-file index.definition=...`) and built into the node's `growlerdb index
-# --def`, so the shard schema carries exactly what the definition's author wrote — types the Iceberg
+# Explicit index definition, passed through verbatim: the workload's index.yaml passes through
+# UNCHANGED (`--set-file index.definition=...`) and is built into the node's `growlerdb index --def`,
+# so the shard schema carries exactly what the definition's author wrote — types the Iceberg
 # auto-mapper can't infer (`IP`, `fast`, `record`, windowing) with no values-level reconstruction to
 # drift. Only rendered when `index.definition` is set; otherwise the node auto-maps.
 apiVersion: v1

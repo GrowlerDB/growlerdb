@@ -8,7 +8,7 @@ test.describe('Indexes', () => {
 
     await expect(page.getByRole('button', { name: 'telemetry' })).toBeVisible();
     await expect(page.getByText('ready', { exact: true })).toBeVisible();
-    // Summary line + reconciled columns (task-140): 1 index, shards "3 × 2" (3 shards, 2 copies —
+    // Summary line + reconciled columns: 1 index, shards "3 × 2" (3 shards, 2 copies —
     // shard 0 has a replica), and a real backup cell (mock reports a present backup at snapshot 42).
     await expect(page.getByText('1 index(es)')).toBeVisible();
     const row = page.locator('.ix-table tbody tr').first();
@@ -24,7 +24,7 @@ test.describe('Indexes', () => {
     await expect(page.getByRole('button', { name: 'Create index' })).toBeVisible();
   });
 
-  test('the list summarizes rebuilding indexes and backup states (task-140)', async ({ page }) => {
+  test('the list summarizes rebuilding indexes and backup states', async ({ page }) => {
     await installMocks(page, {
       indexes: {
         json: {
@@ -43,9 +43,7 @@ test.describe('Indexes', () => {
     await expect(page.locator('.ix-table tbody tr').first()).toContainText('Off');
   });
 
-  test('the Mapping tab renders per-field flags + the blocked-field callout (task-107)', async ({
-    page,
-  }) => {
+  test('the Mapping tab renders per-field flags + the blocked-field callout', async ({ page }) => {
     await installMocks(page);
     await page.goto('/indexes');
     await page.getByRole('button', { name: 'telemetry' }).click();
@@ -55,16 +53,14 @@ test.describe('Indexes', () => {
     await expect(table).toBeVisible();
     // The identifier carries a PK badge.
     await expect(table.locator('tr', { hasText: 'id' }).getByText('PK')).toBeVisible();
-    // A cached fast field; a blocked (D23) field with the warning callout.
+    // A cached fast field; a blocked field with the warning callout.
     await expect(table.getByText('device_id')).toBeVisible();
     await expect(table.locator('tr.blocked', { hasText: 'body' })).toBeVisible();
     await expect(table.getByText('blocked').first()).toBeVisible();
     await expect(page.getByText(/can’t be cached \(D23\)/)).toBeVisible();
   });
 
-  test('the Shards tab renders the health grid + primary/replica counts (task-108)', async ({
-    page,
-  }) => {
+  test('the Shards tab renders the health grid + primary/replica counts', async ({ page }) => {
     await installMocks(page);
     await page.goto('/indexes');
     await page.getByRole('button', { name: 'telemetry' }).click();
@@ -77,7 +73,7 @@ test.describe('Indexes', () => {
     await expect(page.locator('.shard-cell.warn')).toHaveCount(1); // the building shard
   });
 
-  test('Maintenance compact + backup actions run over REST (task-109)', async ({ page }) => {
+  test('Maintenance compact + backup actions run over REST', async ({ page }) => {
     await installMocks(page);
     page.on('dialog', (d) => d.accept()); // accept the confirm()s
     await page.goto('/indexes');
@@ -96,7 +92,7 @@ test.describe('Indexes', () => {
     await expect(page.getByText('Backed up 12 files at snapshot 42')).toBeVisible();
   });
 
-  test('the Activity tab renders the lifecycle event stream (task-110)', async ({ page }) => {
+  test('the Activity tab renders the lifecycle event stream', async ({ page }) => {
     await installMocks(page);
     await page.goto('/indexes');
     await page.getByRole('button', { name: 'telemetry' }).click();

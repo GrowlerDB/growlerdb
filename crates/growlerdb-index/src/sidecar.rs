@@ -1,4 +1,4 @@
-//! Versioned framing for the cold-tier postcard sidecars (task-150 / F5). Postcard is **not**
+//! Versioned framing for the cold-tier postcard sidecars. Postcard is **not**
 //! self-describing, so a later change to the [`HotCache`](crate::hotcache) or
 //! [`BundleLayout`](crate::bundle::BundleLayout) layout would be silently mis-parsed against an
 //! old sidecar (or vice versa). A 4-byte magic + `u16` version lets a reader **detect** an

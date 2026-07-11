@@ -19,14 +19,12 @@
 
     <grpc.version>1.75.0</grpc.version>
     <protobuf.version>4.28.3</protobuf.version>
-    <!-- Prometheus client for the connector's own metrics (task-194 AC6): the ingest-side counters
-         (per-trigger rows read/expected, per-shard acks, stream restarts, write retries, under-reads)
-         that used to be printf-only — invisible once the container log rotated. Scraped off a tiny
-         in-process HTTP server. simpleclient is small + shade-friendly. -->
+    <!-- Prometheus client for the connector's own metrics: the ingest-side counters
+         (per-trigger rows read/expected, per-shard acks, stream restarts, write retries, under-reads),
+         scraped off a tiny in-process HTTP server. simpleclient is small + shade-friendly. -->
     <prometheus.version>0.16.0</prometheus.version>
 
-    <!-- Spark/Iceberg are `provided` (supplied by spark-submit); added with the
-         changelog read in task-63. Pinned here per the locked stack. -->
+    <!-- Spark/Iceberg are `provided` (supplied by spark-submit). Pinned here per the locked stack. -->
     <spark.version>4.0.0</spark.version>
     <scala.binary.version>2.13</scala.binary.version>
     <iceberg.version>1.10.0</iceberg.version>
@@ -68,7 +66,7 @@
       <scope>provided</scope>
     </dependency>
 
-    <!-- Provided at runtime by spark-submit (task-63 adds the changelog read) -->
+    <!-- Provided at runtime by spark-submit -->
     <dependency>
       <groupId>org.apache.spark</groupId>
       <artifactId>spark-sql_${scala.binary.version}</artifactId>

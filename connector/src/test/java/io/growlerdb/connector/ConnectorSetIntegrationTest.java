@@ -27,7 +27,7 @@ import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 /**
- * The parallel connector set (task-196) end-to-end in Spark local mode, against {@link
+ * The parallel connector set end-to-end in Spark local mode, against {@link
  * FakeShardNode}s that ENFORCE the window-covering continuity guard, dedup, and pruning:
  *
  * <ul>
@@ -111,8 +111,7 @@ class ConnectorSetIntegrationTest {
     try (ShardGroupWriteClient c0 = new ShardGroupWriteClient(endpoints, router, lineage, g0);
         ShardGroupWriteClient c1 = new ShardGroupWriteClient(endpoints, router, lineage, g1)) {
 
-      // Worker 0 runs at head H1; MORE rows land before worker 1 ever triggers (head skew —
-      // exactly the shape that wedged exact-match cross-worker designs).
+      // Worker 0 runs at head H1; MORE rows land before worker 1 ever triggers (head skew).
       assertTrue(w0.runOnce(spark, c0.checkpointSnapshotId(), c0).wrote);
       insertRows(8, 4);
       assertTrue(w1.runOnce(spark, c1.checkpointSnapshotId(), c1).wrote);
@@ -146,8 +145,8 @@ class ConnectorSetIntegrationTest {
     }
 
     // --- Phase 3: regroup with EVERY idempotency record pruned ----------------------------
-    // The old exact-match design leaned on batch-id dedup for ahead shards; prove the set
-    // does not: wipe the fakes' batch keys (max-aggression prune), skew, regroup again.
+    // The set must not lean on batch-id dedup for ahead shards: wipe the fakes' batch keys
+    // (max-aggression prune), skew, regroup again.
     insertRows(16, 4);
     try (ShardGroupWriteClient c0 = new ShardGroupWriteClient(endpoints, router, lineage, g0)) {
       assertTrue(base.ownedBy(router, g0).runOnce(spark, c0.checkpointSnapshotId(), c0).wrote);

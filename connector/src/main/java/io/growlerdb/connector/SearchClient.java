@@ -16,14 +16,14 @@ import java.util.function.Supplier;
 /**
  * Thin client to a GrowlerDB <b>read</b> endpoint's {@code Search} gRPC service — a Node
  * ({@code growlerdb serve}) or a Gateway ({@code growlerdb gateway}, which fans the query out
- * across shards/windows). Powers the SQL UDFs (task-51): an engine runs a boolean/full-text query
- * and gets back matching document <b>coordinates</b> (the composite keys, D5) + scores, then
+ * across shards/windows). Powers the SQL UDFs: an engine runs a boolean/full-text query
+ * and gets back matching document <b>coordinates</b> (the composite keys) + scores, then
  * <b>joins those keys against the Iceberg table</b> to filter/score its rows ({@link GrowlerDbSearch}).
  *
  * <p>The endpoint is the index — a Gateway is started per index ({@code gateway --index}) — so the
  * query carries no index name. Plaintext only; TLS/auth on this read path are a follow-up.
  *
- * <p><b>Resilience (task-152 / F12).</b> The read path mirrors {@link WriteClient}'s guards so a
+ * <p><b>Resilience.</b> The read path mirrors {@link WriteClient}'s guards so a
  * wedged Node/Gateway can't hang the query thread forever: a {@link #keepAliveTime keepalive} trips a
  * black-holed connection to re-resolve DNS, a <b>per-call deadline</b> fails a stuck RPC fast, and
  * transient transport failures are <b>retried with backoff</b> (a read is idempotent, so retry is
@@ -88,7 +88,7 @@ public final class SearchClient implements AutoCloseable {
       throw new IllegalArgumentException("maxAttempts must be >= 1");
     }
     // dns:/// so a restarted endpoint's new pod IP is re-resolved on reconnect; keepalive trips a
-    // black-holed connection to TRANSIENT_FAILURE → re-resolution (see WriteClient for the detail).
+    // black-holed connection to TRANSIENT_FAILURE, forcing re-resolution (see WriteClient for detail).
     this.channel =
         ManagedChannelBuilder.forTarget("dns:///" + host + ":" + port)
             .usePlaintext()

@@ -1,4 +1,4 @@
-//! Small shared helpers for the gRPC service impls (task-153 / D1): map errors to a tonic
+//! Small shared helpers for the gRPC service impls: map errors to a tonic
 //! [`Status`] and run blocking work off the async runtime. These replace the
 //! `|e| to_status(Code::Internal, WireError::new("INTERNAL", e.to_string()))` closures and the
 //! `spawn_blocking(..).await.map_err(..)` boilerplate that was copy-pasted across
@@ -13,7 +13,7 @@ pub(crate) fn internal(e: impl std::fmt::Display) -> Status {
     to_status(Code::Internal, WireError::new("INTERNAL", e.to_string()))
 }
 
-/// The "index not served by this node" guard shared by the single-index Node RPCs (task-153 / D2):
+/// The "index not served by this node" guard shared by the single-index Node RPCs:
 /// an empty `requested` name means "the served index"; any other name is `NotFound`. Replaces the
 /// `if !req.index.is_empty() && req.index != self.index { return Err(NotFound…) }` block copy-pasted
 /// across the Admin service (and mirrored on the gateway).

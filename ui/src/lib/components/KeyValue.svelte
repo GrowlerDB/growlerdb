@@ -1,6 +1,6 @@
 <script lang="ts">
-  // A key/value grid (task-93): the document drawer's Fields tab, connection info, etc. Values are
-  // monospace by default (data/identifiers).
+  // A key/value grid: the document drawer's Fields tab, connection info, etc. Values are monospace
+  // by default (data/identifiers).
   let {
     entries,
     mono = true,

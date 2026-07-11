@@ -1,4 +1,4 @@
-// SLI metrics for the Observability screen (task-48). The UI queries the Engine's same-origin
+// SLI metrics for the Observability screen. The UI queries the Engine's same-origin
 // metrics proxy (`/v1/stats/...`, which forwards to Prometheus), so panels need no Prometheus
 // URL or CORS. Parsing + alert evaluation are pure and unit-tested; `queryRange` is the thin
 // network wrapper.
@@ -89,8 +89,8 @@ export interface Alert {
   detail: string;
 }
 
-/** A firing alert as evaluated by the metrics backend's server-side rules (task-111), normalized
- *  by the Engine's `/v1/alerts` proxy. */
+/** A firing alert as evaluated by the metrics backend's server-side rules, normalized by the
+ *  Engine's `/v1/alerts` proxy. */
 export interface ServerAlert {
   name: string;
   severity: string; // 'warning' | 'critical' | …
@@ -124,7 +124,7 @@ export interface SliSnapshot {
   staleLocatorRate: number | null; // /s
 }
 
-/** Derive alert states from the latest SLI values via native thresholds (task-48). This is the
+/** Derive alert states from the latest SLI values via native thresholds. This is the
  *  **fallback** used when the metrics backend's server-side rules are unreachable; the primary
  *  source is {@link fetchAlerts} (`/v1/alerts`). Thresholds mirror the server rules so the two
  *  agree on healthy/unhealthy. */

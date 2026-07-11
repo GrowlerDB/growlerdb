@@ -27,7 +27,7 @@ honestly.
 | AuthN at the gateway (OIDC/JWT, API keys, mTLS) | ✅ Met | `growlerdb-engine::authn` |
 | Control-plane RBAC | ✅ Met | `growlerdb-engine::rbac` |
 | **Tenant isolation verified end-to-end** | ✅ Met | `tests/tenant_isolation.rs` — forged headers/query-widening can't cross tenants; unauth rejected before the shard |
-| Data-plane authz delegated to the catalog | ⚠️ Partial | Hydration is catalog-governed; full Polaris policy enforcement is task-37 (P2) |
+| Data-plane authz delegated to the catalog | ⚠️ Partial | Hydration is catalog-governed; full Polaris policy enforcement is pending (P2) |
 | Supply-chain gates (licenses, advisories, SBOM, signing) | ✅ Met | `cargo-deny` in CI; SBOM + cosign in `release.yml` |
 | Independent security review | ⏳ Pending | Threat-model summary in [SECURITY.md](https://github.com/GrowlerDB/growlerdb/blob/main/SECURITY.md); external review not yet done |
 
@@ -38,21 +38,21 @@ honestly.
 | Health/readiness probes + graceful shutdown | ✅ Met | `growlerdb-telemetry`; probes gate Compose/Helm |
 | Observability (traces/metrics/logs, SLI dashboards) | ✅ Met | M4; LGTM + Grafana SLIs |
 | Resource/DoS guards (page-fetch ceiling, cost guards) | ✅ Met | Gateway limits; segment cost guards |
-| Backup/restore + node rebuild-from-Iceberg | ✅ Met | task-32 — shipped + live-verified; recovery is bounded by rebuild time, never data loss |
-| Replica sync (segment shipping) | ✅ Met | task-31 — segment-shipping shipped + live-verified (single-shard; windowed / multi-shard replica sets are task-227, post-GA) |
+| Backup/restore + node rebuild-from-Iceberg | ✅ Met | Shipped + live-verified; recovery is bounded by rebuild time, never data loss |
+| Replica sync (segment shipping) | ✅ Met | Segment-shipping shipped + live-verified (single-shard; windowed / multi-shard replica sets are post-GA) |
 
 ## Performance
 
 | Criterion | Status | Evidence |
 |---|---|---|
-| Representative benchmark suite + published numbers | ⚠️ Partial | Validated at scale on Hetzner k3s (task-159): empty-start windowed topology with CP-driven placement, **exact source↔index convergence** (Trino distinct == index docs), ingest keep-up to ~19k rows/s, sub-linear windowed top-K, and bounded commit latency under large snapshots. The **published GA benchmark numbers** (staged step-ups + storage milestones + Iceberg/Trino comparison) are task-185/186 — the one perf item before a 1.0 claim |
+| Representative benchmark suite + published numbers | ⚠️ Partial | Validated at scale on k3s: empty-start windowed topology with CP-driven placement, **exact source↔index convergence** (Trino distinct == index docs), ingest keep-up to ~19k rows/s, sub-linear windowed top-K, and bounded commit latency under large snapshots. The **published GA benchmark numbers** (staged step-ups + storage milestones + Iceberg/Trino comparison) are the one perf item before a 1.0 claim |
 
 ## Release & docs
 
 | Criterion | Status | Evidence |
 |---|---|---|
 | SemVer + changelog + deprecation policy | ✅ Met | [RELEASING.md](https://github.com/GrowlerDB/growlerdb/blob/main/RELEASING.md), [CHANGELOG.md](https://github.com/GrowlerDB/growlerdb/blob/main/CHANGELOG.md) |
-| Signed, multi-arch artifacts + SBOM; Helm chart published | ✅ Met | `release.yml` publishes a linux/amd64 + linux/arm64 manifest list with a cosign signature + SBOM (`imagetools inspect`), the Helm chart to GHCR OCI, and release binaries + checksums; both arches run (task-157) |
+| Signed, multi-arch artifacts + SBOM; Helm chart published | ✅ Met | `release.yml` publishes a linux/amd64 + linux/arm64 manifest list with a cosign signature + SBOM (`imagetools inspect`), the Helm chart to GHCR OCI, and release binaries + checksums; both arches run |
 | Getting-started + reference + migration docs | ✅ Met | [docs/](index) |
 
 ## Summary
@@ -61,7 +61,7 @@ The **P1 GA surface** — core search loop, distribution, security/multi-tenancy
 tenant isolation), observability, the console, the OpenSearch adapter, the release pipeline, and
 **backup/restore + single-shard replica sync** — is **in place, tested, and validated at scale on real
 hardware**. The remaining items before a confident **1.0** are, honestly: the **published benchmark
-numbers** (task-185/186 — the topology + convergence are validated; the numbers themselves are the
-deliverable), **full Polaris data-plane authz** (task-37, P2), and an **independent security review**
-(task-166). See the [public roadmap](roadmap) for the post-GA line (windowed replica HA, cold-tier
-validation, connector parallelism). This is the go/no-go gate for cutting GA (task-163).
+numbers** (the topology + convergence are validated; the numbers themselves are the
+deliverable), **full Polaris data-plane authz** (P2), and an **independent security review**.
+See the [public roadmap](roadmap) for the post-GA line (windowed replica HA, cold-tier
+validation, connector parallelism). This is the go/no-go gate for cutting GA.

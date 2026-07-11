@@ -1,15 +1,14 @@
-// A tiny path-based router (task-45). The Engine serves `index.html` for any non-API path
-// (SPA fallback), so client routes are real paths. Subsequent screens (tasks 46–49) register
-// under these routes.
+// A tiny path-based router. The Engine serves `index.html` for any non-API path (SPA fallback), so
+// client routes are real paths.
 import { writable } from 'svelte/store';
 
 export const routes = ['/', '/indexes', '/observability', '/settings'] as const;
 export type Route = (typeof routes)[number];
 
 function normalize(pathname: string): Route {
-  // The revamp folds the old standalone Cluster screen into the header Health pill + Observability
-  // (console-revamp epic); a bookmarked `/cluster` lands on Observability. The Ingestion screen is
-  // likewise folded into Observability's Ingestion section (task-208), so `/ingestion` redirects too.
+  // The Cluster screen folds into the header Health pill + Observability, and the Ingestion screen
+  // into Observability's Ingestion section, so bookmarked `/cluster` and `/ingestion` both redirect
+  // there.
   if (pathname === '/cluster' || pathname === '/ingestion') return '/observability';
   return (routes as readonly string[]).includes(pathname) ? (pathname as Route) : '/';
 }

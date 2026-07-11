@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Chaos drill (task-115): process-crash / self-heal recovery on the Compose stack.
+# Chaos drill: process-crash / self-heal recovery on the Compose stack.
 #
 # Kills a core GrowlerDB service mid-flight and asserts it self-restarts (the `restart:` policy in
 # docker-compose.yml — the Compose analogue of the k8s pods' always-restart + liveness probes) and

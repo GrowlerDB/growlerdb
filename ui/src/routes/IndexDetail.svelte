@@ -1,8 +1,7 @@
 <script lang="ts">
-  // Index-detail sub-screen (task-96): a tabbed view of one index. Stats strip is always visible;
-  // tabs split policy/mapping/shards/maintenance/activity. Maintenance wires reindex/drop/alias
-  // against today's APIs; Mapping (task-107), Shards (task-108) and Activity (task-110) are
-  // scaffolds, and Compact/Backup (task-109) render as PLANNED.
+  // Tabbed view of one index. Stats strip is always visible; tabs split
+  // policy/mapping/shards/maintenance/activity. Maintenance wires reindex/drop/alias against
+  // current APIs; Mapping, Shards and Activity are scaffolds, and Compact/Backup render as PLANNED.
   import { onMount } from 'svelte';
   import { t } from '../lib/i18n';
   import {
@@ -43,7 +42,7 @@
   let info = $state<IndexInfo | null>(null);
   let stats = $state<IndexStats | null>(null);
   let loadError = $state('');
-  let tab = $state('mapping'); // land on the leftmost/primary tab, not the second one (task-134)
+  let tab = $state('mapping'); // land on the leftmost/primary tab
 
   let reindexing = $state(false);
   let reindexResult = $state<ReindexResult | null>(null);
@@ -53,14 +52,14 @@
   let aliasError = $state('');
   let aliasBusy = $state(false);
 
-  // Compact + backup (task-109).
+  // Compact + backup.
   let compacting = $state(false);
   let compactMsg = $state('');
   let backingUp = $state(false);
   let backupMsg = $state('');
   let bstatus = $state<import('../lib/api').BackupStatus | null>(null);
 
-  // Activity log (task-110).
+  // Activity log.
   let activity = $state<ActivityEvent[]>([]);
   function evIcon(kind: string): string {
     if (kind.startsWith('index.created')) return '＋';
@@ -96,13 +95,13 @@
 
   const ownAliases = $derived(aliases.filter((a) => a.targets.includes(name)));
 
-  // Cached-fields policy summary (design-QA T8) — derived from the mapping already loaded: how many
-  // fields are cached for display, and how many are excluded by policy (blocked / not cached).
+  // Cached-fields policy summary derived from the loaded mapping: how many fields are
+  // cached for display, and how many are excluded by policy (blocked / not cached).
   const mappingFields = $derived(info?.fields ?? []);
   const cachedCount = $derived(mappingFields.filter((f) => f.cached).length);
   const excludedCount = $derived(mappingFields.filter((f) => f.blocked).length);
 
-  // Shard map (task-108).
+  // Shard map.
   const shardCells = $derived(info?.shards ?? []);
   const primaryCount = $derived(shardCells.filter((s) => s.primary).length);
   const replicaCount = $derived(shardCells.reduce((n, s) => n + (s.replicas?.length ?? 0), 0));
@@ -500,7 +499,7 @@
     align-items: center;
     gap: 0.75rem;
   }
-  /* The index name is an identifier → mono (design-QA T6). */
+  /* The index name is an identifier → mono. */
   .detail-head h1.ix-title {
     margin: 0;
     font:
@@ -590,7 +589,7 @@
     gap: 0.35rem;
     font-size: 0.85em;
   }
-  /* Dense 16-column heatmap of small squares (design-QA T6): ok = --ok @ .85, degraded = --warn.
+  /* Dense 16-column heatmap of small squares: ok = --ok @ .85, degraded = --warn.
      Detail stays in the per-cell title tooltip. */
   .shard-grid {
     display: grid;

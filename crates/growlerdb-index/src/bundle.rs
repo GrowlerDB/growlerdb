@@ -1,4 +1,4 @@
-//! **Split bundling** for cold windows (task-83, slice 2). task-80 parks each Tantivy segment file
+//! **Split bundling** for cold windows. The cold tier parks each Tantivy segment file
 //! as its own object, so a cold query that touches several files issues one ranged GET *per file*
 //! (term dict, postings, fast fields, store — easily 5–15 objects per segment). Bundling
 //! concatenates a window's files into a single "split" object and records each file's byte span, so
@@ -51,7 +51,7 @@ pub async fn build(
         .map_err(|e| StoreError::Cold(e.to_string()))?;
     // Stream each file through the object writer (multipart on S3) rather than concatenating the
     // whole window into one Vec<u8> — a cold window is potentially many GB, so buffering it all would
-    // OOM the node at park time (task-150 / F3c). Peak memory is one segment file, not the window.
+    // OOM the node at park time. Peak memory is one segment file, not the window.
     let mut writer = op
         .writer(bundle_key)
         .await
@@ -100,7 +100,7 @@ async fn write_bundle_manifest(
 }
 
 /// Like [`build`], but streams the window's index files straight from a **local directory** instead of
-/// re-downloading them from object storage (task-155). At cold-park the files are still on local disk
+/// re-downloading them from object storage. At cold-park the files are still on local disk
 /// (eviction is the last step), so re-fetching each one from the store just to concatenate it is pure
 /// I/O waste. `files` are paths relative to `local_dir` — pass the backup manifest's `index/` files
 /// (stripped of that prefix) so the bundle records the same bare rels as [`build`] and contains
@@ -140,11 +140,11 @@ pub async fn build_from_dir(
     Ok(layout)
 }
 
-/// Un-bundle a split back into individual files under `dest_index_dir` (task-83, for pre-warm): read
+/// Un-bundle a split back into individual files under `dest_index_dir` (for pre-warm): read
 /// the layout from `manifest_key`, then **ranged-read each file's span** from the bundle straight to
 /// disk. The inverse of [`build`] — used to promote a bundled cold window back to a local hot shard.
 /// Ranged per-file reads (not one whole-bundle fetch) keep peak memory to one segment, so promoting a
-/// multi-GB window can't OOM the node (task-150 / F3c). Async object I/O only.
+/// multi-GB window can't OOM the node. Async object I/O only.
 pub async fn unbundle(
     op: &opendal::Operator,
     bundle_key: &str,
@@ -256,7 +256,7 @@ mod tests {
                 .unwrap()
                 .with_cache(RangeCache::new(16 * 1024 * 1024))
                 .with_bundle(Arc::new(state));
-            // task-150 / I4: a read past a bundled file's end must error, not bleed the adjacent
+            // A read past a bundled file's end must error, not bleed the adjacent
             // file's bytes out of the shared bundle object.
             let h = dir
                 .get_file_handle(std::path::Path::new(&first_rel))
@@ -342,7 +342,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn build_from_dir_bundles_local_files_without_re_download() {
-        // The cold-park path (task-155): the window's index files are still on local disk, so the
+        // The cold-park path: the window's index files are still on local disk, so the
         // bundle is built straight from them (no round-trip through the store). Verify the bundle it
         // writes un-bundles back into a searchable index — i.e. equivalent to a store-side build.
         let mut sb = Schema::builder();

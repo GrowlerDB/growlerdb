@@ -1,4 +1,4 @@
-//! The **Gateway** ([task-30] B1, [task-29] C1): terminates the Engine API
+//! The **Gateway** terminates the Engine API
 //! ([REST](crate::rest) + [gRPC](crate::gateway_grpc)) and routes each call to the Nodes
 //! through the [`Node`](crate::node::Node) seam. A Node is a
 //! [`LocalNode`](crate::node::LocalNode) (embedded) or a gRPC client (distributed) — the
@@ -8,14 +8,13 @@
 //! it **scatter-gathers** the query to every shard concurrently and **merges** the results:
 //! search by score (top-k), suggest by count, key lookups routed by key, describe by summed
 //! stats, and **aggregations** by merging each shard's mergeable partial (terms/stats/range/
-//! date_histogram exact; HLL/DDSketch approximate but correctly merged). A shard that fails to respond is a
-//! **flagged gap, never a silent one** (task-67): `search` sets `SearchResponse.partial`, and
+//! date_histogram exact; HLL/DDSketch approximate but correctly merged). A shard that fails to
+//! respond is a **flagged gap, never a silent one**: `search` sets `SearchResponse.partial`, and
 //! `suggest`/`get_by_key`/`describe_index`/`aggregate` set a `failed_shards` count on their
 //! responses; if **every** shard fails the call returns `UNAVAILABLE` rather than a
-//! success-shaped empty result. Global term stats (distributed BM25) and field-sort merge are
-//! follow-up slices.
+//! success-shaped empty result.
 //!
-//! **Paging is merged correctly across shards** (task-68): `offset` via offset-merge (each shard
+//! **Paging is merged correctly across shards**: `offset` via offset-merge (each shard
 //! returns rank 0 .. `offset+limit`, the Gateway applies the global window once), and
 //! `search_after` keyset scrolling via a **global** cursor — the Gateway sends the same cursor to
 //! every shard and composes the next one from the last returned hit's (sort tuple, key), so a
@@ -24,13 +23,10 @@
 //! merges groups by value, summing `group_count` and keeping each group's global top hit. A
 //! single-shard Gateway forwards verbatim and is unaffected by any of this.
 //!
-//! **Resiliency** ([`GatewayLimits`], task-72): each scatter-gather runs under a **deadline** — a
+//! **Resiliency** ([`GatewayLimits`]): each scatter-gather runs under a **deadline** — a
 //! hung/slow shard is aborted and flagged `partial` rather than stalling the query forever (Nodes
 //! also carry transport connect/request timeouts) — and a search's **`offset + limit`** is capped
 //! at the boundary so an unbounded `limit` can't OOM the Gateway.
-//!
-//! [task-30]: ../../../design/06-service-architecture.md
-//! [task-29]: ../../../design/06-service-architecture.md
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -54,11 +50,9 @@ use crate::auth::SharedAuth;
 use crate::authn::SharedAuthn;
 use crate::node::Node;
 
-/// Resiliency limits for a [`Gateway`]'s scatter-gather ([task-72]): a per-query **deadline**
+/// Resiliency limits for a [`Gateway`]'s scatter-gather: a per-query **deadline**
 /// (a slow shard can't stall a query forever) and a **max page fetch** (`offset + limit`, so a
 /// huge `limit` can't make every shard build a giant page and OOM the Gateway).
-///
-/// [task-72]: ../../../backlog/tasks/task-72%20-%20Gateway%20resiliency%20deadlines%20and%20limit%20guards.md
 #[derive(Debug, Clone, Copy)]
 pub struct GatewayLimits {
     /// Wall-clock budget for a scatter-gather; on expiry the Gateway aborts the outstanding
@@ -66,7 +60,7 @@ pub struct GatewayLimits {
     pub deadline: Option<Duration>,
     /// Max `offset + limit` a search may request. Oversized → `InvalidArgument`. `0` = unbounded.
     pub max_fetch: usize,
-    /// Max concurrent per-shard RPCs in flight across all scatter-gathers (task-199). At hundreds of
+    /// Max concurrent per-shard RPCs in flight across all scatter-gathers. At hundreds of
     /// shards an unbounded fan-out would open hundreds of simultaneous connections per burst of
     /// queries and exhaust the Gateway's socket/fd budget; a semaphore caps it (excess tasks queue
     /// under the deadline). `0` = unbounded.
@@ -85,7 +79,7 @@ impl Default for GatewayLimits {
     }
 }
 
-/// Build the fan-out semaphore for `max_concurrent_fanout` (task-199); `0` = effectively unbounded.
+/// Build the fan-out semaphore for `max_concurrent_fanout`; `0` = effectively unbounded.
 fn fanout_semaphore(max: usize) -> Arc<tokio::sync::Semaphore> {
     Arc::new(tokio::sync::Semaphore::new(if max == 0 {
         tokio::sync::Semaphore::MAX_PERMITS
@@ -98,69 +92,68 @@ fn fanout_semaphore(max: usize) -> Arc<tokio::sync::Semaphore> {
 /// identical whether the Nodes are in-process (embedded) or remote (distributed). A
 /// [`ShardRouter`] decides which shard owns a key (for [`get_by_key`](Self::get_by_key)).
 ///
-/// **Multi-index** (task-240): a Gateway can front *many* indexes at once. Each named index has its
+/// **Multi-index**: a Gateway can front *many* indexes at once. Each named index has its
 /// own [`IndexRoute`] (its shard-set + router + partition fields, each independently hot-reloadable),
 /// stored in `routes` keyed by resolved index name. A request names its target index; the Gateway
 /// [`resolve_route`](Self::resolve_route)s it at entry and operates on that route. Built via the
 /// single-index constructors ([`new`](Self::new)/[`sharded`](Self::sharded)/…) the Gateway holds one
-/// static route (`single`) and behaves byte-for-byte as before; built via
+/// static route (`single`); built via
 /// [`multi_index`](Self::multi_index) with a [`RouteResolver`] it lazily resolves each named index
 /// through the control plane on first use.
 #[derive(Clone)]
 pub struct Gateway {
     /// The single static route, when the Gateway was built via a single-index constructor
     /// (`new`/`sharded`/`windowed`/…). Present iff `resolver` is `None`. Every read routes to it;
-    /// `served_index` (below) still gates the request's `index` field. Its inner swap cell keeps
-    /// [`swap_routing`](Self::swap_routing)/[`swap_windowed`](Self::swap_windowed) working exactly as
-    /// before (task-77 hot-reload).
+    /// `served_index` (below) still gates the request's `index` field. Its inner swap cell backs
+    /// [`swap_routing`](Self::swap_routing)/[`swap_windowed`](Self::swap_windowed) hot-reload.
     single: Option<Arc<IndexRoute>>,
-    /// Lazily-populated per-index routes for a **multi-index** Gateway (task-240): resolved-index-name
+    /// Lazily-populated per-index routes for a **multi-index** Gateway: resolved-index-name
     /// → its [`IndexRoute`]. Empty in single-index mode. Populated on first request for an index via
     /// `resolver`, then hot-reloaded by a per-index reloader the resolver spawns.
     routes: Arc<std::sync::RwLock<HashMap<String, Arc<IndexRoute>>>>,
     /// Resolves a named index into an [`IndexRoute`] (fetch its `GetIndex`, connect nodes). `Some`
     /// only in multi-index mode; drives lazy population of `routes`. `None` = single-index (static).
     resolver: Option<Arc<dyn RouteResolver>>,
-    /// Brief negative cache of index names the resolver reported as absent (task-240): name → when it
+    /// Brief negative cache of index names the resolver reported as absent: name → when it
     /// was cached. A flood of requests for a nonexistent index shouldn't hammer the control plane; a
     /// `NOT_FOUND` is remembered for [`NEGATIVE_CACHE_TTL`] before we ask the CP again.
     missing: Arc<std::sync::RwLock<HashMap<String, Instant>>>,
-    /// The index a request with an **empty** `index` field resolves to (task-240). `Some` = that
+    /// The index a request with an **empty** `index` field resolves to. `Some` = that
     /// index; `None` = no default (empty `index` errors unless exactly one index is served — see
     /// [`resolve_route`](Self::resolve_route)). In single-index mode this is the served index name.
     default_index: Option<String>,
     limits: GatewayLimits,
     authn: Option<SharedAuthn>,
-    /// Built-in (no-IdP) password login is available (task-128) — advertised on `/v1/config` so the
+    /// Built-in (no-IdP) password login is available — advertised on `/v1/config` so the
     /// console shows a username/password form rather than an OIDC redirect.
     password_login: bool,
     authz: Option<SharedAuth>,
     cold: Option<ColdTier>,
-    /// The index name this Gateway serves (task-99), in **single-index** mode. A request whose `index`
+    /// The index name this Gateway serves, in **single-index** mode. A request whose `index`
     /// is non-empty and names a *different* index is answered `NOT_FOUND` instead of silently searching
     /// this one. `None` (the default, and all tests) means "serve any request" — no index scoping. In
     /// multi-index mode this is unused (scoping is per-`routes` membership).
     served_index: Option<String>,
-    /// Bounds concurrent per-shard RPCs across all scatter-gathers (task-199) — see
+    /// Bounds concurrent per-shard RPCs across all scatter-gathers — see
     /// [`GatewayLimits::max_concurrent_fanout`].
     fanout: Arc<tokio::sync::Semaphore>,
 }
 
 /// How long a `NOT_FOUND` from the [`RouteResolver`] is remembered before the control plane is asked
-/// again (task-240 negative cache): short, so an index created moments ago becomes queryable quickly,
+/// again: short, so an index created moments ago becomes queryable quickly,
 /// but long enough that a burst of requests for a bad name doesn't storm the control plane.
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5);
 
-/// One index's routing on a [`Gateway`] (task-240): the shard-set + key router (+ optional windowed
-/// descriptors) behind the same hot-swap cell single-index gateways have always used, plus that
+/// One index's routing on a [`Gateway`]: the shard-set + key router (+ optional windowed
+/// descriptors) behind a hot-swap cell, plus that
 /// index's keyword partition fields for fan-out pruning. A multi-index Gateway holds one per served
 /// index; a single-index Gateway holds exactly one (its `single`). Cloneable-cheap (`Arc` inner).
 pub struct IndexRoute {
     /// The shard set + key router, behind a swap so a running route can **hot-reload** its topology
-    /// after a reshard cutover (task-77): [`swap`](Self::swap) installs a new `(shards, router)`
+    /// after a reshard cutover: [`swap`](Self::swap) installs a new `(shards, router)`
     /// atomically; each request reads a snapshot via [`routing`](Self::routing).
     routing: std::sync::RwLock<Arc<RoutingState>>,
-    /// This index's **keyword** partition-key fields, for search fan-out pruning (task-199). When a
+    /// This index's **keyword** partition-key fields, for search fan-out pruning. When a
     /// search AND-pins all of them to values, every matching key routes to a single shard, so the
     /// query goes there instead of broadcasting. Empty = no pruning.
     partition_fields: Vec<String>,
@@ -193,7 +186,7 @@ impl IndexRoute {
             .clone()
     }
 
-    /// **Hot-reload** this route's ordinal topology (task-77): atomically replace shard set + router.
+    /// **Hot-reload** this route's ordinal topology: atomically replace shard set + router.
     /// Skips an empty/count-mismatched swap (keeps the current servable topology), like the Gateway
     /// method it backs.
     pub fn swap(&self, shards: Vec<Arc<dyn Node>>, router: ShardRouter) {
@@ -212,7 +205,7 @@ impl IndexRoute {
         });
     }
 
-    /// **Hot-swap** this route's windowed window set (task-219). Skips an empty/mismatched swap.
+    /// **Hot-swap** this route's windowed window set. Skips an empty/mismatched swap.
     pub fn swap_windowed(
         &self,
         shards: Vec<Arc<dyn Node>>,
@@ -236,7 +229,7 @@ impl IndexRoute {
     }
 }
 
-/// Resolves a named index into an [`IndexRoute`] for a **multi-index** Gateway (task-240): fetch the
+/// Resolves a named index into an [`IndexRoute`] for a **multi-index** Gateway: fetch the
 /// index's shard map (e.g. a control-plane `GetIndex`), connect a [`Node`] per shard, and build the
 /// route (with a per-index hot-reloader wired to its [`IndexRoute::swap`]). Returns `Ok(None)` when
 /// the index doesn't exist (→ `NOT_FOUND`, negative-cached), `Err` on a transient failure (→ the
@@ -250,7 +243,7 @@ pub trait RouteResolver: Send + Sync {
 /// The Gateway's hot-swappable routing: one [`Node`] per shard + the [`ShardRouter`] that places
 /// keys, plus (for a windowed index) the [`WindowRouting`] descriptors. Snapshotted per request
 /// (cheap `Arc` clone) so an in-flight scatter sees a consistent topology even as a reshard — or a
-/// **new window** (task-219 dynamic windowed ingest) — swaps in a new one. Keeping `window_routing`
+/// **new window** — swaps in a new one. Keeping `window_routing`
 /// *inside* the swap cell (rather than a fixed Gateway field) is what lets a running windowed gateway
 /// learn a new window's id + zone-map atomically with its node, via [`swap_windowed`](Gateway::swap_windowed).
 pub struct RoutingState {
@@ -260,7 +253,7 @@ pub struct RoutingState {
     window_routing: Option<WindowRouting>,
 }
 
-/// Windowed-index routing (task-81): the [`TimeWindowing`] config plus, **aligned 1:1 with
+/// Windowed-index routing: the [`TimeWindowing`] config plus, **aligned 1:1 with
 /// `shards`**, each shard's window id and event-time zone-map. Lets the Gateway prune a
 /// time-filtered search to the windows that can match before scatter-gather. `None` on a normal
 /// (hash/partition) Gateway.
@@ -272,7 +265,7 @@ pub struct WindowRouting {
 }
 
 impl WindowRouting {
-    /// A windowed routing descriptor (task-240): the [`TimeWindowing`] config + per-shard
+    /// A windowed routing descriptor: the [`TimeWindowing`] config + per-shard
     /// `(window id, event zone-map)`, for building an [`IndexRoute`] over a windowed index.
     pub fn new(windowing: TimeWindowing, windows: Vec<(i64, Option<(i64, i64)>)>) -> Self {
         Self { windowing, windows }
@@ -280,7 +273,7 @@ impl WindowRouting {
 }
 
 /// Collect `field → value` for [`Query::Term`] leaves that are **ANDed** (in `must`/`filter`,
-/// possibly nested) and target one of `fields` — the partition equalities a search pins (task-199).
+/// possibly nested) and target one of `fields` — the partition equalities a search pins.
 /// Only AND clauses force the field to a single value for *every* match, so `should`/OR, `must_not`,
 /// and negation are ignored: pruning on them could drop shards that legitimately hold matches.
 fn collect_and_pins(
@@ -304,7 +297,7 @@ fn collect_and_pins(
     }
 }
 
-/// Cold-tier observability for a windowed Gateway (task-80): which windows are served **read-through**
+/// Cold-tier observability for a windowed Gateway: which windows are served **read-through**
 /// from object storage, plus the shared byte-range cache they read through (for hit/miss/byte stats).
 #[derive(Clone)]
 struct ColdTier {
@@ -312,7 +305,7 @@ struct ColdTier {
     cache: growlerdb_index::RangeCache,
 }
 
-/// Cold-tier status (task-80) — per-window hot/cold tier + the shared cache's stats. Serialized at
+/// Cold-tier status — per-window hot/cold tier + the shared cache's stats. Serialized at
 /// `GET /v1/cold` so the console can show warm/cold state and the cold-read efficiency.
 #[derive(serde::Serialize)]
 pub struct ColdStatus {
@@ -364,7 +357,7 @@ impl Gateway {
         }
     }
 
-    /// A **multi-index** Gateway (task-240): serves *many* indexes over one endpoint, resolving each
+    /// A **multi-index** Gateway: serves *many* indexes over one endpoint, resolving each
     /// named index lazily through `resolver` (typically a control-plane `GetIndex` builder) and
     /// hot-reloading each independently. A request with an empty `index` uses `default_index` (or, if
     /// `None` and exactly one index has been resolved, that one; else `InvalidArgument`). Readiness is
@@ -387,7 +380,7 @@ impl Gateway {
     }
 
     /// Declare the (single) index's **keyword** partition-key fields so a search that pins them prunes
-    /// its fan-out to the owning shard (task-199). Pass only keyword-typed partition fields — the
+    /// its fan-out to the owning shard. Pass only keyword-typed partition fields — the
     /// caller (the sharded serve path) filters them from the resolved definition; a non-keyword
     /// partition field is omitted so pruning never routes a mistyped value to the wrong shard. Only
     /// meaningful in single-index mode; multi-index routes carry their own partition fields.
@@ -417,7 +410,7 @@ impl Gateway {
         self.single().routing()
     }
 
-    /// **Hot-reload** the (single) topology (task-77): atomically replace the shard set + router, e.g.
+    /// **Hot-reload** the (single) topology: atomically replace the shard set + router, e.g.
     /// after a reshard cutover the control plane committed a new bucket map and added nodes. In-flight
     /// requests finish against their snapshot; subsequent ones route through the new topology. The
     /// router's shard count must match the node count. (Ordinal indexes only — not windowed.)
@@ -425,7 +418,7 @@ impl Gateway {
         self.single().swap(shards, router);
     }
 
-    /// **Hot-swap** the (single) windowed gateway's window set (task-219 dynamic windowed ingest):
+    /// **Hot-swap** the (single) windowed gateway's window set:
     /// atomically install a new `(shards, window descriptors)` so a running windowed gateway can serve
     /// a **newly-created** window (or an updated zone-map) without a restart — the windowed analog of
     /// [`swap_routing`]. `windows` aligns 1:1 with `shards` (one `(window id, event zone-map)` each);
@@ -440,7 +433,7 @@ impl Gateway {
         self.single().swap_windowed(shards, windowing, windows);
     }
 
-    /// Resolve a request's target `index` field to the [`IndexRoute`] that answers it (task-240) — the
+    /// Resolve a request's target `index` field to the [`IndexRoute`] that answers it — the
     /// per-request routing decision every read/write handler makes at entry.
     ///
     /// The empty-index rule: an empty `index` uses `default_index` if set; else, if exactly one index
@@ -448,13 +441,13 @@ impl Gateway {
     /// resolver ambiguity), that one; else `InvalidArgument` ("index required; endpoint serves N
     /// indexes"). A non-empty `index` names its target directly.
     ///
-    /// Single-index mode preserves task-99 scoping exactly: a non-empty name that differs from the
+    /// Single-index mode preserves index scoping exactly: a non-empty name that differs from the
     /// served index is `NOT_FOUND`; empty or the served name resolves to the static route. Multi-index
     /// mode resolves the named index through the `resolver` (lazily populating `routes` and spawning
     /// that index's hot-reloader), negative-caching a `NOT_FOUND` briefly.
     async fn resolve_route(&self, index: &str) -> Result<Arc<IndexRoute>, Status> {
         let want = index.trim();
-        // ---- Single-index (static) mode: byte-for-byte task-99 behavior. --------------------------
+        // ---- Single-index (static) mode. --------------------------
         if let Some(single) = &self.single {
             if let Some(served) = &self.served_index {
                 if !want.is_empty() && want != served {
@@ -556,7 +549,7 @@ impl Gateway {
     /// A multi-shard Gateway with an explicit key [`ShardRouter`] (e.g. partition routing).
     /// The router's shard count must match the node count.
     pub fn sharded_with(shards: Vec<Arc<dyn Node>>, router: ShardRouter) -> Self {
-        // Hard invariants (task-153 / L3): a Gateway with 0 shards (or a count-mismatched router)
+        // Hard invariants: a Gateway with 0 shards (or a count-mismatched router)
         // can't serve and would panic on `shards[…]` — fail loudly at construction, not later.
         assert!(!shards.is_empty(), "a Gateway needs at least one shard");
         assert_eq!(
@@ -567,7 +560,7 @@ impl Gateway {
         Self::with_routing(shards, router, None)
     }
 
-    /// A **windowed** Gateway (task-81): one Node per time-window shard, each tagged with its
+    /// A **windowed** Gateway: one Node per time-window shard, each tagged with its
     /// window id + event-time zone-map (`windows` aligns 1:1 with `shards`). A search carrying a
     /// range filter on the window or event-time field is pruned to the overlapping windows before
     /// scatter-gather; an unfiltered search fans out to all. The cross-shard merge is the same as
@@ -587,11 +580,11 @@ impl Gateway {
     }
 
     /// The shards a search must touch on `route`. Normally every shard; for a windowed route, only the
-    /// windows whose id + event zone-map overlap the query's time range (task-81). A query that
+    /// windows whose id + event zone-map overlap the query's time range. A query that
     /// doesn't parse or carries no relevant range bound prunes nothing (fans out to all) — pruning
     /// only ever *removes* windows that provably can't match, so results never change.
     fn target_shards(route: &IndexRoute, body: &SearchRequest) -> Vec<Arc<dyn Node>> {
-        // Partition-prune (task-199): on a non-windowed, partition-routed index, a search that
+        // Partition-prune: on a non-windowed, partition-routed index, a search that
         // AND-pins every (keyword) partition field can only match keys owned by one shard — route
         // there instead of broadcasting to all. Correct because Partition routing depends solely on
         // the partition (the identifier is dropped), so no matching key lives on another shard.
@@ -625,8 +618,8 @@ impl Gateway {
         (ord < rs.shards.len()).then_some(ord)
     }
 
-    /// The shards a `query_str` must touch on routing snapshot `rs` (shared by search and aggregate,
-    /// task-82): all shards on a normal route; on a windowed route only the windows whose id + event
+    /// The shards a `query_str` must touch on routing snapshot `rs` (shared by search and aggregate):
+    /// all shards on a normal route; on a windowed route only the windows whose id + event
     /// zone-map overlap the query's time range. An unparseable / unfiltered query prunes nothing.
     /// Pruning only removes windows that can't match, so a windowed aggregate over a time range gives
     /// the same result as scanning all windows — just cheaper.
@@ -652,10 +645,10 @@ impl Gateway {
         self
     }
 
-    /// Declare the index name this Gateway serves (task-99). A search whose `index` is non-empty and
+    /// Declare the index name this Gateway serves. A search whose `index` is non-empty and
     /// names a different index is then rejected with `NOT_FOUND` — the console can scope a query to a
     /// named index and trust it won't be silently answered by the wrong one. Without this the Gateway
-    /// ignores `SearchRequest.index` (serves every request, pre-task-99 behavior).
+    /// ignores `SearchRequest.index` and serves every request.
     pub fn serving(mut self, index: impl Into<String>) -> Self {
         let name = index.into();
         // The served index also becomes the empty-`index` default, so a bare request resolves to it.
@@ -668,20 +661,20 @@ impl Gateway {
     /// terminates (wiki/22-security). Once set, every query-surface call must carry a valid
     /// credential: the Gateway authenticates it, stamps the *verified* principal/tenant into
     /// the request (dropping any caller-asserted identity), then routes. Without this the
-    /// Gateway stays open and forwards caller-supplied identity verbatim (pre-M4 behavior).
+    /// Gateway stays open and forwards caller-supplied identity verbatim.
     pub fn with_authn(mut self, authn: SharedAuthn) -> Self {
         self.authn = Some(authn);
         self
     }
 
-    /// Mark that built-in password login is available (task-128) — surfaced via `/v1/config` so the
+    /// Mark that built-in password login is available — surfaced via `/v1/config` so the
     /// console renders a username/password form.
     pub fn with_password_login(mut self, on: bool) -> Self {
         self.password_login = on;
         self
     }
 
-    /// Whether built-in password login is available (task-128), for `/v1/config`.
+    /// Whether built-in password login is available, for `/v1/config`.
     pub fn password_login(&self) -> bool {
         self.password_login
     }
@@ -695,7 +688,7 @@ impl Gateway {
         self
     }
 
-    /// Tag a windowed Gateway with its **cold-tier** state (task-80): the set of `cold_windows`
+    /// Tag a windowed Gateway with its **cold-tier** state: the set of `cold_windows`
     /// served read-through + the shared read-through `cache`, surfaced by [`cold_status`](Self::cold_status).
     pub fn with_cold_tier(
         mut self,
@@ -709,7 +702,7 @@ impl Gateway {
         self
     }
 
-    /// Cold-tier status (task-80): each window's hot/cold tier + event zone-map, plus the shared
+    /// Cold-tier status: each window's hot/cold tier + event zone-map, plus the shared
     /// read-through cache's hit/miss/byte stats. `None` on a non-windowed Gateway.
     pub fn cold_status(&self) -> Option<ColdStatus> {
         let rs = self.routing();
@@ -735,8 +728,8 @@ impl Gateway {
         })
     }
 
-    /// Authenticate + authorize + **resolve the target route** for a read/write `method` in one step
-    /// (task-240): guards the request against the target index (so per-index RBAC sees it), then hands
+    /// Authenticate + authorize + **resolve the target route** for a read/write `method` in one step:
+    /// guards the request against the target index (so per-index RBAC sees it), then hands
     /// back the [`IndexRoute`] the handler operates on. `index` is the request's `index` field.
     ///
     /// Order: **authn → authz(target index) → resolve**. Authenticating first stamps the verified
@@ -767,7 +760,7 @@ impl Gateway {
         self.resolve_route(index).await
     }
 
-    /// The **verified identity** of the caller of `req`, for `GET /v1/me` (task-103). Authenticates
+    /// The **verified identity** of the caller of `req`, for `GET /v1/me`. Authenticates
     /// (but does not authorize — identity is not a gated operation) and returns the trusted
     /// principal/roles/profile. On an **open** gateway (no authenticator) returns the
     /// [anonymous](crate::authn::Verified::anonymous) shape, so the console shows "not signed in"
@@ -782,13 +775,13 @@ impl Gateway {
 
     /// Whether this gateway **requires authentication** ("closed mode") — true iff an authenticator
     /// is configured. The console reads this from `GET /v1/config` to decide whether to gate the app
-    /// behind a login screen (task-127); an open gateway (no authenticator) returns false and the
+    /// behind a login screen; an open gateway (no authenticator) returns false and the
     /// console runs un-gated, the zero-config trial/POC path.
     pub fn auth_required(&self) -> bool {
         self.authn.is_some()
     }
 
-    /// Number of shards this Gateway fronts for its single index. In multi-index mode (task-240) there
+    /// Number of shards this Gateway fronts for its single index. In multi-index mode there
     /// is no single shard count (each resolved index has its own), so this reports `0` — callers that
     /// log a shard count use it only for the single-index CLI paths.
     pub fn shard_count(&self) -> usize {
@@ -801,7 +794,7 @@ impl Gateway {
     /// Run a search. Single-shard: forward verbatim. Multi-shard: scatter to every shard,
     /// merge the hits into one global order (by sort tuple when sorted, else by score), apply
     /// the global `offset`/`limit`, and flag `partial` if any shard failed. Records the query
-    /// SLI (rate/errors/duration, task-39) around the whole call, so both the gRPC and REST
+    /// SLI (rate/errors/duration) around the whole call, so both the gRPC and REST
     /// fronts are covered through this one chokepoint.
     pub async fn search(
         &self,
@@ -818,13 +811,13 @@ impl Gateway {
         &self,
         mut req: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
-        // Authenticate + resolve the target index + authorize against it (task-99 scoping, task-240
+        // Authenticate + resolve the target index + authorize against it (index scoping,
         // multi-index routing + per-index RBAC), all before any routing — the shards must only ever
         // see a trusted identity, and a request naming an index this endpoint doesn't serve is
         // NOT_FOUND rather than silently answered by the wrong one. Empty `index` = the default index.
         let index = req.get_ref().index.clone();
         let route = self.guard_and_resolve("Search", &index, &mut req).await?;
-        // Page-fetch ceiling (task-72): reject a huge `offset + limit` at the boundary before any
+        // Page-fetch ceiling: reject a huge `offset + limit` at the boundary before any
         // shard builds the page — an unbounded `limit` is an easy OOM/DoS (S shards × a giant
         // page, buffered + sorted at the Gateway). Applies to single- and multi-shard alike.
         let fetch = (req.get_ref().offset as usize).saturating_add(req.get_ref().limit as usize);
@@ -835,7 +828,7 @@ impl Gateway {
             )));
         }
         // Target shards: all of them, or — for a windowed index — only the windows whose time
-        // range can match (task-81 pruning). A time filter outside every window matches nothing.
+        // range can match (window pruning). A time filter outside every window matches nothing.
         let shards_total = route.routing().shards.len() as u32;
         let shards = Self::target_shards(&route, req.get_ref());
         if shards.is_empty() {
@@ -864,12 +857,12 @@ impl Gateway {
         // `offset` paging (offset-merge) and `search_after` keyset scrolling (below) are both
         // supported across shards. Keyset paging needs a sort to define the keyset — a
         // score-ranked scroll has no stable cursor (scores aren't a keyset), so reject that —
-        // whether the sort is empty (pure relevance) or carries an explicit `_score` key (task-66).
+        // whether the sort is empty (pure relevance) or carries an explicit `_score` key.
         let sort_by_score = body.sort.iter().any(|s| s.field == SCORE_SORT_KEY);
         if !body.search_after.is_empty() && (body.sort.is_empty() || sort_by_score) {
             return Err(Status::invalid_argument(
                 "search_after requires a non-`_score` sort on a multi-shard index: score-ranked \
-                 keyset paging is unsupported because scores aren't a stable keyset (task-68).",
+                 keyset paging is unsupported because scores aren't a stable keyset.",
             ));
         }
         // Collapse folds groups across shards on its own scatter/merge path — it ignores
@@ -912,25 +905,25 @@ impl Gateway {
             let r = Request::from_parts(meta.clone(), Extensions::default(), shard_body.clone());
             let permit = self.fanout.clone();
             set.spawn(async move {
-                let _permit = permit.acquire_owned().await; // bound concurrent fan-out (task-199)
+                let _permit = permit.acquire_owned().await; // bound concurrent fan-out
                 shard.search(r).await
             });
         }
 
         // Gather under the deadline; a shard that errors, panics, or runs past the deadline (and
-        // is aborted) simply doesn't contribute a body — `failed` counts those (task-67/72).
+        // is aborted) simply doesn't contribute a body — `failed` counts those.
         let bodies = gather_responses(set, self.limits.deadline).await;
         let failed = total_shards - bodies.len();
         // Every shard failed/timed out ⇒ an honest error, not a success-shaped empty page a
-        // client could mistake for "no matches" (task-67).
+        // client could mistake for "no matches".
         if bodies.is_empty() {
             return Err(Status::unavailable(format!(
                 "all {total_shards} shards failed to respond"
             )));
         }
         // Each shard reports its true match count; sum them for the global total. Shards are
-        // normally disjoint (task-68), but during a **reshard** a moved bucket briefly lives on both
-        // its old and new shard (task-77), so the merged hits are deduped by key below. `total` still
+        // normally disjoint, but during a **reshard** a moved bucket briefly lives on both
+        // its old and new shard, so the merged hits are deduped by key below. `total` still
         // sums per-shard counts — it can over-count during that window, like the `partial` flag.
         let mut hits = Vec::new();
         let mut total_matches = 0u64;
@@ -958,7 +951,7 @@ impl Gateway {
         } else {
             hits = merge_field_sorted(hits, &body.sort);
         }
-        // Dedupe by composite key (task-77): keep the first (best-ranked) occurrence of each key, so
+        // Dedupe by composite key: keep the first (best-ranked) occurrence of each key, so
         // a doc that a reshard has on two shards mid-cutover is returned once. A no-op when shards
         // are disjoint (every key appears once).
         let mut seen = std::collections::HashSet::new();
@@ -974,11 +967,11 @@ impl Gateway {
         // `total` is the global match count (summed across shards), not the page size.
         let total = total_matches;
 
-        // Compose the **global** keyset cursor (task-68): for a sorted query that returned a
+        // Compose the **global** keyset cursor: for a sorted query that returned a
         // full page, the next page resumes strictly after the last returned hit's (sort tuple,
         // key). A short page means every shard is exhausted at this position → no cursor.
         // Score-ranked queries — pure relevance or an explicit `_score` key — have no stable
-        // keyset, so they never carry a cursor (task-66).
+        // keyset, so they never carry a cursor.
         let next_cursor =
             if !body.sort.is_empty() && !sort_by_score && limit > 0 && hits.len() == limit {
                 hits.last()
@@ -999,7 +992,7 @@ impl Gateway {
     }
 
     /// Multi-shard **collapse**: each shard collapses locally and returns its top-`limit` groups,
-    /// each carrying the group's top-hit sort values (task-68). The Gateway **folds** groups by
+    /// each carrying the group's top-hit sort values. The Gateway **folds** groups by
     /// value across shards — summing each group's `group_count` and keeping the globally-best hit
     /// (the first in the merged sort order) — then orders the folded groups and truncates to
     /// `limit`. Collapse ignores offset/keyset paging, so no cursor is produced.
@@ -1036,7 +1029,7 @@ impl Gateway {
             let r = Request::from_parts(meta.clone(), Extensions::default(), shard_body.clone());
             let permit = self.fanout.clone();
             set.spawn(async move {
-                let _permit = permit.acquire_owned().await; // bound concurrent fan-out (task-199)
+                let _permit = permit.acquire_owned().await; // bound concurrent fan-out
                 shard.search(r).await
             });
         }
@@ -1091,7 +1084,7 @@ impl Gateway {
         &self,
         mut req: Request<SuggestRequest>,
     ) -> Result<Response<SuggestResponse>, Status> {
-        // Resolve the target index (task-240): suggest now honors `SuggestRequest.index`, so a
+        // Resolve the target index: suggest honors `SuggestRequest.index`, so a
         // multi-index endpoint suggests over the named index (and per-index RBAC applies).
         let index = req.get_ref().index.clone();
         let route = self.guard_and_resolve("Suggest", &index, &mut req).await?;
@@ -1109,7 +1102,7 @@ impl Gateway {
             let r = Request::from_parts(meta.clone(), Extensions::default(), body.clone());
             let permit = self.fanout.clone();
             set.spawn(async move {
-                let _permit = permit.acquire_owned().await; // bound concurrent fan-out (task-199)
+                let _permit = permit.acquire_owned().await; // bound concurrent fan-out
                 shard.suggest(r).await
             });
         }
@@ -1147,7 +1140,7 @@ impl Gateway {
         &self,
         mut req: Request<GetByKeyRequest>,
     ) -> Result<Response<GetByKeyResponse>, Status> {
-        // Resolve the target index (task-240): hydration now honors `GetByKeyRequest.index`.
+        // Resolve the target index: hydration honors `GetByKeyRequest.index`.
         let index = req.get_ref().index.clone();
         let route = self.guard_and_resolve("GetByKey", &index, &mut req).await?;
         let rs = route.routing();
@@ -1156,7 +1149,7 @@ impl Gateway {
         }
         let (meta, _ext, body) = req.into_parts();
 
-        // Windowed (task-225): a key's coordinate carries no window selector, so we can't route it to a
+        // Windowed: a key's coordinate carries no window selector, so we can't route it to a
         // single shard the way ordinal hashing does. Broadcast every key to every window shard — each
         // WindowNode stamps its window id, the node's WindowedLookupService dispatches locally, and the
         // window that owns a key returns its row (others return none). Under the default COORDINATES
@@ -1175,7 +1168,7 @@ impl Gateway {
                     GetByKeyRequest {
                         keys: body.keys.clone(),
                         columns: body.columns.clone(),
-                        index: String::new(), // already routed to this index's shard (task-240)
+                        index: String::new(), // already routed to this index's shard
                         window: 0,            // stamped per-shard by the WindowNode
                     },
                 );
@@ -1207,7 +1200,7 @@ impl Gateway {
         }
 
         // Group requested keys by owning shard. A malformed coordinate is rejected loudly
-        // (task-67) — routing it to an arbitrary shard would surface as a spurious
+        // — routing it to an arbitrary shard would surface as a spurious
         // "not found" that hides the real cause (a bad key, not a missing row).
         let mut per_shard: Vec<Vec<Coordinates>> = vec![Vec::new(); rs.shards.len()];
         for coord in body.keys {
@@ -1238,13 +1231,13 @@ impl Gateway {
                 GetByKeyRequest {
                     keys,
                     columns: body.columns.clone(),
-                    index: String::new(), // already routed to this index's shard (task-240)
+                    index: String::new(), // already routed to this index's shard
                     window: 0,
                 },
             );
             let permit = self.fanout.clone();
             set.spawn(async move {
-                let _permit = permit.acquire_owned().await; // bound concurrent fan-out (task-199)
+                let _permit = permit.acquire_owned().await; // bound concurrent fan-out
                 shard.get_by_key(r).await
             });
         }
@@ -1265,7 +1258,7 @@ impl Gateway {
         }))
     }
 
-    /// Explain how a query scores one document (task-102). Routes to the **single owning shard**
+    /// Explain how a query scores one document. Routes to the **single owning shard**
     /// (by key), then fills the per-stage timings + shard counts the leaf can't know: `index_ms` is
     /// the Node's; `hydration_ms` is a best-effort PK lookup here; `total_ms` is the gateway wall
     /// time. `shards_scanned = 1` (only the owner is touched) of `shards_total`.
@@ -1273,7 +1266,7 @@ impl Gateway {
         &self,
         mut req: Request<ExplainRequest>,
     ) -> Result<Response<ExplainResponse>, Status> {
-        // Resolve the target index (task-99 scoping + task-240 routing/RBAC), authorized as a read.
+        // Resolve the target index (scoping + routing/RBAC), authorized as a read.
         let index = req.get_ref().index.clone();
         let route = self.guard_and_resolve("Search", &index, &mut req).await?;
         let started = std::time::Instant::now();
@@ -1296,7 +1289,7 @@ impl Gateway {
 
         // Best-effort hydration timing — the authoritative row the console shows alongside the
         // explanation (forwarding auth metadata so a tenant-scoped read still resolves). Carry the
-        // resolved index so the internal hydration routes to the same index (task-240).
+        // resolved index so the internal hydration routes to the same index.
         let gk = Request::from_parts(
             meta,
             Extensions::default(),
@@ -1329,7 +1322,7 @@ impl Gateway {
         &self,
         mut req: Request<AggregateRequest>,
     ) -> Result<Response<AggregateResponse>, Status> {
-        // Resolve the target index (task-240): aggregate now honors `AggregateRequest.index`.
+        // Resolve the target index: aggregate honors `AggregateRequest.index`.
         let index = req.get_ref().index.clone();
         let route = self
             .guard_and_resolve("Aggregate", &index, &mut req)
@@ -1350,10 +1343,10 @@ impl Gateway {
                 .map_err(|e| Status::invalid_argument(format!("aggs: {e}")))?
         };
         let aggs: Vec<(String, Agg)> = aggs.into_iter().collect();
-        // Reject a malformed spec at the boundary, before fanning out (task-75).
+        // Reject a malformed spec at the boundary, before fanning out.
         growlerdb_core::validate_aggs(&aggs).map_err(Status::invalid_argument)?;
 
-        // Windowed: prune to the windows whose time range can match the query (task-82); non-windowed
+        // Windowed: prune to the windows whose time range can match the query; non-windowed
         // keeps every shard. A windowed query filtered beyond *all* windows prunes to none → a real,
         // empty aggregation (zero counts), not a failure.
         let shards = Self::windows_matching(&route.routing(), &body.query);
@@ -1384,21 +1377,21 @@ impl Gateway {
                 AggregateRequest {
                     query: body.query.clone(),
                     aggs: body.aggs.clone(),
-                    index: String::new(), // already routed to this index's shard (task-240)
+                    index: String::new(), // already routed to this index's shard
                     partial: true,
                     window: 0, // a WindowNode stamps the real selector; ignored otherwise
                 },
             );
             let permit = self.fanout.clone();
             set.spawn(async move {
-                let _permit = permit.acquire_owned().await; // bound concurrent fan-out (task-199)
+                let _permit = permit.acquire_owned().await; // bound concurrent fan-out
                 shard.aggregate(r).await
             });
         }
         let bodies = gather_responses(set, self.limits.deadline).await;
         let failed = total_shards - bodies.len();
         // Every shard failed/timed out ⇒ error, not a zero-count aggregation that reads as a
-        // real (but empty) result (task-67).
+        // real (but empty) result.
         if bodies.is_empty() {
             return Err(Status::unavailable(format!(
                 "all {total_shards} shards failed to respond"
@@ -1428,7 +1421,7 @@ impl Gateway {
         &self,
         mut req: Request<DescribeIndexRequest>,
     ) -> Result<Response<DescribeIndexResponse>, Status> {
-        // Resolve the target index (task-240): describe now routes by `DescribeIndexRequest.index`.
+        // Resolve the target index: describe routes by `DescribeIndexRequest.index`.
         let index = req.get_ref().index.clone();
         let route = self
             .guard_and_resolve("DescribeIndex", &index, &mut req)
@@ -1446,7 +1439,7 @@ impl Gateway {
             let r = Request::from_parts(meta.clone(), Extensions::default(), body.clone());
             let permit = self.fanout.clone();
             set.spawn(async move {
-                let _permit = permit.acquire_owned().await; // bound concurrent fan-out (task-199)
+                let _permit = permit.acquire_owned().await; // bound concurrent fan-out
                 shard.describe_index(r).await
             });
         }
@@ -1460,14 +1453,14 @@ impl Gateway {
         }
         let mut merged = IndexStats::default();
         let mut any = false;
-        // Keep each shard's stats as the per-shard breakdown so load skew is observable (task-73).
+        // Keep each shard's stats as the per-shard breakdown so load skew is observable.
         let mut per_shard = Vec::with_capacity(bodies.len());
         for body in bodies {
             if let Some(s) = body.stats {
                 if !any {
                     merged.name = s.name.clone();
                     merged.checkpoint = s.checkpoint.clone();
-                    merged.time_fields = s.time_fields.clone(); // same mapping on every shard (task-101)
+                    merged.time_fields = s.time_fields.clone(); // same mapping on every shard
                     any = true;
                 }
                 merged.num_docs += s.num_docs;
@@ -1484,7 +1477,7 @@ impl Gateway {
         }))
     }
 
-    /// Reindex an index: rebuild it from source and durably swap it live (task-71). Unlike the
+    /// Reindex an index: rebuild it from source and durably swap it live. Unlike the
     /// scatter-gather read RPCs, reindex is a **write-fenced mutation** that must run on the single
     /// Node owning the shard. We route it only for a **single-shard** gateway (the embedded
     /// `serve` deployment the console fronts); a distributed multi-shard reindex needs orchestration
@@ -1510,7 +1503,7 @@ impl Gateway {
         rs.shards[0].reindex_index(req).await
     }
 
-    /// Plan (and optionally apply in-place) an index-definition change (task-26): diff a candidate
+    /// Plan (and optionally apply in-place) an index-definition change: diff a candidate
     /// definition vs the served one, reporting reindex-forcing vs in-place changes and, with
     /// `apply`, persisting the in-place ones live. A write-targeted mutation like reindex, so it
     /// routes only for a **single-shard** gateway (the embedded `serve` the console fronts); a
@@ -1534,7 +1527,7 @@ impl Gateway {
         rs.shards[0].alter_index(req).await
     }
 
-    /// Compact the served shard's segments (task-109). Single-shard only (like reindex); a
+    /// Compact the served shard's segments. Single-shard only (like reindex); a
     /// multi-shard gateway returns `Unimplemented` (compact each shard's Node directly).
     pub async fn compact_index(
         &self,
@@ -1554,7 +1547,7 @@ impl Gateway {
         rs.shards[0].compact_index(req).await
     }
 
-    /// Run a backup of the served shard (task-109). Single-shard only.
+    /// Run a backup of the served shard. Single-shard only.
     pub async fn backup_index(
         &self,
         mut req: Request<BackupIndexRequest>,
@@ -1573,7 +1566,7 @@ impl Gateway {
         rs.shards[0].backup_index(req).await
     }
 
-    /// Read the served shard's backup status (task-109). Single-shard.
+    /// Read the served shard's backup status. Single-shard.
     pub async fn backup_status(
         &self,
         mut req: Request<BackupStatusRequest>,
@@ -1588,12 +1581,10 @@ impl Gateway {
 }
 
 /// Drain a scatter's [`JoinSet`](tokio::task::JoinSet) into the successful response bodies,
-/// enforcing an optional **deadline** ([task-72]): on expiry, abort the outstanding shard tasks
+/// enforcing an optional **deadline**: on expiry, abort the outstanding shard tasks
 /// and return whatever arrived. A shard that errors, panics, or is aborted simply doesn't
 /// contribute a body — so the caller derives `failed = spawned - bodies.len()` and flags
 /// `partial` (or returns `UNAVAILABLE` when nothing arrived).
-///
-/// [task-72]: ../../../backlog/tasks/task-72%20-%20Gateway%20resiliency%20deadlines%20and%20limit%20guards.md
 async fn gather_responses<T: Send + 'static>(
     mut set: tokio::task::JoinSet<Result<Response<T>, Status>>,
     deadline: Option<Duration>,
@@ -1951,7 +1942,7 @@ mod tests {
         // total is the global match count (2 + 3 across shards), not the page size (3).
         assert_eq!(resp.total, 5);
         assert!(!resp.partial);
-        // Both shards were scanned (no pruning on an unfiltered query), out of 2 total (task-133).
+        // Both shards were scanned (no pruning on an unfiltered query), out of 2 total.
         assert_eq!(resp.shards_scanned, 2);
         assert_eq!(resp.shards_total, 2);
 
@@ -1971,7 +1962,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn serving_scopes_search_to_the_named_index() {
-        // A Gateway that declares it serves `events` (task-99).
+        // A Gateway that declares it serves `events`.
         let node = Arc::new(ShardNode {
             hits: vec![("a1", 9.0)],
             num_docs: 1,
@@ -1986,7 +1977,7 @@ mod tests {
             })
         };
 
-        // Empty index → the served index (back-compat); matching name → served.
+        // Empty index → the served index; matching name → served.
         assert_eq!(gw.search(q("")).await.unwrap().into_inner().hits.len(), 1);
         assert_eq!(
             gw.search(q("events"))
@@ -2003,7 +1994,7 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::NotFound);
         assert!(err.message().contains("other"));
 
-        // Without `serving`, the index field is ignored (pre-task-99 behavior).
+        // Without `serving`, the index field is ignored.
         let open = Gateway::new(Arc::new(ShardNode {
             hits: vec![("a1", 9.0)],
             num_docs: 1,
@@ -2517,7 +2508,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn swap_routing_hot_reloads_the_topology() {
         use growlerdb_core::{BucketMap, CompositeKey, RoutingStrategy, ShardRouter, Value};
-        // A running Gateway picks up a reshard's new map + node set without a restart (task-77).
+        // A running Gateway picks up a reshard's new map + node set without a restart.
         let (t0, t1) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let ids: Vec<String> = (0..200).map(|i| format!("k{i}")).collect();
         let mut expected = ids.clone();
@@ -2562,7 +2553,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn overlapping_shards_dedupe_during_a_reshard_window() {
-        // Mid-cutover a moved bucket's docs live on both its old and new shard (task-77). A broadcast
+        // Mid-cutover a moved bucket's docs live on both its old and new shard. A broadcast
         // search hits both; the Gateway must return each doc once, not twice.
         let (ta, tb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let shared: Vec<String> = vec!["x".into(), "y".into(), "z".into()];
@@ -2591,7 +2582,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reshard_2_to_3_keeps_every_doc_findable_exactly_once() {
         use growlerdb_core::{BucketMap, RoutingStrategy, ShardRouter};
-        // The in-process cutover (task-77): a real multi-shard Gateway over real shards. Build the
+        // The in-process cutover: a real multi-shard Gateway over real shards. Build the
         // 2-shard layout, reshard to 3 by rebuilding shards split under the reassigned map, and
         // assert every doc is searchable exactly once before AND after — no lost/duplicate/missing
         // reads across the cutover.
@@ -2667,7 +2658,7 @@ mod tests {
         assert_eq!(counts.get("z"), Some(&1));
     }
 
-    // ---- task-67: fail-loud multi-shard guards ----------------------------------
+    // ---- fail-loud multi-shard guards ----------------------------------
 
     fn search_req() -> SearchRequest {
         SearchRequest {
@@ -2679,7 +2670,7 @@ mod tests {
 
     /// A Node that **honors** `offset`/`limit` over its (pre-sorted, score-desc) hits and
     /// records the window it was asked for — so a test can prove the Gateway rewrites the
-    /// per-shard request to `offset=0, limit=offset+limit` (task-68 offset-merge), not forward
+    /// per-shard request to `offset=0, limit=offset+limit` (offset-merge), not forward
     /// the global window verbatim (which a real shard would apply locally → wrong page).
     struct PagingNode {
         hits: Vec<(&'static str, f64)>,
@@ -2814,7 +2805,7 @@ mod tests {
     /// A Node that faithfully honors a `search_after` keyset over its `(id, rank)` hits: it
     /// sorts locally by the rank key (composite-key tiebreaker), resumes strictly after the
     /// decoded cursor, and returns up to `limit` hits carrying their sort values — exactly what
-    /// the Gateway's cross-shard keyset scroll relies on (task-68).
+    /// the Gateway's cross-shard keyset scroll relies on.
     struct KeysetNode {
         hits: Vec<(&'static str, f64)>,
     }
@@ -2968,7 +2959,7 @@ mod tests {
 
     /// A Node that returns pre-collapsed groups: one hit per `(group, top_rank, count)`, carrying
     /// the group value, its local count, and the top hit's sort value — what a real shard emits
-    /// for a collapse query (task-68). Honors the request `limit` (local top-k groups).
+    /// for a collapse query. Honors the request `limit` (local top-k groups).
     struct CollapseNode {
         groups: Vec<(&'static str, f64, u64)>,
     }
@@ -3112,7 +3103,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
-        // An explicit `_score` sort key is also not a stable keyset (task-66), so
+        // An explicit `_score` sort key is also not a stable keyset, so
         // search_after over it is rejected the same way.
         let err = gw
             .search(Request::new(SearchRequest {
@@ -3197,7 +3188,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn describe_exposes_per_shard_stats_for_skew() {
         // Two lopsided shards; describe sums the total AND keeps the per-shard breakdown so the
-        // skew (100 vs 5) is observable (task-73).
+        // skew (100 vs 5) is observable.
         let a = Arc::new(ShardNode {
             hits: vec![],
             num_docs: 100,
@@ -3366,7 +3357,7 @@ mod tests {
         assert!(!results["by_cat"]["buckets"].as_array().unwrap().is_empty());
     }
 
-    // ---- task-72: deadlines + limit guards --------------------------------------
+    // ---- deadlines + limit guards --------------------------------------
 
     /// A Node whose `search` sleeps past any sane deadline — stands in for a hung/slow shard.
     struct SlowNode {
@@ -3491,7 +3482,7 @@ mod tests {
         assert_eq!(resp.hits.len(), 2);
     }
 
-    // ---- AuthN at the Gateway boundary (task-35 slice 2) ------------------------------
+    // ---- AuthN at the Gateway boundary ------------------------------
 
     use std::sync::Mutex;
 
@@ -3590,7 +3581,7 @@ mod tests {
 
     #[test]
     fn auth_required_reflects_whether_an_authenticator_is_configured() {
-        // task-127: /v1/config's source — open (no authenticator) is not gated; configured is.
+        // /v1/config's source — open (no authenticator) is not gated; configured is.
         assert!(!Gateway::new(Arc::new(FakeNode)).auth_required());
         assert!(Gateway::new(Arc::new(FakeNode))
             .with_authn(Arc::new(StubAuthn))
@@ -3599,7 +3590,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn identity_is_anonymous_when_open_and_verified_with_authn() {
-        // task-103: /v1/me's source. Open gateway → anonymous (empty principal).
+        // /v1/me's source. Open gateway → anonymous (empty principal).
         let open = Gateway::new(Arc::new(FakeNode));
         assert!(open
             .identity(&mut Request::new(()))
@@ -3651,7 +3642,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn open_gateway_strips_caller_asserted_identity() {
-        // task-147 / F2: with no authenticator the Gateway must NOT trust caller-supplied identity —
+        // With no authenticator the Gateway must NOT trust caller-supplied identity —
         // a forged principal/tenant is stripped, so it can't drive tenant scoping or RBAC. (Closed
         // mode stamps the *verified* identity instead — see `with_authn_a_valid_credential_...`.)
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -3668,7 +3659,7 @@ mod tests {
         );
     }
 
-    // ---- RBAC at the Gateway (task-36) ------------------------------------------------
+    // ---- RBAC at the Gateway ------------------------------------------------
 
     /// An authenticator that admits any credential as `alice` with fixed roles.
     struct RolesAuthn(Vec<String>);
@@ -3719,7 +3710,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn windowed_gateway_prunes_scatter_to_matching_windows() {
         use growlerdb_core::WindowGranularity;
-        const DAY: i64 = 86_400_000_000; // one day in micros (canonical window scale, task-116)
+        const DAY: i64 = 86_400_000_000; // one day in micros (canonical window scale)
         let day = |n: i64| n * DAY;
 
         // One Node per window, each returning a distinct hit. Because ShardNode ignores the query,
@@ -3788,7 +3779,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn swap_windowed_makes_a_new_window_queryable_and_prunable() {
-        // task-219: a running windowed gateway learns a newly-created window via swap_windowed —
+        // A running windowed gateway learns a newly-created window via swap_windowed —
         // the new window becomes queryable + time-prunable with no restart.
         use growlerdb_core::WindowGranularity;
         const DAY: i64 = 86_400_000_000;
@@ -3861,7 +3852,7 @@ mod tests {
     async fn cold_status_reports_per_window_tier_and_cache() {
         use growlerdb_core::WindowGranularity;
         use growlerdb_index::RangeCache;
-        const DAY: i64 = 86_400_000_000; // one day in micros (canonical window scale, task-116)
+        const DAY: i64 = 86_400_000_000; // one day in micros (canonical window scale)
         let day = |n: i64| n * DAY;
         let node = |id: &'static str| {
             Arc::new(ShardNode {
@@ -3900,7 +3891,7 @@ mod tests {
             .is_none());
     }
 
-    // ---- Multi-index routing (task-240) -----------------------------------------------
+    // ---- Multi-index routing -----------------------------------------------
 
     /// A Node whose `search`/`describe` report a fixed index tag, so a test can tell *which* index's
     /// route answered a request. `describe` echoes the tag as the stats name; `search` returns one hit
@@ -4066,7 +4057,7 @@ mod tests {
         assert_eq!(resp.stats.unwrap().name, "index-a");
     }
 
-    // ---- Per-index RBAC + tenant isolation through multi-index (task-240) --------------
+    // ---- Per-index RBAC + tenant isolation through multi-index --------------
 
     /// An authenticator that admits any credential as `alice` with fixed roles + an index allowlist —
     /// exercises per-index RBAC end to end (the allowlist stamped into metadata, read back by authz).
@@ -4131,7 +4122,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn per_index_rbac_unrestricted_token_reaches_any_index() {
-        // A token with no index allowlist (empty) may reach any resolved index (back-compat).
+        // A token with no index allowlist (empty) may reach any resolved index.
         let authn: SharedAuthn = Arc::new(ScopedAuthn {
             roles: vec!["reader".into()],
             indexes: Vec::new(),

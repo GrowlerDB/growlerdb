@@ -22,7 +22,7 @@ const INSTANCE_NAMES: Record<string, string> = {
   lgtm: 'Observability (LGTM)',
 };
 
-// Kubernetes scrape-job names (chart default) → role (task-226). In k8s a target's `instance` is a
+// Kubernetes scrape-job names (chart default) → role. In k8s a target's `instance` is a
 // pod IP (not a role) and the `up` sample carries no `namespace` label, so the roll-up can't match on
 // either — it matches on the `job` instead. Without this the header health reads "Unknown" on every
 // k8s deploy even when all targets are up.
@@ -38,12 +38,12 @@ export function friendlyInstance(instance: string): string {
   return INSTANCE_NAMES[host] ?? host;
 }
 
-// The deploy namespace GrowlerDB's scrape targets carry in Kubernetes (chart default). Configurable
-// scoping is task-120; for now this is the chart's default namespace.
+// The deploy namespace GrowlerDB's scrape targets carry in Kubernetes (chart default). This is the
+// chart's default namespace; scoping it is not yet configurable.
 const GROWLERDB_NAMESPACE = 'growlerdb';
 
 /** Whether a Prometheus `up` sample belongs to **GrowlerDB** — so the header health roll-up isn't
- *  dragged Down by unrelated targets on a **shared** Prometheus/Mimir (task-120). A target counts if
+ *  dragged Down by unrelated targets on a **shared** Prometheus/Mimir. A target counts if
  *  its instance maps to a known GrowlerDB role (the Compose stack names targets `controlplane:9101`
  *  …) **or** it lives in the GrowlerDB namespace (Kubernetes, where instances are pod IPs). */
 export function isGrowlerdbTarget(s: InstantSample): boolean {
@@ -88,7 +88,7 @@ const STATE_HEALTH: Record<string, Health> = {
   unknown: 'unknown',
   no_primary: 'down',
   unreachable: 'down',
-  // The source was recreated (task-114): the index is stale and serving read-only. The cluster is
+  // The source was recreated: the index is stale and serving read-only. The cluster is
   // impaired but not down (search still answers) — surface it as Degraded; the Ingestion screen
   // carries the specific "source recreated — reindex" detail.
   source_recreated: 'warn',

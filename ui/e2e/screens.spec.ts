@@ -1,9 +1,8 @@
 import { test, expect } from '@playwright/test';
 import { installMocks } from './mocks';
 
-// The Observability redesign (task-208) folds the old standalone Ingestion screen into a sub-tab and
-// organises the SLIs into sections (Search · Runtime · Data · Ingestion · Source · Access) with a
-// persistent Alerts strip. `/ingestion` now redirects here.
+// The Observability screen organises the SLIs into sections (Search · Runtime · Data · Ingestion ·
+// Source · Access) with a persistent Alerts strip. `/ingestion` redirects here.
 
 test.describe('Observability', () => {
   test('renders the Search section — hero + SLI cards, no alerts firing', async ({ page }) => {
@@ -19,7 +18,7 @@ test.describe('Observability', () => {
     // Alerts strip: server rules answered (empty) ⇒ the "Server rules" badge + nothing firing.
     await expect(page.getByText('Server rules')).toBeVisible();
     await expect(page.getByText('No alerts firing')).toBeVisible();
-    // The Grafana deep-link (runtime-provided URL, task-140).
+    // The Grafana deep-link (runtime-provided URL).
     await expect(page.getByRole('link', { name: /Open in Grafana/ })).toBeVisible();
     // Metrics resolved, so the error banner is absent.
     await expect(page.getByRole('alert')).toHaveCount(0);
@@ -32,7 +31,7 @@ test.describe('Observability', () => {
     const tabs = page.getByRole('tab');
     await expect(tabs).toHaveText(['Search', 'Runtime', 'Data', 'Ingestion', 'Source', 'Access']);
 
-    // Source section surfaces the source-health cards (task-197 gauges).
+    // Source section surfaces the source-health cards.
     await page.getByRole('tab', { name: 'Source' }).click();
     await expect(page.getByText('Avg file size')).toBeVisible();
     await expect(page.getByText('Data files', { exact: true })).toBeVisible();
@@ -52,14 +51,14 @@ test.describe('Observability', () => {
     await expect(dialog).toHaveCount(0);
   });
 
-  test('hides the Grafana link when no URL is configured (task-140)', async ({ page }) => {
+  test('hides the Grafana link when no URL is configured', async ({ page }) => {
     await installMocks(page, { config: { json: { auth_required: false } } });
     await page.goto('/observability');
     await expect(page.getByRole('heading', { name: 'Observability' })).toBeVisible();
     await expect(page.getByRole('link', { name: /Open in Grafana/ })).toHaveCount(0);
   });
 
-  test('renders server-side firing alerts in the strip (task-111)', async ({ page }) => {
+  test('renders server-side firing alerts in the strip', async ({ page }) => {
     await installMocks(page, {
       alerts: {
         json: {
@@ -88,9 +87,7 @@ test.describe('Observability', () => {
     await expect(page.getByText('No alerts firing')).toHaveCount(0);
   });
 
-  test('falls back to local SLI checks when the alerts proxy is down (task-111)', async ({
-    page,
-  }) => {
+  test('falls back to local SLI checks when the alerts proxy is down', async ({ page }) => {
     await installMocks(page, { alerts: { status: 502, json: {} } });
     await page.goto('/observability');
     await expect(page.getByText('Local checks')).toBeVisible();

@@ -1,5 +1,5 @@
 {
-  // markdownlint config (task-158). Prose-stylistic rules are off; structural rules stay on to
+  // markdownlint config. Prose-stylistic rules are off; structural rules stay on to
   // catch malformed Markdown. This is the initial baseline — tighten as docs are cleaned up.
   "config": {
     "MD013": false, // line-length — prose wraps freely

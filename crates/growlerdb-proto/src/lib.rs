@@ -3,12 +3,10 @@
 //! convention, and a minimal `System` (health/version) service that proves the
 //! toolchain.
 //!
-//! The proto is canonical; breaking changes bump the package to `growlerdb.v2` ([D25]).
-//! Real services (Write — task-12; Engine API — task-19) add their own protos and
-//! grow this surface per service.
+//! The proto is canonical; breaking changes bump the package to `growlerdb.v2`.
+//! Real services (Write, Engine API) add their own protos and grow this surface per service.
 //!
 //! [Design 08]: ../../../design/08-schemas.md
-//! [D25]: ../../../wiki/21-decisions.md
 
 use tonic::{Request, Response, Status};
 
@@ -247,10 +245,10 @@ impl TryFrom<v1::DocBatch> for growlerdb_core::CommitBatch {
             .ok_or(MissingField("DocBatch.checkpoint"))?
             .try_into()?;
         // `from_checkpoint` is optional on the wire (absent = from the start of the changelog); the
-        // Node's continuity guard (task-194) only engages when it is present.
+        // Node's continuity guard only engages when it is present.
         let from_checkpoint = batch.from_checkpoint.map(TryInto::try_into).transpose()?;
         // `safe_checkpoint` is the connector's resume floor; absent = no floor yet, so the write path
-        // prunes nothing from the idempotency store (task-204).
+        // prunes nothing from the idempotency store.
         let safe_checkpoint = batch.safe_checkpoint.map(TryInto::try_into).transpose()?;
         Ok(
             growlerdb_core::CommitBatch::new(ops, checkpoint, batch.batch_id)
@@ -371,7 +369,7 @@ mod tests {
             cp
         );
 
-        // task-196: the lineage sequence number rides the same message.
+        // The lineage sequence number rides the same message.
         let ordered = growlerdb_core::SourceCheckpoint::iceberg_ordered(99, 7);
         let wire: v1::SourceCheckpoint = ordered.clone().into();
         assert_eq!(wire.iceberg_sequence_number, 7);

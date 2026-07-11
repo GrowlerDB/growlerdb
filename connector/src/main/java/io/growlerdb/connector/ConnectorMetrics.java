@@ -6,12 +6,10 @@ import io.prometheus.client.exporter.HTTPServer;
 import java.io.IOException;
 
 /**
- * The connector's own Prometheus metrics (task-194 AC6). Before this, the ingest-side signals —
- * per-trigger rows read vs. expected, per-shard acks, stream restarts, write retries, under-read
- * stalls — were {@code printf} only, so once the container's 10&nbsp;MB log rotated past the window
- * (Spark INFO floods it) the evidence was gone. That blindness is exactly what let the silent 6-row
- * loss go unexplained. These are counters/gauges instead, scraped off a tiny in-process HTTP server,
- * so they survive log rotation and drive alerts (e.g. {@code rate(under_reads_total) > 0}).
+ * The connector's own Prometheus metrics: per-trigger rows read vs. expected, per-shard acks, stream
+ * restarts, write retries, under-read stalls. Counters/gauges scraped off a tiny in-process HTTP
+ * server, so the ingest-side signals survive log rotation (Spark INFO floods it) and drive alerts
+ * (e.g. {@code rate(under_reads_total) > 0}).
  *
  * <p>Static holder to fit the connector's static/lambda call sites without threading an object
  * through every seam. Metric updates are always cheap and safe to call; the HTTP endpoint is started
@@ -44,7 +42,7 @@ public final class ConnectorMetrics {
   static final Counter UNDER_READS =
       Counter.build()
           .name("growlerdb_connector_under_reads_total")
-          .help("Trigger windows the expected-row-count gate refused as an under-read (task-194).")
+          .help("Trigger windows the expected-row-count gate refused as an under-read.")
           .register();
 
   static final Counter SHARD_ACKS =
@@ -57,7 +55,7 @@ public final class ConnectorMetrics {
   static final Counter STREAM_RESTARTS =
       Counter.build()
           .name("growlerdb_connector_stream_restarts_total")
-          .help("In-process streaming-query restarts after a micro-batch failure (task-144).")
+          .help("In-process streaming-query restarts after a micro-batch failure.")
           .register();
 
   static final Counter WRITE_RETRIES =

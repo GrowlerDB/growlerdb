@@ -19,7 +19,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * Test double of one Node shard's Write service that ENFORCES the ingest contract — unlike
  * {@code RecordingWrite}, which records blindly. Mirrors the Rust {@code Shard::continuity}
- * (task-196 window-covering by sequence number, exact-match fallback without one), batch-id
+ * (window-covering by sequence number, exact-match fallback without one), batch-id
  * dedup, the safe-checkpoint prune (so tests can prove the set survives WITHOUT dedup records),
  * and {@code GetCheckpoint} with the stored sequence. Used by the connector-set tests to catch
  * a guard violation as a loud {@code FAILED_PRECONDITION}, exactly like the real node.
@@ -112,7 +112,7 @@ final class FakeShardNode extends WriteGrpc.WriteImplBase {
     GAP
   }
 
-  /** Mirror of the Rust {@code Shard::continuity} decision (store.rs, task-196). */
+  /** Mirror of the Rust {@code Shard::continuity} decision (store.rs). */
   private Decision continuity(DocBatch batch) {
     if (current == null) {
       return Decision.APPLY;
@@ -138,7 +138,7 @@ final class FakeShardNode extends WriteGrpc.WriteImplBase {
       }
       return (fromSeq > 0 && fromSeq <= current.seq()) ? Decision.APPLY : Decision.GAP;
     }
-    // Legacy exact-match fallback.
+    // Exact-match fallback when no sequence number is available.
     if (!batch.hasFromCheckpoint()) {
       return Decision.APPLY;
     }

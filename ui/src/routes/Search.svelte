@@ -34,7 +34,7 @@
   import Dropdown from '../lib/components/Dropdown.svelte';
   import DocumentDrawer from './DocumentDrawer.svelte';
 
-  // Collapsible filters rail (design-QA T9): the collapsed state persists across reloads via prefs.
+  // Collapsible filters rail: the collapsed state persists across reloads via prefs.
   const RAIL_KEY = 'growlerdb.searchRailCollapsed';
   let railCollapsed = $state(read(RAIL_KEY) === '1');
   function toggleRail() {
@@ -51,9 +51,9 @@
   let hits = $state<SearchHit[]>([]);
   let total = $state(0);
   let partial = $state(false);
-  let partialDismissed = $state(false); // task-133: the partial-results banner is dismissible
-  let elapsedMs = $state<number | null>(null); // client-measured query round-trip (task-133)
-  let shardsScanned = $state(0); // shards the Gateway queried (task-133); 0 = bare Node, no scope
+  let partialDismissed = $state(false); // the partial-results banner is dismissible
+  let elapsedMs = $state<number | null>(null); // client-measured query round-trip
+  let shardsScanned = $state(0); // shards the Gateway queried; 0 = bare Node, no scope
   let shardsTotal = $state(0); // the index's full shard count
   let offset = $state(0);
   let loading = $state(false);
@@ -62,13 +62,13 @@
   let selected = $state<SearchHit | null>(null);
   let saved = $state<SavedSearch[]>([]);
 
-  // Per-index scoping + sort + keyset paging (task-99).
+  // Per-index scoping + sort + keyset paging.
   let indexOptions = $state<string[]>([]);
   let scopeIndex = $state(''); // '' = the index this endpoint serves
-  const SEARCH_INDEX_KEY = 'growlerdb.searchIndex'; // remember the last chosen index (task-131)
+  const SEARCH_INDEX_KEY = 'growlerdb.searchIndex'; // remember the last chosen index
   let sortField = $state(''); // '' = relevance (_score)
   let cursor = $state<string | undefined>(undefined); // next_cursor for keyset "Load more"
-  // Monotonic search generation (task-153 / I9): overlapping searches (typing + facet/sort changes)
+  // Monotonic search generation: overlapping searches (typing + facet/sort changes)
   // race, so a slow earlier response must not clobber a fresh later one. Each run bumps it; a
   // response is applied only if it's still the latest. Not reactive — a plain guard.
   let searchSeq = 0;
@@ -85,7 +85,7 @@
     return [...names].sort();
   });
 
-  // Option lists for the styled dropdowns (design-QA T5).
+  // Option lists for the styled dropdowns.
   const scopeOptions = $derived([
     { value: '', label: t('search.allIndexes') },
     ...indexOptions.map((ix) => ({ value: ix, label: ix })),
@@ -94,11 +94,11 @@
     { value: '', label: t('search.sortScore') },
     ...sortableFields.map((f) => ({ value: f, label: f })),
   ]);
-  // The active query syntax, shown as a pill inside the query field (design-QA T10).
+  // The active query syntax, shown as a pill inside the query field.
   const syntaxLabel = $derived(syntax === 'kql' ? t('search.kql') : t('search.lucene'));
 
-  // Time filter (task-101): the index's DATE columns + the chosen field/range. A resolved range is
-  // ANDed into the query as `field:[fromUs TO toUs]` in canonical epoch **micros** (task-112) — the
+  // Time filter: the index's DATE columns + the chosen field/range. A resolved range is
+  // ANDed into the query as `field:[fromUs TO toUs]` in canonical epoch **micros** — the
   // unit DATE columns are indexed/range-queried in — which the gateway also uses to prune windows.
   let timeFields = $state<string[]>([]);
   let timeField = $state('');
@@ -146,7 +146,7 @@
     run(0);
   }
 
-  /** Load the selected index's DATE columns so the time filter can list them (task-101). The
+  /** Load the selected index's DATE columns so the time filter can list them. The
    *  backend populates `time_fields` on every describe path — including the default-served index
    *  (empty `scopeIndex`) — so an empty list means the index genuinely has no DATE column and the
    *  time filter stays (correctly) disabled, rather than us re-deriving it from the mapping. */
@@ -166,8 +166,8 @@
     } catch {
       indexOptions = []; // no control plane fronted here → scope selector hidden; serve default
     }
-    // Restore the last chosen index (task-131), but only if it still exists. Otherwise default to the
-    // first served index (task-248): a multi-index endpoint rejects an index-less search, so the UI
+    // Restore the last chosen index, but only if it still exists. Otherwise default to the
+    // first served index: a multi-index endpoint rejects an index-less search, so the UI
     // must never send one — pick a real index rather than show "index required". (Empty options = a
     // single-index endpoint with no control plane fronted → leave '' to use the served default.)
     const savedIndex = read(SEARCH_INDEX_KEY);
@@ -186,7 +186,7 @@
     { value: 'kql', label: t('search.kql') },
   ];
 
-  // Query autocomplete (task-88): suggest values for the `field:prefix` token being typed.
+  // Query autocomplete: suggest values for the `field:prefix` token being typed.
   let completions = $state<Suggestion[]>([]);
   let acActive = $state(-1); // highlighted completion (-1 = none)
   let acSeq = 0; // request race guard
@@ -208,7 +208,7 @@
     }
     const seq = ++acSeq;
     acTimer = setTimeout(async () => {
-      // Scope autocomplete to the selected index on a multi-index endpoint (task-240).
+      // Scope autocomplete to the selected index on a multi-index endpoint.
       const results = await suggest(token.field, token.prefix, 8, scopeIndex || undefined);
       if (seq !== acSeq) return; // a newer keystroke superseded this request
       completions = results;
@@ -242,7 +242,7 @@
   /** A facet selection, rendered as a removable chip and ANDed into the query as a filter clause. */
   let filters = $state<{ field: string; value: string }[]>([]);
   let facetGroups = $state<FacetGroup[]>([]);
-  let collapsedFacets = $state<Set<string>>(new Set()); // task-133: per-group collapse
+  let collapsedFacets = $state<Set<string>>(new Set()); // per-group collapse
   function toggleFacetGroup(field: string) {
     const next = new Set(collapsedFacets);
     if (next.has(field)) next.delete(field);
@@ -259,8 +259,8 @@
     const parts: string[] = [];
     if (query.trim()) parts.push(`(${query.trim()})`);
     const r = timeRange();
-    // DATE columns are indexed in epoch micros (task-112); timeRange() is epoch ms → ×1000. Pruned
-    // server-side (task-81).
+    // DATE columns are indexed in epoch micros; timeRange() is epoch ms → ×1000. Pruned
+    // server-side.
     if (r) parts.push(`${timeField}:[${r.from * 1000} TO ${r.to * 1000}]`);
     for (const f of filters) parts.push(clauseOf(f));
     return parts.join(' AND ');
@@ -286,7 +286,7 @@
         syntax,
         index: scopeIndex || undefined,
         sort: sortKeys,
-        highlight: true, // server-side highlights (task-250); falls back to client marking when absent
+        highlight: true, // server-side highlights; falls back to client marking when absent
       });
       if (seq !== searchSeq) return; // a newer search started — discard this stale response
       elapsedMs = Math.round(performance.now() - t0);
@@ -343,7 +343,7 @@
   /** Append the next keyset page (sorted runs only) using the prior response's `next_cursor`. */
   async function loadMore() {
     if (!cursor || loading) return;
-    const seq = searchSeq; // continue the current search generation (task-153 / I9)
+    const seq = searchSeq; // continue the current search generation
     loading = true;
     error = '';
     try {
@@ -353,7 +353,7 @@
         index: scopeIndex || undefined,
         sort: sortKeys,
         cursor,
-        highlight: true, // keep highlights on "Load more" pages consistent (task-250)
+        highlight: true, // keep highlights on "Load more" pages consistent
       });
       if (seq !== searchSeq) return; // a new search replaced these results — don't append a stale page
       hits = [...hits, ...(res.hits ?? [])];
@@ -379,7 +379,7 @@
 
   /** Scope index changed: reload its time fields, then re-run. */
   async function onScopeChange() {
-    persist(SEARCH_INDEX_KEY, scopeIndex); // remember the choice across reloads (task-131)
+    persist(SEARCH_INDEX_KEY, scopeIndex); // remember the choice across reloads
     await loadTimeFields();
     rerun();
   }
@@ -399,7 +399,7 @@
     download('growlerdb-results.csv', toCsv(exportRows()), 'text/csv');
   }
 
-  /** Capture the full current search state so restoring re-applies index/sort/filters/time (task-106). */
+  /** Capture the full current search state so restoring re-applies index/sort/filters/time. */
   async function save() {
     const name = query.trim() || filters.map((f) => `${f.field}:${f.value}`).join(' ') || 'query';
     const state = {
@@ -446,7 +446,7 @@
 
   let pageEnd = $derived(Math.min(offset + hits.length, total));
 
-  /** Column set for the results table (task-86): every cached field name across the page, in
+  /** Column set for the results table: every cached field name across the page, in
    *  first-seen order — so every row is the same shape (score · id · one cell per field). */
   let columns = $derived.by(() => {
     const order: string[] = [];
@@ -465,9 +465,9 @@
   /** Header label for the identifier column — the index's key field name (fallback `id`). */
   let keyLabel = $derived(hits[0]?.coordinates?.identifier?.[0]?.name ?? 'id');
 
-  /** One cell's display value: DATE/time-field columns render as formatted UTC (task-133); every
+  /** One cell's display value: DATE/time-field columns render as formatted UTC; every
    *  other field renders its raw cached value, preferring the server highlight fragment when the
-   *  gateway returned one for this field (task-250), else client-side term marking. */
+   *  gateway returned one for this field, else client-side term marking. */
   function cellText(hit: SearchHit, col: string): { text: string; segments?: HighlightSegment[] } {
     const raw = hit.fields?.[col];
     if (timeFields.includes(col)) {
@@ -481,7 +481,7 @@
 <section class="search" aria-labelledby="screen-heading">
   <h1 id="screen-heading" class="sr-only">{t('search.title')}</h1>
 
-  <!-- BAND 1: full-bleed query strip (design-QA T2). -->
+  <!-- BAND 1: full-bleed query strip. -->
   <div class="qstrip">
     <form role="search" class="qbar" onsubmit={onSubmit}>
       <div class="qrow">
@@ -549,7 +549,7 @@
               </ul>
             {/if}
           </div>
-          <!-- Active-syntax pill inside the field (design-QA T10). -->
+          <!-- Active-syntax pill inside the field. -->
           <span class="syntax-pill mono">{syntaxLabel}</span>
         </div>
         <Segmented options={syntaxOptions} bind:value={syntax} label={t('search.syntax')} />
@@ -560,7 +560,7 @@
     </form>
   </div>
 
-  <!-- BAND 2: stats band spanning rail + results (design-QA T2). -->
+  <!-- BAND 2: stats band spanning rail + results. -->
   <div class="statbar">
     <button
       type="button"
@@ -611,7 +611,7 @@
     {/if}
   </div>
 
-  <!-- BAND 3: full-width partial-results banner (design-QA T2). -->
+  <!-- BAND 3: full-width partial-results banner. -->
   {#if searched && partial && !partialDismissed}
     <div class="partial-banner" role="status">
       <Icon name="warn" />
@@ -698,7 +698,7 @@
         {/if}
 
         {#if hits.length > 0}
-          <!-- Results as a fixed-layout datatable (task-86): one row per hit, one cell per cached
+          <!-- Results as a fixed-layout datatable: one row per hit, one cell per cached
                field, so the layout is uniform across rows. Cells clip on overflow — never wrap. -->
           <div class="results">
             <!-- Fixed layout so cells clip uniformly; a min-width floor per field column means many
@@ -747,7 +747,7 @@
         {/if}
 
         {#if sorted}
-          <!-- Keyset (search_after) scroll: forward-only, no offset (stable across shards, task-99). -->
+          <!-- Keyset (search_after) scroll: forward-only, no offset (stable across shards). -->
           {#if cursor}
             <nav class="pager" aria-label={t('search.pager')}>
               <button type="button" class="load-more" onclick={loadMore} disabled={loading}>
@@ -772,8 +772,8 @@
       {/if}
     </main>
 
-    <!-- Filters rail: a single flush panel with a right border (design-QA T2), collapsible to a
-         thin strip whose state persists (design-QA T9). -->
+    <!-- Filters rail: a single flush panel with a right border, collapsible to a
+         thin strip whose state persists. -->
     <aside class="col-rail" class:collapsed={railCollapsed} aria-label={t('search.filters')}>
       {#if railCollapsed}
         <button
@@ -886,7 +886,7 @@
 {/if}
 
 <style>
-  /* The Search screen is a full-viewport app shell (design-QA T2): full-bleed horizontal bands over
+  /* The Search screen is a full-viewport app shell: full-bleed horizontal bands over
      a flex body whose panes scroll independently. The section itself does not scroll and carries no
      padding — each band and the body own their spacing (overrides the generic `#main > section`). */
   .search {
@@ -997,7 +997,7 @@
     cursor: not-allowed;
   }
 
-  /* BAND 3 — full-width dismissible partial-results banner (task-133). */
+  /* BAND 3 — full-width dismissible partial-results banner. */
   .partial-banner {
     flex: 0 0 auto;
     display: flex;
@@ -1032,7 +1032,7 @@
     overflow-y: auto;
     padding: 1rem 1.25rem;
   }
-  /* The filters rail: one flush panel on the LEFT with a right border (design-QA T2). order:-1 keeps
+  /* The filters rail: one flush panel on the LEFT with a right border. order:-1 keeps
      results first in the DOM (a11y) while painting the rail on the left. */
   .col-rail {
     order: -1;
@@ -1076,7 +1076,7 @@
   .rail-toggle:hover {
     color: var(--text);
   }
-  /* Collapsed rail: a ~40px strip with a vertical "Filters" label (design-QA T9). */
+  /* Collapsed rail: a ~40px strip with a vertical "Filters" label. */
   .rail-strip {
     width: 100%;
     height: 100%;
@@ -1143,7 +1143,7 @@
     flex: 1;
     min-width: 0;
   }
-  /* Time-field chips (design-QA T5) — replaces the bare <select> with the mockup's chip picker. */
+  /* Time-field chips. */
   .tf-block {
     display: flex;
     flex-direction: column;
@@ -1225,7 +1225,7 @@
   .facet-group {
     margin-bottom: 0.7rem;
   }
-  /* The facet-group header is now a collapse toggle button (task-133) — reset button chrome. */
+  /* The facet-group header is a collapse toggle button — reset button chrome. */
   .facet-field {
     display: flex;
     align-items: center;
@@ -1408,7 +1408,7 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  /* The saved query's text on a second line (task-133), muted + truncated. */
+  /* The saved query's text on a second line, muted + truncated. */
   .saved-q .sq-query {
     overflow: hidden;
     text-overflow: ellipsis;

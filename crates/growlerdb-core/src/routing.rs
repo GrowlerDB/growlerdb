@@ -1,4 +1,4 @@
-//! **Shard routing** ([task-29], [task-77]): map a document [`CompositeKey`] to a shard
+//! **Shard routing** ([Service architecture]): map a document [`CompositeKey`] to a shard
 //! ordinal. The same router places writes (the connector picks the owning shard) and routes
 //! key lookups (the Gateway sends a key only to its shard), so both agree on placement.
 //!
@@ -7,9 +7,9 @@
 //! shard — so partition-scoped queries hit fewer shards. The hash is FNV-1a over the key's
 //! stable byte encoding: deterministic across processes and releases, no dependency.
 //!
-//! Two **placement** modes (task-77):
-//! * **Legacy** — `shard = fnv1a(key) % shards`. The original direct mapping; resharding
-//!   re-routes (almost) every key, so it's reindex-only. All indexes built before the bucket
+//! Two **placement** modes:
+//! * **Legacy** — `shard = fnv1a(key) % shards`. The direct mapping; resharding
+//!   re-routes (almost) every key, so it's reindex-only. Indexes without a bucket
 //!   layer use this, and it stays the default so existing data is never misplaced.
 //! * **Bucketed** — `bucket = fnv1a(key) % `[`NUM_BUCKETS`]`; shard = `bucket→shard map. A fixed
 //!   virtual-bucket layer (consistent hashing): growing/shrinking shards moves whole **buckets**
@@ -17,15 +17,14 @@
 //!   every key. A [balanced](BucketMap::balanced) map over a shard count that divides
 //!   `NUM_BUCKETS` reproduces legacy placement exactly, so the two agree on power-of-two counts.
 //!
-//! [task-29]: ../../../design/06-service-architecture.md
-//! [task-77]: ../../../backlog/tasks/task-77%20-%20Online%20elasticity%20via%20virtual%20buckets%20(consistent%20hashing).md
+//! [Service architecture]: ../../../design/06-service-architecture.md
 
 use std::sync::Arc;
 
 use crate::api::CommitBatch;
 use crate::doc::CompositeKey;
 
-/// Number of **virtual buckets** (task-77): keys hash into `0..NUM_BUCKETS`, and a
+/// Number of **virtual buckets**: keys hash into `0..NUM_BUCKETS`, and a
 /// [`BucketMap`] assigns each bucket to a shard. Fixed for the cluster's life. A power of two,
 /// so a [balanced](BucketMap::balanced) map over any power-of-two shard count reproduces legacy
 /// `fnv % shards` placement exactly (`(fnv % NUM_BUCKETS) % shards == fnv % shards` when
@@ -42,12 +41,12 @@ pub enum RoutingStrategy {
     Partition,
 }
 
-/// Physical placement of routed keys — legacy direct modulo, or the task-77 virtual-bucket map.
+/// Physical placement of routed keys — legacy direct modulo, or the virtual-bucket map.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Placement {
-    /// `shard = fnv1a(key) % shards` (clamped ≥ 1). The original mapping; resharding is a rebuild.
+    /// `shard = fnv1a(key) % shards` (clamped ≥ 1). The direct mapping; resharding is a rebuild.
     Legacy { shards: u32 },
-    /// `shard = map[fnv1a(key) % NUM_BUCKETS]`. Resharding moves whole buckets (task-77).
+    /// `shard = map[fnv1a(key) % NUM_BUCKETS]`. Resharding moves whole buckets.
     Bucketed(Arc<BucketMap>),
 }
 
@@ -79,7 +78,7 @@ impl ShardRouter {
         Self::new(shards, RoutingStrategy::Partition)
     }
 
-    /// A **bucketed** router (task-77): keys hash to a bucket, `map` assigns buckets to shards.
+    /// A **bucketed** router: keys hash to a bucket, `map` assigns buckets to shards.
     /// Resharding moves whole buckets ([`BucketMap::reassign`]) instead of re-routing every key.
     pub fn bucketed(strategy: RoutingStrategy, map: BucketMap) -> Self {
         Self {
@@ -88,7 +87,7 @@ impl ShardRouter {
         }
     }
 
-    /// Build the router an index's **registry routing config** describes (task-77) — the single
+    /// Build the router an index's **registry routing config** describes — the single
     /// interpretation both the Gateway (reads) and the connector (writes) use, so they can't drift:
     /// an **empty** `bucket_owners` ⇒ legacy `fnv % shard_count`; a non-empty one ⇒ bucketed over
     /// that map. Errors if a stored map is malformed or its shard count disagrees with `shard_count`
@@ -128,7 +127,7 @@ impl ShardRouter {
     }
 
     /// The **bucket** (`0..`[`NUM_BUCKETS`]) a key hashes to under this router's strategy —
-    /// independent of placement. Drives bucket-level migration and skew diagnostics (task-77).
+    /// independent of placement. Drives bucket-level migration and skew diagnostics.
     pub fn bucket(&self, key: &CompositeKey) -> u32 {
         (fnv1a(&self.strategy_bytes(key)) % u64::from(NUM_BUCKETS)) as u32
     }
@@ -159,7 +158,7 @@ impl ShardRouter {
     }
 
     /// Whether shard `ordinal` owns `key` under this router — the filter a node applies when it
-    /// **rebuilds its shard for a reshard** (task-77): re-derive from source but keep only the docs
+    /// **rebuilds its shard for a reshard**: re-derive from source but keep only the docs
     /// this shard owns under the new map. Equivalent to `route(key) == ordinal`.
     pub fn owns(&self, key: &CompositeKey, ordinal: u32) -> bool {
         self.route(key) == ordinal
@@ -186,10 +185,10 @@ impl ShardRouter {
             .into_iter()
             .enumerate()
             .map(|(ordinal, ops)| {
-                // Carry the `from` checkpoint onto every sub-batch (task-194): each shard's
-                // continuity guard needs it, and all shards resume from the same source position.
-                // Carry the safe-checkpoint resume floor too (task-204): it is the same across
-                // shards, and a sub-batch without it would prune nothing on its shard.
+                // Carry the `from` checkpoint onto every sub-batch: each shard's continuity guard
+                // needs it, and all shards resume from the same source position. Carry the
+                // safe-checkpoint resume floor too: it is the same across shards, and a sub-batch
+                // without it would prune nothing on its shard.
                 CommitBatch::new(
                     ops,
                     batch.checkpoint.clone(),
@@ -212,7 +211,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
-/// The **bucket → shard** assignment (task-77): the registry's elastic placement table. Each of
+/// The **bucket → shard** assignment: the registry's elastic placement table. Each of
 /// the [`NUM_BUCKETS`] buckets names its owning shard ordinal; growing/shrinking shards
 /// ([`reassign`](Self::reassign)) moves whole buckets — a bounded set (~1/N) — instead of
 /// re-routing every key. The default ([`balanced`](Self::balanced)) is round-robin `b % shards`,
@@ -291,7 +290,7 @@ impl BucketMap {
     }
 
     /// A copy of this map with `bucket` reassigned to `shard` — the one-bucket move behind
-    /// **skew relief** (task-77): shed a bucket from a busy shard to a quieter one without a full
+    /// **skew relief**: shed a bucket from a busy shard to a quieter one without a full
     /// reshard. Errors if `bucket`/`shard` is out of range, or if the move would leave `bucket`'s
     /// old owner with no buckets (an empty shard isn't a valid dense map — move a different one).
     pub fn with_owner(&self, bucket: u32, shard: u32) -> Result<Self, String> {
@@ -312,7 +311,7 @@ impl BucketMap {
     }
 
     /// Recommend a single-bucket **skew-relief** move from `per_shard_docs` — the per-shard load
-    /// (e.g. doc counts) the task-73 diagnostics report, aligned to shard ordinals (task-77 AC4).
+    /// (e.g. doc counts) the diagnostics report, aligned to shard ordinals.
     /// Returns `(bucket, from, to)` to move the hottest shard's first bucket onto the coldest, or
     /// `None` when the load is already balanced (the hottest carries ≤ 10% more than the coldest)
     /// or the hot shard owns only one bucket (can't shed without emptying). Per-bucket *heat* isn't
@@ -496,7 +495,7 @@ mod tests {
                 2,
                 4,
             ),
-            // Temporal keys (task-184): `Ts` encodes under type tag 5 (canonical epoch micros,
+            // Temporal keys: `Ts` encodes under type tag 5 (canonical epoch micros,
             // 8-byte LE). One identifier-role and one partition-role vector, so a drift in the
             // Java side's tag-5 encoding fails the parity test under either strategy.
             (
@@ -518,7 +517,7 @@ mod tests {
                 0,
                 2,
             ),
-            // Edge cases (task-69): a **partition-strategy key with no partition fields** must
+            // Edge cases: a **partition-strategy key with no partition fields** must
             // fall back to hashing the full key (so part8 == hash8), and a **fully empty key**
             // must encode to empty bytes → fnv offset basis. Both must agree cross-language.
             (
@@ -648,7 +647,7 @@ mod tests {
             assert_eq!(
                 part.safe_checkpoint,
                 Some(SourceCheckpoint::iceberg(40)),
-                "sub-batch dropped the prune floor — its shard would never prune (task-204)"
+                "sub-batch dropped the prune floor — its shard would never prune"
             );
         }
     }
@@ -800,7 +799,7 @@ mod tests {
 
     #[test]
     fn reshard_relocates_only_moved_buckets_and_loses_nothing() {
-        // The cutover-correctness property (task-77): across a 2→3 reshard, every key still has
+        // The cutover-correctness property: across a 2→3 reshard, every key still has
         // exactly one owning shard (no lost/duplicate docs), a key relocates **iff** its bucket
         // moved (minimal movement), and a relocated key lands on its bucket's new owner — i.e. the
         // rebuilt shards (split by `route`) and the post-cutover read routing agree.

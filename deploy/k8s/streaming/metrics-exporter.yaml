@@ -1,7 +1,7 @@
-# Scale-test metrics exporter (task-159): the Iceberg/source-side signals GrowlerDB doesn't emit
-# natively (see task-182 for the engine-native ones). Reads the source table's snapshot summary +
-# history and the served doc count, and exposes Prometheus gauges so we can chart dataset size,
-# ingest throughput, source→index lag, and Iceberg-compaction events alongside query/hydration perf.
+# Scale-test metrics exporter: the Iceberg/source-side signals GrowlerDB doesn't emit natively.
+# Reads the source table's snapshot summary + history and the served doc count, and exposes
+# Prometheus gauges so we can chart dataset size, ingest throughput, source→index lag, and
+# Iceberg-compaction events alongside query/hydration perf.
 # python + pyiceberg + prometheus_client, script from a ConfigMap (no image to build).
 apiVersion: v1
 kind: ConfigMap

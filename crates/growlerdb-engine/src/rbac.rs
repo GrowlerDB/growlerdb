@@ -1,10 +1,10 @@
-//! **Control-plane RBAC** (task-36, M4): a coarse, role-based [`AuthHook`](crate::auth::AuthHook)
+//! **Control-plane RBAC**: a coarse, role-based [`AuthHook`](crate::auth::AuthHook)
 //! that gates Engine operations by the caller's verified roles. Roles map to operation
 //! **scopes**, each RPC method requires a scope, and a request is allowed iff one of the
 //! caller's roles grants that scope.
 //!
 //! This is the *operation* tier ("what may you do"): coarse, about methods, not rows. Row- and
-//! column-level access stays delegated to the lake (Polaris, task-37); tenant scoping (task-38)
+//! column-level access stays delegated to the lake (Polaris); tenant scoping
 //! is enforced separately. The roles come from [authentication](crate::authn) — validated token
 //! or API-key claims, never caller-asserted — and reach this hook via the request metadata that
 //! the [`Gateway`](crate::gateway::Gateway) stamps and forwards.
@@ -48,31 +48,30 @@ impl std::fmt::Display for Scope {
     }
 }
 
-/// The role names an admin may assign via user management (task-104). The canonical task-103 set.
+/// The canonical role names an admin may assign via user management.
 pub const ASSIGNABLE_ROLES: &[&str] = &["reader", "operator", "admin"];
 
 /// The scope an RPC `method` requires, or `None` for an unrecognized method (which the policy
 /// **denies** — fail closed, so a newly added method can't slip through ungated).
 pub fn scope_for_method(method: &str) -> Option<Scope> {
     Some(match method {
-        // Read/query surface — incl. explain (task-102), scrolling, and per-user saved queries
-        // (task-106): any reader may run and manage these.
+        // Read/query surface — incl. explain, scrolling, and per-user saved queries:
+        // any reader may run and manage these.
         "Search" | "Suggest" | "Aggregate" | "GetByKey" | "Explain" | "OpenPit" | "ClosePit"
         | "Export" | "ListSavedQueries" | "SaveSavedQuery" | "DeleteSavedQuery" => Scope::Search,
         // Index metadata / introspection / status reads + the assignable-role catalog (read-only).
         // `ListUsers` is NOT here: enumerating every subject + its role bindings is authorization-
-        // topology disclosure, so it needs Admin, not any reader (task-153 / G4).
+        // topology disclosure, so it needs Admin, not any reader.
         "DescribeIndex" | "GetIndex" | "ListIndexes" | "ListAliases" | "DescribeSource"
         | "IngestionStatus" | "GetCheckpoint" | "ListRoles" | "ListActivity" => Scope::IndexRead,
         "Write" => Scope::IndexWrite,
-        // Administer indexes + manage user role bindings (task-104) + API tokens (task-105) + list
-        // users (G4).
+        // Administer indexes + manage user role bindings + API tokens + list users.
         "CreateIndex" | "DropIndex" | "AlterIndex" | "ReindexIndex" | "SetAlias" | "DropAlias"
         | "SetUserRoles" | "CreateToken" | "ListTokens" | "RevokeToken" | "ListUsers" => {
             Scope::Admin
         }
         // Cluster operations: reshard/bucket moves + node self-registration + CP-driven windowed
-        // placement (node heartbeat + window-owner resolution, task-219).
+        // placement (node heartbeat + window-owner resolution).
         "PlanReshard"
         | "ApplyReshard"
         | "MoveBucket"
@@ -96,23 +95,23 @@ impl RbacPolicy {
         Self::default()
     }
 
-    /// The default role catalog. The **canonical** console roles (task-103) are:
+    /// The default role catalog. The **canonical** console roles are:
     /// - `reader` — query + read index metadata (Search, IndexRead)
     /// - `operator` — reader + cluster ops (Search, IndexRead, Ops)
     /// - `admin` — full control: every scope
     ///
-    /// The original task-36 roles remain as aliases so existing token bindings keep working:
+    /// Legacy roles remain as aliases so existing token bindings keep working:
     /// - `viewer` ≡ `reader`
     /// - `index-admin` — viewer + write + administer indexes
     /// - `service` — internal components: every scope (≡ `admin`)
     pub fn with_default_roles() -> Self {
         use Scope::*;
         Self::new()
-            // Canonical roles (task-103).
+            // Canonical roles.
             .grant("reader", [Search, IndexRead])
             .grant("operator", [Search, IndexRead, Ops])
             .grant("admin", [Search, IndexRead, IndexWrite, Admin, Ops])
-            // Legacy aliases (task-36) — kept for backward compatibility.
+            // Legacy aliases — kept for backward compatibility.
             .grant("viewer", [Search, IndexRead])
             .grant("index-admin", [Search, IndexRead, IndexWrite, Admin])
             .grant("service", [Search, IndexRead, IndexWrite, Admin, Ops])
@@ -150,7 +149,7 @@ impl RbacPolicy {
     }
 }
 
-/// Validate that a caller holding `caller_roles` may assign/mint `requested_roles` (task-147 / F3).
+/// Validate that a caller holding `caller_roles` may assign/mint `requested_roles`.
 /// Every requested role must be in [`ASSIGNABLE_ROLES`] **and** its scopes must be a subset of the
 /// caller's effective scopes — so an `Admin`-but-not-`Ops` `index-admin` cannot grant an `Ops`-bearing
 /// role (`operator`/`admin`) and escalate to cluster operations. Evaluated against the canonical
@@ -183,10 +182,10 @@ impl AuthHook for RbacPolicy {
                 ctx.method
             )));
         };
-        // Per-index RBAC (task-240): a token carrying an index allowlist may only touch those indexes.
+        // Per-index RBAC: a token carrying an index allowlist may only touch those indexes.
         // Enforced *before* the scope check, and only when the request resolved to a concrete target
         // index (`ctx.index`) — cluster/admin ops that don't name an index (`index = None`) are gated
-        // by scope alone. An empty allowlist = unrestricted (back-compat: existing tokens keep working).
+        // by scope alone. An empty allowlist = unrestricted.
         if !ctx.allowed_indexes.is_empty() {
             if let Some(target) = &ctx.index {
                 if !ctx.allowed_indexes.iter().any(|i| i == target) {
@@ -228,7 +227,7 @@ mod tests {
     }
 
     /// An [`AuthContext`] scoped to a resolved target `index` with an `allowed` index allowlist —
-    /// exercises per-index RBAC (task-240).
+    /// exercises per-index RBAC.
     fn ctx_index(
         method: &'static str,
         roles: &[&str],
@@ -247,7 +246,7 @@ mod tests {
 
     #[test]
     fn check_assignable_prevents_privilege_escalation() {
-        // task-147 / F3: an index-admin (Admin, but no Ops) can only grant `reader`.
+        // An index-admin (Admin, but no Ops) can only grant `reader`.
         let index_admin = vec!["index-admin".to_string()];
         assert!(check_assignable(&index_admin, &["reader".to_string()]).is_ok());
         // Granting an Ops-bearing role it doesn't hold is rejected (the escalation path).
@@ -299,7 +298,7 @@ mod tests {
 
     #[test]
     fn reader_may_explain_and_manage_saved_queries() {
-        // task-102/106 methods are read-tier: any reader can use them (not fail-closed).
+        // Explain + saved-query methods are read-tier: any reader can use them (not fail-closed).
         let policy = RbacPolicy::with_default_roles();
         for m in [
             "Explain",
@@ -372,7 +371,7 @@ mod tests {
 
     #[test]
     fn per_index_allowlist_denies_a_token_scoped_to_another_index() {
-        // task-240: a reader whose token allows only index `a` may search `a` but NOT `b`.
+        // A reader whose token allows only index `a` may search `a` but NOT `b`.
         let policy = RbacPolicy::with_default_roles();
         // Allowed index → permitted (role still grants the scope).
         assert!(policy

@@ -1,8 +1,5 @@
-//! The embedded **engine façade** ([embedded topology]) — wires source → index →
-//! search → hydrate into one in-process unit, driven by the CLI (task-9). No
-//! server, auth, sharding, or UI; those are M2/M3.
-//!
-//! [embedded topology]: ../../../design/06-service-architecture.md
+//! The embedded **engine façade** — wires source → index → search → hydrate into
+//! one in-process unit, driven by the CLI. No server, auth, sharding, or UI.
 
 use std::path::PathBuf;
 
@@ -43,7 +40,7 @@ pub struct DriftReport {
     /// Missing docs re-indexed (in the source but absent from the index).
     pub reindexed: usize,
     /// The stale-delete pass was **skipped** because a concurrent ingest advanced the shard during
-    /// the source scan (task-195 TOCTOU guard). Missing-repair still ran; the next reconcile retries
+    /// the source scan (TOCTOU guard). Missing-repair still ran; the next reconcile retries
     /// the deletes once the shard is momentarily quiescent.
     pub deletes_skipped: bool,
 }
@@ -55,21 +52,20 @@ impl DriftReport {
     }
 }
 
-/// Max affected keys to log on a nonzero repair (task-195) — bounded so a large drift can't flood
+/// Max affected keys to log on a nonzero repair — bounded so a large drift can't flood
 /// the log; the counts (and the `drift_*` metrics) carry the full magnitude.
 const DRIFT_LOG_KEYS: usize = 20;
 
-/// Reconcile a shard scope against the source's current `source_docs` (task-18 drift
-/// repair): drop indexed keys the source no longer has (via partition reconciliation)
-/// and re-index source docs the index is missing. Pure over the store + the provided
-/// source docs, so it is exercised without a live catalog. `partition` empty ⇒ the
-/// whole index.
+/// Reconcile a shard scope against the source's current `source_docs`: drop indexed
+/// keys the source no longer has (via partition reconciliation) and re-index source
+/// docs the index is missing. Pure over the store + the provided source docs, so it is
+/// exercised without a live catalog. `partition` empty ⇒ the whole index.
 ///
-/// For the **sharded** backstop (task-195) the caller filters `source_docs` to the keys this shard
+/// For the **sharded** backstop the caller filters `source_docs` to the keys this shard
 /// owns before calling, so the stale-set (indexed keys absent from `source_docs`) can't sweep away
-/// another shard's keys — the placement-destroying bug of the old whole-table reconcile.
+/// another shard's keys.
 /// `expected_checkpoint` is the shard's checkpoint captured **before** the source scan that produced
-/// `source_docs`; it fences the stale-delete against a concurrent ingest (task-195 TOCTOU guard).
+/// `source_docs`; it fences the stale-delete against a concurrent ingest (TOCTOU guard).
 /// `None` opts out for callers with no concurrent writer (CLI/tests).
 pub(crate) fn apply_drift(
     shard: &Shard,
@@ -98,7 +94,7 @@ pub(crate) fn apply_drift(
     }
     let reindexed = missing.len();
     // A nonzero repair is a real index↔source divergence — log it (bounded) so the affected keys are
-    // recoverable from logs, not just a metric count (task-195). Clean runs stay silent.
+    // recoverable from logs, not just a metric count. Clean runs stay silent.
     if deleted > 0 || reindexed > 0 || deletes_skipped {
         let missing_keys: Vec<String> = missing
             .iter()
@@ -198,7 +194,7 @@ impl Engine {
         self.index_shard(table, def_yaml, name, 1, 0).await
     }
 
-    /// Build **one ordinal shard** of an index from `table` (task-77): like [`index`](Self::index),
+    /// Build **one ordinal shard** of an index from `table`: like [`index`](Self::index),
     /// but keeps only the documents shard `shard_ordinal` of `shards` owns under the index's routing
     /// strategy. This is how a node in a sharded cluster builds *its* partition from source — so a
     /// broadcast search over the shards sees each document exactly once (no cross-shard duplicates).
@@ -239,7 +235,7 @@ impl Engine {
     }
 
     /// Persist an index's **definition only** — resolve `table`'s schema into `index.json` and write
-    /// it, building **no shards/windows** (task-223). This is how a **windowed** node starts truly
+    /// it, building **no shards/windows**. This is how a **windowed** node starts truly
     /// empty on k8s: `serve` needs the resolved `index.json` on disk, but a windowed node must NOT
     /// batch-build windows from the source — with no ordinal filter every node would build *all*
     /// windows locally, replicating them across the pool and defeating control-plane placement (the
@@ -269,16 +265,16 @@ impl Engine {
     }
 
     /// Read `table` into the index. **Non-windowed:** stream the source in bounded chunks into the
-    /// single shard, so peak memory is independent of table size (task-84 — the old whole-table read
-    /// OOM'd on large tables). **Windowed:** buffer + [`write_windowed`](LocalIndexStore::write_windowed)
-    /// (streamed windowing is a follow-up). Returns `(snapshot, doc_count)`.
+    /// single shard, so peak memory is independent of table size. **Windowed:** buffer +
+    /// [`write_windowed`](LocalIndexStore::write_windowed) (streamed windowing is a follow-up).
+    /// Returns `(snapshot, doc_count)`.
     async fn build_from_source(
         &self,
         reader: &IcebergReader,
         table: &str,
         resolved: &ResolvedIndex,
-        // Per-shard build filter (task-77): keep only docs this `(router, ordinal)` owns. `None`
-        // for a normal full build.
+        // Per-shard build filter: keep only docs this `(router, ordinal)` owns. `None` for a
+        // normal full build.
         shard_filter: Option<&(ShardRouter, u32)>,
     ) -> Result<(Snapshot, usize), EngineError> {
         let (snapshot, doc_count) = if resolved.windowing.is_some() {
@@ -301,11 +297,11 @@ impl Engine {
             let (snapshot_id, _) = reader.current_snapshot(table).await?;
             let mut chunk = 0u64;
             // Count docs **written** (post-filter), not source rows read — so a sharded build
-            // reports its shard's doc count, not the whole table's (task-77).
+            // reports its shard's doc count, not the whole table's.
             let mut written = 0usize;
             reader
                 .read_documents_streamed(table, resolved, |mut docs| {
-                    // Sharded build (task-77): drop docs this shard doesn't own, so the shard holds
+                    // Sharded build: drop docs this shard doesn't own, so the shard holds
                     // only its partition and a broadcast search can't double-count.
                     if let Some((router, ordinal)) = shard_filter {
                         docs.retain(|d| router.owns(&d.doc.key, *ordinal));
@@ -322,13 +318,13 @@ impl Engine {
                         .map_err(|e| e.to_string())
                 })
                 .await?;
-            // Anchor the built index to its source's Iceberg `table-uuid` (task-114) so a later
-            // `serve` can detect a drop+recreate of the source and refuse to serve stale data.
+            // Anchor the built index to its source's Iceberg `table-uuid` so a later `serve` can
+            // detect a drop+recreate of the source and refuse to serve stale data.
             shard.set_source_uuid(&reader.table_uuid(table).await?)?;
             (Snapshot(shard.current_snapshot()?), written)
         };
 
-        // Never silently commit an empty index from a non-empty source (task-85): if we read 0 docs
+        // Never silently commit an empty index from a non-empty source: if we read 0 docs
         // but the snapshot reports rows, the read is broken (e.g. a delete in the table's history).
         // Skipped for a sharded build, where a shard may legitimately own no docs.
         if doc_count == 0 && shard_filter.is_none() {
@@ -346,7 +342,7 @@ impl Engine {
 
     /// Write a freshly-read build/rebuild batch to the index: one single shard, or — for a
     /// **windowed** index — per-window shards via the time-window router
-    /// ([`write_windowed`](LocalIndexStore::write_windowed), task-81). Returns a representative
+    /// ([`write_windowed`](LocalIndexStore::write_windowed)). Returns a representative
     /// committed [`Snapshot`]: the single shard's, or the latest window's (windowed shards commit
     /// independently, so the outcome's lone snapshot is informational — the per-window state is the
     /// source of truth). The single shard is created lazily here so a windowed build never leaves an
@@ -374,7 +370,7 @@ impl Engine {
         }
     }
 
-    /// **Append fast-path sync** (task-18): for an `APPEND_FAST_PATH` index, read only
+    /// **Append fast-path sync**: for an `APPEND_FAST_PATH` index, read only
     /// the files added since the committed checkpoint and index them (no delete/update
     /// handling). Cheaper than the changelog scan for immutable tables; resumes from
     /// the shard's checkpoint. Errors on a changelog-mode index — that's the
@@ -409,24 +405,24 @@ impl Engine {
         })
     }
 
-    /// **Drift reconciliation** (task-18): compare the index against the source's
+    /// **Drift reconciliation**: compare the index against the source's
     /// current snapshot and repair discrepancies — delete indexed keys the source
     /// dropped, re-index keys it gained. The periodic backstop that keeps the index
-    /// consistent with Iceberg regardless of sync mode or delete encoding. M1
-    /// reconciles the whole index; per-partition scoping is the scaling refinement.
+    /// consistent with Iceberg regardless of sync mode or delete encoding. Reconciles
+    /// the whole index; per-partition scoping is the scaling refinement.
     pub async fn reconcile(&self, index: &str) -> Result<DriftReport, EngineError> {
         let resolved = self.load_definition(index)?;
         let shard = self.store.open_shard(&ShardId::single(index), &resolved)?;
         let table = source_table(&resolved);
         // Capture the checkpoint before the source read so the stale-delete can fence against a
-        // concurrent ingest (task-195 TOCTOU guard); harmless for the CLI single-shard path.
+        // concurrent ingest (TOCTOU guard); harmless for the CLI single-shard path.
         let expected_checkpoint = shard.current_checkpoint()?;
         let reader = IcebergReader::connect(&self.iceberg).await?;
         let source = reader.read_documents(&table, &resolved).await?;
         apply_drift(&shard, &[], source.docs, expected_checkpoint)
     }
 
-    /// **Rebuild from Iceberg** (task-18): the hard-reset backstop — drop the index's
+    /// **Rebuild from Iceberg**: the hard-reset backstop — drop the index's
     /// on-disk state and re-index the current snapshot from scratch, reusing the
     /// persisted definition. Always available because the index is rebuildable from
     /// the source.
@@ -514,7 +510,7 @@ impl Engine {
             shard_count: 1,     // the embedded engine builds a single shard
             tenant_field: None, // auto-mapped indexes aren't tenant-scoped (set it explicitly)
             windowing: None,    // auto-mapped indexes aren't time-windowed (set it explicitly)
-            // The universal default (task-184 / D30); PREDICATE is an explicit choice.
+            // The universal default; PREDICATE is an explicit choice.
             location_strategy: growlerdb_core::LocationStrategy::default(),
         })
     }
@@ -527,8 +523,8 @@ impl Engine {
     /// Persist a resolved definition so `search` can reopen the shard later.
     fn persist_definition(&self, index: &str, resolved: &ResolvedIndex) -> Result<(), EngineError> {
         let path = self.definition_path(index);
-        // `index.json` lives at the index root, which may not exist yet — the (windowed) build now
-        // persists the definition *before* creating any shard dir (task-81 4e-1). Ensure the parent.
+        // `index.json` lives at the index root, which may not exist yet — the (windowed) build
+        // persists the definition *before* creating any shard dir. Ensure the parent.
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -553,7 +549,7 @@ fn source_table(resolved: &ResolvedIndex) -> String {
     }
 }
 
-/// The per-shard build filter (task-77) for building shard `ordinal` of `shards`: a `(router,
+/// The per-shard build filter for building shard `ordinal` of `shards`: a `(router,
 /// ordinal)` whose [`owns`](ShardRouter::owns) keeps only this shard's docs. `shards <= 1` ⇒ `None`
 /// (full build). Errors on a windowed index — it shards by time window, not by ordinal.
 fn shard_build_filter(
@@ -736,7 +732,7 @@ mod tests {
 
     #[test]
     fn write_build_routes_windowed_to_window_shards_else_single() {
-        const DAY: i64 = 86_400_000_000; // micros (canonical window scale, task-116)
+        const DAY: i64 = 86_400_000_000; // micros (canonical window scale)
         let tmp = tempfile::tempdir().unwrap();
         let engine = Engine::open(tmp.path(), IcebergConfig::local()).unwrap();
 
@@ -782,7 +778,7 @@ mod tests {
 
     #[test]
     fn persist_definition_creates_index_root_when_absent() {
-        // index()/rebuild() persist the definition *before* any shard dir is created (4e-1), so the
+        // index()/rebuild() persist the definition *before* any shard dir is created, so the
         // index root may not exist yet — persist_definition must create it (regression for the e2e
         // `NotFound` writing index.json onto a missing dir).
         let tmp = tempfile::tempdir().unwrap();
@@ -793,7 +789,7 @@ mod tests {
 
     #[test]
     fn chunked_writes_equal_a_single_batch() {
-        // The streamed build (task-84) writes the source in many bounded chunks (one commit each,
+        // The streamed build writes the source in many bounded chunks (one commit each,
         // unique batch ids) instead of one giant batch. Assert the resulting index is identical:
         // every doc searchable across the per-chunk segments, same counts as a single write.
         let docs: Vec<LocatedDoc> = (0..30)
@@ -895,9 +891,8 @@ mod tests {
 
     #[test]
     fn sharded_reconcile_repairs_only_this_shards_owned_keys() {
-        // The task-195 guarantee: reconcile scoped to a shard's owned keys repairs its own drift
-        // (delete stale, re-index missing) WITHOUT pulling another shard's keys into it — the
-        // placement-destroying bug of the old whole-table, `ShardId::single` reconcile.
+        // Reconcile scoped to a shard's owned keys repairs its own drift (delete stale, re-index
+        // missing) WITHOUT pulling another shard's keys into it.
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalIndexStore::open(tmp.path()).unwrap();
         let shard0 = store

@@ -114,7 +114,7 @@ async fn growlerdb_serve_hosts_write_grpc() {
         .snapshot;
     assert_eq!(again, 1);
 
-    // The connector's resume point (task-16): GetCheckpoint reports the committed
+    // The connector's resume point: GetCheckpoint reports the committed
     // checkpoint (Iceberg snapshot 1) + the current index snapshot, over gRPC.
     let cp = client
         .get_checkpoint(GetCheckpointRequest::default())
@@ -130,7 +130,7 @@ async fn growlerdb_serve_hosts_write_grpc() {
         "checkpoint should be Iceberg snapshot 1",
     );
 
-    // Search over gRPC (task-19): the just-written doc is queryable by body text,
+    // Search over gRPC: the just-written doc is queryable by body text,
     // returning its coordinates.
     let mut search =
         growlerdb_proto::v1::search_client::SearchClient::connect(format!("http://{addr}"))

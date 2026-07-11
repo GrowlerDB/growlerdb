@@ -11,7 +11,7 @@ import org.junit.jupiter.api.Test;
  * Parity vectors asserting {@link WindowRouter} computes window ids byte-identically to the Rust
  * engine ({@code growlerdb_core::TimeWindowing::window_of ∘ field_micros}). If the connector and
  * engine ever disagree, a row would be streamed to a different node than the one the CP placed its
- * window on — so this guards the routing contract (task-219).
+ * window on — so this guards the routing contract.
  */
 class WindowRouterParityTest {
 

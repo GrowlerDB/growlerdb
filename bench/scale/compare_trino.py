@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""GrowlerDB vs Iceberg-alone (Trino) query comparison (task-186).
+"""GrowlerDB vs Iceberg-alone (Trino) query comparison.
 
 Runs equivalent predicates as GrowlerDB search(+hydrate) and as Trino SQL table scans over the SAME
 Iceberg table, times both, and reports side-by-side latency. Run at each storage milestone
-(task-185) to show where the index wins (selective predicates / point lookups) vs where a scan is
+to show where the index wins (selective predicates / point lookups) vs where a scan is
 comparable (full scans).
 
 Runs from a kubectl-capable host: GrowlerDB via GATEWAY_URL (port-forward); Trino via `kubectl exec`.
@@ -15,7 +15,7 @@ NS = os.environ.get("NAMESPACE", "growlerdb")
 GATEWAY = os.environ.get("GATEWAY_URL", "http://localhost:8080")
 INDEX = os.environ.get("INDEX", "http_logs")
 # The Iceberg table the SQL scans — defaults to INDEX so a windowed run (http_logs_windowed) compares
-# against its own source table, not a hardcoded http_logs (task-159 "Trino window pairs").
+# against its own source table, not a hardcoded http_logs.
 TABLE = os.environ.get("TRINO_TABLE", INDEX)
 ITERS = int(os.environ.get("ITERS", "5"))
 

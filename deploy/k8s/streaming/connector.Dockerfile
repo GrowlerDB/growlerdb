@@ -1,4 +1,4 @@
-# The GrowlerDB Spark changelog connector, packaged for Kubernetes (task-123). Builds the fat jar
+# The GrowlerDB Spark changelog connector, packaged for Kubernetes. Builds the fat jar
 # (the build needs the shared protos at crates/growlerdb-proto/proto) and bakes it into the Spark
 # runtime image the connector pod runs via spark-submit. Build from the REPO ROOT:
 #   docker build -t ghcr.io/growlerdb/growlerdb-connector:dev -f deploy/k8s/streaming/connector.Dockerfile .

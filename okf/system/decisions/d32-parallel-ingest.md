@@ -8,7 +8,7 @@ timestamp: 2026-07-04T14:22:00
 
 # D32. Parallel ingest — shard-group connector sets
 
-**Decision.** Ingest scales out as a **set of W independent connector workers** (task-196), each a
+**Decision.** Ingest scales out as a **set of W independent connector workers**, each a
 full connector process owning the disjoint **shard group** `{s : s % W == i}` for its worker id
 `i` (the StatefulSet pod ordinal). Each worker reads the table's changelog, **filters it
 executor-side to the rows whose keys route to its owned shards**, maps, and writes ONLY its shards
@@ -26,7 +26,7 @@ alternative (per-source-partition assignment with every worker writing every sha
 per-connector checkpoint namespacing on the node, breaks per-key ordering whenever a key spans
 partitions, and multiplies the guard's writer-race surface. Shard-group ownership preserves
 per-key ordering for free (a key routes to one shard; its owner processes the changelog in
-`_change_ordinal` order). The enabling foundation is D31's task-196 refinement: **ordered
+`_change_ordinal` order). The enabling foundation is D31's refinement: **ordered
 checkpoints + the window-covering guard**. Without it, workers' independent trigger heads put
 their groups on incomparable checkpoint lattices, and any regroup (scaling W, or migrating back
 to the single connector) wedged on spurious `CHECKPOINT_GAP`s. With it, regrouping is plain
@@ -48,7 +48,7 @@ content stays safe under covering, but whole-index restores are the documented d
 driver work drops to ~1/W of the rows (executor-side filter); the remaining single-process ceiling
 per worker is the Spark driver itself — beyond it, raise W.
 
-**Status.** Accepted (task-196). Unit + integration tested against a guard-enforcing node double
+**Status.** Accepted. Unit + integration tested against a guard-enforcing node double
 (skewed parallel ingest, regroup 2→1, pruned-store regroup — zero gaps) and end-to-end against
 two real `growlerdb serve` shards (parallel commit, node-restart durability, no-op resume,
 disjoint search coverage). Refines **D10** (the runtime is now a *set* of single-JVM Spark

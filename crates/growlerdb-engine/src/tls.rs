@@ -1,4 +1,4 @@
-//! **mTLS for internal services** (task-35 slice 5, M4): the tonic TLS configs that secure the
+//! **mTLS for internal services**: the tonic TLS configs that secure the
 //! Gateway↔Node hops. Internal traffic is *mutually* authenticated — a server presents its own
 //! identity **and** requires the client to present a certificate signed by the shared cluster
 //! CA, so only cluster peers (not arbitrary network clients) can reach a Node. This is the

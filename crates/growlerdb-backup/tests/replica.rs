@@ -1,4 +1,4 @@
-//! Replica via segment shipping (task-31, D14): a replica **pulls sealed segments** from the
+//! Replica via segment shipping: a replica **pulls sealed segments** from the
 //! primary's backup instead of re-indexing, so its segments are byte-identical and it scores
 //! exactly like the primary. Covers: byte-identical pull, no duplicate indexing (the replica never
 //! writes), incremental refresh (only new segments transfer), and consistent scoring across a
@@ -132,7 +132,7 @@ async fn replica_pulls_segments_and_scores_identically() {
     );
 }
 
-/// task-31 (live read-replica): `refresh_and_reopen` re-opens the shard only when the pull changed
+/// Live read-replica: `refresh_and_reopen` re-opens the shard only when the pull changed
 /// something, and the re-opened shard reflects the primary's new segments — the unit a `serve
 /// --replica` poll loop calls before a hot-swap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

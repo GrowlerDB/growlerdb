@@ -4,7 +4,7 @@
 //! [locator](growlerdb_core::RowLocator) to `{iceberg_file, row_position}`, then read
 //! the authoritative rows from Iceberg (reading only the located files). This ties
 //! the [`IndexReader`] (locator) and the [`IcebergReader`] (rows) together; the
-//! engine façade and CLI (task-9) drive it.
+//! engine façade and CLI drive it.
 //!
 //! [Flow 2]: ../../../design/07-data-flows.md
 
@@ -17,7 +17,7 @@ use growlerdb_source::IcebergReader;
 use crate::EngineError;
 
 /// Resolve `keys` to their `(key, locator)` pairs via the shard. A key with no
-/// locator is an error (M0; the verify-and-fall-back path is M1).
+/// locator is an error.
 pub fn resolve_locators(
     shard: &Shard,
     keys: &[CompositeKey],
@@ -34,7 +34,7 @@ pub fn resolve_locators(
 }
 
 /// Resolve `keys` into the source's hydration requests **per the shard's location
-/// strategy** (task-184 / D30):
+/// strategy**:
 ///
 /// * `COORDINATES` — the layered locate ([`resolve_locators`]) + the live-file bitmap
 ///   ([`apply_live_file_bitmap`]): each key carries its `(file, position)` for the
@@ -64,7 +64,7 @@ pub fn resolve_requests(
     }
 }
 
-/// Apply the **live-file bitmap** (task-184 slice 3) to resolved locators: a locator
+/// Apply the **live-file bitmap** to resolved locators: a locator
 /// whose file the shard has flagged dead (rewritten away by Iceberg compaction) is
 /// **known stale** — its point read is doomed — so it's stripped to `None` and the
 /// source's hydrate sends the key straight to the pass-2 fallback (whose result then
@@ -209,7 +209,7 @@ mod tests {
         assert!(matches!(err, EngineError::MissingLocator(_)));
     }
 
-    // ---- PREDICATE location strategy (task-184 / D30) --------------------------------
+    // ---- PREDICATE location strategy --------------------------------
 
     /// A committed shard on the **PREDICATE** strategy (same doc as [`committed_shard`]).
     fn committed_predicate_shard(dir: &std::path::Path) -> Shard {

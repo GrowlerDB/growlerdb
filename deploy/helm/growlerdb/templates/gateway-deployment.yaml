@@ -31,9 +31,9 @@ spec:
           securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
           args:
             - gateway
-            # Front the index's shards from the **live control-plane** registry (task-117): read the
-            # per-ordinal primaries + bucket map over gRPC and hot-reload on change — no shared
-            # registry file. `--control-plane` here drives both routing and the REST mgmt proxy.
+            # Front the index's shards from the **live control-plane** registry: read the per-ordinal
+            # primaries + bucket map over gRPC and hot-reload on change — no shared registry file.
+            # `--control-plane` here drives both routing and the REST mgmt proxy.
             - --control-plane
             - {{ include "growlerdb.controlplane.endpoint" . }}
             - --index
@@ -67,8 +67,8 @@ spec:
             {{- include "growlerdb.icebergEnv" . | nindent 12 }}
             {{- include "growlerdb.observabilityEnv" . | nindent 12 }}
             {{- with .Values.observability.grafanaUrl }}
-            # Only the gateway serves /v1/config, so the console's Grafana link lives here (task-140);
-            # keeping it off the node/control-plane pods avoids rolling them for a console-only value.
+            # Only the gateway serves /v1/config, so the console's Grafana link lives here; keeping it
+            # off the node/control-plane pods avoids rolling them for a console-only value.
             - name: GROWLERDB_GRAFANA_URL
               value: {{ . | quote }}
             {{- end }}

@@ -14,7 +14,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
 /**
- * Streams a {@link DocBatch} into a <b>distributed windowed</b> index (task-219): each upsert is
+ * Streams a {@link DocBatch} into a <b>distributed windowed</b> index: each upsert is
  * routed to its <b>time window</b> ({@link WindowRouter}, byte-identical to the engine), the window's
  * owning node is resolved from the control plane (placed on first ask), and the window's sub-batch is
  * committed to that node — the write-side of CP-driven windowed placement, mirroring the engine's
@@ -63,7 +63,7 @@ public final class WindowedWriteClient implements BatchWriter {
    * Each sub-batch carries the same checkpoint and a per-window {@code batch_id} ({@code {id}#w{window}}),
    * and — matching {@code TimeWindowing::partition_batch} — <b>no</b> {@code from}/{@code safe}
    * checkpoint, so a window that skipped a batch isn't gap-rejected by the node's continuity guard.
-   * Pure (no I/O), so the placement is unit-tested without a live cluster (task-219).
+   * Pure (no I/O), so the placement is unit-tested without a live cluster.
    */
   static SortedMap<Long, DocBatch> partition(
       DocBatch batch, WindowRouter router, java.util.Set<Long> knownWindows) {
@@ -77,7 +77,7 @@ public final class WindowedWriteClient implements BatchWriter {
             throw new IllegalStateException(
                 "upsert is missing the window field `"
                     + router.field()
-                    + "` — add it to --fields so the connector can route by window (task-219)");
+                    + "` — add it to --fields so the connector can route by window");
           }
           byWindow.computeIfAbsent(router.windowOf(wv), w -> new ArrayList<>()).add(op);
         }

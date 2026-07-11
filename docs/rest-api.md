@@ -142,7 +142,7 @@ Same surface over gRPC (proto package `growlerdb.v1`):
 - **Control plane** — `ControlPlane`: `CreateIndex` / `DropIndex` / `ListIndexes` / `GetIndex` /
   `DescribeSource` / `RegisterServedIndex` / `IngestionStatus` / `PlanReshard` / `ApplyReshard` /
   `MoveBucket`.
-  `GetIndex` also vends the index's virtual-bucket map (task-77; empty ⇒ legacy `fnv % shards`
+  `GetIndex` also vends the index's virtual-bucket map (empty ⇒ default `fnv % shards`
   routing). `RegisterServedIndex` takes `shard_ordinals` so node *k* claims only shard *k* of a
   multi-node index. `PlanReshard` computes the bounded bucket→shard reassignment for a new shard
   count (read-only). **`ApplyReshard` executes a growth reshard**: builds the new shards from source

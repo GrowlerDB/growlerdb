@@ -1,5 +1,5 @@
 //! The Node **Suggest** gRPC service ([Design 01]) — term suggestions over an
-//! indexed field's dictionary (task-25): **autocomplete** (prefix completions) and
+//! indexed field's dictionary: **autocomplete** (prefix completions) and
 //! **did-you-mean** (fuzzy corrections). Adapts the in-process `Shard::suggest_prefix`
 //! / `suggest_fuzzy`. Suggestion frequencies are approximate (not liveness-filtered),
 //! the suggester contract.
@@ -80,7 +80,7 @@ impl Suggest for SuggestService {
         } else {
             req.limit as usize
         };
-        // Node-level ceiling (task-146 / F13): a Node is directly reachable in distributed mode, so
+        // Node-level ceiling: a Node is directly reachable in distributed mode, so
         // cap an unbounded `limit` before it drives a huge scan.
         if limit > crate::search_service::MAX_NODE_FETCH {
             return Err(invalid("limit exceeds the maximum page fetch (10000)"));
@@ -91,7 +91,7 @@ impl Suggest for SuggestService {
         };
 
         let shard = self.shard.current();
-        // Tenant scoping (task-38): suggest scans a field's term dictionary across all docs,
+        // Tenant scoping: suggest scans a field's term dictionary across all docs,
         // which a per-doc filter can't constrain — so it would leak other tenants' terms.
         // Fail closed on a tenant-scoped index until a tenant-aware suggester lands.
         if let Some(field) = shard.tenant_field() {

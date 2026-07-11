@@ -1,4 +1,4 @@
-# Scale-test cluster inputs (task-159). Everything the run scales on is a variable here, so a run is
+# Scale-test cluster inputs. Everything the run scales on is a variable here, so a run is
 # reproduced or resized by changing tfvars — see okf/quality/scale-test-plan.md.
 
 variable "hcloud_token" {

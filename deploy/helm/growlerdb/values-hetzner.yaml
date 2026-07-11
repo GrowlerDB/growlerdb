@@ -1,8 +1,8 @@
-# Hetzner k3s (cloud) — performance / scale cluster (task-55/79).
+# Hetzner k3s (cloud) — performance / scale cluster.
 # More shards for query parallelism + bigger node resources; gateway HPA for query concurrency;
 # OIDC auth (public) + a ServiceMonitor into Grafana. Pair with: helm install ... -f values-hetzner.yaml
 #
-# Same private GHCR image as the lab cluster (create the `ghcr-pull` secret in this namespace too):
+# Same private GHCR image as the other clusters (create the `ghcr-pull` secret in this namespace too):
 #   docker build -t ghcr.io/growlerdb/growlerdb:latest -f deploy/Dockerfile . && docker push ghcr.io/growlerdb/growlerdb:latest
 #   kubectl -n growlerdb create secret docker-registry ghcr-pull \
 #     --docker-server=ghcr.io --docker-username=<github-username> --docker-password=$CR_PAT_READONLY

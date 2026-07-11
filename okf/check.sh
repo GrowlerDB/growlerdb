@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# OKF conformance check (task-181): every non-reserved concept .md must carry a non-empty `type`
+# OKF conformance check: every non-reserved concept .md must carry a non-empty `type`
 # frontmatter field. The reserved index.md files (curated directory listings) intentionally carry none. Run from anywhere.
 set -euo pipefail
 cd "$(dirname "$0")/.." || exit 1

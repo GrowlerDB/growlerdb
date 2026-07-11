@@ -2,9 +2,9 @@
   import { highlightSegments, type Segment } from '../lib/highlight';
   import type { HighlightSegment } from '../lib/api';
 
-  // Prefer server-side highlight `segments` (task-250) when present — they reflect the analyzed
+  // Prefer server-side highlight `segments` when present — they reflect the analyzed
   // match (stemming/positions). Otherwise fall back to client-side marking of the query `terms`
-  // in `text` (task-46). Both render the same way: text runs, with matched runs in <mark>.
+  // in `text`. Both render the same way: text runs, with matched runs in <mark>.
   let {
     text = '',
     terms = [],

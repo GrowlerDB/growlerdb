@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Chaos drill (task-115): catalog (Polaris) outage on the Compose stack.
+# Chaos drill: catalog (Polaris) outage on the Compose stack.
 #
-# Kills Polaris and asserts the AC-#5 posture:
+# Kills Polaris and asserts:
 #   1. SEARCH stays available during the outage — it serves the local index and never touches the
 #      catalog, so a catalog failure must not take reads down.
 #   2. Polaris SELF-RESTARTS (the `restart: unless-stopped` policy).
 #   3. HYDRATION recovers AUTOMATICALLY once the catalog returns — `keys:get` reads the authoritative
 #      Iceberg row through Polaris, so a hydrated row is end-to-end proof the catalog is back AND
-#      (via the persistent Postgres metastore, task-114) survived the bounce with its tables intact,
+#      (via the persistent Postgres metastore) survived the bounce with its tables intact,
 #      i.e. no stale/orphaned index.
 # Hydration is honestly degraded *during* the outage (not asserted here — Polaris restarts in seconds,
 # so a "hydration fails now" check is inherently racy; the durable claims are #1–#3).

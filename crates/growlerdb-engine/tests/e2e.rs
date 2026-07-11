@@ -1,4 +1,4 @@
-//! M0 **walking-skeleton** end-to-end test — the M0 done-gate.
+//! **Walking-skeleton** end-to-end test.
 //!
 //! Proves the whole spine against the **real** Compose stack (MinIO + Polaris +
 //! the seeded `growlerdb.docs` table — no lakehouse mocks): index → search → assert
@@ -105,7 +105,7 @@ async fn walking_skeleton_index_search_hydrate() {
     assert_eq!(prow.fields.keys().collect::<Vec<_>>(), vec!["title"]);
 }
 
-/// **task-77 sharded-build gate** — building two shards of the real seeded table partitions it
+/// **Sharded-build gate** — building two shards of the real seeded table partitions it
 /// disjointly, so a multi-shard cluster sees every document exactly once.
 ///
 /// Builds shard 0 and shard 1 of `growlerdb.docs` with `index_shard(.., shards=2, ordinal=K)`
@@ -168,15 +168,15 @@ async fn sharded_build_partitions_the_table_disjointly() {
     assert!(ids1.iter().all(|id| router.route(&doc_key(id)) == 1));
 }
 
-/// **M1 done-gate** — an update + a delete round-trip reflected in search.
+/// An update + a delete round-trip reflected in search.
 ///
 /// Builds the index from the real seeded table, then applies a changelog-style
 /// [`DocOp`] batch (the same ops the Spark connector commits over gRPC, here applied
 /// in-process): **update** doc-3's content and **delete** doc-2. Asserts that search
 /// reflects both — the new content is found, the superseded/deleted content is gone —
-/// proving updates & deletes (task-14: `key_to_doc` supersede + merge-on-read)
-/// end-to-end on Compose. The JVM↔Rust gRPC path for the same is covered by the
-/// connector cross-process test (task-11).
+/// proving updates & deletes (`key_to_doc` supersede + merge-on-read) end-to-end on
+/// Compose. The JVM↔Rust gRPC path for the same is covered by the connector
+/// cross-process test.
 #[tokio::test]
 #[ignore = "requires the local dev stack (just up) + `127.0.0.1 minio` in /etc/hosts"]
 async fn update_and_delete_round_trip_reflected_in_search() {
@@ -187,7 +187,7 @@ async fn update_and_delete_round_trip_reflected_in_search() {
         .await
         .expect("index");
 
-    // Baseline (from the M0 gate): `body:iceberg` → doc-2; `body:search` → doc-2 + doc-3.
+    // Baseline: `body:iceberg` → doc-2; `body:search` → doc-2 + doc-3.
     let before = engine
         .search("docs", "body:search", 10, false, Projection::All)
         .await
@@ -264,9 +264,9 @@ async fn update_and_delete_round_trip_reflected_in_search() {
     );
 }
 
-/// task-17: a stale locator (as if Iceberg rewrote the data file) must **verify
-/// and fall back** — re-find the row by key, return the correct content (never a
-/// phantom), and **refresh** the locator so it self-heals.
+/// A stale locator (as if Iceberg rewrote the data file) must **verify and fall
+/// back** — re-find the row by key, return the correct content (never a phantom),
+/// and **refresh** the locator so it self-heals.
 #[tokio::test]
 #[ignore = "requires the local dev stack (just up) + `127.0.0.1 minio` in /etc/hosts"]
 async fn stale_locator_self_heals_via_verify_and_fall_back() {
@@ -326,12 +326,12 @@ async fn stale_locator_self_heals_via_verify_and_fall_back() {
     assert_eq!(again[0].fields["title"].to_index_string(), "iceberg search");
 }
 
-/// **task-195 reconcile backstop (AC #5)** — the D9 detect-and-repair promise, end-to-end against
+/// **Reconcile backstop** — the detect-and-repair promise, end-to-end against
 /// the real seeded table. Injects drift in **both** directions into the built index, then asserts a
 /// single [`Engine::reconcile`] cycle repairs it all, and that re-running is a no-op (idempotent).
 ///
-/// The two *missing* injections stand for the two provenances AC #5 names: an **artificially-deleted
-/// indexed row** (indexed, then lost from the index while still in the source — the task-194
+/// The two *missing* injections stand for two provenances: an **artificially-deleted
+/// indexed row** (indexed, then lost from the index while still in the source — the
 /// silent-loss class) and an **artificially-skipped source row** (a source row ingest never
 /// applied). Both leave the index in the same "source has the key, index doesn't" state, which
 /// reconcile repairs *regardless of cause* — the whole point of the backstop. A third **stale**

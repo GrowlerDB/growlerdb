@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Staged multi-scale test driver (task-185).
+"""Staged multi-scale test driver.
 
 Steps ingest rate and storage size, capturing the full metric set at each milestone so the scale
 questions can be answered with graphs + a results table. Runs from a kubectl-capable host (Mac / CI
@@ -23,10 +23,10 @@ WORKLOAD = os.environ.get("WORKLOAD", "http_logs")  # which query mix harness.py
 CONCURRENCY = os.environ.get("CONCURRENCY", "16")
 # (records/s target, BATCH, SLEEP_S) — reachable steps on the interim cluster; 100k is modeled.
 # BATCH is the generator's per-append rows = one Iceberg SNAPSHOT = the connector's commit size (the
-# connector cuts only at snapshot boundaries, so it can't sub-divide a snapshot — task-237). Commit
-# latency is ~O(snapshot) — the 2026-07-08 sweep measured write p95 ~880ms @10k-row snapshots vs
-# ~4.5s @150k — so KEEP BATCH bounded (≤ the connector's 50k maxCommitRows) and hit the rate with a
-# shorter SLEEP_S, rather than a huge BATCH. The old (…, 300000, 30) self-inflicted ~9.5s p99 commits.
+# connector cuts only at snapshot boundaries, so it can't sub-divide a snapshot). Commit latency is
+# ~O(snapshot) — write p95 ~880ms @10k-row snapshots vs ~4.5s @150k — so KEEP BATCH bounded (≤ the
+# connector's 50k maxCommitRows) and hit the rate with a shorter SLEEP_S, rather than a huge BATCH
+# (a 300k BATCH self-inflicts ~9.5s p99 commits).
 INGEST_STEPS = [(1000, 10000, 10), (10000, 30000, 3)]
 STORAGE_GB = [float(x) for x in os.environ.get("STORAGE_GB", "1,10,100").split(",")]
 ROW_BYTES = 28.0  # measured http_logs bytes/row; milestone target rows = GB / ROW_BYTES
@@ -52,8 +52,8 @@ def set_ingest(batch, sleep_s):
     kubectl("set", "env", "deploy/growlerdb-generator", f"BATCH={batch}", f"SLEEP_S={sleep_s}")
 
 
-# Generator replica count for resume (task-231): parallel generators sustain higher ingest; freeze
-# scales to 0, resume restores to $GENERATORS (default 1).
+# Generator replica count for resume: parallel generators sustain higher ingest; freeze scales to 0,
+# resume restores to $GENERATORS (default 1).
 GENERATORS = int(os.environ.get("GENERATORS", "1"))
 
 
@@ -79,13 +79,13 @@ def snapshot():
         "hydration_p95_s": prom("histogram_quantile(0.95,sum(rate(growlerdb_hydration_duration_seconds_bucket[2m]))by(le))"),
         "node_cpu_cores": prom("sum(rate(node_cpu_seconds_total{mode!=\"idle\"}[2m]))"),
         "index_source_ratio": prom("sum(growlerdb_index_bytes) / max(growlerdb_source_bytes)"),
-        # Per-component index bytes (task-218): term/postings/positions/fieldnorms (the inverted
-        # index), fast, store, locator, other — sums to index_bytes, so a ratio change is
-        # attributable to the structure that moved (positions dropped, key terms shrunk, ...).
+        # Per-component index bytes: term/postings/positions/fieldnorms (the inverted index), fast,
+        # store, locator, other — sums to index_bytes, so a ratio change is attributable to the
+        # structure that moved (positions dropped, key terms shrunk, ...).
         "index_bytes_component": prom_by("sum by (component) (growlerdb_index_bytes_component)", "component"),
-        # Measurement context (task-218): a size sample between merges carries superseded docs
-        # (NoMergePolicy — purged only at compaction), so record the delete debt + segment count
-        # alongside; a milestone with high debt overstates the steady-state footprint.
+        # Measurement context: a size sample between merges carries superseded docs (NoMergePolicy —
+        # purged only at compaction), so record the delete debt + segment count alongside; a milestone
+        # with high debt overstates the steady-state footprint.
         "segments_live": prom("sum(growlerdb_segments_live)"),
         "index_deleted_docs": prom("sum(growlerdb_index_deleted_docs)"),
     }
@@ -109,8 +109,8 @@ def run_loadgen(seconds=180):
 
 
 def run_trino(seconds_label):
-    """GrowlerDB-vs-Iceberg(Trino) comparison at this milestone (task-186) — skipped if Trino isn't
-    deployed. Delegates to compare_trino.py (same equivalent-predicate pairs), writing its result to a
+    """GrowlerDB-vs-Iceberg(Trino) comparison at this milestone — skipped if Trino isn't deployed.
+    Delegates to compare_trino.py (same equivalent-predicate pairs), writing its result to a
     temp OUT this reads back. Honest framing: search+PK-hydrate vs table-scan, not general OLAP."""
     if not kubectl("get", "deploy", "trino", "--ignore-not-found"):
         return {"skipped": "trino not deployed"}
@@ -133,11 +133,11 @@ def main():
         time.sleep(240)  # let the rate settle
         s = snapshot()
         s["target_rps"] = target
-        # Keep-up = indexing matches ingestion (backlog steady/draining), NOT rows_behind < target
-        # (task-230): rows_behind is a row count and the connector commits in BATCH-sized chunks, so a
-        # single steady batch (e.g. 30k) tripped the old `< target` test as a false "not keeping up".
-        # If index_rate >= ingest_rate the backlog isn't growing → keeping up; also record lag in
-        # seconds for context (rows_behind / ingest_rate) rather than a bare count.
+        # Keep-up = indexing matches ingestion (backlog steady/draining), NOT rows_behind < target:
+        # rows_behind is a row count and the connector commits in BATCH-sized chunks, so a single
+        # steady batch (e.g. 30k) would trip a `< target` test as a false "not keeping up". If
+        # index_rate >= ingest_rate the backlog isn't growing → keeping up; also record lag in seconds
+        # for context (rows_behind / ingest_rate) rather than a bare count.
         s["lag_seconds"] = round(s["rows_behind"] / max(s["ingest_rate_rps"], 1), 1)
         s["keeps_up"] = s["index_rate_dps"] >= s["ingest_rate_rps"] * 0.98
         results["ingest_steps"].append(s)

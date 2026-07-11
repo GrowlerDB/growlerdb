@@ -1,4 +1,4 @@
-"""Top-K document retrieval (task-55 re-run): the IoT-realistic "show me the matching readings" query
+"""Top-K document retrieval: the IoT-realistic "show me the matching readings" query
 (`LIMIT K`), comparing what each engine returns:
   - GrowlerDB coordinates-only  (index `telemetry`, no cached fields)        :8097
   - GrowlerDB cached fields      (index `telemetry_cached`, _source-equiv)    :8098

@@ -22,7 +22,7 @@ Profiles: `seed` (sample tables), `stack` (GrowlerDB + LGTM), `pipeline` (the st
 Redpanda). Long-running services carry `restart:` policies (self-heal); chaos drills exercise recovery
 ([reliability](/quality/reliability.md)).
 
-**Two demo indexes** (task-241): the `seed` profile writes `growlerdb.docs` (3 rows, the minimal
+**Two demo indexes:** the `seed` profile writes `growlerdb.docs` (3 rows, the minimal
 E2E table) *and* the richer `growlerdb.catalog` (10 rows — one field of every type). The `stack`
 profile serves each from its own node (`node` → `docs`, `node-catalog` → `catalog`, built from
 `catalog.yaml`), and the single `--all-indexes` [gateway](/system/runtime/components/gateway.md) routes

@@ -116,7 +116,7 @@ off-by-timezone date. To change a field's `format`/unit on an existing index, re
 > **Windowing.** A time-**windowed** index (`windowing:`) buckets on the same canonical micros scale,
 > so its `field` (and optional `event_time_field`) **must be a `DATE`** — declare a `format` on the
 > source column (the demo's `ingest`/`event` are `epoch_ms`) or use a native Iceberg timestamp. A
-> raw `LONG` window field is **rejected** (its unit is ambiguous). *Migration:* a pre-task-116
+> raw `LONG` window field is **rejected** (its unit is ambiguous). *Migration:* a
 > windowed index that used a millis-`LONG` window field must re-declare it with a `format` and
 > reindex — the stored window ids/zone-maps were millis and are rebuilt on the canonical micros scale.
 

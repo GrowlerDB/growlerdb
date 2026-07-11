@@ -1,7 +1,7 @@
-// Minimal i18n (task-45): a message catalog per locale + `t(key, params)`. The baseline
-// ships `en`; adding a locale is dropping in a catalog. Interpolation uses `{name}` tokens.
-// Runtime switching (task-91): `setLocale` updates `localeStore`; App re-keys on it so every
-// `t(...)` re-evaluates. The choice is persisted in localStorage.
+// Minimal i18n: a message catalog per locale + `t(key, params)`. The baseline ships `en`; adding a
+// locale is dropping in a catalog. Interpolation uses `{name}` tokens. `setLocale` updates
+// `localeStore`; App re-keys on it so every `t(...)` re-evaluates. The choice is persisted in
+// localStorage.
 import { writable } from 'svelte/store';
 import en from './locales/en';
 

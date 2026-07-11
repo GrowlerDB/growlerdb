@@ -5,10 +5,10 @@
 //! the core behind a small surface (build / open) leaves a future Lucene backend
 //! possible, exactly as the design intends.
 //!
-//! M0 scope: TEXT fields are analyzed (Tantivy's default tokenizer — simple
-//! tokenizer + lowercasing, i.e. "standard + lowercase"), KEYWORD fields are
-//! indexed raw, and the [`CompositeKey`] is stored per document (JSON) so every
-//! hit carries the coordinates the engine hydrates from Iceberg (task-8).
+//! TEXT fields are analyzed (Tantivy's default tokenizer — simple tokenizer +
+//! lowercasing, i.e. "standard + lowercase"), KEYWORD fields are indexed raw, and
+//! the [`CompositeKey`] is stored per document (JSON) so every hit carries the
+//! coordinates the engine hydrates from Iceberg.
 //!
 //! [Tantivy]: https://github.com/quickwit-oss/tantivy
 //! [wiki 05]: ../../../wiki/05-search-core.md
@@ -40,23 +40,23 @@ use tantivy::{
 };
 
 /// Name of the stored field holding a doc's `enc(CompositeKey)` bytes — hit identity,
-/// rebuilt via [`CompositeKey::decode`] (task-212). Same encoding as [`KEY_ENC_FIELD`],
-/// computed once per doc.
+/// rebuilt via [`CompositeKey::decode`]. Same encoding as [`KEY_ENC_FIELD`], computed
+/// once per doc.
 pub const KEY_FIELD: &str = "_key";
 /// Name of the **bytes-indexed** field holding `enc(CompositeKey)` — lets a reader
-/// exclude a generation's tombstoned docs by key for liveness-correct aggregations
-/// (task-24/64). Not stored (the stored `_key` carries the same bytes for hits).
+/// exclude a generation's tombstoned docs by key for liveness-correct aggregations.
+/// Not stored (the stored `_key` carries the same bytes for hits).
 const KEY_ENC_FIELD: &str = "_keyenc";
 /// Name of the u64 **fast field** holding a doc's internal **locator ID** — the
-/// immutable *reference* layer of the [D30] layered locator (task-184). The id indexes
-/// the shard's dense location array ([`crate::location`]), which maps it to the row's
-/// current `(file_id, row_position)`. Written on every upsert — the layered locator is
-/// the only shard layout.
+/// immutable *reference* layer of the [D30] layered locator. The id indexes the shard's
+/// dense location array ([`crate::location`]), which maps it to the row's current
+/// `(file_id, row_position)`. Written on every upsert — the layered locator is the only
+/// shard layout.
 ///
 /// [D30]: ../../../okf/system/decisions/d30-layered-locator.md
 pub const LOC_ID_FIELD: &str = "_locid";
 
-/// Writer heap budget. Small for M0 batches; tuned later (task-33 compaction).
+/// Writer heap budget.
 pub const WRITER_HEAP_BYTES: usize = 50_000_000;
 
 /// Errors from building or reading a segment.
@@ -113,12 +113,12 @@ pub struct IndexSchema {
     /// to every upsert by the store's commit path.
     loc_id_field: Field,
     /// (path, tantivy field, type, declared timestamp format) for each mapped field, in definition
-    /// order. The optional [`TimeFormat`] (task-112) is set only for fields declared as timestamps;
-    /// it tells [`add_typed_value`] to normalize the source epoch to canonical micros at build.
+    /// order. The optional [`TimeFormat`] is set only for fields declared as timestamps; it tells
+    /// [`add_typed_value`] to normalize the source epoch to canonical micros at build.
     fields: Vec<(String, Field, FieldType, Option<TimeFormat>)>,
-    /// The tenant-scoping field (task-38), if the index is tenant-scoped.
+    /// The tenant-scoping field, if the index is tenant-scoped.
     tenant_field: Option<String>,
-    /// The index's **location strategy** (D30, task-184). Under
+    /// The index's **location strategy** (D30). Under
     /// [`Predicate`](LocationStrategy::Predicate) the store's commit path never
     /// populates [`LOC_ID_FIELD`] and writes no location slots — the schema **keeps**
     /// the field either way (see [`from_resolved`](Self::from_resolved)).
@@ -130,9 +130,9 @@ impl IndexSchema {
     ///
     /// TEXT → analyzed full-text; KEYWORD → raw; LONG/DOUBLE/BOOL/DATE/IP → typed,
     /// indexed (range-queryable) columns. The `fast` flag adds a columnar fast field
-    /// (sort/filter/aggregate, task-23/24); `cached` stores the value for return with
-    /// the hit (D23). The composite key is added as a `STORED`-only bytes field — the
-    /// compact `enc(key)` (task-212).
+    /// (sort/filter/aggregate); `cached` stores the value for return with the hit (D23).
+    /// The composite key is added as a `STORED`-only bytes field — the compact
+    /// `enc(key)`.
     pub fn from_resolved(idx: &ResolvedIndex) -> Self {
         let mut builder = Schema::builder();
         let key_field = builder.add_bytes_field(KEY_FIELD, STORED);
@@ -141,9 +141,9 @@ impl IndexSchema {
         for f in &idx.fields {
             let handle = match f.ty {
                 FieldType::Text => {
-                    // Per-field indexing detail (task-216): record level (positions are the
-                    // phrase-query slice, usually the largest part of a text field's inverted
-                    // index) and fieldnorms (BM25 length normalization, ~1 byte/doc).
+                    // Per-field indexing detail: record level (positions are the phrase-query
+                    // slice, usually the largest part of a text field's inverted index) and
+                    // fieldnorms (BM25 length normalization, ~1 byte/doc).
                     let indexing = TextFieldIndexing::default()
                         .set_tokenizer("default")
                         .set_index_option(record_option(f.record))
@@ -172,13 +172,13 @@ impl IndexSchema {
             };
             fields.push((f.path.clone(), handle, f.ty, f.format));
         }
-        // The D30 locator-ID fast field (task-184), added after the mapped fields so
-        // the internal handles never shift a user field's ordinal. It is declared for
-        // **every** strategy — a `PREDICATE` index just never populates it (a missing
-        // u64 fast value costs ~nothing bitpacked). Keeping the schema identical
-        // across strategies avoids the slice-2 field-ordinal hazard: segments, backup,
-        // reindex, and cold-open tooling see one schema shape, and a strategy never
-        // shifts another field's ordinal.
+        // The D30 locator-ID fast field, added after the mapped fields so the internal
+        // handles never shift a user field's ordinal. It is declared for **every**
+        // strategy — a `PREDICATE` index just never populates it (a missing u64 fast
+        // value costs ~nothing bitpacked). Keeping the schema identical across strategies
+        // avoids the field-ordinal hazard: segments, backup, reindex, and cold-open
+        // tooling see one schema shape, and a strategy never shifts another field's
+        // ordinal.
         let loc_id_field = builder.add_u64_field(LOC_ID_FIELD, FAST);
         Self {
             schema: builder.build(),
@@ -191,22 +191,22 @@ impl IndexSchema {
         }
     }
 
-    /// The index's [location strategy](LocationStrategy) (D30, task-184) — how the
-    /// store's commit path and the engine's hydration path locate source rows.
+    /// The index's [location strategy](LocationStrategy) (D30) — how the store's commit
+    /// path and the engine's hydration path locate source rows.
     pub fn location_strategy(&self) -> LocationStrategy {
         self.location_strategy
     }
 
-    /// The tenant-scoping field (task-38), if this index is tenant-scoped — the field reads
-    /// inject a mandatory `= <verified claim>` filter on.
+    /// The tenant-scoping field, if this index is tenant-scoped — the field reads inject
+    /// a mandatory `= <verified claim>` filter on.
     pub fn tenant_field(&self) -> Option<&str> {
         self.tenant_field.as_deref()
     }
 
-    /// The mapped **DATE** fields, in definition order (task-101). These are the columns a console
-    /// time filter can range-scope a query on; when one is also the windowing field, the gateway
-    /// prunes non-overlapping windows (task-81). Stored as canonical **epoch microseconds**
-    /// (task-112) — the unit Tantivy `DateTime::from_timestamp_micros` and the range/sort path use.
+    /// The mapped **DATE** fields, in definition order. These are the columns a console
+    /// time filter can range-scope a query on; when one is also the windowing field, the
+    /// gateway prunes non-overlapping windows. Stored as canonical **epoch microseconds** —
+    /// the unit Tantivy `DateTime::from_timestamp_micros` and the range/sort path use.
     pub fn date_fields(&self) -> Vec<&str> {
         self.fields
             .iter()
@@ -228,8 +228,8 @@ impl IndexSchema {
     }
 
     /// Build the [`TantivyDocument`] for `doc`: the stored + indexed `enc(key)` (one
-    /// encoding, computed once — hit identity and the delete term, task-212), and each
-    /// mapped field's typed value (skipping absent fields).
+    /// encoding, computed once — hit identity and the delete term), and each mapped
+    /// field's typed value (skipping absent fields).
     pub fn to_tantivy(&self, doc: &Document) -> TantivyDocument {
         let mut td = TantivyDocument::new();
         let enc = doc.key.encode();
@@ -249,7 +249,7 @@ impl IndexSchema {
     }
 }
 
-/// The Tantivy [`IndexRecordOption`] for a TEXT field's [`TextRecord`] level (task-216).
+/// The Tantivy [`IndexRecordOption`] for a TEXT field's [`TextRecord`] level.
 fn record_option(record: TextRecord) -> IndexRecordOption {
     match record {
         TextRecord::Basic => IndexRecordOption::Basic,
@@ -259,7 +259,7 @@ fn record_option(record: TextRecord) -> IndexRecordOption {
 }
 
 /// `NumericOptions` for a LONG/DOUBLE/BOOL field per the field's `indexed`/`fast`/`cached` flags.
-/// A **fast-only** field (task-215, the default when `fast: true`) carries no inverted index —
+/// A **fast-only** field (the default when `fast: true`) carries no inverted index —
 /// range, exact-match (routed through Range), sort/search-after, and exists all run on the
 /// columnar store (Tantivy's `RangeQuery` takes the fast path whenever the field is fast, and
 /// `ExistsQuery` only ever reads fast fields), so the postings + term dict would be dead weight.
@@ -337,12 +337,12 @@ fn add_typed_value(
                 td.add_bool(field, *b);
             }
         }
-        // Dates are stored as canonical epoch **microseconds** (task-112). A field declared with a
+        // Dates are stored as canonical epoch **microseconds**. A field declared with a
         // `format` carries its source value in some other epoch unit (the demo's `ts` is millis), so
         // normalize it here; an unparseable value is **skipped** (the doc still indexes its other
         // fields) rather than wedging the batch or writing an off-by-10³ date. A field with no
         // declared format already arrives as canonical micros — a native source date/timestamp
-        // extracts to `Ts` (task-184), and a pre-parsed epoch column may still arrive as `Int`
+        // extracts to `Ts`, and a pre-parsed epoch column may still arrive as `Int`
         // (`TimeFormat::to_micros` likewise passes a `Ts` through untouched).
         FieldType::Date => match format {
             Some(fmt) => {
@@ -433,7 +433,7 @@ fn guard_regex(pattern: &str) -> Result<()> {
 pub struct TantivySegmentCore;
 
 impl TantivySegmentCore {
-    /// The settings a **new** index is created with (task-212): zstd doc-store compression.
+    /// The settings a **new** index is created with: zstd doc-store compression.
     /// lz4 (the default) only match-copies, so high-entropy stored values — hex/UUID hit keys,
     /// random-ish cached fields — pass through nearly uncompressed; zstd entropy-codes them
     /// (~2x on hex). Per-index: the compressor persists in `meta.json`, so an existing index
@@ -471,7 +471,7 @@ impl TantivySegmentCore {
 
     /// Open the shard's **single** Tantivy index at `dir`, creating it empty if absent.
     /// All commits add segments to this one index (the single-index model); compaction
-    /// is `IndexWriter::merge` over its segments (task-33). An existing index opens with
+    /// is `IndexWriter::merge` over its segments. An existing index opens with
     /// the settings persisted in its `meta.json` (its original doc-store compressor);
     /// only a fresh create gets [`new_index_settings`](Self::new_index_settings).
     pub fn open_or_create_index(&self, schema: &IndexSchema, dir: &Path) -> Result<Index> {
@@ -487,8 +487,8 @@ impl TantivySegmentCore {
     }
 }
 
-/// Rebuild a hit's [`CompositeKey`] from its stored `_key` bytes (task-212) — the
-/// strict inverse of the `enc(key)` written at index time.
+/// Rebuild a hit's [`CompositeKey`] from its stored `_key` bytes — the strict inverse of
+/// the `enc(key)` written at index time.
 fn stored_key(doc: &TantivyDocument, key_field: Field) -> Result<CompositeKey> {
     let bytes = doc
         .get_first(key_field)
@@ -497,7 +497,7 @@ fn stored_key(doc: &TantivyDocument, key_field: Field) -> Result<CompositeKey> {
     Ok(CompositeKey::decode(bytes)?)
 }
 
-/// The result of explaining one document's score for a query (task-102): Tantivy's BM25
+/// The result of explaining one document's score for a query: Tantivy's BM25
 /// score-explanation tree plus the post-analyzer tokens the query searched for.
 #[derive(Debug, Clone)]
 pub struct ExplainHit {
@@ -531,7 +531,7 @@ impl SegmentReader {
 
     /// A read handle **pinned** to `index`'s current commit — never reloads, so its
     /// searcher is a stable snapshot and Tantivy keeps the referenced segment files
-    /// alive even as later commits/compaction run. This is a point-in-time pin (task-65).
+    /// alive even as later commits/compaction run. This is a point-in-time pin.
     pub fn snapshot(index: &Index) -> Result<Self> {
         Ok(SegmentReader {
             index: index.clone(),
@@ -555,10 +555,9 @@ impl SegmentReader {
 
     /// The **locator ID** (`_locid` fast field) of the live doc carrying `enc(key)`,
     /// or `None` when no live doc has the key. This is the D30 write path's pre-commit
-    /// **reuse lookup** (task-184): a key-term probe of each segment's dictionary + one
-    /// fast-field read, ~1 µs warm per key (spike-measured, ≈1–2% of ingest CPU at bulk
-    /// rates), which keeps the location array O(live keys) instead of O(all versions
-    /// ever written).
+    /// **reuse lookup**: a key-term probe of each segment's dictionary + one fast-field
+    /// read, ~1 µs warm per key (≈1–2% of ingest CPU at bulk rates), which keeps the
+    /// location array O(live keys) instead of O(all versions ever written).
     pub fn live_loc_id(&self, key_enc: &[u8]) -> Result<Option<u64>> {
         let schema = self.index.schema();
         let Ok(key_enc_field) = schema.get_field(KEY_ENC_FIELD) else {
@@ -675,8 +674,8 @@ impl SegmentReader {
         Ok(live.into_iter().collect())
     }
 
-    /// Read the **cached** (stored) display fields of `doc` into a value map (D23,
-    /// task-26) — every stored field except the internal key, typed back to a wire
+    /// Read the **cached** (stored) display fields of `doc` into a value map (D23) —
+    /// every stored field except the internal key, typed back to a wire
     /// [`Value`](growlerdb_core::Value). These ride along on each [`Hit`] so a page
     /// renders without hydration.
     fn cached_fields(&self, doc: &TantivyDocument) -> std::collections::BTreeMap<String, GValue> {
@@ -708,9 +707,9 @@ impl SegmentReader {
     }
 
     /// Run `aggs` over the docs matching `query` and return the **intermediate** results for the
-    /// store to merge/finalize (task-24). Under the single-index-per-shard model, Tantivy's own
-    /// delete handling already excludes superseded/deleted docs, so there is no tombstone exclusion
-    /// to apply here (task-75).
+    /// store to merge/finalize. Under the single-index-per-shard model, Tantivy's own delete
+    /// handling already excludes superseded/deleted docs, so there is no tombstone exclusion to
+    /// apply here.
     pub fn aggregate_intermediate(
         &self,
         query: &Query,
@@ -726,8 +725,8 @@ impl SegmentReader {
     /// Count the documents matching `query` — the **live match total**, since the single
     /// index natively excludes superseded/deleted docs (same liveness as `num_docs`/aggregations).
     /// Cheap: no scoring, sorting, or doc materialization, just a `Count` over the matched docset.
-    /// Used for the search response's `total` (the true match count, distinct from page size —
-    /// task-68). Validates fields like [`search`](Self::search), so a bad query errors clearly.
+    /// Used for the search response's `total` (the true match count, distinct from page size).
+    /// Validates fields like [`search`](Self::search), so a bad query errors clearly.
     pub fn count(&self, query: &Query) -> Result<u64> {
         let tantivy_query = self.build(query)?;
         let searcher = self.reader.searcher();
@@ -752,8 +751,8 @@ impl SegmentReader {
     /// more keys the window is the top-`limit` by the **primary** key, and each hit
     /// carries the value of **every** key (in key order) read from its columnar fast
     /// field — `None` when the doc lacks the field — so the store can do the full
-    /// multi-key merge + page across generations (task-23). For key sort `Hit::score`
-    /// is 0.0 (relevance isn't the ranking).
+    /// multi-key merge + page across generations. For key sort `Hit::score` is 0.0
+    /// (relevance isn't the ranking).
     pub fn search_sorted(
         &self,
         query: &Query,
@@ -762,8 +761,8 @@ impl SegmentReader {
         after: Option<&SearchAfter>,
     ) -> Result<Vec<(Hit, Vec<SortValue>)>> {
         // With a keyset cursor, AND the user query with a predicate that admits only
-        // docs strictly after the cursor in the total order (task-23). The cursor
-        // needs a primary sort key to range over.
+        // docs strictly after the cursor in the total order. The cursor needs a primary
+        // sort key to range over.
         let base = self.build(query)?;
         let tantivy_query: Box<dyn TantivyQuery> = match after {
             None => base,
@@ -805,8 +804,8 @@ impl SegmentReader {
         };
 
         // The window score is the ranking value for an unsorted query and for an
-        // explicit `_score` primary (task-66); for a field-sorted query it's 0.0 (the
-        // store ranks by the sort tuple, not relevance).
+        // explicit `_score` primary; for a field-sorted query it's 0.0 (the store ranks
+        // by the sort tuple, not relevance).
         let by_score = sort.is_empty() || sort.first().is_some_and(Sort::is_score);
         let key_field = self.index.schema().get_field(KEY_FIELD)?;
         let mut out = Vec::with_capacity(window.len());
@@ -864,7 +863,7 @@ impl SegmentReader {
         };
         let searcher = self.reader.searcher();
         let docs = searcher.search(tantivy_query.as_ref(), &DocSetCollector)?;
-        // When a `_score` key is present (task-66) we need each matching doc's relevance.
+        // When a `_score` key is present we need each matching doc's relevance.
         // The exhaustive collector doesn't score, so score per doc via `explain` (the same
         // scorer as search, so it matches ranking exactly). `_score` rejects keyset paging,
         // so `tantivy_query` here is the unwrapped user query — the right thing to explain.
@@ -903,7 +902,7 @@ impl SegmentReader {
         Ok(out)
     }
 
-    /// The set of **highlightable** TEXT field names given a highlight request (task-250): the
+    /// The set of **highlightable** TEXT field names given a highlight request: the
     /// requested `fields`, or — when the request lists none — every analyzed TEXT field the index
     /// stores (`cached`), in schema order. A requested field that isn't an analyzed, stored TEXT
     /// field is silently dropped (highlighting is best-effort; a non-highlightable name shouldn't
@@ -933,8 +932,8 @@ impl SegmentReader {
         }
     }
 
-    /// Fill each hit's per-field [`highlight`](Hit::highlight) from the **analyzed match**
-    /// (task-250): for every requested highlightable TEXT field, build a Tantivy
+    /// Fill each hit's per-field [`highlight`](Hit::highlight) from the **analyzed match**:
+    /// for every requested highlightable TEXT field, build a Tantivy
     /// [`SnippetGenerator`](tantivy::snippet::SnippetGenerator) for `query` and snippet the hit's
     /// own **cached** text, converting the highlighted byte ranges to XSS-safe
     /// [segments](HighlightSegment). Bounded by `hl.fragment_size` (the snippet window). Fields with
@@ -984,7 +983,7 @@ impl SegmentReader {
         Ok(())
     }
 
-    /// **Prefix autocomplete** (task-25): the indexed terms of `field` that start with
+    /// **Prefix autocomplete**: the indexed terms of `field` that start with
     /// `prefix`, each with its document frequency, by scanning the field's term
     /// dictionary from `prefix` until a term no longer matches. `field` must be an
     /// indexed string field (TEXT → analyzed tokens, KEYWORD → raw values); the store
@@ -1036,7 +1035,7 @@ impl SegmentReader {
         Ok(out)
     }
 
-    /// **Did-you-mean** candidates (task-25): indexed terms of `field` within edit
+    /// **Did-you-mean** candidates: indexed terms of `field` within edit
     /// distance `max_dist` of `term` (excluding `term` itself), each as `(term,
     /// distance, doc_freq)`. Scans the field's term dictionary, pruning by length and
     /// a distance-bounded Levenshtein, capped at `scan_cap` terms. The store merges
@@ -1105,7 +1104,7 @@ impl SegmentReader {
         order: tantivy::Order,
         limit: usize,
     ) -> Result<Vec<(f32, tantivy::DocAddress)>> {
-        // `_score` as the primary key (task-66): the window IS the top-`limit` by score —
+        // `_score` as the primary key: the window IS the top-`limit` by score —
         // ordered by relevance, with the real per-doc score carried through (unlike fast
         // fields, whose window score is 0.0 and read back via `fast_value`). Descending is
         // the natural score order; an ascending `_score` is re-ordered by the store.
@@ -1182,8 +1181,8 @@ impl SegmentReader {
     }
 
     /// Validate `field` is a **fast** field usable as a sort key — numeric, date, or a
-    /// KEYWORD string fast field. The reserved [`SCORE_SORT_KEY`] (`_score`, task-66) is
-    /// always sortable (relevance, not a field), so it is exempt from the fast check.
+    /// KEYWORD string fast field. The reserved [`SCORE_SORT_KEY`] (`_score`) is always
+    /// sortable (relevance, not a field), so it is exempt from the fast check.
     fn ensure_sortable(&self, field: &str) -> Result<()> {
         if field == SCORE_SORT_KEY {
             return Ok(());
@@ -1299,7 +1298,7 @@ impl SegmentReader {
     fn keyset_after(&self, sort: &[Sort], cursor: &SearchAfter) -> Result<Box<dyn TantivyQuery>> {
         if sort_has_score(sort) {
             // A relevance score isn't a stable, range-able key, so it can't anchor a
-            // keyset predicate (task-66). `_score` sorts are offset-paged only.
+            // keyset predicate. `_score` sorts are offset-paged only.
             return Err(IndexError::QueryType(
                 "search_after (keyset paging) is not supported with a `_score` sort key; \
                  use offset paging"
@@ -1545,8 +1544,8 @@ impl SegmentReader {
                     ))),
                     _ => {
                         // A multi-token phrase needs positions. A field mapped with
-                        // `record: BASIC|FREQ` (task-216) doesn't have them — fail with the
-                        // fix, not tantivy's opaque weight error or silently-empty results.
+                        // `record: BASIC|FREQ` doesn't have them — fail with the fix, not
+                        // tantivy's opaque weight error or silently-empty results.
                         let schema = self.index.schema();
                         let entry = schema.get_field_entry(field);
                         let has_positions = matches!(
@@ -1682,7 +1681,7 @@ impl SegmentReader {
         Ok(out)
     }
 
-    /// **Explain** how `query` scores the document identified by `key_enc` (task-102): locate the doc
+    /// **Explain** how `query` scores the document identified by `key_enc`: locate the doc
     /// by its encoded composite key, then ask Tantivy for the per-clause BM25 explanation. Also
     /// returns the post-analyzer tokens the query searched for. `found = false` if the key isn't in
     /// the index; `matched = false` if the doc exists but the query doesn't select it.
@@ -1725,7 +1724,7 @@ impl SegmentReader {
         }
     }
 
-    /// The post-analyzer tokens `query` searches for, as `(field, tokens)` (task-102). Walks the
+    /// The post-analyzer tokens `query` searches for, as `(field, tokens)`. Walks the
     /// leaf clauses, running each field's analyzer so the console can show exactly what was matched.
     fn analyzed_terms(&self, query: &Query) -> Vec<(String, Vec<String>)> {
         let mut out = Vec::new();
@@ -1953,8 +1952,8 @@ fn field_kind(schema: &Schema, field: Field) -> Option<bool> {
 }
 
 /// Convert a Tantivy snippet — a `fragment` string plus `highlighted` byte ranges into it — to an
-/// XSS-safe [`HighlightFragment`] of alternating context / matched [segments](HighlightSegment)
-/// (task-250). Overlapping ranges are collapsed first (Tantivy can emit adjacent/overlapping hits),
+/// XSS-safe [`HighlightFragment`] of alternating context / matched [segments](HighlightSegment).
+/// Overlapping ranges are collapsed first (Tantivy can emit adjacent/overlapping hits),
 /// and the fragment carries no HTML — the client wraps `marked` segments in `<mark>` itself.
 fn snippet_to_fragment(
     fragment: &str,
@@ -2118,12 +2117,13 @@ mapping:
         // The analyzed text path still works alongside the typed columns.
         assert_eq!(reader.search(&q("body:brown"), 10).unwrap().len(), 2);
 
-        // BOOL term match (task-247 / issue 1): `active:true`/`active:false` must select the right
-        // doc without erroring (previously Internal "Expected term with u64/i64/f64/date, got Bool").
+        // BOOL term match: `active:true`/`active:false` must select the right doc without
+        // erroring (Tantivy's range path rejects a Bool term with "Expected term with
+        // u64/i64/f64/date, got Bool").
         assert_eq!(reader.search(&q("active:true"), 10).unwrap().len(), 1);
         assert_eq!(reader.search(&q("active:false"), 10).unwrap().len(), 1);
 
-        // DATE range with an ISO-8601 bound (task-247 / issue 2): both docs are 2023-11-14
+        // DATE range with an ISO-8601 bound: both docs are 2023-11-14
         // (1_700_000_000_000_000 micros). An ISO date-string bound must be accepted and select them;
         // it must match the equivalent epoch-micros bound exactly.
         assert_eq!(
@@ -2165,8 +2165,8 @@ mapping:
     fn a_declared_timestamp_format_normalizes_the_source_epoch_to_micros_at_build() {
         use growlerdb_core::Value;
         // `ts` is epoch-**millis** at the source (an int64 column) but declared as a timestamp via
-        // `format: epoch_ms` — so it resolves to a DATE and must be indexed in canonical **micros**
-        // (task-112). A doc whose `ts` can't be parsed is skipped, not allowed to wedge the build.
+        // `format: epoch_ms` — so it resolves to a DATE and must be indexed in canonical **micros**.
+        // A doc whose `ts` can't be parsed is skipped, not allowed to wedge the build.
         let src = SourceSchema::new(
             vec![
                 SourceField::new("id", SourceType::String),
@@ -2189,7 +2189,7 @@ mapping:
         .unwrap()
         .resolve(&src)
         .unwrap();
-        // The format made it a DATE — so it shows up as a time field for the console (task-101).
+        // The format made it a DATE — so it shows up as a time field for the console.
         let schema = IndexSchema::from_resolved(&idx);
         assert_eq!(schema.date_fields(), vec!["ts"]);
 
@@ -2204,7 +2204,7 @@ mapping:
         let batch = DocBatch::new(vec![
             mk("a", Value::Int(1_782_000_000_000)), // valid epoch ms
             mk("b", Value::Str("not-a-timestamp".into())), // unparseable → ts skipped, doc still built
-            // A `Ts` is *already* canonical micros (a native source timestamp, task-184) — the
+            // A `Ts` is *already* canonical micros (a native source timestamp) — the
             // declared epoch_ms format must pass it through untouched, not rescale it by 10³.
             mk("c", Value::Ts(1_782_000_000_000_000)),
         ]);
@@ -2214,7 +2214,7 @@ mapping:
         assert_eq!(core.build(&schema, &batch, dir.path()).unwrap(), 3);
         let reader = core.open(dir.path()).unwrap();
 
-        // A range query in **micros** (the canonical unit the console now sends) finds both the
+        // A range query in **micros** (the canonical unit the console sends) finds both the
         // normalized millis doc and the already-canonical Ts doc...
         assert_eq!(
             reader
@@ -2240,20 +2240,20 @@ mapping:
         let schema = IndexSchema::from_resolved(&docs_index());
         let core = TantivySegmentCore;
 
-        // AC1/AC3: build a segment from a DocBatch, written to a local directory.
+        // Build a segment from a DocBatch, written to a local directory.
         let written = core.build(&schema, &batch(), dir.path()).unwrap();
         assert_eq!(written, 3);
 
-        // AC3: reopen the directory and read it back.
+        // Reopen the directory and read it back.
         let reader = core.open(dir.path()).unwrap();
         assert_eq!(reader.num_docs(), 3);
 
-        // AC4: BM25 is queryable. "brown" appears in docs 1 and 2.
+        // BM25 is queryable. "brown" appears in docs 1 and 2.
         let hits = reader.search(&q("body:brown"), 10).unwrap();
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().all(|h| h.score > 0.0));
 
-        // AC2: the composite key is stored per doc and retrievable from a hit.
+        // The composite key is stored per doc and retrievable from a hit.
         let ids: Vec<i64> = hits
             .iter()
             .filter_map(|h| match h.key.get("id") {
@@ -2364,7 +2364,7 @@ mapping:
         ));
     }
 
-    // ---- task-21: the full query-type family ----------------------------------
+    // ---- the full query-type family ----------------------------------
 
     /// A reader over the standard `batch()` (ids 1 "quick brown fox", 2 "lazy brown
     /// dog", 3 "cats").
@@ -2507,9 +2507,8 @@ mapping:
 
     #[test]
     fn field_grouped_or_set_matches_end_to_end() {
-        // task-247 / issue 3: `field:(a OR b)` used to return 0 hits (the `field:` prefix wasn't
-        // distributed over the group). It must now match the union, identically to the expanded
-        // `field:a OR field:b`.
+        // `field:(a OR b)` must match the union, identically to the expanded
+        // `field:a OR field:b` (the `field:` prefix distributes over the group).
         let dir = tempfile::tempdir().unwrap();
         let r = reader_over_batch(dir.path());
         // body: 1="…fox…", 2="…dog…", 3="…cats". `fox OR cats` → docs 1, 3.
@@ -2687,8 +2686,8 @@ mapping:
 
     #[test]
     fn parsed_query_strings_execute() {
-        // task-22 → task-21: a wildcard / phrase / boolean *string* parses to the AST
-        // and runs end to end over the corpus (ids 1,2 "brown").
+        // A wildcard / phrase / boolean *string* parses to the AST and runs end to end
+        // over the corpus (ids 1,2 "brown").
         let dir = tempfile::tempdir().unwrap();
         let r = reader_over_batch(dir.path());
         assert_eq!(ids(&r.search(&q("body:bro*"), 10).unwrap()), vec![1, 2]);

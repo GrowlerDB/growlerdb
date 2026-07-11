@@ -1,5 +1,5 @@
 //! `growlerdb-client` — the first-party **Rust client** for the GrowlerDB Engine API
-//! ([Design 01], task-27). A thin, ergonomic wrapper over the generated `growlerdb.v1`
+//! ([Design 01]). A thin, ergonomic wrapper over the generated `growlerdb.v1`
 //! tonic clients: one [`Client`] multiplexes Search / GetByKey / Suggest / Admin over a
 //! single channel, with a small [`SearchQuery`] builder so callers needn't hand-build
 //! proto messages.
@@ -58,7 +58,7 @@ pub struct Client {
 }
 
 /// Default TCP connect timeout — bounds `connect()` so an unreachable/slow endpoint fails fast
-/// instead of hanging (task-152 / F12).
+/// instead of hanging.
 const DEFAULT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Default per-request timeout — bounds every RPC so a wedged node can't hang the caller forever.
 const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -72,7 +72,7 @@ impl Client {
 
     /// As [`connect`](Self::connect) with explicit `connect_timeout` (TCP/handshake) and `request_timeout`
     /// (applied to every RPC) — so neither a dead endpoint nor a wedged node can hang the caller
-    /// indefinitely (task-152 / F12).
+    /// indefinitely.
     pub async fn connect_with(
         endpoint: impl Into<String>,
         connect_timeout: std::time::Duration,
@@ -123,7 +123,7 @@ impl Client {
                 keys,
                 columns,
                 window: 0,
-                // Single-index client: the endpoint's default index (task-240).
+                // Single-index client: the endpoint's default index.
                 index: String::new(),
             })
             .await?
@@ -170,9 +170,9 @@ impl Client {
                 limit,
                 kind: kind as i32,
                 max_edits,
-                // The window selector is gateway-internal (task-82); a client never sets it.
+                // The window selector is gateway-internal; a client never sets it.
                 window: 0,
-                // Single-index client: the endpoint's default index (task-240).
+                // Single-index client: the endpoint's default index.
                 index: String::new(),
             })
             .await?
@@ -220,7 +220,7 @@ impl SearchQuery {
         }
     }
 
-    /// Scope the search to a named index (task-99); empty = the index the endpoint serves.
+    /// Scope the search to a named index; empty = the index the endpoint serves.
     pub fn index(mut self, index: impl Into<String>) -> Self {
         self.index = index.into();
         self
@@ -259,7 +259,7 @@ impl SearchQuery {
         self
     }
 
-    /// Opt into **server-side highlighting** (task-250): the hits carry matched fragments per field.
+    /// Opt into **server-side highlighting**: the hits carry matched fragments per field.
     /// `fields` empty ⇒ the index's default highlightable TEXT fields; the bounds accept 0 for the
     /// server defaults. Off unless called (highlighting is a per-hit cost).
     pub fn highlight(
@@ -295,12 +295,12 @@ impl From<SearchQuery> for SearchRequest {
             search_after: q.search_after,
             // Default scoring (per-shard BM25); SCORE_GLOBAL is reserved (design/09).
             score_mode: growlerdb_proto::v1::ScoreMode::ScoreLocal as i32,
-            // The window selector is gateway-internal (task-82); a client request never sets it.
+            // The window selector is gateway-internal; a client request never sets it.
             window: 0,
-            // Lucene grammar; the SDK can expose a KQL option later (task-90).
+            // Lucene grammar; the SDK can expose a KQL option later.
             syntax: growlerdb_proto::v1::QuerySyntax::Lucene as i32,
             index: q.index,
-            // Server-side highlighting opt-in (task-250); None ⇒ off.
+            // Server-side highlighting opt-in; None ⇒ off.
             highlight: q.highlight,
         }
     }

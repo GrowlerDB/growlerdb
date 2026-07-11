@@ -1,6 +1,6 @@
 <script lang="ts">
-  // Themed ECharts wrapper (task-208): the "hero" time-series charts (source-vs-index rate,
-  // index:source size, latency) the sparkline cards can't express. The parent passes a plain
+  // Themed ECharts wrapper: the "hero" time-series charts (source-vs-index rate, index:source
+  // size, latency) the sparkline cards can't express. The parent passes a plain
   // ECharts `option` (series/data only); this component injects theme-token colors (so light/dark
   // + accent keep working), handles resize, and disposes cleanly. Deep charts still live in Grafana.
   import { onMount, onDestroy } from 'svelte';
@@ -43,8 +43,8 @@
     const c = tokens();
     return {
       // Theme tokens first; then fixed mid-tone hues (legible on light + dark) so a chart with
-      // more than four series (the 8-component index-size stack, task-218) doesn't cycle back
-      // to a duplicate color.
+      // more than four series (the 8-component index-size stack) doesn't cycle back to a
+      // duplicate color.
       color: [c.accent, c.ok, c.warn, c.faint, '#7c6ff0', '#12a5b8', '#d6558f', '#8a8f98'],
       textStyle: {
         color: c.text,

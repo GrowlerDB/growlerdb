@@ -1,6 +1,6 @@
 <script lang="ts">
-  // Status/label badge (task-93). `tone='planned'` is the consistent "not built yet" pill used
-  // across the revamp; ok/warn/accent carry semantic colour.
+  // Status/label badge. `tone='planned'` is the "not built yet" pill; ok/warn/accent carry
+  // semantic colour.
   import type { Snippet } from 'svelte';
   let {
     tone = 'default',

@@ -14,11 +14,11 @@ import org.apache.spark.sql.SparkSession;
  * {@code create_changelog_view} procedure (the {@code IncrementalChangelogScan}),
  * yielding rows tagged {@code _change_type} / {@code _change_ordinal} /
  * {@code _commit_snapshot_id} plus the table columns. The row→{@code DocOp}
- * mapping is {@link ChangelogMapper} (task-13).
+ * mapping is {@link ChangelogMapper}.
  *
  * <p>The changelog scan abstracts away data-file layout, so it does not carry the
  * source {@code (file, position)}; {@link #toRows} emits a <b>placeholder
- * locator</b> and hydration fills it lazily via verify-and-fall-back (task-17).
+ * locator</b> and hydration fills it lazily via verify-and-fall-back.
  */
 public final class ChangelogReader {
 
@@ -59,11 +59,11 @@ public final class ChangelogReader {
 
   /**
    * Stream the changelog DataFrame as {@link ChangelogRow}s, pulling <b>one partition at a time</b>
-   * to the driver ({@link Dataset#toLocalIterator}) rather than the whole window at once
-   * (task-203). Combined with the bounded read→map→commit loop, this keeps driver memory O(chunk)
-   * — a large post-outage backlog no longer OOMs the 8g driver (exit 52). The DataFrame is ordered
-   * by {@code _change_ordinal} (a global sort's range partitioning), so iterating partitions in
-   * index order preserves changelog order. Locator is a placeholder (see class docs).
+   * to the driver ({@link Dataset#toLocalIterator}) rather than the whole window at once. Combined
+   * with the bounded read→map→commit loop, this keeps driver memory O(chunk) — a large post-outage
+   * backlog does not OOM the driver. The DataFrame is ordered by {@code _change_ordinal} (a global
+   * sort's range partitioning), so iterating partitions in index order preserves changelog order.
+   * Locator is a placeholder (see class docs).
    */
   public static Iterator<ChangelogRow> rowIterator(Dataset<Row> changelog, List<String> columns) {
     Iterator<Row> rows = changelog.toLocalIterator();
@@ -82,8 +82,8 @@ public final class ChangelogReader {
 
   /**
    * Materialize the whole changelog DataFrame as {@link ChangelogRow}s — drains
-   * {@link #rowIterator}. Retained for the read-only inspection app and tests; the ingestion path
-   * streams via {@link #rowIterator} instead (task-203).
+   * {@link #rowIterator}. Used by the read-only inspection app and tests; the ingestion path
+   * streams via {@link #rowIterator} instead.
    */
   public static List<ChangelogRow> toRows(Dataset<Row> changelog, List<String> columns) {
     List<ChangelogRow> rows = new ArrayList<>();
@@ -92,7 +92,7 @@ public final class ChangelogReader {
   }
 
   /** Map one changelog {@link Row} to a {@link ChangelogRow}, projecting {@code columns} as wire
-   *  {@link Value}s. Placeholder locator (hydration fills it lazily, task-17). */
+   *  {@link Value}s. Placeholder locator (hydration fills it lazily). */
   static ChangelogRow toRow(Row row, List<String> columns) {
     ChangeType type = ChangeType.fromIceberg(row.getAs("_change_type"));
     long ordinal = ((Number) row.getAs("_change_ordinal")).longValue();
@@ -111,8 +111,8 @@ public final class ChangelogReader {
   private static final long MICROS_PER_DAY = 86_400_000_000L;
 
   /**
-   * Map a Spark scalar to a wire {@link Value} (M1 subset). Temporal scalars map to
-   * {@code ts_micros} — canonical <b>epoch microseconds UTC</b> (task-184), matching what the
+   * Map a Spark scalar to a wire {@link Value}. Temporal scalars map to
+   * {@code ts_micros} — canonical <b>epoch microseconds UTC</b>, matching what the
    * Rust source extracts ({@code Value::Ts}) — so a temporal key encodes/routes identically on
    * both sides instead of stringifying via {@code toString()}. Spark's external row types are
    * {@code java.sql.Date}/{@code Timestamp} (or {@code java.time.LocalDate}/{@code Instant}

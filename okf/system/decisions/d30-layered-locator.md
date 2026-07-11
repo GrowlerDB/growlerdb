@@ -28,7 +28,7 @@ pointers in ~12 B/row. Spikes (2026-07-04): dense array **12.0 B/entry exact** v
 lookups ~1M/s warm, so compaction re-map is parquet-read-bound, not index-bound. Projected total
 index:source ≈ 0.85–0.9× on worst-case http_logs (from 2.4×), ~0.45–0.55× on realistic rows.
 Because the location array is tiny and the pointer data lives in segments, parked cold windows
-offload ~97%+ of index bytes to object storage (previously ~16% — `aux.redb` stayed local).
+offload ~97%+ of index bytes to object storage (the `aux.redb` layer no longer stays local).
 
 **Consequences.** The Tantivy-commit-then-redb-checkpoint ordering is retained (checkpoint + batch
 idempotency still depend on it); the location array fsyncs before the Tantivy commit; `aux.redb`
@@ -38,7 +38,7 @@ design review (2026-07-04) rejected the earlier v3-first draft: v3 ecosystem gap
 reads in iceberg-rust, changelog `_row_id`, a `rewrite_manifests` row-id bug) gate only the
 `row_id` strategy, which ships later as a strategy flip. Refines **D13** (its pruning preference
 becomes the `predicate` strategy); **D28** stays scoped to v3 *types* — row-lineage adoption is
-tracked here. Full plan, review findings, and spike numbers: task-184's plan document (backlog).
+tracked here.
 
 **Status.** Accepted. Implementation staged (foundations → layers → re-map → predicate strategy →
 `row_id` when the v3 stack is ready). The layers are **live** and the **keyed redb table is

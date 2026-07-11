@@ -1,6 +1,6 @@
 # Default values for the GrowlerDB chart. Override with `-f my-values.yaml` or `--set`.
-# The cluster topology is Design 14: control-plane (registry) + node StatefulSet (searchers on
-# local PVs) + gateway Deployment (query routing + console UI).
+# The cluster topology is: control-plane (registry) + node StatefulSet (searchers on local PVs) +
+# gateway Deployment (query routing + console UI).
 
 # -- The GrowlerDB image (built from deploy/Dockerfile — there is no public image yet, so build
 #    and push it to a registry you control, then point `image.repository` at it).
@@ -50,10 +50,10 @@ credentials:
   s3SecretKey: ""
 
 # ---- The index the nodes build + serve -------------------------------------------------------
-# The index is partitioned into `shards` ordinals (task-77 virtual-bucket sharding). The node
-# StatefulSet runs **one pod per shard** (pod-K builds + serves ordinal K from the source, on its own
-# PV), self-registers at its stable pod DNS, and the gateway reads the shard map from the live
-# control-plane (task-117) and fronts each shard's primary. `shards: 1` = a single-shard index.
+# The index is partitioned into `shards` ordinals (virtual-bucket sharding). The node StatefulSet
+# runs **one pod per shard** (pod-K builds + serves ordinal K from the source, on its own PV),
+# self-registers at its stable pod DNS, and the gateway reads the shard map from the live
+# control-plane and fronts each shard's primary. `shards: 1` = a single-shard index.
 # NOTE: one primary pod per shard (write-correct for streaming). Zero-downtime per-shard *replicas*
 # are a follow-up — `serve --replica` segment-shipping is single-shard only, and a Service-fronted
 # replica set would diverge under streaming writes. HA today = shards spread across hosts + PDBs +
@@ -62,7 +62,7 @@ index:
   name: "docs"
   sourceTable: "growlerdb.docs"
   shards: 1
-  # Windowed topology (task-219): when true, the node StatefulSet serves a TIME-WINDOWED index —
+  # Windowed topology: when true, the node StatefulSet serves a TIME-WINDOWED index —
   # nodes start empty and serve control-plane-assigned windows (no `--shards`/`--shard-ordinal`), the
   # connector streams each row to its window's owning node, and the gateway hot-reloads windows. The
   # chart can't parse `definition`, so set this explicitly for a windowed workload. `shards` is then
@@ -73,19 +73,19 @@ index:
   # by sort/range. Set `definition` to a VERBATIM GrowlerDB index definition (the index.yaml format —
   # name/source/key/mapping/windowing) to build from an explicit def instead (mounted as a ConfigMap,
   # passed as `--def`); empty = auto-map. Pass a file with `--set-file index.definition=path/to/index.yaml`
-  # (task-214: deploy/k8s/scale-up.sh derives it from the workload). Its `name`/`source.iceberg.table`
-  # must agree with index.name / index.sourceTable above (those drive the StatefulSet/CLI args).
+  # (deploy/k8s/scale-up.sh derives it from the workload). Its `name`/`source.iceberg.table` must agree
+  # with index.name / index.sourceTable above (those drive the StatefulSet/CLI args).
   definition: ""
 
-# ---- Reconcile backstop (task-195) -----------------------------------------------------------
+# ---- Reconcile backstop -----------------------------------------------------------------------
 # A scheduled drift reconcile: fan a shard-scoped `ReconcileIndex` out to every shard's node — the
 # systematic detector/repairer for silently lost/orphaned rows regardless of cause (the general-case
-# complement to the ingest-path guards, D31). Each node compares only the keys it owns, so it can't
+# complement to the ingest-path guards). Each node compares only the keys it owns, so it can't
 # pull another shard's keys into it. Emits `growlerdb_drift_stale_total` / `_missing_total`; alert on
 # a nonzero repair rate. Opt-in — enable once the index is populated and steadily ingesting.
 reconcile:
   enabled: false
-  # Force a full row-level sweep (--full), bypassing the count-gate (task-198). Leave false for the
+  # Force a full row-level sweep (--full), bypassing the count-gate. Leave false for the
   # cheap count-gated run; set true on a SEPARATE, less-frequent release/CronJob for the periodic deep
   # sweep that catches drift equal counts can hide (compensating stale+missing, dup PKs, dropped
   # partitions).
@@ -100,7 +100,7 @@ reconcile:
     requests: { cpu: 100m, memory: 128Mi }
     limits: { cpu: "1", memory: 512Mi }
 
-# ---- Observability (task-39/40) --------------------------------------------------------------
+# ---- Observability ---------------------------------------------------------------------------
 # Every component serves Prometheus `/metrics` + `/healthz` + `/readyz` on its metrics port. Set an
 # OTLP collector base URL to also export traces (the binary reads `GROWLERDB_OTLP_ENDPOINT`); e.g. a
 # Grafana Alloy / OTel-LGTM receiver at `http://lgtm:4318`. Empty = metrics only, no trace export.
@@ -143,18 +143,17 @@ node:
   restPort: 8080
   metricsPort: 9102
   # Background maintenance cadences, in seconds (0 disables) — deploy config, not hidden binary
-  # defaults (task-214). `compactIntervalSecs` drives the auto-compaction tick: segments fuse /
-  # deletes purge when the CompactionPolicy thresholds trip, and the per-shard gauges
-  # (growlerdb_index_bytes[_component], growlerdb_index_docs, growlerdb_segments_live,
-  # growlerdb_index_deleted_docs — task-218) refresh on this tick, so it is also the metrics
-  # sampling cadence. `remapIntervalSecs` drives the D30 locator re-map poll after Iceberg
-  # compaction rewrites source files.
+  # defaults. `compactIntervalSecs` drives the auto-compaction tick: segments fuse / deletes purge
+  # when the CompactionPolicy thresholds trip, and the per-shard gauges (growlerdb_index_bytes
+  # [_component], growlerdb_index_docs, growlerdb_segments_live, growlerdb_index_deleted_docs) refresh
+  # on this tick, so it is also the metrics sampling cadence. `remapIntervalSecs` drives the locator
+  # re-map poll after Iceberg compaction rewrites source files.
   compactIntervalSecs: 60
   remapIntervalSecs: 45
   persistence:
     enabled: true
-    # Local-NVMe is the intended class for the index store (Design 04/14). Set to your cluster's
-    # local/NVMe StorageClass; empty uses the cluster default.
+    # Local-NVMe is the intended class for the index store. Set to your cluster's local/NVMe
+    # StorageClass; empty uses the cluster default.
     storageClass: ""
     size: 20Gi
     accessModes: ["ReadWriteOnce"]
@@ -177,7 +176,7 @@ gateway:
   grpcPort: 50061
   restPort: 8080 # REST Engine API + the console UI, behind the Service
   metricsPort: 9103
-  # Seconds between control-plane topology polls (task-77/117): the gateway reads the index's shard
+  # Seconds between control-plane topology polls: the gateway reads the index's shard
   # map from the live control-plane and hot-reloads on change (reshard cutover / a shard's primary
   # moving) with no restart. 0 disables polling (topology fixed at startup).
   reloadSecs: 15
@@ -187,14 +186,14 @@ gateway:
     dir: /usr/share/growlerdb/ui
   # Optional Prometheus base URL — when set, the gateway proxies /v1/stats/* for the UI's SLI panels.
   prometheusUrl: ""
-  # Authentication (task-35/36). The gateway is **open** unless an OIDC issuer is set: with it, the
+  # Authentication. The gateway is **open** unless an OIDC issuer is set: with it, the
   # gateway validates `Authorization: Bearer` JWTs against the issuer's JWKS and enforces RBAC from
   # the verified claims. Strongly recommended for any internet-reachable (e.g. Ingress) deployment.
   auth:
     oidc:
       issuer: "" # e.g. https://keycloak.example/realms/growlerdb — empty = no auth (open)
       audience: "" # expected `aud` claim (required when issuer is set)
-  # Expose the OpenSearch-compatible `_search` read adapter (task-50). Off by default.
+  # Expose the OpenSearch-compatible `_search` read adapter. Off by default.
   opensearch: false
   service:
     type: ClusterIP

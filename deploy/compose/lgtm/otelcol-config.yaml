@@ -1,5 +1,5 @@
 # otel-lgtm's default OTel Collector config, plus a scrape job for GrowlerDB's Prometheus
-# `/metrics` endpoints (task-40) — so the SLIs reach the bundled Prometheus → Grafana.
+# `/metrics` endpoints — so the SLIs reach the bundled Prometheus → Grafana.
 # Mounted over /otel-lgtm/otelcol-config.yaml. Keep in sync with the image default on upgrade.
 receivers:
   otlp:
@@ -24,7 +24,7 @@ receivers:
           scrape_interval: 5s
           static_configs:
             - targets: ["controlplane:9101", "node:9102", "gateway:9103"]
-        # Host CPU/mem/disk for the Observability "Runtime" panels (task-208.3).
+        # Host CPU/mem/disk for the Observability "Runtime" panels.
         - job_name: "node-exporter"
           scrape_interval: 5s
           static_configs:

@@ -1,4 +1,4 @@
-// Network mocks for the console E2E (task-92). The SPA is a pure client of the Engine REST API,
+// Network mocks for the console E2E. The SPA is a pure client of the Engine REST API,
 // so intercepting `**/v1/**` lets us drive every screen deterministically with no backend. Each
 // endpoint has a sensible default; a test overrides only the slot it cares about (e.g. an error or
 // empty response for `search`).
@@ -86,7 +86,7 @@ function promMatrix() {
 function defaults(): Required<Overrides> {
   return {
     me: { json: { authenticated: false, subject: '', roles: [] } },
-    // Open mode + a configured Grafana URL (task-140): the Observability deep-dashboards card links
+    // Open mode + a configured Grafana URL: the Observability deep-dashboards card links
     // to this runtime-provided URL; tests override with no grafana_url to assert the card hides.
     config: { json: { auth_required: false, grafana_url: 'http://grafana.local:3000' } },
     search: {
@@ -253,7 +253,7 @@ function defaults(): Required<Overrides> {
     cold: { status: 404, json: {} },
     statsQuery: { json: promVector() },
     statsRange: { json: promMatrix() },
-    // Server-side alert rules (task-111): empty by default → panel shows "No alerts firing" with the
+    // Server-side alert rules: empty by default → panel shows "No alerts firing" with the
     // "Server rules" badge. Tests override with firing alerts to exercise the panel.
     alerts: { json: { alerts: [] } },
   };

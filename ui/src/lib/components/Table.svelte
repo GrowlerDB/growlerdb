@@ -1,5 +1,5 @@
 <script lang="ts">
-  // A styled data table (task-93): consistent header/row chrome at the current density (`--cell`).
+  // A styled data table: consistent header/row chrome at the current density (`--cell`).
   // The caller supplies the column headers + the rows via the `head` and `body` snippets so the
   // table stays type-safe over its own row shape.
   import type { Snippet } from 'svelte';

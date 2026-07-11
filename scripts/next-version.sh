@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Compute the next release version from the latest `v*` git tag (task-156).
+# Compute the next release version from the latest `v*` git tag.
 #
 # Usage: scripts/next-version.sh <patch|minor|major>
 #
 # - No prior `vX.Y.Z` tag → prints INITIAL_VERSION (default 0.1.0), the decided GA baseline
-#   (see RELEASING.md / ADR D29); the bump argument is ignored for the very first release.
+#   (see RELEASING.md); the bump argument is ignored for the very first release.
 # - Otherwise → increments the requested component of the latest tag, resetting the lower ones
 #   (minor → X.(Y+1).0, major → (X+1).0.0).
 #

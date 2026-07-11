@@ -1,6 +1,6 @@
 <script lang="ts">
-  // A small status dot (task-93): ok/warn/accent/muted, optionally pulsing (e.g. the header health
-  // pill, "rebuilding" shards).
+  // A small status dot: ok/warn/accent/muted, optionally pulsing (e.g. the header health pill,
+  // "rebuilding" shards).
   let {
     tone = 'ok',
     pulse = false,

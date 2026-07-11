@@ -31,7 +31,7 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
 /**
- * Drives the connector's real execution path (task-51) end to end against a loopback {@code Search}
+ * Drives the connector's real execution path end to end against a loopback {@code Search}
  * server, using Trino's actual SPI types but no engine: {@link GrowlerDbSearchFunction#analyze}
  * (argument parsing + schema discovery → descriptor + handle), then {@link GrowlerDbSearchProcessor}
  * (re-running the query + building a {@link Page}), reading the values back out. Verifies the parts

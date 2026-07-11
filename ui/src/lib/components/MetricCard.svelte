@@ -1,6 +1,6 @@
 <script lang="ts">
-  // A metric card (task-93) for the Observability SLI grid: label · big value · unit · sub-line ·
-  // optional sparkline, tinted by tone.
+  // A metric card for the Observability SLI grid: label · big value · unit · sub-line · optional
+  // sparkline, tinted by tone.
   import type { Snippet } from 'svelte';
   let {
     label,

@@ -12,7 +12,7 @@ import java.util.List;
 import java.util.stream.Collectors;
 
 /**
- * Executes one {@code growlerdb_search} invocation on a worker (task-51): re-runs the query against
+ * Executes one {@code growlerdb_search} invocation on a worker: re-runs the query against
  * the GrowlerDB endpoint and emits the matching keys + score as a single {@link Page} matching the
  * schema {@link GrowlerDbSearchFunction#analyze} returned. One split → one page → finished.
  */

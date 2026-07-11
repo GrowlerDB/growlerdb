@@ -1,4 +1,4 @@
-//! Cross-process smoke test of the **Rust SDK** ([`growlerdb-client`], task-27): seed
+//! Cross-process smoke test of the **Rust SDK** ([`growlerdb-client`]): seed
 //! an index on disk, spawn the real `growlerdb serve`, and drive Search / Suggest /
 //! Admin through the first-party client — the same shape as the connector e2e.
 //!

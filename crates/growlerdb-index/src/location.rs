@@ -1,11 +1,11 @@
-//! The **location store** — the mutable third layer of the [D30] layered locator
-//! (task-184, slice 2): locator ID → `(file_id, row_position)`.
+//! The **location store** — the mutable third layer of the [D30] layered locator:
+//! locator ID → `(file_id, row_position)`.
 //!
 //! A shard-local dense array file (`location.arr`, beside `aux.redb`) of fixed
 //! **12-byte** entries: `u32 file_id` (LE) + `u64 row_position` (LE). The locator ID
 //! *is* the slot index — an entry's byte offset is `id × 12` — so the file needs no
-//! keys, no tree, and no per-entry overhead (measured 12.0 B/entry exact vs redb's
-//! 53.9 B/entry; see the task-184 plan's spike). `file_id` indexes the
+//! keys, no tree, and no per-entry overhead (12.0 B/entry exact vs redb's
+//! 53.9 B/entry). `file_id` indexes the
 //! interned file table (`files` in `aux.redb`); the row position is the row's ordinal
 //! in that Iceberg data file.
 //!
@@ -93,8 +93,8 @@ impl LocationStore {
     }
 
     /// Overwrite slot `id` in place with a new `(file_id, row_position)` — the update
-    /// path when a key's row moved (upsert reuse now; compaction re-map in slice 3).
-    /// Errors on an id past the end (slots are only ever allocated by `append`).
+    /// path when a key's row moved. Errors on an id past the end (slots are only ever
+    /// allocated by `append`).
     pub fn patch(&self, id: u64, file_id: u32, row_position: u64) -> io::Result<()> {
         if id >= self.len.load(Ordering::Acquire) {
             return Err(io::Error::new(
@@ -183,7 +183,7 @@ mod tests {
     #[test]
     fn entry_byte_layout_is_12_bytes_le_exactly() {
         // Golden test for the on-disk format: 12 B fixed, u32 file_id LE + u64 pos LE,
-        // offset = id × 12 (the slice-2 notes' binding decision 1).
+        // offset = id × 12.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(LOCATION_FILE);
         let s = LocationStore::open(&path).unwrap();

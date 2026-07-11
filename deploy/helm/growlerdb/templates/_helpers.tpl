@@ -93,8 +93,8 @@ app.kubernetes.io/instance: {{ .Release.Name }}
   valueFrom: { secretKeyRef: { name: {{ include "growlerdb.secretName" . }}, key: s3SecretKey } }
 {{- end -}}
 
-{{/* Observability env shared by every component (task-39/40): export OTLP traces when an endpoint
-     is configured. Metrics/health are served on each component's metrics port regardless. */}}
+{{/* Observability env shared by every component: export OTLP traces when an endpoint is
+     configured. Metrics/health are served on each component's metrics port regardless. */}}
 {{- define "growlerdb.observabilityEnv" -}}
 {{- with .Values.observability.otlpEndpoint }}
 - name: GROWLERDB_OTLP_ENDPOINT
@@ -102,7 +102,7 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 {{- end -}}
 
-{{/* Standard liveness/readiness probes against a component's telemetry port (task-39). */}}
+{{/* Standard liveness/readiness probes against a component's telemetry port. */}}
 {{- define "growlerdb.probes" -}}
 livenessProbe:
   httpGet: { path: /healthz, port: metrics }

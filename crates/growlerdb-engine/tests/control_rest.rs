@@ -1,4 +1,4 @@
-//! The **control-plane REST surface** (task-47): the gateway's `/v1/indexes` REST routes proxy
+//! The **control-plane REST surface**: the gateway's `/v1/indexes` REST routes proxy
 //! to the Control Plane over gRPC. Stand up a real `ControlPlaneService` (over a temp registry)
 //! on a tonic server, point the REST `control_router` at it via a gRPC client, and drive the
 //! list/get/drop lifecycle over HTTP. `CreateIndex`/`DescribeSource` need a live Iceberg source,
@@ -134,7 +134,7 @@ async fn ingestion_status_over_rest() {
 
 #[tokio::test]
 async fn saved_queries_persist_per_subject_with_sharing() {
-    // task-106: saved searches are scoped to the verified subject; `shared` makes one workspace-visible.
+    // Saved searches are scoped to the verified subject; `shared` makes one workspace-visible.
     let tmp = tempfile::tempdir().unwrap();
     let app = control_app(&[], tmp.path()).await;
 
@@ -217,7 +217,7 @@ async fn saved_queries_persist_per_subject_with_sharing() {
         .contains("critical"));
 }
 
-/// A `control_router` wired to a Control Plane that **enforces RBAC** (task-104). No authenticator,
+/// A `control_router` wired to a Control Plane that **enforces RBAC**. No authenticator,
 /// so it trusts the gateway-stamped `x-growlerdb-principal`/`x-growlerdb-roles` metadata + merges
 /// local role bindings — exactly the embedded-behind-a-gateway model.
 async fn control_app_rbac(root: &std::path::Path) -> Router {
@@ -246,7 +246,7 @@ async fn control_app_rbac(root: &std::path::Path) -> Router {
 
 #[tokio::test]
 async fn user_management_is_admin_gated_and_bindings_merge() {
-    // task-104: only admins manage users, and a granted role takes effect on the subject's next call.
+    // Only admins manage users, and a granted role takes effect on the subject's next call.
     let tmp = tempfile::tempdir().unwrap();
     let app = control_app_rbac(tmp.path()).await;
 
@@ -329,7 +329,7 @@ async fn user_management_is_admin_gated_and_bindings_merge() {
 
 #[tokio::test]
 async fn api_tokens_create_list_revoke_admin_gated() {
-    // task-105: tokens are admin-gated; the secret is returned once and never listed.
+    // Tokens are admin-gated; the secret is returned once and never listed.
     let tmp = tempfile::tempdir().unwrap();
     let app = control_app_rbac(tmp.path()).await;
 
@@ -393,7 +393,7 @@ async fn api_tokens_create_list_revoke_admin_gated() {
 
 #[tokio::test]
 async fn activity_log_records_lifecycle_events() {
-    // task-110: a lifecycle mutation (alias swap) is recorded to the index's activity log + readable.
+    // A lifecycle mutation (alias swap) is recorded to the index's activity log + readable.
     let tmp = tempfile::tempdir().unwrap();
     let app = control_app(&["docs"], tmp.path()).await;
 

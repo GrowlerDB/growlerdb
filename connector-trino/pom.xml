@@ -9,7 +9,7 @@
   <version>0.0.0</version>
   <packaging>jar</packaging>
   <name>GrowlerDB Trino connector</name>
-  <description>Trino connector exposing a growlerdb_search table function: boolean retrieval over a GrowlerDB index, returning keys + score to JOIN against the Iceberg table (task-51).</description>
+  <description>Trino connector exposing a growlerdb_search table function: boolean retrieval over a GrowlerDB index, returning keys + score to JOIN against the Iceberg table.</description>
 
   <properties>
     <!-- Trino 470's SPI targets JDK 23; the plugin runs inside Trino's JVM. -->

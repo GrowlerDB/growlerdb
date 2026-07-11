@@ -13,7 +13,7 @@ import org.apache.spark.sql.types.StructType;
 import org.junit.jupiter.api.Test;
 
 /**
- * The pure hit→(schema, rows) projection behind {@link GrowlerDbSearch#search} (task-51) — the
+ * The pure hit→(schema, rows) projection behind {@link GrowlerDbSearch#search} — the
  * search-then-join shape, tested without a SparkSession.
  */
 class GrowlerDbSearchTest {

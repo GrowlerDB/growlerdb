@@ -1,4 +1,4 @@
-//! Cross-process smoke test of the **Python SDK** (task-27): seed an index, spawn the
+//! Cross-process smoke test of the **Python SDK**: seed an index, spawn the
 //! real `growlerdb serve` with the REST gateway, and run `clients/python/smoke.py`
 //! against it. Skipped (not failed) when `python3` isn't on the PATH, so the suite
 //! stays green in environments without Python.

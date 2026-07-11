@@ -24,11 +24,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 /**
- * The concurrent per-shard fan-out (task-196 AC3, {@link ShardFanOut}): sub-batches of one batch
- * commit <b>overlapped</b> instead of via the old sequential blocking loop, every sub-batch —
- * including empties (task-194 lockstep) — is still sent, and a failure on one shard neither
- * prevents siblings from committing nor gets lost (all-settle, lowest-ordinal error propagates,
- * later ones suppressed). Against in-process Node stubs, no Spark needed.
+ * The concurrent per-shard fan-out ({@link ShardFanOut}): sub-batches of one batch commit
+ * <b>overlapped</b>, every sub-batch — including empties (lockstep) — is still sent, and a failure
+ * on one shard neither prevents siblings from committing nor gets lost (all-settle, lowest-ordinal
+ * error propagates, later ones suppressed). Against in-process Node stubs, no Spark needed.
  */
 class ShardedWriteClientFanOutTest {
 
@@ -36,7 +35,7 @@ class ShardedWriteClientFanOutTest {
 
   /**
    * Concurrency proof: every server holds its response until ALL servers have received their
-   * sub-batch. The old sequential loop deadlocks here (shard 0 blocks before shard 1 is ever
+   * sub-batch. A sequential loop would deadlock here (shard 0 blocks before shard 1 is ever
    * called); the overlapped fan-out sails through. An empty ops list means every sub-batch is
    * empty — passing also proves empties are still sent to every shard.
    */

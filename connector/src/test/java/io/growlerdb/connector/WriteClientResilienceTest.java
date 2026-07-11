@@ -19,8 +19,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 /**
- * Resilience of the connector's {@link WriteClient} to a Node restart (task-124, the Java sibling
- * of the Gateway's task-122). A force-killed shard pod black-holes in-flight writes; without a
+ * Resilience of the connector's {@link WriteClient} to a Node restart. A force-killed shard pod
+ * black-holes in-flight writes; without a
  * deadline the blocking RPC hangs ~forever and ingestion freezes silently. These exercise the two
  * guards against that — a per-call deadline (fail fast, don't hang) and idempotent retry with
  * backoff (absorb a brief outage in place) — against an in-process Node stub, no Spark needed.
@@ -67,10 +67,10 @@ class WriteClientResilienceTest {
   }
 
   /**
-   * RESOURCE_EXHAUSTED is the Node's write-admission backpressure — transient by construction
-   * (task-194): a slow commit under a compaction I/O storm holds its admission slot, so a retry can
+   * RESOURCE_EXHAUSTED is the Node's write-admission backpressure — transient by construction:
+   * a slow commit under a compaction I/O storm holds its admission slot, so a retry can
    * hit it. It must be retried (the idempotent batch_id makes the replay safe), not turned into an
-   * instant stream failure (the detonator of the silent-loss event).
+   * instant stream failure.
    */
   @Test
   void writeRetriesThroughResourceExhaustedBackpressure() throws IOException {
@@ -88,7 +88,7 @@ class WriteClientResilienceTest {
   }
 
   /**
-   * A checkpoint-continuity gap (FAILED_PRECONDITION, task-194) is <b>not</b> retryable: the batch
+   * A checkpoint-continuity gap (FAILED_PRECONDITION) is <b>not</b> retryable: the batch
    * doesn't continue from the shard's checkpoint, so retrying the same batch can't help — it must
    * propagate so the connector fails the trigger (and the discontinuity is resolved out of band).
    */

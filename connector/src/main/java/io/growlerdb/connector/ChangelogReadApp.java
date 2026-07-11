@@ -8,14 +8,14 @@ import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 
 /**
- * Self-contained Spark demo proving the changelog read (task-63), run via
- * {@code spark-submit} in Compose (the {@code spark} profile). Against a local
- * Hadoop catalog it creates a table, applies INSERT / UPDATE / DELETE, reads the
- * changelog through {@link ChangelogReader}, and asserts the emitted change types
- * — exiting non-zero on mismatch (so {@code --exit-code-from} gives pass/fail).
+ * Self-contained Spark demo proving the changelog read, run via {@code spark-submit}
+ * in Compose (the {@code spark} profile). Against a local Hadoop catalog it creates a
+ * table, applies INSERT / UPDATE / DELETE, reads the changelog through
+ * {@link ChangelogReader}, and asserts the emitted change types — exiting non-zero on
+ * mismatch (so {@code --exit-code-from} gives pass/fail).
  *
- * <p>Polaris/MinIO interop (AC4) is exercised by the connector E2E (task-11),
- * which reads the seeded table from the real catalog.
+ * <p>Polaris/MinIO interop is exercised by the connector E2E, which reads the seeded
+ * table from the real catalog.
  */
 public final class ChangelogReadApp {
 

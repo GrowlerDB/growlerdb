@@ -18,4 +18,4 @@ timestamp: 2026-07-04T14:22:00
 [scalability/benchmarking](/quality/scalability.md); the ingestion guarantees themselves are
 [exactly-once](/product/functional/ingestion/checkpoints-exactly-once.md). The "scaling out with
 indexers" mechanism now exists: the shard-group connector set
-([D32](/system/decisions/d32-parallel-ingest.md), task-196).
+([D32](/system/decisions/d32-parallel-ingest.md)).

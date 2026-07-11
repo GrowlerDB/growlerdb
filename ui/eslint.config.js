@@ -1,4 +1,4 @@
-// ESLint flat config for the GrowlerDB console (task-158). Lints TS + Svelte 5; formatting is
+// ESLint flat config for the GrowlerDB console. Lints TS + Svelte 5; formatting is
 // delegated to Prettier (eslint-config-prettier + svelte's prettier config disable conflicting rules).
 import js from '@eslint/js';
 import ts from 'typescript-eslint';

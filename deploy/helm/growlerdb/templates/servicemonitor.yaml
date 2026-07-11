@@ -1,6 +1,6 @@
 {{- if .Values.metrics.serviceMonitor.enabled }}
 {{- /*
-  Prometheus-Operator ServiceMonitor (task-39/40): scrape every component's `metrics` port.
+  Prometheus-Operator ServiceMonitor: scrape every component's `metrics` port.
   Requires the monitoring.coreos.com/v1 CRD (kube-prometheus-stack / Prometheus Operator). The
   headless node Service also carries a `metrics` port; we select the regular per-component Services
   by the chart's selector labels and scrape the shared `metrics` endpoint.

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Staged-run results table + extrapolation (task-185 AC#3/#4).
+"""Staged-run results table + extrapolation.
 
 Reads the `results.json` that staged_run.py writes and emits (to stdout, Markdown):
   1. an INGEST step-up table (rate vs keep-up + resources),
   2. a STORAGE milestone table (size vs query/hydration latency, index:source, resources, Trino),
   3. an EXTRAPOLATION block projecting the scales the interim cluster can't reach (1 TB, 100k rec/s)
      from a linear least-squares fit of the measured points, each clearly labelled measured vs modeled
-     with a ± band from the fit residual (task-79 convention).
+     with a ± band from the fit residual.
 
 Pure post-processing — no cluster, no deps. `python results_table.py results.json`.
 """
@@ -103,7 +103,7 @@ def extrapolation(data):
         print("\n**Node CPU → 100k rec/s** (headroom for the modeled top rate)")
         print(project(rps, [s.get("node_cpu_cores", 0) for s in steps], 100_000, unit=" cores"))
     print("\n_Measured points are real; the modeled points are a linear projection with a ±1.96σ "
-          "residual band — treat as order-of-magnitude, not a guarantee (task-79)._")
+          "residual band — treat as order-of-magnitude, not a guarantee._")
 
 
 def main():

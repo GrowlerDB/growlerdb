@@ -14,7 +14,7 @@ import org.apache.spark.sql.streaming.StreamingQueryException;
 import org.apache.spark.sql.streaming.Trigger;
 
 /**
- * {@code spark-submit} entrypoint for the ingestion connector (task-11): a Spark
+ * {@code spark-submit} entrypoint for the ingestion connector: a Spark
  * Structured Streaming job that drives {@link ConnectorJob} — changelog read →
  * {@code DocOp} mapping → Write gRPC to a GrowlerDB Node ({@code growlerdb serve}).
  *
@@ -30,7 +30,7 @@ import org.apache.spark.sql.streaming.Trigger;
  *       on every new snapshot, resuming from the in-memory cursor.
  * </ul>
  *
- * <p><b>Resume (task-16):</b> unless {@code --start} overrides it, the start
+ * <p><b>Resume:</b> unless {@code --start} overrides it, the start
  * checkpoint is read from the Node via {@link WriteClient#checkpointSnapshotId()} —
  * the position it has durably committed — so a restart resumes exactly-once (atomic
  * write+checkpoint commit; {@code batch_id} dedups a boundary re-read).
@@ -41,19 +41,18 @@ import org.apache.spark.sql.streaming.Trigger;
  */
 public final class ConnectorApp {
 
-  /** Backoff before restarting the streaming query in-process after a batch failure (task-144). */
+  /** Backoff before restarting the streaming query in-process after a batch failure. */
   static final int STREAM_RESTART_BACKOFF_SECS = 5;
 
   public static void main(String[] args) throws Exception {
-    // task-125: re-resolve Node DNS promptly so the write client picks up a restarted shard pod's new
-    // IP within seconds (in-place reconnect) instead of re-dialing the dead cached IP until the retry
-    // budget forces a pod restart (task-124's worst case). The JDK caches successful lookups — often
-    // effectively forever — so a crashed-then-returned pod keeps resolving to its dead address. Cap
-    // the TTL. Must run before any hostname is resolved (i.e. before Spark/gRPC start), so it's the
-    // very first thing main does. Overridable via GROWLERDB_DNS_TTL_SECONDS for ops tuning.
+    // Cap the JDK DNS cache TTL so the write client picks up a restarted Node pod's new IP within
+    // seconds instead of re-dialing the dead cached IP. The JDK caches successful lookups often
+    // effectively forever, so a crashed-then-returned pod keeps resolving to its dead address. Must
+    // run before any hostname is resolved (before Spark/gRPC start). Overridable via
+    // GROWLERDB_DNS_TTL_SECONDS.
     capDnsCacheTtl();
-    // Start the connector metrics endpoint (task-194 AC6) — a no-op unless GROWLERDB_METRICS_PORT is
-    // set, so the ingest-side signals survive log rotation without binding a port in local runs.
+    // Start the connector metrics endpoint — a no-op unless GROWLERDB_METRICS_PORT is set, so the
+    // ingest-side signals survive log rotation without binding a port in local runs.
     ConnectorMetrics.startServer();
     Map<String, String> opts = parse(args);
     String catalog = opts.getOrDefault("catalog", "demo");
@@ -63,15 +62,14 @@ public final class ConnectorApp {
     List<String> partition = csv(opts.getOrDefault("partition", ""));
     Long start = opts.containsKey("start") ? Long.parseLong(opts.get("start")) : null;
     boolean stream = opts.containsKey("stream");
-    // task-113: cap each commit's changelog rows so a large catch-up window is committed in bounded
-    // sub-batches instead of one oversized Write. 0/absent → the ConnectorJob default.
+    // Cap each commit's changelog rows so a large catch-up window is committed in bounded sub-batches
+    // instead of one oversized Write. 0/absent → the ConnectorJob default.
     long maxCommitRows =
         opts.containsKey("max-commit-rows") ? Long.parseLong(opts.get("max-commit-rows")) : 0;
 
-    // Parallel connector set (task-196): `--workers W` + `--worker-id i` (arg wins over the
-    // GROWLERDB_WORKER_ID env — the StatefulSet pod index). Worker i owns shards {s : s % W == i}
-    // and writes ONLY those; its resume is its own group's checkpoint min. Flags absent ⇒ the
-    // classic single-connector path, unchanged.
+    // Parallel connector set: `--workers W` + `--worker-id i` (arg wins over the GROWLERDB_WORKER_ID
+    // env — the StatefulSet pod index). Worker i owns shards {s : s % W == i} and writes ONLY those;
+    // its resume is its own group's checkpoint min. Flags absent ⇒ the single-connector path.
     Integer workers = opts.containsKey("workers") ? Integer.parseInt(opts.get("workers")) : null;
     Integer workerId = workerId(opts);
     if ((workers == null) != (workerId == null)) {
@@ -88,18 +86,18 @@ public final class ConnectorApp {
     // Target one Node (`--node host:port`) or a sharded cluster (`--nodes h1:p1,h2:p2,…`).
     List<String> nodes = csv(opts.getOrDefault("nodes", opts.getOrDefault("node", "127.0.0.1:50051")));
 
-    // Routing source of truth (task-69): when a `--control-plane host:port` (+ `--index`) is given,
-    // fetch the shard count and strategy from the registry — the same source the Gateway reads —
-    // and fail fast if the local config disagrees, so writes can't land where reads never look.
-    // Without it, fall back to deriving the strategy from `--partition` (the legacy/dev path).
+    // Routing source of truth: when a `--control-plane host:port` (+ `--index`) is given, fetch the
+    // shard count and strategy from the registry — the same source the Gateway reads — and fail fast
+    // if the local config disagrees, so writes can't land where reads never look. Without it, fall
+    // back to deriving the strategy from `--partition`.
     ShardRouter.Strategy routing;
-    // Virtual-bucket map from the registry (task-77): when present, the connector routes
-    // `key → bucket → shard` through the same map the Gateway reads, so writes land where reads
-    // look. Empty/absent ⇒ legacy `fnv % shards`.
+    // Virtual-bucket map from the registry: when present, the connector routes `key → bucket → shard`
+    // through the same map the Gateway reads, so writes land where reads look. Empty/absent ⇒
+    // `fnv % shards`.
     int[] bucketOwners = null;
-    // Windowed index (task-219): when the registry reports windowing, the connector routes each row
-    // to its TIME WINDOW's owning node (resolved live from the control plane) rather than by key-hash,
-    // so it keeps a long-lived CP client for the run instead of closing it after GetIndex.
+    // Windowed index: when the registry reports windowing, the connector routes each row to its time
+    // window's owning node (resolved live from the control plane) rather than by key-hash, so it keeps
+    // a long-lived CP client for the run instead of closing it after GetIndex.
     WindowingConfig windowing = null;
     ControlPlaneClient windowedCp = null;
     String controlPlane = opts.getOrDefault("control-plane", "");
@@ -140,7 +138,7 @@ public final class ConnectorApp {
     }
     if (windowing != null && workers != null) {
       throw new IllegalArgumentException(
-          "--workers is not supported for a windowed index (task-219): windows are routed by time,"
+          "--workers is not supported for a windowed index: windows are routed by time,"
               + " not hash shard groups");
     }
 
@@ -189,17 +187,17 @@ public final class ConnectorApp {
                 ? new ShardGroupWriteClient(nodes, router, lineage, owned)
                 : writerFor(nodes, routing, bucketOwners, lineage)) {
       // Resume exactly-once: unless an explicit --start override is given, pick up
-      // from the checkpoint the Node has durably committed (task-16). null = the
-      // shard is empty, so read the changelog from the beginning.
+      // from the checkpoint the Node has durably committed. null = the shard is
+      // empty, so read the changelog from the beginning.
       Long resumeFrom = (start != null) ? start : client.checkpointSnapshotId();
       System.out.printf(
           "resuming from %s%n", resumeFrom == null ? "the start (no checkpoint)" : resumeFrom);
       if (stream) {
-        // task-144: a write that exhausts its retry budget (e.g. ALL Node pods mid-roll, dialing
-        // stale IPs) fails the micro-batch → the streaming query fails. Restart it IN-PROCESS —
-        // resuming from the Node's durable checkpoint (exactly-once rests there, not on Spark's
-        // offset) — rather than letting awaitTermination() throw → JVM exit(1) → CrashLoopBackOff.
-        // So a full node roll drains lag and recovers with the connector staying up (RESTARTS flat).
+        // A write that exhausts its retry budget (e.g. ALL Node pods mid-roll, dialing stale IPs)
+        // fails the micro-batch → the streaming query fails. Restart it IN-PROCESS — resuming from
+        // the Node's durable checkpoint (exactly-once rests there, not on Spark's offset) — rather
+        // than letting awaitTermination() throw → JVM exit(1) → CrashLoopBackOff. So a full node roll
+        // drains lag and recovers with the connector staying up (RESTARTS flat).
         int restarts = 0;
         while (true) {
           try {
@@ -207,7 +205,7 @@ public final class ConnectorApp {
             break; // graceful stop (SIGTERM) — the query completed, exit the loop
           } catch (StreamingQueryException e) {
             restarts++;
-            ConnectorMetrics.recordStreamRestart(); // survives log rotation (task-194 AC6)
+            ConnectorMetrics.recordStreamRestart(); // survives log rotation
             System.err.printf(
                 "connector: stream failed (%s); restart #%d in %ds — resuming from the Node checkpoint%n",
                 e.getMessage(), restarts, STREAM_RESTART_BACKOFF_SECS);
@@ -280,18 +278,6 @@ public final class ConnectorApp {
         .start();
   }
 
-  /**
-   * One Node → a direct {@link WriteClient}; several → a {@link ShardedWriteClient} that routes
-   * each op to its owning shard with {@code routing} (partition when the key is partitioned,
-   * else hash — the same rule the Gateway derives from the index definition).
-   */
-  /**
-   * The routing strategy for an index with these {@code partitionFields}: partition routing when
-   * the key is partitioned (co-locate a partition on a shard), else hash. Mirrors Rust
-   * {@code ResolvedIndex::routing_strategy}, so the connector places writes on the same shard the
-   * Gateway reads them from. (The connector must be configured with the index's partition fields;
-   * it does not re-derive them from the source schema.)
-   */
   /** {@code --worker-id} arg, else the {@code GROWLERDB_WORKER_ID} env (the pod index), else null. */
   static Integer workerId(Map<String, String> opts) {
     if (opts.containsKey("worker-id")) {
@@ -313,7 +299,7 @@ public final class ConnectorApp {
   }
 
   /**
-   * Validate the connector's local config against the registry's routing config (task-69) and
+   * Validate the connector's local config against the registry's routing config and
    * return the authoritative strategy. Fails fast — rather than silently misplacing every doc —
    * when:
    *
@@ -358,8 +344,8 @@ public final class ConnectorApp {
 
   /**
    * One Node → a direct {@link WriteClient}; several → a {@link ShardedWriteClient}. When
-   * {@code bucketOwners} is non-empty (task-77), the sharded writer routes through that bucket map
-   * (matching the Gateway); otherwise legacy {@code fnv % shards}. A single node always routes to
+   * {@code bucketOwners} is non-empty, the sharded writer routes through that bucket map
+   * (matching the Gateway); otherwise {@code fnv % shards}. A single node always routes to
    * shard 0, so the bucket map is irrelevant there.
    */
   static BatchWriter writerFor(List<String> nodes, ShardRouter.Strategy routing, int[] bucketOwners) {
@@ -368,7 +354,7 @@ public final class ConnectorApp {
 
   /**
    * As above, with the source table's {@link SnapshotLineage} so the sharded resume-min orders
-   * diverged shard checkpoints by sequence number instead of the random snapshot id (task-205).
+   * diverged shard checkpoints by sequence number instead of the random snapshot id.
    */
   static BatchWriter writerFor(
       List<String> nodes, ShardRouter.Strategy routing, int[] bucketOwners, SnapshotLineage lineage) {
@@ -383,8 +369,8 @@ public final class ConnectorApp {
   }
 
   /**
-   * Cap the JDK's positive DNS cache so a restarted Node's new pod IP is picked up within seconds
-   * (task-125). {@code networkaddress.cache.ttl} is a <i>security</i> property, not a {@code -D}
+   * Cap the JDK's positive DNS cache so a restarted Node's new pod IP is picked up within seconds.
+   * {@code networkaddress.cache.ttl} is a <i>security</i> property, not a {@code -D}
    * system property, so set it programmatically — and early, before the cache policy is read on the
    * first lookup. Default 3s; {@code GROWLERDB_DNS_TTL_SECONDS} overrides.
    */

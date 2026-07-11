@@ -2,7 +2,7 @@ name: release
 
 # Cut a release two ways (see RELEASING.md):
 #   - workflow_dispatch with `bump: patch|minor|major` — the gate runs, then the next version is
-#     computed from the last `v*` tag (task-156) and the tag is created for you.
+#     computed from the last `v*` tag and the tag is created for you.
 #   - pushing a `v*` SemVer tag by hand — uses that tag verbatim.
 # Either way it publishes a signed multi-arch container + SBOM, the Helm chart (OCI), and release
 # binaries with checksums. Artifacts are tag-derived; the in-tree workspace version stays 0.0.0.

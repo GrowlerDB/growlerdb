@@ -32,7 +32,7 @@ pub enum EngineError {
     /// Reading the source (Iceberg) failed.
     #[error(transparent)]
     Source(#[from] SourceError),
-    /// A build read **0 documents from a non-empty source** (task-85) — the source's current
+    /// A build read **0 documents from a non-empty source** — the source's current
     /// snapshot reports `records` rows but the read produced none (e.g. a delete-in-history the
     /// changelog read mishandles). Fail loudly instead of committing a silently-empty index.
     #[error(
@@ -45,7 +45,7 @@ pub enum EngineError {
         /// `total-records` from the current snapshot's summary.
         records: i64,
     },
-    /// A **sharded build** (task-77) was asked for on a windowed index. Windowed indexes shard by
+    /// A **sharded build** was asked for on a windowed index. Windowed indexes shard by
     /// time window, not by ordinal/bucket, so the two sharding models don't compose.
     #[error(
         "index `{0}` is windowed — it shards by time window, not by `--shards`/`--shard-ordinal`"

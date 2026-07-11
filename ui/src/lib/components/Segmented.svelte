@@ -1,5 +1,5 @@
 <script lang="ts">
-  // Segmented toggle (task-93): a row of mutually-exclusive options; the active one is raised.
+  // Segmented toggle: a row of mutually-exclusive options; the active one is raised.
   // `value` is bindable. Used for String/AST, Lucene/KQL, theme, density, etc.
   let {
     options,

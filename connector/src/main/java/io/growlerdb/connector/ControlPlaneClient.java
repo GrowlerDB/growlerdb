@@ -10,9 +10,9 @@ import io.grpc.ManagedChannelBuilder;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Thin client to the GrowlerDB {@code ControlPlane} gRPC service (task-28). The connector uses it
+ * Thin client to the GrowlerDB {@code ControlPlane} gRPC service. The connector uses it
  * to fetch an index's <b>routing config</b> from the registry — the same source the Gateway reads
- * from — so write placement and read routing can't drift (task-69). {@link #getIndex} returns the
+ * from — so write placement and read routing can't drift. {@link #getIndex} returns the
  * shard count and routing strategy; the connector validates its own endpoint set against them and
  * fails fast on a mismatch instead of silently writing where reads never look.
  */
@@ -21,7 +21,7 @@ public final class ControlPlaneClient implements AutoCloseable {
   private final ManagedChannel channel;
   private final ControlPlaneGrpc.ControlPlaneBlockingStub stub;
 
-  /** Connect to the Control Plane at {@code host:port} (plaintext; TLS/auth are M4). */
+  /** Connect to the Control Plane at {@code host:port} (plaintext; TLS/auth not yet supported). */
   public ControlPlaneClient(String host, int port) {
     this.channel = ManagedChannelBuilder.forTarget("dns:///" + host + ":" + port).usePlaintext().build();
     this.stub = ControlPlaneGrpc.newBlockingStub(channel);
@@ -33,7 +33,7 @@ public final class ControlPlaneClient implements AutoCloseable {
   }
 
   /**
-   * Resolve the node that owns a time {@code window} of a windowed {@code index} (task-219), placing
+   * Resolve the node that owns a time {@code window} of a windowed {@code index}, placing
    * it on the least-loaded live node on first ask. The connector calls this with each row's computed
    * window id to learn where to stream that window's writes. Idempotent for an already-placed window.
    */

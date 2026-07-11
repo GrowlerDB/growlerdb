@@ -1,5 +1,5 @@
 <script lang="ts">
-  // A right-side slide-in drawer (task-93): the document drawer, etc. Backdrop click + Escape close.
+  // A right-side slide-in drawer: the document drawer, etc. Backdrop click + Escape close.
   import type { Snippet } from 'svelte';
   let {
     title,

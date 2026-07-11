@@ -56,7 +56,7 @@ class ChangelogMapperTest {
   void equalityDeleteOnKeyMapsToDeleteByKey() {
     // An Iceberg equality delete keyed on `id` surfaces as a DELETE change carrying
     // only the equality (key) column — no full pre-image. GrowlerDB is keyed by the
-    // composite key, so it still maps cleanly to delete-by-key (task-15 AC1).
+    // composite key, so it still maps cleanly to delete-by-key.
     Map<String, Value> keyOnly = new HashMap<>();
     keyOnly.put("id", str("doc-1")); // body (a non-key column) is absent
     ChangelogRow eqDelete =
@@ -99,7 +99,7 @@ class ChangelogMapperTest {
 
   @Test
   void lastWriteWinsRegardlessOfInputOrder() {
-    // Given out of sequence order; the mapper sorts by (snapshot, ordinal).
+    // Out-of-sequence input: the mapper sorts by (snapshot, ordinal).
     DocBatch batch =
         mapper()
             .toBatch(
@@ -152,7 +152,7 @@ class ChangelogMapperTest {
 
   @Test
   void stampsResumeFloorWhenSupplied() {
-    // task-204: the resume floor (`safeCheckpoint`) rides the batch so the Node can prune
+    // The resume floor (`safeCheckpoint`) rides the batch so the Node can prune
     // idempotency records at/below it. A null floor leaves the field unset (prune nothing).
     SourceCheckpoint from = SourceCheckpoint.newBuilder().setIcebergSnapshot(5).build();
     SourceCheckpoint floor = SourceCheckpoint.newBuilder().setIcebergSnapshot(3).build();

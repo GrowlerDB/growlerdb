@@ -8,15 +8,14 @@ import org.apache.iceberg.spark.Spark3Util;
 import org.apache.spark.sql.SparkSession;
 
 /**
- * Lineage order over Iceberg snapshots (task-196): snapshot ids are random longs and carry no
- * order (task-205), so anything that must compare two checkpoints — the Node's window-covering
+ * Lineage order over Iceberg snapshots: snapshot ids are random longs and carry no
+ * order, so anything that must compare two checkpoints — the Node's window-covering
  * continuity guard, the resume-from-min across shards, idempotency pruning — orders by the
  * snapshot's <b>data sequence number</b>, which is strictly monotone along a branch (format v2).
  * The connector stamps it on every checkpoint it sends; this is where it comes from.
  *
  * <p>Empty for an unknown/expired snapshot or a v1 table (Iceberg reports sequence 0) — every
- * consumer then falls back to the exact-match legacy semantics, which are safe, just wedgeable
- * (task-206).
+ * consumer then falls back to the exact-match semantics, which are safe, just wedgeable.
  */
 @FunctionalInterface
 public interface SnapshotLineage {
@@ -31,7 +30,7 @@ public interface SnapshotLineage {
     return cp.build();
   }
 
-  /** No lineage info: every checkpoint is unordered (the pre-task-196 behavior). */
+  /** No lineage info: every checkpoint is unordered. */
   static SnapshotLineage none() {
     return snapshotId -> OptionalLong.empty();
   }

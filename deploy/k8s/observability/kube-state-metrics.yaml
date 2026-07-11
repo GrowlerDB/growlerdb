@@ -1,4 +1,4 @@
-# kube-state-metrics for the scale-test cluster (task-189): pod restarts, OOMKills, container
+# kube-state-metrics for the scale-test cluster: pod restarts, OOMKills, container
 # waiting reasons, PVC state -> the Stability dashboard row. Minimal single-replica deploy.
 apiVersion: v1
 kind: ServiceAccount

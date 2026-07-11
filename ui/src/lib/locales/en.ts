@@ -1,5 +1,5 @@
-// English message catalog. All user-facing strings live here so the UI is i18n-ready
-// (task-45): components reference keys via `t(...)`, never hardcoded text.
+// English message catalog. All user-facing strings live here so the UI is i18n-ready: components
+// reference keys via `t(...)`, never hardcoded text.
 export default {
   'app.title': 'GrowlerDB',
   'app.home': 'GrowlerDB home (search)',
@@ -89,7 +89,7 @@ export default {
   'search.results': '{count} result(s)',
   'search.shardsScanned': '{scanned}/{total} shards',
   'search.shardsScannedHint':
-    'Shards scanned for this query out of the index total. A time filter prunes shards that cannot match (task-81).',
+    'Shards scanned for this query out of the index total. A time filter prunes shards that cannot match.',
   'search.suggestions': 'Suggestions',
   'search.partial': 'Partial results',
   'search.partialHint':
@@ -239,7 +239,7 @@ export default {
   'indexes.tabMaintenance': 'Maintenance',
   'indexes.tabActivity': 'Activity',
   'indexes.mappingPlanned':
-    'Per-field mapping (analyzers, cached vs. indexed flags, types) is planned (task-107).',
+    'Per-field mapping (analyzers, cached vs. indexed flags, types) is planned.',
   'indexes.mappingNone': 'No field mapping available for this index.',
   'indexes.mappingBlocked':
     'Fields marked ⊘ can’t be cached (D23) — sensitive or over-size. They’re still searchable; fetch their values via hydration.',
@@ -250,7 +250,7 @@ export default {
   'indexes.mapCached': 'Cached',
   'indexes.mapBlocked': 'blocked',
   'indexes.shardMapPlanned':
-    'A live shard map — placement, virtual-bucket routing, cold-tier residence — is planned (task-108).',
+    'A live shard map — placement, virtual-bucket routing, cold-tier residence — is planned.',
   'indexes.shardsNone': 'No shards assigned yet.',
   'indexes.shardCounts': '{primaries} primaries · {replicas} replicas',
   'indexes.shardActive': 'Active',
@@ -271,7 +271,7 @@ export default {
   'indexes.maintDanger': 'Danger zone',
   'indexes.maintCompact': 'Compact segments',
   'indexes.maintBackup': 'Back up now',
-  'indexes.maintOpsPlanned': 'Compaction and on-demand backup are planned (task-109).',
+  'indexes.maintOpsPlanned': 'Compaction and on-demand backup are planned.',
   'indexes.compacting': 'Compacting…',
   'indexes.confirmCompact':
     'Compact {name}? Merges segments to reduce fragmentation; runs in the background.',

@@ -8,7 +8,7 @@ timestamp: 2026-07-09T12:00:00
 
 # D35. Multi-index routing from one gateway, with per-index RBAC
 
-**Decision.** A single **Gateway** can serve **many indexes** at once (task-240). Each request names
+**Decision.** A single **Gateway** can serve **many indexes** at once. Each request names
 its target index (`SearchRequest.index` and the equivalent field now on `Aggregate`/`GetByKey`/
 `Suggest`/`Describe`/admin requests); the Gateway **resolves that name to a per-index route** at
 entry and operates on it. The old single-index `--index` mode is unchanged (byte-for-byte); a new
@@ -26,7 +26,7 @@ quickly. A transient resolve failure is `UNAVAILABLE` and is **not** cached (the
 
 **Empty-index rule.** An empty `index` field resolves to `default_index` if set; else, if exactly one
 index is currently served, that one; else `InvalidArgument("index required; endpoint serves N
-indexes")`. Single-index mode keeps task-99 scoping exactly: an empty or matching name resolves to the
+indexes")`. Single-index mode keeps its scoping exactly: an empty or matching name resolves to the
 served index; a *different* name is `NOT_FOUND`. The OpenSearch `/_search` (`_all`) path maps to the
 empty/default index; `/{index}/_search` routes to that index.
 
@@ -74,8 +74,8 @@ correct, just unoptimized; wiring partition fields through `GetIndex` is a follo
 write/admin RPCs (reindex/alter/compact/backup) still resolve per index but remain single-shard-only
 (honest `Unimplemented` on a multi-shard index), unchanged by this decision.
 
-**Status.** Accepted (task-240). `Gateway` holds `single` (static, single-index) or `routes` + a
+**Status.** Accepted. `Gateway` holds `single` (static, single-index) or `routes` + a
 `RouteResolver` (multi-index); every read/write handler resolves by index at entry via
 `guard_and_resolve`; `RbacPolicy` enforces the index allowlist; the CLI `gateway --all-indexes` builds
 a control-plane-backed resolver; the compose gateway fronts all indexes. Depends on the auth seam
-(task-35/36) and control-plane registry (task-49/77/219).
+and the control-plane registry.

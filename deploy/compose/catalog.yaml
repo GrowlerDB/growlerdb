@@ -1,9 +1,9 @@
-# A rich (non-windowed) demo index over the seeded `growlerdb.catalog` table (task-241) — one row per
+# A rich (non-windowed) demo index over the seeded `growlerdb.catalog` table — one row per
 # GrowlerDB concept, exercising every field type so the getting-started "query playground" can show
 # every Lucene/KQL operator against known data. Build + serve+register:
 #   growlerdb index growlerdb.catalog --def catalog.yaml --name catalog
 #   growlerdb serve catalog --addr 0.0.0.0:50052 --rest-addr 0.0.0.0:8083 --register http://controlplane:50071
-# The `--all-indexes` gateway (task-240) routes `{"index":"catalog", ...}` requests here automatically.
+# The `--all-indexes` gateway routes `{"index":"catalog", ...}` requests here automatically.
 #
 # NB on the default search field: the engine's default field is the *first analyzed TEXT field in
 # field order* (there is no `default_field` flag in the mapping schema — an unknown key is parsed and
@@ -22,9 +22,9 @@ mapping:
   fields:
     - { path: id, type: KEYWORD }
     - { path: body, type: TEXT, default_field: true }   # first TEXT field ⇒ the default search field
-    # `cached: true` returns these small, high-signal values WITH each hit (D23/task-86), so the
+    # `cached: true` returns these small, high-signal values WITH each hit, so the
     # console renders them inline (right of the PK, lighter font, query terms highlighted) without a
-    # hydration round-trip. `body` stays uncached — big text is hydrate-only (D23).
+    # hydration round-trip. `body` stays uncached — big text is hydrate-only.
     - { path: title, type: TEXT, cached: true }
     # `fast: true` also makes `category` aggregatable, so the console's left rail can facet on it
     # (guide / reference / tutorial with real counts) — a useful filter, unlike the unique-valued
@@ -38,6 +38,6 @@ mapping:
     # index (`indexed: true`) — which TEXT/KEYWORD get by default but numeric/BOOL/DATE do not.
     - { path: published, type: DATE, format: epoch_ms, fast: true }
     - { path: server_ip, type: IP }
-    # `indexed: true` so the BOOL *term* filter `archived:true` (playground #14/#15) has postings to
+    # `indexed: true` so the BOOL *term* filter `archived:true` has postings to
     # match — a `fast`-only BOOL is range/sortable but not term-queryable, so the filter would be empty.
     - { path: archived, type: BOOL, indexed: true }

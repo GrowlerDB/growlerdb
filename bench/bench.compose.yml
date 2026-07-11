@@ -1,4 +1,4 @@
-# Benchmark overlay (task-55): Trino (query the same Iceberg table directly) + Elasticsearch
+# Benchmark overlay: Trino (query the same Iceberg table directly) + Elasticsearch
 # (dual-index the same data) for a head-to-head vs GrowlerDB. Joins the running stack's network.
 networks:
   default:

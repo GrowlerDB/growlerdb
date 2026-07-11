@@ -1,4 +1,4 @@
-"""GrowlerDB — first-party Python client for the Engine API (task-27).
+"""GrowlerDB — first-party Python client for the Engine API.
 
 A small, dependency-free client over the REST/JSON gateway (`/v1/...`), which
 mirrors the `growlerdb.v1` gRPC surface 1:1. Uses only the standard library, so it
