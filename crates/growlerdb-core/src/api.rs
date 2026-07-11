@@ -210,22 +210,27 @@ pub struct Highlight {
 pub const DEFAULT_HIGHLIGHT_MAX_FRAGMENTS: usize = 3;
 /// Default approximate characters per highlight fragment — the snippet window.
 pub const DEFAULT_HIGHLIGHT_FRAGMENT_SIZE: usize = 150;
+/// Ceiling on `max_fragments` — bounds the per-hit highlight payload a request can force.
+pub const MAX_HIGHLIGHT_MAX_FRAGMENTS: usize = 50;
+/// Ceiling on `fragment_size` — bounds the snippet window a request can force.
+pub const MAX_HIGHLIGHT_FRAGMENT_SIZE: usize = 2_000;
 
 impl Highlight {
     /// A highlight request over `fields` (empty = the default highlightable set). A
-    /// `max_fragments`/`fragment_size` of 0 means "use the default".
+    /// `max_fragments`/`fragment_size` of 0 means "use the default"; each is clamped to its
+    /// ceiling so a request can't force an unbounded per-hit payload.
     pub fn new(fields: Vec<String>, max_fragments: usize, fragment_size: usize) -> Self {
         Self {
             fields,
             max_fragments: if max_fragments == 0 {
                 DEFAULT_HIGHLIGHT_MAX_FRAGMENTS
             } else {
-                max_fragments
+                max_fragments.min(MAX_HIGHLIGHT_MAX_FRAGMENTS)
             },
             fragment_size: if fragment_size == 0 {
                 DEFAULT_HIGHLIGHT_FRAGMENT_SIZE
             } else {
-                fragment_size
+                fragment_size.min(MAX_HIGHLIGHT_FRAGMENT_SIZE)
             },
         }
     }
@@ -323,32 +328,93 @@ pub struct AggRange {
     pub to: Option<f64>,
 }
 
+/// Largest `size` a [`Terms`](Agg::Terms) aggregation may request. Caps the bucket cardinality one
+/// aggregation can force the store to build and merge across shards.
+pub const MAX_TERMS_SIZE: usize = 10_000;
+
+/// Smallest [`DateHistogram`](Agg::DateHistogram) interval accepted. A sub-second interval over a
+/// wide event-time span would materialize an unbounded number of buckets; a one-second floor bounds
+/// the bucket count to something a full time range can plausibly need.
+pub const MIN_DATE_HISTOGRAM_INTERVAL_SECS: u64 = 1;
+
+/// Largest number of aggregations one request may carry. Bounds the total per-request aggregation
+/// work independent of any single agg's own cap.
+pub const MAX_AGGS: usize = 8;
+
+/// Parse a Tantivy `fixed_interval` duration string (e.g. `"1d"`, `"3600s"`, `"90m"`) to whole
+/// seconds. Accepts a bare number (seconds) or a number with an `s`/`m`/`h`/`d` suffix. Returns
+/// `None` for an unparseable or zero-length interval.
+fn interval_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, mult) = match s.as_bytes().last() {
+        Some(b's') => (&s[..s.len() - 1], 1),
+        Some(b'm') => (&s[..s.len() - 1], 60),
+        Some(b'h') => (&s[..s.len() - 1], 3_600),
+        Some(b'd') => (&s[..s.len() - 1], 86_400),
+        _ => (s, 1),
+    };
+    num.trim().parse::<u64>().ok()?.checked_mul(mult)
+}
+
 /// Validate an aggregation spec before it reaches Tantivy, so bad input is a clear
-/// `InvalidArgument` rather than an opaque internal error. Currently checks `range` buckets:
-/// Tantivy requires each `[from, to)` to be well-formed and the list to be ascending and
-/// non-overlapping. Returns a human-readable message naming the offending aggregation.
+/// `InvalidArgument` rather than an opaque internal error (or an unbounded amount of work).
+/// Checks: the number of aggregations ([`MAX_AGGS`]); each `terms` `size` ([`MAX_TERMS_SIZE`]);
+/// each `date_histogram` interval ([`MIN_DATE_HISTOGRAM_INTERVAL_SECS`]); and `range` buckets
+/// (each `[from, to)` well-formed, the list ascending and non-overlapping). This is the single
+/// boundary both the Node and Gateway `Aggregate` paths call, so the caps hold over direct gRPC too.
+/// Returns a human-readable message naming the offending aggregation.
 pub fn validate_aggs(aggs: &[(String, Agg)]) -> std::result::Result<(), String> {
+    if aggs.len() > MAX_AGGS {
+        return Err(format!(
+            "too many aggregations ({}); the maximum is {MAX_AGGS}",
+            aggs.len()
+        ));
+    }
     for (name, agg) in aggs {
-        if let Agg::Range { ranges, .. } = agg {
-            let mut prev_upper = f64::NEG_INFINITY;
-            for r in ranges {
-                let from = r.from.unwrap_or(f64::NEG_INFINITY);
-                let to = r.to.unwrap_or(f64::INFINITY);
-                // `partial_cmp` returns `None` for a NaN bound, so a non-`Less` result rejects
-                // both `from >= to` and NaN.
-                if from.partial_cmp(&to) != Some(std::cmp::Ordering::Less) {
+        match agg {
+            Agg::Terms { size, .. } => {
+                if *size > MAX_TERMS_SIZE {
                     return Err(format!(
-                        "range agg `{name}`: each bucket needs from < to (got [{:?}, {:?}))",
-                        r.from, r.to
+                        "terms agg `{name}`: size ({size}) exceeds the maximum ({MAX_TERMS_SIZE})"
                     ));
                 }
-                if from.partial_cmp(&prev_upper) == Some(std::cmp::Ordering::Less) {
-                    return Err(format!(
-                        "range agg `{name}`: buckets must be ascending and non-overlapping"
-                    ));
-                }
-                prev_upper = to;
             }
+            Agg::DateHistogram { fixed_interval, .. } => match interval_secs(fixed_interval) {
+                None => {
+                    return Err(format!(
+                        "date_histogram agg `{name}`: unparseable interval `{fixed_interval}`"
+                    ));
+                }
+                Some(secs) if secs < MIN_DATE_HISTOGRAM_INTERVAL_SECS => {
+                    return Err(format!(
+                        "date_histogram agg `{name}`: interval `{fixed_interval}` is below the \
+                         minimum ({MIN_DATE_HISTOGRAM_INTERVAL_SECS}s)"
+                    ));
+                }
+                Some(_) => {}
+            },
+            Agg::Range { ranges, .. } => {
+                let mut prev_upper = f64::NEG_INFINITY;
+                for r in ranges {
+                    let from = r.from.unwrap_or(f64::NEG_INFINITY);
+                    let to = r.to.unwrap_or(f64::INFINITY);
+                    // `partial_cmp` returns `None` for a NaN bound, so a non-`Less` result rejects
+                    // both `from >= to` and NaN.
+                    if from.partial_cmp(&to) != Some(std::cmp::Ordering::Less) {
+                        return Err(format!(
+                            "range agg `{name}`: each bucket needs from < to (got [{:?}, {:?}))",
+                            r.from, r.to
+                        ));
+                    }
+                    if from.partial_cmp(&prev_upper) == Some(std::cmp::Ordering::Less) {
+                        return Err(format!(
+                            "range agg `{name}`: buckets must be ascending and non-overlapping"
+                        ));
+                    }
+                    prev_upper = to;
+                }
+            }
+            Agg::Stats { .. } | Agg::Cardinality { .. } | Agg::Percentiles { .. } => {}
         }
     }
     Ok(())
@@ -662,5 +728,71 @@ mod tests {
         assert!(validate_aggs(&range_agg(vec![range(Some(20.0), Some(10.0))])).is_err());
         // NaN bound.
         assert!(validate_aggs(&range_agg(vec![range(Some(f64::NAN), Some(10.0))])).is_err());
+    }
+
+    #[test]
+    fn validate_aggs_caps_terms_size() {
+        let ok = vec![(
+            "t".to_string(),
+            Agg::Terms {
+                field: "cat".into(),
+                size: MAX_TERMS_SIZE,
+            },
+        )];
+        assert!(validate_aggs(&ok).is_ok());
+        let over = vec![(
+            "t".to_string(),
+            Agg::Terms {
+                field: "cat".into(),
+                size: MAX_TERMS_SIZE + 1,
+            },
+        )];
+        assert!(validate_aggs(&over).is_err());
+    }
+
+    #[test]
+    fn validate_aggs_rejects_subsecond_date_histogram() {
+        let mk = |iv: &str| {
+            vec![(
+                "d".to_string(),
+                Agg::DateHistogram {
+                    field: "ts".into(),
+                    fixed_interval: iv.into(),
+                },
+            )]
+        };
+        assert!(validate_aggs(&mk("1d")).is_ok());
+        assert!(validate_aggs(&mk("3600s")).is_ok());
+        // Tantivy accepts a bare-number (seconds) or suffixed interval; a sub-second one is rejected.
+        assert!(validate_aggs(&mk("0")).is_err());
+        assert!(validate_aggs(&mk("nonsense")).is_err());
+    }
+
+    #[test]
+    fn validate_aggs_caps_agg_count() {
+        let many: Vec<(String, Agg)> = (0..=MAX_AGGS)
+            .map(|i| {
+                (
+                    format!("s{i}"),
+                    Agg::Stats {
+                        field: "amount".into(),
+                    },
+                )
+            })
+            .collect();
+        assert!(many.len() > MAX_AGGS);
+        assert!(validate_aggs(&many).is_err());
+    }
+
+    #[test]
+    fn highlight_new_clamps_bounds() {
+        let h = Highlight::new(Vec::new(), MAX_HIGHLIGHT_MAX_FRAGMENTS + 100, 0);
+        assert_eq!(h.max_fragments, MAX_HIGHLIGHT_MAX_FRAGMENTS);
+        // A zero still means "use the default".
+        assert_eq!(h.fragment_size, DEFAULT_HIGHLIGHT_FRAGMENT_SIZE);
+
+        let h = Highlight::new(Vec::new(), 0, MAX_HIGHLIGHT_FRAGMENT_SIZE + 100);
+        assert_eq!(h.max_fragments, DEFAULT_HIGHLIGHT_MAX_FRAGMENTS);
+        assert_eq!(h.fragment_size, MAX_HIGHLIGHT_FRAGMENT_SIZE);
     }
 }

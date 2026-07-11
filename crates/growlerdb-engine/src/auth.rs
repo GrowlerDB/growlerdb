@@ -74,6 +74,13 @@ impl AuthDenied {
 pub trait AuthHook: Send + Sync {
     /// Authorize a request described by `ctx`.
     fn authorize(&self, ctx: &AuthContext) -> Result<(), AuthDenied>;
+
+    /// Whether this hook makes decisions from caller identity (roles/principal). When `true`, a
+    /// service must have a real authenticator installed, else the identity it enforces against is
+    /// caller-asserted and forgeable. Defaults to `false` (the no-op [`AllowAll`]).
+    fn is_authorizing(&self) -> bool {
+        false
+    }
 }
 
 /// The default no-op hook: permits every request.

@@ -581,21 +581,29 @@ async fn run_search(
         }
     };
 
+    // Key hydrated rows by their own coordinates: `get_by_key` returns rows in completion order and
+    // may drop tenant-filtered or missing keys, so pairing by position would mis-attribute `_source`
+    // to the wrong `_id` on a sharded/windowed index. Look each hit's source up by its coordinates.
+    let sources: std::collections::HashMap<String, Map<String, JsonValue>> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let id = compose_id(row.key.as_ref()?);
+            let fields = row
+                .fields
+                .into_iter()
+                .filter_map(|f| f.value.map(|v| (f.name, value_to_json(v))))
+                .collect::<Map<String, JsonValue>>();
+            Some((id, fields))
+        })
+        .collect();
+
     let mut hits = Vec::with_capacity(resp.hits.len());
     let mut max_score = f64::MIN;
-    for (i, hit) in resp.hits.iter().enumerate() {
+    for hit in resp.hits.iter() {
         let coords = hit.coordinates.clone().unwrap_or_default();
         let id = compose_id(&coords);
-        let source = rows
-            .get(i)
-            .map(|row| {
-                row.fields
-                    .clone()
-                    .into_iter()
-                    .filter_map(|f| f.value.map(|v| (f.name, value_to_json(v))))
-                    .collect::<Map<String, JsonValue>>()
-            })
-            .unwrap_or_default();
+        // Missing key → omit `_source` rather than shift another hit's row onto this `_id`.
+        let source = sources.get(&id).cloned().unwrap_or_default();
         max_score = max_score.max(hit.score);
         let mut doc = json!({
             "_index": index,
