@@ -23,7 +23,7 @@ receivers:
         - job_name: "growlerdb"
           scrape_interval: 5s
           static_configs:
-            - targets: ["controlplane:9101", "node:9102", "gateway:9103"]
+            - targets: ["controlplane:9101", "node:9102", "node-catalog:9104", "gateway:9103"]
         # Host CPU/mem/disk for the Observability "Runtime" panels.
         - job_name: "node-exporter"
           scrape_interval: 5s
