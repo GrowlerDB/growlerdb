@@ -11,8 +11,8 @@ test.describe('Search & Explore', () => {
 
     await expect(page.getByText('2 result(s)')).toBeVisible();
     await expect(page.locator('.results .id').first()).toContainText('evt-1');
-    // Inline cached display fields (task-86) render under the hit.
-    await expect(page.locator('.results .fields').first()).toContainText('sensor-1');
+    // Cached display fields (task-86) render as cells in the results table row.
+    await expect(page.locator('.results .hit').first()).toContainText('sensor-1');
 
     // Open the document drawer for the first hit → authoritative Iceberg row (Fields tab).
     await page.locator('.results .hit').first().click();
@@ -199,7 +199,7 @@ test.describe('Search & Explore', () => {
     await expect(statbar).toContainText('6/64 shards');
   });
 
-  test('result rows render a highlighted snippet and a right-aligned timestamp (task-133)', async ({
+  test('table cells highlight matched terms and format DATE columns (task-133)', async ({
     page,
   }) => {
     const micros = Date.UTC(2026, 5, 30, 12, 34, 56) * 1000; // 2026-06-30 12:34:56 UTC
@@ -232,14 +232,12 @@ test.describe('Search & Explore', () => {
     await page.press('#query', 'Enter');
     await expect(page.getByText('1 result(s)')).toBeVisible();
 
-    // The query term is highlighted inside the snippet (body field).
-    await expect(page.locator('.hit .snippet mark')).toHaveText('temperature');
-    // The DATE column (epoch micros) renders right-aligned, formatted UTC.
-    await expect(page.locator('.hit-ts')).toContainText('2026-06-30 12:34:56');
-    // Remaining fields stay as chips; the snippet + timestamp sources are not duplicated there.
-    const chips = page.locator('.hit .fields');
-    await expect(chips).toContainText('status');
-    await expect(chips).not.toContainText('temperature within range');
+    // The query term is highlighted inside the body cell.
+    await expect(page.locator('.hit mark')).toHaveText('temperature');
+    // The DATE column (epoch micros) renders formatted UTC in its cell.
+    await expect(page.locator('.hit')).toContainText('2026-06-30 12:34:56');
+    // Every cached field is a cell in the same row — including the status value.
+    await expect(page.locator('.hit')).toContainText('ok');
   });
 
   test('time filter stays disabled when the index reports no DATE columns (task-132)', async ({

@@ -459,14 +459,6 @@ input {
   gap: 0.5rem;
 }
 
-.hit {
-  display: flex;
-  gap: 1rem;
-  align-items: baseline;
-}
-.hit .id {
-  font-family: ui-monospace, monospace;
-}
 .explain-toggle {
   color: var(--muted);
   margin-left: auto;
