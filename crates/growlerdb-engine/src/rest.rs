@@ -28,7 +28,7 @@ use growlerdb_proto::v1::{
     Sort as WireSort, SuggestKind, SuggestRequest,
 };
 
-use growlerdb_proto::ControlPlaneClient;
+use growlerdb_proto::service_token::CpClient;
 
 use crate::gateway::Gateway;
 
@@ -122,7 +122,7 @@ pub fn router_with_ui(gateway: Arc<Gateway>, ui_dir: &std::path::Path) -> Router
 /// query [`router`] so the UI (and REST clients) can manage indexes, not just query them. Auth
 /// headers are forwarded as metadata, so the Control Plane's RBAC seam governs these the same as
 /// over gRPC.
-pub fn control_router(client: ControlPlaneClient<tonic::transport::Channel>) -> Router {
+pub fn control_router(client: CpClient) -> Router {
     use axum::routing::get;
     Router::new()
         .route(
@@ -319,7 +319,7 @@ struct AlertsDto {
     alerts: Vec<AlertDto>,
 }
 
-type ControlClient = ControlPlaneClient<tonic::transport::Channel>;
+type ControlClient = CpClient;
 
 async fn list_indexes_handler(
     State(client): State<ControlClient>,

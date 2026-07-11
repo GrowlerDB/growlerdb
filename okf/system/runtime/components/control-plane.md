@@ -23,6 +23,15 @@ built-in credentials, session epochs, and the per-index activity log.
   never block on fsync.
 - Serves auth-state lookups (O(1) token hash index) with a consistent lock order.
 
+## Internal-RPC credential
+
+The internal RPCs (registration, shard-map reads, placement) are a service-to-service layer, distinct
+from the user [RBAC](/product/functional/rbac-and-tenancy.md) that governs data-plane requests. They can
+be gated with a shared **service token** (`GROWLERDB_SERVICE_TOKEN`): when set, every RPC must carry the
+matching token (constant-time checked) or is rejected — closing the internal RPCs to callers outside the
+mesh, independent of the user-auth mode. Unset ⇒ open (local dev). The control plane can also serve over
+[TLS/mTLS](/product/functional/auth/mtls.md), optional and off by default.
+
 ## Notes
 
 Implemented in `growlerdb-controlplane`. Its persistent state is small; durability is temp+fsync+rename.

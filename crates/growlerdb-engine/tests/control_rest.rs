@@ -15,7 +15,7 @@ use growlerdb_engine::{
     mint_session_jwt, rest, ControlPlaneService, JwtAuthenticator, RbacPolicy,
     BUILTIN_SESSION_AUDIENCE, BUILTIN_SESSION_ISSUER, BUILTIN_SESSION_TTL_SECS,
 };
-use growlerdb_proto::{ControlPlaneClient, ControlPlaneServer};
+use growlerdb_proto::ControlPlaneServer;
 use growlerdb_source::IcebergConfig;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -54,7 +54,9 @@ async fn control_app(seed: &[&str], root: &std::path::Path) -> Router {
 
     let endpoint = format!("http://{addr}");
     for _ in 0..50 {
-        if let Ok(client) = ControlPlaneClient::connect(endpoint.clone()).await {
+        if let Ok(client) =
+            growlerdb_proto::service_token::connect(endpoint.clone(), None, None).await
+        {
             return rest::control_router(client);
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -115,7 +117,9 @@ async fn authn_control_app(root: &std::path::Path, enforce_rbac: bool) -> Router
     );
     let endpoint = format!("http://{addr}");
     for _ in 0..50 {
-        if let Ok(client) = ControlPlaneClient::connect(endpoint.clone()).await {
+        if let Ok(client) =
+            growlerdb_proto::service_token::connect(endpoint.clone(), None, None).await
+        {
             return rest::control_router(client);
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
