@@ -16,7 +16,7 @@
     type HighlightSegment,
   } from '../lib/api';
   import { currentFieldToken, withCompletion } from '../lib/autocomplete';
-  import { queryTerms } from '../lib/highlight';
+  import { queryTermsByField, fieldTerms, type ScopedTerms } from '../lib/highlight';
   import { formatEpochMicros } from '../lib/results';
   import Highlighted from './Highlighted.svelte';
   import { toJson, toCsv, download } from '../lib/export';
@@ -47,7 +47,7 @@
   let query = $state('');
   let syntax = $state<QuerySyntax>('lucene');
   let lastQuery = $state('');
-  let terms = $state<string[]>([]);
+  let scoped = $state<ScopedTerms>({ fields: {}, bare: [] });
   let hits = $state<SearchHit[]>([]);
   let total = $state(0);
   let partial = $state(false);
@@ -298,7 +298,7 @@
       cursor = res.next_cursor;
       offset = sorted ? 0 : from;
       lastQuery = eq; // the effective query (base + filters + time) — used by the drawer's Explain
-      terms = queryTerms(eq);
+      scoped = queryTermsByField(eq);
       searched = true;
       void refreshFacets(eq, hits, seq);
     } catch (err) {
@@ -732,7 +732,11 @@
                     {#each columns as col (col)}
                       {@const cell = cellText(hit, col)}
                       <td title={cell.text}
-                        ><Highlighted text={cell.text} {terms} segments={cell.segments} /></td
+                        ><Highlighted
+                          text={cell.text}
+                          terms={fieldTerms(scoped, col)}
+                          segments={cell.segments}
+                        /></td
                       >
                     {/each}
                   </tr>
@@ -873,7 +877,7 @@
   {#key selected}
     <DocumentDrawer
       hit={selected}
-      {terms}
+      {scoped}
       query={lastQuery}
       {syntax}
       onClose={() => (selected = null)}

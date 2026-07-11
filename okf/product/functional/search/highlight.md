@@ -34,8 +34,10 @@ HTML-escaped).
 
 When a response carries **no** server highlights (the search didn't opt in, or a field had no matching
 fragment), the console falls back to a best-effort client-side marker: it marks the parsed
-[query](/product/functional/search/query.md) terms literally in the hit's cached/hydrated text. This is
-a display convenience and does **not** reflect stemming, per-field analysis, or phrase positions — the
+[query](/product/functional/search/query.md) terms literally in the hit's cached/hydrated text. It is
+**field-scoped** — a `field:term` term marks only that field's cell/value, not every field that happens
+to contain the word (a bare, unqualified term marks broadly, since its target field is the index
+default). It remains a display convenience and does **not** reflect stemming or phrase positions — the
 server highlight does. Both render identically (the same `{text, marked}` segment shape).
 
 ## Notes
