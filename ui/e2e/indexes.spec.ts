@@ -43,9 +43,7 @@ test.describe('Indexes', () => {
     await expect(page.locator('.ix-table tbody tr').first()).toContainText('Off');
   });
 
-  test('the Mapping tab renders per-field flags + the blocked-field callout', async ({
-    page,
-  }) => {
+  test('the Mapping tab renders per-field flags + the blocked-field callout', async ({ page }) => {
     await installMocks(page);
     await page.goto('/indexes');
     await page.getByRole('button', { name: 'telemetry' }).click();
@@ -62,9 +60,7 @@ test.describe('Indexes', () => {
     await expect(page.getByText(/can’t be cached \(D23\)/)).toBeVisible();
   });
 
-  test('the Shards tab renders the health grid + primary/replica counts', async ({
-    page,
-  }) => {
+  test('the Shards tab renders the health grid + primary/replica counts', async ({ page }) => {
     await installMocks(page);
     await page.goto('/indexes');
     await page.getByRole('button', { name: 'telemetry' }).click();

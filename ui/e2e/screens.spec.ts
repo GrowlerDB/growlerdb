@@ -87,9 +87,7 @@ test.describe('Observability', () => {
     await expect(page.getByText('No alerts firing')).toHaveCount(0);
   });
 
-  test('falls back to local SLI checks when the alerts proxy is down', async ({
-    page,
-  }) => {
+  test('falls back to local SLI checks when the alerts proxy is down', async ({ page }) => {
     await installMocks(page, { alerts: { status: 502, json: {} } });
     await page.goto('/observability');
     await expect(page.getByText('Local checks')).toBeVisible();

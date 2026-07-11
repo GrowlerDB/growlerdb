@@ -140,9 +140,7 @@ test.describe('Search & Explore', () => {
     await expect(page.locator('.filter-chip')).toHaveCount(0);
   });
 
-  test('time filter scopes the query to a detected timestamp column', async ({
-    page,
-  }) => {
+  test('time filter scopes the query to a detected timestamp column', async ({ page }) => {
     await installMocks(page, {
       describeIndex: {
         json: {
@@ -199,9 +197,7 @@ test.describe('Search & Explore', () => {
     await expect(statbar).toContainText('6/64 shards');
   });
 
-  test('table cells highlight matched terms and format DATE columns', async ({
-    page,
-  }) => {
+  test('table cells highlight matched terms and format DATE columns', async ({ page }) => {
     const micros = Date.UTC(2026, 5, 30, 12, 34, 56) * 1000; // 2026-06-30 12:34:56 UTC
     await installMocks(page, {
       describeIndex: {
@@ -240,9 +236,7 @@ test.describe('Search & Explore', () => {
     await expect(page.locator('.hit')).toContainText('ok');
   });
 
-  test('time filter stays disabled when the index reports no DATE columns', async ({
-    page,
-  }) => {
+  test('time filter stays disabled when the index reports no DATE columns', async ({ page }) => {
     // Default describeIndex mock carries no `time_fields`. The backend always populates the field,
     // so empty means "no DATE column" — the time control must stay disabled, NOT re-derive fields
     // from the mapping (the removed client-side fallback).
