@@ -77,7 +77,7 @@ public final class WindowedWriteClient implements BatchWriter {
             throw new IllegalStateException(
                 "upsert is missing the window field `"
                     + router.field()
-                    + "` — add it to --fields so the connector can route by window (task-219)");
+                    + "` — add it to --fields so the connector can route by window");
           }
           byWindow.computeIfAbsent(router.windowOf(wv), w -> new ArrayList<>()).add(op);
         }

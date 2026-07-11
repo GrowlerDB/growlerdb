@@ -118,7 +118,7 @@ impl Search for WindowedSearchService {
         _request: Request<OpenPitRequest>,
     ) -> Result<Response<OpenPitResponse>, Status> {
         Err(Status::unimplemented(
-            "distributed windowed point-in-time is not yet supported (task-82 follow-on)",
+            "distributed windowed point-in-time is not yet supported",
         ))
     }
 
@@ -127,7 +127,7 @@ impl Search for WindowedSearchService {
         _request: Request<ClosePitRequest>,
     ) -> Result<Response<ClosePitResponse>, Status> {
         Err(Status::unimplemented(
-            "distributed windowed point-in-time is not yet supported (task-82 follow-on)",
+            "distributed windowed point-in-time is not yet supported",
         ))
     }
 
@@ -138,7 +138,7 @@ impl Search for WindowedSearchService {
         // Explain names a doc by coordinate, not a window selector; finding its window would need a
         // scatter. Not supported over a distributed windowed index yet.
         Err(Status::unimplemented(
-            "explain is not yet supported over a distributed windowed index (task-102 follow-on)",
+            "explain is not yet supported over a distributed windowed index",
         ))
     }
 
@@ -149,7 +149,7 @@ impl Search for WindowedSearchService {
         _request: Request<ExportRequest>,
     ) -> Result<Response<Self::ExportStream>, Status> {
         Err(Status::unimplemented(
-            "distributed windowed export is not yet supported (task-82 follow-on)",
+            "distributed windowed export is not yet supported",
         ))
     }
 }
@@ -291,7 +291,7 @@ impl Admin for WindowedAdminService {
         _request: Request<AlterIndexRequest>,
     ) -> Result<Response<AlterIndexResponse>, Status> {
         Err(Status::unimplemented(
-            "alter is not supported over a distributed windowed index (task-225 follow-on)",
+            "alter is not supported over a distributed windowed index",
         ))
     }
 
@@ -300,7 +300,7 @@ impl Admin for WindowedAdminService {
         _request: Request<ReindexIndexRequest>,
     ) -> Result<Response<ReindexIndexResponse>, Status> {
         Err(Status::unimplemented(
-            "reindex is not supported over a distributed windowed index (task-225 follow-on)",
+            "reindex is not supported over a distributed windowed index",
         ))
     }
 
@@ -309,7 +309,7 @@ impl Admin for WindowedAdminService {
         _request: Request<ReconcileIndexRequest>,
     ) -> Result<Response<ReconcileIndexResponse>, Status> {
         Err(Status::unimplemented(
-            "reconcile is not supported over a distributed windowed index (task-225 follow-on)",
+            "reconcile is not supported over a distributed windowed index",
         ))
     }
 
@@ -327,7 +327,7 @@ impl Admin for WindowedAdminService {
         _request: Request<BackupIndexRequest>,
     ) -> Result<Response<BackupIndexResponse>, Status> {
         Err(Status::unimplemented(
-            "backup is not supported over a distributed windowed index (task-225 follow-on)",
+            "backup is not supported over a distributed windowed index",
         ))
     }
 
@@ -336,7 +336,7 @@ impl Admin for WindowedAdminService {
         _request: Request<BackupStatusRequest>,
     ) -> Result<Response<BackupStatusResponse>, Status> {
         Err(Status::unimplemented(
-            "backup status is not supported over a distributed windowed index (task-225 follow-on)",
+            "backup status is not supported over a distributed windowed index",
         ))
     }
 }

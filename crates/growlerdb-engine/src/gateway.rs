@@ -862,7 +862,7 @@ impl Gateway {
         if !body.search_after.is_empty() && (body.sort.is_empty() || sort_by_score) {
             return Err(Status::invalid_argument(
                 "search_after requires a non-`_score` sort on a multi-shard index: score-ranked \
-                 keyset paging is unsupported because scores aren't a stable keyset (task-68).",
+                 keyset paging is unsupported because scores aren't a stable keyset.",
             ));
         }
         // Collapse folds groups across shards on its own scatter/merge path — it ignores

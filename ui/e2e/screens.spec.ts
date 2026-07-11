@@ -51,14 +51,14 @@ test.describe('Observability', () => {
     await expect(dialog).toHaveCount(0);
   });
 
-  test('hides the Grafana link when no URL is configured (task-140)', async ({ page }) => {
+  test('hides the Grafana link when no URL is configured', async ({ page }) => {
     await installMocks(page, { config: { json: { auth_required: false } } });
     await page.goto('/observability');
     await expect(page.getByRole('heading', { name: 'Observability' })).toBeVisible();
     await expect(page.getByRole('link', { name: /Open in Grafana/ })).toHaveCount(0);
   });
 
-  test('renders server-side firing alerts in the strip (task-111)', async ({ page }) => {
+  test('renders server-side firing alerts in the strip', async ({ page }) => {
     await installMocks(page, {
       alerts: {
         json: {
@@ -87,7 +87,7 @@ test.describe('Observability', () => {
     await expect(page.getByText('No alerts firing')).toHaveCount(0);
   });
 
-  test('falls back to local SLI checks when the alerts proxy is down (task-111)', async ({
+  test('falls back to local SLI checks when the alerts proxy is down', async ({
     page,
   }) => {
     await installMocks(page, { alerts: { status: 502, json: {} } });

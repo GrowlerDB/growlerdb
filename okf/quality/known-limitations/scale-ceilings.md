@@ -31,8 +31,8 @@ The single most important framing. The two cases scale very differently:
 
 ## Ranked ceilings
 
-| # | Ceiling | Grows with | Severity | Status |
-|---|---------|-----------|----------|-----------|
+| # | Ceiling | Grows with | Status |
+|---|---------|-----------|-----------|
 | 1 | **Ingest scale-out** — *(addressed via [parallel ingest](/system/decisions/d32-parallel-ingest.md))* a **shard-group connector set** now partitions one table across W workers (executor-side owned-row filter, per-group resume, no coordination), on top of ordered checkpoints + the window-covering guard (which also fixed three latent stall/dedup bugs) and the concurrent per-shard fan-out. Residual: each *worker* is still one Spark driver — beyond its ceiling, raise W (bounded by shard count) | ingest rate | done |
 | 2 | **Source file/metadata growth degrades reads** — GrowlerDB reads O(files) (scan planning + hydration), so a source that accumulates small files / fat metadata slows queries. **Not GrowlerDB's to fix** — it never manages the source table ([layered locator](/system/decisions/d30-layered-locator.md)); the remedy (Iceberg maintenance) is the user's, outside GrowlerDB. GrowlerDB's job is *observability* so users can diagnose it: *(addressed)* per-index `growlerdb_source_*` gauges (data-file count, mean file size, delete files, snapshots) sampled from source snapshot metadata surface exactly this, with a [source-health runbook](/system/source-health.md). The demo/scale-test maintenance CronJob is a convenience, not a product feature | file inflow | user-owned (GrowlerDB: metrics, done) |
 | 3 | **`location.arr` hot floor** — 12 B/row, O(total rows), stays hot **even when the window is parked**; cold-tiering does not bound it (~1.2–6 TB hot-NVMe floor per 100 TB index, unbounded with retention) | total rows × retention | serious |

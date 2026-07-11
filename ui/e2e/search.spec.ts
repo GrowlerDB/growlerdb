@@ -55,7 +55,7 @@ test.describe('Search & Explore', () => {
     await expect(alert).toContainText('500');
   });
 
-  test('flags partial results when a shard is down (task-87 honesty)', async ({ page }) => {
+  test('flags partial results when a shard is down', async ({ page }) => {
     await installMocks(page, {
       search: {
         json: {
@@ -74,7 +74,7 @@ test.describe('Search & Explore', () => {
     await expect(page.getByRole('status')).toContainText('Partial results');
   });
 
-  test('scopes the search to a selected index (task-99)', async ({ page }) => {
+  test('scopes the search to a selected index', async ({ page }) => {
     await installMocks(page);
     await page.goto('/');
     await page.fill('#query', 'status:ok');
@@ -89,7 +89,7 @@ test.describe('Search & Explore', () => {
     await expect(page.getByText('2 result(s)')).toBeVisible();
   });
 
-  test('sorts by a field and scrolls with keyset Load-more (task-99)', async ({ page }) => {
+  test('sorts by a field and scrolls with keyset Load-more', async ({ page }) => {
     const hit = (id: string, score: number) => ({
       coordinates: { identifier: [{ name: 'id', value: id }] },
       score,
@@ -116,7 +116,7 @@ test.describe('Search & Explore', () => {
     await expect(page.locator('.results .hit')).toHaveCount(4);
   });
 
-  test('facets refine the query via active-filter chips (task-100)', async ({ page }) => {
+  test('facets refine the query via active-filter chips', async ({ page }) => {
     await installMocks(page);
     await page.goto('/');
     await page.fill('#query', 'status:ok');
@@ -140,7 +140,7 @@ test.describe('Search & Explore', () => {
     await expect(page.locator('.filter-chip')).toHaveCount(0);
   });
 
-  test('time filter scopes the query to a detected timestamp column (task-101)', async ({
+  test('time filter scopes the query to a detected timestamp column', async ({
     page,
   }) => {
     await installMocks(page, {
@@ -177,7 +177,7 @@ test.describe('Search & Explore', () => {
     await expect(page.locator('.filter-chip.time')).toHaveCount(0);
   });
 
-  test('the stats line shows the shards-scanned ratio (task-133)', async ({ page }) => {
+  test('the stats line shows the shards-scanned ratio', async ({ page }) => {
     await installMocks(page, {
       search: {
         json: {
@@ -199,7 +199,7 @@ test.describe('Search & Explore', () => {
     await expect(statbar).toContainText('6/64 shards');
   });
 
-  test('table cells highlight matched terms and format DATE columns (task-133)', async ({
+  test('table cells highlight matched terms and format DATE columns', async ({
     page,
   }) => {
     const micros = Date.UTC(2026, 5, 30, 12, 34, 56) * 1000; // 2026-06-30 12:34:56 UTC
@@ -240,7 +240,7 @@ test.describe('Search & Explore', () => {
     await expect(page.locator('.hit')).toContainText('ok');
   });
 
-  test('time filter stays disabled when the index reports no DATE columns (task-132)', async ({
+  test('time filter stays disabled when the index reports no DATE columns', async ({
     page,
   }) => {
     // Default describeIndex mock carries no `time_fields`. The backend always populates the field,
@@ -256,7 +256,7 @@ test.describe('Search & Explore', () => {
     await expect(page.locator('.time-btn')).toBeDisabled();
   });
 
-  test('saved searches load from the server when authenticated (task-106)', async ({ page }) => {
+  test('saved searches load from the server when authenticated', async ({ page }) => {
     await installMocks(page, {
       savedQueries: {
         json: {
@@ -286,7 +286,7 @@ test.describe('Search & Explore', () => {
     await expect(page.getByText('2 result(s)')).toBeVisible();
   });
 
-  test('toggles the KQL syntax selector (task-90)', async ({ page }) => {
+  test('toggles the KQL syntax selector', async ({ page }) => {
     await installMocks(page);
     await page.goto('/');
 

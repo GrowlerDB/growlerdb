@@ -1436,7 +1436,7 @@ async fn serve_replica(
         }
     };
     if resolved.windowing.is_some() {
-        anyhow::bail!("serving a windowed index as a replica is not yet supported (task-82)");
+        anyhow::bail!("serving a windowed index as a replica is not yet supported");
     }
     let served_snapshot = stats.manifest.snapshot;
     let shard = Arc::new(store.open_shard(&shard_id, &resolved)?);
@@ -2500,7 +2500,7 @@ fn routing_plan_from_get_index(
     if resp.shard_status.iter().any(|s| s.window != 0) || resp.windowing.is_some() {
         anyhow::bail!(
             "`{index}` is windowed but reached the ordinal routing planner — it must route through \
-             the windowed gateway path (task-219)"
+             the windowed gateway path"
         );
     }
     let mut shards: Vec<&growlerdb_proto::v1::ShardStatus> = resp.shard_status.iter().collect();

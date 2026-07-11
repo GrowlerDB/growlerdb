@@ -1646,7 +1646,7 @@ mod tests {
         let epoch = reg.session_epoch("demo");
         assert!(
             epoch > 0,
-            "a scope change bumps the session epoch (task-147 / B4)"
+            "a scope change bumps the session epoch"
         );
         // Clearing the allowlist removes the binding (subject becomes unrestricted again).
         reg.set_user_indexes("demo", vec![]).unwrap();

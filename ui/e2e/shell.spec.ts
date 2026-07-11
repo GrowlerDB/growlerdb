@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test';
 import { installMocks } from './mocks';
 
-test.describe('App shell (task-94/98)', () => {
+test.describe('App shell', () => {
   test('the account menu opens and navigates to Settings', async ({ page }) => {
     await installMocks(page);
     await page.goto('/');
@@ -37,7 +37,7 @@ test.describe('App shell (task-94/98)', () => {
     await expect(page.getByRole('heading', { name: 'Observability' })).toBeVisible();
   });
 
-  test('an admin manages role bindings in Settings (task-104)', async ({ page }) => {
+  test('an admin manages role bindings in Settings', async ({ page }) => {
     await installMocks(page, {
       me: { json: { authenticated: true, subject: 'ada', display_name: 'Ada', roles: ['admin'] } },
       users: { json: { users: [{ subject: 'bob', roles: ['reader'] }] } },
@@ -56,7 +56,7 @@ test.describe('App shell (task-94/98)', () => {
     await expect(page.getByRole('alert')).toHaveCount(0);
   });
 
-  test('an admin issues an API token (shown once) in Settings (task-105)', async ({ page }) => {
+  test('an admin issues an API token (shown once) in Settings', async ({ page }) => {
     await installMocks(page, {
       me: { json: { authenticated: true, subject: 'ada', display_name: 'Ada', roles: ['admin'] } },
       tokens: {
@@ -78,7 +78,7 @@ test.describe('App shell (task-94/98)', () => {
     await expect(page.getByText('gdb_live_abcd1234secret')).toBeVisible();
   });
 
-  test('the account menu shows the verified identity from /v1/me (task-103)', async ({ page }) => {
+  test('the account menu shows the verified identity from /v1/me', async ({ page }) => {
     await installMocks(page, {
       me: {
         json: {

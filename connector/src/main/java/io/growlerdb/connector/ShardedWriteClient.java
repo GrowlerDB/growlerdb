@@ -208,7 +208,7 @@ public final class ShardedWriteClient implements BatchWriter {
         System.err.printf(
             "ShardedWriteClient: shard checkpoints diverge and snapshot %d has no known sequence "
                 + "number — falling back to the NUMERIC min %d, which is not lineage order "
-                + "(task-205); resume may pick the wrong shard%n",
+                + "— resume may pick the wrong shard%n",
             cp.snapshotId(), numericMin);
         return numericMin;
       }

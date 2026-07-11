@@ -32,7 +32,7 @@ describe('componentsFromUp', () => {
     expect(node.detail).toContain('DOWN');
   });
 
-  it('ignores non-GrowlerDB targets on a shared Prometheus/Mimir (task-120)', () => {
+  it('ignores non-GrowlerDB targets on a shared Prometheus/Mimir', () => {
     // A down target in another namespace must NOT count — only GrowlerDB's own targets do.
     const external: InstantSample = {
       metric: { job: 'boxowl-api', instance: '10.1.2.3:80', namespace: 'boxowl' },
@@ -57,7 +57,7 @@ describe('componentsFromUp', () => {
     expect(componentsFromUp([external])).toEqual([]);
   });
 
-  it('recognises k8s targets by their gdb-* job — pod-IP instance, no namespace (task-226)', () => {
+  it('recognises k8s targets by their gdb-* job — pod-IP instance, no namespace', () => {
     // In k8s the `up` sample has a pod-IP instance and no namespace label; only the job identifies it.
     // Previously these matched nothing → the header rolled up to "Unknown" even when all were up.
     const gdb: InstantSample[] = [
@@ -113,7 +113,7 @@ describe('componentsFromIngestion', () => {
     const cs = componentsFromIngestion([ingest('docs', 5, 'unreachable')]);
     expect(cs.find((c) => c.name === 'Ingestion: docs')!.health).toBe('down');
   });
-  it('flags a source_recreated index as degraded (warn) — impaired, not down (task-114)', () => {
+  it('flags a source_recreated index as degraded (warn) — impaired, not down', () => {
     const cs = componentsFromIngestion([ingest('docs', 5, 'source_recreated')]);
     expect(cs.find((c) => c.name === 'Ingestion: docs')!.health).toBe('warn');
   });

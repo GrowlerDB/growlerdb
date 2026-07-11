@@ -76,7 +76,7 @@ public final class WindowRouter {
                 "window field format `"
                     + format
                     + "` (a string date) is not supported for connector windowed routing yet"
-                    + " (task-219) — use a numeric epoch window field");
+                    + " — use a numeric epoch window field");
       };
     }
     return 0L; // no usable value → window 0 (matches field_micros' unwrap_or(0))

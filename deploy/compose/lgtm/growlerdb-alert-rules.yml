@@ -47,7 +47,7 @@ groups:
           severity: warning
         annotations:
           summary: 'Hydration miss rate {{ $value | humanizePercentage }} exceeds 20%'
-          description: 'GetByKey is failing to hydrate a high fraction of requested keys — the index may be drifting from its source (e.g. a recreated source table; task-114). Reindex if confirmed.'
+          description: 'GetByKey is failing to hydrate a high fraction of requested keys — the index may be drifting from its source (e.g. a recreated source table). Reindex if confirmed.'
 
       # --- Ingest silent-loss guards -----------------------------------------------
       # Any of these firing means a loss-guard tripped or ingest silently stalled.
@@ -61,7 +61,7 @@ groups:
           severity: critical
         annotations:
           summary: 'Connector refused {{ $value | printf "%.0f" }} under-read window(s) in 10m'
-          description: 'The changelog scan returned fewer rows than the source committed; the connector halted the trigger rather than advancing the checkpoint over the gap (task-194). Ingest is stalled loudly — investigate the source/compaction race.'
+          description: 'The changelog scan returned fewer rows than the source committed; the connector halted the trigger rather than advancing the checkpoint over the gap. Ingest is stalled loudly — investigate the source/compaction race.'
 
       # The Node's checkpoint-continuity guard rejected a batch (a lineage gap / regression /
       # cross-wiring). Should never happen in steady state.
@@ -72,7 +72,7 @@ groups:
           severity: critical
         annotations:
           summary: 'Node rejected {{ $value | printf "%.0f" }} batch(es) as a checkpoint gap in 10m'
-          description: 'A batch did not continue from a shard''s checkpoint (task-194 continuity guard) — a lineage gap, checkpoint regression, or cross-wired sub-batch. The shard refused to advance over unapplied data.'
+          description: 'A batch did not continue from a shard''s checkpoint — a lineage gap, checkpoint regression, or cross-wired sub-batch. The shard refused to advance over unapplied data.'
 
       # Reconcile repaired drift — the backstop found the index diverged from the source.
       - alert: DriftRepaired
@@ -82,7 +82,7 @@ groups:
           severity: warning
         annotations:
           summary: 'Reconcile repaired {{ $value | printf "%.0f" }} drifted doc(s) in 1h'
-          description: 'The reconcile backstop deleted stale / re-indexed missing docs — the index had silently drifted from the source (task-195). Investigate the ingest path; the affected keys are in the node logs.'
+          description: 'The reconcile backstop deleted stale / re-indexed missing docs — the index had silently drifted from the source. Investigate the ingest path; the affected keys are in the node logs.'
 
       # Idle-lag: ingest is behind and NOT catching up — the checkpoint is stuck while the source has
       # moved on. Distinct from a transient catch-up: `for: 15m` requires it to be sustained.

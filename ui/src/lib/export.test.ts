@@ -19,7 +19,7 @@ describe('toCsv', () => {
     expect(toCsv([])).toBe('');
   });
 
-  it('neutralizes spreadsheet formula injection (task-153 / I8)', () => {
+  it('neutralizes spreadsheet formula injection', () => {
     // Values that would evaluate as a formula in Excel/Sheets are prefixed with a single quote.
     expect(toCsv([{ v: '=cmd|calc' }])).toBe("v\n'=cmd|calc");
     expect(toCsv([{ v: '@SUM(A1)' }])).toBe("v\n'@SUM(A1)");

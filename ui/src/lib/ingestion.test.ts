@@ -43,7 +43,7 @@ describe('worstState', () => {
     expect(worstState([shard('behind'), shard('no_primary', 1)])).toBe('no_primary');
   });
 
-  it('treats source_recreated (stale index) as the most severe — the headline (task-114)', () => {
+  it('treats source_recreated (stale index) as the most severe — the headline', () => {
     expect(worstState([shard('behind'), shard('source_recreated', 1)])).toBe('source_recreated');
     expect(worstState([shard('unreachable'), shard('source_recreated', 1)])).toBe(
       'source_recreated',

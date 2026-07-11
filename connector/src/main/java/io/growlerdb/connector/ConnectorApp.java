@@ -138,7 +138,7 @@ public final class ConnectorApp {
     }
     if (windowing != null && workers != null) {
       throw new IllegalArgumentException(
-          "--workers is not supported for a windowed index (task-219): windows are routed by time,"
+          "--workers is not supported for a windowed index: windows are routed by time,"
               + " not hash shard groups");
     }
 

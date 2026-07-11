@@ -24,7 +24,7 @@ test.describe('Indexes', () => {
     await expect(page.getByRole('button', { name: 'Create index' })).toBeVisible();
   });
 
-  test('the list summarizes rebuilding indexes and backup states (task-140)', async ({ page }) => {
+  test('the list summarizes rebuilding indexes and backup states', async ({ page }) => {
     await installMocks(page, {
       indexes: {
         json: {
@@ -43,7 +43,7 @@ test.describe('Indexes', () => {
     await expect(page.locator('.ix-table tbody tr').first()).toContainText('Off');
   });
 
-  test('the Mapping tab renders per-field flags + the blocked-field callout (task-107)', async ({
+  test('the Mapping tab renders per-field flags + the blocked-field callout', async ({
     page,
   }) => {
     await installMocks(page);
@@ -62,7 +62,7 @@ test.describe('Indexes', () => {
     await expect(page.getByText(/can’t be cached \(D23\)/)).toBeVisible();
   });
 
-  test('the Shards tab renders the health grid + primary/replica counts (task-108)', async ({
+  test('the Shards tab renders the health grid + primary/replica counts', async ({
     page,
   }) => {
     await installMocks(page);
@@ -77,7 +77,7 @@ test.describe('Indexes', () => {
     await expect(page.locator('.shard-cell.warn')).toHaveCount(1); // the building shard
   });
 
-  test('Maintenance compact + backup actions run over REST (task-109)', async ({ page }) => {
+  test('Maintenance compact + backup actions run over REST', async ({ page }) => {
     await installMocks(page);
     page.on('dialog', (d) => d.accept()); // accept the confirm()s
     await page.goto('/indexes');
@@ -96,7 +96,7 @@ test.describe('Indexes', () => {
     await expect(page.getByText('Backed up 12 files at snapshot 42')).toBeVisible();
   });
 
-  test('the Activity tab renders the lifecycle event stream (task-110)', async ({ page }) => {
+  test('the Activity tab renders the lifecycle event stream', async ({ page }) => {
     await installMocks(page);
     await page.goto('/indexes');
     await page.getByRole('button', { name: 'telemetry' }).click();

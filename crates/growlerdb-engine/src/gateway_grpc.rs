@@ -32,7 +32,7 @@ use crate::gateway::Gateway;
 fn not_routed(what: &str) -> Status {
     Status::unimplemented(format!(
         "{what} is not routed through the Gateway yet — call the Node directly \
-         (cross-shard routing lands with task-29; admin mutations are Node/Control-Plane)"
+         (cross-shard routing lands later; admin mutations are Node/Control-Plane)"
     ))
 }
 

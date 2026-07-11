@@ -42,7 +42,7 @@ public final class ConnectorMetrics {
   static final Counter UNDER_READS =
       Counter.build()
           .name("growlerdb_connector_under_reads_total")
-          .help("Trigger windows the expected-row-count gate refused as an under-read (task-194).")
+          .help("Trigger windows the expected-row-count gate refused as an under-read.")
           .register();
 
   static final Counter SHARD_ACKS =
@@ -55,7 +55,7 @@ public final class ConnectorMetrics {
   static final Counter STREAM_RESTARTS =
       Counter.build()
           .name("growlerdb_connector_stream_restarts_total")
-          .help("In-process streaming-query restarts after a micro-batch failure (task-144).")
+          .help("In-process streaming-query restarts after a micro-batch failure.")
           .register();
 
   static final Counter WRITE_RETRIES =

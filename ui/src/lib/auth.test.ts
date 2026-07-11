@@ -7,7 +7,7 @@ import {
   isTokenExpired,
 } from './auth';
 
-describe('isTokenExpired (task-153 / B17)', () => {
+describe('isTokenExpired', () => {
   // A minimal unsigned JWT with the given payload (only the payload segment is read).
   const jwt = (payload: Record<string, unknown>) => `h.${btoa(JSON.stringify(payload))}.s`;
 
