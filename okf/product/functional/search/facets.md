@@ -15,7 +15,9 @@ user can see the distribution and filter down. Served by `POST /v1/facets` (and 
 
 - Returns, per requested field, the top values and their document counts for the current query.
 - Selecting a facet value adds a score-neutral **filter** clause to the query (ANDed in).
-- The console renders facet groups in the search results rail; groups are collapsible.
+- The console renders facet groups in the search results rail; groups are collapsible. It hides
+  **degenerate** groups — where every bucket has count 1 (e.g. a unique-valued numeric like `views`),
+  so selecting a value would narrow to a single hit — since they filter nothing useful.
 
 ## Notes
 

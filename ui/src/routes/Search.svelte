@@ -318,7 +318,13 @@
     }
     const res = await facets(eq, [...fields]);
     if (seq !== searchSeq) return; // discard facets for a superseded search
-    facetGroups = res.facets;
+    // Hide degenerate facets: a group whose every bucket has count 1 groups nothing — clicking a
+    // value just narrows to a single hit (e.g. unique numerics like `views`), so it's noise, not a
+    // filter. Keep a group only if some value groups ≥2 hits, or the user is already filtering on it.
+    const activeFields = new Set(filters.map((f) => f.field));
+    facetGroups = res.facets.filter(
+      (g) => activeFields.has(g.field) || g.buckets.some((b) => b.count >= 2),
+    );
   }
 
   /** Toggle a facet value: add it as a filter (or remove it if already active), then re-run. */
@@ -688,6 +694,15 @@
                 <span class="hit-body">
                   <span class="hit-top">
                     <span class="id mono">{hitId(hit)}</span>
+                    {#if parts.chips.length > 0}
+                      <!-- Cached fields fill the space right of the id on the primary row, clipped
+                           on overflow rather than wrapping to new lines (task-86 inline display). -->
+                      <span class="fields">
+                        {#each parts.chips as [name, value] (name)}
+                          <span class="field"><b>{name}</b>{value}</span>
+                        {/each}
+                      </span>
+                    {/if}
                     {#if parts.ts}
                       <time class="hit-ts mono" title={parts.ts.name}>{parts.ts.display}</time>
                     {/if}
@@ -700,13 +715,6 @@
                         segments={parts.serverSegments}
                       /></span
                     >
-                  {/if}
-                  {#if parts.chips.length > 0}
-                    <span class="fields">
-                      {#each parts.chips as [name, value] (name)}
-                        <span class="field"><b>{name}</b>{value}</span>
-                      {/each}
-                    </span>
                   {/if}
                 </span>
               </button>
@@ -1296,16 +1304,14 @@
   .hit-top {
     display: flex;
     align-items: baseline;
-    justify-content: space-between;
-    gap: 0.75rem;
+    gap: 0.9rem;
     min-width: 0;
   }
   .hit .id {
     font-weight: 600;
     color: var(--text);
-    overflow: hidden;
-    text-overflow: ellipsis;
     white-space: nowrap;
+    flex-shrink: 0;
   }
   .hit-ts {
     color: var(--text-3);
@@ -1330,10 +1336,17 @@
   }
   .hit .fields {
     display: flex;
-    flex-wrap: wrap;
-    gap: 0.35rem 0.9rem;
+    flex-wrap: nowrap;
+    flex: 1 1 0;
+    min-width: 0;
+    gap: 0.9rem;
+    overflow: hidden;
     color: var(--text-2);
     font-size: 0.9em;
+  }
+  .hit .field {
+    white-space: nowrap;
+    flex-shrink: 0;
   }
   .hit .field b {
     color: var(--text-3);
