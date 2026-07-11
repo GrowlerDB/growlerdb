@@ -47,7 +47,7 @@ jobs:
       ui: ${{ steps.f.outputs.ui }}
       stack: ${{ steps.f.outputs.stack }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           fetch-depth: 0
       - id: f
@@ -85,9 +85,9 @@ jobs:
       RUSTC_WRAPPER: sccache
       SCCACHE_CACHE_SIZE: "12G"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       # Installs protoc + node (and, where it works, rust) per mise.toml.
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
       # mise's rust plugin wraps rustup and on some self-hosted runners silently
       # leaves no usable `cargo` on PATH. Guarantee a stable toolchain (and repair
       # the box) regardless of its prior state.
@@ -102,10 +102,10 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       # Rust-aware cache: understands target/ layout and keys on Cargo.lock so a
       # broken lockfile can't poison the cache (vs the generic actions/cache).
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # Install sccache (the RUSTC_WRAPPER set above). Disk-backed cache persists across runs on the
       # self-hosted box, so workspace-crate codegen is reused even though rust-cache drops it.
-      - uses: mozilla-actions/sccache-action@v0.0.6
+      - uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.6
       # Surface disk headroom: a silent death in "Build tests" is usually ENOSPC.
       - name: Disk free
         run: df -h / "$HOME" "$RUNNER_TEMP" || true
@@ -129,10 +129,10 @@ jobs:
     if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'self-hosted' }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
         with:
-          command: check licenses bans
+          command: check advisories bans licenses sources
 
   # Console gate (Svelte SPA under ui/): type-check + unit tests + production build, then a
   # Playwright E2E pass. The E2E is fully mocked at the network layer (e2e/mocks.ts),
@@ -146,8 +146,8 @@ jobs:
       run:
         working-directory: ui
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: 22
           cache: npm
@@ -182,8 +182,8 @@ jobs:
       RUSTC_WRAPPER: sccache
       SCCACHE_CACHE_SIZE: "12G"
     steps:
-      - uses: actions/checkout@v5
-      - uses: jdx/mise-action@v4
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
       # See build-test: guarantee a usable cargo on self-hosted runners.
       - name: Ensure Rust toolchain
         run: |
@@ -194,8 +194,8 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
-      - uses: mozilla-actions/sccache-action@v0.0.6
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.6
       # The catalog vends an S3 endpoint of `minio:9000`; map it for host clients.
       - name: Map minio hostname
         run: echo "127.0.0.1 minio" | sudo tee -a /etc/hosts
@@ -233,9 +233,9 @@ jobs:
   lint:
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'self-hosted' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       # node for `npx markdownlint-cli2`; consistent toolchain with the rest of CI.
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
       - name: Install linters (pinned)
         env:
           DEBIAN_FRONTEND: noninteractive
