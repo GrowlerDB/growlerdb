@@ -142,5 +142,5 @@ Full docs are the **GitHub Pages site at <https://growlerdb.github.io/growlerdb/
 ## License & contributing
 
 AGPL-3.0-only (see [LICENSE](LICENSE)); a commercial license is available for uses that cannot accept
-AGPL. Contributions are by **DCO sign-off** — see [CONTRIBUTING.md](CONTRIBUTING.md) and the
-[Code of Conduct](CODE_OF_CONDUCT.md).
+AGPL. Contributions are under a **license-grant [CLA](CLA.md)** — see [CONTRIBUTING.md](CONTRIBUTING.md)
+and the [Code of Conduct](CODE_OF_CONDUCT.md).

@@ -28,7 +28,7 @@ Architecture & product decision records — what was chosen and why. One concept
 * [D24. Product scope: pure text search](/system/decisions/d24-product-scope.md) - A pure text search engine over Iceberg; non-goals are detection/alerting, analytics/OLAP, and being a datastore.
 * [D25. API & format stability](/system/decisions/d25-api-stability.md) - SemVer with a versioned Engine API, wire protocol, and on-disk format, each with deprecation windows.
 * [D26. Telemetry: no phone-home](/system/decisions/d26-telemetry.md) - No phone-home by default; optional anonymous opt-in only; queries and data are never collected.
-* [D27. Governance & community](/system/decisions/d27-governance.md) - A pure open-source community project (AGPL-3.0, see D36; DCO); a managed-SaaS path is preserved; a foundation is deferred.
+* [D27. Governance & community](/system/decisions/d27-governance.md) - A pure open-source community project (AGPL-3.0, see D36; a license-grant CLA); a managed-SaaS path is preserved; a foundation is deferred.
 * [D28. Iceberg v3 adoption path](/system/decisions/d28-iceberg-v3.md) - A planned path to adopt Iceberg v3 types (variant to flattened dotted paths, nanosecond timestamps to date).
 * [D29. Release versioning: tag-derived, auto-incremented](/system/decisions/d29-release-versioning.md) - The git tag is the source of truth; artifacts are stamped from it while the tree stays 0.0.0; auto-increment patch, explicit minor/major, 0.1.0 GA baseline.
 * [D30. Layered locator: identity / reference / location](/system/decisions/d30-layered-locator.md) - Key terms + an internal locator-ID fast field + a dense-array location store, with per-index location strategies (coordinates / row_id / predicate); no constraints imposed on the source table.
