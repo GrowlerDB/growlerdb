@@ -22,7 +22,7 @@ nav_external_links:
   - title: Source on GitHub
     url: https://github.com/GrowlerDB/growlerdb
 
-footer_content: "GrowlerDB — Apache-2.0. Search returns keys; rows hydrate from Iceberg."
+footer_content: "GrowlerDB — AGPL-3.0. Search returns keys; rows hydrate from Iceberg."
 
 # Needed for the GitHub Pages native build to apply a remote theme.
 plugins:

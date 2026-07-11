@@ -14,4 +14,4 @@ The quality attributes GrowlerDB targets, stated as requirements.
 * [Consistency](/product/non-functional/consistency.md) - eventually consistent with Iceberg, bounded by lag
 * [Multi-tenancy](/product/non-functional/tenancy.md) - strict per-tenant isolation (verified)
 * [Security & compliance](/product/non-functional/security-posture.md) - encryption, cached-field policy, isolation
-* [Openness](/product/non-functional/openness.md) - Apache-2.0, engine and index store open
+* [Openness](/product/non-functional/openness.md) - AGPL-3.0, engine and index store open
