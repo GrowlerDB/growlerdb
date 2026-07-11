@@ -7,9 +7,14 @@ container network).
 """
 
 import os
+import warnings
 
 import pyarrow as pa
 from pyiceberg.catalog.rest import RestCatalog
+
+# overwrite() deletes-then-appends; on a fresh, empty table the internal delete matches no rows,
+# which pyiceberg flags. The seed only ever writes into empty tables, so silence that one message.
+warnings.filterwarnings("ignore", message="Delete operation did not match any records")
 
 catalog = RestCatalog(
     "growlerdb",
@@ -22,6 +27,9 @@ catalog = RestCatalog(
         "s3.access-key-id": os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin"),
         "s3.secret-access-key": os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin"),
         "s3.path-style-access": "true",
+        # An explicit region stops pyiceberg's S3 FileIO from trying (and failing) to resolve one
+        # against MinIO. MinIO ignores the value; it just silences the warning.
+        "s3.region": os.environ.get("AWS_REGION", "us-east-1"),
         # MinIO can't vend STS creds; write directly with our own S3 creds.
         "header.X-Iceberg-Access-Delegation": "",
     },

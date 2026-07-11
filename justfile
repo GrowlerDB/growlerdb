@@ -87,7 +87,9 @@ ui-check:
 up:
     docker compose -f deploy/compose/docker-compose.yml up -d minio createbuckets polaris
     deploy/compose/setup-polaris.sh
-    docker compose -f deploy/compose/docker-compose.yml --profile seed up --build --exit-code-from seed seed
+    # `run --rm` runs the seed as a one-off and returns its exit code, without the misleading
+    # "Aborting on container exit" that `up --exit-code-from` prints when the one-shot job ends.
+    docker compose -f deploy/compose/docker-compose.yml --profile seed run --rm --build seed
 
 # Build the GrowlerDB container image once (lean `dist` profile, cached). Reused by stack/pipeline,
 # so the heavy Rust build happens once — `up` below reuses it. Re-run this after changing Rust code.
@@ -151,7 +153,7 @@ connector-e2e:
 stack:
     docker compose -f deploy/compose/docker-compose.yml up -d minio createbuckets polaris
     deploy/compose/setup-polaris.sh
-    docker compose -f deploy/compose/docker-compose.yml --profile seed up --build --exit-code-from seed seed
+    docker compose -f deploy/compose/docker-compose.yml --profile seed run --rm --build seed
     # control-plane / node / gateway share one image (growlerdb-local:dev). `up --build` builds them
     # in parallel and they race to name the same tag ("image already exists") on Docker's containerd
     # store. Build the shared image ONCE, then start without --build.
@@ -181,7 +183,7 @@ chaos-catalog:
 # re-create the catalog + re-seed the sample table (stack already up)
 seed:
     deploy/compose/setup-polaris.sh
-    docker compose -f deploy/compose/docker-compose.yml --profile seed up --build --exit-code-from seed seed
+    docker compose -f deploy/compose/docker-compose.yml --profile seed run --rm --build seed
 
 down:
     docker compose -f deploy/compose/docker-compose.yml --profile seed down -v
