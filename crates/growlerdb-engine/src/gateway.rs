@@ -645,6 +645,22 @@ impl Gateway {
         self
     }
 
+    /// Run a single-shard forward under the same per-query deadline the scatter-gather uses. The
+    /// multi-shard path bounds itself via [`gather_responses`], but a direct single-shard forward
+    /// otherwise had no ceiling, so one slow legal query could pin a blocking worker indefinitely.
+    /// On expiry the caller gets `DEADLINE_EXCEEDED`.
+    async fn under_deadline<T>(
+        &self,
+        fut: impl std::future::Future<Output = Result<T, Status>>,
+    ) -> Result<T, Status> {
+        match self.limits.deadline {
+            Some(d) => tokio::time::timeout(d, fut).await.map_err(|_| {
+                Status::deadline_exceeded("query exceeded the per-request deadline")
+            })?,
+            None => fut.await,
+        }
+    }
+
     /// Declare the index name this Gateway serves. A search whose `index` is non-empty and
     /// names a different index is then rejected with `NOT_FOUND` — the console can scope a query to a
     /// named index and trust it won't be silently answered by the wrong one. Without this the Gateway
@@ -844,7 +860,7 @@ impl Gateway {
             }));
         }
         if shards.len() == 1 {
-            let mut resp = shards[0].search(req).await?;
+            let mut resp = self.under_deadline(shards[0].search(req)).await?;
             let r = resp.get_mut();
             r.shards_scanned = 1;
             r.shards_total = shards_total;
@@ -1140,6 +1156,15 @@ impl Gateway {
         &self,
         mut req: Request<GetByKeyRequest>,
     ) -> Result<Response<GetByKeyResponse>, Status> {
+        // Bound the batch before any routing/fan-out — mirrors the Node's self-defense so the
+        // gateway rejects an oversized request up front rather than scattering it.
+        let n_keys = req.get_ref().keys.len();
+        if n_keys > crate::lookup_service::MAX_KEYS {
+            return Err(Status::invalid_argument(format!(
+                "keys ({n_keys}) exceeds the maximum ({})",
+                crate::lookup_service::MAX_KEYS
+            )));
+        }
         // Resolve the target index: hydration honors `GetByKeyRequest.index`.
         let index = req.get_ref().index.clone();
         let route = self.guard_and_resolve("GetByKey", &index, &mut req).await?;
@@ -1330,7 +1355,7 @@ impl Gateway {
         {
             let rs = route.routing();
             if rs.shards.len() == 1 {
-                return rs.shards[0].aggregate(req).await;
+                return self.under_deadline(rs.shards[0].aggregate(req)).await;
             }
         }
         let (meta, _ext, body) = req.into_parts();

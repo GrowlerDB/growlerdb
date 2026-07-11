@@ -5,9 +5,10 @@
 //! distributed) — then maps the proto response back to JSON. gRPC `Status` codes map to
 //! HTTP status codes.
 //!
-//! Auth parity: the `x-growlerdb-principal` / `x-growlerdb-tenant` HTTP headers are
-//! copied into request metadata, so the [auth seam](crate::auth) sees the same context
-//! over REST as over gRPC.
+//! Auth parity: only the `authorization` bearer is forwarded into request metadata; the
+//! [AuthN layer](crate::authn) stamps verified identity downstream, so caller-asserted
+//! `x-growlerdb-*` identity headers are never propagated (they would be forgeable on a
+//! control-plane path without an authenticator).
 //!
 //! [Engine API]: ../../../design/01-engine-api.md
 
@@ -31,6 +32,16 @@ use growlerdb_proto::ControlPlaneClient;
 
 use crate::gateway::Gateway;
 
+/// Ceiling on a REST request body — a query DTO is small, so this rejects an oversized upload
+/// before it is buffered.
+const REST_BODY_LIMIT: usize = 1 << 20; // 1 MiB
+
+/// Wall-clock ceiling on a REST request, mirroring the [Gateway's per-query deadline]. Bounds a
+/// slow request at the edge in addition to the Gateway's own single-shard timeout.
+///
+/// [Gateway's per-query deadline]: crate::gateway::GatewayLimits
+const REST_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Build the `/v1/...` REST router over the [Gateway](crate::gateway::Gateway).
 pub fn router(gateway: Arc<Gateway>) -> Router {
     Router::new()
@@ -48,6 +59,11 @@ pub fn router(gateway: Arc<Gateway>) -> Router {
         .route("/v1/index:backup", post(backup_handler))
         .route("/v1/index:backup-status", post(backup_status_handler))
         .route("/v1/cold", get(cold_status_handler))
+        .layer(axum::extract::DefaultBodyLimit::max(REST_BODY_LIMIT))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            REST_REQUEST_TIMEOUT,
+        ))
         .with_state(gateway)
 }
 
@@ -2174,23 +2190,16 @@ fn is_false(b: &bool) -> bool {
 
 // ---- request metadata + error mapping ------------------------------------------
 
-/// Wrap a proto body in a tonic request, copying the auth headers into metadata so
-/// authentication and the [auth seam](crate::auth) behave the same over REST as over gRPC.
-/// `authorization` carries the bearer credential the [AuthN layer](crate::authn) validates;
-/// `x-growlerdb-principal` / `x-growlerdb-tenant` are internal-trust headers (the
-/// AuthN layer drops and replaces them once an authenticator is installed).
+/// Wrap a proto body in a tonic request, forwarding only the bearer credential so
+/// authentication behaves the same over REST as over gRPC. Verified identity is stamped
+/// downstream by the [AuthN layer](crate::authn); caller-asserted `x-growlerdb-principal` /
+/// `x-growlerdb-tenant` / `x-growlerdb-roles` headers are never propagated, since a
+/// control-plane path with no authenticator would otherwise trust a forged role claim.
 pub(crate) fn grpc_request<T>(body: T, headers: &HeaderMap) -> Request<T> {
     let mut req = Request::new(body);
-    for key in [
-        "authorization",
-        "x-growlerdb-principal",
-        "x-growlerdb-tenant",
-        "x-growlerdb-roles",
-    ] {
-        if let Some(val) = headers.get(key).and_then(|v| v.to_str().ok()) {
-            if let Ok(val) = val.parse() {
-                req.metadata_mut().insert(key, val);
-            }
+    if let Some(val) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        if let Ok(val) = val.parse() {
+            req.metadata_mut().insert("authorization", val);
         }
     }
     req

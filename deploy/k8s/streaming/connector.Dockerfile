@@ -13,3 +13,5 @@ RUN mvn -q -B -DskipTests package
 
 FROM apache/spark:4.0.0
 COPY --from=build /repo/connector/target/growlerdb-connector-0.0.0.jar /opt/growlerdb/connector.jar
+# Drop root — the Spark image ships a `spark` user (UID 185); the jar is world-readable so submit works.
+USER spark

@@ -97,9 +97,20 @@ impl Node for CaptureNode {
         &self,
         _req: Request<GetByKeyRequest>,
     ) -> Result<Response<GetByKeyResponse>, Status> {
+        // Return the row keyed by its own coordinates, as the real Lookup service does — the adapter
+        // now attributes `_source` by coordinates, not response position.
         Ok(Response::new(GetByKeyResponse {
             rows: vec![HydratedRow {
-                key: None,
+                key: Some(Coordinates {
+                    partition: vec![Field {
+                        name: "tenant".into(),
+                        value: Some(int_val(42)),
+                    }],
+                    identifier: vec![Field {
+                        name: "id".into(),
+                        value: Some(str_val("u1")),
+                    }],
+                }),
                 fields: vec![
                     Field {
                         name: "title".into(),

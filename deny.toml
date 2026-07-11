@@ -21,3 +21,26 @@ multiple-versions = "warn"
 
 [advisories]
 version = 2
+yanked = "deny"
+# Every advisory here has no safe upgrade in our tree; each line states why it's tolerable.
+ignore = [
+    # rsa Marvin timing side-channel: only reachable via jsonwebtoken, which we use solely to
+    # VERIFY JWTs (public-key RSA) — never private-key decrypt/sign — so the leak can't apply; no
+    # upstream fix exists in `rsa`.
+    "RUSTSEC-2023-0071",
+    # quick-xml DoS (quadratic attribute scan / unbounded namespace alloc): reached only through
+    # opendal, which parses XML from the trusted object store (S3/MinIO), not attacker input; a
+    # malicious store would be required. Clears once opendal ships quick-xml >=0.41.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+    # paste: unmaintained, no known vulnerability; a transitive proc-macro dep.
+    "RUSTSEC-2024-0436",
+    # atomic-polyfill: unmaintained, no known vulnerability; a transitive dep.
+    "RUSTSEC-2023-0089",
+]
+
+[sources]
+# Only crates.io is trusted; unknown registries/git sources are a supply-chain risk.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
