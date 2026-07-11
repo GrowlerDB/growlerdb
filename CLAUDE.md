@@ -16,4 +16,4 @@ is and how it works is the **OKF** in [`okf/`](okf/index.md) — start there.
   the relevant `okf/` concept (a new decision → an ADR under `okf/system/decisions/`). CI enforces
   the conformance check (`just okf-check`). See [`okf/workflow.md`](okf/workflow.md).
 
-Commit trailer: `Co-Authored-By: …`. Keep PRs small and honestly scoped.
+No commit trailer. Keep PRs small and honestly scoped.

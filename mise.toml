@@ -4,6 +4,6 @@
 rust = { version = "stable", components = "rustfmt,clippy" }
 # protobuf compiler — required by tonic-build/prost-build (the gRPC wire layer).
 "asdf:paxosglobal/asdf-protoc" = "31.1"
-# Node — the UI build toolchain (Svelte SPA under ui/, task-45).
+# Node — the UI build toolchain (Svelte SPA under ui/).
 node = "22"
 # `just` is a prerequisite (brew install just, or your package manager).

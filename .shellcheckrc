@@ -1,4 +1,4 @@
-# shellcheck config (task-158).
+# shellcheck config
 # SC1091: sourced files (deploy/compose/chaos/lib.sh) aren't resolved during isolated/CI linting —
 # the drills `. lib.sh` at runtime; static analysis can't follow it, which is fine here.
 disable=SC1091

@@ -3,6 +3,6 @@
 #
 # Custom env vars are not forwarded into the container unless listed. The release binaries job sets
 # GROWLERDB_VERSION from the tag so the CLI's build.rs bakes the real version into `--version`
-# (task-156 / ADR D29).
+# (ADR D29).
 [build.env]
 passthrough = ["GROWLERDB_VERSION"]
