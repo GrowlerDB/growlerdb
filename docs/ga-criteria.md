@@ -63,5 +63,6 @@ tenant isolation), observability, the console, the OpenSearch adapter, the relea
 hardware**. The remaining items before a confident **1.0** are, honestly: the **published benchmark
 numbers** (the topology + convergence are validated; the numbers themselves are the
 deliverable), **full Polaris data-plane authz** (P2), and an **independent security review**.
-See the [public roadmap](roadmap) for the post-GA line (windowed replica HA, cold-tier
-validation, connector parallelism). This is the go/no-go gate for cutting GA.
+See the [public roadmap](roadmap) for the post-GA OSS line (cold-tier validation, connector
+parallelism) and the [commercial line](roadmap#open-source-vs-enterprise) (zero-downtime windowed /
+multi-shard replica HA). This is the go/no-go gate for cutting GA.

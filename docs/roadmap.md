@@ -25,6 +25,18 @@ Validated at scale on real hardware (Hetzner k3s): empty-start windowed placemen
 source↔index convergence**, ingest keep-up, sub-linear windowed top-K, and bounded commit latency
 under large source snapshots.
 
+## Open source vs Enterprise
+
+The **engine is open source** under **AGPL-3.0** — indexing, search, hydration, the query language,
+distributed sharded/windowed search, the OpenSearch adapter, the console, basic security (OIDC login,
+RBAC, verified tenant isolation, TLS), cold-tiering, and backup/restore + single-shard replicas. What's
+shipped stays open.
+
+A **commercial license** covers advanced operational and governance capabilities aimed at larger
+deployments: **zero-downtime windowed / multi-shard replica HA**, cross-region DR, enterprise identity
+(SSO/SAML/SCIM), audit logging, and managed multi-tenancy. A commercial license is also available for
+**embedding GrowlerDB in a closed product** (an exception to AGPL's copyleft).
+
 ## Known limitations
 
 - **Published benchmark numbers are pending.** The topology, convergence, and latency behaviour are
@@ -32,7 +44,8 @@ under large source snapshots.
   being produced — treat performance figures as directional until then.
 - **Read-HA for windowed / multi-shard indexes is limited.** Read replicas are single-shard today; a
   lost windowed-node's windows are unavailable until it recovers (its data is rebuildable from source).
-  Zero-downtime windowed / multi-shard replica sets are post-GA.
+  Zero-downtime windowed / multi-shard replica sets are part of the commercial offering (see
+  [Open source vs Enterprise](#open-source-vs-enterprise)).
 - **Data-plane authz is catalog-delegated.** Hydration is governed by the Iceberg catalog and tenant
   isolation is enforced at the gateway; full Apache Polaris policy enforcement on the data plane is
   post-GA.
@@ -47,12 +60,11 @@ Near-term, in rough priority:
 
 1. **Published scale benchmarks** — staged ingest step-ups + storage milestones, GrowlerDB search+hydrate
    vs an Iceberg/Trino table-scan baseline.
-2. **Windowed read-HA** — window replicas so a node loss doesn't drop a window from results.
-3. **Cold-tier validation at scale** + per-key hydration routing (drop the current broadcast fan-out).
-4. **Ingest throughput** — parallel windowed connectors toward higher sustained rates.
-5. **Vector + hybrid search** — embeddings, ANN, filtered KNN, reranking.
-6. **More sources** — a second table format (Delta read) and a near-real-time hot tier.
-7. **Full Polaris data-plane authz.**
+2. **Cold-tier validation at scale** + per-key hydration routing (drop the current broadcast fan-out).
+3. **Ingest throughput** — parallel windowed connectors toward higher sustained rates.
+4. **Vector + hybrid search** — embeddings, ANN, filtered KNN, reranking.
+5. **More sources** — a second table format (Delta read) and a near-real-time hot tier.
+6. **Full Polaris data-plane authz.**
 
 Dates aren't promised; this is direction, not commitment. The [GA criteria](ga-criteria) page tracks
 the go/no-go gate for the initial release.

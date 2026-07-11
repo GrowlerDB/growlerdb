@@ -27,9 +27,9 @@ full-text index of your Iceberg data. Search returns the matching **primary keys
 
 > Status: **GA line** (0.x). The full surface — distributed search/hydration, AuthN/RBAC +
 > tenant isolation, observability, the console UI, an OpenSearch-compatible `_search` adapter, and
-> Compose + Helm deployment — is in place and tested. Road to 1.0: performance benchmarking,
-> backup/restore + replica segment-shipping, and an external security review. See
-> [docs/ga-criteria.md](docs/ga-criteria.md).
+> Compose + Helm deployment — is in place and tested (including backup/restore and single-shard
+> replicas). Road to 1.0: published benchmark numbers, full Polaris data-plane authz, and an external
+> security review. See [docs/ga-criteria.md](docs/ga-criteria.md).
 
 ## Architecture
 
