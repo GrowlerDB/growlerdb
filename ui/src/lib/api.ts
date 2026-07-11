@@ -395,8 +395,12 @@ export interface Row {
 /** Hydrate authoritative rows by coordinate via `/v1/keys:get`. Row/column governance is
  *  enforced by the Engine on the Iceberg read, so this can only return what the
  *  caller is allowed to see. */
-export async function getByKey(keys: Coordinates[], columns: string[] = []): Promise<Row[]> {
-  const res = await apiFetch('/v1/keys:get', { keys, columns });
+export async function getByKey(
+  keys: Coordinates[],
+  columns: string[] = [],
+  index?: string,
+): Promise<Row[]> {
+  const res = await apiFetch('/v1/keys:get', { index, keys, columns });
   if (!res.ok) throw new Error(`hydrate failed (${res.status})`);
   const body = (await res.json()) as { rows: Row[] };
   return body.rows ?? [];
