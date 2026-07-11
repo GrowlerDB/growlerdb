@@ -1,6 +1,6 @@
 """Seed a small sample Iceberg table (`growlerdb.docs`) into the local Polaris catalog.
 
-Creates a few rows (id, title, body) — enough for the M0 walking-skeleton E2E
+Creates a few rows (id, title, body) — enough for the walking-skeleton E2E
 test. Connection details come from environment variables (with localhost defaults
 for running on the host; the compose `seed` service overrides them for the
 container network).
@@ -53,7 +53,7 @@ table = catalog.create_table_if_not_exists("growlerdb.docs", schema=schema)
 table.overwrite(rows)  # idempotent: always exactly these rows
 print("seeded growlerdb.docs with", rows.num_rows, "rows")
 
-# A time-stamped sensor-readings table for the time-window (task-81) demo/verification: `ingest` is
+# A time-stamped sensor-readings table for the time-window demo/verification: `ingest` is
 # when the reading landed in Iceberg (windows bucket by this), `event` is when the reading was
 # actually sampled at the device (queried via the per-window event-time zone-map). r5 is "late" —
 # ingested on day 2 but sampled on day 0 — so it lands in the day-2 window yet widens that window's
@@ -87,7 +87,7 @@ readings_table = catalog.create_table_if_not_exists("growlerdb.readings", schema
 readings_table.overwrite(readings)
 print("seeded growlerdb.readings with", readings.num_rows, "rows across 3 ingest days")
 
-# A richer `growlerdb.catalog` table (task-241) — a catalog of GrowlerDB docs/features, one row per
+# A richer `growlerdb.catalog` table — a catalog of GrowlerDB docs/features, one row per
 # concept — that drives the getting-started "query playground". Every field type the mapping demos is
 # populated with *varied, predictable* values so each query form (term / phrase / keyword / set /
 # numeric+float+date range / CIDR / wildcard / prefix / fuzzy / boost / bool / NOT / match-all /

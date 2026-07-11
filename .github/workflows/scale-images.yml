@@ -5,7 +5,7 @@ name: scale-images
 # `growlerdb-connector` (Spark changelog connector + Iceberg maintenance), and `growlerdb-seed` (the
 # corpus generator). `release.yml` still owns the signed, multi-arch, SBOM'd *released* server tags
 # (X.Y.Z / latest); THIS workflow builds a `:dev` (+ commit-SHA) server image from **merged main** so a
-# post-merge / pre-release scale run deploys the code under test instead of a stale `latest` (task-220).
+# post-merge / pre-release scale run deploys the code under test instead of a stale `latest`.
 #
 # Runs on workflow_dispatch (before a scale run) and on pushes that touch server/connector/seed sources.
 # amd64 only: the Hetzner scale nodes (CCX) are amd64; keep it fast. Tags `:dev` (what the manifests
@@ -51,7 +51,7 @@ jobs:
         include:
           # The server (control-plane / node / gateway — one binary). `release.yml` builds the signed
           # multi-arch RELEASED tags; this `:dev` build is what a post-merge scale run deploys so it
-          # runs the code under test, not a stale `latest` (task-220). Stamped with a dev version so
+          # runs the code under test, not a stale `latest`. Stamped with a dev version so
           # the deployed `--version` is verifiable.
           - name: server
             image: growlerdb

@@ -1,9 +1,8 @@
 import { test, expect } from '@playwright/test';
 import { installMocks } from './mocks';
 
-// The Observability redesign (task-208) folds the old standalone Ingestion screen into a sub-tab and
-// organises the SLIs into sections (Search · Runtime · Data · Ingestion · Source · Access) with a
-// persistent Alerts strip. `/ingestion` now redirects here.
+// The Observability screen organises the SLIs into sections (Search · Runtime · Data · Ingestion ·
+// Source · Access) with a persistent Alerts strip. `/ingestion` redirects here.
 
 test.describe('Observability', () => {
   test('renders the Search section — hero + SLI cards, no alerts firing', async ({ page }) => {
@@ -19,7 +18,7 @@ test.describe('Observability', () => {
     // Alerts strip: server rules answered (empty) ⇒ the "Server rules" badge + nothing firing.
     await expect(page.getByText('Server rules')).toBeVisible();
     await expect(page.getByText('No alerts firing')).toBeVisible();
-    // The Grafana deep-link (runtime-provided URL, task-140).
+    // The Grafana deep-link (runtime-provided URL).
     await expect(page.getByRole('link', { name: /Open in Grafana/ })).toBeVisible();
     // Metrics resolved, so the error banner is absent.
     await expect(page.getByRole('alert')).toHaveCount(0);
@@ -32,7 +31,7 @@ test.describe('Observability', () => {
     const tabs = page.getByRole('tab');
     await expect(tabs).toHaveText(['Search', 'Runtime', 'Data', 'Ingestion', 'Source', 'Access']);
 
-    // Source section surfaces the source-health cards (task-197 gauges).
+    // Source section surfaces the source-health cards.
     await page.getByRole('tab', { name: 'Source' }).click();
     await expect(page.getByText('Avg file size')).toBeVisible();
     await expect(page.getByText('Data files', { exact: true })).toBeVisible();

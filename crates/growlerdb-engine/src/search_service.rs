@@ -1,6 +1,6 @@
 //! The Node **Search** gRPC service ([Design 01]) — the read side of the Engine
-//! API. Adapts the in-process [`IndexReader`] (query execution over the local index,
-//! task-21/22/23) to the wire `Search` service, returning ranked document
+//! API. Adapts the in-process [`IndexReader`] (query execution over the local index)
+//! to the wire `Search` service, returning ranked document
 //! **coordinates** + scores. Hydration of the authoritative rows is a follow-up.
 //!
 //! [Design 01]: ../../../design/01-engine-api.md
@@ -26,7 +26,7 @@ use crate::shard_handle::ShardHandle;
 /// leaves `page_size` at 0.
 const DEFAULT_EXPORT_PAGE_SIZE: usize = 1000;
 
-/// Hard `offset+limit` (and suggest `limit`) ceiling enforced by the Node services (task-146 / F13).
+/// Hard `offset+limit` (and suggest `limit`) ceiling enforced by the Node services.
 /// The Gateway caps page fetches, but a Node is directly reachable in distributed mode, so it must
 /// self-defend against an unbounded `limit` that would build a giant top-k and OOM the process.
 /// Matches the Gateway's default `max_fetch`.
@@ -34,7 +34,7 @@ pub(crate) const MAX_NODE_FETCH: usize = 10_000;
 
 /// A `Search` service over one shard. Query execution is blocking (Tantivy + redb),
 /// so it runs on the blocking pool. Every RPC consults the [auth hook](SharedAuth)
-/// (no-op by default; task-19 seam) before serving.
+/// (no-op by default) before serving.
 #[derive(Clone)]
 pub struct SearchService {
     shard: ShardHandle,
@@ -71,7 +71,7 @@ impl Search for SearchService {
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         auth::authorize(&self.auth, "Search", &request)?;
-        // Cold-window pre-warm signal (task-153 / I3): count real searches, so a promoted-when-hot
+        // Cold-window pre-warm signal: count real searches, so a promoted-when-hot
         // decision reflects query load, not incidental `current()` calls from other services.
         self.shard.record_search();
         let tenant = auth::tenant_of(&request);
@@ -79,7 +79,7 @@ impl Search for SearchService {
         let invalid =
             |e: String| to_status(Code::InvalidArgument, WireError::new("INVALID_ARGUMENT", e));
 
-        // Parse the query string with the requested grammar — Lucene (default) or KQL (task-90).
+        // Parse the query string with the requested grammar — Lucene (default) or KQL.
         let query = if req.syntax == QuerySyntax::Kql as i32 {
             Query::parse_kql(&req.query)
         } else {
@@ -106,7 +106,7 @@ impl Search for SearchService {
             Some(decode_cursor(&req.search_after).map_err(invalid)?)
         };
         let offset = req.offset as usize;
-        // Page-fetch ceiling at the Node too (task-146 / F13): the Gateway caps `offset+limit`, but
+        // Page-fetch ceiling at the Node too: the Gateway caps `offset+limit`, but
         // the Node is a real endpoint (RemoteNode connects directly to it in distributed mode), so a
         // direct RPC with a giant `limit` would build an enormous top-k and OOM the Node, bypassing
         // the Gateway guard. Mirror the Gateway's default ceiling here.
@@ -118,7 +118,7 @@ impl Search for SearchService {
         }
         let collapse = req.collapse;
         let pit_id = req.pit_id;
-        // Server-side highlighting opt-in (task-250): present only when the client asked for it.
+        // Server-side highlighting opt-in: present only when the client asked for it.
         // Non-highlightable field names are dropped downstream, not rejected here.
         let highlight = req
             .highlight
@@ -131,7 +131,7 @@ impl Search for SearchService {
 
         // Query execution is blocking; keep it off the async runtime.
         let shard = self.shard.current();
-        // Tenant scoping (task-38): if the index is tenant-scoped, AND a mandatory tenant
+        // Tenant scoping: if the index is tenant-scoped, AND a mandatory tenant
         // filter from the verified claim — the caller can neither read nor widen past it.
         let query = tenant_scope(&shard, query, tenant.as_deref())?;
         let resp = tokio::task::spawn_blocking(move || {
@@ -153,7 +153,7 @@ impl Search for SearchService {
                             group: Some(g.group.into()),
                             group_count: g.count as u64,
                             // The group's top-hit sort values, so the Gateway can fold and
-                            // order collapse groups across shards (task-68).
+                            // order collapse groups across shards.
                             sort_values: g.sort_values.iter().map(Into::into).collect(),
                             fields: hit_fields(&g.hit.fields),
                             highlight: hit_highlight(&g.hit.highlight),
@@ -161,7 +161,7 @@ impl Search for SearchService {
                         .collect(),
                     next_cursor: Vec::new(),
                     partial: false,
-                    // A bare Node has no shard scope; the Gateway stamps scanned/total (task-133).
+                    // A bare Node has no shard scope; the Gateway stamps scanned/total.
                     ..Default::default()
                 });
             }
@@ -180,7 +180,7 @@ impl Search for SearchService {
                 )?
             };
             // `total` is the true match count (read against the same snapshot), not the page
-            // size, so a Gateway can sum it across shards for a global total (task-68).
+            // size, so a Gateway can sum it across shards for a global total.
             let total = if pit_id == 0 {
                 shard.search_count(&query)?
             } else {
@@ -195,7 +195,7 @@ impl Search for SearchService {
         Ok(Response::new(resp))
     }
 
-    /// Explain how `query` scores one document (task-102). Locates the doc by coordinate, asks the
+    /// Explain how `query` scores one document. Locates the doc by coordinate, asks the
     /// index for Tantivy's BM25 explanation tree + analyzed terms, and measures the index-side time.
     /// The Gateway adds hydration/total timings + shard counts. Honors tenant scoping like search.
     #[tracing::instrument(name = "node.explain", skip_all, err)]
@@ -334,7 +334,7 @@ impl Search for SearchService {
         // producer parks on `blocking_send` until the client drains).
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<SearchResponse, Status>>(4);
         let shard = self.shard.current();
-        // Tenant scoping (task-38): export is a full scan, so the tenant filter matters most here.
+        // Tenant scoping: export is a full scan, so the tenant filter matters most here.
         let query = tenant_scope(&shard, query, tenant.as_deref())?;
         tokio::task::spawn_blocking(move || {
             // Use the caller's PIT, or open one for the export's duration (then close).
@@ -368,7 +368,7 @@ impl Search for SearchService {
                     &sort,
                     0,
                     cursor.as_ref(),
-                    // Export streams full result sets; highlighting is a search-page feature (task-250).
+                    // Export streams full result sets; highlighting is a search-page feature.
                     None,
                 ) {
                     Ok((hits, next)) => {
@@ -417,11 +417,11 @@ impl Search for SearchService {
         };
         let aggs: Vec<(String, Agg)> = aggs.into_iter().collect();
         // Validate the spec (e.g. range buckets ascending/non-overlapping) before it reaches
-        // Tantivy, so bad input is a clear InvalidArgument, not an opaque Internal (task-75).
+        // Tantivy, so bad input is a clear InvalidArgument, not an opaque Internal.
         growlerdb_core::validate_aggs(&aggs).map_err(invalid)?;
 
         let shard = self.shard.current();
-        // Tenant scoping (task-38): aggregations over another tenant's rows would leak counts/
+        // Tenant scoping: aggregations over another tenant's rows would leak counts/
         // sums, so the same mandatory filter applies before the agg runs.
         let query = tenant_scope(&shard, query, tenant.as_deref())?;
         if req.partial {
@@ -452,7 +452,7 @@ impl Search for SearchService {
     }
 }
 
-/// Apply **tenant scoping** (task-38) to a read's query. If `shard` is tenant-scoped, the
+/// Apply **tenant scoping** to a read's query. If `shard` is tenant-scoped, the
 /// request must carry a verified `tenant` claim, and a mandatory `tenant_field = tenant`
 /// filter is AND-ed in (the caller can neither read nor widen past it). A tenant-scoped index
 /// with no claim is rejected (`PermissionDenied`) — fail closed. Unscoped indexes pass through.
@@ -473,7 +473,7 @@ fn tenant_scope(shard: &Shard, query: Query, tenant: Option<&str>) -> Result<Que
 }
 
 /// Convert Tantivy's serialized `Explanation` JSON (`{value, description, details}`) into the
-/// wire [`ExplainClause`] tree (task-102). Returns `None` for a non-object (e.g. null = unmatched).
+/// wire [`ExplainClause`] tree. Returns `None` for a non-object (e.g. null = unmatched).
 fn json_to_clause(v: &serde_json::Value) -> Option<ExplainClause> {
     let obj = v.as_object()?;
     Some(ExplainClause {
@@ -510,20 +510,20 @@ fn page_response(
                 // Field-sorted hits carry their sort values so the Gateway can merge
                 // across shards (design/09); score-ranked hits leave this empty.
                 sort_values: sort_values.iter().map(Into::into).collect(),
-                // Cached display fields (D23/task-86) render the page without hydration.
+                // Cached display fields render the page without hydration.
                 fields: hit_fields(&h.fields),
-                // Server-side highlights (task-250); empty unless the request opted in.
+                // Server-side highlights; empty unless the request opted in.
                 highlight: hit_highlight(&h.highlight),
             })
             .collect(),
         next_cursor: next.map(encode_cursor).unwrap_or_default(),
         partial: false,
-        // A bare Node has no shard scope; the Gateway stamps scanned/total (task-133).
+        // A bare Node has no shard scope; the Gateway stamps scanned/total.
         ..Default::default()
     }
 }
 
-/// Map a core [`Hit`](growlerdb_core::Hit)'s server-side highlights (task-250) to the wire
+/// Map a core [`Hit`](growlerdb_core::Hit)'s server-side highlights to the wire
 /// `map<string, HighlightField>`: each field's fragments as XSS-safe segment runs. Empty when the
 /// search didn't opt in or no field had a matching fragment.
 fn hit_highlight(
@@ -550,9 +550,9 @@ fn hit_highlight(
         .collect()
 }
 
-/// The cached display fields (D23) of a core [`Hit`](growlerdb_core::Hit) as wire [`Field`]s — the
+/// The cached display fields of a core [`Hit`](growlerdb_core::Hit) as wire [`Field`]s — the
 /// `cached` fields the index returns with each hit so a page renders document-like rows without a
-/// hydration round-trip (task-86). Empty when the index caches no display fields.
+/// hydration round-trip. Empty when the index caches no display fields.
 fn hit_fields(fields: &std::collections::BTreeMap<String, growlerdb_core::Value>) -> Vec<Field> {
     fields
         .iter()
@@ -595,7 +595,7 @@ fn store_status(e: StoreError) -> Status {
 /// Encode a keyset cursor to the opaque wire token (JSON bytes — clients treat it as
 /// opaque and round-trip it verbatim). Shared with the [Gateway](crate::gateway), which
 /// composes the **global** cursor for a multi-shard scroll in this same format so every
-/// Node can decode it (task-68).
+/// Node can decode it.
 pub(crate) fn encode_cursor(cursor: SearchAfter) -> Vec<u8> {
     // SearchAfter is plain data (numbers + a composite key); serialization is infallible.
     serde_json::to_vec(&cursor).unwrap_or_default()
@@ -742,7 +742,7 @@ mod tests {
     async fn pit_against_a_retired_shard_is_a_clean_expired_error() {
         use crate::shard_handle::ShardHandle;
         // Open a PIT, then swap in a fresh shard (as ReindexIndex does). A search carrying the old
-        // pit_id must get a clean PIT-expired error, not an internal failure or stale data (task-71).
+        // pit_id must get a clean PIT-expired error, not an internal failure or stale data.
         let tmp1 = tempfile::tempdir().unwrap();
         let tmp2 = tempfile::tempdir().unwrap();
         let handle = ShardHandle::new(std::sync::Arc::new(ranked_shard(tmp1.path())));
@@ -951,7 +951,7 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_page_fetch_is_rejected_at_the_node() {
-        // task-146 / F13: a direct RPC with a giant limit must be rejected before building the page,
+        // A direct RPC with a giant limit must be rejected before building the page,
         // not left to OOM the Node (the Gateway isn't in the path for a direct Node RPC).
         let tmp = tempfile::tempdir().unwrap();
         let svc = ranked_service(tmp.path());
@@ -1203,7 +1203,7 @@ mod tests {
         assert_eq!(err.code(), Code::InvalidArgument);
     }
 
-    // ---- Tenant scoping (task-38) -----------------------------------------------------
+    // ---- Tenant scoping -----------------------------------------------------
 
     /// A tenant-scoped shard: a `tenant` KEYWORD field declared as `tenant_field`, with docs
     /// from two tenants (`acme`: a, c; `globex`: b).
@@ -1300,7 +1300,7 @@ mod tests {
         assert_eq!(err.code(), Code::PermissionDenied);
     }
 
-    /// A `docs` shard with a **cached** TEXT `body` field, for highlight tests (task-250).
+    /// A `docs` shard with a **cached** TEXT `body` field, for highlight tests.
     fn highlight_service(root: &std::path::Path) -> SearchService {
         let src = SourceSchema::new(
             vec![

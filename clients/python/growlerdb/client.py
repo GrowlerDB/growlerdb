@@ -42,7 +42,7 @@ class Client:
 
     Covers Search, GetByKey, Suggest, and Admin.
 
-    Authentication (task-152 / G3): pass ``token`` — an OIDC bearer or a GrowlerDB API
+    Authentication: pass ``token`` — an OIDC bearer or a GrowlerDB API
     token — and it is sent as ``Authorization: Bearer <token>``, which the gateway
     verifies (the identity + roles come from the *verified* token, not from the client).
     This is the only mechanism that works against a closed (auth-required) gateway.

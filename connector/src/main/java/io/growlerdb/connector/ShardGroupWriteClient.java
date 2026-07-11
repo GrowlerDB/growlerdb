@@ -9,7 +9,7 @@ import java.util.TreeMap;
 import java.util.concurrent.Callable;
 
 /**
- * The write client of one worker in a <b>parallel connector set</b> (task-196): the worker owns
+ * The write client of one worker in a <b>parallel connector set</b>: the worker owns
  * a fixed {@link ShardGroup shard group} and this client sends a batch's sub-batches — including
  * empty lockstep advances — to its <b>owned shards only</b>, dropping the rest (their owners send
  * them). Every shard keeps exactly one writer, so the Node's per-shard continuity guard holds
@@ -71,7 +71,7 @@ public final class ShardGroupWriteClient implements BatchWriter {
         byOrdinal.put(ordinal, new WriteClient(hp[0].trim(), Integer.parseInt(hp[1].trim())));
       }
     } catch (RuntimeException e) {
-      // Don't leak channels of the clients already opened when a later endpoint is malformed.
+      // Don't leak channels of clients already opened when a later endpoint is malformed.
       closeQuietly();
       throw e;
     }
@@ -80,7 +80,7 @@ public final class ShardGroupWriteClient implements BatchWriter {
   @Override
   public long write(DocBatch batch) {
     // Partition over ALL ordinals — identical ids/placement to the single-connector path —
-    // then send only the owned sub-batches (empties included: lockstep within the group).
+    // then send only the owned sub-batches (empties included for lockstep within the group).
     List<DocBatch> perShard = ShardedWriteClient.partition(batch, router);
     List<Callable<Long>> writes = new ArrayList<>(owned.size());
     for (int ordinal : owned) {

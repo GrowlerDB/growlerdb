@@ -9,7 +9,7 @@ import java.util.SortedSet;
 import java.util.TreeSet;
 import org.junit.jupiter.api.Test;
 
-/** The shard-group assignment math (task-196): deterministic, total, disjoint. */
+/** The shard-group assignment math: deterministic, total, disjoint. */
 class ShardGroupTest {
 
   @Test

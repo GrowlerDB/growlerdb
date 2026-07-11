@@ -1,4 +1,4 @@
-//! Minimal **index definition & field mapping** for the M0 walking skeleton.
+//! **Index definition & field mapping**.
 //!
 //! An [`IndexDefinition`] is the declarative config describing one index: its
 //! source, its composite [key](KeySpec), and its field [`Mapping`]. Users author
@@ -6,7 +6,7 @@
 //! leaf fields + key hints) into a [`ResolvedIndex`] — concrete key fields and a
 //! concrete typed field list — validating that every referenced path exists.
 //!
-//! Toward [Design 04](../../../design/04-index-definition.md) (M2 task-20):
+//! Per [Design 04](../../../design/04-index-definition.md):
 //!
 //! * Field types: **TEXT**, **KEYWORD**, **LONG**, **DOUBLE**, **BOOL**, **DATE**,
 //!   **IP**, with the `fast` (columnar) and `cached` (returned-with-hit) flags
@@ -58,13 +58,13 @@ pub enum DefError {
     #[error("key field `{0}` is floating-point; floats can't be routing/identity keys (NaN is unstable and not cross-language canonical) — use an integer, string, or date key")]
     FloatKey(String),
 
-    /// A `sensitive` field was marked `cached` — D23 hard-blocks caching sensitive
-    /// fields (route them through Polaris-governed hydration instead).
+    /// A `sensitive` field was marked `cached` — caching sensitive fields is
+    /// hard-blocked (route them through Polaris-governed hydration instead).
     #[error("field `{0}` is sensitive and cannot be cached (D23)")]
     SensitiveCached(String),
 
     /// A **big-text** field (declared `max_bytes` over [`MAX_CACHED_FIELD_BYTES`]) was
-    /// marked `cached` — D23 makes big text hydrate-only (storing it inline bloats the
+    /// marked `cached` — big text is hydrate-only (storing it inline bloats the
     /// index and every hit page). Drop `cached` and fetch it via hydration instead.
     #[error("field `{path}` is big text ({max_bytes} > {cap} byte cap) and cannot be cached — fetch it via hydration (D23)")]
     BigTextCached {
@@ -76,7 +76,7 @@ pub enum DefError {
         cap: u64,
     },
 
-    /// `tenant_field` names a field that isn't in the index mapping. Tenant scoping (task-38)
+    /// `tenant_field` names a field that isn't in the index mapping. Tenant scoping
     /// injects an exact-match filter on this field, so it must be a mapped, filterable field.
     #[error("tenant_field `{0}` is not a mapped field — map it as a KEYWORD field to scope by it")]
     TenantFieldUnmapped(String),
@@ -86,7 +86,7 @@ pub enum DefError {
     #[error("tenant_field `{0}` must be a KEYWORD field (exact match); other types can't anchor a tenant filter")]
     TenantFieldNotKeyword(String),
 
-    /// `windowing.field` isn't in the index mapping. Time-window sharding (task-81) buckets
+    /// `windowing.field` isn't in the index mapping. Time-window sharding buckets
     /// documents by this field, so it must be a mapped, fast timestamp field.
     #[error(
         "windowing field `{0}` is not a mapped field — map it as a fast DATE (timestamp) field"
@@ -94,7 +94,7 @@ pub enum DefError {
     WindowFieldUnmapped(String),
 
     /// `windowing.field` is mapped but not a `DATE`. Windows bucket on the **canonical micros**
-    /// timestamp scale (task-116), so a window/event field must be a timestamp — a native Iceberg
+    /// timestamp scale, so a window/event field must be a timestamp — a native Iceberg
     /// `date`/`timestamp`, or any column declared with a `format` (e.g. `epoch_ms`). A raw `LONG` is
     /// rejected because its unit is ambiguous (millis vs micros) and would silently misbucket.
     #[error(
@@ -110,7 +110,7 @@ pub enum DefError {
     )]
     WindowFieldNotFast(String),
 
-    /// A field declared a timestamp `format` (task-112) but also an explicit non-DATE `type` — the
+    /// A field declared a timestamp `format` but also an explicit non-DATE `type` — the
     /// format already makes it a DATE, so the type is contradictory.
     #[error("field `{path}` has a timestamp `format` but type `{ty:?}` — a `format` makes it a DATE; drop the type or set it to DATE")]
     TimestampFormatType {
@@ -120,57 +120,55 @@ pub enum DefError {
         ty: FieldType,
     },
 
-    /// `indexed: false` on a TEXT/KEYWORD field (task-215). Text search and exact keyword match
+    /// `indexed: false` on a TEXT/KEYWORD field. Text search and exact keyword match
     /// run on the inverted index — string terms have no columnar query fallback — so a
     /// non-indexed string field would be unsearchable.
     #[error("field `{0}` is TEXT/KEYWORD and cannot be `indexed: false` — string search has no columnar fallback")]
     IndexedFalseText(String),
 
-    /// `indexed: false` without `fast: true` (task-215). With neither the inverted index nor a
+    /// `indexed: false` without `fast: true`. With neither the inverted index nor a
     /// columnar fast field, no query path can reach the field at all.
     #[error("field `{0}` has `indexed: false` but not `fast: true` — the field would be unqueryable; set `fast: true` (columnar) or drop `indexed: false`")]
     IndexedFalseNotFast(String),
 
-    /// `record:` on a non-TEXT field (task-216) — the knob shapes the analyzed inverted
+    /// `record:` on a non-TEXT field — the knob shapes the analyzed inverted
     /// index, which only TEXT has (KEYWORD is raw single-token; typed fields aren't analyzed).
     #[error("field `{0}` is not TEXT — `record:` only applies to analyzed TEXT fields")]
     RecordOnNonText(String),
 
-    /// `fieldnorms:` on a non-TEXT field (task-216) — length normalization only means
+    /// `fieldnorms:` on a non-TEXT field — length normalization only means
     /// something for analyzed multi-token TEXT.
     #[error("field `{0}` is not TEXT — `fieldnorms:` only applies to analyzed TEXT fields")]
     FieldnormsOnNonText(String),
 }
 
-/// D23 cache cap: a field whose declared `max_bytes` exceeds this is **big text** and
+/// Cache cap: a field whose declared `max_bytes` exceeds this is **big text** and
 /// may not be `cached` (it is hydrate-only). 32 KiB — large enough for titles/summaries,
 /// small enough that storing it inline on every hit stays cheap.
 pub const MAX_CACHED_FIELD_BYTES: u64 = 32 * 1024;
 
-/// A complete index definition (M0 subset).
+/// A complete index definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexDefinition {
     /// Index name (aliasable later).
     pub name: String,
     /// Where the documents come from.
     pub source: Source,
-    /// Composite document key ([D5]). Defaults to derive-from-source.
-    ///
-    /// [D5]: ../../../wiki/21-decisions.md
+    /// Composite document key. Defaults to derive-from-source.
     #[serde(default)]
     pub key: KeySpec,
     /// Which source fields to index, and how.
     #[serde(default)]
     pub mapping: Mapping,
-    /// The number of shards the index is **routed and built at** (task-73). Placement is
+    /// The number of shards the index is **routed and built at**. Placement is
     /// `route(key) % shard_count`, so changing it re-routes ~every document — it is a
     /// **reindex-only** operation ([`alter_to`](ResolvedIndex::alter_to) flags a change as
-    /// reindex-required; online resharding via virtual buckets is the future path, task-77).
-    /// The deployed shard map (Control Plane) and the connector fan-out must match this count
-    /// (task-69). Defaults to 1 (single shard).
+    /// reindex-required; online resharding via virtual buckets is the future path).
+    /// The deployed shard map (Control Plane) and the connector fan-out must match this count.
+    /// Defaults to 1 (single shard).
     #[serde(default = "default_shard_count")]
     pub shard_count: u32,
-    /// The field carrying a row's **tenant id**, for tenant scoping (task-38). When set, the
+    /// The field carrying a row's **tenant id**, for tenant scoping. When set, the
     /// engine ANDs a mandatory `tenant_field = <claim>` filter into every read from the
     /// caller's verified tenant claim — so a caller can never read another tenant's rows.
     /// Must be a mapped **KEYWORD** field. **Independent of the routing/partition key**:
@@ -178,25 +176,25 @@ pub struct IndexDefinition {
     /// co-locating a tenant on a shard is a separate, opt-in routing choice. `None` = no scoping.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_field: Option<String>,
-    /// Time-window (range) sharding (task-81): when set, the index is partitioned by this time
+    /// Time-window (range) sharding: when set, the index is partitioned by this time
     /// field into contiguous **window shards** (one per window), enabling time-range query pruning
-    /// and cold-window parking (task-80). The field must be a mapped, **fast** `DATE`/`LONG` field
+    /// and cold-window parking. The field must be a mapped, **fast** `DATE`/`LONG` field
     /// (epoch ms). `None` = no time-windowing (hash/partition routing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub windowing: Option<crate::window::TimeWindowing>,
-    /// How hydration locates a key's source row ([D30], task-184): [`COORDINATES`]
+    /// How hydration locates a key's source row ([layered locator]): [`COORDINATES`]
     /// (the default — per-row location data kept in the index) or [`PREDICATE`]
     /// (store-less — re-find by a pruned key scan). See [`LocationStrategy`] for the
     /// trade-off and the predicate strategy's honest scope.
     ///
-    /// [D30]: ../../../okf/system/decisions/d30-layered-locator.md
+    /// [layered locator]: ../../../okf/system/decisions/d30-layered-locator.md
     /// [`COORDINATES`]: LocationStrategy::Coordinates
     /// [`PREDICATE`]: LocationStrategy::Predicate
     #[serde(default)]
     pub location_strategy: LocationStrategy,
 }
 
-/// Per-index **location strategy** ([D30], task-184): how hydration resolves a
+/// Per-index **location strategy** ([layered locator]): how hydration resolves a
 /// composite key back to its source row. Chosen by the author in the definition
 /// (`location_strategy:`); the default is the universal [`Coordinates`](Self::Coordinates).
 /// Auto-detection from table inspection (format version, sort order, partition spec)
@@ -206,7 +204,7 @@ pub struct IndexDefinition {
 /// predicate **fallback** stay on under every strategy — a strategy changes
 /// performance and index size, never correctness.
 ///
-/// [D30]: ../../../okf/system/decisions/d30-layered-locator.md
+/// [layered locator]: ../../../okf/system/decisions/d30-layered-locator.md
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum LocationStrategy {
@@ -242,10 +240,10 @@ impl IndexDefinition {
     pub fn resolve(&self, source: &SourceSchema) -> Result<ResolvedIndex, DefError> {
         let key = self.key.resolve(source)?;
         let fields = self.mapping.resolve(source)?;
-        // D23 cached-field policy, hard-blocked (not user-overridable):
+        // Cached-field policy, hard-blocked (not user-overridable):
         //   * sensitive fields are never cacheable;
         //   * big-text fields (declared over the cap) are hydrate-only.
-        // Plus the task-215 `indexed` guardrails: a non-indexed field must have a columnar
+        // Plus the `indexed` guardrails: a non-indexed field must have a columnar
         // query path (fast), and string types can't opt out at all.
         for f in &fields {
             if !f.indexed {
@@ -271,7 +269,7 @@ impl IndexDefinition {
                 }
             }
         }
-        // Tenant scoping (task-38): the tenant field must be a mapped KEYWORD field, so the
+        // Tenant scoping: the tenant field must be a mapped KEYWORD field, so the
         // injected `tenant = claim` filter is an exact, un-widenable match.
         if let Some(tf) = &self.tenant_field {
             match fields.iter().find(|f| &f.path == tf) {
@@ -282,9 +280,9 @@ impl IndexDefinition {
                 Some(_) => {}
             }
         }
-        // Time-window sharding (task-81): the ingest-time window field — and the optional
-        // event-time zone-map field — must each be a mapped, fast **DATE** (canonical micros,
-        // task-116) field, so documents bucket into windows on the same scale the index/range path
+        // Time-window sharding: the ingest-time window field — and the optional
+        // event-time zone-map field — must each be a mapped, fast **DATE** (canonical micros)
+        // field, so documents bucket into windows on the same scale the index/range path
         // uses and time-range queries can prune by them. A raw LONG is rejected: declare a `format`.
         if let Some(w) = &self.windowing {
             let check_time_field = |name: &str| -> Result<(), DefError> {
@@ -304,7 +302,7 @@ impl IndexDefinition {
         }
         let (equality_deletes, mut warnings) =
             classify_equality_deletes(&source.equality_delete_fields, &key, &fields);
-        // Honest-scope guardrail (task-184 / D30): a `PREDICATE` index stores no
+        // Honest-scope guardrail: a `PREDICATE` index stores no
         // location data, so hydration latency depends entirely on how well the source
         // layout prunes a key-equality scan. We do NOT inspect the table layout (that
         // is deferred with auto-detection) — we warn, so the trade-off is a stated
@@ -344,9 +342,9 @@ impl IndexDefinition {
 ///   predicate (e.g. `status = 'archived'`) can't be keyed, so the affected
 ///   partition is re-scanned and diffed against the index.
 ///
-/// AC of [task-15]: validates the columns are a subset of key + indexed fields and
-/// **warns** (does not fail) when they aren't — so the reconciliation path is a known
-/// choice, not a silent surprise.
+/// Validates the columns are a subset of key + indexed fields and **warns** (does not
+/// fail) when they aren't — so the reconciliation path is a known choice, not a silent
+/// surprise.
 fn classify_equality_deletes(
     equality_delete_fields: &[String],
     key: &ResolvedKey,
@@ -384,7 +382,7 @@ fn classify_equality_deletes(
     (EqualityDeleteHandling::Reconcile { uncovered }, warnings)
 }
 
-/// The source the index is fed from. M0 supports Iceberg only; the single-key-map
+/// The source the index is fed from. Iceberg only; the single-key-map
 /// shape (`source: { iceberg: { … } }`) leaves room for `kafka`/`cdc`/`file`.
 ///
 /// Serialized through [`SourceWire`] so the `{ kind: { … } }` authoring surface
@@ -429,15 +427,13 @@ pub struct IcebergSource {
     pub catalog: String,
     /// Table identifier, `namespace.table`.
     pub table: String,
-    /// Scan mode. M0 reads the current snapshot append-only regardless; the
+    /// Scan mode. Reads the current snapshot append-only regardless; the
     /// field parses so a fuller definition round-trips.
     #[serde(default)]
     pub scan: ScanMode,
 }
 
-/// How the source is scanned ([D9]). M0 honours neither variant specially.
-///
-/// [D9]: ../../../wiki/21-decisions.md
+/// How the source is scanned. Neither variant is honoured specially yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ScanMode {
@@ -448,12 +444,10 @@ pub enum ScanMode {
     AppendFastPath,
 }
 
-/// The composite document key: partition fields + identifier fields ([D5]).
+/// The composite document key: partition fields + identifier fields.
 ///
 /// Empty lists mean *derive from the source* (its partition spec + identifier
 /// fields); a non-empty list overrides that side explicitly.
-///
-/// [D5]: ../../../wiki/21-decisions.md
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct KeySpec {
     /// Partition fields — drive routing and hydration pruning. Empty ⇒ derive.
@@ -488,7 +482,7 @@ impl KeySpec {
                         referenced_by: "key",
                     })
                 }
-                // Reject floating-point keys up front (task-69): a float can't be a stable
+                // Reject floating-point keys up front: a float can't be a stable
                 // routing/identity key, and NaN encodes differently across languages.
                 Some(f) if f.ty == SourceType::Double => return Err(DefError::FloatKey(p.clone())),
                 Some(_) => {}
@@ -538,7 +532,7 @@ impl Mapping {
                     referenced_by: "mapping.fields",
                 });
             }
-            // A timestamp `format` (task-112) declares the field a DATE; an explicit non-DATE `type`
+            // A timestamp `format` declares the field a DATE; an explicit non-DATE `type`
             // alongside it is a contradiction — reject it loudly rather than silently pick one.
             if f.format.is_some() && matches!(f.ty, Some(t) if t != FieldType::Date) {
                 return Err(DefError::TimestampFormatType {
@@ -600,7 +594,7 @@ fn resolve_field(
     ovr: Option<&FieldMapping>,
 ) -> Result<ResolvedField, DefError> {
     let format = ovr.and_then(|o| o.format);
-    // A declared timestamp `format` (task-112) makes the field a DATE regardless of its source
+    // A declared timestamp `format` makes the field a DATE regardless of its source
     // Arrow type — that's the whole point (an int64/string epoch column becomes a timestamp).
     // The contradictory case (explicit non-DATE `type` + `format`) is rejected in `resolve`.
     let ty = if format.is_some() {
@@ -624,7 +618,7 @@ fn resolve_field(
         analyzer: ovr.and_then(|o| o.analyzer.clone()),
         format,
         fast,
-        // task-215 fast-only default: TEXT/KEYWORD are always inverted-indexed (string search has
+        // Fast-only default: TEXT/KEYWORD are always inverted-indexed (string search has
         // no columnar fallback); a fast non-text field defaults to columnar-only (its range /
         // exact / sort / exists paths all run on the fast field — the inverted index would be
         // dead weight). An explicit `indexed:` wins; the invalid combinations (`false` on text,
@@ -633,7 +627,7 @@ fn resolve_field(
             FieldType::Text | FieldType::Keyword => true,
             _ => !fast,
         }),
-        // task-216 TEXT indexing detail: full fidelity by default — positions (phrase-safe)
+        // TEXT indexing detail: full fidelity by default — positions (phrase-safe)
         // and fieldnorms (BM25 length normalization). Meaningful only for TEXT (non-TEXT
         // rejected above); carried as concrete values so the derived schema never guesses.
         record: ovr.and_then(|o| o.record).unwrap_or(TextRecord::Position),
@@ -657,51 +651,51 @@ pub struct FieldMapping {
     /// Analyzer name for TEXT fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analyzer: Option<String>,
-    /// Timestamp source format (task-112). Declaring it makes the field a **DATE** regardless of its
+    /// Timestamp source format. Declaring it makes the field a **DATE** regardless of its
     /// source Arrow type (so a plain `int64` epoch column or a digit string can be a real timestamp)
     /// and tells ingestion how to normalize the source value to canonical epoch micros.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<crate::timestamp::TimeFormat>,
-    /// Columnar **fast** field — sortable / filterable / aggregatable in-index
-    /// (task-23/24). Default false.
+    /// Columnar **fast** field — sortable / filterable / aggregatable in-index.
+    /// Default false.
     #[serde(default)]
     pub fast: bool,
-    /// Whether the field gets an **inverted index** (task-215). Defaults per type: TEXT/KEYWORD
+    /// Whether the field gets an **inverted index**. Defaults per type: TEXT/KEYWORD
     /// always `true` (string search has no columnar fallback); numeric/date/IP default to
     /// `!fast` — a fast field's range / exact-match / sort / exists paths all run on the
     /// columnar store, so its inverted index is dead weight (a per-doc-unique timestamp is the
     /// worst case). Set `indexed: true` alongside `fast: true` to keep both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub indexed: Option<bool>,
-    /// TEXT-only (task-216): how much the inverted index records per posting —
+    /// TEXT-only: how much the inverted index records per posting —
     /// `BASIC` (doc ids), `FREQ` (+ term frequencies, full BM25), or `POSITION`
     /// (+ token positions, phrase queries). Default `POSITION` (full fidelity);
     /// drop to `FREQ` on text fields never phrase-searched — positions are usually
     /// the largest slice of a text field's inverted index. Rejected on non-TEXT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record: Option<TextRecord>,
-    /// TEXT-only (task-216): store per-doc **fieldnorms** (field lengths, the BM25
+    /// TEXT-only: store per-doc **fieldnorms** (field lengths, the BM25
     /// length-normalization input). Default true; `false` drops ~1 byte/doc for text
     /// fields whose relevance ranking doesn't matter (pure filter/needle fields) —
     /// BM25 then scores without length normalization. Rejected on non-TEXT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fieldnorms: Option<bool>,
     /// **Cached** display field — the value is stored in-index and returned with the
-    /// hit, so a page renders without hydration (D23). Default false.
+    /// hit, so a page renders without hydration. Default false.
     #[serde(default)]
     pub cached: bool,
-    /// **Sensitive** field (eventually catalog/Polaris-marked) — D23 hard-blocks it
+    /// **Sensitive** field (eventually catalog/Polaris-marked) — hard-blocked
     /// from caching; requesting `cached` on it is a resolve error. Default false.
     #[serde(default)]
     pub sensitive: bool,
     /// Declared maximum byte length of the field's values, if known (from the catalog
-    /// or the author). Drives the D23 **big-text** rule: over [`MAX_CACHED_FIELD_BYTES`]
+    /// or the author). Drives the **big-text** rule: over [`MAX_CACHED_FIELD_BYTES`]
     /// the field is hydrate-only and cannot be `cached`. Default unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<u64>,
 }
 
-/// GrowlerDB field type (M2 typed system).
+/// GrowlerDB field type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum FieldType {
@@ -729,7 +723,7 @@ impl FieldType {
     }
 }
 
-/// How much the inverted index records per TEXT-field posting (task-216) — the
+/// How much the inverted index records per TEXT-field posting — the
 /// Elasticsearch `index_options` / Quickwit `record` knob. Each level up costs bytes:
 /// positions are typically the largest slice of a text field's inverted index, and
 /// exist only to serve phrase queries.
@@ -873,7 +867,7 @@ pub struct ResolvedIndex {
     pub key: ResolvedKey,
     /// The resolved, typed field list.
     pub fields: Vec<ResolvedField>,
-    /// How this source's equality deletes apply to the index (task-15). Defaulted
+    /// How this source's equality deletes apply to the index. Defaulted
     /// for definitions resolved before this field existed.
     #[serde(default)]
     pub equality_deletes: EqualityDeleteHandling,
@@ -881,21 +875,21 @@ pub struct ResolvedIndex {
     /// that forces the reconciliation fallback). Empty when nothing to flag.
     #[serde(default)]
     pub warnings: Vec<String>,
-    /// Shard count the index is routed/built at (carried from the definition, task-73). Changing
+    /// Shard count the index is routed/built at (carried from the definition). Changing
     /// it re-routes every document → reindex-only (see [`alter_to`](Self::alter_to)). Defaulted
     /// for definitions resolved before this field existed.
     #[serde(default = "default_shard_count")]
     pub shard_count: u32,
-    /// The tenant-scoping field (task-38), validated to be a mapped KEYWORD field. When set,
+    /// The tenant-scoping field, validated to be a mapped KEYWORD field. When set,
     /// reads inject a mandatory `tenant_field = <verified claim>` filter. Defaulted for
     /// definitions resolved before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_field: Option<String>,
-    /// Time-window sharding (task-81), validated to a mapped fast DATE/LONG field. `None` = none.
+    /// Time-window sharding, validated to a mapped fast DATE/LONG field. `None` = none.
     /// Defaulted for definitions resolved before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub windowing: Option<crate::window::TimeWindowing>,
-    /// The index's [location strategy](LocationStrategy) (D30, task-184), carried from
+    /// The index's [location strategy](LocationStrategy), carried from
     /// the definition. Defaulted (`COORDINATES`) for definitions resolved before this
     /// field existed.
     #[serde(default)]
@@ -903,18 +897,16 @@ pub struct ResolvedIndex {
 }
 
 impl ResolvedIndex {
-    /// The tenant-scoping field, if this index is tenant-scoped (task-38). When `Some`, every
+    /// The tenant-scoping field, if this index is tenant-scoped. When `Some`, every
     /// read must carry a verified tenant claim and is filtered to `tenant_field = claim`.
     pub fn tenant_field(&self) -> Option<&str> {
         self.tenant_field.as_deref()
     }
-    /// How this index's documents map to shards ([task-29] AC1): **partition** routing when
+    /// How this index's documents map to shards: **partition** routing when
     /// the key has partition fields (co-locating a partition on one shard so partition-scoped
     /// queries hit fewer shards), else **hash** (a uniform spread). Both the read side
     /// (Gateway) and the write side (connector) derive their [`ShardRouter`] from this, so
     /// placement and lookup agree.
-    ///
-    /// [task-29]: ../../../design/06-service-architecture.md
     pub fn routing_strategy(&self) -> RoutingStrategy {
         if self.key.partition_fields.is_empty() {
             RoutingStrategy::Hash
@@ -930,8 +922,8 @@ impl ResolvedIndex {
     }
 }
 
-/// The impact of **altering** an index from one resolved definition to another
-/// (task-26): whether the change needs a full **reindex** (existing immutable segments
+/// The impact of **altering** an index from one resolved definition to another:
+/// whether the change needs a full **reindex** (existing immutable segments
 /// lack the new shape) or is safe to apply **in place**, with human-readable reasons so
 /// an operator is *guided*, not surprised.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -975,7 +967,7 @@ impl ResolvedIndex {
         }
         if self.shard_count != new.shard_count {
             // Routing is `route(key) % shard_count`, so a count change re-routes ~every doc —
-            // a reindex-only operation (task-73; no in-place migration).
+            // a reindex-only operation (no in-place migration).
             plan.reindex_reasons.push(format!(
                 "shard_count {} → {} (re-routes every doc; reshard via reindex)",
                 self.shard_count, new.shard_count
@@ -1044,7 +1036,7 @@ fn diff_field(path: &str, old: &ResolvedField, new: &ResolvedField, plan: &mut A
     }
     if old.record != new.record {
         // Postings carry the recorded detail (freqs/positions) physically — either
-        // direction is a rebuild (task-216).
+        // direction is a rebuild.
         plan.reindex_reasons.push(format!(
             "field `{path}` record {:?} → {:?}",
             old.record, new.record
@@ -1062,7 +1054,7 @@ fn diff_field(path: &str, old: &ResolvedField, new: &ResolvedField, plan: &mut A
     }
     if old.indexed != new.indexed {
         // The inverted index either exists in the segments or it doesn't — a flip in either
-        // direction (task-215) changes the on-disk shape and can only be honored by a rebuild.
+        // direction changes the on-disk shape and can only be honored by a rebuild.
         plan.reindex_reasons.push(format!(
             "field `{path}` indexed {} → {}",
             old.indexed, new.indexed
@@ -1086,8 +1078,8 @@ fn diff_field(path: &str, old: &ResolvedField, new: &ResolvedField, plan: &mut A
     }
 }
 
-/// How a source's **equality deletes** are applied to the index ([task-15] /
-/// [equality deletes](../../../wiki/06-ingestion.md)). GrowlerDB is keyed by the
+/// How a source's **equality deletes** are applied to the index ([equality
+/// deletes](../../../wiki/06-ingestion.md)). GrowlerDB is keyed by the
 /// composite document key, so an equality delete on the key columns is just a
 /// `delete_by_key`; anything else needs a partition re-scan.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -1125,31 +1117,31 @@ pub struct ResolvedField {
     pub ty: FieldType,
     /// Analyzer name (TEXT only).
     pub analyzer: Option<String>,
-    /// Timestamp source format (task-112) — present iff the field was declared a timestamp; tells
+    /// Timestamp source format — present iff the field was declared a timestamp; tells
     /// ingestion how to normalize the source value to canonical epoch micros. `None` for a native
     /// DATE (already a date in the source) or a non-date field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<crate::timestamp::TimeFormat>,
-    /// Columnar fast field — sortable / filterable / aggregatable (task-23/24).
+    /// Columnar fast field — sortable / filterable / aggregatable.
     #[serde(default)]
     pub fast: bool,
-    /// Whether the field gets an inverted index (task-215) — see [`FieldMapping::indexed`]
+    /// Whether the field gets an inverted index — see [`FieldMapping::indexed`]
     /// for the per-type default. Always explicit in the persisted form: the derived Tantivy
     /// schema hangs off it, so it must never be guessed at rehydration.
     pub indexed: bool,
-    /// TEXT indexing detail (task-216): what each posting records — see
+    /// TEXT indexing detail: what each posting records — see
     /// [`FieldMapping::record`]. `POSITION` (and irrelevant) for non-TEXT fields.
     pub record: TextRecord,
-    /// TEXT fieldnorms (task-216) — see [`FieldMapping::fieldnorms`]. `true` (and
+    /// TEXT fieldnorms — see [`FieldMapping::fieldnorms`]. `true` (and
     /// irrelevant) for non-TEXT fields.
     pub fieldnorms: bool,
-    /// Cached display field — value stored in-index and returned with the hit (D23).
+    /// Cached display field — value stored in-index and returned with the hit.
     #[serde(default)]
     pub cached: bool,
-    /// Sensitive field — never cacheable (D23). See [`FieldMapping::sensitive`].
+    /// Sensitive field — never cacheable. See [`FieldMapping::sensitive`].
     #[serde(default)]
     pub sensitive: bool,
-    /// Declared max byte length, if known — drives the D23 big-text caching rule.
+    /// Declared max byte length, if known — drives the big-text caching rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<u64>,
 }
@@ -1285,7 +1277,7 @@ mapping:
     }
 
     #[test]
-    fn fast_non_text_defaults_to_columnar_only(/* task-215 */) {
+    fn fast_non_text_defaults_to_columnar_only() {
         // `count` is fast → no inverted index by default; `day` (DATE, not fast) keeps it;
         // `body` (TEXT) is always indexed, fast or not.
         let yaml = "name: docs\nsource: { iceberg: { catalog: growlerdb, table: growlerdb.docs } }\nmapping:\n  selection: ALL\n  fields:\n    - { path: count, fast: true }\n    - { path: body, fast: true }\n";
@@ -1309,7 +1301,7 @@ mapping:
     }
 
     #[test]
-    fn explicit_indexed_true_keeps_both_structures(/* task-215 */) {
+    fn explicit_indexed_true_keeps_both_structures() {
         let yaml = "name: docs\nsource: { iceberg: { catalog: growlerdb, table: growlerdb.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: count, fast: true, indexed: true } ] }\n";
         let r = IndexDefinition::from_yaml(yaml)
             .unwrap()
@@ -1319,7 +1311,7 @@ mapping:
     }
 
     #[test]
-    fn indexed_false_on_text_is_rejected(/* task-215 */) {
+    fn indexed_false_on_text_is_rejected() {
         let yaml = "name: docs\nsource: { iceberg: { catalog: growlerdb, table: growlerdb.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: body, type: TEXT, indexed: false, fast: true } ] }\n";
         let err = IndexDefinition::from_yaml(yaml)
             .unwrap()
@@ -1332,7 +1324,7 @@ mapping:
     }
 
     #[test]
-    fn indexed_false_without_fast_is_rejected(/* task-215 */) {
+    fn indexed_false_without_fast_is_rejected() {
         // Neither inverted nor columnar → unqueryable; loud error, not a silent dead field.
         let yaml = "name: docs\nsource: { iceberg: { catalog: growlerdb, table: growlerdb.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: count, indexed: false } ] }\n";
         let err = IndexDefinition::from_yaml(yaml)
@@ -1343,7 +1335,7 @@ mapping:
     }
 
     #[test]
-    fn text_record_and_fieldnorms_default_to_full_fidelity(/* task-216 */) {
+    fn text_record_and_fieldnorms_default_to_full_fidelity() {
         let yaml = "name: docs\nsource: { iceberg: { catalog: growlerdb, table: growlerdb.docs } }\nmapping:\n  selection: EXPLICIT\n  fields:\n    - { path: body, type: TEXT }\n    - { path: id, type: TEXT, record: FREQ, fieldnorms: false }\n";
         let r = IndexDefinition::from_yaml(yaml)
             .unwrap()
@@ -1361,7 +1353,7 @@ mapping:
     }
 
     #[test]
-    fn record_and_fieldnorms_are_rejected_on_non_text(/* task-216 */) {
+    fn record_and_fieldnorms_are_rejected_on_non_text() {
         let record_on_long = "name: docs\nsource: { iceberg: { catalog: growlerdb, table: growlerdb.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: count, record: BASIC } ] }\n";
         let err = IndexDefinition::from_yaml(record_on_long)
             .unwrap()
@@ -1378,7 +1370,7 @@ mapping:
     }
 
     #[test]
-    fn flipping_record_or_fieldnorms_requires_reindex(/* task-216 */) {
+    fn flipping_record_or_fieldnorms_requires_reindex() {
         let old = resolve_yaml(
             "name: docs\nsource: { iceberg: { catalog: growlerdb, table: growlerdb.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: body, type: TEXT } ] }\n",
         );
@@ -1410,7 +1402,7 @@ mapping:
     }
 
     #[test]
-    fn timestamp_format_makes_an_int_column_a_date(/* task-112 */) {
+    fn timestamp_format_makes_an_int_column_a_date() {
         // `count` is a LONG source column; declaring `format: epoch_ms` makes it a DATE timestamp.
         let yaml = "name: docs\nsource: { iceberg: { catalog: growlerdb, table: growlerdb.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: count, format: epoch_ms, fast: true } ] }\n";
         let r = IndexDefinition::from_yaml(yaml)
@@ -1426,7 +1418,7 @@ mapping:
     }
 
     #[test]
-    fn a_format_with_a_contradictory_non_date_type_is_rejected(/* task-112 */) {
+    fn a_format_with_a_contradictory_non_date_type_is_rejected() {
         let yaml = "name: docs\nsource: { iceberg: { catalog: growlerdb, table: growlerdb.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: count, type: LONG, format: epoch_ms } ] }\n";
         let err = IndexDefinition::from_yaml(yaml)
             .unwrap()
@@ -1604,7 +1596,7 @@ mapping:
 
     #[test]
     fn sensitive_field_cannot_be_cached() {
-        // D23 hard-block: marking a sensitive field `cached` is a resolve error.
+        // Hard-block: marking a sensitive field `cached` is a resolve error.
         let yaml = "name: docs\nsource: { iceberg: { catalog: growlerdb, table: growlerdb.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: body, cached: true, sensitive: true } ] }\n";
         let err = IndexDefinition::from_yaml(yaml)
             .unwrap()
@@ -1615,7 +1607,7 @@ mapping:
 
     #[test]
     fn big_text_field_cannot_be_cached() {
-        // D23: a field declared over the cache cap is hydrate-only — caching it errors.
+        // A field declared over the cache cap is hydrate-only — caching it errors.
         let over = MAX_CACHED_FIELD_BYTES + 1;
         let yaml = format!(
             "name: docs\nsource: {{ iceberg: {{ catalog: growlerdb, table: growlerdb.docs }} }}\nmapping: {{ selection: EXPLICIT, fields: [ {{ path: body, cached: true, max_bytes: {over} }} ] }}\n"
@@ -1657,8 +1649,8 @@ mapping:
 
     #[test]
     fn float_key_field_is_rejected() {
-        // A floating-point source field can't be a key — neither identifier nor partition
-        // (task-69): floats are unstable identity/routing keys and NaN diverges cross-language.
+        // A floating-point source field can't be a key — neither identifier nor partition:
+        // floats are unstable identity/routing keys and NaN diverges cross-language.
         let id_src = SourceSchema::new(
             vec![
                 SourceField::new("price", SourceType::Double),
@@ -1691,7 +1683,7 @@ mapping:
     #[test]
     fn temporal_key_fields_are_permitted() {
         // Date/timestamp source columns (both map to `SourceType::Date`) are legal key fields
-        // in either role (task-184): they extract to `Value::Ts` (canonical epoch micros) and
+        // in either role: they extract to `Value::Ts` (canonical epoch micros) and
         // encode/route deterministically, unlike floats.
         let src = SourceSchema::new(
             vec![
@@ -1776,7 +1768,7 @@ mapping:
         .resolve(&docs_schema());
         assert!(matches!(not_time, Err(DefError::WindowFieldNotTime(f)) if f == "id"));
 
-        // A raw LONG is now rejected (task-116): its unit is ambiguous — declare a `format`.
+        // A raw LONG is rejected: its unit is ambiguous — declare a `format`.
         let raw_long = IndexDefinition::from_yaml(
             "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nwindowing: { field: count, granularity: daily }\nmapping: { selection: EXPLICIT, fields: [ { path: count, type: LONG, fast: true } ] }\n",
         )
@@ -1794,7 +1786,7 @@ mapping:
     }
 
     #[test]
-    fn location_strategy_defaults_to_coordinates_and_round_trips(/* task-184 / D30 */) {
+    fn location_strategy_defaults_to_coordinates_and_round_trips() {
         // Omitted → COORDINATES, no honest-scope warning.
         let default_def = IndexDefinition::from_yaml(
             "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\n",
@@ -1818,7 +1810,7 @@ mapping:
     }
 
     #[test]
-    fn predicate_strategy_resolves_with_an_honest_scope_warning(/* task-184 / D30 */) {
+    fn predicate_strategy_resolves_with_an_honest_scope_warning() {
         let resolved = IndexDefinition::from_yaml(
             "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nlocation_strategy: PREDICATE\n",
         )
@@ -1841,7 +1833,7 @@ mapping:
     }
 
     #[test]
-    fn changing_location_strategy_requires_reindex(/* task-184 / D30 */) {
+    fn changing_location_strategy_requires_reindex() {
         let base = "name: docs\nsource: { iceberg: { catalog: growlerdb, table: growlerdb.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: body, type: TEXT } ] }";
         let coords = resolve_yaml(&format!("{base}\n"));
         let pred = resolve_yaml(&format!("{base}\nlocation_strategy: PREDICATE\n"));
@@ -1875,7 +1867,7 @@ mapping:
 
     #[test]
     fn changing_shard_count_requires_reindex() {
-        // Resharding re-routes every doc, so a shard_count change is reindex-only (task-73) —
+        // Resharding re-routes every doc, so a shard_count change is reindex-only —
         // never an in-place alter.
         let base = "name: docs\nsource: { iceberg: { catalog: growlerdb, table: growlerdb.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: body, type: TEXT } ] }";
         let old = resolve_yaml(&format!("{base}\nshard_count: 4\n"));
@@ -1928,7 +1920,7 @@ mapping:
     }
 
     #[test]
-    fn flipping_indexed_requires_reindex(/* task-215 */) {
+    fn flipping_indexed_requires_reindex() {
         // Same YAML both sides except `indexed:` — the fast field defaults to columnar-only,
         // opting back in flips the segments' shape.
         let old = resolve_yaml(
@@ -1980,7 +1972,7 @@ mapping:
 
     #[test]
     fn extra_design04_keys_are_ignored_not_rejected() {
-        // A richer field entry (fast/cached/sub_fields) still parses in M0.
+        // A richer field entry (fast/cached/sub_fields) still parses.
         let yaml = r#"
 name: docs
 source: { iceberg: { catalog: growlerdb, table: growlerdb.docs, scan: APPEND_FAST_PATH } }

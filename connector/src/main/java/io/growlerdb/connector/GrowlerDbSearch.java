@@ -18,10 +18,10 @@ import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 
 /**
- * Spark SQL entry point for GrowlerDB retrieval (task-51): run a boolean/full-text query against a
+ * Spark SQL entry point for GrowlerDB retrieval: run a boolean/full-text query against a
  * GrowlerDB index and get the matching document keys + relevance score back as a {@link Dataset} you
- * <b>join against the source Iceberg table</b>. This is the "search-then-join" model (D5,
- * wiki/07): GrowlerDB returns coordinates, the lakehouse engine resolves the authoritative rows.
+ * <b>join against the source Iceberg table</b>. This is the "search-then-join" model:
+ * GrowlerDB returns coordinates, the lakehouse engine resolves the authoritative rows.
  *
  * <pre>{@code
  * Dataset<Row> matches = GrowlerDbSearch.search(spark, "gateway-host", 50061,
@@ -93,7 +93,7 @@ public final class GrowlerDbSearch {
     return rows;
   }
 
-  /** A composite key's fields in column order: partition fields, then identifier fields (D5). */
+  /** A composite key's fields in column order: partition fields, then identifier fields. */
   private static List<Field> keyFields(Coordinates c) {
     List<Field> fields = new ArrayList<>(c.getPartitionList());
     fields.addAll(c.getIdentifierList());
@@ -125,7 +125,7 @@ public final class GrowlerDbSearch {
       case BOOL:
         return v.getBool();
       case TS_MICROS:
-        // Canonical epoch micros (task-184) → the TimestampType external type.
+        // Canonical epoch micros → the TimestampType external type.
         long micros = v.getTsMicros();
         return java.sql.Timestamp.from(
             java.time.Instant.ofEpochSecond(

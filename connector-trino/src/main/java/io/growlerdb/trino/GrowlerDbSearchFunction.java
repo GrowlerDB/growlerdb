@@ -20,7 +20,7 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
- * The {@code growlerdb_search} polymorphic table function (task-51):
+ * The {@code growlerdb_search} polymorphic table function:
  *
  * <pre>{@code
  * SELECT e.*
@@ -33,7 +33,7 @@ import java.util.stream.Collectors;
  * }</pre>
  *
  * Boolean retrieval runs in GrowlerDB; the function returns the matching keys (one column per key
- * field, D5) + a {@code growlerdb_score} double, which you JOIN against the source Iceberg table.
+ * field) + a {@code growlerdb_score} double, which you JOIN against the source Iceberg table.
  * {@code analyze} learns the result schema from the index's key fields; execution re-runs the query.
  */
 public class GrowlerDbSearchFunction extends AbstractConnectorTableFunction {

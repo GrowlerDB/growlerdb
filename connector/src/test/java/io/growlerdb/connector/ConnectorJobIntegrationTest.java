@@ -27,7 +27,7 @@ import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 /**
- * End-to-end of the connector pipeline (task-11) in Spark <b>local mode</b>: a temp
+ * End-to-end of the connector pipeline in Spark <b>local mode</b>: a temp
  * Iceberg table (Hadoop catalog) gets INSERT/UPDATE/DELETE, {@link ConnectorJob}
  * reads the changelog → maps → commits over the real Write gRPC to an in-process
  * Node stub, and we assert the committed {@link DocBatch}. This proves the
@@ -120,7 +120,7 @@ class ConnectorJobIntegrationTest {
     spark.sql("DROP TABLE IF EXISTS demo.ns.big");
     spark.sql("CREATE TABLE demo.ns.big (id STRING, body STRING) USING iceberg");
     // Three snapshots, two rows each (6 changelog rows). With a 2-row cap the window can't ride one
-    // Write — it must split at snapshot boundaries into multiple bounded commits (task-113).
+    // Write — it must split at snapshot boundaries into multiple bounded commits.
     spark.sql("INSERT INTO demo.ns.big VALUES ('a','1'), ('b','1')");
     spark.sql("INSERT INTO demo.ns.big VALUES ('c','1'), ('d','1')");
     spark.sql("INSERT INTO demo.ns.big VALUES ('e','1'), ('f','1')");
@@ -186,7 +186,7 @@ class ConnectorJobIntegrationTest {
         assertTrue(checkpoint != null, "first run establishes a checkpoint");
 
         // Drop + recreate the source with the same name → a brand-new lineage; the old checkpoint
-        // is no longer an ancestor of the head (task-114).
+        // is no longer an ancestor of the head.
         spark.sql("DROP TABLE demo.ns.recreated");
         spark.sql("CREATE TABLE demo.ns.recreated (id STRING, body STRING) USING iceberg");
         spark.sql("INSERT INTO demo.ns.recreated VALUES ('b', '2')");
@@ -219,7 +219,7 @@ class ConnectorJobIntegrationTest {
             List.of("id"));
 
     // Expected = Σ added-records over the window's append snapshots = 4; and the head is resolved
-    // from the `main` ref (task-194), matching the changelog scan's lineage.
+    // from the `main` ref, matching the changelog scan's lineage.
     Long head = job.currentSnapshotId(spark);
     assertEquals(4L, job.expectedAppendedRecords(spark, null, head), "counts both appends");
 
@@ -253,7 +253,7 @@ class ConnectorJobIntegrationTest {
     // An UPDATE / DELETE produces an overwrite/delete snapshot, whose changelog net diff legitimately
     // diverges from physical `added-records` (a row-level delete adds a DELETE row, an update rewrites
     // a data file). The gate must NOT strict-count such a window (that would false-stall); it returns
-    // -1 (exempt) and reconcile (task-195) is the backstop there.
+    // -1 (exempt) and reconcile is the backstop there.
     spark.sql("UPDATE demo.ns.mixed SET body = '2' WHERE id = 'a'");
     spark.sql("DELETE FROM demo.ns.mixed WHERE id = 'b'");
 

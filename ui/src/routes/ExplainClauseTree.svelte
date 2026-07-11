@@ -1,5 +1,5 @@
 <script lang="ts">
-  // One node of the BM25 explanation tree (task-102), rendered recursively. Each node shows its
+  // One node of the BM25 explanation tree, rendered recursively. Each node shows its
   // contributed score + description; children are the sub-clauses (term freq, IDF, field norm, …).
   import Self from './ExplainClauseTree.svelte';
   import type { ExplainClause } from '../lib/api';

@@ -1,10 +1,10 @@
-# A time-windowed index over the seeded `growlerdb.readings` table (task-81). Window by ingest time
+# A time-windowed index over the seeded `growlerdb.readings` table. Window by ingest time
 # (daily), prune sample-time queries via per-window event zone-maps. Build + serve:
 #   growlerdb index growlerdb.readings --def readings-windowed.yaml --name readings
 #   growlerdb serve readings --addr 0.0.0.0:50052 --rest-addr 0.0.0.0:8090
 # The window/event fields are `int64` epoch-millis at the source, so they're declared `format:
-# epoch_ms` → real timestamps stored as canonical micros (task-112/116), the one scale the windowing,
-# range, and console time-filter paths share. (A raw LONG window field is now rejected — its unit is
+# epoch_ms` → real timestamps stored as canonical micros, the one scale the windowing,
+# range, and console time-filter paths share. (A raw LONG window field is rejected — its unit is
 # ambiguous.)
 name: readings
 source:

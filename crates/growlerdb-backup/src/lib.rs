@@ -1,4 +1,4 @@
-//! **Object-storage backup & restore** for a shard's index (task-32). A backup ships a shard's
+//! **Object-storage backup & restore** for a shard's index. A backup ships a shard's
 //! consistent committed state — sealed Tantivy segments + the `location.arr` array + the
 //! `aux.redb` aux store + the index definition — to object storage; a restore pulls it back onto
 //! a replacement node, which then
@@ -35,13 +35,13 @@ pub enum BackupError {
     Codec(#[from] serde_json::Error),
     #[error("no backup found at prefix `{0}`")]
     NotFound(String),
-    /// The prefix is a **bundled** cold window (task-150 / F7): its data lives in the split bundle,
+    /// The prefix is a **bundled** cold window: its data lives in the split bundle,
     /// not per-file objects, so it can't be `restore`d — un-bundle it (`promote_cold`) instead.
     #[error("prefix `{0}` is a bundled cold window; un-bundle (promote) it rather than restore")]
     Bundled(String),
-    /// The manifest declares a [format](Manifest::format) newer than this binary supports (D30
-    /// foundations): the backup was written by a newer GrowlerDB whose layout this version can't
-    /// interpret, so refuse loudly rather than mis-restore.
+    /// The manifest declares a [format](Manifest::format) newer than this binary supports: the
+    /// backup was written by a newer GrowlerDB whose layout this version can't interpret, so
+    /// refuse loudly rather than mis-restore.
     #[error(
         "backup manifest format {found} is newer than the supported format {supported}: this \
          backup was written by a newer GrowlerDB — restore it with a matching GrowlerDB version"
@@ -51,12 +51,11 @@ pub enum BackupError {
 
 type Result<T> = std::result::Result<T, BackupError>;
 
-/// The manifest **format version** this binary writes and consumes. Format **1** IS the
-/// D30 layered-locator shard format — the file list carries `location.arr` beside the
-/// segments and `aux.redb`. (GrowlerDB is unreleased, so 1 was reset to mean the layered
-/// format; there is no earlier on-disk format in the wild.) The version field + the
-/// refuse-newer check in [`read_manifest`] are release hygiene: a future incompatible
-/// layout bumps this, and older binaries fail loudly instead of mis-restoring.
+/// The manifest **format version** this binary writes and consumes. Format **1** is the
+/// layered-locator shard format — the file list carries `location.arr` beside the
+/// segments and `aux.redb`. The version field + the refuse-newer check in [`read_manifest`]
+/// are release hygiene: a future incompatible layout bumps this, and older binaries fail
+/// loudly instead of mis-restoring.
 pub const MANIFEST_FORMAT: u32 = 1;
 
 /// Manifests written without a `format` field deserialize as format 1.
@@ -67,10 +66,9 @@ fn default_manifest_format() -> u32 {
 /// What a backup recorded — enough to restore the shard and resume ingestion exactly-once.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
-    /// Manifest **format version** (D30 foundations): bumped on incompatible layout changes.
-    /// Every consumer goes through [`read_manifest`], which refuses formats newer than
-    /// [`MANIFEST_FORMAT`] with [`BackupError::UnsupportedFormat`]. Defaulted to 1 so
-    /// pre-versioning manifests keep restoring.
+    /// Manifest **format version**: bumped on incompatible layout changes. Every consumer goes
+    /// through [`read_manifest`], which refuses formats newer than [`MANIFEST_FORMAT`] with
+    /// [`BackupError::UnsupportedFormat`]. Defaults to 1 when the field is absent.
     #[serde(default = "default_manifest_format")]
     pub format: u32,
     /// Index name.
@@ -87,10 +85,10 @@ pub struct Manifest {
     pub definition_json: Option<String>,
     /// Backup creation time (epoch ms).
     pub created_ms: u128,
-    /// Set once a cold window has been **bundled** (task-150 / F7): the individual `index/*` data
-    /// objects were removed and their bytes now live in the split bundle, so this manifest's file
-    /// list no longer resolves against `<prefix>/data/`. A plain [`restore`] refuses such a prefix
-    /// (it must be un-bundled — [`promote_cold`] does). Defaulted for pre-flag manifests.
+    /// Set once a cold window has been **bundled**: the individual `index/*` data objects were
+    /// removed and their bytes now live in the split bundle, so this manifest's file list no
+    /// longer resolves against `<prefix>/data/`. A plain [`restore`] refuses such a prefix (it
+    /// must be un-bundled — [`promote_cold`] does). Defaults to false when the field is absent.
     #[serde(default)]
     pub bundled: bool,
 }
@@ -112,7 +110,7 @@ pub struct S3Config {
     pub secret_access_key: String,
 }
 
-/// Wrap `op` with a **jittered retry layer** (task-149 / F9). Object stores routinely return
+/// Wrap `op` with a **jittered retry layer**. Object stores routinely return
 /// transient errors — S3 `503 SlowDown`, 5xx, connection resets — under exactly the load GrowlerDB
 /// generates (shipping a many-file shard, scanning a big snapshot). Without this a single blip aborts
 /// the whole backup / restore / replica-refresh mid-flight, and the non-transactional file-then-
@@ -128,7 +126,7 @@ fn with_retry(op: Operator) -> Operator {
 }
 
 /// An [`Operator`] over S3/MinIO. MinIO needs path-style addressing (opendal's default — virtual
-/// host style stays off unless explicitly enabled). Retries transient failures (task-149 / F9).
+/// host style stays off unless explicitly enabled). Retries transient failures.
 pub fn s3_store(cfg: &S3Config) -> Result<Operator> {
     let mut b = opendal::services::S3::default()
         .bucket(&cfg.bucket)
@@ -142,7 +140,7 @@ pub fn s3_store(cfg: &S3Config) -> Result<Operator> {
 }
 
 /// An [`Operator`] over a local directory — a filesystem backup target (mounted volume / NFS),
-/// and the backend the tests use. Retries transient failures (task-149 / F9; NFS can blip too).
+/// and the backend the tests use. Retries transient failures (NFS can blip too).
 pub fn fs_store(root: impl AsRef<Path>) -> Result<Operator> {
     let root = root.as_ref();
     std::fs::create_dir_all(root)?;
@@ -209,7 +207,7 @@ pub async fn backup(
         )
         .await?;
 
-    // Backup GC (task-33): prune superseded splits from object storage. Every compaction on the
+    // Backup GC: prune superseded splits from object storage. Every compaction on the
     // primary fuses segments into new, differently-named files; the old segment objects under
     // `{prefix}/data/` are no longer referenced by any manifest, and re-backing-up to the same
     // prefix only *adds* the new files — so without this the store accumulates orphaned splits
@@ -226,14 +224,14 @@ pub async fn backup(
 /// removes keys absent from the manifest's file set, so the restorable state (manifest + its files)
 /// is never touched. Returns the number of objects pruned.
 ///
-/// **Precondition — single writer per prefix (task-149 / I7).** GrowlerDB backs a shard up from its
+/// **Precondition — single writer per prefix.** GrowlerDB backs a shard up from its
 /// **one** primary, so there is exactly one writer per backup prefix. Two concurrent `backup()`s
 /// against the same prefix (e.g. a split-brain "both primary") could have one's prune delete a file
 /// the other just committed. That precondition holds by the shard-ownership model; the safety net for
 /// a replica that read an older manifest and races this prune is [`refresh`]'s re-read-and-retry on a
 /// mid-flight `NotFound`.
 /// List every **object** key under `prefix` (recursive), filtering out the trailing-slash directory
-/// markers the fs backend emits (task-153 / D3). The shared scan behind prune / bundle-delete /
+/// markers the fs backend emits. The shared scan behind prune / bundle-delete /
 /// promote — each of those only differs in what it does per key, not in how it enumerates them.
 async fn list_object_keys(store: &Operator, prefix: &str) -> Result<Vec<String>> {
     let mut keys = Vec::new();
@@ -247,7 +245,7 @@ async fn list_object_keys(store: &Operator, prefix: &str) -> Result<Vec<String>>
 }
 
 /// Best-effort delete every object under `prefix` (recursive), swallowing list/per-key errors — for
-/// reclaiming a superseded prefix where a straggler is harmless (task-153 / D3). Callers needing a
+/// reclaiming a superseded prefix where a straggler is harmless. Callers needing a
 /// count or hard failure use [`list_object_keys`] directly.
 async fn delete_prefix_best_effort(store: &Operator, prefix: &str) {
     if let Ok(keys) = list_object_keys(store, prefix).await {
@@ -274,7 +272,7 @@ async fn prune_superseded(store: &Operator, prefix: &str, manifest: &Manifest) -
     Ok(pruned)
 }
 
-/// Park a **cold** shard for tiered storage (task-80): back it up to `store` under `prefix`, then —
+/// Park a **cold** shard for tiered storage: back it up to `store` under `prefix`, then —
 /// only once the manifest is committed, so the backup is restorable — drop the open shard and evict
 /// its local directory `shard_dir`. The shard is taken **by value** so its file handles (redb +
 /// tantivy mmaps) close before the directory is unlinked. A parked window then lives only in object
@@ -307,14 +305,14 @@ pub async fn park(
     Ok(manifest)
 }
 
-/// Revive a parked shard (task-80): restore the backup at `prefix` back into `shard_dir` — the
+/// Revive a parked shard: restore the backup at `prefix` back into `shard_dir` — the
 /// inverse of [`park`]. A thin wrapper over [`restore`] named for the cold-tiering lifecycle; the
 /// caller then opens the shard and ingestion replays the tail from the manifest checkpoint.
 pub async fn revive(store: &Operator, prefix: &str, shard_dir: &Path) -> Result<Manifest> {
     restore(store, prefix, shard_dir).await
 }
 
-/// **Cold-park** a window shard for *read-through* serving (task-80): back its bulk up to `store`
+/// **Cold-park** a window shard for *read-through* serving: back its bulk up to `store`
 /// under `prefix`, then evict only the local Tantivy `index/` dir while **keeping `aux.redb`**, and
 /// drop a [`ColdMarker`] in `window_dir`. Unlike [`park`] (full evict → unqueryable until restored),
 /// the window stays **searchable in place** — `open_cold_shard` serves the index read-through from
@@ -347,11 +345,11 @@ pub async fn cold_park(
     .await?;
     // Backup committed → close handles (redb + tantivy) before touching the directory. The local
     // `index/` is NOT evicted yet: eviction is the LAST step (after the marker is durable) so a crash
-    // mid-park leaves a fully-serving hot shard, never a markerless empty window (task-150 / F4).
+    // mid-park leaves a fully-serving hot shard, never a markerless empty window.
     drop(shard);
     let base = prefix.trim_end_matches('/');
     let object_prefix = format!("{base}/data/index");
-    // Precomputed hotcache (task-83): warm the just-parked index once and store the structural reads
+    // Precomputed hotcache: warm the just-parked index once and store the structural reads
     // as a sidecar, so cold opens issue zero object round-trips. Kept OUTSIDE `{prefix}/data/` so the
     // backup GC (which prunes unreferenced data objects) never touches it. Best-effort: a failure to
     // build it just means cold opens fall back to plain read-through, so don't fail the park.
@@ -372,13 +370,13 @@ pub async fn cold_park(
             None => None,
         }
     };
-    // Split bundle (task-83): concatenate the parked index files into ONE object so cold queries
+    // Split bundle: concatenate the parked index files into ONE object so cold queries
     // issue ranged GETs against a single object instead of one per file. On success the now-redundant
     // individual index objects are removed — the bundle is the sole serving copy, so no storage
     // doubling — and open falls to the bundle for both structural and posting reads. On failure we
     // keep the individual files and fall back to plain per-file read-through. Stored OUTSIDE `data/`
     // so backup GC won't touch it. Built AFTER the hotcache (which reads the individual files).
-    // Bundle from the LOCAL window files (task-155): they're still on disk here (eviction is the last
+    // Bundle from the LOCAL window files: they're still on disk here (eviction is the last
     // step), so stream them straight into the split object instead of re-downloading the whole window
     // from the store. The backup manifest lists exactly what was parked; the `index/` entries (stripped
     // of that prefix) are the bare rels the bundle records, read from `window_dir/index`.
@@ -402,7 +400,7 @@ pub async fn cold_park(
         {
             Ok(_) => {
                 delete_prefix_best_effort(store, &format!("{object_prefix}/")).await;
-                // Keep the committed manifest consistent with the store (task-150 / F7): the
+                // Keep the committed manifest consistent with the store: the
                 // individual `index/*` objects are gone, so mark it `bundled` and drop those entries
                 // (keep `aux.redb`) — a plain `restore` of this prefix now refuses cleanly instead of
                 // 404-ing mid-download. Best-effort: the cold window serves from the bundle regardless.
@@ -429,7 +427,7 @@ pub async fn cold_park(
         window_dir.join(growlerdb_index::COLD_MARKER),
         serde_json::to_vec_pretty(&marker)?,
     )?;
-    // Evict the local bulk LAST, now that the marker is durably written (task-150 / F4) — before this
+    // Evict the local bulk LAST, now that the marker is durably written — before this
     // point a crash leaves a hot shard; after it, discovery serves the window cold read-through.
     // `aux.redb` stays as the cold footprint.
     let index_subdir = window_dir.join("index");
@@ -439,13 +437,13 @@ pub async fn cold_park(
     Ok(marker)
 }
 
-/// Promote a cold (read-through) window back to a **local hot shard** (task-83 pre-warm): materialize
+/// Promote a cold (read-through) window back to a **local hot shard**: materialize
 /// its Tantivy index files locally under `window_dir/index` — from the split bundle when present, else
-/// the individual objects (pre-bundle windows) — then drop the `cold.json` marker. The window's
+/// the individual objects (unbundled windows) — then drop the `cold.json` marker. The window's
 /// `aux.redb` is already local, so afterward `open_shard` opens a normal on-NVMe hot shard with no
 /// cold latency; the caller swaps it into the live handle. On success the window's now-unused
-/// object-storage copies (bundle / hotcache / backup) are reclaimed (task-150 / B9), which also
-/// mops up any `data/index/*` orphaned by a crashed bundle-delete (I5).
+/// object-storage copies (bundle / hotcache / backup) are reclaimed, which also
+/// mops up any `data/index/*` orphaned by a crashed bundle-delete.
 pub async fn promote_cold(store: &Operator, marker: &ColdMarker, window_dir: &Path) -> Result<()> {
     let index_dir = window_dir.join("index");
     std::fs::create_dir_all(&index_dir)?;
@@ -457,7 +455,7 @@ pub async fn promote_cold(store: &Operator, marker: &ColdMarker, window_dir: &Pa
             growlerdb_index::bundle::unbundle(store, bundle_key, manifest_key, &index_dir).await?;
         }
         _ => {
-            // Pre-bundle cold window: pull the individual index objects down.
+            // Unbundled cold window: pull the individual index objects down.
             let base = format!("{}/", marker.object_prefix.trim_end_matches('/'));
             for key in list_object_keys(store, &base).await? {
                 let rel = key.strip_prefix(base.as_str()).unwrap_or(key.as_str());
@@ -474,7 +472,7 @@ pub async fn promote_cold(store: &Operator, marker: &ColdMarker, window_dir: &Pa
     // Drop the cold marker → discovery/open now treats this as a hot local window.
     let _ = std::fs::remove_file(window_dir.join(growlerdb_index::COLD_MARKER));
     durable::sync_dir(window_dir)?;
-    // Reclaim the window's object-storage copies now that it's served locally (task-150 / B9, I5):
+    // Reclaim the window's object-storage copies now that it's served locally:
     // remove everything under the window's backup prefix — bundle, split.manifest, hotcache.bin,
     // data/, manifest.json. Best-effort: a failure just leaves reclaimable objects, never breaks the
     // now-local shard. `object_prefix` is `<prefix>/data/index`, so strip that to get the prefix root.
@@ -486,8 +484,8 @@ pub async fn promote_cold(store: &Operator, marker: &ColdMarker, window_dir: &Pa
 
 /// Read a backup's manifest from `store` under `prefix` (without downloading the data). The single
 /// funnel every manifest consumer uses (restore / revive / refresh / status), so this is where a
-/// manifest [format](Manifest::format) newer than [`MANIFEST_FORMAT`] is refused (D30 foundations):
-/// a newer layout can't be interpreted here, and failing loudly beats mis-restoring.
+/// manifest [format](Manifest::format) newer than [`MANIFEST_FORMAT`] is refused: a newer layout
+/// can't be interpreted here, and failing loudly beats mis-restoring.
 pub async fn read_manifest(store: &Operator, prefix: &str) -> Result<Manifest> {
     let prefix = prefix.trim_end_matches('/');
     let key = format!("{prefix}/manifest.json");
@@ -516,8 +514,8 @@ pub async fn read_manifest(store: &Operator, prefix: &str) -> Result<Manifest> {
 pub async fn restore(store: &Operator, prefix: &str, dest: &Path) -> Result<Manifest> {
     let manifest = read_manifest(store, prefix).await?;
     // A bundled cold-window prefix has no `index/*` data objects (they live in the split bundle), so
-    // a per-file restore can't rebuild it — refuse cleanly rather than 404 mid-download (task-150 /
-    // F7). Such a window is un-bundled by `promote_cold`, not restored.
+    // a per-file restore can't rebuild it — refuse cleanly rather than 404 mid-download. Such a
+    // window is un-bundled by `promote_cold`, not restored.
     if manifest.bundled {
         return Err(BackupError::Bundled(prefix.to_string()));
     }
@@ -552,7 +550,7 @@ pub struct RefreshStats {
     pub removed: usize,
 }
 
-/// Refresh a **replica** shard at `dest` from the primary's backup at `prefix` — D14 segment
+/// Refresh a **replica** shard at `dest` from the primary's backup at `prefix` — segment
 /// shipping: the replica *pulls sealed segments* rather than re-indexing the source. Incremental:
 /// immutable segment files already present (same path + size) are skipped; the mutable
 /// `meta.json` / `.managed.json` / `aux.redb` are always re-fetched; and local index files no
@@ -563,8 +561,8 @@ pub async fn refresh(store: &Operator, prefix: &str, dest: &Path) -> Result<Refr
     let manifest = read_manifest(store, prefix).await?;
     match refresh_once(store, prefix, dest, manifest).await {
         // A listed segment 404'd mid-download: a concurrent backup's GC (prune_superseded) pruned a
-        // file this now-stale manifest still names (task-149 / I7). Re-read the manifest and retry
-        // once against the current file set; a second NotFound is a real error.
+        // file this now-stale manifest still names. Re-read the manifest and retry once against the
+        // current file set; a second NotFound is a real error.
         Err(BackupError::Store(e)) if e.kind() == opendal::ErrorKind::NotFound => {
             let manifest = read_manifest(store, prefix).await?;
             refresh_once(store, prefix, dest, manifest).await
@@ -637,7 +635,7 @@ async fn refresh_once(
     })
 }
 
-/// One **live read-replica** refresh cycle (task-31): [`refresh`] the replica's `shard_id` shard in
+/// One **live read-replica** refresh cycle: [`refresh`] the replica's `shard_id` shard in
 /// `store`, and re-open it **only when the primary has actually moved on** — returning the fresh
 /// shard for the caller to hot-swap (e.g. `ShardHandle::swap`). The primary's `meta.json`/`aux.redb`
 /// re-download every poll (they're mutable), so the authoritative "something changed" signal is the

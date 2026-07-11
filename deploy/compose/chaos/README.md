@@ -1,6 +1,6 @@
 # Chaos drills (Compose)
 
-Fault-injection drills for the single-host Compose stack (task-115). Each drill injects a failure
+Fault-injection drills for the single-host Compose stack. Each drill injects a failure
 against a **running** stack and asserts the system self-heals — the Compose analogue of the
 Kubernetes chaos scenarios (pod/node faults via the Helm chart), which live separately.
 
@@ -14,7 +14,7 @@ Kubernetes chaos scenarios (pod/node faults via the Helm chart), which live sepa
 | Drill | Injects | Asserts |
 |---|---|---|
 | `crash-recovery.sh [node\|gateway\|controlplane]` | `docker kill` (SIGKILL) of a core service | it self-restarts (the `restart:` policy), `/readyz` recovers, and search still answers through the gateway — all within the RTO bound |
-| `catalog-outage.sh` | `docker kill` of Polaris (the Iceberg catalog) | **search stays available** during the outage (local index, catalog-independent), Polaris self-restarts, and **hydration recovers automatically** when it returns (`keys:get` reads the authoritative Iceberg row — end-to-end proof the catalog survived the bounce with its tables, task-114). Requires `jq`. |
+| `catalog-outage.sh` | `docker kill` of Polaris (the Iceberg catalog) | **search stays available** during the outage (local index, catalog-independent), Polaris self-restarts, and **hydration recovers automatically** when it returns (`keys:get` reads the authoritative Iceberg row — end-to-end proof the catalog survived the bounce with its tables). Requires `jq`. |
 
 ```sh
 # crash a core service (default `node`)

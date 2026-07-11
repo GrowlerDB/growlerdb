@@ -1,17 +1,13 @@
 //! Runtime document model — the data the [index](crate::index_def) is built from.
 //!
-//! A [`Document`] is a [`CompositeKey`] (partition + identifier values, [D5]) plus
-//! its mapped field values. A [`DocBatch`] is a batch of them. This is the M0
-//! subset of the [Index API](../../../design/02-index-api.md) write path: upserts
-//! only — `DocOp::Delete`, checkpoints, and vectors arrive with streaming (M1).
-//!
-//! [D5]: ../../../wiki/21-decisions.md
+//! A [`Document`] is a [`CompositeKey`] (partition + identifier values) plus its
+//! mapped field values. A [`DocBatch`] is a batch of them.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// A scalar field value (M0 subset). Mirrors the source types GrowlerDB maps from.
+/// A scalar field value. Mirrors the source types GrowlerDB maps from.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Value {
@@ -23,15 +19,15 @@ pub enum Value {
     Float(f64),
     /// Boolean.
     Bool(bool),
-    /// A temporal instant as canonical **epoch microseconds UTC** (the task-112
-    /// convention the index stores dates in). One variant covers both source dates
+    /// A temporal instant as canonical **epoch microseconds UTC** (the convention
+    /// the index stores dates in). One variant covers both source dates
     /// and timestamps — the source schema disambiguates at the boundary.
     Ts(i64),
 }
 
 impl Value {
-    /// Render the value as the string that gets tokenized/indexed. M0 indexes
-    /// every field as TEXT or KEYWORD, so non-string values are stringified.
+    /// Render the value as the string that gets tokenized/indexed. Non-string
+    /// values are stringified for TEXT/KEYWORD indexing.
     pub fn to_index_string(&self) -> String {
         match self {
             Value::Str(s) => s.clone(),
@@ -39,7 +35,7 @@ impl Value {
             Value::Float(f) => f.to_string(),
             Value::Bool(b) => b.to_string(),
             // Canonical micros, rendered like an Int — matches how a pre-parsed epoch
-            // column has always been stringified for TEXT/KEYWORD indexing.
+            // column is stringified for TEXT/KEYWORD indexing.
             Value::Ts(t) => t.to_string(),
         }
     }
@@ -63,10 +59,8 @@ impl From<i64> for Value {
     }
 }
 
-/// The composite document key ([D5]): ordered partition fields + identifier
+/// The composite document key: ordered partition fields + identifier
 /// fields. Order is preserved so the key encodes/round-trips deterministically.
-///
-/// [D5]: ../../../wiki/21-decisions.md
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompositeKey {
     /// Partition field name → value, in key order.
@@ -98,12 +92,10 @@ impl CompositeKey {
     /// store ([Design 08](../../../design/08-schemas.md)). Each field is encoded
     /// as `role · len(name) · name · type-tag · len(value) · value`, so lookups
     /// are **exact** and deterministic. It is **not** order-preserving across
-    /// types — hash routing ([D12]) doesn't need it. Type tags: `1` Str, `2` Int,
+    /// types — hash routing doesn't need it. Type tags: `1` Str, `2` Int,
     /// `3` Float, `4` Bool, `5` Ts — the encoding of existing tags is frozen (it
     /// is the routing-hash input and the Tantivy delete term), so new types only
     /// ever **append** tags.
-    ///
-    /// [D12]: ../../../wiki/21-decisions.md
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         for (role, fields) in [(0u8, &self.partition), (1u8, &self.identifier)] {
@@ -121,8 +113,8 @@ impl CompositeKey {
 fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     // The length prefix is a `u32`, so a value/name ≥ 4 GiB would wrap and produce an ambiguous
     // (collision-prone) key. That's absurd for a key field, and everything else would break first —
-    // but assert the invariant so it can't silently corrupt in dev/tests (task-153 / L6). The prefix
-    // width is part of the on-disk key encoding, so it stays `u32` (widening would break existing keys).
+    // but assert the invariant so it can't silently corrupt in dev/tests. The prefix width is part
+    // of the on-disk key encoding, so it stays `u32` (widening would break existing keys).
     debug_assert!(
         bytes.len() <= u32::MAX as usize,
         "key component exceeds the u32 length prefix",
@@ -145,7 +137,7 @@ fn push_value(out: &mut Vec<u8>, value: &Value) {
         Value::Float(f) => {
             // A float key isn't canonical cross-language and NaN has many bit patterns, so
             // `KeySpec::resolve` rejects Double key fields — a Float should never reach a key
-            // position. Assert it here too, where the bytes are produced (task-153 / I13).
+            // position. Assert it here too, where the bytes are produced.
             debug_assert!(!f.is_nan(), "NaN float in a composite key (non-canonical)");
             out.push(3);
             push_bytes(out, &f.to_bits().to_le_bytes());
@@ -199,8 +191,8 @@ pub enum KeyDecodeError {
 
 impl CompositeKey {
     /// Decode an [`encode`](Self::encode) output back into the key — the exact inverse of the
-    /// frozen encoding (task-212: the index stores this same byte string as the hit's key, so
-    /// hits/exports rebuild the key from it instead of a per-doc JSON copy). **Strict**: trailing
+    /// frozen encoding. The index stores this same byte string as the hit's key, so hits/exports
+    /// rebuild the key from it instead of a per-doc JSON copy. **Strict**: trailing
     /// bytes, unknown tags/roles, wrong fixed-value widths, and non-UTF-8 names all error —
     /// a stored key either round-trips exactly or fails loudly, never silently reshapes.
     pub fn decode(bytes: &[u8]) -> Result<Self, KeyDecodeError> {
@@ -283,14 +275,11 @@ impl CompositeKey {
 }
 
 /// A position in the source stream that a [committed](crate::doc) index state
-/// reflects — persisted so re-ingest from the same point is a no-op (exactly-once,
-/// [D9]). M0 reads an Iceberg snapshot append-only.
-///
-/// [D9]: ../../../wiki/21-decisions.md
+/// reflects — persisted so re-ingest from the same point is a no-op (exactly-once).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceCheckpoint {
     /// The Iceberg table snapshot the index reflects. `snapshot_id` is the position's
-    /// **identity** — a random long, so it carries no order (task-205). `sequence_number`
+    /// **identity** — a random long, so it carries no order. `sequence_number`
     /// is the snapshot's Iceberg **data sequence number** — strictly monotone along a
     /// branch (v2 tables), the only sound way to order two checkpoints. `None` = unknown
     /// (a legacy persisted value, or a v1 table where sequence numbers don't exist):
@@ -342,7 +331,7 @@ impl SourceCheckpoint {
 
     /// Lineage order between two checkpoints: `Equal` for the same position, else ordered
     /// by sequence number when **both** are known, else `None` — incomparable (snapshot
-    /// ids are random longs, task-205), so callers must fall back to exact-match
+    /// ids are random longs), so callers must fall back to exact-match
     /// semantics rather than guess.
     pub fn lineage_cmp(&self, other: &SourceCheckpoint) -> Option<std::cmp::Ordering> {
         if self.same_position(other) {
@@ -420,7 +409,7 @@ impl Document {
     }
 }
 
-/// A batch of documents to build into a segment (M0: upserts only).
+/// A batch of documents to build into a segment (upserts only).
 #[derive(Debug, Clone, Default)]
 pub struct DocBatch {
     /// The documents in the batch.
@@ -462,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn composite_key_decode_inverts_encode(/* task-212 */) {
+    fn composite_key_decode_inverts_encode() {
         // Every value type, both roles, multi-field, unicode names, empty strings.
         let keys = [
             CompositeKey::new(
@@ -490,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn composite_key_decode_rejects_malformed_bytes(/* task-212 */) {
+    fn composite_key_decode_rejects_malformed_bytes() {
         let enc = CompositeKey::new(
             vec![("day".into(), Value::Str("x".into()))],
             vec![("id".into(), Value::Int(7))],
@@ -627,7 +616,7 @@ mod tests {
         assert_eq!(serde_json::from_str::<SourceCheckpoint>(&json).unwrap(), cp);
     }
 
-    /// task-196: sequence-numbered checkpoints round-trip, no-sequence ones keep the exact
+    /// Sequence-numbered checkpoints round-trip, no-sequence ones keep the exact
     /// legacy JSON shape (nothing changes on disk until sequence numbers actually flow), and
     /// legacy persisted values parse.
     #[test]
@@ -648,7 +637,7 @@ mod tests {
         );
     }
 
-    /// task-196/205: lineage order comes from the sequence number; same position is Equal even
+    /// Lineage order comes from the sequence number; same position is Equal even
     /// across the format seam; different positions without both sequences are incomparable —
     /// snapshot ids are random longs and must never be ordered numerically.
     #[test]

@@ -1,20 +1,19 @@
-# Periodic Iceberg table maintenance for growlerdb.http_logs (task-126). The streaming generator commits a
+# Periodic Iceberg table maintenance for growlerdb.http_logs. The streaming generator commits a
 # tiny append every few seconds, so the source table accumulates thousands of small data files +
 # manifests — which slows *hydration* (search reads the authoritative rows from Iceberg via the
 # index's row locators; lots of tiny files + fat metadata = slow planning/opens). This CronJob runs
 # the standard Iceberg maintenance procedures via spark-sql against the Polaris catalog:
 #   - rewrite_data_files : compact small files into ~128MB files (the hydration win). SORTED by
 #       (ts, request_id) so rows cluster in the parquet row groups by time then key — a point lookup
-#       of a `request_id` prunes to a small run of row groups (task-145). The sort key MUST match the
+#       of a `request_id` prunes to a small run of row groups. The sort key MUST match the
 #       table's schema: http_logs is unpartitioned, hash-routed by `request_id` (no `site`/`id`).
 #       Aggressive: min-input-files=2, so any table with ≥2 small files is compacted every run.
 #   - rewrite_manifests  : compact the manifest list
 #   - expire_snapshots   : drop old snapshots + reclaim their now-unreferenced data files
 #   - remove_orphan_files: delete data/metadata files that NO snapshot references. expire_snapshots
 #       does not catch these — the sorted rewrite above uses partial-progress commits, whose
-#       superseded/partial-commit files become orphans that otherwise accumulate unbounded (they hit
-#       21GB of orphans on the home-lab before this was wired in — vs ~136MB of live data — and kept
-#       tipping the node into DiskPressure). It lists the data dir via the Hadoop FileSystem (not
+#       superseded/partial-commit files become orphans that otherwise accumulate unbounded and can
+#       tip a node into DiskPressure. It lists the data dir via the Hadoop FileSystem (not
 #       S3FileIO), which has no handler for MinIO's `s3://` scheme by default ("No FileSystem for
 #       scheme s3"), so we add hadoop-aws + an `fs.s3a` mapping. The interval (ORPHAN_OLDER_THAN_HOURS,
 #       default 24h — also Iceberg's minimum for the SQL procedure) stays safely older than the

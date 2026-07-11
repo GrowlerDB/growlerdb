@@ -1,9 +1,9 @@
-# GrowlerDB Spark changelog connector (task-123) — RENDERED per workload (task-214), do not apply
-# directly: python3 bench/scale/harness.py render <workload> --shards N (or deploy/k8s/scale-up.sh).
+# GrowlerDB Spark changelog connector — RENDERED per workload, do not apply directly:
+# python3 bench/scale/harness.py render <workload> --shards N (or deploy/k8s/scale-up.sh).
 # --table/--identifier/--fields/--index derive from the workload's index.yaml, and --nodes is sized
 # to the shard count — a mismatch aborts the connector ("routing config mismatch") and ingestion
 # silently stays at 0. A Deployment so it auto-restarts on a streaming error — on restart it
-# re-reads each Node's committed checkpoint and resumes exactly-once (task-16).
+# re-reads each Node's committed checkpoint and resumes exactly-once.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -18,9 +18,8 @@ spec:
   template:
     metadata:
       labels: { app: growlerdb-connector }
-      # Scrape the connector's own ingest metrics (task-194 AC6): per-trigger rows read/expected,
-      # per-shard acks, stream restarts, write retries, under-read stalls — the signals that were
-      # printf-only and rotated away during the silent-loss window.
+      # Scrape the connector's own ingest metrics: per-trigger rows read/expected, per-shard acks,
+      # stream restarts, write retries, under-read stalls.
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9091"
@@ -30,24 +29,24 @@ spec:
       containers:
         - name: connector
           image: ghcr.io/growlerdb/growlerdb-connector:dev
-          imagePullPolicy: Always   # :dev is mutable — re-pull on every roll so rebuilds land (cf. Helm #238)
+          imagePullPolicy: Always   # :dev is mutable — re-pull on every roll so rebuilds land
           env:
             - { name: AWS_ACCESS_KEY_ID, value: minioadmin }
             - { name: AWS_SECRET_ACCESS_KEY, value: minioadmin }
             - { name: AWS_REGION, value: us-east-1 }
-            # task-125: graceful in-place recovery from a shard-node crash. The stream commits tiny
-            # batches, so a tight write deadline lets a wedged write fail + retry fast; channel
-            # keepalive (WriteClient) detects the dead connection and re-resolves DNS to the restarted
-            # pod's new IP, so writes resume in seconds with no pod restart. (Code defaults — 30s
+            # Graceful in-place recovery from a shard-node crash. The stream commits tiny batches,
+            # so a tight write deadline lets a wedged write fail + retry fast; channel keepalive
+            # (WriteClient) detects the dead connection and re-resolves DNS to the restarted pod's
+            # new IP, so writes resume in seconds with no pod restart. (Code defaults — 30s
             # deadline — stay safe for large backfills.)
             - { name: GROWLERDB_WRITE_DEADLINE_SECONDS, value: "8" }
-            # Expose the connector's Prometheus metrics on :9091 (task-194 AC6). Unset ⇒ no server.
+            # Expose the connector's Prometheus metrics on :9091. Unset ⇒ no server.
             - { name: GROWLERDB_METRICS_PORT, value: "9091" }
             # Cap the JVM DNS cache at *launch* so the keepalive-triggered re-resolution returns the
             # new pod IP. Must be a JVM launch flag — an in-code Security.setProperty runs too late
             # (Spark resolves hosts before main()). sun.net.inetaddr.ttl is the launch-time knob.
             # Also point log4j at the bundled config so Spark/Hadoop/Iceberg INFO doesn't flood the
-            # container log and rotate the connector's own lines out of the window (task-194 AC6).
+            # container log and rotate the connector's own lines out of the window.
             - { name: SPARK_SUBMIT_OPTS, value: "-Dsun.net.inetaddr.ttl=3 -Dsun.net.inetaddr.negative.ttl=1 -Dlog4j2.configurationFile=connector-log4j2.properties" }
           ports:
             - { name: metrics, containerPort: 9091 }

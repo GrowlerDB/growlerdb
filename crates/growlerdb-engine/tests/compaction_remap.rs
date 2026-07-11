@@ -1,4 +1,4 @@
-//! **Compaction-under-hydration regression test** (task-184 slice 3 acceptance, [D30]):
+//! **Compaction-under-hydration regression test**:
 //! an Iceberg compaction moves every row to new data files at new positions and deletes
 //! the old files — with the background **re-map** on, hydration afterwards needs **zero**
 //! lazy refreshes (`growlerdb_stale_locators_total` delta = 0) and every slot points at
@@ -16,8 +16,6 @@
 //! composes: `resolve_locators` → `apply_live_file_bitmap` → pass-1 verify against the
 //! real parquet contents → pass-2 fallback by key → `refresh_locators` +
 //! `sli::hydration` (which owns the stale counter).
-//!
-//! [D30]: ../../okf/system/decisions/d30-layered-locator.md
 
 use std::collections::BTreeMap;
 use std::path::Path;

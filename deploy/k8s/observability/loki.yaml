@@ -1,9 +1,8 @@
-# Log aggregation for the scale-test cluster (task-234): single-binary Loki + a Promtail DaemonSet
+# Log aggregation for the scale-test cluster: single-binary Loki + a Promtail DaemonSet
 # that ships every growlerdb-namespace pod's logs into it, wired as a Grafana datasource (grafana.yaml).
-# The Run-3 miss: the bundle had metrics but NO logs — `kubectl logs` only, per-pod, gone at teardown.
 # With this, connector/node/gateway/generator logs are queryable in the same Grafana as the metrics
-# (correlate a write-latency spike with the node's log), and exportable before `terraform destroy`
-# (task-235). Ephemeral storage (emptyDir) + short retention — this is a test bundle, not production.
+# (correlate a write-latency spike with the node's log), and exportable before `terraform destroy`.
+# Ephemeral storage (emptyDir) + short retention — this is a test bundle, not production.
 # Deploy: applied by scale-up.sh step 6 (`kubectl apply -f deploy/k8s/observability/`).
 apiVersion: v1
 kind: ConfigMap
@@ -89,9 +88,9 @@ data:
       - url: http://loki:3100/loki/api/v1/push
     scrape_configs:
       # Tail every growlerdb-namespace pod's container logs via a STATIC path glob + CRI parse, and
-      # extract the pod/container labels from the filename (task-236). NB: the kubernetes_sd `role: pod`
-      # relabel approach silently produced 0 active targets here (verified on kind, promtail 2.9.10 +
-      # 3.3.0); the static glob over the kubelet's on-disk CRI logs is the reliable pattern and needs no
+      # extract the pod/container labels from the filename. NB: the kubernetes_sd `role: pod` relabel
+      # approach silently produced 0 active targets here (verified on kind, promtail 2.9.10 + 3.3.0);
+      # the static glob over the kubelet's on-disk CRI logs is the reliable pattern and needs no
       # k8s API access. Path shape: /var/log/pods/<ns>_<pod>_<uid>/<container>/*.log.
       - job_name: growlerdb-pods
         static_configs:

@@ -8,9 +8,9 @@ timestamp: 2026-07-04T14:22:00
 
 # D33. Distributed windowed topology — CP-driven placement, streaming-first
 
-**Decision.** A **windowed** index (D-windowing / task-81) is deployed distributed as **N
-interchangeable nodes** that serve **control-plane-assigned time windows**, not fixed hash ordinals
-(task-219). The control plane keeps a per-index **node inventory** (nodes heartbeat via `RegisterNode`;
+**Decision.** A **windowed** index is deployed distributed as **N
+interchangeable nodes** that serve **control-plane-assigned time windows**, not fixed hash ordinals.
+The control plane keeps a per-index **node inventory** (nodes heartbeat via `RegisterNode`;
 in-memory, TTL'd — liveness is ephemeral, not durable topology) and **places each window on the
 least-loaded live node on first ask** (`ResolveWindowOwner`, idempotent, dead-owner re-placement). It
 is **streaming-first**: windowed nodes start **empty**, and the node creates a window's shard on the
@@ -49,7 +49,7 @@ CronJob is hash-tuned; a window-partition sort key is a convenience follow-up). 
 fields aren't supported for connector-side routing yet (numeric-epoch only — a loud error, not a
 silent misroute).
 
-**Status.** Accepted (task-219). Engine + connector unit/integration tested (placement, `swap_windowed`,
+**Status.** Accepted. Engine + connector unit/integration tested (placement, `swap_windowed`,
 dynamic mux, `WindowedWriteService` create-on-write + per-window checkpoint, `WindowRouter` parity,
 `WindowedWriteClient` partition). Extends **D12** (adds a time-window sharding mode alongside hash),
 **D9** (reconcile is per-shard, unaffected), and the windowing feature. Closes the

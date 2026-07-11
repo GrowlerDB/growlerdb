@@ -17,7 +17,7 @@ import org.apache.spark.sql.RowFactory;
 import org.junit.jupiter.api.Test;
 
 /**
- * Unit tests for {@link ConnectorJob#plan} — the bounded-catch-up windowing (task-113). Pure list
+ * Unit tests for {@link ConnectorJob#plan} — the bounded-catch-up windowing. Pure list
  * logic, no Spark: split an ordinal-sorted changelog window into sub-batches capped at N rows, cut
  * only at snapshot boundaries, each carrying a valid snapshot checkpoint.
  */
@@ -117,7 +117,7 @@ class ConnectorJobPlanTest {
     assertEquals(5, commits.get(0).rows.size());
   }
 
-  // --- streaming (task-203) ---------------------------------------------------
+  // --- streaming ---------------------------------------------------
 
   @Test
   void streamCommitsFlushesTheSameCutsAsPlanToTheSink() {
@@ -175,7 +175,7 @@ class ConnectorJobPlanTest {
     assertTrue(maxChunk[0] <= 10, "no chunk exceeded the cap: " + maxChunk[0]);
   }
 
-  // --- bounded metadata walk (task-203, AC2) ----------------------------------
+  // --- bounded metadata walk ----------------------------------
 
   /** A `.snapshots` metadata row: (snapshot_id, parent_id, operation, added-records string). */
   private static Row snap(long id, Long parent, String op, String added) {

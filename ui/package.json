@@ -1,6 +1,6 @@
 {
   "name": "growlerdb-ui",
-  "description": "GrowlerDB console — a Svelte SPA over the Engine API (task-45).",
+  "description": "GrowlerDB console — a Svelte SPA over the Engine API.",
   "private": true,
   "version": "0.0.0",
   "type": "module",

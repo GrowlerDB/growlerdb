@@ -13,7 +13,7 @@ x-growlerdb-image: &growlerdb-image
   build:
     context: ../..
     dockerfile: deploy/Dockerfile
-  # Self-heal (task-115): a crashed/OOM-killed control-plane, node, or gateway restarts instead of
+  # Self-heal: a crashed/OOM-killed control-plane, node, or gateway restarts instead of
   # staying down — the Compose analogue of the k8s pods' implicit always-restart + liveness probes.
   restart: unless-stopped
 
@@ -25,16 +25,16 @@ x-growlerdb-env: &growlerdb-env
   GROWLERDB_S3_ENDPOINT: http://minio:9000
   # Export traces (OTLP/HTTP) to the LGTM collector.
   GROWLERDB_OTLP_ENDPOINT: http://lgtm:4318
-  # Built-in authN for the demo (task-244): the control-plane mints HS256 session JWTs via
+  # Built-in authN for the demo: the control-plane mints HS256 session JWTs via
   # `/v1/login` and the gateway validates them with this SAME shared secret. This is a DEMO secret,
-  # deliberately baked in so `just stack` demonstrates real login + per-index RBAC (task-240) — NOT a
+  # deliberately baked in so `just stack` demonstrates real login + per-index RBAC — NOT a
   # production credential. Rotate/replace it (and set your own demo password) for any real deployment.
   GROWLERDB_AUTH_SECRET: demo-stack-hs256-secret-change-me
 
 services:
   minio:
     image: minio/minio:latest
-    restart: unless-stopped   # object store self-heals (task-115)
+    restart: unless-stopped   # object store self-heals
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -65,11 +65,11 @@ services:
   # Iceberg REST catalog. Image/env are version-sensitive; verify on first bring-up.
   # Persistent metastore for Polaris (relational-jdbc → Postgres). Without it Polaris keeps the
   # catalog IN MEMORY and forgets every table on restart — which silently orphans the node's index
-  # (the index keeps doc keys from the dropped table → hydration "row not found"; see task-114).
+  # (the index keeps doc keys from the dropped table → hydration "row not found").
   # A volume-backed Postgres lets the catalog survive an accidental Polaris bounce.
   polaris-db:
     image: postgres:17-alpine
-    restart: unless-stopped   # catalog metastore self-heals (task-115)
+    restart: unless-stopped   # catalog metastore self-heals
     environment:
       POSTGRES_USER: polaris
       POSTGRES_PASSWORD: polaris
@@ -108,7 +108,7 @@ services:
 
   polaris:
     image: apache/polaris:latest
-    restart: unless-stopped   # catalog server self-heals; recovers automatically when it returns (task-115)
+    restart: unless-stopped   # catalog server self-heals; recovers automatically when it returns
     depends_on:
       createbuckets:
         condition: service_completed_successfully
@@ -132,7 +132,7 @@ services:
     ports:
       - "8181:8181"   # Iceberg REST
 
-  # task-63: changelog read in Spark **local mode** against a temp Iceberg table
+  # Changelog read in Spark **local mode** against a temp Iceberg table
   # (Hadoop catalog) — self-contained, no MinIO/Polaris. Runs the prebuilt fat jar
   # (`cd connector && mise exec -- mvn package`) via spark-submit; the app creates a
   # table, applies INSERT/UPDATE/DELETE, reads the changelog, and exits non-zero on
@@ -179,7 +179,7 @@ services:
   lgtm:
     profiles: ["stack"]
     image: grafana/otel-lgtm:latest
-    restart: unless-stopped   # observability stack self-heals (task-115)
+    restart: unless-stopped   # observability stack self-heals
     ports:
       - "3000:3000"   # Grafana UI (anonymous admin in this dev image)
       - "4317:4317"   # OTLP gRPC
@@ -189,7 +189,7 @@ services:
       - ./lgtm/otelcol-config.yaml:/otel-lgtm/otelcol-config.yaml:ro
       - ./lgtm/grafana-provider.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/growlerdb.yaml:ro
       - ./lgtm/dashboards:/otel-lgtm/growlerdb-dashboards:ro
-      # Evaluate GrowlerDB SLI alerting rules server-side (task-111); fired alerts → /api/v1/alerts.
+      # Evaluate GrowlerDB SLI alerting rules server-side; fired alerts → /api/v1/alerts.
       - ./lgtm/prometheus.yaml:/otel-lgtm/prometheus.yaml:ro
       - ./lgtm/growlerdb-alert-rules.yml:/otel-lgtm/growlerdb-alert-rules.yml:ro
     healthcheck:
@@ -198,14 +198,14 @@ services:
       timeout: 3s
       retries: 30
 
-  # Host CPU / memory / disk for the Observability "Runtime" panels (task-208.3). Mounts the host
+  # Host CPU / memory / disk for the Observability "Runtime" panels. Mounts the host
   # /proc, /sys, and rootfs read-only so it reports real host metrics; the collector scrapes it into
   # the bundled Prometheus alongside the GrowlerDB /metrics. Without it the Runtime CPU/mem/disk
   # cards show a "needs the metrics stack" state.
   node-exporter:
     profiles: ["stack"]
     image: prom/node-exporter:v1.8.2
-    restart: unless-stopped   # host-metrics exporter self-heals (task-115)
+    restart: unless-stopped   # host-metrics exporter self-heals
     command:
       - "--path.procfs=/host/proc"
       - "--path.sysfs=/host/sys"
@@ -219,7 +219,7 @@ services:
   controlplane:
     profiles: ["stack"]
     <<: *growlerdb-image
-    # `--login-secret` (task-244): enable the `/v1/login` RPC (mints session JWTs from the registry
+    # `--login-secret`: enable the `/v1/login` RPC (mints session JWTs from the registry
     # credential store) and seed the built-in users, but keep the control plane's OWN authorization
     # OPEN — the enforcement point is the gateway (`--builtin-auth`) on the public data plane, so the
     # internal node/gateway control-plane RPCs (registration, shard-map reads), which carry no service
@@ -227,8 +227,8 @@ services:
     command: ["control-plane", "--addr", "0.0.0.0:50071", "--metrics-addr", "0.0.0.0:9101", "--login-secret"]
     environment:
       <<: *growlerdb-env
-      # Demo login (task-244): a well-known baked-in credential, scoped to exactly the two demo indexes
-      # so per-index RBAC (task-240) is EXERCISED, not bypassed. Seeded on first boot only.
+      # Demo login: a well-known baked-in credential, scoped to exactly the two demo indexes
+      # so per-index RBAC is EXERCISED, not bypassed. Seeded on first boot only.
       #   user `demo` / password `demo`, roles [reader, operator], indexes [docs, catalog].
       # Change these for any non-demo use. (The initial `admin` user is still seeded with a generated,
       # printed-once password — see the control-plane logs.)
@@ -252,7 +252,7 @@ services:
   # Node: build the `docs` index from the seeded Iceberg table, then serve it (gRPC :50051,
   # REST :8080), health/metrics on :9102. The `just stack` recipe seeds the table first.
   # `--register` announces the served index to the control-plane registry (at its routable
-  # `--advertise-addr`), so it shows up in the Indexes + Ingestion screens (task-49).
+  # `--advertise-addr`), so it shows up in the Indexes + Ingestion screens.
   node:
     profiles: ["stack"]
     <<: *growlerdb-image
@@ -282,10 +282,10 @@ services:
       timeout: 3s
       retries: 60
 
-  # Node (catalog): a SECOND index alongside `docs` (task-241) — builds the richer `growlerdb.catalog`
+  # Node (catalog): a SECOND index alongside `docs` — builds the richer `growlerdb.catalog`
   # table with catalog.yaml and serves+registers it (gRPC :50052, REST :8083, metrics :9104). The
   # `--all-indexes` gateway routes `{"index":"catalog", ...}` requests here automatically — no gateway
-  # change needed. Demonstrates multi-index routing (task-240) end to end and backs the getting-started
+  # change needed. Demonstrates multi-index routing end to end and backs the getting-started
   # "query playground". Seed creates the table first (the `just stack` recipe seeds before this profile).
   node-catalog:
     profiles: ["stack"]
@@ -322,13 +322,13 @@ services:
     <<: *growlerdb-image
     command:
       - "gateway"
-      # Built-in authN (task-128/244): validate the HS256 session JWTs the control-plane's `/v1/login`
+      # Built-in authN: validate the HS256 session JWTs the control-plane's `/v1/login`
       # mints, using the shared GROWLERDB_AUTH_SECRET, and enforce RBAC + per-index scoping. The console
       # learns this via `/v1/config` and shows a login form (not open mode).
       - "--builtin-auth"
-      # Front EVERY registered index over one endpoint (task-240 multi-index routing): each request
+      # Front EVERY registered index over one endpoint (multi-index routing): each request
       # routes to its named index's shards, resolved lazily from the control-plane and hot-reloaded
-      # per index. Per-index RBAC still applies. Replaces the old single-Node `--node-addr` wiring.
+      # per index. Per-index RBAC still applies.
       - "--all-indexes"
       - "--addr"
       - "0.0.0.0:50061"
@@ -336,14 +336,14 @@ services:
       - "0.0.0.0:8080"
       - "--metrics-addr"
       - "0.0.0.0:9103"
-      # Serve the console + back its Indexes / Observability screens (tasks 45-48).
+      # Serve the console + back its Indexes / Observability screens.
       - "--ui-dir"
       - "/usr/share/growlerdb/ui"
       - "--control-plane"
       - "http://controlplane:50071"
       - "--prometheus"
       - "http://lgtm:9090"
-      # Optional OpenSearch-compatible `_search` adapter (task-50) — `<index>/_search`.
+      # Optional OpenSearch-compatible `_search` adapter — `<index>/_search`.
       - "--opensearch"
     environment:
       <<: *growlerdb-env
@@ -376,7 +376,7 @@ services:
   redpanda:
     profiles: ["pipeline"]
     image: redpandadata/redpanda:latest
-    restart: unless-stopped   # stream broker self-heals (task-115)
+    restart: unless-stopped   # stream broker self-heals
     command:
       - redpanda
       - start
@@ -501,7 +501,7 @@ services:
         condition: service_started
 
   # Trino — query the Iceberg tables directly with SQL to see the source data GrowlerDB indexes and
-  # compare source vs. index (task-242). Reads the same Polaris catalog + MinIO the seed writes. Heavy
+  # compare source vs. index. Reads the same Polaris catalog + MinIO the seed writes. Heavy
   # (JVM), so it's gated behind the `trino` profile: `docker compose --profile trino up -d trino`,
   # then `docker compose exec trino trino` and `SELECT * FROM iceberg.growlerdb.docs;`.
   trino:

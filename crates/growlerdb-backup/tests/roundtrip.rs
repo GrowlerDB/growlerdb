@@ -1,4 +1,4 @@
-//! Backup → restore round-trip (task-32) over the filesystem object-store backend (no MinIO
+//! Backup → restore round-trip over the filesystem object-store backend (no MinIO
 //! needed): build a populated shard, back it up, restore into a fresh location, and assert the
 //! restored shard returns the same results and carries the same snapshot + checkpoint (so
 //! ingestion can resume the tail exactly-once). Also covers the no-backup case.
@@ -91,7 +91,7 @@ async fn backup_then_restore_round_trips_data_and_checkpoint() {
     .unwrap();
 
     assert_eq!(manifest.snapshot, 1);
-    // D30: format 1 IS the layered format — the backup ships the dense location array
+    // Format 1 is the layered format — the backup ships the dense location array
     // alongside the segments + aux store.
     assert_eq!(manifest.format, MANIFEST_FORMAT);
     assert_eq!(manifest.format, 1, "format 1 is the layered format");
@@ -141,7 +141,7 @@ async fn backup_then_restore_round_trips_data_and_checkpoint() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn park_evicts_local_window_then_revive_restores_it() {
-    // Cold-tiering (task-80): parking a (window) shard backs it up and evicts the local dir;
+    // Cold-tiering: parking a (window) shard backs it up and evicts the local dir;
     // reviving restores it, searchable again with the same checkpoint. Uses a window shard since
     // that's the tiering unit, though park/revive are shard-type agnostic.
     let idx = docs_index();
@@ -217,7 +217,7 @@ async fn park_evicts_local_window_then_revive_restores_it() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cold_park_evicts_bulk_keeps_aux_and_serves_read_through() {
-    // Cold-tiering (task-80): cold_park backs up the bulk, evicts the local Tantivy `index/` but
+    // Cold-tiering: cold_park backs up the bulk, evicts the local Tantivy `index/` but
     // keeps `aux.redb`, and drops a marker — then the window is served read-through in place.
     let idx = docs_index();
     let w: i64 = 1_700_000_000_000;
@@ -266,12 +266,12 @@ async fn cold_park_evicts_bulk_keeps_aux_and_serves_read_through() {
     assert_eq!(marker.object_prefix, "cold/docs/w1700000000000/data/index");
     assert_eq!((marker.event_min, marker.event_max), (Some(10), Some(99)));
     assert_eq!(marker.snapshot, 1);
-    // task-83: cold_park built + stored a hotcache sidecar (outside data/ so backup GC won't prune).
+    // cold_park built + stored a hotcache sidecar (outside data/ so backup GC won't prune).
     assert_eq!(
         marker.hotcache_key.as_deref(),
         Some("cold/docs/w1700000000000/hotcache.bin")
     );
-    // task-83 slice 2: it also bundled the index into ONE object + a layout manifest, and removed
+    // it also bundled the index into ONE object + a layout manifest, and removed
     // the now-redundant individual index objects (no storage doubling).
     assert_eq!(
         marker.bundle_key.as_deref(),
@@ -293,7 +293,7 @@ async fn cold_park_evicts_bulk_keeps_aux_and_serves_read_through() {
         leftover_index_objects, 0,
         "individual index objects removed once bundled"
     );
-    // task-150 / F7: the manifest is rewritten `bundled` (its index/* entries dropped), and a plain
+    // the manifest is rewritten `bundled` (its index/* entries dropped), and a plain
     // restore of a bundled prefix refuses cleanly instead of 404-ing on the deleted objects.
     let bundled_manifest = read_manifest(&store, "cold/docs/w1700000000000")
         .await
@@ -306,7 +306,7 @@ async fn cold_park_evicts_bulk_keeps_aux_and_serves_read_through() {
             .any(|f| f.path.starts_with("index/")),
         "index/* entries dropped from the bundled manifest"
     );
-    // D30: only `index/*` files were bundled/deleted — the aux + location-array entries (and
+    // Only `index/*` files were bundled/deleted — the aux + location-array entries (and
     // their data objects, part of the restorable backup) survive the bundling rewrite.
     assert!(bundled_manifest.files.iter().any(|f| f.path == "aux.redb"));
     assert!(bundled_manifest
@@ -350,7 +350,7 @@ async fn cold_park_evicts_bulk_keeps_aux_and_serves_read_through() {
             .search_all(&Query::parse("body:alpha").unwrap(), 10)
             .unwrap()
             .len();
-        // D30: the layered locate works on the parked window — the key term resolves
+        // The layered locate works on the parked window — the key term resolves
         // through the read-through segments, the slot from the LOCAL array.
         let key = CompositeKey::new(vec![], vec![("id".into(), Value::from("doc-1"))]);
         let loc = cold.locate(&key).unwrap();
@@ -366,7 +366,7 @@ async fn cold_park_evicts_bulk_keeps_aux_and_serves_read_through() {
     assert_eq!(cold_loc.iceberg_file, "f");
     assert_eq!(cold_loc.row_position, 0);
 
-    // task-83 slice 3: PRE-WARM — a hot-again window is promoted back to a local hot shard.
+    // PRE-WARM — a hot-again window is promoted back to a local hot shard.
     // (Re-open the store handle + index; the search block above moved its clones.)
     let local = LocalIndexStore::open(root.path()).unwrap();
     let idx = docs_index();
@@ -389,7 +389,7 @@ async fn cold_park_evicts_bulk_keeps_aux_and_serves_read_through() {
         2,
         "promoted window serves from local NVMe (no cold latency)"
     );
-    // task-150 / B9: promote reclaimed the window's object-storage copies — nothing left under its
+    // promote reclaimed the window's object-storage copies — nothing left under its
     // backup prefix (no leaked bundle/hotcache/manifest).
     let leftover_objects = store
         .list_with("cold/docs/w1700000000000/")
@@ -404,7 +404,7 @@ async fn cold_park_evicts_bulk_keeps_aux_and_serves_read_through() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backup_gc_prunes_superseded_splits() {
-    // task-33 backup GC: after the primary compacts (fusing many segments into one), a re-backup
+    // Backup GC: after the primary compacts (fusing many segments into one), a re-backup
     // to the same prefix must remove the now-orphaned old segment objects from the store, not just
     // add the new fused segment. Assert the store's data/ objects match the new manifest exactly.
     let idx = docs_index();
@@ -500,7 +500,7 @@ async fn backup_gc_prunes_superseded_splits() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refresh_re_reads_the_manifest_on_a_mid_flight_404() {
-    // task-149 / I7: a replica's refresh reads the manifest, then downloads each listed file. If a
+    // A replica's refresh reads the manifest, then downloads each listed file. If a
     // concurrent backup's GC pruned a file this (now-stale) manifest still names, the download 404s;
     // refresh must re-read the manifest and retry rather than fail on the race. Here the ghost file
     // is *persistently* absent, so after the re-read+retry it surfaces cleanly as NotFound (proving
@@ -555,8 +555,8 @@ async fn refresh_re_reads_the_manifest_on_a_mid_flight_404() {
 
 #[test]
 fn pre_versioning_manifest_defaults_to_format_1() {
-    // D30 foundations: manifests written before the `format` field existed carry none — they must
-    // deserialize as format 1 (same defaulting pattern as `bundled`).
+    // A manifest without a `format` field must deserialize as format 1 (same defaulting
+    // pattern as `bundled`).
     let legacy = r#"{
         "index": "docs",
         "shard": "docs",
@@ -573,8 +573,8 @@ fn pre_versioning_manifest_defaults_to_format_1() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_manifest_without_format_field_still_restores() {
-    // D30 foundations: a real backup whose manifest.json predates the `format` field (strip it
-    // from a fresh backup's manifest) must restore exactly as today.
+    // A real backup whose manifest.json has no `format` field (stripped from a fresh
+    // backup's manifest) must still restore.
     let idx = docs_index();
     let id = ShardId::single("docs");
     let src_root = tempfile::tempdir().unwrap();
@@ -598,7 +598,7 @@ async fn legacy_manifest_without_format_field_still_restores() {
         .await
         .unwrap();
 
-    // Rewrite the manifest as a legacy (pre-versioning) one: drop the `format` field.
+    // Rewrite the manifest without a `format` field.
     let raw = store
         .read(&format!("{prefix}/manifest.json"))
         .await
@@ -631,9 +631,9 @@ async fn legacy_manifest_without_format_field_still_restores() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn newer_manifest_format_is_refused_cleanly() {
-    // D30 foundations: a manifest stamped with a format newer than this binary's MANIFEST_FORMAT
-    // (written by a newer GrowlerDB — e.g. after the D30 locator layers bump it) must refuse with
-    // a clear UnsupportedFormat on every consumer, not mis-restore.
+    // A manifest stamped with a format newer than this binary's MANIFEST_FORMAT (written by a
+    // newer GrowlerDB) must refuse with a clear UnsupportedFormat on every consumer, not
+    // mis-restore.
     let idx = docs_index();
     let id = ShardId::single("docs");
     let src_root = tempfile::tempdir().unwrap();

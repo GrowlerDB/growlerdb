@@ -1,5 +1,5 @@
 <script lang="ts">
-  // Underline tabs (task-93): a tab bar with an accent underline on the active tab. `active` is
+  // Underline tabs: a tab bar with an accent underline on the active tab. `active` is
   // bindable; the parent renders the active panel (`{#if active === 'x'}`).
   let {
     tabs,

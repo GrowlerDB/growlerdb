@@ -12,7 +12,7 @@ for _ in $(seq 1 60); do
   # Parse the token with sed (no python3/jq dep — runs on any minimal host). `curl -s` swallows the
   # connection noise while Polaris boots; the trailing `|| true` keeps a boot-time curl failure (exit
   # 7/56 before Polaris serves) from tripping `set -e` so the retry loop can run — an empty TOK just
-  # retries. (Unlike the old `2>/dev/null` on python3, this masks nothing about the response itself.)
+  # retries.
   TOK=$(curl -s -X POST "$POLARIS/api/catalog/v1/oauth/tokens" \
     -d grant_type=client_credentials -d client_id=root -d client_secret=s3cr3t \
     -d scope=PRINCIPAL_ROLE:ALL \
@@ -31,7 +31,7 @@ echo "create catalog 'growlerdb': http=$code  (201=created, 409=exists)"
 
 # Grant catalog admin to the root principal (via the service_admin principal-role). Creating an
 # INTERNAL catalog already auto-assigns `catalog_admin` to service_admin, so on a *persistent*
-# metastore (Postgres, task-114 guardrail) this PUT hits a duplicate grant record and returns 500
+# metastore (Postgres) this PUT hits a duplicate grant record and returns 500
 # — harmless. Accept 2xx as granted; otherwise verify the assignment already exists before failing.
 gcode=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
   "$POLARIS/api/management/v1/principal-roles/service_admin/catalog-roles/growlerdb" \

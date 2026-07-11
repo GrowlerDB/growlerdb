@@ -1,6 +1,6 @@
-// OIDC **authorization-code + PKCE** (task-45, AC2). The UI authenticates the human against
+// OIDC **authorization-code + PKCE**. The UI authenticates the human against
 // the IdP (Keycloak by default) and forwards the resulting bearer token to the Engine API
-// (see `api.ts`); the Engine gateway validates it (task-35). No client secret — PKCE is the
+// (see `api.ts`); the Engine gateway validates it. No client secret — PKCE is the
 // public-client flow. The pure pieces (verifier/challenge/authorize-URL) are unit-tested; the
 // redirect + token exchange are thin wrappers over the IdP's discovery document.
 
@@ -32,7 +32,7 @@ export function isAuthenticated(): boolean {
   return getToken() !== null;
 }
 
-/** Whether `token` (default: the stored one) is past its JWT `exp` (task-153 / B17). A token with no
+/** Whether `token` (default: the stored one) is past its JWT `exp`. A token with no
  *  `exp` is treated as non-expiring here — the gateway is still the authority (it verifies `exp`
  *  server-side); this just lets the client skip a known-401 request and re-gate proactively. */
 export function isTokenExpired(token: string | null = getToken()): boolean {
@@ -43,9 +43,9 @@ export function isTokenExpired(token: string | null = getToken()): boolean {
 }
 
 /** The signed-in user, derived from the bearer's claims, or `null` when not authenticated. An
- *  interim client-side read of the JWT until the server identity surface (`GET /v1/me`, task-103)
+ *  interim client-side read of the JWT until the server identity surface (`GET /v1/me`)
  *  lands — never faked: `null` means "show the unauthenticated state". `roles` is best-effort from
- *  common claim shapes (the gateway is the authority on roles, task-36). */
+ *  common claim shapes (the gateway is the authority on roles). */
 export interface CurrentUser {
   subject: string;
   name: string;

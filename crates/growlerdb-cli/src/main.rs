@@ -1,6 +1,5 @@
-//! `growlerdb` — the GrowlerDB CLI. For the M0 walking skeleton it runs the engine in
-//! **embedded mode** (no server, auth, or sharding): the CLI drives the in-process
-//! [`Engine`](growlerdb_engine::Engine) over the local index store + Iceberg.
+//! `growlerdb` — the GrowlerDB CLI. In embedded mode (no server, auth, or sharding) it drives
+//! the in-process [`Engine`](growlerdb_engine::Engine) over the local index store + Iceberg.
 
 use clap::{Args, Parser, Subcommand};
 use growlerdb_core::{CompositeKey, HydratedRow, Projection, Value};
@@ -9,12 +8,12 @@ use growlerdb_source::IcebergConfig;
 
 /// The version reported by `--version` and the System gRPC service. Baked by `build.rs` from the
 /// release tag (`GROWLERDB_VERSION`) when set, else the in-tree workspace `0.0.0` (see RELEASING.md
-/// / ADR D29 — artifacts are tag-derived, the tree stays `0.0.0`).
+/// — artifacts are tag-derived, the tree stays `0.0.0`).
 const VERSION: &str = env!("GROWLERDB_BUILD_VERSION");
 
-/// Server-side mutual-TLS for an internal gRPC service (task-35): present `--tls-cert`/`--tls-key`
-/// as this service's identity and require every client to present a cert chaining to
-/// `--tls-client-ca`. All three together enable mTLS; omit them to serve plaintext (dev).
+/// Server-side mutual-TLS for an internal gRPC service: present `--tls-cert`/`--tls-key` as this
+/// service's identity and require every client to present a cert chaining to `--tls-client-ca`.
+/// All three together enable mTLS; omit them to serve plaintext (dev).
 #[derive(Args, Clone)]
 struct ServerTlsArgs {
     /// PEM certificate for this service's TLS identity.
@@ -48,9 +47,9 @@ impl ServerTlsArgs {
     }
 }
 
-/// Client-side TLS for a Gateway dialing internal Nodes (task-35): verify Node server certs
-/// against `--node-tls-ca` and present `--node-tls-cert`/`--node-tls-key` as the Gateway's
-/// client identity (mutual TLS). Enabled by `--node-tls-ca`.
+/// Client-side TLS for a Gateway dialing internal Nodes: verify Node server certs against
+/// `--node-tls-ca` and present `--node-tls-cert`/`--node-tls-key` as the Gateway's client
+/// identity (mutual TLS). Enabled by `--node-tls-ca`.
 #[derive(Args, Clone)]
 struct UpstreamTlsArgs {
     /// PEM CA used to verify Node server certificates (enables mutual TLS to Nodes; requires
@@ -112,12 +111,12 @@ struct Cli {
     data_dir: String,
 
     /// Serve health/readiness probes (`/healthz`, `/readyz`) and Prometheus `/metrics` on this
-    /// `host:port` (task-39). Applies to the long-running server commands; omit to disable.
+    /// `host:port`. Applies to the long-running server commands; omit to disable.
     #[arg(long, global = true)]
     metrics_addr: Option<String>,
 
-    /// Serve the built UI SPA (`ui/dist`) from the REST front (task-45) — the GrowlerDB console
-    /// at the same `host:port` as the Engine API. Omit to run API-only.
+    /// Serve the built UI SPA (`ui/dist`) from the REST front — the GrowlerDB console at the same
+    /// `host:port` as the Engine API. Omit to run API-only.
     #[arg(long, env = "GROWLERDB_UI_DIR", global = true)]
     ui_dir: Option<String>,
 
@@ -137,14 +136,14 @@ enum Command {
         /// Index name (defaults to the table's last segment).
         #[arg(long)]
         name: Option<String>,
-        /// Total shards in the cluster (task-77). `>1` builds only **this** node's partition, so a
+        /// Total shards in the cluster. `>1` builds only **this** node's partition, so a
         /// broadcast search over the shards sees each document once. Default 1 = full build.
         #[arg(long, default_value_t = 1)]
         shards: u32,
-        /// This node's shard ordinal in `0..shards` (task-77). Pair with `--shards`.
+        /// This node's shard ordinal in `0..shards`. Pair with `--shards`.
         #[arg(long, default_value_t = 0)]
         shard_ordinal: u32,
-        /// Write `index.json` (the resolved definition) only — build **no** shards/windows (task-223).
+        /// Write `index.json` (the resolved definition) only — build **no** shards/windows.
         /// A **windowed** node starts empty this way: it needs the definition on disk to `serve`, but
         /// must not batch-build windows from the source (that replicates every window onto every node
         /// and defeats control-plane placement). Ignores `--shards`/`--shard-ordinal`.
@@ -177,16 +176,16 @@ enum Command {
     /// repair discrepancies (delete vanished keys, re-index new ones).
     ///
     /// Without `--control-plane`, reconciles the local embedded index (single-shard dev path).
-    /// With `--control-plane host:port`, drives the **cluster** backstop (task-195): fetch the
-    /// index's shard map + bucket owners from the registry and fan a shard-scoped `ReconcileIndex`
-    /// out to every shard's primary node — the form a scheduled CronJob runs.
+    /// With `--control-plane host:port`, drives the **cluster** backstop: fetch the index's shard
+    /// map + bucket owners from the registry and fan a shard-scoped `ReconcileIndex` out to every
+    /// shard's primary node — the form a scheduled CronJob runs.
     Reconcile {
         /// Index name.
         index: String,
         /// Control-plane `host:port`. Set ⇒ cluster mode (fan out to each shard's node).
         #[arg(long)]
         control_plane: Option<String>,
-        /// Force a full row-level scan, bypassing the count-gate (task-198). Use for a periodic deep
+        /// Force a full row-level scan, bypassing the count-gate. Use for a periodic deep
         /// sweep that catches drift the count-gate can't (compensating stale+missing, or dup PKs).
         #[arg(long)]
         full: bool,
@@ -196,7 +195,7 @@ enum Command {
         /// Index name.
         index: String,
     },
-    /// Back up an index's shard to object storage (S3/MinIO) for restore on node loss (task-32).
+    /// Back up an index's shard to object storage (S3/MinIO) for restore on node loss.
     /// Reads credentials from `GROWLERDB_S3_*` and the bucket from `GROWLERDB_BACKUP_BUCKET`.
     Backup {
         /// Index name (must be built locally).
@@ -214,9 +213,9 @@ enum Command {
         #[arg(long)]
         prefix: Option<String>,
     },
-    /// Refresh a **replica** of an index from the primary's backup — incremental segment shipping
-    /// (task-31, D14): pulls only new sealed segments, byte-identical to the primary. Run on a
-    /// timer (then `serve` the index) for a warm read-replica.
+    /// Refresh a **replica** of an index from the primary's backup — incremental segment shipping:
+    /// pulls only new sealed segments, byte-identical to the primary. Run on a timer (then `serve`
+    /// the index) for a warm read-replica.
     RefreshReplica {
         /// Index name.
         index: String,
@@ -224,8 +223,8 @@ enum Command {
         #[arg(long)]
         prefix: Option<String>,
     },
-    /// Move cold (time-aged) windows of a **windowed** index to object storage (task-80), evicting
-    /// the local index bulk while keeping the window **searchable read-through**. Keeps the
+    /// Move cold (time-aged) windows of a **windowed** index to object storage, evicting the local
+    /// index bulk while keeping the window **searchable read-through**. Keeps the
     /// most-recent windows hot per the index's `hot_windows` policy (or `--keep-hot`). Reads
     /// `GROWLERDB_S3_*` + `GROWLERDB_BACKUP_BUCKET`; `growlerdb revive` promotes a window back to hot.
     Park {
@@ -235,8 +234,8 @@ enum Command {
         #[arg(long)]
         keep_hot: Option<usize>,
     },
-    /// Promote a cold window back to hot (task-80): restore its bulk to local NVMe so it serves
-    /// locally again (a cold window is already searchable read-through; this pre-warms it). Reads
+    /// Promote a cold window back to hot: restore its bulk to local NVMe so it serves locally
+    /// again (a cold window is already searchable read-through; this pre-warms it). Reads
     /// `GROWLERDB_S3_*` + `GROWLERDB_BACKUP_BUCKET`.
     Revive {
         /// Index name.
@@ -244,8 +243,8 @@ enum Command {
         /// Window id (epoch-ms of the window start) to promote back to hot.
         window: i64,
     },
-    /// Retention (task-52): drop the **oldest** indexes matching a `*`-glob `pattern` beyond
-    /// `--keep`, e.g. roll off old daily indexes once you've rolled to a new one. Names sort
+    /// Retention: drop the **oldest** indexes matching a `*`-glob `pattern` beyond `--keep`,
+    /// e.g. roll off old daily indexes once you've rolled to a new one. Names sort
     /// chronologically when they embed a date (`events-2025-06-15`). Goes through the control plane.
     Retention {
         /// Index name pattern (a `*`-glob, e.g. `events-*`).
@@ -277,7 +276,7 @@ enum Command {
         /// Self-register this served index in the Control-Plane registry at this gRPC endpoint
         /// (e.g. `http://controlplane:50071`), so a node-built index is discoverable cluster-wide
         /// (the Indexes/Ingestion screens) instead of invisible until `CreateIndex`. The node
-        /// announces its shard assignment at `--advertise-addr` (task-49).
+        /// announces its shard assignment at `--advertise-addr`.
         #[arg(long, requires = "advertise_addr")]
         register: Option<String>,
         /// The routable gRPC endpoint other services reach this node at (e.g.
@@ -285,20 +284,19 @@ enum Command {
         /// with `--register` since `--addr` is often a bind-only wildcard (`0.0.0.0:...`).
         #[arg(long)]
         advertise_addr: Option<String>,
-        /// Total ordinal shards in the index (task-77 multi-node sharding). With `--register`, this
-        /// node registers as serving `--shard-ordinal` of `--shards`, so the Gateway's shard map
-        /// places it at that ordinal. Default 1 = a single-shard index (this node serves it all).
+        /// Total ordinal shards in the index (multi-node sharding). With `--register`, this node
+        /// registers as serving `--shard-ordinal` of `--shards`, so the Gateway's shard map places
+        /// it at that ordinal. Default 1 = a single-shard index (this node serves it all).
         #[arg(long, default_value_t = 1)]
         shards: u32,
-        /// This node's shard ordinal in `0..shards` (task-77). Pair with `--shards` (>1). The shard
+        /// This node's shard ordinal in `0..shards`. Pair with `--shards` (>1). The shard
         /// must already be built for this ordinal (`growlerdb index --shards N --shard-ordinal K`).
         #[arg(long, default_value_t = 0)]
         shard_ordinal: u32,
-        /// Serve as a read-only **replica** (task-31): pull the primary's sealed segments from
-        /// backup, serve search/lookup/suggest (no writes or reindex), and periodically re-pull +
-        /// hot-swap new segments. The definition comes from the backup manifest. Needs the backup
-        /// env (`GROWLERDB_BACKUP_BUCKET`, `GROWLERDB_S3_*`); single-shard indexes only (a windowed
-        /// replica is task-82).
+        /// Serve as a read-only **replica**: pull the primary's sealed segments from backup, serve
+        /// search/lookup/suggest (no writes or reindex), and periodically re-pull + hot-swap new
+        /// segments. The definition comes from the backup manifest. Needs the backup env
+        /// (`GROWLERDB_BACKUP_BUCKET`, `GROWLERDB_S3_*`); single-shard indexes only.
         #[arg(long)]
         replica: bool,
         /// Backup prefix to replicate from (default `backups/<index>`). Only with `--replica`.
@@ -307,12 +305,12 @@ enum Command {
         /// Seconds between replica refresh polls (default 30).
         #[arg(long, default_value_t = 30)]
         replica_refresh_secs: u64,
-        /// Seconds between **auto-compaction** health checks (task-33): when the shard is fragmented
+        /// Seconds between **auto-compaction** health checks: when the shard is fragmented
         /// (≥8 segments) or carries delete debt (≥20%), segments are fused / deletes purged. `0`
         /// disables. Ignored for `--replica` (a replica must not compact). Default 60.
         #[arg(long, default_value_t = 60)]
         compact_interval_secs: u64,
-        /// Seconds between **compaction re-map** polls (task-184 slice 3 / D30): the node watches
+        /// Seconds between **compaction re-map** polls: the node watches
         /// the source table's live data-file set; when Iceberg compaction rewrites files away, it
         /// marks them dead and re-points the affected locators at the new files in the background
         /// — so hydration doesn't pay a per-read refresh after every source compaction. `0`
@@ -340,11 +338,11 @@ enum Command {
         #[arg(long, requires = "index")]
         registry: Option<String>,
         /// The index **or alias** to front. Pair with `--registry` (a registry.json file) **or**
-        /// `--control-plane` (the live registry over gRPC). An alias (task-52, file mode) fronts the
+        /// `--control-plane` (the live registry over gRPC). An alias (file mode) fronts the
         /// union of its members' shards. Each shard's `NodeId` is its gRPC endpoint.
         #[arg(long)]
         index: Option<String>,
-        /// Front **every** registered index over one endpoint (task-240 multi-index routing): each
+        /// Front **every** registered index over one endpoint: each
         /// request routes to its named index's shard-set, resolved lazily from `--control-plane` on
         /// first use and hot-reloaded independently. Mutually exclusive with `--index`; requires
         /// `--control-plane`. Readiness flips when the control plane is reachable, not when an index
@@ -365,7 +363,7 @@ enum Command {
         /// Expected `aud` claim for OIDC tokens (required with `--oidc-issuer`).
         #[arg(long, requires = "oidc_issuer")]
         oidc_audience: Option<String>,
-        /// Built-in (no external IdP) password auth (task-128): validate the session JWTs that the
+        /// Built-in (no external IdP) password auth: validate the session JWTs that the
         /// control-plane's `/v1/login` mints, using a shared secret. Closed mode without OIDC.
         /// Mutually exclusive with `--oidc-issuer`; requires `--auth-secret`.
         #[arg(long, conflicts_with = "oidc_issuer", requires = "auth_secret")]
@@ -375,23 +373,23 @@ enum Command {
         #[arg(long, env = "GROWLERDB_AUTH_SECRET")]
         auth_secret: Option<String>,
         /// Control-Plane gRPC endpoint (e.g. `http://controlplane:50071`). When set, the REST
-        /// front exposes index management (`/v1/indexes`, `/v1/source:describe`, task-47) by
+        /// front exposes index management (`/v1/indexes`, `/v1/source:describe`) by
         /// proxying to it. With `--index` (and no `--registry`) it also drives **shard routing**:
         /// the Gateway reads the index's shard map from the live control-plane over gRPC and
-        /// hot-reloads on change — the distributed (Kubernetes) deploy path (task-77).
+        /// hot-reloads on change — the distributed (Kubernetes) deploy path.
         #[arg(long)]
         control_plane: Option<String>,
         /// Prometheus-compatible metrics URL (e.g. `http://lgtm:9090`). When set, the REST front
-        /// proxies `/v1/stats/...` to it (task-48) so the UI's SLI panels query same-origin.
+        /// proxies `/v1/stats/...` to it so the UI's SLI panels query same-origin.
         #[arg(long)]
         prometheus: Option<String>,
-        /// Expose the optional OpenSearch-compatible `_search` adapter (task-50, D4): a documented
+        /// Expose the optional OpenSearch-compatible `_search` adapter: a documented
         /// DSL subset translated to native queries, results as documents (`_id` from the key,
         /// `_source` via hydration). Off by default; the native PK API is primary.
         #[arg(long)]
         opensearch: bool,
         /// Poll the registry (file or control-plane) every N seconds and **hot-reload** the topology
-        /// when it changes (task-77) — after a reshard cutover the gateway picks up the new shard set
+        /// when it changes — after a reshard cutover the gateway picks up the new shard set
         /// + bucket map with no restart. Ordinal indexes only (not windowed). `0` disables.
         #[arg(long, default_value_t = 15)]
         reload_secs: u64,
@@ -405,18 +403,18 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:50071")]
         addr: String,
         /// OIDC issuer URL. When set, the control plane validates bearers itself and enforces RBAC
-        /// (admin-gated user management, task-104); without it the control plane is open.
+        /// (admin-gated user management); without it the control plane is open.
         #[arg(long)]
         oidc_issuer: Option<String>,
         /// Expected JWT audience (required with `--oidc-issuer`).
         #[arg(long, requires = "oidc_issuer")]
         oidc_audience: Option<String>,
-        /// Built-in (no external IdP) password auth (task-128): enable the `/v1/login` RPC (mints
+        /// Built-in (no external IdP) password auth: enable the `/v1/login` RPC (mints
         /// session JWTs from the registry credential store) and validate them. Mutually exclusive
         /// with `--oidc-issuer`; requires `--auth-secret` (shared with the gateway).
         #[arg(long, conflicts_with = "oidc_issuer", requires = "auth_secret")]
         builtin_auth: bool,
-        /// Login-only mode (task-244, the `just stack` demo): enable the `/v1/login` RPC (mint session
+        /// Login-only mode (the `just stack` demo): enable the `/v1/login` RPC (mint session
         /// JWTs) and seed the demo/admin users, but leave the control plane's OWN authorization **open**
         /// — so the enforcement point is the gateway (`--builtin-auth`) on the public data plane, while
         /// the internal node/gateway control-plane RPCs (registration, shard-map reads) stay reachable
@@ -439,7 +437,7 @@ enum Command {
     },
 }
 
-/// Cluster reconcile backstop (task-195): fetch the index's shard map + bucket owners from the
+/// Cluster reconcile backstop: fetch the index's shard map + bucket owners from the
 /// control plane, then fan a **shard-scoped** `ReconcileIndex` out to each shard's primary node —
 /// each node compares only the keys it owns (via the same bucket map the gateway/connector route by),
 /// so a reconcile can't pull another shard's keys into it. Prints per-shard drift + a total. Any
@@ -489,7 +487,7 @@ async fn reconcile_cluster(control_plane: &str, index: &str, full: bool) -> anyh
         Ok::<ReconcileIndexResponse, anyhow::Error>(resp)
     };
 
-    // Whole-index count-gate (task-198): a cheap counts-only probe first. If Σ index docs across all
+    // Whole-index count-gate: a cheap counts-only probe first. If Σ index docs across all
     // shards already equals the source table's total record count, the index is in sync — skip the
     // expensive row-level reconcile entirely. Routing-agnostic (covers hash-routed indexes the
     // per-partition gate can't). Any unreachable shard / missing primary / zero source total falls
@@ -573,7 +571,7 @@ async fn reconcile_cluster(control_plane: &str, index: &str, full: bool) -> anyh
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    // Structured JSON logging + the Prometheus metrics recorder (task-39).
+    // Structured JSON logging + the Prometheus metrics recorder.
     growlerdb_telemetry::init("growlerdb");
     // Startup splash to stderr (clap handles --help/--version before this, so it
     // only shows for real commands and never pollutes piped stdout).
@@ -595,7 +593,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let def_yaml = def.map(std::fs::read_to_string).transpose()?;
             if define_only {
-                // Definition only, no build (task-223) — how a windowed node starts truly empty.
+                // Definition only, no build — how a windowed node starts truly empty.
                 let outcome = engine
                     .define_index(&table, def_yaml.as_deref(), name.as_deref())
                     .await?;
@@ -818,7 +816,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Spawn the health-driven **auto-compaction** loop (task-33) for one shard `handle`: on a timer it
+/// Spawn the health-driven **auto-compaction** loop for one shard `handle`: on a timer it
 /// fuses segments / purges deletes when the live shard crosses the [`CompactionPolicy`] thresholds,
 /// so segments don't accumulate unbounded under steady ingest. The merge is blocking I/O → the
 /// blocking pool, non-disruptive to in-flight readers / open PITs, and always runs on the *current*
@@ -844,17 +842,17 @@ fn spawn_auto_compaction(handle: growlerdb_engine::ShardHandle, label: String, i
                     continue;
                 }
             };
-            // Track live segments every tick (task-143) so the segments panel shows growth between
-            // merges, not just at compaction time — and the delete debt (task-218), so a size
+            // Track live segments every tick so the segments panel shows growth between
+            // merges, not just at compaction time — and the delete debt, so a size
             // sample taken between merges can be read in context (superseded docs still on disk).
             growlerdb_telemetry::sli::segments_live(&label, health.segments);
             growlerdb_telemetry::sli::index_deleted_docs(&label, health.deleted);
-            // Live doc count (task-187): the index side of the source→index convergence check —
+            // Live doc count: the index side of the source→index convergence check —
             // sum(growlerdb_index_docs) vs sum(growlerdb_source_records) must meet at steady state.
             if let Ok(docs) = shard.num_docs() {
                 growlerdb_telemetry::sli::index_docs(&label, docs);
             }
-            // One walk serves both gauges (task-218): the total is the breakdown's sum, so
+            // One walk serves both gauges: the total is the breakdown's sum, so
             // `growlerdb_index_bytes` == sum over `growlerdb_index_bytes_component` by construction.
             let bd = shard.index_size_breakdown();
             growlerdb_telemetry::sli::index_bytes(&label, bd.total());
@@ -874,7 +872,7 @@ fn spawn_auto_compaction(handle: growlerdb_engine::ShardHandle, label: String, i
                 match tokio::task::spawn_blocking(move || compact_shard.compact(&policy)).await {
                     Ok(Ok(())) => {
                         eprintln!("compact `{label}`: done");
-                        // Count the merge + record the post-merge segment count (task-143).
+                        // Count the merge + record the post-merge segment count.
                         if let Ok(after) = handle.current().compaction_health() {
                             growlerdb_telemetry::sli::compaction(&label, before, after.segments);
                         }
@@ -893,7 +891,7 @@ fn spawn_auto_compaction(handle: growlerdb_engine::ShardHandle, label: String, i
     });
 }
 
-/// Spawn the background **compaction re-map** loop (task-184 slice 3 / D30 `coordinates`
+/// Spawn the background **compaction re-map** loop (`coordinates` location
 /// strategy) for the index's hot shard(s): each tick it polls the source table's current plan
 /// (one catalog call; manifest reads only when the snapshot advanced — the reader's
 /// snapshot-pinned plan cache) and diffs the live data-file set against the shards' interned
@@ -907,7 +905,7 @@ fn spawn_auto_compaction(handle: growlerdb_engine::ShardHandle, label: String, i
 /// passes every hot window's handle: one poll + one key scan serves them all (each window skips
 /// the keys it doesn't hold). Never called for a replica (it pulls the primary's healed
 /// locators) — and a cold window's shard has no writer but is single-writer by construction, so
-/// hot handles only. A **`PREDICATE`** index (task-184 / D30) spawns nothing: it stores no
+/// hot handles only. A **`PREDICATE`** index spawns nothing: it stores no
 /// location data, so source compaction leaves nothing to re-map or mark dead.
 fn spawn_locator_remap(
     handles: Vec<growlerdb_engine::ShardHandle>,
@@ -995,8 +993,8 @@ fn spawn_locator_remap(
     }
 }
 
-/// Background **pre-warm** loop for one cold window (task-83). Samples the window's **search** counter
-/// each interval (task-153 / I3); when its per-interval search count crosses [`PreWarmPolicy`], the
+/// Background **pre-warm** loop for one cold window. Samples the window's **search** counter
+/// each interval; when its per-interval search count crosses [`PreWarmPolicy`], the
 /// window is promoted back to hot — its index is materialized locally (un-bundled from object storage)
 /// and hot-swapped
 /// into the live handle, after which it serves from local NVMe with no cold latency and the loop ends
@@ -1037,8 +1035,8 @@ fn spawn_prewarm(
                 Ok(Some(m)) => m,
                 // Genuinely no longer cold (already promoted) → stop watching.
                 Ok(None) => break,
-                // A transient marker-read error must NOT end the watcher forever (task-148 /
-                // G-prewarm): log, count it, and retry next interval.
+                // A transient marker-read error must NOT end the watcher forever:
+                // log, count it, and retry next interval.
                 Err(e) => {
                     eprintln!("pre-warm `{label}`: marker read failed ({e}) — retrying");
                     growlerdb_telemetry::sli::background_failure("pre-warm");
@@ -1085,7 +1083,7 @@ fn spawn_prewarm(
 }
 
 /// Everything [`serve`] (and the windowed variant [`serve_windowed`]) needs to host a Node — bundled
-/// into one struct (task-153 / K1) instead of 13 positional args. Borrows the string config from the
+/// into one struct instead of many positional args. Borrows the string config from the
 /// dispatched `Command`; `tls` is owned (moved in). The windowed path ignores `max_inflight` /
 /// `shards` / `shard_ordinal` (a windowed index shards by time window, not ordinal).
 struct ServeConfig<'a> {
@@ -1124,7 +1122,7 @@ async fn serve(cfg: ServeConfig<'_>) -> anyhow::Result<()> {
         )
     })?;
     // Parse the definition; if it's corrupt, fall back to the last-known-good `.prev` copy with a
-    // loud warning rather than failing to boot the Node (task-70).
+    // loud warning rather than failing to boot the Node.
     let resolved: growlerdb_core::ResolvedIndex = match serde_json::from_slice(&def_bytes) {
         Ok(r) => r,
         Err(e) => {
@@ -1142,12 +1140,12 @@ async fn serve(cfg: ServeConfig<'_>) -> anyhow::Result<()> {
         }
     };
     // Surface resolution warnings (e.g. an equality-delete column that forces the
-    // costlier partition-reconciliation fallback, task-15) so it's a known choice.
+    // costlier partition-reconciliation fallback) so it's a known choice.
     for warning in &resolved.warnings {
         eprintln!("warning: {warning}");
     }
     let store = LocalIndexStore::open(cfg.data_dir)?;
-    // A windowed index (task-81) is served as many per-window shards behind a pruning Gateway, not
+    // A windowed index is served as many per-window shards behind a pruning Gateway, not
     // one single shard — a separate, REST-first path (reusing the same config).
     if resolved.windowing.is_some() {
         return serve_windowed(cfg, store, resolved).await;
@@ -1174,7 +1172,7 @@ async fn serve(cfg: ServeConfig<'_>) -> anyhow::Result<()> {
     store.recover_reindex(&shard_id)?;
     let shard = Arc::new(store.open_shard(&shard_id, &resolved)?);
 
-    // Lineage guard (task-114): if this index recorded its source's Iceberg `table-uuid` at build,
+    // Lineage guard: if this index recorded its source's Iceberg `table-uuid` at build,
     // verify the live table still carries it. A mismatch means the source was dropped+recreated (or
     // its catalog was reset) and the index is stale — its keys no longer exist in the table, so
     // search would return rows that fail to hydrate ("Row not found"). Rather than refuse to boot,
@@ -1208,11 +1206,11 @@ async fn serve(cfg: ServeConfig<'_>) -> anyhow::Result<()> {
     }
 
     // One swappable handle shared by every service, so a reindex swap is visible across the
-    // whole Node at once (task-30 B1).
+    // whole Node at once.
     let handle = growlerdb_engine::ShardHandle::new(shard);
 
     // One reindex fence shared by Write (rejects writes while reindexing) and Admin (engages it
-    // for the reindex) — so a rebuild can't lose the write delta or regress the checkpoint (task-71).
+    // for the reindex) — so a rebuild can't lose the write delta or regress the checkpoint.
     let reindex_fence = growlerdb_engine::ReindexFence::new();
     let write = growlerdb_engine::WriteService::new(handle.clone(), index, max_inflight)
         .with_fence(reindex_fence.clone())
@@ -1238,7 +1236,7 @@ async fn serve(cfg: ServeConfig<'_>) -> anyhow::Result<()> {
         table.clone(),
         reindex_fence.clone(),
     );
-    // Enable console-/REST-triggered backups (task-109) when an object-storage target is configured.
+    // Enable console-/REST-triggered backups when an object-storage target is configured.
     if std::env::var("GROWLERDB_BACKUP_BUCKET").is_ok() {
         match backup_s3_config()
             .and_then(|cfg| growlerdb_backup::s3_store(&cfg).map_err(anyhow::Error::from))
@@ -1252,7 +1250,7 @@ async fn serve(cfg: ServeConfig<'_>) -> anyhow::Result<()> {
     }
     let system = SystemService::new(VERSION);
 
-    // Reap point-in-time handles (task-65) clients opened but never closed, so a held
+    // Reap point-in-time handles clients opened but never closed, so a held
     // ReadView can't pin redb's read version (space amplification) indefinitely.
     const PIT_TTL: std::time::Duration = std::time::Duration::from_secs(300);
     const PIT_SWEEP: std::time::Duration = std::time::Duration::from_secs(60);
@@ -1269,12 +1267,12 @@ async fn serve(cfg: ServeConfig<'_>) -> anyhow::Result<()> {
         }
     });
 
-    // Health-driven **auto-compaction** (task-33), so segments don't accumulate unbounded under
+    // Health-driven **auto-compaction**, so segments don't accumulate unbounded under
     // steady ingest. (Only this primary path compacts — a `serve --replica` must never compact, or
     // it would diverge from the byte-identical segments it pulls.)
     spawn_auto_compaction(handle.clone(), index.to_string(), compact_interval_secs);
 
-    // Background **compaction re-map** (task-184 slice 3): heal locators in bulk when Iceberg
+    // Background **compaction re-map**: heal locators in bulk when Iceberg
     // compaction rewrites the source's data files, instead of a per-hydration refresh tax.
     spawn_locator_remap(
         vec![handle.clone()],
@@ -1321,7 +1319,7 @@ async fn serve(cfg: ServeConfig<'_>) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("invalid --addr `{addr}`: {e}"))?;
     let mut builder = Server::builder();
     if let Some(tls) = tls {
-        // mTLS required: clients must present a cert chaining to the configured CA (task-35).
+        // mTLS required: clients must present a cert chaining to the configured CA.
         builder = builder.tls_config(tls)?;
         println!(
             "serving index `{index}` on {socket} over mutual TLS (clients must present a cert)"
@@ -1334,17 +1332,17 @@ async fn serve(cfg: ServeConfig<'_>) -> anyhow::Result<()> {
         );
     }
 
-    // The shard is open and services are built. Readiness (task-39 probe) is gated below: a node
-    // that registers with a control plane reports ready only once it's in the registry (task-119).
+    // The shard is open and services are built. Readiness is gated below: a node
+    // that registers with a control plane reports ready only once it's in the registry.
     let readiness = spawn_health(metrics_addr).await?;
 
     // Announce this served index to the Control-Plane registry so it's discoverable cluster-wide and
     // routable by the gateway. Retries until the CP is reachable and re-announces on an interval
-    // (task-119): in K8s the node pods routinely come up before the CP, so a one-shot attempt would
+    // in K8s the node pods routinely come up before the CP, so a one-shot attempt would
     // leave the shard serving but invisible to the gateway forever. `serve` hosts the single shard
     // `ShardId::single(index)`.
     if let (Some(cp), Some(endpoint)) = (register, advertise_addr) {
-        // Multi-node sharding (task-77): with `--shards N > 1`, register as serving only this
+        // Multi-node sharding: with `--shards N > 1`, register as serving only this
         // node's `--shard-ordinal`; otherwise the single-node default (serve the whole index).
         let ordinals = if shards > 1 {
             vec![shard_ordinal]
@@ -1386,12 +1384,12 @@ async fn serve(cfg: ServeConfig<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Serve an index as a read-only **replica** (task-31): pull the primary's sealed segments from
+/// Serve an index as a read-only **replica**: pull the primary's sealed segments from
 /// backup, serve the read surface (Search / Lookup / Suggest, plus Admin **describe** — no Write
 /// and no reindex, so a replica can't diverge from the primary), and run a background poll that
 /// re-pulls and **hot-swaps** new segments whenever the primary's backed-up snapshot advances. The
 /// definition is taken from the backup manifest (falling back to a local `index.json`). Single-shard
-/// only; a windowed replica is task-82.
+/// only; a windowed replica is not yet supported.
 #[allow(clippy::too_many_arguments)]
 async fn serve_replica(
     data_dir: &str,
@@ -1580,7 +1578,7 @@ async fn serve_replica(
     Ok(())
 }
 
-/// Serve a **windowed** index (task-81): open its per-window shards, front them with a windowed
+/// Serve a **windowed** index: open its per-window shards, front them with a windowed
 /// [`Gateway`](growlerdb_engine::Gateway) that prunes a time-filtered search to the matching
 /// windows, and expose search over REST. Windowed search is **REST-first** today — the gRPC Node
 /// surface is per-shard, and distributed per-window addressing is a later slice — so `--rest-addr`
@@ -1627,13 +1625,13 @@ async fn serve_windowed(
         growlerdb_core::Source::Iceberg(s) => s.table.clone(),
     };
 
-    // A windowed node may start **empty** (task-219 streaming-first): it registers into the CP
+    // A windowed node may start **empty** (streaming-first): it registers into the CP
     // placement pool and creates each window on the first write the connector streams to it. So an
     // empty window set is valid — the node serves zero windows until ingest populates them (the batch
     // `growlerdb index` build path still pre-populates them when used).
     let windows = store.window_shards(index)?;
 
-    // Cold windows (task-80) are served **read-through** from object storage; build the shared
+    // Cold windows are served **read-through** from object storage; build the shared
     // object store + range cache only if any window is parked.
     let any_cold = windows
         .iter()
@@ -1684,7 +1682,7 @@ async fn serve_windowed(
             );
             // Each window shard backs an in-process `LocalNode` (the embedded REST Gateway) plus the
             // gRPC window multiplexers over the *same* swappable handle: `SearchService` + `SuggestService`
-            // (task-82) and `LookupService` (hydration) + `AdminService` (describe) (task-225). The handle
+            // and `LookupService` (hydration) + `AdminService` (describe). The handle
             // is also returned so a HOT window can be auto-compacted.
             let build = |shard: Arc<growlerdb_index::Shard>| -> (
                 Arc<dyn Node>,
@@ -1746,7 +1744,7 @@ async fn serve_windowed(
                             bundle,
                         )?);
                         // Cold = read-through, no writer → never compacted, but its handle is kept so
-                        // an access-driven pre-warm loop can promote it back to hot (task-83).
+                        // an access-driven pre-warm loop can promote it back to hot.
                         let (node, search, suggest, lookup, admin, handle) = build(shard);
                         cold_handles.push((w, handle));
                         (
@@ -1798,7 +1796,7 @@ async fn serve_windowed(
     let cold_count = cold_ids.len();
     let hot_count = windows.len() - cold_count;
 
-    // Dynamic windowed ingest (task-219): the search/suggest mux maps become **shared + mutable** so
+    // Dynamic windowed ingest: the search/suggest mux maps become **shared + mutable** so
     // the windowed write path can add a window created at runtime, and we snapshot the boot windows
     // as the write service's seed (window → handle/node/zone). Built before `hot_handles`/`nodes` are
     // consumed below.
@@ -1822,7 +1820,7 @@ async fn serve_windowed(
     let admin_windows: growlerdb_engine::SharedAdminWindows =
         Arc::new(std::sync::RwLock::new(windowed_admin));
 
-    // Background **compaction re-map** (task-184 slice 3) across the HOT windows: one poll + one
+    // Background **compaction re-map** across the HOT windows: one poll + one
     // key scan of the rewritten files serves every window (each skips keys it doesn't hold).
     // Cold read-through windows keep the lazy verify-and-refresh + dead-file short-circuit.
     spawn_locator_remap(
@@ -1834,14 +1832,14 @@ async fn serve_windowed(
         remap_interval_secs,
     );
 
-    // Auto-compact each HOT window shard (task-33): under steady ingest the current window
+    // Auto-compact each HOT window shard: under steady ingest the current window
     // accumulates segments, so each hot window gets its own health-driven compaction loop. Cold
     // read-through windows have no writer and are skipped.
     for (w, handle) in hot_handles {
         spawn_auto_compaction(handle, format!("{index} w{w}"), compact_interval_secs);
     }
 
-    // Access-driven pre-warm (task-83): each cold window watches its read rate; a parked window that
+    // Access-driven pre-warm: each cold window watches its read rate; a parked window that
     // gets hot again is promoted back to a local hot shard (un-bundled from object storage) and
     // hot-swapped in, so it stops paying cold-tier latency. Needs the object store (present iff cold).
     if let Some(op) = &object_store {
@@ -1865,7 +1863,7 @@ async fn serve_windowed(
     }
     let gateway = Arc::new(gateway);
 
-    // The windowed **write** service (task-219): routes each streamed doc to its window shard,
+    // The windowed **write** service: routes each streamed doc to its window shard,
     // creating the window on first write and publishing it (mux + this gateway) so it's immediately
     // queryable. A new window also gets its own auto-compaction loop via `on_new_window`.
     let on_new_window: growlerdb_engine::OnNewWindow = {
@@ -1912,10 +1910,10 @@ async fn serve_windowed(
     let readiness = spawn_health(metrics_addr).await?;
 
     // Report the served windows (+ zone-maps) to the control plane so a cluster-level Gateway can
-    // route to them (task-81 4c). Retries until reachable and re-announces on an interval — same K8s
-    // startup race as the sharded path (task-119); `/readyz` stays not-ready until registered.
+    // route to them. Retries until reachable and re-announces on an interval — same K8s
+    // startup race as the sharded path; `/readyz` stays not-ready until registered.
     if let (Some(cp), Some(endpoint)) = (register, advertise_addr) {
-        // Dynamic windowed registration (task-219): heartbeat into the CP placement pool (so new
+        // Dynamic windowed registration: heartbeat into the CP placement pool (so new
         // windows can be placed here) AND re-announce the windows this node currently serves (+
         // zone-maps) each tick — so a window created since boot is advertised, not just the boot set.
         let label = format!("windowed `{index}` at {endpoint}");
@@ -1932,7 +1930,7 @@ async fn serve_windowed(
     }
 
     // gRPC listener: System (health/version) + the **window multiplexers** — `Search` and `Suggest`
-    // (task-82) plus `Lookup` (hydration) and `Admin` (describe) (task-225) — over `window id → service`
+    // plus `Lookup` (hydration) and `Admin` (describe) — over `window id → service`
     // maps that dispatch by the request's window selector, so a cluster Gateway can route per-window
     // requests to this one endpoint. (Aggregate/PIT over distributed windows are follow-ons.)
     let socket: std::net::SocketAddr = addr
@@ -1949,7 +1947,7 @@ async fn serve_windowed(
         .add_service(
             growlerdb_engine::WindowedSuggestService::new(suggest_windows.clone()).into_server(),
         )
-        // Hydration (keys:get) + describe over the windows (task-225): the Gateway broadcasts a
+        // Hydration (keys:get) + describe over the windows: the Gateway broadcasts a
         // hydration to every window and fans a describe to each, dispatched by selector here.
         .add_service(
             growlerdb_engine::WindowedLookupService::new(lookup_windows.clone()).into_server(),
@@ -1957,7 +1955,7 @@ async fn serve_windowed(
         .add_service(
             growlerdb_engine::WindowedAdminService::new(admin_windows.clone()).into_server(),
         )
-        // The windowed Write service (task-219) — the connector streams each window's rows here.
+        // The windowed Write service — the connector streams each window's rows here.
         .add_service(write_service.into_server())
         .add_service(SystemServer::new(SystemService::new(VERSION)))
         .serve_with_shutdown(socket, async {
@@ -1968,13 +1966,13 @@ async fn serve_windowed(
     Ok(())
 }
 
-/// Everything [`gateway`] needs, bundled into one struct (task-153 / K1) instead of 16 positional
+/// Everything [`gateway`] needs, bundled into one struct instead of many positional
 /// args. Borrows its string config from the dispatched `Command`; `node_tls` is owned (moved in).
 struct GatewayConfig<'a> {
     node_addr: Option<&'a str>,
     registry: Option<&'a str>,
     index: Option<&'a str>,
-    /// Front every registered index over one endpoint (task-240). Mutually exclusive with `index`.
+    /// Front every registered index over one endpoint. Mutually exclusive with `index`.
     all_indexes: bool,
     addr: &'a str,
     rest_addr: &'a str,
@@ -2026,7 +2024,7 @@ async fn gateway(cfg: GatewayConfig<'_>) -> anyhow::Result<()> {
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid --rest-addr `{rest_addr}`: {e}"))?;
 
-    // Serve /healthz + /readyz **before** building the gateway (task-142): if the gateway must WAIT
+    // Serve /healthz + /readyz **before** building the gateway: if the gateway must WAIT
     // for the control-plane at boot (rolled together), /healthz stays up so liveness passes and the
     // pod isn't killed, while /readyz stays not-ready until the routing snapshot is in hand (marked
     // ready just before the gRPC serve below). Net: up-but-not-ready during the wait, never
@@ -2044,7 +2042,7 @@ async fn gateway(cfg: GatewayConfig<'_>) -> anyhow::Result<()> {
         Option<tonic::transport::ClientTlsConfig>,
         RoutingFingerprint,
     )> = None;
-    // The windowed analog (task-219): the cluster gateway re-polls `GetIndex` and swaps in windows
+    // The windowed analog: the cluster gateway re-polls `GetIndex` and swaps in windows
     // created/placed at runtime, so a temporal workload's new windows become queryable with no restart.
     let mut reload_cp_windowed: Option<(
         String,
@@ -2053,7 +2051,7 @@ async fn gateway(cfg: GatewayConfig<'_>) -> anyhow::Result<()> {
         WindowFingerprint,
     )> = None;
     let (gw, routed_to) = if all_indexes {
-        // Multi-index (task-240): front EVERY registered index over one endpoint, resolving each
+        // Multi-index: front EVERY registered index over one endpoint, resolving each
         // named index lazily from the live control-plane on first use and hot-reloading each
         // independently. Readiness (below) is the control plane's reachability — we don't block boot
         // on any one index resolving, so a fresh cluster with no indexes yet still serves.
@@ -2062,7 +2060,7 @@ async fn gateway(cfg: GatewayConfig<'_>) -> anyhow::Result<()> {
                 "--all-indexes requires --control-plane (the live registry to route from)"
             )
         })?;
-        // Wait until the control plane is reachable (task-142): up but /readyz not-ready meanwhile,
+        // Wait until the control plane is reachable: up but /readyz not-ready meanwhile,
         // rather than crash-looping when rolled alongside the control-plane.
         wait_for_control_plane(cp).await;
         let resolver = std::sync::Arc::new(CpRouteResolver {
@@ -2087,7 +2085,7 @@ async fn gateway(cfg: GatewayConfig<'_>) -> anyhow::Result<()> {
                 (gw, desc)
             }
             // Sharded routing from the **live control-plane** over gRPC (no registry file) — the
-            // distributed/Kubernetes path (task-77): the control-plane and gateway are separate pods,
+            // distributed/Kubernetes path: the control-plane and gateway are separate pods,
             // so there's no shared registry.json to read.
             (None, Some(index), _) => {
                 let cp = control_plane.ok_or_else(|| {
@@ -2100,7 +2098,7 @@ async fn gateway(cfg: GatewayConfig<'_>) -> anyhow::Result<()> {
                     "index `{index}` ({} shard(s)) via control-plane {cp}",
                     gw.shard_count()
                 );
-                // Wire the reload matching the index kind (task-219): ordinal → swap_routing; windowed →
+                // Wire the reload matching the index kind: ordinal → swap_routing; windowed →
                 // swap_windowed (so runtime-created windows are picked up).
                 if reload_secs > 0 {
                     match reload {
@@ -2144,13 +2142,13 @@ async fn gateway(cfg: GatewayConfig<'_>) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("fetching OIDC keys from `{issuer}`: {e}"))?;
         spawn_jwks_refresher(authn.clone());
         println!("gateway: OIDC/JWT authentication enabled (issuer `{issuer}`, aud `{audience}`)");
-        // With authenticated roles in hand, enforce coarse control-plane RBAC (task-36):
+        // With authenticated roles in hand, enforce coarse control-plane RBAC:
         // map the verified roles to operation scopes and reject calls that lack them.
         println!("gateway: RBAC enabled (viewer / index-admin / operator / service roles)");
         gw.with_authn(authn)
             .with_authz(Arc::new(growlerdb_engine::RbacPolicy::with_default_roles()))
     } else if builtin_auth {
-        // Built-in (no external IdP) closed mode (task-128): validate the HS256 session JWTs the
+        // Built-in (no external IdP) closed mode: validate the HS256 session JWTs the
         // control-plane's /v1/login mints, using the shared secret. Same iss/aud as the minter.
         let secret = auth_secret
             .ok_or_else(|| anyhow::anyhow!("--auth-secret is required with --builtin-auth"))?;
@@ -2171,7 +2169,7 @@ async fn gateway(cfg: GatewayConfig<'_>) -> anyhow::Result<()> {
     };
     let gw = Arc::new(gw);
 
-    // Hot-reload the topology after a reshard cutover (task-77): poll the registry and swap in the
+    // Hot-reload the topology after a reshard cutover: poll the registry and swap in the
     // new shard set + router with no restart.
     if let Some((registry_path, idx, tls)) = reload {
         spawn_registry_reloader(gw.clone(), registry_path, idx.clone(), tls, reload_secs);
@@ -2193,7 +2191,7 @@ async fn gateway(cfg: GatewayConfig<'_>) -> anyhow::Result<()> {
         println!("gateway: windowed hot-reload on for `{idx}` via control-plane {cp} (every {reload_secs}s)");
     }
 
-    // REST front on its own listener; with a Control Plane, also expose index management (task-47).
+    // REST front on its own listener; with a Control Plane, also expose index management.
     let mut router = rest_router(gw.clone(), ui_dir);
     if let Some(cp) = control_plane {
         let client = connect_cp_with_retry(cp).await;
@@ -2208,7 +2206,7 @@ async fn gateway(cfg: GatewayConfig<'_>) -> anyhow::Result<()> {
         router = router.merge(growlerdb_engine::opensearch_router(gw.clone()));
         println!("gateway: OpenSearch-compatible adapter on http://{rest_socket}/<index>/_search");
     }
-    // RED metrics for every REST endpoint (task-208.2): one layer over the fully-merged router, so
+    // RED metrics for every REST endpoint: one layer over the fully-merged router, so
     // `MatchedPath` resolves the route template for all `/v1/*` routes.
     router = router.layer(axum::middleware::from_fn(
         growlerdb_engine::rest::track_http_metrics,
@@ -2230,7 +2228,7 @@ async fn gateway(cfg: GatewayConfig<'_>) -> anyhow::Result<()> {
     // gRPC front: Gateway-backed Search/Suggest/Lookup/Admin routing to the Node(s).
     let (search, suggest, lookup, admin) = growlerdb_engine::gateway_grpc::servers(gw);
     println!("gateway: gRPC Engine API on {grpc_socket} → {routed_to}");
-    // Routing snapshot in hand + fronts bound → ready (task-39/142 readiness probe). Health was
+    // Routing snapshot in hand + fronts bound → ready. Health was
     // spawned early (above); only now do we flip /readyz to ready.
     readiness.mark_ready();
     Server::builder()
@@ -2246,7 +2244,7 @@ async fn gateway(cfg: GatewayConfig<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The REST Engine-API router, optionally also serving the built UI SPA from `ui_dir` (task-45).
+/// The REST Engine-API router, optionally also serving the built UI SPA from `ui_dir`.
 fn rest_router(
     gateway: std::sync::Arc<growlerdb_engine::Gateway>,
     ui_dir: Option<&str>,
@@ -2260,7 +2258,7 @@ fn rest_router(
     }
 }
 
-/// Spawn the health/readiness + Prometheus `/metrics` server on `addr` (task-39), returning a
+/// Spawn the health/readiness + Prometheus `/metrics` server on `addr`, returning a
 /// [`Readiness`](growlerdb_telemetry::Readiness) the caller flips once warm. With no `addr` the
 /// probe surface is disabled and the returned handle is already ready (nothing to gate).
 async fn spawn_health(addr: Option<&str>) -> anyhow::Result<growlerdb_telemetry::Readiness> {
@@ -2322,7 +2320,7 @@ async fn gateway_from_registry(
 ) -> anyhow::Result<growlerdb_engine::Gateway> {
     let registry = growlerdb_controlplane::Registry::open(registry_path)
         .map_err(|e| anyhow::anyhow!("opening registry `{registry_path}`: {e}"))?;
-    // A single **windowed** index (task-82) routes per time window, not over an ordinal shard map
+    // A single **windowed** index routes per time window, not over an ordinal shard map
     // (which it doesn't have) — front its windows over `WindowNode`s so a time-filtered search
     // prunes to the owning windows across nodes.
     if let Some(entry) = registry.get(name) {
@@ -2330,11 +2328,11 @@ async fn gateway_from_registry(
             return gateway_windowed_from_registry(&registry, name, windowing, node_tls).await;
         }
     }
-    // Otherwise `name` is an ordinal index or an **alias** (task-52): connect the shard primaries +
+    // Otherwise `name` is an ordinal index or an **alias**: connect the shard primaries +
     // build the router. Factored out so the hot-reload loop ([`spawn_registry_reloader`]) can re-run
     // it on a topology change and swap the result in.
     let (nodes, router) = resolve_sharded_routing(&registry, name, node_tls).await?;
-    // Search fan-out pruning (task-199): if the index is partition-routed on keyword fields, tell the
+    // Search fan-out pruning: if the index is partition-routed on keyword fields, tell the
     // Gateway their names so a search pinning them routes to the owning shard instead of broadcasting.
     let partition_fields = registry
         .get(name)
@@ -2344,7 +2342,7 @@ async fn gateway_from_registry(
         .with_partition_fields(partition_fields))
 }
 
-/// The index's partition-key field names **iff every one is a keyword** field (task-199) — the
+/// The index's partition-key field names **iff every one is a keyword** field — the
 /// precondition for search fan-out pruning to route a string-valued query filter to the exact shard.
 /// A non-keyword partition field (int/date/…) would route a string value to the wrong shard and drop
 /// results, so a mixed partition disables pruning entirely (returns empty → the Gateway fans out).
@@ -2363,7 +2361,7 @@ fn keyword_partition_fields(def: &growlerdb_core::ResolvedIndex) -> Vec<String> 
 }
 
 /// (shard endpoints, bucket_owners) — the registry state that determines a sharded gateway's
-/// topology (task-77). The hot-reload loop swaps the gateway only when this changes, so an unrelated
+/// topology. The hot-reload loop swaps the gateway only when this changes, so an unrelated
 /// registry write (another index, an ingestion update) doesn't churn node connections.
 type RoutingFingerprint = (Vec<String>, Vec<u32>);
 
@@ -2386,7 +2384,7 @@ fn routing_fingerprint(
 }
 
 /// Resolve `name`'s ordinal/alias shards into connected [`RemoteNode`]s + the key router. A single
-/// index routes through its **virtual-bucket map** when present (task-77; the same map the connector
+/// index routes through its **virtual-bucket map** when present (the same map the connector
 /// reads), else legacy `fnv % shards`; an **alias** hashes over the union of its members' nodes.
 async fn resolve_sharded_routing(
     registry: &growlerdb_controlplane::Registry,
@@ -2400,7 +2398,7 @@ async fn resolve_sharded_routing(
     let (members, endpoints) = resolve_targets(registry, name)?;
     let mut nodes: Vec<Arc<dyn growlerdb_engine::Node>> = Vec::with_capacity(endpoints.len());
     for (i, endpoint) in endpoints.iter().enumerate() {
-        // Lazy connect (task-122): tolerant of a down shard + re-resolves DNS on reconnect.
+        // Lazy connect: tolerant of a down shard + re-resolves DNS on reconnect.
         let node = connect_node_lazy(endpoint, node_tls.clone())
             .map_err(|e| anyhow::anyhow!("shard {i} primary `{endpoint}`: {e}"))?;
         nodes.push(Arc::new(node));
@@ -2420,7 +2418,7 @@ async fn resolve_sharded_routing(
 }
 
 /// Poll the registry every `secs` and **hot-reload** the gateway's topology when it changes
-/// (task-77): after a reshard cutover (new bucket map plus nodes), the running gateway picks up the
+/// after a reshard cutover (new bucket map plus nodes), the running gateway picks up the
 /// new shard set and router with no restart. Each tick does a cheap fingerprint check; only a real
 /// change reconnects nodes and swaps. A read error keeps the current topology (an outage must not
 /// blank the gateway). Ordinal/alias indexes only — windowed gateways aren't reloaded.
@@ -2436,7 +2434,7 @@ fn spawn_registry_reloader(
         let mut last: Option<RoutingFingerprint> = open(&registry_path)
             .ok()
             .and_then(|r| routing_fingerprint(&r, &index).ok());
-        // One-time phase offset so fleet-wide gateways don't all poll on the same tick (B12); the
+        // One-time phase offset so fleet-wide gateways don't all poll on the same tick; the
         // interval preserves the phase thereafter.
         tokio::time::sleep(jittered(std::time::Duration::from_secs(secs), 0.5)).await;
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
@@ -2483,7 +2481,7 @@ fn spawn_registry_reloader(
 }
 
 /// Backoff between gateway startup attempts to reach the control-plane + resolve the index's shards
-/// (task-142/119). The gateway retries **unboundedly** (up but /readyz not-ready) rather than
+/// The gateway retries **unboundedly** (up but /readyz not-ready) rather than
 /// exiting, so a gateway rolled alongside the control-plane waits instead of crash-looping.
 const GW_CP_STARTUP_INTERVAL_SECS: u64 = 5;
 
@@ -2496,7 +2494,7 @@ fn routing_plan_from_get_index(
     index: &str,
     resp: &growlerdb_proto::v1::GetIndexResponse,
 ) -> anyhow::Result<(Vec<String>, growlerdb_core::RoutingStrategy, Vec<u32>)> {
-    // A windowed index (task-219) is fronted by [`windowed_gateway_from_get_index`], not the ordinal
+    // A windowed index is fronted by [`windowed_gateway_from_get_index`], not the ordinal
     // planner, and its reloader is never wired — so reaching here with window shards is an internal
     // routing bug, not an unsupported case.
     if resp.shard_status.iter().any(|s| s.window != 0) || resp.windowing.is_some() {
@@ -2581,7 +2579,7 @@ fn connect_sharded_from_get_index(
     let shard_count = endpoints.len() as u32;
     let mut nodes: Vec<Arc<dyn growlerdb_engine::Node>> = Vec::with_capacity(endpoints.len());
     for (ord, endpoint) in endpoints.iter().enumerate() {
-        // Lazy connect (task-122): never fail the build on an unreachable shard, and re-resolve DNS
+        // Lazy connect: never fail the build on an unreachable shard, and re-resolve DNS
         // on reconnect so a returned-at-new-IP shard recovers and a still-down one fails fast → partial.
         let node = connect_node_lazy(endpoint, node_tls.clone())
             .map_err(|e| anyhow::anyhow!("shard {ord} primary `{endpoint}`: {e}"))?;
@@ -2593,7 +2591,7 @@ fn connect_sharded_from_get_index(
 }
 
 /// Reconstruct the [`TimeWindowing`](growlerdb_core::TimeWindowing) config from a control-plane
-/// `GetIndex` response's [`WindowingConfig`](growlerdb_proto::v1::WindowingConfig) (task-219) — so a
+/// `GetIndex` response's [`WindowingConfig`](growlerdb_proto::v1::WindowingConfig) — so a
 /// live-CP windowed gateway can prune exactly like the file-registry path (which reads it from the
 /// stored definition).
 fn windowing_from_get_index(
@@ -2617,14 +2615,14 @@ fn windowing_from_get_index(
     })
 }
 
-/// Build a **windowed** Gateway (task-219) from a live-CP `GetIndex` response — the gRPC analog of
+/// Build a **windowed** Gateway from a live-CP `GetIndex` response — the gRPC analog of
 /// [`gateway_windowed_from_registry`]. One [`WindowNode`](growlerdb_engine::WindowNode) per window
 /// (deduped by endpoint, since a node fronts many windows on one channel), tagged with its id + the
 /// event-time zone-map so a time-filtered search prunes to overlapping windows before scattering.
 /// Not hot-reloaded yet (the window set is static under today's single-process serve); dynamic-window
 /// reload is a follow-up (needs a windowed swap on the Gateway).
 /// (window, primary endpoint) pairs identifying a windowed topology — the windowed analog of
-/// [`RoutingFingerprint`] (task-219), so the reloader logs only when the window→node set changes.
+/// [`RoutingFingerprint`], so the reloader logs only when the window→node set changes.
 type WindowFingerprint = Vec<(i64, String)>;
 
 /// The windowed routing resolved from a live-CP `GetIndex`: one [`WindowNode`] per window (deduped by
@@ -2636,7 +2634,7 @@ type CpWindowedRouting = (
     WindowFingerprint,
 );
 
-/// Resolve a windowed index's routing from a live-CP `GetIndex` response (task-219): connect one
+/// Resolve a windowed index's routing from a live-CP `GetIndex` response: connect one
 /// [`WindowNode`] per window (deduped by endpoint — a node fronts many windows on one channel), the
 /// windowing config + per-window event-time zone-maps for pruning, and the topology fingerprint.
 /// Shared by the startup build and the hot-reload loop (so a window created at runtime is picked up).
@@ -2693,7 +2691,7 @@ async fn resolve_windowed_routing_cp(
     Ok((nodes, windowing, descriptors, fingerprint))
 }
 
-/// Build a windowed [`Gateway`] + its [`WindowFingerprint`] from a live-CP `GetIndex` (task-219).
+/// Build a windowed [`Gateway`] + its [`WindowFingerprint`] from a live-CP `GetIndex`.
 async fn windowed_gateway_from_get_index(
     index: &str,
     resp: &growlerdb_proto::v1::GetIndexResponse,
@@ -2712,7 +2710,7 @@ async fn windowed_gateway_from_get_index(
 /// (the Kubernetes start race), so retry until every shard has a primary rather than crash-looping.
 /// Returns the gateway and the startup [`RoutingFingerprint`] (seeds the reloader so it doesn't
 /// redundantly re-apply the same topology on its first tick).
-/// What hot-reload a live-CP gateway needs (task-219): an **ordinal** shard topology (reshard/primary
+/// What hot-reload a live-CP gateway needs: an **ordinal** shard topology (reshard/primary
 /// moves) vs a **windowed** window set (windows created/placed at runtime). Both poll `GetIndex`, but
 /// swap differently — [`swap_routing`](growlerdb_engine::Gateway::swap_routing) vs
 /// [`swap_windowed`](growlerdb_engine::Gateway::swap_windowed).
@@ -2727,10 +2725,10 @@ async fn gateway_from_control_plane(
     node_tls: Option<tonic::transport::ClientTlsConfig>,
 ) -> (growlerdb_engine::Gateway, CpReload) {
     // One build attempt: connect to the control plane, then resolve the index's topology. BOTH a
-    // connection refusal (the CP pod isn't up yet — task-142) and shards-not-yet-registered (the
-    // Kubernetes start race — task-119) are transient at boot, so retry_until_ok waits it out rather
+    // connection refusal (the CP pod isn't up yet) and shards-not-yet-registered (the
+    // Kubernetes start race) are transient at boot, so retry_until_ok waits it out rather
     // than exit(1) → CrashLoopBackOff. The caller serves /healthz + a not-ready /readyz meanwhile.
-    // A **windowed** index (task-219) builds a window-pruning gateway (hot-reloaded via swap_windowed
+    // A **windowed** index builds a window-pruning gateway (hot-reloaded via swap_windowed
     // so runtime-created windows are picked up); an ordinal index returns its routing fingerprint.
     let attempt = || {
         let node_tls = node_tls.clone();
@@ -2776,7 +2774,7 @@ async fn gateway_from_control_plane(
     .await
 }
 
-/// Wait (unboundedly, task-142) until the control-plane at `cp` accepts a gRPC connection, so a
+/// Wait (unboundedly) until the control-plane at `cp` accepts a gRPC connection, so a
 /// `--all-indexes` gateway rolled alongside the control-plane stays up (not-ready) rather than
 /// crash-looping. Multi-index readiness is CP reachability, *not* any one index resolving.
 async fn wait_for_control_plane(cp: &str) {
@@ -2804,8 +2802,8 @@ async fn wait_for_control_plane(cp: &str) {
 }
 
 /// A [`RouteResolver`](growlerdb_engine::RouteResolver) that resolves a named index into an
-/// [`IndexRoute`](growlerdb_engine::IndexRoute) from the live control-plane (task-240 multi-index
-/// routing): fetch its `GetIndex`, connect a Node per shard (ordinal or windowed), and — if
+/// [`IndexRoute`](growlerdb_engine::IndexRoute) from the live control-plane: fetch its `GetIndex`,
+/// connect a Node per shard (ordinal or windowed), and — if
 /// `reload_secs > 0` — spawn a per-index hot-reloader so a reshard / new window is picked up with no
 /// restart. Closes over the CP endpoint + node TLS so one resolver serves every index the gateway
 /// fronts.
@@ -2866,7 +2864,7 @@ impl growlerdb_engine::RouteResolver for CpRouteResolver {
                 connect_sharded_from_get_index(index, &resp, self.node_tls.clone())
                     .map_err(|e| e.to_string())?;
             // The live-CP path carries no partition-field pruning hints (as the single-index live-CP
-            // gateway also doesn't) — correct, just fans out instead of pruning (task-199/240).
+            // gateway also doesn't) — correct, just fans out instead of pruning.
             let route = growlerdb_engine::IndexRoute::new(nodes, router, None, Vec::new());
             if self.reload_secs > 0 {
                 spawn_index_route_reloader(
@@ -2883,7 +2881,7 @@ impl growlerdb_engine::RouteResolver for CpRouteResolver {
     }
 }
 
-/// Poll the control-plane every `secs` and **hot-reload** one multi-index route's topology (task-240):
+/// Poll the control-plane every `secs` and **hot-reload** one multi-index route's topology:
 /// the per-index analog of [`spawn_control_plane_reloader`], but swapping an
 /// [`IndexRoute`](growlerdb_engine::IndexRoute) in place rather than the whole gateway. `windowed`
 /// selects the swap kind (windows vs ordinal shards). A read error keeps the current topology (an
@@ -2960,7 +2958,7 @@ fn spawn_index_route_reloader(
 }
 
 /// Retry `attempt` with a fixed `interval` backoff **until it succeeds**, returning its value;
-/// `on_error(attempt_number, err)` runs on each failure (logging). Unbounded by design (task-142):
+/// `on_error(attempt_number, err)` runs on each failure (logging). Unbounded by design:
 /// a gateway waiting for a not-yet-reachable control-plane at boot must stay up (not-ready), not
 /// exit → CrashLoopBackOff. Pure control flow — unit-tested with a closure that fails then succeeds.
 async fn retry_until_ok<T, F, Fut>(
@@ -2985,7 +2983,7 @@ where
     }
 }
 
-/// Connect to the control plane over gRPC, retrying with backoff until it's reachable (task-142) —
+/// Connect to the control plane over gRPC, retrying with backoff until it's reachable —
 /// used for the REST index-management proxy so a gateway rolled alongside the control-plane waits
 /// rather than exiting. (The routing build already waited for the CP, so this normally connects on
 /// the first try; the retry only covers a CP blip in between.)
@@ -3005,7 +3003,7 @@ async fn connect_cp_with_retry(
 }
 
 /// Poll the live Control-Plane every `secs` and **hot-reload** the gateway's topology on change
-/// (task-77 distributed): after a reshard cutover — or a shard primary moving to a new node — the
+/// (distributed): after a reshard cutover — or a shard primary moving to a new node — the
 /// running gateway picks up the new shard set + bucket map with no restart. The gRPC analog of
 /// [`spawn_registry_reloader`]. A read error keeps the current topology (a control-plane blip must
 /// not blank the gateway). `startup_fp` seeds `last` so the first tick is a no-op if nothing changed.
@@ -3018,12 +3016,12 @@ fn spawn_control_plane_reloader(
     startup_fp: RoutingFingerprint,
 ) {
     tokio::spawn(async move {
-        // Connect lazily and reconnect inside the loop (task-148 / G2): a single connect blip must
+        // Connect lazily and reconnect inside the loop: a single connect blip must
         // NOT end the reloader forever — otherwise topology freezes after one transient CP outage.
         let mut client: Option<growlerdb_proto::ControlPlaneClient<tonic::transport::Channel>> =
             None;
         let mut last: Option<RoutingFingerprint> = Some(startup_fp);
-        // One-time phase offset so fleet-wide gateways don't all poll the CP on the same tick (B12).
+        // One-time phase offset so fleet-wide gateways don't all poll the CP on the same tick.
         tokio::time::sleep(jittered(std::time::Duration::from_secs(secs), 0.5)).await;
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
         tick.tick().await; // immediate first tick is the startup state
@@ -3043,7 +3041,7 @@ fn spawn_control_plane_reloader(
             let c = client.as_mut().expect("client present");
             match resolve_sharded_routing_cp(c, &index, node_tls.clone()).await {
                 // Swap in a freshly-built routing **every** tick, not just on a topology change
-                // (task-122): the node channels are lazy, so rebuilding is cheap and — crucially — it
+                // the node channels are lazy, so rebuilding is cheap and — crucially — it
                 // re-resolves each shard's DNS, so a shard pod that crashed and returned at a new IP
                 // is reconnected within one interval with no manual gateway restart. The connect now
                 // can't fail on a down shard (lazy), so a partially-down cluster still serves (partial)
@@ -3070,7 +3068,7 @@ fn spawn_control_plane_reloader(
     });
 }
 
-/// The windowed analog of [`spawn_control_plane_reloader`] (task-219): poll `GetIndex` and
+/// The windowed analog of [`spawn_control_plane_reloader`]: poll `GetIndex` and
 /// [`swap_windowed`](growlerdb_engine::Gateway::swap_windowed) so the cluster gateway picks up windows
 /// **created/placed at runtime** — the temporal workload's timeline advances continuously, so new
 /// windows must become queryable through the gateway with no restart. A read error keeps the current
@@ -3142,7 +3140,7 @@ fn spawn_windowed_control_plane_reloader(
     });
 }
 
-/// Build a **windowed** Gateway (task-82) for `name` from the registry window map: one
+/// Build a **windowed** Gateway for `name` from the registry window map: one
 /// [`WindowNode`](growlerdb_engine::WindowNode) per assigned window, each over a `RemoteNode` to its
 /// serving node's endpoint and tagged with its window id, plus the per-window event-time zone-map so
 /// the Gateway prunes a time-filtered search to the overlapping windows before scattering. Remote
@@ -3195,7 +3193,7 @@ async fn gateway_windowed_from_registry(
     ))
 }
 
-/// Resolve `name` — an **index** or an **alias** (task-52) — to `(members, endpoints)`: the member
+/// Resolve `name` — an **index** or an **alias** — to `(members, endpoints)`: the member
 /// index names, and the gRPC endpoints to front (each member's shard primaries, in member then
 /// ordinal order). A search over the resulting Gateway fans out across every member's shards and
 /// merges. Errors if `name` is registered as neither, or a member's shards aren't (fully) assigned.
@@ -3219,7 +3217,7 @@ fn resolve_targets(
     Ok((members, endpoints))
 }
 
-/// Connect a [`RemoteNode`] to `endpoint`, over mutual TLS when `tls` is set ([task-35]) or
+/// Connect a [`RemoteNode`] to `endpoint`, over mutual TLS when `tls` is set or
 /// plaintext otherwise.
 async fn connect_node(
     endpoint: &str,
@@ -3234,7 +3232,7 @@ async fn connect_node(
     node.map_err(|e| anyhow::anyhow!("connecting to Node `{endpoint}`: {e}"))
 }
 
-/// Lazy variant of [`connect_node`] for sharded routing (task-122). Builds the Node channel without
+/// Lazy variant of [`connect_node`] for sharded routing. Builds the Node channel without
 /// dialing now, so (a) a down shard never fails the whole routing build — the Gateway can front a
 /// partially-down cluster — and (b) the channel re-resolves DNS on each (re)connect, so a shard pod
 /// that crashed and returned at a new IP is reached again, while a still-down shard fails fast at the
@@ -3252,17 +3250,17 @@ fn connect_node_lazy(
 
 /// Announce a node-served index to the Control-Plane registry: send its resolved definition (so
 /// the control plane needn't re-resolve against the source) + the routable `endpoint` it serves
-/// from. Idempotent — safe to call on every node restart (task-49).
-/// Backoff bounds + heartbeat for control-plane registration (task-119).
+/// from. Idempotent — safe to call on every node restart.
+/// Backoff bounds + heartbeat for control-plane registration.
 const REGISTER_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 const REGISTER_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
 const REGISTER_REANNOUNCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Announce a served index to the control-plane registry in the background, **retrying until it
-/// succeeds** and then re-announcing on an interval (task-119). In Kubernetes all pods start
-/// together, so the control plane is routinely not reachable yet at node start; the old one-shot
-/// best-effort attempt left the shard serving but invisible to the gateway forever. The node serves
-/// immediately, but `readiness` is marked ready only on the **first** successful registration — so
+/// succeeds** and then re-announcing on an interval. In Kubernetes all pods start
+/// together, so the control plane is routinely not reachable yet at node start; a one-shot
+/// best-effort attempt would leave the shard serving but invisible to the gateway forever. The node
+/// serves immediately, but `readiness` is marked ready only on the **first** successful registration — so
 /// `/readyz` stays not-ready until the node is actually in the registry, the gateway never routes to
 /// or waits on a half-joined shard, and a rolling restart re-registers. Re-announcing (an idempotent
 /// upsert, control_service.rs) re-points the registry at this node after a control-plane restart.
@@ -3309,7 +3307,7 @@ fn spawn_registration(
     });
 }
 
-/// Apply ±`frac` jitter to `base` (task-148 / B12) so fleet-wide loops don't fire in lockstep — in
+/// Apply ±`frac` jitter to `base` so fleet-wide loops don't fire in lockstep — in
 /// Kubernetes every node starts together, and a synchronized re-announce/reload herd hammers the
 /// control plane (each re-announce drives a full-registry rewrite). Uses the sub-second wall clock as
 /// a cheap entropy source — no `rand` dependency, and only decorrelation (not unpredictability) is
@@ -3351,7 +3349,7 @@ async fn registration_loop<F, Fut>(
                 backoff = initial_backoff;
                 warned = false;
                 readiness.mark_ready();
-                // Jitter the heartbeat so a fleet doesn't re-announce in lockstep (B12).
+                // Jitter the heartbeat so a fleet doesn't re-announce in lockstep.
                 tokio::time::sleep(jittered(reannounce, 0.2)).await;
             }
             Err(e) => {
@@ -3362,7 +3360,7 @@ async fn registration_loop<F, Fut>(
                     );
                     warned = true;
                 }
-                // Jitter the backoff so a CP restart doesn't trigger a synchronized retry storm (B12).
+                // Jitter the backoff so a CP restart doesn't trigger a synchronized retry storm.
                 tokio::time::sleep(jittered(backoff, 0.2)).await;
                 backoff = (backoff * 2).min(max_backoff);
             }
@@ -3395,7 +3393,7 @@ async fn register_served_index(
     Ok(())
 }
 
-/// Heartbeat this windowed node into the control-plane **placement pool** (task-219) so the CP can
+/// Heartbeat this windowed node into the control-plane **placement pool** so the CP can
 /// place newly-seen windows on it (answering the connector's `ResolveWindowOwner`).
 async fn register_node(control_plane: &str, index: &str, endpoint: &str) -> anyhow::Result<()> {
     let mut client = growlerdb_proto::ControlPlaneClient::connect(control_plane.to_string())
@@ -3411,7 +3409,7 @@ async fn register_node(control_plane: &str, index: &str, endpoint: &str) -> anyh
     Ok(())
 }
 
-/// Dynamic windowed registration (task-219): on an interval, heartbeat into the placement pool and
+/// Dynamic windowed registration: on an interval, heartbeat into the placement pool and
 /// re-announce the windows this node **currently** serves (+ zone-maps) — so a window created since
 /// boot is advertised to the control plane (and thus the cluster gateway), not just the boot set. The
 /// windowed counterpart to [`spawn_registration`] (which announces a fixed set).
@@ -3455,12 +3453,12 @@ fn spawn_windowed_registration(
     });
 }
 
-/// Seed the built-in users on first closed-mode / login boot (task-128/244). Idempotent:
+/// Seed the built-in users on first closed-mode / login boot. Idempotent:
 /// - the **admin** (role `admin`) is seeded only if the registry has NO credentials yet, with the
 ///   supplied password or a generated one printed once;
 /// - a **demo** user is seeded when `GROWLERDB_DEMO_USER` is set (the `just stack` demo) and it
 ///   doesn't already exist — a well-known, index-scoped credential so the walkthrough SHOWS login +
-///   per-index RBAC (task-240), not open access. Roles `reader, operator` (query + read metadata +
+///   per-index RBAC, not open access. Roles `reader, operator` (query + read metadata +
 ///   ops read; NOT admin/write) and an `indexes` allowlist (default `docs,catalog`) that the minted
 ///   session JWT carries so the gateway restricts the demo user to exactly those indexes.
 ///
@@ -3545,7 +3543,7 @@ async fn control_plane(
     let registry_path = std::path::Path::new(data_dir).join("registry.json");
     std::fs::create_dir_all(data_dir)?;
     let registry = Arc::new(growlerdb_controlplane::Registry::open(&registry_path)?);
-    // With OIDC, the control plane validates bearers itself and enforces RBAC (task-104) — so
+    // With OIDC, the control plane validates bearers itself and enforces RBAC — so
     // admin-gated user management is real, and local role bindings merge against a verified subject.
     let svc = if let Some(issuer) = oidc_issuer {
         let audience = oidc_audience
@@ -3557,7 +3555,7 @@ async fn control_plane(
             .await
             .map_err(|e| anyhow::anyhow!("fetching OIDC keys from `{issuer}`: {e}"))?;
         spawn_jwks_refresher(jwks.clone());
-        // Accept OIDC bearers *and* API tokens (task-105): `Bearer …` → JWKS, `ApiKey …` → the
+        // Accept OIDC bearers *and* API tokens: `Bearer …` → JWKS, `ApiKey …` → the
         // registry's tokens (a revoked token fails immediately).
         let tokens = Arc::new(growlerdb_engine::RegistryTokenAuthenticator::new(
             registry.clone(),
@@ -3577,7 +3575,7 @@ async fn control_plane(
         )
         .with_authn(chain)
     } else if builtin_auth {
-        // Built-in (no external IdP) closed mode (task-128): the /v1/login RPC mints session JWTs
+        // Built-in (no external IdP) closed mode: the /v1/login RPC mints session JWTs
         // from the registry credential store; the control plane validates them (+ API tokens) and
         // enforces RBAC. Seed the built-in users on first boot so the deployment is reachable.
         let secret = auth_secret
@@ -3606,7 +3604,7 @@ async fn control_plane(
         .with_authn(chain)
         .with_session_secret(secret.into_bytes())
     } else if login_secret {
-        // Login-only mode (task-244, the `just stack` demo): mint session JWTs via `/v1/login` and
+        // Login-only mode (the `just stack` demo): mint session JWTs via `/v1/login` and
         // seed the built-in users, but leave the control plane's OWN authorization **open**. The
         // enforcement point is the gateway (`--builtin-auth`) on the public data plane; the control
         // plane stays reachable for the internal node/gateway RPCs (registration, shard-map reads)
@@ -3631,9 +3629,9 @@ async fn control_plane(
         registry_path.display()
     );
     // Keep the ingestion-lag + shard-availability gauges fresh for Prometheus regardless of console
-    // polling (task-143).
+    // polling.
     svc.spawn_ingestion_metrics_sampler(15);
-    // Registry opened → ready (task-39 readiness probe).
+    // Registry opened → ready.
     let readiness = spawn_health(metrics_addr).await?;
     readiness.mark_ready();
     Server::builder()
@@ -3647,7 +3645,7 @@ async fn control_plane(
 }
 
 /// Load a shard's persisted resolved definition (`<data_dir>/<index>/index.json`), falling back
-/// to the last-known-good `.prev` copy if the live file is corrupt (task-70).
+/// to the last-known-good `.prev` copy if the live file is corrupt.
 fn load_resolved(data_dir: &str, index: &str) -> anyhow::Result<growlerdb_core::ResolvedIndex> {
     let def_path = std::path::Path::new(data_dir)
         .join(index)
@@ -3684,7 +3682,7 @@ fn backup_s3_config() -> anyhow::Result<growlerdb_backup::S3Config> {
     })
 }
 
-/// Local byte-range cache size for read-through cold windows (task-80), from
+/// Local byte-range cache size for read-through cold windows, from
 /// `GROWLERDB_COLD_CACHE_BYTES` (default 1 GiB). One cache is shared across all cold windows.
 fn cold_cache_bytes() -> usize {
     std::env::var("GROWLERDB_COLD_CACHE_BYTES")
@@ -3693,7 +3691,7 @@ fn cold_cache_bytes() -> usize {
         .unwrap_or(1024 * 1024 * 1024)
 }
 
-/// Back up an index's shard to object storage (task-32).
+/// Back up an index's shard to object storage.
 async fn backup_cmd(data_dir: &str, index: &str, prefix: Option<&str>) -> anyhow::Result<()> {
     use growlerdb_index::{LocalIndexStore, ShardId};
     let resolved = load_resolved(data_dir, index)?;
@@ -3726,7 +3724,7 @@ async fn backup_cmd(data_dir: &str, index: &str, prefix: Option<&str>) -> anyhow
     Ok(())
 }
 
-/// Cold-park windows of a windowed index (task-80): keep the most-recent `keep_hot` (or the index's
+/// Cold-park windows of a windowed index: keep the most-recent `keep_hot` (or the index's
 /// `hot_windows` policy) hot, cold-park the rest to `cold/<index>/w<window>` — evicting the local
 /// bulk while keeping each window searchable read-through. `revive` promotes a window back to hot.
 async fn park_cmd(data_dir: &str, index: &str, keep_hot: Option<usize>) -> anyhow::Result<()> {
@@ -3757,7 +3755,7 @@ async fn park_cmd(data_dir: &str, index: &str, keep_hot: Option<usize>) -> anyho
         let window_dir = store_local.shard_path(&id);
         let prefix = format!("cold/{index}/w{w}");
         let staging = std::path::Path::new(data_dir).join(format!(".cold-staging-{index}-w{w}"));
-        // Cold-tier (task-80): evict the local bulk but keep the window searchable read-through.
+        // Cold-tier: evict the local bulk but keep the window searchable read-through.
         let marker = growlerdb_backup::cold_park(
             shard,
             index,
@@ -3782,7 +3780,7 @@ async fn park_cmd(data_dir: &str, index: &str, keep_hot: Option<usize>) -> anyho
     Ok(())
 }
 
-/// Promote a cold window back to hot (task-80): restore its bulk from `cold/<index>/w<window>` into
+/// Promote a cold window back to hot: restore its bulk from `cold/<index>/w<window>` into
 /// the local window-shard dir and drop the cold marker, so it's served locally again — the inverse
 /// of cold-parking. (A cold window is *already* searchable read-through; this is for pre-warming a
 /// window expecting heavy traffic.)
@@ -3805,7 +3803,7 @@ async fn revive_cmd(data_dir: &str, index: &str, window: i64) -> anyhow::Result<
     Ok(())
 }
 
-/// The retention **victims** for a keep-last-N policy (task-52): of `names` matching `pattern`,
+/// The retention **victims** for a keep-last-N policy: of `names` matching `pattern`,
 /// sorted, all **but** the most-recent `keep` (the oldest roll-off). Pure — the CLI applies it to
 /// the index list it reads from the control plane.
 fn retention_plan(names: &[String], pattern: &str, keep: usize) -> Vec<String> {
@@ -3819,7 +3817,7 @@ fn retention_plan(names: &[String], pattern: &str, keep: usize) -> Vec<String> {
     matching
 }
 
-/// Drop the oldest indexes matching `pattern` beyond `keep`, via the control plane (task-52).
+/// Drop the oldest indexes matching `pattern` beyond `keep`, via the control plane.
 async fn retention_cmd(
     control_plane: &str,
     pattern: &str,
@@ -3872,7 +3870,7 @@ async fn retention_cmd(
 }
 
 /// Restore an index's shard from an object-storage backup, or rebuild from Iceberg when there is
-/// none (task-32). After a backup restore, the connector resumes the tail from the checkpoint.
+/// none. After a backup restore, the connector resumes the tail from the checkpoint.
 async fn restore_cmd(
     engine: &Engine,
     data_dir: &str,
@@ -3924,7 +3922,7 @@ async fn restore_cmd(
     Ok(())
 }
 
-/// Refresh a replica from the primary's backup (task-31): incremental segment shipping +
+/// Refresh a replica from the primary's backup: incremental segment shipping +
 /// re-materialize the definition at the index root, so a subsequent `serve` is a read replica.
 async fn refresh_replica_cmd(
     data_dir: &str,
@@ -3998,7 +3996,7 @@ mod tests {
 
     #[test]
     fn jittered_stays_within_bounds() {
-        // task-148 / B12: jitter must decorrelate without exploding or collapsing the interval.
+        // Jitter must decorrelate without exploding or collapsing the interval.
         let base = std::time::Duration::from_secs(30);
         for _ in 0..1000 {
             let j = jittered(base, 0.2);
@@ -4011,7 +4009,7 @@ mod tests {
         assert!(jittered(base, 5.0) >= base.mul_f64(0.1));
     }
 
-    /// task-142: the gateway's startup build must **retry until it succeeds** (CP unreachable / shards
+    /// The gateway's startup build must **retry until it succeeds** (CP unreachable / shards
     /// not yet registered) rather than exiting on the first failure → CrashLoopBackOff. Simulates a
     /// dependency down for the first two attempts then up: `retry_until_ok` keeps trying and returns
     /// the value once it succeeds; `on_error` fires once per failure.
@@ -4049,7 +4047,7 @@ mod tests {
         assert_eq!(errors, 2, "on_error fired once per failed attempt");
     }
 
-    /// task-119: registration must retry until the control plane is reachable, and the node must not
+    /// Registration must retry until the control plane is reachable, and the node must not
     /// report ready until it has registered. Simulates a CP that's unreachable for the first two
     /// attempts then comes up: the loop keeps trying, and once it succeeds readiness flips to ready.
     #[tokio::test]
@@ -4178,7 +4176,7 @@ mod tests {
         assert!(routing_plan_from_get_index("events", &gap).is_err());
 
         // A windowed index (window != 0) must route through the windowed gateway, not the ordinal
-        // planner (task-219) — the planner rejects it whether flagged by a window id …
+        // planner — the planner rejects it whether flagged by a window id …
         let mut windowed = get_index_resp(&[(0, "http://n1:50051")], 1, 0, vec![]);
         windowed.shard_status[0].window = 1_700_000_000_000_000;
         assert!(routing_plan_from_get_index("events", &windowed).is_err());
@@ -4194,7 +4192,7 @@ mod tests {
 
     #[test]
     fn windowing_from_get_index_reconstructs_config() {
-        // Granularity words map to the enum; an event-time field + hot_windows round-trip (task-219).
+        // Granularity words map to the enum; an event-time field + hot_windows round-trip.
         let wc = growlerdb_proto::v1::WindowingConfig {
             field: "ingest".into(),
             granularity: "daily".into(),

@@ -1,13 +1,11 @@
-//! The Node **Admin** gRPC service ([Design 01]) over the served shard (task-26/task-30).
+//! The Node **Admin** gRPC service over the served shard.
 //! `DescribeIndex` reports stats. `AlterIndex` resolves a candidate definition against the
 //! source schema and returns the [`AlterPlan`](growlerdb_core::AlterPlan) (detect + guide);
 //! with `apply` set it accepts only a true **no-op** live — every real change (reindex-requiring,
 //! rename, or a restart-required read-time policy like `sensitive`/`max_bytes`) is rejected with a
-//! clear status, since the running shard keeps its built schema (task-71). `ReindexIndex` rebuilds
+//! clear status, since the running shard keeps its built schema. `ReindexIndex` rebuilds
 //! from the source and durably swaps the shard live, fencing writes for the rebuild so the
 //! checkpoint can't regress. Create / drop / list pair with the multi-index server + Control Plane.
-//!
-//! [Design 01]: ../../../design/01-engine-api.md
 
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -45,13 +43,13 @@ struct SourceContext {
     shard_id: ShardId,
     iceberg: IcebergConfig,
     table: String,
-    /// Shared reindex write-fence (task-71): engaged for the duration of a reindex so the Write
+    /// Shared reindex write-fence: engaged for the duration of a reindex so the Write
     /// service rejects new writes (no rebuild-window delta to drop) and a second reindex is
     /// refused (single-flight). Shared with the Node's [`WriteService`](crate::WriteService).
     fence: ReindexFence,
 }
 
-/// The accumulated outcome of a count-gated reconcile (task-198): counts over the divergent
+/// The accumulated outcome of a count-gated reconcile: counts over the divergent
 /// partitions it row-reconciled plus how many partitions it scanned vs. skipped as in-sync.
 #[derive(Default)]
 struct GateResult {
@@ -78,7 +76,7 @@ impl GateResult {
     }
 }
 
-/// Object-storage backup target (task-109): the [`Operator`](opendal::Operator) + prefix a
+/// Object-storage backup target: the [`Operator`](opendal::Operator) + prefix a
 /// node-triggered backup writes to / reads status from. Absent ⇒ `BackupIndex` is `Unimplemented`
 /// and `BackupStatus` reports `configured = false`.
 #[derive(Clone)]
@@ -98,7 +96,7 @@ pub struct AdminService {
     /// Present when the Node has source access, enabling [`AlterIndex`](Admin::alter_index)
     /// planning and [`ReindexIndex`](Admin::reindex_index) execution.
     source: Option<Arc<SourceContext>>,
-    /// Present when the Node was started with an object-storage backup target (task-109).
+    /// Present when the Node was started with an object-storage backup target.
     backup: Option<BackupCfg>,
 }
 
@@ -125,7 +123,7 @@ impl AdminService {
         }
     }
 
-    /// Enable node-triggered backups (task-109): `store` is the object-storage target and `prefix`
+    /// Enable node-triggered backups: `store` is the object-storage target and `prefix`
     /// the key prefix backups are written under. Without this, `BackupIndex` is `Unimplemented` and
     /// `BackupStatus` reports `configured = false`.
     pub fn with_backup(mut self, store: opendal::Operator, prefix: impl Into<String>) -> Self {
@@ -166,7 +164,7 @@ impl AdminService {
         AdminServer::new(self)
     }
 
-    /// Per-partition count-gated reconcile (task-198). Returns `Some(result)` when the gate applied
+    /// Per-partition count-gated reconcile. Returns `Some(result)` when the gate applied
     /// (the source is cleanly identity-partitioned on the index's partition-key fields), having
     /// row-reconciled only the partitions whose source `record_count` differs from the index
     /// key-count and skipped the rest. Returns `None` when the gate doesn't apply (not
@@ -280,14 +278,14 @@ fn wire_plan(current: &ResolvedIndex, candidate: &ResolvedIndex) -> WireAlterPla
 }
 
 /// Validate an in-place alter and return `candidate` as the new baseline when it's a true no-op.
-/// Everything else is rejected with `FailedPrecondition` (task-71):
+/// Everything else is rejected with `FailedPrecondition`:
 ///
 /// * a **no-op** → `Ok` (the only safe live apply; nothing changes, nothing is written);
 /// * a **reindex-requiring** change → run `ReindexIndex`;
 /// * a **rename** → identity/paths are fixed on a single-index node;
 /// * any other in-place change — i.e. a **read-time policy** declaration (`sensitive`/`max_bytes`)
 ///   — is **restart-required**: the running shard keeps the schema it was built with, so applying
-///   it live would silently not take effect (M3 review M3). The operator changes the definition
+///   it live would silently not take effect. The operator changes the definition
 ///   (`index.json`, the boot source of truth) and restarts. Pure / no side effects — the apply
 ///   path never writes, so it's never exposed to the file-write hazard.
 fn apply_in_place(
@@ -338,8 +336,8 @@ impl Admin for AdminService {
                 num_docs: shard.num_docs()?,
                 generation_count: shard.segment_count()?,
                 checkpoint: render_checkpoint(shard.current_checkpoint()?),
-                size_bytes: shard.size_bytes(), // per-shard on-disk size (task-73 skew signal)
-                time_fields: shard.date_fields(), // DATE columns for the console time filter (task-101)
+                size_bytes: shard.size_bytes(), // per-shard on-disk size (skew signal)
+                time_fields: shard.date_fields(), // DATE columns for the console time filter
             })
         })
         .await?
@@ -406,7 +404,7 @@ impl Admin for AdminService {
             Status::unimplemented("this node was started without source access for reindex")
         })?;
 
-        // Fence (task-71): engaging is the single-flight guard (a second reindex is refused) AND
+        // Fence: engaging is the single-flight guard (a second reindex is refused) AND
         // it makes the Write service reject new writes for the duration — so the connector can't
         // advance the shard past the rebuild snapshot, a delta the swap would otherwise drop.
         if !ctx.fence.engage() {
@@ -423,10 +421,10 @@ impl Admin for AdminService {
             .expect("definition lock not poisoned")
             .clone();
 
-        // Reshard filter (task-77): a non-empty bucket map means rebuild this shard keeping only the
+        // Reshard filter: a non-empty bucket map means rebuild this shard keeping only the
         // docs it owns under the new map — the per-node data step of an online reshard. Empty ⇒ a
         // normal full reindex. A filtered shard may legitimately end up empty (it owns no populated
-        // buckets), so the task-85 empty-rebuild guard is skipped when filtering.
+        // buckets), so the empty-rebuild guard is skipped when filtering.
         let reshard_filter: Option<(ShardRouter, u32)> = if req.bucket_owners.is_empty() {
             None
         } else {
@@ -439,18 +437,18 @@ impl Admin for AdminService {
         };
         let filtering = reshard_filter.is_some();
 
-        // Stream the source into the rebuild (task-76): the staging shard is populated chunk by
+        // Stream the source into the rebuild: the staging shard is populated chunk by
         // chunk straight off the Iceberg scan, so peak memory is O(one streamed chunk), not
-        // O(table) — the old `read_documents` buffered the whole table into a `Vec` first.
+        // O(table).
         let reader = IcebergReader::connect(&ctx.iceberg)
             .await
             .map_err(internal)?;
         // Fix the rebuild snapshot from table metadata (cheap, no scan) before streaming, so every
-        // chunk commits at one checkpoint. The rebuilt shard cannot regress the live one (task-71):
-        // writes are fenced, so the live checkpoint is an ancestor of the head read here. The old
-        // `max(old, snapshot_id)` "monotonicity belt" is gone — snapshot ids are random longs, so a
-        // numeric max could actually PICK the stale side (task-205); the fence is the guarantee,
-        // and the sequence number stamped below is the order.
+        // chunk commits at one checkpoint. The rebuilt shard cannot regress the live one:
+        // writes are fenced, so the live checkpoint is an ancestor of the head read here. There is
+        // no numeric `max(old, snapshot_id)` "monotonicity belt" — snapshot ids are random longs, so
+        // a numeric max could actually PICK the stale side; the fence is the guarantee, and the
+        // sequence number stamped below is the order.
         let (snapshot_id, sequence) = reader
             .current_snapshot_ordered(&ctx.table)
             .await
@@ -459,7 +457,7 @@ impl Admin for AdminService {
         let checkpoint = snapshot_id;
 
         // The source's reported row count — lets us refuse to swap in an empty rebuild if the
-        // streamed read came back empty from a non-empty table (task-85 data-loss guard).
+        // streamed read came back empty from a non-empty table (data-loss guard).
         let records = reader
             .current_snapshot_records(&ctx.table)
             .await
@@ -481,7 +479,7 @@ impl Admin for AdminService {
         // The rebuild + atomic on-disk swap is blocking I/O → the blocking pool. The async Iceberg
         // read is driven on that same blocking thread via `block_on`; its sync sink writes each
         // bounded chunk straight into the staging shard (mirrors `Engine::build_from_source`), so
-        // peak rebuild memory is O(one chunk), not O(table) (task-76).
+        // peak rebuild memory is O(one chunk), not O(table).
         let store = ctx.store.clone();
         let shard_id = ctx.shard_id.clone();
         let table = ctx.table.clone();
@@ -492,14 +490,14 @@ impl Admin for AdminService {
                 let mut doc_count = 0u64;
                 let promoted = store.reindex(&shard_id, &resolved, |shard| {
                     // Sub-commit each streamed chunk in bounded slices with progress — a single
-                    // giant commit balloons peak memory and gives no signal on a long op (task-71).
+                    // giant commit balloons peak memory and gives no signal on a long op.
                     // Every commit carries the rebuild checkpoint; a per-commit seq keeps each
                     // batch_id unique.
                     let mut seq = 0u64;
                     handle
                         .block_on(
                             reader.read_documents_streamed(&table, &resolved, |mut docs| {
-                                // Reshard (task-77): drop docs this shard no longer owns under the new
+                                // Reshard: drop docs this shard no longer owns under the new
                                 // map, so the rebuilt shard holds only its post-reshard buckets.
                                 if let Some((router, ordinal)) = &reshard_filter {
                                     docs.retain(|d| router.owns(&d.doc.key, *ordinal));
@@ -514,14 +512,14 @@ impl Admin for AdminService {
                                     .map_err(|e| e.to_string())?;
                                 }
                                 // Per-chunk progress at debug (off by default) so a big rebuild
-                                // doesn't spam unbounded stderr (task-153 / I11).
+                                // doesn't spam unbounded stderr.
                                 tracing::debug!(index = %index_name, doc_count, "reindex: committed chunk");
                                 Ok(())
                             }),
                         )
                         .map_err(|e| StoreError::Source(e.to_string()))?;
                     // A 0-doc read from a non-empty source is a broken read — abort before the swap
-                    // so the live index is never replaced by an empty one (task-85). Skipped for a
+                    // so the live index is never replaced by an empty one. Skipped for a
                     // reshard rebuild, where a shard may legitimately own no populated buckets.
                     if !filtering {
                         if let Some(reason) = empty_rebuild_abort_reason(doc_count, records) {
@@ -572,7 +570,7 @@ impl Admin for AdminService {
             .expect("definition lock not poisoned")
             .clone();
 
-        // Shard scope (task-195): restrict the comparison to the keys THIS shard owns, so the
+        // Shard scope: restrict the comparison to the keys THIS shard owns, so the
         // stale-set (indexed keys absent from the read) can't sweep away another shard's keys.
         // Empty `bucket_owners` ⇒ the whole index (single-shard / unsharded).
         let owner_filter: Option<(ShardRouter, u32)> = if req.bucket_owners.is_empty() {
@@ -592,7 +590,7 @@ impl Admin for AdminService {
             .map_err(internal)?;
         let table = ctx.table.clone();
 
-        // Whole-index count-gate phase (task-198, `count_only`): report this shard's live doc count +
+        // Whole-index count-gate phase (`count_only`): report this shard's live doc count +
         // the source table's total record count, WITHOUT reconciling. The cluster driver aggregates
         // Σ index_count across shards and compares to the source total to skip the row-level reconcile
         // when the index is already in sync — routing-agnostic (covers hash-routed indexes the
@@ -616,7 +614,7 @@ impl Admin for AdminService {
         }
 
         // Capture the shard's checkpoint BEFORE any source read: the stale-delete only runs if the
-        // shard hasn't advanced since (task-195 TOCTOU guard), so a concurrent ingest that lands a
+        // shard hasn't advanced since (TOCTOU guard), so a concurrent ingest that lands a
         // new key during the scan can't have that key mistaken for stale and deleted.
         let expected_checkpoint = self
             .shard
@@ -624,7 +622,7 @@ impl Admin for AdminService {
             .current_checkpoint()
             .map_err(internal)?;
 
-        // Per-partition count-gate (task-198): unless `full` forces a whole-shard scan, try to
+        // Per-partition count-gate: unless `full` forces a whole-shard scan, try to
         // reconcile only the partitions whose source record-count differs from the index key-count,
         // skipping the in-sync majority without reading their rows.
         if !req.full {
@@ -708,7 +706,7 @@ impl Admin for AdminService {
         })
         .await?
         .map_err(internal)?;
-        // Segments·merges metric (task-143): count the compaction + record the post-merge segments.
+        // Segments·merges metric: count the compaction + record the post-merge segments.
         growlerdb_telemetry::sli::compaction(&self.index, before, after);
         Ok(Response::new(CompactIndexResponse {
             segments_before: before,
@@ -786,13 +784,13 @@ impl Admin for AdminService {
 }
 
 /// Docs per reindex commit — each streamed source chunk is sub-committed in bounded slices so a
-/// rebuild commits incrementally with progress instead of one giant commit (task-71). Peak *read*
-/// memory is bounded by the streamed chunk size, independent of table size (task-76).
+/// rebuild commits incrementally with progress instead of one giant commit. Peak *read*
+/// memory is bounded by the streamed chunk size, independent of table size.
 const REINDEX_COMMIT_CHUNK: usize = 10_000;
 
-/// Build the durable commit for one reindex chunk (task-76 streamed rebuild) — pure, no I/O, so
+/// Build the durable commit for one reindex chunk — pure, no I/O, so
 /// it's unit-testable without a stack. Every chunk carries the rebuild `checkpoint` (with its
-/// lineage sequence number when the table has one — v2; task-196); the per-chunk `seq` keeps
+/// lineage sequence number when the table has one — v2); the per-chunk `seq` keeps
 /// each `batch_id` unique (commits are idempotent/replayable by id).
 fn reindex_commit(docs: Vec<LocatedDoc>, checkpoint: i64, sequence: i64, seq: u64) -> CommitBatch {
     let cp = if sequence > 0 {
@@ -803,7 +801,7 @@ fn reindex_commit(docs: Vec<LocatedDoc>, checkpoint: i64, sequence: i64, seq: u6
     CommitBatch::from_upserts(docs, cp, format!("reindex-{checkpoint}-{seq}"))
 }
 
-/// Guard against a reindex silently rebuilding an **empty** index over a live shard (task-85):
+/// Guard against a reindex silently rebuilding an **empty** index over a live shard:
 /// if the streamed read produced 0 docs but the source snapshot reports rows, the read is broken
 /// (e.g. a delete-in-history the changelog read mishandles) — so the swap must be aborted rather
 /// than destroy the served data. `records` is the source's reported row count (`None` ⇒ unknown ⇒
@@ -814,18 +812,18 @@ fn empty_rebuild_abort_reason(doc_count: u64, records: Option<i64>) -> Option<St
     match records {
         Some(n) if doc_count == 0 && n > 0 => Some(format!(
             "reindex read 0 docs from a source that reports {n} rows — refusing to swap in an empty \
-             index (a delete-in-history read bug, task-85); the live index is unchanged"
+             index (a delete-in-history read bug); the live index is unchanged"
         )),
         _ => None,
     }
 }
 
 /// Headroom multiplier over the current index size for the free-disk precheck: the old, staging,
-/// and (briefly) backup copies coexist during the swap (task-71).
+/// and (briefly) backup copies coexist during the swap.
 const REINDEX_DISK_HEADROOM: u64 = 3;
 
 /// Refuse a reindex up front if free disk plausibly can't hold the rebuild — better than failing
-/// hours in (task-71). Compares ≈`REINDEX_DISK_HEADROOM`× the current index size to the free space
+/// hours in. Compares ≈`REINDEX_DISK_HEADROOM`× the current index size to the free space
 /// at the shard's parent dir. A probe failure (`None`) skips the check rather than blocking.
 fn precheck_free_disk(shard_dir: &Path) -> Result<(), String> {
     let size = dir_size(shard_dir);
@@ -933,7 +931,7 @@ mod tests {
         AdminService::new(Arc::new(shard), "docs")
     }
 
-    // task-76: the streamed-rebuild commit builder is pure, so its checkpoint/batch-id contract is
+    // The streamed-rebuild commit builder is pure, so its checkpoint/batch-id contract is
     // testable without a stack (the end-to-end streaming reindex stays `#[ignore]`-gated on Polaris).
     #[test]
     fn reindex_commit_carries_checkpoint_and_unique_ids() {
@@ -949,7 +947,7 @@ mod tests {
         };
 
         // Every chunk of one rebuild commits at the same checkpoint (with the table's
-        // lineage sequence number when it has one — v2, task-196; 0 ⇒ unknown, plain)...
+        // lineage sequence number when it has one — v2; 0 ⇒ unknown, plain)...
         let c1 = reindex_commit(vec![doc("a"), doc("b")], 42, 7, 1);
         let c2 = reindex_commit(vec![doc("c")], 42, 7, 2);
         assert_eq!(c1.checkpoint, SourceCheckpoint::iceberg_ordered(42, 7));
@@ -974,7 +972,7 @@ mod tests {
         assert_eq!(empty.checkpoint, SourceCheckpoint::iceberg(7));
     }
 
-    // task-85: a reindex that reads 0 docs from a *non-empty* source must abort before the swap so
+    // A reindex that reads 0 docs from a *non-empty* source must abort before the swap so
     // the live index is never replaced by an empty one. Pure, so testable without a stack.
     #[test]
     fn empty_rebuild_aborts_only_on_nonempty_source() {
@@ -997,7 +995,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn compact_merges_segments(/* task-109 */) {
+    async fn compact_merges_segments() {
         let tmp = tempfile::tempdir().unwrap();
         let svc = service(tmp.path()); // two commits ⇒ two segments under NoMergePolicy
         let resp = svc
@@ -1090,7 +1088,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn describe_surfaces_date_fields_for_the_time_filter() {
-        // task-101: describe reports the index's DATE columns so the console time filter can list them.
+        // Describe reports the index's DATE columns so the console time filter can list them.
         let tmp = tempfile::tempdir().unwrap();
         let src = SourceSchema::new(
             vec![
@@ -1222,7 +1220,7 @@ mod tests {
         let (current, src) = alter_fixtures();
 
         // A read-time policy change (flip `sensitive`) is in-place per `alter_to`, but the running
-        // shard keeps its built schema → restart-required, rejected (task-71). Nothing persisted.
+        // shard keeps its built schema → restart-required, rejected. Nothing persisted.
         let policy = resolve_candidate(
             "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD }, { path: city, type: KEYWORD, sensitive: true } ] }\n",
             &src,
@@ -1254,7 +1252,7 @@ mod tests {
     #[test]
     fn apply_in_place_noop_succeeds_without_error() {
         // Applying the identical definition is the one safe live apply: a no-op returns the
-        // baseline (and, being pure, writes nothing) (task-71).
+        // baseline (and, being pure, writes nothing).
         let (current, _src) = alter_fixtures();
         let applied = apply_in_place(&current, current.clone()).unwrap();
         assert_eq!(applied.name, current.name);
@@ -1263,7 +1261,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn second_concurrent_reindex_is_rejected() {
-        // A reindex already in flight holds the fence; a second is rejected (task-71) rather than
+        // A reindex already in flight holds the fence; a second is rejected rather than
         // trampling the shared staging dirs.
         let (resolved, _src) = alter_fixtures();
         let tmp = tempfile::tempdir().unwrap();

@@ -1,4 +1,4 @@
-# Server-side alerting rules for GrowlerDB SLIs (task-111). Evaluated by the bundled Prometheus
+# Server-side alerting rules for GrowlerDB SLIs. Evaluated by the bundled Prometheus
 # in the otel-lgtm image; firing alerts surface at `/api/v1/alerts`, which the Engine normalizes
 # and the console reads via `GET /v1/alerts`. Thresholds mirror the console's local fallback
 # checks (ui/src/lib/stats.ts `evaluateAlerts`) so the two agree on healthy/unhealthy.
@@ -32,7 +32,7 @@ groups:
           summary: 'Stale-locator churn {{ $value | printf "%.2f" }}/s exceeds 1/s'
           description: 'Hydration is discarding stale locators faster than expected.'
 
-      # Index↔source drift early-warning (task-114): GetByKey returning far fewer rows than keys
+      # Index↔source drift early-warning: GetByKey returning far fewer rows than keys
       # requested means search hits whose keys no longer exist in the source — a stale index, e.g.
       # after a recreated source table. Sustained high miss fraction → reindex. The denominator is
       # clamped so a quiet period can't blow the ratio up.
@@ -49,9 +49,8 @@ groups:
           summary: 'Hydration miss rate {{ $value | humanizePercentage }} exceeds 20%'
           description: 'GetByKey is failing to hydrate a high fraction of requested keys — the index may be drifting from its source (e.g. a recreated source table; task-114). Reindex if confirmed.'
 
-      # --- Ingest silent-loss guards (task-194 AC6) -----------------------------------------------
-      # Any of these firing means a loss-guard tripped or ingest silently stalled — the signals that
-      # were printf-only and rotated away when the 6-row loss was investigated.
+      # --- Ingest silent-loss guards -----------------------------------------------
+      # Any of these firing means a loss-guard tripped or ingest silently stalled.
 
       # The connector's expected-row-count gate refused a window as an under-read. This is the direct
       # silent-loss signature: alert on ANY occurrence.
@@ -75,7 +74,7 @@ groups:
           summary: 'Node rejected {{ $value | printf "%.0f" }} batch(es) as a checkpoint gap in 10m'
           description: 'A batch did not continue from a shard''s checkpoint (task-194 continuity guard) — a lineage gap, checkpoint regression, or cross-wired sub-batch. The shard refused to advance over unapplied data.'
 
-      # Reconcile repaired drift — the backstop found the index diverged from the source (task-195).
+      # Reconcile repaired drift — the backstop found the index diverged from the source.
       - alert: DriftRepaired
         expr: sum(increase(growlerdb_drift_stale_total[1h]) + increase(growlerdb_drift_missing_total[1h])) > 0
         for: 0m

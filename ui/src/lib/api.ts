@@ -1,8 +1,7 @@
-// The Engine API client (task-45/46). The UI is a pure client of the same gRPC/REST API
-// programmatic callers use — it never reaches the Index or storage directly (wiki/20-ui).
-// Every request carries the verified bearer token (AC2), which the Engine gateway validates
-// (task-35). The base URL is empty by default — the SPA is served *by* the Engine, so the
-// API is same-origin.
+// The Engine API client. The UI is a pure client of the same gRPC/REST API programmatic callers
+// use — it never reaches the Index or storage directly. Every request carries the verified bearer
+// token, which the Engine gateway validates. The base URL is empty by default — the SPA is served
+// *by* the Engine, so the API is same-origin.
 import { getToken, clearToken, isTokenExpired } from './auth';
 
 /** Fired when a request we authenticated is rejected 401 (expired/revoked token) — App re-gates. */
@@ -15,8 +14,8 @@ const BASE: string = (import.meta.env.VITE_ENGINE_API as string | undefined) ?? 
 export async function apiFetch(path: string, body?: unknown, method?: string): Promise<Response> {
   const headers: Record<string, string> = {};
   let token = getToken();
-  // Proactively drop an expired token (task-153 / B17): fire the re-gate and go unauthenticated
-  // instead of sending a request the gateway would 401 anyway.
+  // Proactively drop an expired token: fire the re-gate and go unauthenticated instead of sending
+  // a request the gateway would 401 anyway.
   if (token && isTokenExpired(token)) {
     clearToken();
     if (typeof window !== 'undefined') window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
@@ -32,9 +31,9 @@ export async function apiFetch(path: string, body?: unknown, method?: string): P
     init.body = JSON.stringify(body);
   }
   const res = await fetch(`${BASE}${path}`, init);
-  // task-127: a 401 on a request we *did* authenticate means the token expired or was revoked.
-  // Drop the dead token and signal the app to re-gate — closed mode shows the login screen again;
-  // open mode never had a token, so it's unaffected.
+  // A 401 on a request we *did* authenticate means the token expired or was revoked. Drop the dead
+  // token and signal the app to re-gate — closed mode shows the login screen again; open mode never
+  // had a token, so it's unaffected.
   if (res.status === 401 && token) {
     clearToken();
     if (typeof window !== 'undefined') window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
@@ -53,47 +52,47 @@ export interface Coordinates {
   identifier?: KeyField[];
 }
 
-/** One XSS-safe highlight segment (task-250): a run of text and whether it is a matched term.
+/** One XSS-safe highlight segment: a run of text and whether it is a matched term.
  *  Mirrors {@link import('./highlight').Segment} so server + client-side highlights render alike. */
 export interface HighlightSegment {
   text: string;
   marked: boolean;
 }
 
-/** Server-side highlights for a hit (task-250): field name → fragments → segment runs. Present only
- *  when the search opted in (`highlight` in the request) and a field actually matched. */
+/** Server-side highlights for a hit: field name → fragments → segment runs. Present only when the
+ *  search opted in (`highlight` in the request) and a field actually matched. */
 export type HitHighlight = Record<string, HighlightSegment[][]>;
 
 export interface SearchHit {
   coordinates?: Coordinates;
   score?: number;
-  /** Cached display fields returned with the hit (D23/task-86), so a results page renders
-   *  document-like rows without hydration. Absent when the index caches no display fields. */
+  /** Cached display fields returned with the hit, so a results page renders document-like rows
+   *  without hydration. Absent when the index caches no display fields. */
   fields?: Record<string, unknown>;
-  /** Server-side highlights (task-250): field → matched fragments (each a list of `{text, marked}`
-   *  segments), reflecting the analyzed match. Absent unless the search requested highlighting. */
+  /** Server-side highlights: field → matched fragments (each a list of `{text, marked}` segments),
+   *  reflecting the analyzed match. Absent unless the search requested highlighting. */
   highlight?: HitHighlight;
 }
 
 export interface SearchResponse {
   hits: SearchHit[];
   total: number;
-  /** Set by the Gateway when a shard failed to respond, so hits/total under-count (task-87).
+  /** Set by the Gateway when a shard failed to respond, so hits/total under-count.
    *  Absent on a complete result, so a missing flag is trustworthy. */
   partial?: boolean;
-  /** Shards the Gateway queried vs the index's total (task-133): a time/window filter prunes
+  /** Shards the Gateway queried vs the index's total: a time/window filter prunes
    *  shards it can prove won't match. Both absent from a bare Node (no shard scope). */
   shards_scanned?: number;
   shards_total?: number;
-  /** Opaque keyset cursor for the next page (task-99): present only on a sorted, full page.
+  /** Opaque keyset cursor for the next page: present only on a sorted, full page.
    *  Pass it back as `cursor` to scroll. Absent for score-ranked or short pages. */
   next_cursor?: string;
 }
 
-/** The query grammar the `query` string is parsed with (task-90). */
+/** The query grammar the `query` string is parsed with. */
 export type QuerySyntax = 'lucene' | 'kql';
 
-/** A sort key: order hits by `field` (descending by default), task-99. */
+/** A sort key: order hits by `field` (descending by default). */
 export interface SortKey {
   field: string;
   desc?: boolean;
@@ -104,19 +103,19 @@ export interface SearchOptions {
   limit?: number;
   offset?: number;
   syntax?: QuerySyntax;
-  /** Scope to a named index (task-99); the gateway 404s a name it doesn't serve. */
+  /** Scope to a named index; the gateway 404s a name it doesn't serve. */
   index?: string;
   /** Sort keys in priority order; empty/omitted = rank by score. */
   sort?: SortKey[];
   /** `search_after` keyset cursor from a prior response's `next_cursor` (deep paging). */
   cursor?: string;
-  /** Opt into server-side highlighting (task-250). `true` = default highlightable TEXT fields;
+  /** Opt into server-side highlighting. `true` = default highlightable TEXT fields;
    *  an object names fields and/or bounds. Omitted = no highlights (the client-side marker is used). */
   highlight?: boolean | { fields?: string[]; max_fragments?: number; fragment_size?: number };
 }
 
 /** Run a query through the Engine `/v1/search` endpoint. Supports per-index scoping, field sort,
- *  offset paging, and `search_after` keyset scrolling (task-99). */
+ *  offset paging, and `search_after` keyset scrolling. */
 export async function search(query: string, opts: SearchOptions = {}): Promise<SearchResponse> {
   const body: Record<string, unknown> = {
     query,
@@ -129,7 +128,7 @@ export async function search(query: string, opts: SearchOptions = {}): Promise<S
     body.sort = opts.sort.map((s) => ({ field: s.field, desc: s.desc ?? true }));
   }
   if (opts.cursor) body.search_after = opts.cursor;
-  // Opt into server-side highlighting (task-250): `true` sends an empty object (default fields);
+  // Opt into server-side highlighting: `true` sends an empty object (default fields);
   // an object passes fields/bounds through. Omitted ⇒ no `highlight` key (highlighting off).
   if (opts.highlight === true) body.highlight = {};
   else if (opts.highlight && typeof opts.highlight === 'object') body.highlight = opts.highlight;
@@ -144,7 +143,7 @@ export interface FacetBucket {
   count: number;
 }
 
-/** A field's top facet values (terms aggregation), task-100. */
+/** A field's top facet values (terms aggregation). */
 export interface FacetGroup {
   field: string;
   buckets: FacetBucket[];
@@ -152,11 +151,11 @@ export interface FacetGroup {
 
 export interface FacetsResponse {
   facets: FacetGroup[];
-  /** A shard failed, so counts under-count (task-87). */
+  /** A shard failed, so counts under-count. */
   partial?: boolean;
 }
 
-/** Compute left-rail facets for a query via `/v1/facets` (task-100): a top-N terms aggregation per
+/** Compute left-rail facets for a query via `/v1/facets`: a top-N terms aggregation per
  *  field, reusing the engine's distributed Aggregate path. Fields that aren't aggregatable are
  *  skipped server-side. Returns `{ facets: [] }` on any failure — facets are a best-effort refinement
  *  and must never break the results view. */
@@ -170,14 +169,14 @@ export async function facets(query: string, fields: string[], size = 10): Promis
   }
 }
 
-/** One node of the BM25 score-explanation tree (task-102). */
+/** One node of the BM25 score-explanation tree. */
 export interface ExplainClause {
   description: string;
   score: number;
   details?: ExplainClause[];
 }
 
-/** A real query explanation for one document (task-102): BM25 tree, analyzed terms, timings. */
+/** A real query explanation for one document: BM25 tree, analyzed terms, timings. */
 export interface ExplainResult {
   found: boolean;
   matched: boolean;
@@ -189,7 +188,7 @@ export interface ExplainResult {
   shards_total: number;
 }
 
-/** Explain how `query` scores one document via `/v1/explain` (task-102). Opt-in, per-hit. */
+/** Explain how `query` scores one document via `/v1/explain`. Opt-in, per-hit. */
 export async function explain(
   query: string,
   coordinates: Coordinates,
@@ -201,26 +200,26 @@ export async function explain(
   return res.json();
 }
 
-/** Unauthenticated runtime config (task-127): tells the console whether to gate the app behind a
+/** Unauthenticated runtime config: tells the console whether to gate the app behind a
  *  login screen. Available before sign-in (unlike `/v1/me`, which 401s for anonymous on a closed
  *  gateway). */
 export interface ServerConfig {
   auth_required: boolean;
-  /** Built-in username/password login is available (task-128) — show a login form, not just OIDC. */
+  /** Built-in username/password login is available — show a login form, not just OIDC. */
   password_login?: boolean;
-  /** This deployment's Grafana base URL (task-140), served at runtime so the link points at the
+  /** This deployment's Grafana base URL, served at runtime so the link points at the
    *  actual deployment. Absent when unset — the console then hides the "Open Grafana" link. */
   grafana_url?: string;
 }
 
-/** A built-in login result (task-128): the session JWT to send as `Authorization: Bearer`. */
+/** A built-in login result: the session JWT to send as `Authorization: Bearer`. */
 export interface LoginResult {
   token: string;
   expires_at_ms: number;
   roles: string[];
 }
 
-/** Built-in credential login (task-128): exchange a username/password for a session token via
+/** Built-in credential login: exchange a username/password for a session token via
  *  `POST /v1/login`. Throws a friendly message on bad credentials (401) or other failure. */
 export async function passwordLogin(username: string, password: string): Promise<LoginResult> {
   const res = await apiFetch('/v1/login', { username, password });
@@ -244,7 +243,7 @@ export async function serverConfig(): Promise<ServerConfig> {
   return { auth_required: false };
 }
 
-/** The verified caller identity from `GET /v1/me` (task-103). */
+/** The verified caller identity from `GET /v1/me`. */
 export interface Me {
   authenticated: boolean;
   subject: string;
@@ -266,7 +265,7 @@ export async function me(): Promise<Me | null> {
   }
 }
 
-/** API-token metadata (task-105) — never the secret or its hash. */
+/** API-token metadata — never the secret or its hash. */
 export interface ApiTokenMeta {
   id: string;
   label: string;
@@ -282,40 +281,40 @@ export interface CreatedToken {
   secret: string;
 }
 
-/** List API tokens (metadata only) via `/v1/tokens` (task-105). Admin-gated. */
+/** List API tokens (metadata only) via `/v1/tokens`. Admin-gated. */
 export async function listTokens(): Promise<ApiTokenMeta[]> {
   const res = await apiFetch('/v1/tokens');
   if (!res.ok) throw new Error(`list tokens failed (${res.status})`);
   return ((await res.json()) as { tokens?: ApiTokenMeta[] }).tokens ?? [];
 }
 
-/** Issue an API token; the `secret` is returned exactly once (task-105). */
+/** Issue an API token; the `secret` is returned exactly once. */
 export async function createToken(label: string, roles: string[]): Promise<CreatedToken> {
   const res = await apiFetch('/v1/tokens', { label, roles });
   if (!res.ok) throw new Error(`create token failed (${res.status})`);
   return res.json();
 }
 
-/** Revoke an API token by id (task-105). */
+/** Revoke an API token by id. */
 export async function revokeToken(id: string): Promise<void> {
   const res = await apiFetch(`/v1/tokens/${encodeURIComponent(id)}`, undefined, 'DELETE');
   if (!res.ok && res.status !== 204) throw new Error(`revoke token failed (${res.status})`);
 }
 
-/** A local role binding (task-104): an admin-granted set of roles for a subject. */
+/** A local role binding: an admin-granted set of roles for a subject. */
 export interface RoleBinding {
   subject: string;
   roles: string[];
 }
 
-/** List local role bindings via `/v1/users` (task-104). Admin-gated server-side. */
+/** List local role bindings via `/v1/users`. Admin-gated server-side. */
 export async function listUsers(): Promise<RoleBinding[]> {
   const res = await apiFetch('/v1/users');
   if (!res.ok) throw new Error(`list users failed (${res.status})`);
   return ((await res.json()) as { users?: RoleBinding[] }).users ?? [];
 }
 
-/** The assignable role catalog via `/v1/roles` (task-104). */
+/** The assignable role catalog via `/v1/roles`. */
 export async function listRoles(): Promise<string[]> {
   const res = await apiFetch('/v1/roles');
   if (!res.ok) return [];
@@ -329,7 +328,7 @@ export async function setUserRoles(subject: string, roles: string[]): Promise<Ro
   return res.json();
 }
 
-/** A server-persisted saved search (task-106). `state` is an opaque JSON blob the UI round-trips. */
+/** A server-persisted saved search. `state` is an opaque JSON blob the UI round-trips. */
 export interface SavedQueryRow {
   id: string;
   name: string;
@@ -340,7 +339,7 @@ export interface SavedQueryRow {
   created_at_ms?: number;
 }
 
-/** List the caller's saved searches (own + shared) via `/v1/saved-queries` (task-106). */
+/** List the caller's saved searches (own + shared) via `/v1/saved-queries`. */
 export async function listSavedQueries(): Promise<SavedQueryRow[]> {
   const res = await apiFetch('/v1/saved-queries');
   if (!res.ok) throw new Error(`list saved queries failed (${res.status})`);
@@ -366,10 +365,10 @@ export interface Suggestion {
   count: number;
 }
 
-/** Term suggestions for a field via `/v1/suggest` (task-25), used for query autocomplete (task-88).
+/** Term suggestions for a field via `/v1/suggest`, used for query autocomplete.
  *  Returns `[]` on any failure rather than throwing — suggest is best-effort and is fail-closed on
  *  tenant-scoped indexes (403), so a missing dropdown must never break typing. `index` scopes the
- *  suggestion to a named index on a multi-index endpoint (task-240); empty = the default index. */
+ *  suggestion to a named index on a multi-index endpoint; empty = the default index. */
 export async function suggest(
   field: string,
   text: string,
@@ -394,7 +393,7 @@ export interface Row {
 }
 
 /** Hydrate authoritative rows by coordinate via `/v1/keys:get`. Row/column governance is
- *  enforced by the Engine on the Iceberg read (task-37), so this can only return what the
+ *  enforced by the Engine on the Iceberg read, so this can only return what the
  *  caller is allowed to see. */
 export async function getByKey(keys: Coordinates[], columns: string[] = []): Promise<Row[]> {
   const res = await apiFetch('/v1/keys:get', { keys, columns });
@@ -409,21 +408,21 @@ export function hitId(hit: SearchHit): string {
   return ids.map((f) => String(f.value)).join(' / ') || '?';
 }
 
-// ---- index management (control-plane REST, task-47) ------------------------------
+// ---- index management (control-plane REST) ------------------------------
 
 export interface IndexSummary {
   name: string;
   status: string;
 }
 
-/** One per-index activity event (task-110). */
+/** One per-index activity event. */
 export interface ActivityEvent {
   ts_ms: number;
   kind: string;
   message: string;
 }
 
-/** The index's activity log (newest-first) via `/v1/index:activity` (task-110). Best-effort: `[]`. */
+/** The index's activity log (newest-first) via `/v1/index:activity`. Best-effort: `[]`. */
 export async function listActivity(name: string, limit = 50): Promise<ActivityEvent[]> {
   try {
     const res = await apiFetch('/v1/index:activity', { index: name, limit });
@@ -434,19 +433,19 @@ export async function listActivity(name: string, limit = 50): Promise<ActivityEv
   }
 }
 
-/** Result of a compaction (task-109): live segment count before/after the merge. */
+/** Result of a compaction: live segment count before/after the merge. */
 export interface CompactResult {
   segments_before: number;
   segments_after: number;
 }
-/** Result of a backup run (task-109). */
+/** Result of a backup run. */
 export interface BackupResult {
   snapshot: number;
   file_count: number;
   created_ms: number;
   prefix: string;
 }
-/** Last-backup status (task-109). `configured` = the node has a backup target. */
+/** Last-backup status. `configured` = the node has a backup target. */
 export interface BackupStatus {
   configured: boolean;
   present: boolean;
@@ -455,14 +454,14 @@ export interface BackupStatus {
   file_count?: number;
 }
 
-/** Compact an index's segments via `/v1/index:compact` (task-109). */
+/** Compact an index's segments via `/v1/index:compact`. */
 export async function compactIndex(name: string): Promise<CompactResult> {
   const res = await apiFetch('/v1/index:compact', { index: name });
   if (!res.ok) throw new Error(`compact failed (${res.status})`);
   return res.json();
 }
 
-/** Run a backup via `/v1/index:backup` (task-109). Surfaces the server reason (incl. 501 not-configured). */
+/** Run a backup via `/v1/index:backup`. Surfaces the server reason (incl. 501 not-configured). */
 export async function backupIndex(name: string): Promise<BackupResult> {
   const res = await apiFetch('/v1/index:backup', { index: name });
   if (!res.ok) {
@@ -478,14 +477,14 @@ export async function backupIndex(name: string): Promise<BackupResult> {
   return res.json();
 }
 
-/** Read last-backup status via `/v1/index:backup-status` (task-109). */
+/** Read last-backup status via `/v1/index:backup-status`. */
 export async function backupStatus(name: string): Promise<BackupStatus> {
   const res = await apiFetch('/v1/index:backup-status', { index: name });
   if (!res.ok) return { configured: false, present: false };
   return res.json();
 }
 
-/** One field's resolved mapping (task-107). `blocked` is a D23 reason the field can't be cached. */
+/** One field's resolved mapping. `blocked` is the reason the field can't be cached. */
 export interface FieldMapping {
   path: string;
   type: string;
@@ -496,7 +495,7 @@ export interface FieldMapping {
   blocked?: string;
 }
 
-/** One shard's placement + state for the detail Shards tab (task-108). */
+/** One shard's placement + state for the detail Shards tab. */
 export interface ShardStatus {
   ordinal: number;
   window?: number;
@@ -510,9 +509,9 @@ export interface IndexInfo {
   status: string;
   shard_count: number;
   routing: string;
-  /** Per-field mapping for the detail Mapping tab (task-107). */
+  /** Per-field mapping for the detail Mapping tab. */
   fields?: FieldMapping[];
-  /** Per-shard placement for the detail Shards tab (task-108). */
+  /** Per-shard placement for the detail Shards tab. */
   shards?: ShardStatus[];
 }
 
@@ -522,7 +521,7 @@ export interface IndexStats {
   num_docs: number;
   generation_count: number;
   checkpoint: string;
-  /** Mapped DATE columns (task-101) — candidates for the search time filter. Absent when none. */
+  /** Mapped DATE columns — candidates for the search time filter. Absent when none. */
   time_fields?: string[];
 }
 
@@ -567,7 +566,7 @@ export async function describeSource(table: string): Promise<SourceSchema> {
 }
 
 /** Create an index from a definition YAML. Throws with the server's reason on failure (e.g.
- *  the D23 cached-field hard-block), so the form can surface it inline. */
+ *  the cached-field hard-block), so the form can surface it inline. */
 export async function createIndex(definition: string): Promise<string> {
   const res = await apiFetch('/v1/indexes', { definition });
   if (!res.ok) {
@@ -594,7 +593,7 @@ export interface ReindexResult {
   snapshot: number;
 }
 
-/** Rebuild an index from its source and atomically swap it live (task-71/89). The write-fence
+/** Rebuild an index from its source and atomically swap it live. The write-fence
  *  lives on the owning Node, so a reindex already running surfaces as 412; a multi-shard gateway
  *  returns 501 (distributed reindex is future work). Throws with the server's reason so the screen
  *  can surface it inline. */
@@ -616,7 +615,7 @@ export async function reindexIndex(name: string): Promise<ReindexResult> {
   return res.json();
 }
 
-// ---- aliases / zero-downtime swap (task-52 ILM, task-89 UI) -----------------------
+// ---- aliases / zero-downtime swap -----------------------
 
 /** An alias and the index(es) it points at — a stable name reads route through. */
 export interface Alias {
@@ -630,7 +629,7 @@ export async function listAliases(): Promise<Alias[]> {
   return ((await res.json()) as { aliases: Alias[] }).aliases ?? [];
 }
 
-/** Create or **atomically re-point** an alias to `targets` (the zero-downtime swap, task-52): one
+/** Create or **atomically re-point** an alias to `targets` (the zero-downtime swap): one
  *  control-plane write replaces the alias's members, so reads follow with no gap. Throws with the
  *  server's reason (e.g. a name clash with an index, or an unknown target) so the form can show it. */
 export async function setAlias(alias: string, targets: string[]): Promise<void> {
@@ -652,7 +651,7 @@ export async function dropAlias(alias: string): Promise<void> {
   if (!res.ok) throw new Error(`drop alias failed (${res.status})`);
 }
 
-// ---- ingestion (sync) status (task-49) -------------------------------------------
+// ---- ingestion (sync) status -------------------------------------------
 // GrowlerDB has no separate "connector": every index is kept in sync with exactly one Iceberg
 // source by changelog ingestion, so "ingestion status" = the source head vs. each shard's
 // committed checkpoint.
@@ -665,9 +664,9 @@ export interface ShardIngestion {
   committed_snapshot_id: number;
   index_snapshot: number;
   state: string; // in_sync | behind | uninitialized | no_primary | unreachable | unknown
-  /** Wall-clock staleness vs the source head, ms (0 when in_sync); for a "behind by Ns" label (task-137). */
+  /** Wall-clock staleness vs the source head, ms (0 when in_sync); for a "behind by Ns" label. */
   lag_ms: number;
-  /** For a windowed index (task-226): the time-window id this row represents; 0 for an ordinal shard. */
+  /** For a windowed index: the time-window id this row represents; 0 for an ordinal shard. */
   window: number;
 }
 
@@ -692,7 +691,7 @@ export async function getIngestion(): Promise<IndexIngestion[]> {
   return ((await res.json()) as { items: IndexIngestion[] }).items ?? [];
 }
 
-/** One window's storage tier (task-80): hot (local) or cold (read-through from object storage). */
+/** One window's storage tier: hot (local) or cold (read-through from object storage). */
 export interface WindowTier {
   window: number;
   cold: boolean;
@@ -700,7 +699,7 @@ export interface WindowTier {
   event_max: number | null;
 }
 
-/** Read-through cache stats for the cold tier (task-80). */
+/** Read-through cache stats for the cold tier. */
 export interface ColdCacheStats {
   hits: number;
   misses: number;
@@ -708,7 +707,7 @@ export interface ColdCacheStats {
   cached_bytes: number;
 }
 
-/** Cold-tier status of a windowed index — per-window tier + the shared cache (task-80). */
+/** Cold-tier status of a windowed index — per-window tier + the shared cache. */
 export interface ColdStatus {
   windows: WindowTier[];
   cache: ColdCacheStats | null;

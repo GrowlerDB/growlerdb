@@ -1,5 +1,5 @@
 # otel-lgtm's default bundled-Prometheus config, plus `rule_files` so GrowlerDB's SLI alerting
-# rules (task-111) are evaluated server-side. Mounted over /otel-lgtm/prometheus.yaml.
+# rules are evaluated server-side. Mounted over /otel-lgtm/prometheus.yaml.
 # Keep the non-`rule_files` sections in sync with the image default on upgrade:
 #   docker run --rm --entrypoint cat grafana/otel-lgtm:latest /otel-lgtm/prometheus.yaml
 ---

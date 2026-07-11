@@ -92,9 +92,9 @@ class ShardRouterParityTest {
             50,
             2,
             4),
-        // Temporal keys (task-184): ts_micros encodes under type tag 5 (canonical epoch micros,
-        // 8-byte LE). One identifier-role and one partition-role vector — same numbers as the
-        // Rust golden table, so a drift in either side's tag-5 encoding fails a test.
+        // Temporal keys: ts_micros encodes under type tag 5 (canonical epoch micros, 8-byte LE).
+        // One identifier-role and one partition-role vector — same numbers as the Rust golden
+        // table, so a drift in either side's tag-5 encoding fails a test.
         new Golden(
             "ts_id", key(List.of(), List.of(field("ts", ts(1_782_000_123_456_789L)))), 9199418800307739891L, 243, 3, 3),
         new Golden(
@@ -106,9 +106,9 @@ class ShardRouterParityTest {
             624,
             0,
             2),
-        // Edge cases (task-69): partition strategy with no partition fields falls back to hashing
-        // the full key (part8 == hash8), and a fully empty key encodes to empty bytes (fnv offset
-        // basis). Same numbers as the Rust golden table.
+        // Edge cases: partition strategy with no partition fields falls back to hashing the full
+        // key (part8 == hash8), and a fully empty key encodes to empty bytes (fnv offset basis).
+        // Same numbers as the Rust golden table.
         new Golden(
             "empty_part", key(List.of(), List.of(field("id", str("solo")))), -107607401798346843L, 933, 5, 5),
         new Golden("empty_key", key(List.of(), List.of()), -3750763034362895579L, 805, 5, 5));
@@ -176,8 +176,8 @@ class ShardRouterParityTest {
 
   @Test
   void partitionPlacesEachOpOnTheBucketMapOwner() {
-    // task-77: a bucketed router (from the registry's vended map) fans writes out by bucket owner,
-    // exactly as the Gateway routes reads — so write placement matches read routing.
+    // A bucketed router (from the registry's vended map) fans writes out by bucket owner, exactly
+    // as the Gateway routes reads — so write placement matches read routing.
     ShardRouter router = ShardRouter.bucketed(ShardRouter.Strategy.HASH, ShardRouter.balancedBucketMap(4));
     DocBatch.Builder b =
         DocBatch.newBuilder()
@@ -229,9 +229,9 @@ class ShardRouterParityTest {
 
   @Test
   void partitionCopiesResumeFloorAndFromOntoEverySubBatch() {
-    // task-204 + task-194: the connector stamps the window's `from` and its resume FLOOR on the
-    // top-level batch; partition must copy BOTH onto every sub-batch so each shard's continuity
-    // guard and idempotency prune see the same source positions.
+    // The connector stamps the window's `from` and its resume FLOOR on the top-level batch;
+    // partition must copy BOTH onto every sub-batch so each shard's continuity guard and
+    // idempotency prune see the same source positions.
     ShardRouter router = ShardRouter.hashed(3);
     DocBatch.Builder b =
         DocBatch.newBuilder()
@@ -256,7 +256,7 @@ class ShardRouterParityTest {
   @Test
   void partitionOmitsResumeFloorWhenAbsent() {
     // No floor on the top-level batch (e.g. an empty shard set the connector never resumed past) →
-    // no sub-batch invents one, so the Node prunes nothing (task-204).
+    // no sub-batch invents one, so the Node prunes nothing.
     ShardRouter router = ShardRouter.hashed(2);
     DocBatch batch =
         DocBatch.newBuilder()

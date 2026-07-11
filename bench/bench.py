@@ -1,4 +1,4 @@
-"""Query benchmark (task-55): the same 5 IoT telemetry queries against GrowlerDB (REST), Trino (REST, same
+"""Query benchmark: the same 5 IoT telemetry queries against GrowlerDB (REST), Trino (REST, same
 Iceberg table), and Elasticsearch (REST). Reports median + min latency over N reps and the result
 count (a correctness cross-check). Run on the host against the published ports."""
 import json

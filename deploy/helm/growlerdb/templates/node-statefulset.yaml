@@ -34,19 +34,19 @@ spec:
           # shard's partition from the source on first boot only (the PV persists it across restarts),
           # then serve it and self-register the ordinal with the control plane at this pod's stable
           # DNS, so the gateway (which reads the live registry) fronts it and it appears in the
-          # Indexes + Ingestion screens (task-49/77).
+          # Indexes + Ingestion screens.
           command: ["/bin/sh", "-c"]
           args:
             - |
               set -e
               {{- if .Values.index.windowed }}
-              # Windowed topology (task-219): nodes serve control-plane-ASSIGNED time-window shards, not
-              # a fixed hash ordinal. Each node starts EMPTY — `--define-only` (task-223) writes just
-              # index.json (the resolved def) and builds ZERO windows, so `serve` auto-detects windowing
-              # and serves an empty windowed index that grows only as the connector streams the windows
-              # the CP places here. WITHOUT --define-only a windowed build reads the source (already
-              # populated if the generator ran first) and batch-builds EVERY window on EVERY node —
-              # replicating windows across the pool and defeating placement. No --shards/--shard-ordinal.
+              # Windowed topology: nodes serve control-plane-ASSIGNED time-window shards, not a fixed
+              # hash ordinal. Each node starts EMPTY — `--define-only` writes just index.json (the
+              # resolved def) and builds ZERO windows, so `serve` auto-detects windowing and serves an
+              # empty windowed index that grows only as the connector streams the windows the CP places
+              # here. WITHOUT --define-only a windowed build reads the source (already populated if the
+              # generator ran first) and batch-builds EVERY window on EVERY node — replicating windows
+              # across the pool and defeating placement. No --shards/--shard-ordinal.
               if [ ! -f "/data/{{ .Values.index.name }}/index.json" ]; then
                 growlerdb index {{ .Values.index.sourceTable }} --name {{ .Values.index.name }} --define-only{{ if .Values.index.definition }} \
                   --def /etc/growlerdb/index-def.yaml{{ end }}

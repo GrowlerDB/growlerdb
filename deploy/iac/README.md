@@ -1,6 +1,6 @@
 # Scale-test IaC (Hetzner k3s)
 
-Repeatable provisioning for the GrowlerDB scale test (task-159) — Terraform + the `hcloud` provider.
+Repeatable provisioning for the GrowlerDB scale test — Terraform + the `hcloud` provider.
 Spec: [`okf/quality/scale-test-plan.md`](../../okf/quality/scale-test-plan.md). Budget-pinned to
 **≤ $200/run** (default 4× `ccx33`, local NVMe); `destroy` returns the account to baseline.
 
@@ -39,7 +39,7 @@ terraform destroy                            # cost-guarded teardown; record the
   so the whole run is reproducible from one `tfvars`.
 - Hetzner cloud prices change periodically; reconfirm rates before a run.
 
-## Hetzner gotchas (learned the hard way, now handled in cloud-init)
+## Hetzner gotchas (handled in cloud-init)
 
 - **Dedicated-vCPU (`ccx`) quota** on a fresh account can be as low as **8 cores (1 node)**. If the
   planned `ccx33` is rejected with "dedicated core limit exceeded", request a limit increase in the
@@ -48,9 +48,9 @@ terraform destroy                            # cost-guarded teardown; record the
   `curl -H "Authorization: Bearer $HCLOUD_TOKEN" https://api.hetzner.cloud/v1/server_types`.
 - **Private NIC timing:** the private network attaches shortly after boot; cloud-init **actively
   brings `enp7s0` up + requests DHCP with retries** (bounded 300s deadline, then loud failure) before
-  installing k3s (task-221). This self-heals the boot-timing straggler that previously came up with the
-  NIC DOWN and hung cloud-init forever — no manual `ip link set enp7s0 up; dhcpcd -4 enp7s0` rescue
-  should be needed. If a node still won't join, check its `cloud-init` log for the FATAL NIC message.
+  installing k3s. This self-heals the boot-timing straggler that otherwise comes up with the NIC DOWN
+  and hangs cloud-init forever — no manual `ip link set enp7s0 up; dhcpcd -4 enp7s0` rescue should be
+  needed. If a node still won't join, check its `cloud-init` log for the FATAL NIC message.
 - **Node IP + flannel:** agents join with `--node-ip <private>` and **`--flannel-iface enp7s0`** so
   flannel's VXLAN MTU is derived from the private NIC (1450→1400). Without this, flannel sizes MTU
   from the public `eth0` (1500) and cross-node pod/DNS traffic silently drops.

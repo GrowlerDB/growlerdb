@@ -1,4 +1,4 @@
-# JVM toolchain for the Spark connector subproject (task-62).
+# JVM toolchain for the Spark connector subproject.
 # Inherits rust + protoc from ../mise.toml; adds JDK 21 (Spark 4.0's target) + Maven, both
 # provisioned by mise so the build is runner-independent (the self-hosted CI runners don't ship
 # a system `mvn`; locally, `mise install` here gives you the same toolchain).

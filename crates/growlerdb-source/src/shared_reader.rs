@@ -1,8 +1,8 @@
-//! A lazily-connected, shared [`IcebergReader`] handle (task-184 / D30 foundations).
+//! A lazily-connected, shared [`IcebergReader`] handle.
 //!
-//! The lookup service used to run `IcebergReader::connect` **per RPC** — rebuilding the
-//! REST-catalog client (auth/config/HTTP client) for every `GetByKey`. A long-lived
-//! service instead holds a [`SharedReader`]: the first request connects, later requests
+//! Connecting `IcebergReader::connect` per RPC would rebuild the REST-catalog client
+//! (auth/config/HTTP client) for every `GetByKey`. A long-lived service instead holds a
+//! [`SharedReader`]: the first request connects, later requests
 //! reuse the same reader (and with it the reader's snapshot-pinned
 //! [plan cache](crate::plan_cache)). On a source failure the holder calls
 //! [`invalidate`](SharedReader::invalidate), so a dead/expired client is dropped and the

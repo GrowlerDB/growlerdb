@@ -1,4 +1,4 @@
-# Streaming pipeline + chaos drills (task-123)
+# Streaming pipeline + chaos drills
 
 Adds continuous ingestion to the [K8s deploy](../README.md): a **generator** appends to
 `growlerdb.docs` and the **Spark connector** reads its changelog and continuously updates the `docs`
@@ -8,7 +8,7 @@ index stays correct (exactly-once, no loss/dup, auto-resume).
 > Prereq: the `docs` index is deployed and serving (see [../README.md](../README.md)). The connector
 > resumes from each Node's committed checkpoint, so it streams snapshots *after* the index's build.
 
-**Workload-driven manifests (task-214)**: `generator.template.yaml` + `connector.template.yaml`
+**Workload-driven manifests**: `generator.template.yaml` + `connector.template.yaml`
 are RENDERED per workload — `python3 bench/scale/harness.py render <workload> --shards N` derives
 the generator (the workload's own `corpus.py` mounted, its `stream()` driven) and the connector
 (`--table/--identifier/--fields/--index` from the workload's `index.yaml`, `--nodes` sized to the
@@ -17,7 +17,7 @@ hash-routed workload; `http_logs_windowed` the **daily-windowed** temporal one (
 source, synthetic advancing timeline). Switching is configuration (`WORKLOAD=<name>
 deploy/k8s/scale-up.sh`), never a manifest edit. See `okf/quality/scale-test-plan.md`.
 
-## 1. Build + push the connector image (amd64, on a mini-PC)
+## 1. Build + push the connector image (amd64)
 
 ```sh
 docker build -t ghcr.io/growlerdb/growlerdb-connector:dev -f deploy/k8s/streaming/connector.Dockerfile .
@@ -51,8 +51,8 @@ kubectl -n growlerdb run c --rm -i --restart=Never --image=curlimages/curl:lates
 For each, the **convergence invariant** is: once the dust settles, the index doc count equals the
 source's **distinct-id count** — no silent loss or duplication. (Distinct id, not raw row count: the
 generator can re-emit duplicate ids under load, and the engine collapses them last-write-wins, so the
-index is legitimately below the row count. The task-194 silent-loss triage turned on exactly this
-distinction.) Gate it automatically with **exact-count-at-drain** — which also survives an under-read
+index is legitimately below the row count.) Gate it automatically with **exact-count-at-drain** —
+which also survives an under-read
 window that lag-based checks miss (an under-read advances the cursor with lag reaching ~0, yet rows
 never applied):
 
@@ -63,7 +63,7 @@ deploy/k8s/streaming/convergence-gate.sh
 deploy/k8s/streaming/convergence-gate.sh --with-maintenance
 ```
 
-The connector's own drain signals are now metrics, not printf (task-194 AC6): scrape
+The connector's own drain signals are metrics: scrape
 `growlerdb_connector_rows_read_total` vs `growlerdb_connector_rows_expected_total`, per-shard
 `growlerdb_connector_shard_acks_total`, `growlerdb_connector_under_reads_total`,
 `growlerdb_connector_stream_restarts_total`, and the node's `growlerdb_checkpoint_gap_total` —
@@ -71,22 +71,20 @@ alerts fire on any nonzero (see `deploy/compose/lgtm/growlerdb-alert-rules.yml`)
 
 - **Node crash mid-stream** (🔴 prime suspect): `kubectl -n growlerdb delete pod gdb-growlerdb-node-1
   --force --grace-period=0`. Watch the connector log — it reconnects to the restarted node (new IP)
-  and resumes; the index `total` keeps climbing. The original drill found this *wedged* — the Java
-  write client had the gateway's eager-connect/no-deadline flaw (task-122), so a force-killed pod
-  black-holed in-flight writes and ingestion froze silently. Fixed in task-124: `WriteClient` now
-  fails fast on a per-call deadline and retries with backoff (idempotent `batch_id`), so the write
-  resumes in place — or, if the node stays down, the stream errors → the pod auto-restarts → resumes
-  exactly-once from each Node's checkpoint. Either way, no silent freeze.
+  and resumes; the index `total` keeps climbing. `WriteClient` fails fast on a per-call deadline and
+  retries with backoff (idempotent `batch_id`), so the write resumes in place — or, if the node stays
+  down, the stream errors → the pod auto-restarts → resumes exactly-once from each Node's checkpoint.
+  Either way, no silent freeze.
 - **Connector crash**: `kubectl -n growlerdb delete pod -l app=growlerdb-connector`. On restart it
   re-reads `GetCheckpoint` and resumes exactly-once — no gap, no dup.
 - **Catalog down**: `kubectl -n growlerdb delete pod -l app=polaris`. Ingestion pauses (changelog read
   fails) while the backlog grows; when Polaris returns, the connector drains it via **bounded
-  catch-up** (task-113) and search keeps serving throughout.
+  catch-up** and search keeps serving throughout.
 - **Big backlog**: scale the connector to 0 for a while (`kubectl -n growlerdb scale deploy
   growlerdb-connector --replicas=0`), let the source grow, then back to 1 → it catches up in bounded
   batches and converges.
 
-## Parallel connector set (task-196)
+## Parallel connector set
 
 `connector-set.yaml` runs the same connector as a **StatefulSet of W workers** for horizontal
 ingest scale-out: worker `i` (the pod ordinal, via `GROWLERDB_WORKER_ID`) owns shards
@@ -96,7 +94,7 @@ resumes from its own group's lineage-min checkpoint. Rules:
 - **Either/or, never both**: don't run the set and the single connector (`connector.yaml`) on one
   table simultaneously. Two writers on one shard fail fast at the node (`CHECKPOINT_GAP` — loud,
   no silent loss). Migrate in either direction by scaling one to 0 first; resume always comes from
-  the nodes' durable checkpoints, and the window-covering guard (task-196) makes the handoff plain
+  the nodes' durable checkpoints, and the window-covering guard makes the handoff plain
   resume-from-min — no drain barrier needed.
 - `--workers` in the pod args **must equal `spec.replicas`**, and `replicas` must be ≤ the shard
   count (an extra worker owns no shards and crash-loops with an actionable message).
@@ -112,7 +110,7 @@ asserts the index `total` equals the source `COUNT(DISTINCT id)` exactly (exit n
 divergence, so it's a CI/soak regression gate). Add `--with-maintenance` to drain against a live
 compaction.
 
-## Iceberg table maintenance (task-126)
+## Iceberg table maintenance
 
 The generator commits a tiny append every few seconds, so `growlerdb.docs` accumulates thousands of
 small data files + manifests — which slows **hydration** (search reads the authoritative rows from

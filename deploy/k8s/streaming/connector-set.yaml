@@ -1,9 +1,9 @@
-# GrowlerDB parallel connector SET (task-196): W workers, each a full connector process owning a
+# GrowlerDB parallel connector SET: W workers, each a full connector process owning a
 # disjoint shard group (worker i of W owns shards {s : s % W == i}) — horizontal ingest scale-out
 # over one table. Each worker filters the changelog executor-side to its owned rows, writes only
 # its shards (per-shard continuity guard holds: one writer per shard), and resumes from its OWN
 # group's lineage-min checkpoint. Scaling W up/down needs no coordination: the window-covering
-# guard (D31 refinement) makes regrouping plain resume-from-min.
+# guard makes regrouping plain resume-from-min.
 #
 # RUNBOOK
 #  - NEVER run this set and the single connector (connector.yaml) on the same table at once: two

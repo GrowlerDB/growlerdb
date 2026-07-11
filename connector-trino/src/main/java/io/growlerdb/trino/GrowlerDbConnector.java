@@ -12,9 +12,9 @@ import java.util.Optional;
 import java.util.Set;
 
 /**
- * The GrowlerDB Trino connector (task-51): no tables, just the {@code growlerdb_search} table
- * function. Stateless — each call re-runs the search — so metadata is empty and one transaction
- * handle suffices.
+ * The GrowlerDB Trino connector: no tables, just the {@code growlerdb_search} table function.
+ * Stateless — each call re-runs the search — so metadata is empty and one transaction handle
+ * suffices.
  */
 public class GrowlerDbConnector implements Connector {
 

@@ -1,4 +1,4 @@
-//! The background **compaction re-map** driver (task-184 slice 3, [D30] `coordinates`
+//! The background **compaction re-map** driver (the `coordinates`
 //! strategy): turn locator staleness from a per-read tax into a bounded background cost.
 //!
 //! Iceberg compaction (`rewrite_data_files` — a `replace` snapshot) moves rows into new
@@ -14,9 +14,8 @@
 //!    the doomed point read and goes straight to the pass-2 fallback), and
 //! 2. **re-maps**: column-projects only the key columns + row positions of the plan's
 //!    *added* files, and bulk-patches each key's location slot with its new
-//!    `(file, position)` — batched and key-sorted (term-dictionary locality; spike
-//!    ~1M key-sorted lookups/s warm), fsynced per chunk under the shard's
-//!    writer-lock contract.
+//!    `(file, position)` — batched and key-sorted (term-dictionary locality),
+//!    fsynced per chunk under the shard's writer-lock contract.
 //!
 //! ## Why every interleaving is safe
 //!
@@ -34,8 +33,6 @@
 //! Files that carry delete files are **not** re-mapped (ingest records delete-shifted
 //! positions for them; the key scan reads physical positions) — their slots heal via
 //! the lazy path. Freshly-compacted files are delete-free, so this is the rare case.
-//!
-//! [D30]: ../../../okf/system/decisions/d30-layered-locator.md
 
 use std::collections::HashSet;
 use std::sync::Arc;

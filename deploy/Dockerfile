@@ -7,7 +7,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
-# Release version baked into the binary's `--version` (task-156). Passed by release.yml from the git
+# Release version baked into the binary's `--version`. Passed by release.yml from the git
 # tag; empty for a local `docker build`, where build.rs falls back to the in-tree 0.0.0.
 ARG GROWLERDB_VERSION
 # BuildKit cache mounts persist the cargo registry/git + the target/ dir ACROSS image builds, so a
@@ -23,7 +23,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     GROWLERDB_VERSION="${GROWLERDB_VERSION}" cargo build --profile dist -p growlerdb-cli \
     && cp target/dist/growlerdb /usr/local/bin/growlerdb
 
-# Build the UI SPA (task-45/46/47/48) — the gateway serves it via --ui-dir.
+# Build the UI SPA — the gateway serves it via --ui-dir.
 FROM node:22-bookworm-slim AS ui-build
 WORKDIR /ui
 COPY ui/package.json ui/package-lock.json ./

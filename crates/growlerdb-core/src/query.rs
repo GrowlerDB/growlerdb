@@ -20,10 +20,9 @@ pub enum MatchOp {
     And,
 }
 
-/// A parsed query ([Design 03] AST). The text-family leaves (`Match` … `Regex`)
-/// and `Exists` are M2 (task-21); typed `Range`/`IpCidr` land with the typed-bound
-/// work. Field existence and **type rules** are validated at **execution** (against
-/// the index schema), where the field types are known — see `growlerdb-index`.
+/// A parsed query ([Design 03] AST). Field existence and **type rules** are
+/// validated at **execution** (against the index schema), where the field types
+/// are known — see `growlerdb-index`.
 ///
 /// [Design 03]: ../../../design/03-query-schema.md
 #[derive(Debug, Clone, PartialEq)]
@@ -186,7 +185,7 @@ impl Query {
     }
 
     /// AND a mandatory, **non-scoring** `field = value` constraint onto this query — the
-    /// mechanism behind tenant scoping (task-38). The original query becomes a single `must`
+    /// mechanism behind tenant scoping. The original query becomes a single `must`
     /// clause and the constraint a sibling `filter`, so a match requires **both**: no `OR` (or
     /// any structure) in the caller's query can widen past the constraint. The caller's
     /// scoring is preserved (the constraint is a non-scoring filter).
@@ -205,8 +204,8 @@ impl Query {
     /// The conjunctive integer `[lower, upper]` bounds this query constrains `field` to — from
     /// `Range` clauses on `field` in **must/filter** (conjunctive) positions, intersected (tightest
     /// wins). `should`/`must_not` can't narrow the result, so they're ignored. `None` = unbounded;
-    /// a bound that doesn't parse as `i64` is treated as unbounded. Used for time-window pruning
-    /// (task-81): both the ingest-time window field and the event-time field are queried this way.
+    /// a bound that doesn't parse as `i64` is treated as unbounded. Used for time-window pruning:
+    /// both the ingest-time window field and the event-time field are queried this way.
     pub fn range_bounds(&self, field: &str) -> (Option<i64>, Option<i64>) {
         fn parse(s: &Option<String>) -> Option<i64> {
             s.as_ref().and_then(|v| v.parse::<i64>().ok())
@@ -252,7 +251,7 @@ pub enum ParseError {
     #[error("unexpected token: {0}")]
     UnexpectedToken(String),
     /// Parenthesis nesting exceeded [`MAX_QUERY_DEPTH`] — bounds parser recursion so a crafted
-    /// query can't overflow the stack (task-146).
+    /// query can't overflow the stack.
     #[error("query nested too deeply (max {0})")]
     TooDeep(usize),
     /// A `field:value` clause was malformed (bad range / phrase / number),
@@ -404,16 +403,16 @@ fn operator(word: &str, syntax: Syntax) -> Option<Tok> {
 
 /// Max parenthesis nesting the parser accepts. The recursive descent recurses once per `(`
 /// (`parse_clause` → `parse_or`), so without a bound a crafted query like `"(".repeat(200_000)`
-/// overflows the stack — an *uncatchable* abort that kills the whole process for every tenant
-/// (task-146 / F1). Set far above any human-authored query.
+/// overflows the stack — an *uncatchable* abort that kills the whole process for every tenant.
+/// Set far above any human-authored query.
 const MAX_QUERY_DEPTH: usize = 128;
 
 /// Max fuzzy edit distance accepted at parse. Levenshtein automata are only meaningful to 2, and the
-/// execution engine rejects more anyway — this fails fast with a clear message (task-146 / G1).
+/// execution engine rejects more anyway — this fails fast with a clear message.
 const MAX_FUZZY_DISTANCE: u8 = 2;
 
 /// Max phrase slop accepted at parse. Proximity beyond this is pathological and super-linear at
-/// execution; realistic slop is single digits (task-146 / G1).
+/// execution; realistic slop is single digits.
 const MAX_PHRASE_SLOP: u32 = 100;
 
 struct Parser {
@@ -496,7 +495,7 @@ impl Parser {
             Some(Tok::LParen) => {
                 self.pos += 1;
                 // Bound recursion: a group descends into `parse_or` again, so unbounded nesting
-                // would overflow the stack (task-146 / F1).
+                // would overflow the stack.
                 self.depth += 1;
                 if self.depth > MAX_QUERY_DEPTH {
                     return Err(ParseError::TooDeep(MAX_QUERY_DEPTH));
@@ -551,7 +550,7 @@ impl Parser {
 fn atom_to_query(atom: &str, at: usize) -> Result<Query, ParseError> {
     let (field, value) = split_field(atom);
     let (core, boost) = strip_boost(value);
-    // Reject non-finite / negative boosts (task-146 / B1): `f32::from_str` accepts `nan`/`inf`/
+    // Reject non-finite / negative boosts: `f32::from_str` accepts `nan`/`inf`/
     // negatives, which poison the top-k and sort comparators (NaN breaks total ordering → panic or
     // corrupt ranking) once the boost reaches execution.
     if let Some(b) = boost {
@@ -731,7 +730,7 @@ fn value_node(field: Option<String>, core: &str, at: usize) -> Result<Query, Par
             None if suffix.is_empty() => 0,
             None => return Err(invalid("unexpected text after phrase")),
         };
-        // Bound proximity (task-146 / G1): huge slop is super-linear at execution.
+        // Bound proximity: huge slop is super-linear at execution.
         if slop > MAX_PHRASE_SLOP {
             return Err(invalid("phrase slop too large (max 100)"));
         }
@@ -784,7 +783,7 @@ fn value_node(field: Option<String>, core: &str, at: usize) -> Result<Query, Par
             } else {
                 suffix.parse().map_err(|_| invalid("bad fuzzy distance"))?
             };
-            // Bound edit distance (task-146 / G1): only 0/1/2 are meaningful; the execution engine
+            // Bound edit distance: only 0/1/2 are meaningful; the execution engine
             // rejects more anyway — fail fast with a clear message.
             if distance > MAX_FUZZY_DISTANCE {
                 return Err(invalid("fuzzy distance must be 0, 1, or 2"));
@@ -947,7 +946,7 @@ mod tests {
     #[test]
     fn field_grouped_set_distributes_the_prefix() {
         // `field:(a OR b)` must parse identically to `field:a OR field:b` — the field prefix
-        // distributes over the group (task-247 / issue 3).
+        // distributes over the group.
         assert_eq!(
             Query::parse("category:(guide OR reference)").unwrap(),
             Query::parse("category:guide OR category:reference").unwrap()
@@ -1009,7 +1008,7 @@ mod tests {
         ));
     }
 
-    // ---- task-22: the full string grammar -------------------------------------
+    // ---- the full string grammar ----------------------------------------------
 
     #[test]
     fn parses_phrase_with_slop() {
@@ -1094,7 +1093,7 @@ mod tests {
 
     #[test]
     fn deep_nesting_is_rejected_not_crashed() {
-        // task-146 / F1: a crafted deeply-nested query must return an error, never overflow the
+        // A crafted deeply-nested query must return an error, never overflow the
         // stack. 200k open-parens would abort the process without the depth bound.
         let bomb = "(".repeat(200_000);
         assert_eq!(
@@ -1108,7 +1107,7 @@ mod tests {
 
     #[test]
     fn non_finite_or_negative_boost_is_rejected() {
-        // task-146 / B1: NaN/Inf/negative boosts poison the scoring/sort comparators.
+        // NaN/Inf/negative boosts poison the scoring/sort comparators.
         for bad in ["x^nan", "x^inf", "x^-2", "status:error^infinity"] {
             assert!(
                 matches!(
@@ -1125,7 +1124,7 @@ mod tests {
 
     #[test]
     fn out_of_range_fuzzy_and_slop_are_rejected() {
-        // task-146 / G1: bound fuzzy distance and phrase slop at parse.
+        // Bound fuzzy distance and phrase slop at parse.
         assert!(matches!(
             Query::parse("name:jon~3").unwrap_err(),
             ParseError::InvalidValue { .. }

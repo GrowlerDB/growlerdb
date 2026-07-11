@@ -1,9 +1,9 @@
-//! **Distributed per-window routing** (task-82): the two halves that let a standalone
+//! **Distributed per-window routing**: the two halves that let a standalone
 //! [Gateway](crate::gateway::Gateway) prune a time-filtered search to the owning windows when those
 //! windows live on remote Nodes — the distributed mirror of the embedded `serve_windowed`.
 //!
 //! A windowed index is served by **one process fronting many window shards** (so they share one
-//! read-through cold cache, task-80), reachable on a single gRPC endpoint. So a per-window request
+//! read-through cold cache), reachable on a single gRPC endpoint. So a per-window request
 //! must say *which* window it targets:
 //!
 //! * [`WindowNode`] is the **client** half — the Gateway holds one per window (all over the same
@@ -37,28 +37,28 @@ use tonic::{Request, Response, Status};
 
 use crate::{AdminService, LookupService, Node, SearchService, SuggestService};
 
-/// A node's live `window id → SearchService` map behind a shared lock (task-219 dynamic windowed
+/// A node's live `window id → SearchService` map behind a shared lock (dynamic windowed
 /// ingest): the windowed write path **inserts** a new window's service on first write, and the
 /// multiplexer reads it — so a freshly-created window becomes queryable with no restart. The service
 /// is `Clone` (an `Arc` handle), so `route` clones it out from under the read lock.
 pub type SharedSearchWindows = Arc<RwLock<BTreeMap<i64, SearchService>>>;
 /// The suggest counterpart to [`SharedSearchWindows`].
 pub type SharedSuggestWindows = Arc<RwLock<BTreeMap<i64, SuggestService>>>;
-/// The lookup (GetByKey hydration) counterpart to [`SharedSearchWindows`] (task-225): a key can live
+/// The lookup (GetByKey hydration) counterpart to [`SharedSearchWindows`]: a key can live
 /// in any window (its coordinate carries no time), so the Gateway **broadcasts** a hydration to every
 /// window and each node's [`WindowedLookupService`] dispatches the one it serves.
 pub type SharedLookupWindows = Arc<RwLock<BTreeMap<i64, LookupService>>>;
-/// The admin (DescribeIndex) counterpart to [`SharedSearchWindows`] (task-225): the Gateway fans a
+/// The admin (DescribeIndex) counterpart to [`SharedSearchWindows`]: the Gateway fans a
 /// describe to every window and sums the per-window stats into the index total.
 pub type SharedAdminWindows = Arc<RwLock<BTreeMap<i64, AdminService>>>;
 
-/// The **server** half of distributed windowed routing (task-82): a `Search` service that fronts a
+/// The **server** half of distributed windowed routing: a `Search` service that fronts a
 /// node's many window shards (`window id → SearchService`) and dispatches each request to the shard
 /// its [`SearchRequest::window`] selector names. A request for a window this node doesn't serve is
 /// an `InvalidArgument` (the Gateway only routes a window to a node that owns it, so this means a
 /// stale shard map). `window = 0` (unset) also fails — a windowed node always expects a selector.
 ///
-/// The window map is **shared + mutable** ([`SharedSearchWindows`], task-219) so the windowed write
+/// The window map is **shared + mutable** ([`SharedSearchWindows`]) so the windowed write
 /// path can add a newly-created window without rebuilding the service.
 pub struct WindowedSearchService {
     windows: SharedSearchWindows,
@@ -106,7 +106,7 @@ impl Search for WindowedSearchService {
         &self,
         request: Request<AggregateRequest>,
     ) -> Result<Response<AggregateResponse>, Status> {
-        // Aggregate dispatches by the same window selector as search (task-82): the Gateway prunes a
+        // Aggregate dispatches by the same window selector as search: the Gateway prunes a
         // time-filtered aggregation to the overlapping windows, then scatters a partial to each.
         let window = request.get_ref().window;
         let svc = self.route(window)?;
@@ -136,7 +136,7 @@ impl Search for WindowedSearchService {
         _request: Request<ExplainRequest>,
     ) -> Result<Response<ExplainResponse>, Status> {
         // Explain names a doc by coordinate, not a window selector; finding its window would need a
-        // scatter. Not supported over a distributed windowed index yet (task-102 follow-on).
+        // scatter. Not supported over a distributed windowed index yet.
         Err(Status::unimplemented(
             "explain is not yet supported over a distributed windowed index (task-102 follow-on)",
         ))
@@ -154,7 +154,7 @@ impl Search for WindowedSearchService {
     }
 }
 
-/// The suggest counterpart to [`WindowedSearchService`] (task-82): a `Suggest` service over a
+/// The suggest counterpart to [`WindowedSearchService`]: a `Suggest` service over a
 /// node's `window id → SuggestService` map that dispatches each request to the shard its
 /// [`SuggestRequest::window`] selector names. Suggest fans out to *every* window (a term can live in
 /// any of them — no time pruning), so the Gateway scatters to all windows and each is dispatched
@@ -164,7 +164,7 @@ pub struct WindowedSuggestService {
 }
 
 impl WindowedSuggestService {
-    /// A multiplexer over the shared `windows` map (`window id → SuggestService`, task-219).
+    /// A multiplexer over the shared `windows` map (`window id → SuggestService`).
     pub fn new(windows: SharedSuggestWindows) -> Self {
         Self { windows }
     }
@@ -198,7 +198,7 @@ impl Suggest for WindowedSuggestService {
     }
 }
 
-/// The **lookup** (GetByKey hydration) counterpart to [`WindowedSearchService`] (task-225): a `Lookup`
+/// The **lookup** (GetByKey hydration) counterpart to [`WindowedSearchService`]: a `Lookup`
 /// service over a node's `window id → LookupService` map that dispatches each hydration to the shard
 /// its [`GetByKeyRequest::window`] selector names. Unlike search there's no time pruning — a key's
 /// coordinate carries no window — so the Gateway **broadcasts** to every window and each is dispatched
@@ -209,7 +209,7 @@ pub struct WindowedLookupService {
 }
 
 impl WindowedLookupService {
-    /// A multiplexer over the shared `windows` map (`window id → LookupService`, task-219/225).
+    /// A multiplexer over the shared `windows` map (`window id → LookupService`).
     pub fn new(windows: SharedLookupWindows) -> Self {
         Self { windows }
     }
@@ -243,7 +243,7 @@ impl Lookup for WindowedLookupService {
     }
 }
 
-/// The **admin** (DescribeIndex) counterpart to [`WindowedSearchService`] (task-225): an `Admin`
+/// The **admin** (DescribeIndex) counterpart to [`WindowedSearchService`]: an `Admin`
 /// service over a node's `window id → AdminService` map that dispatches a describe to the window its
 /// [`DescribeIndexRequest::window`] selector names, so the Gateway can fan a describe to every window
 /// and sum the per-window stats into the index total. Alter/reindex are cluster-shape ops that don't
@@ -253,7 +253,7 @@ pub struct WindowedAdminService {
 }
 
 impl WindowedAdminService {
-    /// A multiplexer over the shared `windows` map (`window id → AdminService`, task-219/225).
+    /// A multiplexer over the shared `windows` map (`window id → AdminService`).
     pub fn new(windows: SharedAdminWindows) -> Self {
         Self { windows }
     }
@@ -341,7 +341,7 @@ impl Admin for WindowedAdminService {
     }
 }
 
-/// The **client** half of distributed windowed routing (task-82): a [`Node`] that wraps the remote
+/// The **client** half of distributed windowed routing: a [`Node`] that wraps the remote
 /// node serving a window and **stamps that window's id** onto every search/suggest before
 /// delegating, so the receiving multiplexer knows which shard to hit. The Gateway holds one per window
 /// (often several over the same endpoint) and scatters to them exactly as it would plain shards —
@@ -667,7 +667,7 @@ mod tests {
         let rec = Arc::new(RecordingNode(Mutex::new(-1)));
         let node = WindowNode::new(rec.clone(), 11);
         // The Gateway broadcasts a hydration with no window; the WindowNode stamps its own so the
-        // receiving multiplexer knows which window's shard to hit (task-225).
+        // receiving multiplexer knows which window's shard to hit.
         node.get_by_key(Request::new(GetByKeyRequest::default()))
             .await
             .unwrap();

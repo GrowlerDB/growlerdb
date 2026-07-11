@@ -1,4 +1,4 @@
-"""The TIME-WINDOWED http_logs corpus (task-159 temporal case) — both entry points (task-214).
+"""The TIME-WINDOWED http_logs corpus (temporal case) — both entry points.
 
 `load()` bulk-writes the OSB `http_logs` corpus (point CORPUS_PATH at the downloaded documents
 file(s); see the README). `stream()` is the in-cluster continuous generator: it advances a
@@ -143,7 +143,7 @@ def load(table="growlerdb.http_logs_windowed", fraction=1.0):
 
 def stream(table="growlerdb.http_logs_windowed", batch=10, sleep_s=5):
     """Append http_logs-shaped rows on a SYNTHETIC timeline forever — the in-cluster windowed
-    generator (task-214): one synthetic day per LOGS_PER_DAY rows (env, default 750k), jittered
+    generator: one synthetic day per LOGS_PER_DAY rows (env, default 750k), jittered
     within the day, so day-partitions/windows form continuously. Creates the partitioned table
     if absent (never drops — a restart resumes) and prints `created <table>` once, the readiness
     gate deploy/k8s/scale-up.sh waits on."""

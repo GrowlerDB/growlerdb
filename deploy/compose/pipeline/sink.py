@@ -58,7 +58,7 @@ def main():
     # Partition the lake table by `site` (identity) — demonstrates GrowlerDB's composite key =
     # partition field(s) + identifier: readings co-locate by site, and a point lookup of `id` within
     # a `site` prunes the Iceberg scan to that site's files (fast hydration even after compaction
-    # rewrites the locators — task-145). Name-based + idempotent: applied once, to new data.
+    # rewrites the locators). Name-based + idempotent: applied once, to new data.
     if not table.spec().fields:
         with table.update_spec() as update:
             update.add_field("site", IdentityTransform(), "site")

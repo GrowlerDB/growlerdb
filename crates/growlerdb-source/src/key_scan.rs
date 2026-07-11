@@ -1,4 +1,4 @@
-//! Column-projected **key scans** for the compaction re-map (task-184 slice 3, D30
+//! Column-projected **key scans** for the compaction re-map (the layered-locator
 //! `coordinates` strategy — `okf/system/decisions/d30-layered-locator.md`).
 //!
 //! When an Iceberg rewrite (`replace` snapshot) moves rows into new data files, every

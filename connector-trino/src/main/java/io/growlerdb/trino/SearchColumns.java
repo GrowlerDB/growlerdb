@@ -14,9 +14,9 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * The search-then-join projection (task-51): maps GrowlerDB hits to the columns a
+ * The search-then-join projection: maps GrowlerDB hits to the columns a
  * {@code growlerdb_search(...)} table function returns — one column per composite-key field
- * (partition then identifier, D5) plus a {@code growlerdb_score} double. The key-field name/kind/
+ * (partition then identifier) plus a {@code growlerdb_score} double. The key-field name/kind/
  * value logic is pure (Trino-type-free) so it's unit-testable; {@link #trinoType} bridges the small
  * fixed kind set to Trino's type singletons for the returned descriptor + page building.
  */
@@ -31,7 +31,7 @@ public final class SearchColumns {
     BIGINT,
     DOUBLE,
     BOOLEAN,
-    /** A temporal key (wire {@code ts_micros}, task-184) — canonical epoch micros UTC. */
+    /** A temporal key (wire {@code ts_micros}) — canonical epoch micros UTC. */
     TIMESTAMP
   }
 

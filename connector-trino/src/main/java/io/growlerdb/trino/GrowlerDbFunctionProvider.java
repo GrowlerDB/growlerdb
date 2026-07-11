@@ -7,7 +7,7 @@ import io.trino.spi.function.table.ConnectorTableFunctionHandle;
 import io.trino.spi.function.table.TableFunctionProcessorProvider;
 import io.trino.spi.function.table.TableFunctionSplitProcessor;
 
-/** Supplies the worker-side executor for {@code growlerdb_search} (task-51). */
+/** Supplies the worker-side executor for {@code growlerdb_search}. */
 public class GrowlerDbFunctionProvider implements FunctionProvider {
 
   @Override

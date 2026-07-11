@@ -1,4 +1,4 @@
-//! End-to-end test of the **public gRPC Engine-API front** (task-30 B1): mount the
+//! End-to-end test of the **public gRPC Engine-API front**: mount the
 //! Gateway-backed Search/Suggest/Admin gRPC services over a `LocalNode`, connect real gRPC
 //! clients, and confirm the query+describe surface routes through the Gateway — and that the
 //! intentionally un-routed methods (PIT, admin mutations) surface `Unimplemented`.
@@ -183,7 +183,7 @@ async fn grpc_front_reports_unrouted_methods_as_unimplemented() {
             Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
         }
     };
-    // PIT is not routed through the Gateway yet (task-29).
+    // PIT is not routed through the Gateway yet.
     let err = search.open_pit(OpenPitRequest {}).await.unwrap_err();
     assert_eq!(err.code(), Code::Unimplemented);
 

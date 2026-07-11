@@ -6,7 +6,7 @@ runcmd:
     # Bring the private NIC up + lease its IP before starting k3s (Hetzner attaches the private network
     # shortly after boot; starting k3s first pins the wrong node IP). ACTIVELY bring the link up + DHCP
     # with retries and a bounded, loud-failing deadline rather than passively polling, so a boot-timing
-    # straggler self-heals instead of hanging cloud-init forever (task-221).
+    # straggler self-heals instead of hanging cloud-init forever.
     NIC=enp7s0
     deadline=$(( $(date +%s) + 300 ))
     until ip -4 addr show "$NIC" 2>/dev/null | grep -q "${private_ip}"; do

@@ -1,6 +1,6 @@
 # Scale-test harness (pluggable workloads)
 
-Dataset-agnostic driver for the GrowlerDB scale test (task-159). Spec:
+Dataset-agnostic driver for the GrowlerDB scale test. Spec:
 [`okf/quality/scale-test-plan.md`](../../okf/quality/scale-test-plan.md). Provision the cluster with
 the [IaC](../../deploy/iac/README.md), deploy GrowlerDB via the Helm chart, then drive load + queries
 here.
@@ -21,11 +21,11 @@ CDN/app access log** (~17 rich fields, ~350-450 B/row; `request_id` key + search
 hydrated from Iceberg), hash-routed by `request_id`. The rich rows are what make **index:source**
 ratios meaningful: a thin row is swamped by the fixed ~14 B/row hydration locator (measured ~2.3x for
 this log workload — high-cardinality searchable fields the columnar source compresses away; sub-1x is
-the large-text regime, TASK-213). **`http_logs_windowed`** is the temporal variant (partitioned by
+the large-text regime). **`http_logs_windowed`** is the temporal variant (partitioned by
 day, daily-windowed — cold-tier park/revive + event-time query pruning). `synthetic` is a download-free
 seeded fallback; `wikipedia` is a drop-in example (corpus loader TODO).
 
-For the **streaming** path (task-214), the k8s manifests are RENDERED from the workload itself —
+For the **streaming** path, the k8s manifests are RENDERED from the workload itself —
 `python harness.py render <workload> --shards N` → `.render/<workload>/{generator,connector}.yaml` —
 so the generator runs the workload's own `corpus.py` `stream()` (the windowed one advances a
 **synthetic timeline**, `LOGS_PER_DAY` events per synthetic day, so day-windows form as the run
@@ -71,7 +71,7 @@ python harness.py query synthetic --duration 10
 INDEX=synthetic TABLE=synthetic python convergence_check.py   # index doc count == source distinct ids
 ```
 
-## Staged perf run (the GA graphs — task-185/186)
+## Staged perf run (the GA graphs)
 
 `query` is one continuous scale; the **staged driver** steps ingest rate + storage size and captures
 the full metric set per milestone so the scale questions get graphs, not a single point. Run it from a
@@ -87,27 +87,26 @@ python results_table.py results.json > results.md   # milestone×metric table + 
 
 At each **storage milestone** the driver freezes ingest, drives the query mix (via `harness.py query`),
 runs the **convergence check**, and — if `deploy/trino` is up (it's in the observability bundle) — the
-**GrowlerDB-vs-Iceberg(Trino)** comparison (`compare_trino.py`, task-186; `TRINO_TABLE` defaults to
+**GrowlerDB-vs-Iceberg(Trino)** comparison (`compare_trino.py`; `TRINO_TABLE` defaults to
 `INDEX` so a windowed run compares against its own table). `results_table.py` is pure post-processing
 (no cluster): the measured milestones plus a **linear projection** to 1 TB / 100k rec/s, each labelled
-measured vs modeled with a ±residual band (task-79 honesty convention). `compare_trino.py` /
+measured vs modeled with a ±residual band (honesty convention). `compare_trino.py` /
 `staged_run.py` also run standalone if you only want one phase.
 
-**Parallelize ingest** (task-231): a single generator pod caps ~8.5k rows/s. Raise the generator
+**Parallelize ingest:** a single generator pod caps ~8.5k rows/s. Raise the generator
 replica count with `GENERATORS=N deploy/k8s/scale-up.sh` (or `harness.py render --generators N`) — each
 pod's rows carry a unique `run` prefix, so replicas produce disjoint ids and aggregate rows/s scales
 ~linearly. Use this to feed GrowlerDB above the single-pod ceiling. When an ingest step still can't
 keep up, the **write-path panels** (write latency `growlerdb_write_duration_seconds`, queue depth, and
 the scraped connector rows-read/retries) localize the bottleneck to the commit path vs node compute vs
-the connector (task-233/183), and **Loki** (in the bundle) has the pod logs alongside.
+the connector, and **Loki** (in the bundle) has the pod logs alongside.
 
-**Snapshot size = commit latency** (task-237): the generator's `BATCH` is one Iceberg snapshot = the
+**Snapshot size = commit latency:** the generator's `BATCH` is one Iceberg snapshot = the
 connector's commit size (it cuts only at snapshot boundaries, so it can't sub-divide a snapshot).
-Commit latency is ~O(snapshot): the 2026-07-08 sweep measured write p95 ~880ms at 10k-row snapshots
-vs ~4.5s at 150k. So drive a rate with a **bounded `BATCH` (≤ the connector's 50k `maxCommitRows`) +
-short `SLEEP_S`**, not a huge `BATCH` — `staged_run.py`'s ingest steps now do (a 300k `BATCH`
-self-inflicted ~9.5s p99 commits). Bounding the source snapshot is the practical lever until the
-connector can split within a snapshot (task-237).
+Commit latency is ~O(snapshot): write p95 ~880ms at 10k-row snapshots vs ~4.5s at 150k. So drive a
+rate with a **bounded `BATCH` (≤ the connector's 50k `maxCommitRows`) + short `SLEEP_S`**, not a huge
+`BATCH` — `staged_run.py`'s ingest steps do (a 300k `BATCH` self-inflicts ~9.5s p99 commits). Bounding
+the source snapshot is the practical lever until the connector can split within a snapshot.
 
 ## Notes
 
@@ -117,6 +116,6 @@ connector can split within a snapshot (task-237).
 - **Repeatable:** public corpora are fixed and the synthetic generator is seeded (`BENCH_SEED`), so
   runs are comparable and regression-gated regardless of dataset.
 - **Scope:** GrowlerDB's own numbers go here; a head-to-head vs ES/OpenSearch (same corpus, real
-  `opensearch-benchmark`) is the task-55 report, not the OKF bundle.
+  `opensearch-benchmark`) is a separate report, not the OKF bundle.
 - Deps for the corpus loaders: `pyiceberg`, `pyarrow` (as in `bench/`); the query driver + `validate`
   use only the stdlib plus `PyYAML`.

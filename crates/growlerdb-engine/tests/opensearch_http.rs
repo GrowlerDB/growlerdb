@@ -1,4 +1,4 @@
-//! The **OpenSearch adapter** end-to-end over HTTP (task-50): drive `POST /<index>/_search` through
+//! The **OpenSearch adapter** end-to-end over HTTP: drive `POST /<index>/_search` through
 //! the real `opensearch_router` → `Gateway` → a capturing fake Node, and assert (a) the DSL was
 //! translated to the native query the engine received, and (b) results are shaped as OpenSearch
 //! documents — `_id` from the composite key, `_source` from hydration.
@@ -42,7 +42,7 @@ impl Node for CaptureNode {
     ) -> Result<Response<SearchResponse>, Status> {
         let inner = req.into_inner();
         *self.seen_query.lock().unwrap() = inner.query.clone();
-        // Echo a highlight fragment back only when the request opted in (task-250), so the HTTP test
+        // Echo a highlight fragment back only when the request opted in, so the HTTP test
         // can assert both that the `highlight` clause was forwarded and that it renders in the response.
         let highlight = if inner.highlight.is_some() {
             let mut m = std::collections::HashMap::new();
@@ -182,7 +182,7 @@ async fn search_translates_dsl_and_shapes_documents() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn highlight_clause_produces_a_highlight_object() -> Result<(), Box<dyn std::error::Error>> {
-    // A `highlight` clause opts the search into server-side highlighting (task-250); the response
+    // A `highlight` clause opts the search into server-side highlighting; the response
     // carries a standard OpenSearch `highlight` object with `<em>`-marked, HTML-escaped fragments.
     let node = CaptureNode {
         seen_query: Arc::new(Mutex::new(String::new())),
@@ -207,7 +207,7 @@ async fn highlight_clause_produces_a_highlight_object() -> Result<(), Box<dyn st
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_highlight_clause_omits_the_highlight_object() {
-    // Without a `highlight` clause the response carries no `highlight` (off by default, task-250).
+    // Without a `highlight` clause the response carries no `highlight` (off by default).
     let node = CaptureNode {
         seen_query: Arc::new(Mutex::new(String::new())),
     };

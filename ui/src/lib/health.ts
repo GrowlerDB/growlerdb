@@ -1,6 +1,6 @@
-// Cluster-health roll-up for the header Health pill (task-94). Polls the same signals the old
-// Cluster screen did — Prometheus `up` + per-index ingestion — through `lib/cluster.ts`, and exposes
-// one reactive `Health`. A failed scrape degrades the relevant component, never throws.
+// Cluster-health roll-up for the header Health pill. Polls Prometheus `up` + per-index ingestion
+// through `lib/cluster.ts` and exposes one reactive `Health`. A failed scrape degrades the
+// relevant component, never throws.
 import { writable } from 'svelte/store';
 import { queryInstant } from './stats';
 import { getIngestion } from './api';

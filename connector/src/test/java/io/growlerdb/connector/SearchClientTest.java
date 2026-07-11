@@ -17,7 +17,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
-/** {@link SearchClient} calls the Node {@code Search} RPC and returns its hits (task-51). */
+/** {@link SearchClient} calls the Node {@code Search} RPC and returns its hits. */
 class SearchClientTest {
 
   @Test

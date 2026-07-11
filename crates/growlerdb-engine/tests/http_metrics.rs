@@ -1,4 +1,4 @@
-//! REST **RED metrics** middleware (task-208.2): [`rest::track_http_metrics`] records a per-route
+//! REST **RED metrics** middleware: [`rest::track_http_metrics`] records a per-route
 //! request counter (labelled by the matched route template + status) and a duration histogram, so
 //! the console's Runtime "API …" panels and the Search "query status codes" panel have data. This
 //! drives a request through a layered router and asserts the metrics render on `/metrics`.

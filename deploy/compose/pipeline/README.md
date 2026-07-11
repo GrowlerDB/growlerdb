@@ -65,9 +65,8 @@ the Polaris REST catalog; see [`connector/README.md`](../../../connector/README.
 - The node **retries** its initial index build until `growlerdb.telemetry_stream` exists, so startup
   ordering is race-free — the sink creates the table on first message.
 - The connector resumes from the node's durable checkpoint, so a restart neither loses nor
-  double-applies readings (exactly-once; `batch_id` dedups a boundary re-read) — verified by
-  restarting the node mid-stream and watching the connector pick up where it left off.
-- Running the connector inside `spark-submit` against Polaris + MinIO needed a few connector
+  double-applies readings (exactly-once; `batch_id` dedups a boundary re-read).
+- Running the connector inside `spark-submit` against Polaris + MinIO relies on a few connector
   hardenings (all in `connector/`): force the gRPC `dns` scheme for in-network `host:port` channels,
   merge `META-INF/services` in the shaded jar (so the `dns` resolver survives), a Spark `rate`-source
   heartbeat trigger (the Iceberg streaming source's offset log goes through the table's S3 FileIO,
@@ -80,8 +79,7 @@ the Polaris REST catalog; see [`connector/README.md`](../../../connector/README.
   persisted index is silently orphaned — search returns rows that won't hydrate ("Row not found").
   Persisting the catalog means an accidental Polaris bounce no longer wipes it. For UI-only changes,
   use `just ui-reload` (recreates only the gateway, never the node/Polaris). `just pipeline-down -v`
-  is still the way to reset the demo from scratch (drops MinIO + index + metastore volumes). The
-  durable, product-side guard for a genuinely recreated source is tracked in task-114.
+  is still the way to reset the demo from scratch (drops MinIO + index + metastore volumes).
 - `ts` is indexed as a numeric `LONG` (sortable + range-queryable, e.g. `ts:[from TO to]`), not a
   `DATE`, so the console's auto-detected **time-filter** control doesn't appear for it — a known demo
   limitation (wiring `ts` as a DATE needs the millis-vs-micros encoding aligned end to end).

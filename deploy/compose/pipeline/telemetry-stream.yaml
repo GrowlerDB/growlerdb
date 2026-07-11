@@ -8,7 +8,7 @@ source:
     catalog: growlerdb
     table: growlerdb.telemetry_stream
 key:
-  # Composite key = partition field(s) + identifier (the original design). `site` partitions the
+  # Composite key = partition field(s) + identifier. `site` partitions the
   # source table, so it drives Partition routing (readings from a site co-locate on one shard) and
   # prunes hydration point-lookups to that site's files. `id` uniquely identifies a reading within
   # a site. A GetByKey coordinate therefore carries both `site` and `id`.
@@ -20,7 +20,7 @@ mapping:
     - { path: id, type: KEYWORD }
     # `ts` is epoch-millis at the source (generator.py: int(time.time()*1000)); `format: epoch_ms`
     # makes it a real timestamp (DATE, canonical micros) so the console time filter + range/sort
-    # work on it (task-112).
+    # work on it.
     - { path: ts, format: epoch_ms, fast: true, cached: true }
     - { path: device_id, type: KEYWORD, fast: true, cached: true }
     - { path: site, type: KEYWORD, fast: true, cached: true }

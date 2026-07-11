@@ -10,10 +10,10 @@ import org.apache.spark.api.java.function.FilterFunction;
 import org.apache.spark.sql.Row;
 
 /**
- * Executor-side changelog filter for a shard-group worker (task-196): keep only the rows whose
- * key routes to one of the worker's owned shards. This is what makes the set a real scale-out —
- * without it every worker's driver pulls and maps the FULL changelog and only the write RPCs
- * shrink; with it each driver sees ~1/W of the rows, executor-side.
+ * Executor-side changelog filter for a shard-group worker: keep only the rows whose key routes to
+ * one of the worker's owned shards. This is what makes the set a real scale-out — without it every
+ * worker's driver pulls and maps the FULL changelog and only the write RPCs shrink; with it each
+ * driver sees ~1/W of the rows, executor-side.
  *
  * <p>Routing is per key, and every op of a key routes to the same shard, so UPDATE_BEFORE /
  * UPDATE_AFTER pairs and per-key last-write-wins stay intact within one worker. A row missing a
@@ -30,7 +30,7 @@ final class OwnedRowFilter implements FilterFunction<Row> {
 
   private OwnedRowFilter(IndexMapping mapping, ShardRouter router, Set<Integer> owned) {
     // Copy to guaranteed-serializable collections; the lambda-free class form keeps the Spark
-    // closure cleaner to reason about.
+    // closure easy to reason about.
     this.partitionFields = new ArrayList<>(mapping.partitionFields);
     this.identifierFields = new ArrayList<>(mapping.identifierFields);
     this.router = router;

@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # shellcheck disable=SC2034  # vars/functions below are consumed by the drills that source this file
-# Shared helpers for the Compose chaos drills (task-115). SOURCE this from a drill; don't execute it.
+# Shared helpers for the Compose chaos drills. SOURCE this from a drill; don't execute it.
 # Requires: docker, curl. (Individual drills may `require jq`.)
 
 # Resolve paths/vars relative to this lib so drills work from any CWD.

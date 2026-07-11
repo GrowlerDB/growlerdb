@@ -1,5 +1,5 @@
-//! **Precomputed hotcache** for cold windows (task-83, a refinement on task-80's read-through cold
-//! tier). Opening a parked window read-through normally costs a burst of small object-store
+//! **Precomputed hotcache** for cold windows, a refinement on the read-through cold
+//! tier. Opening a parked window read-through normally costs a burst of small object-store
 //! round-trips *before the first hit is even scored*: the two atomic files (`meta.json`,
 //! `.managed.json`), a `stat` per segment file for its length, and the structural byte ranges every
 //! [`SegmentReader`](crate::SegmentReader) reads (term-dictionary index, fast-field codecs, store
@@ -67,8 +67,7 @@ pub fn build(op: opendal::Operator, object_prefix: &str) -> Result<Vec<u8>> {
         lens: recorded.lens.into_iter().collect(),
         atomic: recorded.atomic.into_iter().collect(),
     };
-    // Frame with a magic + version so a later format change degrades instead of mis-parsing
-    // (task-150 / F5).
+    // Frame with a magic + version so a later format change degrades instead of mis-parsing.
     Ok(crate::sidecar::frame(
         crate::sidecar::HOTCACHE_MAGIC,
         postcard::to_stdvec(&hc)?,
@@ -77,9 +76,9 @@ pub fn build(op: opendal::Operator, object_prefix: &str) -> Result<Vec<u8>> {
 
 /// Preload a hotcache `bytes` (from [`build`]) into a [`HotState`] to hand to
 /// [`ObjectDirectory::with_hot`](crate::ObjectDirectory). Atomic bodies, file lengths, **and** the
-/// structural byte ranges are all pinned in the returned state (task-150 / B7) — the ranges no longer
+/// structural byte ranges are all pinned in the returned state — the ranges no longer
 /// go into the shared evictable cache — so opening the window needs no object round-trips and they
-/// can't be evicted out from under it. Errors on an unrecognized/incompatible sidecar (task-150 / F5)
+/// can't be evicted out from under it. Errors on an unrecognized/incompatible sidecar
 /// so the caller can fall back to plain read-through.
 pub(crate) fn preload(bytes: &[u8]) -> Result<HotState> {
     let payload = crate::sidecar::unframe(crate::sidecar::HOTCACHE_MAGIC, bytes)?;
@@ -212,7 +211,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unusable_hotcache_sidecar_is_rejected() {
-        // task-150 / F5: an unframed/incompatible sidecar is rejected (so `open_cold_shard` falls
+        // An unframed/incompatible sidecar is rejected (so `open_cold_shard` falls
         // back to plain read-through) rather than mis-parsed.
         assert!(preload(b"not a framed sidecar at all").is_err());
         // A real sidecar with a corrupted magic byte is rejected too.

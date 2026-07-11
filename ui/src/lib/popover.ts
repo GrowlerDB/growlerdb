@@ -1,5 +1,5 @@
-// Popover positioning (task-93): place a panel under a trigger, clamped to the viewport. Pure +
-// tested; the Popover component just reads `getBoundingClientRect()` and applies the result.
+// Popover positioning: place a panel under a trigger, clamped to the viewport. Pure + tested; the
+// Popover component just reads `getBoundingClientRect()` and applies the result.
 
 export interface Rect {
   top: number;

@@ -1,6 +1,6 @@
-//! `growlerdb-telemetry` — the **observability foundation** (task-39, M4): structured JSON
+//! `growlerdb-telemetry` — the **observability foundation**: structured JSON
 //! logging, a Prometheus metrics recorder for the core SLIs, and Kubernetes health/readiness
-//! probes. Per [observability](../../../wiki/23-observability.md) (D7), telemetry is open and
+//! probes. Per [observability](../../../wiki/23-observability.md), telemetry is open and
 //! standards-based: metrics are scrapeable in Prometheus exposition format (the wiki's
 //! "scrape or OTLP" metrics path), logs are machine-parseable JSON carrying span context.
 //!
@@ -43,7 +43,7 @@ const OTLP_ENDPOINT_ENV: &str = "GROWLERDB_OTLP_ENDPOINT";
 pub fn init(service: &str) {
     // Global metrics recorder (install once). The handle renders Prometheus exposition text.
     //
-    // Give the latency histograms explicit buckets (task-224): without them, the Prometheus exporter
+    // Give the latency histograms explicit buckets: without them, the Prometheus exporter
     // renders a `histogram!` as a **summary** (client-computed `{quantile}` series over a decaying
     // window), which has no `_bucket` — so `histogram_quantile` returns nothing and the reported
     // p50/p95/p99 drift on every scrape and decay to 0 when traffic stops (confusing on a live chart).
@@ -187,14 +187,14 @@ pub mod sli {
     use metrics::{counter, gauge, histogram};
 
     /// Record an index's **ingestion lag** — the worst shard's wall-clock staleness vs the source
-    /// head, in ms (task-143). A gauge (current value, not a rate), labelled by `index` so the
+    /// head, in ms. A gauge (current value, not a rate), labelled by `index` so the
     /// console can show a per-index "behind by Ns" panel and Grafana/alerts can threshold it.
     /// 0 means every shard is caught up. Emitted whenever ingestion status is computed.
     pub fn ingest_lag_ms(index: &str, lag_ms: i64) {
         gauge!("growlerdb_ingest_lag_ms", "index" => index.to_string()).set(lag_ms as f64);
     }
 
-    /// Record an index's **shard availability** (task-143): `up` = shards with a reachable primary,
+    /// Record an index's **shard availability**: `up` = shards with a reachable primary,
     /// `total` = shards the index has. Two gauges labelled by `index` so the console shows an "N/M
     /// shards up" panel and an alert can fire when `up < total`.
     pub fn shard_availability(index: &str, up: u64, total: u64) {
@@ -202,7 +202,7 @@ pub mod sli {
         gauge!("growlerdb_shards_total", "index" => index.to_string()).set(total as f64);
     }
 
-    /// Record the current **live segment count** for an index/shard (task-143) — the merge health
+    /// Record the current **live segment count** for an index/shard — the merge health
     /// signal a segments panel charts. A gauge (current value), labelled by `label` (the index name,
     /// or `"<index> w<window>"` for a windowed shard). Emit it on the compaction loop's tick so it
     /// tracks segment growth between merges.
@@ -210,15 +210,15 @@ pub mod sli {
         gauge!("growlerdb_segments_live", "index" => label.to_string()).set(segments as f64);
     }
 
-    /// A shard's full on-disk index footprint in bytes (task-182) — Tantivy files **plus** the
-    /// locator layers, i.e. exactly the sum of `growlerdb_index_bytes_component` (task-218).
+    /// A shard's full on-disk index footprint in bytes — Tantivy files **plus** the
+    /// locator layers, i.e. exactly the sum of `growlerdb_index_bytes_component`.
     /// Emitted on the compaction loop's tick alongside `segments_live` — so the index-size panel
     /// tracks growth (and the drop after a merge), not just the segment count.
     pub fn index_bytes(label: &str, bytes: u64) {
         gauge!("growlerdb_index_bytes", "index" => label.to_string()).set(bytes as f64);
     }
 
-    /// Live indexed document count for a shard (task-187), emitted on the compaction loop's tick
+    /// Live indexed document count for a shard, emitted on the compaction loop's tick
     /// alongside `index_bytes`. `sum(growlerdb_index_docs)` across shards is GrowlerDB's own count of
     /// what it holds — the index side of the **source→index convergence** check: at steady state it
     /// must equal the source's live row count (`sum(growlerdb_source_records)`); a persistent gap is
@@ -227,7 +227,7 @@ pub mod sli {
         gauge!("growlerdb_index_docs", "index" => label.to_string()).set(docs as f64);
     }
 
-    /// Per-component index size in bytes (task-182; inverted sub-split task-218): `component` is
+    /// Per-component index size in bytes: `component` is
     /// `term` (term dictionaries), `postings`, `positions` (phrase support), `fieldnorms` (BM25
     /// lengths) — together the classic inverted index — plus `fast` (fast-field cache), `store`
     /// (doc store), `locator` (hydration lookup), and `other` (metadata/deletes). Lets the
@@ -241,7 +241,7 @@ pub mod sli {
         .set(bytes as f64);
     }
 
-    /// Deleted-but-unpurged docs in a shard (task-218) — the **delete debt** a size sample must be
+    /// Deleted-but-unpurged docs in a shard — the **delete debt** a size sample must be
     /// read against: under `NoMergePolicy` superseded/deleted docs stay on disk (and their keys in
     /// the term dictionaries) until a compaction merges them away, so `growlerdb_index_bytes`
     /// between merges overstates the steady-state footprint. Emitted on the compaction loop's tick
@@ -251,7 +251,7 @@ pub mod sli {
         gauge!("growlerdb_index_deleted_docs", "index" => label.to_string()).set(deleted as f64);
     }
 
-    /// Record a completed **compaction/merge** (task-143): bump `growlerdb_compactions_total`, add the
+    /// Record a completed **compaction/merge**: bump `growlerdb_compactions_total`, add the
     /// segments reclaimed (`before - after`) to `growlerdb_segments_merged_total`, and update the
     /// live-segment gauge to the post-merge count. Labelled by `label` (index / windowed shard).
     /// A no-op merge (`before <= after`) still counts as a compaction attempt but reclaims nothing.
@@ -263,7 +263,7 @@ pub mod sli {
         segments_live(label, segments_after);
     }
 
-    /// Record a **successful** run of a background maintenance loop (task-148 / F11): bumps a runs
+    /// Record a **successful** run of a background maintenance loop: bumps a runs
     /// counter and sets a last-success-timestamp gauge (epoch seconds), both labelled by `loop_name`
     /// (e.g. `compaction`, `replica-refresh`, `jwks-refresh`, `registry-reload`, `cp-reload`,
     /// `pre-warm`). The gauge lets operators alert on staleness ("hasn't succeeded in N minutes")
@@ -274,7 +274,7 @@ pub mod sli {
             .set(now_epoch_secs());
     }
 
-    /// Record a **failed** run of a background maintenance loop (task-148 / F11): bumps a failures
+    /// Record a **failed** run of a background maintenance loop: bumps a failures
     /// counter labelled by `loop_name`, so chronic background failure is alertable instead of only
     /// visible in stderr. Pairs with [`background_success`].
     pub fn background_failure(loop_name: &str) {
@@ -300,7 +300,7 @@ pub mod sli {
         histogram!("growlerdb_query_duration_seconds").record(duration_secs);
     }
 
-    /// Record a completed **HTTP request** to the REST API (task-208.2): its matched `route`
+    /// Record a completed **HTTP request** to the REST API: its matched `route`
     /// template (e.g. `/v1/search` — the router template, NOT the raw path, so label cardinality
     /// stays bounded), the response `status` code, and `duration_secs`. Drives the Runtime API
     /// panels (request rate, 4xx/5xx rate, p95 latency across every endpoint) and the Search
@@ -314,7 +314,7 @@ pub mod sli {
             .record(duration_secs);
     }
 
-    /// Record a built-in **login attempt** outcome (task-208.2): `outcome` is `success`,
+    /// Record a built-in **login attempt** outcome: `outcome` is `success`,
     /// `bad_credential`, `locked` (throttled after repeated failures), or `busy` (shed under load).
     /// One counter `growlerdb_logins_total{outcome}` drives the Access panels — the sign-in rate and
     /// the failure rate (a brute-force / misconfiguration signal). OIDC logins are minted by the
@@ -325,24 +325,24 @@ pub mod sli {
 
     /// Record indexed documents committed (ingestion throughput), labelled by `index` so the
     /// console can chart throughput per index (`sum(rate(...[5m])) by (index)`), not just
-    /// cluster-wide (task-136).
+    /// cluster-wide.
     pub fn ingested_docs(index: &str, count: u64) {
         counter!("growlerdb_ingested_docs_total", "index" => index.to_string()).increment(count);
     }
 
-    /// Record a completed **index write/commit** (task-233): the wall-clock `duration_secs` of the
+    /// Record a completed **index write/commit**: the wall-clock `duration_secs` of the
     /// blocking stage+commit (Tantivy commit + location fsync + redb checkpoint), labelled by `index`.
     /// The latency counterpart to [`ingested_docs`](Self::ingested_docs) (throughput): when ingestion
     /// saturates, a rising write p95 *while node CPU stays flat* localizes the ceiling to the commit
     /// path rather than query or compaction (the exact gap that left the scale run unable to
     /// pinpoint its ~6.5k docs/s ceiling). Exports as a true histogram — the `_duration_seconds` suffix
-    /// picks up the explicit latency buckets (task-224).
+    /// picks up the explicit latency buckets.
     pub fn write(index: &str, duration_secs: f64) {
         histogram!("growlerdb_write_duration_seconds", "index" => index.to_string())
             .record(duration_secs);
     }
 
-    /// Record the node's current **write-queue depth** (task-233): in-flight + queued commits waiting
+    /// Record the node's current **write-queue depth**: in-flight + queued commits waiting
     /// on the write-admission semaphore. A gauge, labelled by `index` — backpressure shows here (depth
     /// climbing toward the admission limit) *before* it shows up as a growing `ingest_lag_ms`, so a
     /// connector out-running the commit path is visible directly, not just inferred.
@@ -350,7 +350,7 @@ pub mod sli {
         gauge!("growlerdb_write_queue_depth", "index" => index.to_string()).set(depth as f64);
     }
 
-    /// Record the outcome of a **drift reconcile** cycle over a shard (task-195), labelled by
+    /// Record the outcome of a **drift reconcile** cycle over a shard, labelled by
     /// `index` and shard `ordinal`. `stale` = indexed docs the source no longer holds (deleted),
     /// `missing` = source docs the shard owns but hadn't indexed (re-indexed). Both are counters so
     /// an alert can fire on any nonzero rate (`sum(rate(...[1h])) by (index) > 0` = the index silently
@@ -375,7 +375,7 @@ pub mod sli {
     /// keys were authoritatively `found` in the source.
     ///
     /// A rising **miss rate** (`requested - found`) is the cheap early-warning for index↔source
-    /// **drift** (task-114): a stale index — e.g. after a recreated source — still returns search
+    /// **drift**: a stale index — e.g. after a recreated source — still returns search
     /// hits whose keys no longer exist in the table, so they fail to hydrate. It flags trouble even
     /// before the lineage guard engages on a restart.
     pub fn hydration(duration_secs: f64, refreshed_locators: u64, requested: u64, found: u64) {
@@ -388,14 +388,14 @@ pub mod sli {
         }
     }
 
-    /// Record the keys resolved by a hydration's locate (task-184 / D30, the layered
+    /// Record the keys resolved by a hydration's locate (the layered
     /// path: key term → `_locid` fast field → `location.arr`). Counts **keys**, not
     /// requests, so locator traffic is directly rate-able.
     pub fn locate_keys(keys: u64) {
         counter!("growlerdb_locate_keys_total").increment(keys);
     }
 
-    /// Record a completed **compaction re-map** event (task-184 slice 3 / D30): an Iceberg
+    /// Record a completed **compaction re-map** event: an Iceberg
     /// rewrite removed interned data files from the live table, and the background re-map
     /// re-pointed the affected location slots at the rewritten rows' new files. Counts events
     /// and rows re-mapped, labelled by `index` — a rising `growlerdb_stale_locators_total`
@@ -407,7 +407,7 @@ pub mod sli {
             .increment(rows_remapped);
     }
 
-    /// Record the current **dead-file count** (task-184 slice 3): interned data files flagged
+    /// Record the current **dead-file count**: interned data files flagged
     /// dead (rewritten away — permanent tombstones). A gauge labelled by `index`; it grows with
     /// each compaction the source table undergoes, and hydration skips point reads into these
     /// files, so the gauge doubles as a "compactions the index has absorbed" signal.
@@ -415,7 +415,7 @@ pub mod sli {
         gauge!("growlerdb_locator_dead_files", "index" => index.to_string()).set(count as f64);
     }
 
-    /// Record **source-health** gauges for an index's source table (task-197), sampled from Iceberg
+    /// Record **source-health** gauges for an index's source table, sampled from Iceberg
     /// metadata GrowlerDB already reads (the current snapshot's `total-*` summary + the retained-
     /// snapshot count — no scan). These *diagnose* a source that wants Iceberg maintenance: GrowlerDB
     /// reads O(files) on the query path, so a source accumulating small files / long snapshot history
@@ -445,7 +445,7 @@ pub mod sli {
         gauge!("growlerdb_source_avg_file_bytes", "index" => idx()).set(avg);
     }
 
-    /// Record the source table's **partition skew** (task-208.2): the largest identity partition's
+    /// Record the source table's **partition skew**: the largest identity partition's
     /// record count over the mean (`1.0` = evenly sized; higher = a hotspot partition). Labelled by
     /// `index`; only emitted for cleanly identity-partitioned sources. Drives the Source "partition
     /// skew" panel — a lopsided-ingest / hot-key signal.
@@ -453,7 +453,7 @@ pub mod sli {
         gauge!("growlerdb_source_partition_skew", "index" => index.to_string()).set(skew);
     }
 
-    /// Record **duplicate primary keys** a hydration key scan detected (task-184 / D30):
+    /// Record **duplicate primary keys** a hydration key scan detected:
     /// extra distinct source rows matching an already-matched key — the source table is
     /// not unique on the composite key. The scan stays deterministic (highest
     /// `(file, position)` wins), but a nonzero rate means hydration/update/delete
@@ -466,7 +466,7 @@ pub mod sli {
         }
     }
 
-    /// Record a hydration **plan-cache** outcome (task-184 / D30): whether pass 1's
+    /// Record a hydration **plan-cache** outcome: whether pass 1's
     /// current-snapshot plan was reused from the snapshot-pinned cache (`hit`) or freshly
     /// planned — catalog + manifest reads (`miss`). The miss rate makes planning cost
     /// observable for the scale tests: a miss per batch means the cache isn't earning
@@ -521,16 +521,16 @@ mod tests {
         sli::query(0.034, true);
         sli::ingested_docs("docs", 5);
         sli::hydration(0.002, 0, 10, 7); // 10 keys requested, 7 found → 3 hydration misses
-        sli::ingest_lag_ms("docs", 45_000); // task-143 gauges
+        sli::ingest_lag_ms("docs", 45_000);
         sli::shard_availability("docs", 2, 3);
-        sli::compaction("docs", 5, 1); // task-143: 4 segments reclaimed
+        sli::compaction("docs", 5, 1); // 4 segments reclaimed
         sli::segments_live("docs", 1);
-        sli::duplicate_pks(2); // task-184: the key scan saw 2 extra rows for matched keys
-        sli::source_health("docs", 1_000, 4_000_000, 3, 50_000, 42); // task-197 source gauges
-        sli::http_request("/v1/search", 200, 0.008); // task-208.2 RED metrics
-        sli::login("success"); // task-208.2 auth metrics
-        sli::source_partition_skew("docs", 1.8); // task-208.2 partition skew
-        sli::index_docs("docs", 3); // task-187 convergence: index side
+        sli::duplicate_pks(2); // the key scan saw 2 extra rows for matched keys
+        sli::source_health("docs", 1_000, 4_000_000, 3, 50_000, 42);
+        sli::http_request("/v1/search", 200, 0.008);
+        sli::login("success");
+        sli::source_partition_skew("docs", 1.8);
+        sli::index_docs("docs", 3); // convergence: index side
 
         let (status, body) = get(&health_router(Readiness::new()), "/metrics").await;
         assert_eq!(status, StatusCode::OK);
@@ -539,7 +539,7 @@ mod tests {
         assert!(body.contains("growlerdb_query_total"));
         assert!(body.contains("growlerdb_query_errors_total"));
         assert!(body.contains("growlerdb_ingested_docs_total"));
-        // task-224: latency metrics export as true histograms (`_bucket`), NOT summaries
+        // latency metrics export as true histograms (`_bucket`), NOT summaries
         // (`{quantile}`), so `histogram_quantile` works and the console/Grafana p50/p95/p99 charts are
         // stable + aggregatable rather than decaying per-scrape estimates.
         assert!(
@@ -551,27 +551,27 @@ mod tests {
             !body.contains("_duration_seconds{quantile"),
             "latency metrics must not export as summary quantiles"
         );
-        // The hydration-miss drift SLI (task-114): keys requested vs found are exported.
+        // The hydration-miss drift SLI: keys requested vs found are exported.
         assert!(body.contains("growlerdb_hydration_keys_requested_total"));
         assert!(body.contains("growlerdb_hydration_keys_found_total"));
-        // Ingestion-lag + shard-availability gauges (task-143), labelled by index.
+        // Ingestion-lag + shard-availability gauges, labelled by index.
         assert!(body.contains("growlerdb_ingest_lag_ms"));
         assert!(body.contains("growlerdb_shards_up"));
         assert!(body.contains("growlerdb_shards_total"));
-        // Compaction / live-segments (task-143).
+        // Compaction / live-segments.
         assert!(body.contains("growlerdb_compactions_total"));
         assert!(body.contains("growlerdb_segments_merged_total"));
         assert!(body.contains("growlerdb_segments_live"));
-        // Duplicate-PK detection on the hydration key scan (task-184).
+        // Duplicate-PK detection on the hydration key scan.
         assert!(body.contains("growlerdb_duplicate_pks_total"));
-        // REST RED metrics (task-208.2): per-route request counter + duration histogram.
+        // REST RED metrics: per-route request counter + duration histogram.
         assert!(body.contains("growlerdb_http_requests_total"));
         assert!(body.contains("growlerdb_http_request_duration_seconds"));
         assert!(body.contains("growlerdb_logins_total"));
         assert!(body.contains("growlerdb_source_partition_skew"));
-        // Native index doc count (task-187) — the index side of source→index convergence.
+        // Native index doc count — the index side of source→index convergence.
         assert!(body.contains("growlerdb_index_docs"));
-        // Source-health diagnostic gauges (task-197), labelled by index.
+        // Source-health diagnostic gauges, labelled by index.
         assert!(body.contains("growlerdb_source_data_files"));
         assert!(body.contains("growlerdb_source_bytes"));
         assert!(body.contains("growlerdb_source_delete_files"));

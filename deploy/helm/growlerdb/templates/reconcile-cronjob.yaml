@@ -1,5 +1,5 @@
 {{- if .Values.reconcile.enabled }}
-# Scheduled drift reconcile backstop (task-195). Runs `growlerdb reconcile <index> --control-plane`,
+# Scheduled drift reconcile backstop. Runs `growlerdb reconcile <index> --control-plane`,
 # which reads the index's shard map + bucket owners from the registry and fans a shard-scoped
 # ReconcileIndex out to every shard's primary node. The nodes do the source read + repair (delete
 # stale, re-index missing) and emit growlerdb_drift_* metrics; this pod only orchestrates over gRPC,

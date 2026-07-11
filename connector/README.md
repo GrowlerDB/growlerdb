@@ -1,8 +1,8 @@
 # GrowlerDB Spark connector (JVM)
 
-The **ingestion connector** ([D10](../../wiki/21-decisions.md#d10-ingestion-runtime-spark-until-rust-matures)): a Spark Structured Streaming job that reads the Iceberg **changelog** and writes `DocOp`s to a GrowlerDB Node over the **Write gRPC** service (`growlerdb serve`). It is a separate JVM subproject — **not** part of the Rust cargo workspace.
+The **ingestion connector**: a Spark Structured Streaming job that reads the Iceberg **changelog** and writes `DocOp`s to a GrowlerDB Node over the **Write gRPC** service (`growlerdb serve`). It is a separate JVM subproject — **not** part of the Rust cargo workspace.
 
-> Status: the pipeline is wired (task-11). `ChangelogReader` (task-63) → `ChangelogMapper` (task-13) → `WriteClient` Write gRPC, orchestrated by `ConnectorJob` and the `spark-submit` entrypoint `ConnectorApp`. See the [connector plan](../../backlog/docs/task-11-plan.md).
+> Status: the pipeline is wired. `ChangelogReader` → `ChangelogMapper` → `WriteClient` Write gRPC, orchestrated by `ConnectorJob` and the `spark-submit` entrypoint `ConnectorApp`.
 
 ## Pipeline
 
@@ -18,7 +18,7 @@ submitter (`--conf spark.sql.catalog.<name>.*`), so it works against a Hadoop ca
 (local) or Polaris REST (dev stack). It runs one batch by default, or a `foreachBatch`
 Structured Streaming loop with `--stream`.
 
-**Exactly-once / resume (task-16):** on startup (unless `--start` overrides it) the
+**Exactly-once / resume:** on startup (unless `--start` overrides it) the
 connector reads the checkpoint the Node has durably committed via the `GetCheckpoint`
 RPC and resumes the changelog from there. Because the Node commits the write and the
 checkpoint in one atomic transaction and dedups on `batch_id`, a window re-read at the

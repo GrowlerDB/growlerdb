@@ -16,11 +16,10 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 /**
- * Thin client to a GrowlerDB Node's {@code Write} gRPC service (task-12 / {@code growlerdb
- * serve}). The connector (task-11) maps changelog rows to {@link DocBatch}es and
- * commits them through this client.
+ * Thin client to a GrowlerDB Node's {@code Write} gRPC service ({@code growlerdb serve}). The
+ * connector maps changelog rows to {@link DocBatch}es and commits them through this client.
  *
- * <p><b>Resilience to a Node restart (task-124, sibling of the Gateway's task-122).</b> The
+ * <p><b>Resilience to a Node restart.</b> The
  * channel resolves the Node by DNS ({@code dns:///host:port}), so when a shard's pod crashes and
  * returns at a new IP the name is re-resolved on reconnect. But that only helps if a call to the
  * dead pod actually <i>fails</i> — a force-killed pod's torn-down network black-holes in-flight
@@ -34,7 +33,7 @@ import java.util.function.Supplier;
  *   <li>transient transport failures ({@code UNAVAILABLE}/{@code DEADLINE_EXCEEDED}) are
  *       <b>retried with backoff</b>, giving the channel time to re-resolve DNS and reconnect to
  *       the returned pod so the write resumes <i>in place</i>. Retries are safe because every
- *       batch carries an idempotent {@code batch_id} the Node dedups (task-16), so a replay of a
+ *       batch carries an idempotent {@code batch_id} the Node dedups, so a replay of a
  *       write that actually committed is a no-op.
  * </ul>
  *
@@ -45,22 +44,22 @@ import java.util.function.Supplier;
 public final class WriteClient implements BatchWriter {
 
   /**
-   * gRPC inbound message cap (task-113), matching the Node's raised {@code Write} decode limit. The
+   * gRPC inbound message cap, matching the Node's raised {@code Write} decode limit. The
    * connector mostly <i>sends</i> (and bounded catch-up keeps each batch small), so this is a safety
    * margin for large responses rather than the hot path — but it keeps both ends consistent.
    */
   static final int MAX_MESSAGE_BYTES = 256 * 1024 * 1024;
 
   /**
-   * Per-call deadline default (task-124). Bounds any single RPC so a wedged Node fails fast rather
+   * Per-call deadline default. Bounds any single RPC so a wedged Node fails fast rather
    * than blocking on TCP retransmits. 30s is generous for a large bounded-catch-up sub-batch (up to
    * {@code DEFAULT_MAX_COMMIT_ROWS}); a steady stream of tiny batches can run much tighter for
-   * faster in-place recovery (task-125) via {@code GROWLERDB_WRITE_DEADLINE_SECONDS}.
+   * faster in-place recovery via {@code GROWLERDB_WRITE_DEADLINE_SECONDS}.
    */
   static final int PER_CALL_DEADLINE_SECONDS = 30;
 
-  /** Retry tunables (task-124): capped exponential backoff over transient transport failures. The
-   *  budget is generous (task-144) so a FULL node roll — all pods restarting with new IPs, dials to
+  /** Retry tunables: capped exponential backoff over transient transport failures. The
+   *  budget is generous so a FULL node roll — all pods restarting with new IPs, dials to
    *  stale IPs timing out — is absorbed here (retry until DNS re-resolves + a pod is READY) before
    *  the micro-batch fails; if it still exhausts, the streaming query restarts in-process rather than
    *  the JVM exiting. ~10 attempts with backoff to 15s ≈ a couple minutes of coverage. */
@@ -76,7 +75,7 @@ public final class WriteClient implements BatchWriter {
   private final long initialBackoffMs;
   private final long maxBackoffMs;
 
-  /** Connect to a GrowlerDB Node at {@code host:port} (plaintext; TLS/auth are M4). */
+  /** Connect to a GrowlerDB Node at {@code host:port} (plaintext; TLS/auth are future work). */
   public WriteClient(String host, int port) {
     this(
         host,
@@ -112,12 +111,12 @@ public final class WriteClient implements BatchWriter {
       long initialBackoffMs,
       long maxBackoffMs) {
     if (maxAttempts < 1) {
-      throw new IllegalArgumentException("maxAttempts must be >= 1"); // else callWithRetry NPEs (task-152 / I14)
+      throw new IllegalArgumentException("maxAttempts must be >= 1"); // else callWithRetry NPEs
     }
     // Transport-agnostic at compile time; grpc-netty-shaded supplies it at runtime. dns:/// so a
-    // restarted Node's new pod IP is re-resolved on reconnect (task-124).
+    // restarted Node's new pod IP is re-resolved on reconnect.
     //
-    // Keepalive (task-125) is what makes that reconnect happen *in place*. A force-killed Node pod
+    // Keepalive is what makes that reconnect happen *in place*. A force-killed Node pod
     // black-holes its TCP connection: without keepalive the subchannel stays READY (gRPC never
     // learns the socket is dead), a call just hits its deadline, and the channel never re-resolves
     // DNS — so every retry re-uses the dead connection until the budget exhausts and the connector
@@ -149,14 +148,14 @@ public final class WriteClient implements BatchWriter {
 
   /**
    * A shard's durably committed checkpoint: the snapshot id (identity — a random long) plus,
-   * when known, its lineage-monotone Iceberg sequence number (task-196), which is the only
-   * sound way to order two checkpoints (task-205).
+   * when known, its lineage-monotone Iceberg sequence number, which is the only sound way to order
+   * two checkpoints.
    */
   public record ShardCheckpoint(long snapshotId, java.util.OptionalLong sequenceNumber) {}
 
   /**
    * The Iceberg snapshot the Node has durably committed, or {@code null} if it has
-   * none yet — the connector's <b>resume point</b> after a restart (task-16). Because
+   * none yet — the connector's <b>resume point</b> after a restart. Because
    * the write and checkpoint commit atomically, this never points past applied data;
    * a window read from here is at-least-once and de-duplicated by {@code batch_id}.
    */
@@ -171,7 +170,7 @@ public final class WriteClient implements BatchWriter {
   }
 
   /**
-   * The checkpoint for a specific time {@code window} on a windowed node (task-219) — the connector
+   * The checkpoint for a specific time {@code window} on a windowed node — the connector
    * resumes each window independently. {@code window == 0} reads the node's single (ordinal) shard.
    */
   public ShardCheckpoint checkpoint(long window) {
@@ -194,7 +193,7 @@ public final class WriteClient implements BatchWriter {
         seq > 0 ? java.util.OptionalLong.of(seq) : java.util.OptionalLong.empty());
   }
 
-  /** Drained when this shard's durable checkpoint has reached exactly {@code head} (task-194). */
+  /** Drained when this shard's durable checkpoint has reached exactly {@code head}. */
   @Override
   public boolean drainedTo(long head) {
     Long cp = checkpointSnapshotId();
@@ -208,7 +207,7 @@ public final class WriteClient implements BatchWriter {
 
   /**
    * Run {@code call}, retrying transient transport failures with capped exponential backoff so a
-   * brief Node outage (a crashed pod returning at a new IP) is absorbed in place (task-124). Only
+   * brief Node outage (a crashed pod returning at a new IP) is absorbed in place. Only
    * {@code UNAVAILABLE}/{@code DEADLINE_EXCEEDED} are retried — application errors (e.g. the
    * lineage guard) propagate immediately. Idempotent {@code batch_id} makes a write replay safe.
    */
@@ -221,8 +220,7 @@ public final class WriteClient implements BatchWriter {
         if (!isRetryable(e.getStatus().getCode()) || attempt == maxAttempts) {
           throw e;
         }
-        // Count the retry (task-194 AC6) so a transient-failure storm shows up as a metric, not just
-        // in the printf that the audit found had rotated away during the loss window.
+        // Count the retry so a transient-failure storm shows up as a metric, not just in the printf.
         ConnectorMetrics.recordWriteRetry(e.getStatus().getCode().name());
         System.err.printf(
             "WriteClient.%s failed (%s), attempt %d/%d — retrying in %dms%n",
@@ -236,13 +234,13 @@ public final class WriteClient implements BatchWriter {
   }
 
   private static boolean isRetryable(Status.Code code) {
-    // RESOURCE_EXHAUSTED is transient by construction (task-194): it is the Node's write-admission
+    // RESOURCE_EXHAUSTED is transient by construction: it is the Node's write-admission
     // backpressure — a slot is busy, not a permanent rejection. Under a compaction I/O storm a slow
     // commit can hold its admission slot past the client deadline (the Node bounds concurrent commits
     // to the slot count so it sheds load rather than thrashing the disk), so a retry hits
-    // RESOURCE_EXHAUSTED. Treating it as non-retryable turned that backpressure into an INSTANT
-    // stream failure (the likely detonator of the silent-loss event); it must back off and retry.
-    // The idempotent batch_id makes the eventual replay a safe no-op.
+    // RESOURCE_EXHAUSTED. Treating it as non-retryable would turn that backpressure into an instant
+    // stream failure, so it must back off and retry. The idempotent batch_id makes the eventual
+    // replay a safe no-op.
     return code == Status.Code.UNAVAILABLE
         || code == Status.Code.DEADLINE_EXCEEDED
         || code == Status.Code.RESOURCE_EXHAUSTED;

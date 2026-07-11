@@ -1,4 +1,4 @@
-// Query autocomplete (task-88): the search box holds a Lucene/KQL query, so completing a value
+// Query autocomplete: the search box holds a Lucene/KQL query, so completing a value
 // means finding the `field:prefix` token the user is currently typing (at the cursor/end), asking
 // the Suggest API for that field's terms, and replacing the prefix with the chosen value. Pure +
 // unit-tested; the Svelte component handles debounce, keyboard, and the network call.

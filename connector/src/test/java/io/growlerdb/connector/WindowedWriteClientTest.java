@@ -16,7 +16,7 @@ import java.util.Set;
 import java.util.SortedMap;
 import org.junit.jupiter.api.Test;
 
-/** Unit tests for {@link WindowedWriteClient#partition} — the pure window-routing of a batch (task-219). */
+/** Unit tests for {@link WindowedWriteClient#partition} — the pure window-routing of a batch. */
 class WindowedWriteClientTest {
 
   private static final long DAY = 86_400_000_000L;

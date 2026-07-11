@@ -1,4 +1,4 @@
-# Time-windowed scale-test workload (task-159 temporal case): the same http_logs corpus, but the
+# Time-windowed scale-test workload (temporal case): the same http_logs corpus, but the
 # source is Iceberg-partitioned by day and the index is windowed daily on `ts`. Run it alongside the
 # non-temporal `http_logs` to capture BOTH numbers — the temporal sweet spot (cold-tier + query
 # pruning) and the hash-routed design boundary. See okf/quality/scale-test-plan.md.

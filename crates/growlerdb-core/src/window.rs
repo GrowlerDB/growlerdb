@@ -1,16 +1,16 @@
-//! **Time-window (range) sharding** ([task-81], D12 range opt-in). Where [hash/partition
+//! **Time-window (range) sharding** ([Service architecture]). Where [hash/partition
 //! routing](crate::routing) spreads keys over a *fixed* shard count, time-windowing buckets a
 //! **time field** into **contiguous windows** that grow over time — one shard per window. That
 //! lets time-range queries **prune** to the overlapping windows and lets cold (older) windows be
-//! **parked** to object storage and revived on demand ([task-80]).
+//! **parked** to object storage and revived on demand ([Deployment ops]).
 //!
 //! Buckets are fixed-duration and aligned to the Unix epoch (no calendar library, fully
 //! deterministic across processes/releases). A window's **id** is the epoch-**micros** of its start
-//! — the same canonical scale the index, range queries, and the console time filter use (task-112),
+//! — the same canonical scale the index, range queries, and the console time filter use,
 //! so a `format`-declared timestamp can be the window field and pruning stays correct.
 //!
-//! [task-81]: ../../../design/06-service-architecture.md
-//! [task-80]: ../../../design/14-deployment-ops.md
+//! [Service architecture]: ../../../design/06-service-architecture.md
+//! [Deployment ops]: ../../../design/14-deployment-ops.md
 
 use serde::{Deserialize, Serialize};
 
@@ -45,7 +45,7 @@ impl WindowGranularity {
 }
 
 /// Time-window routing for an index: the source **time field** (a `DATE` timestamp, canonical
-/// micros — task-112) and the window [granularity](WindowGranularity).
+/// micros) and the window [granularity](WindowGranularity).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimeWindowing {
     /// The **ingest-time** field whose value (epoch micros) places a document in a window. Windowing
@@ -57,7 +57,7 @@ pub struct TimeWindowing {
     /// so event-time queries can prune ingest-time windows. `None` = no event-time zone-map.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_time_field: Option<String>,
-    /// Cold-tiering policy (task-80): the number of most-recent windows to keep **hot** (on local
+    /// Cold-tiering policy: the number of most-recent windows to keep **hot** (on local
     /// NVMe). Older windows are eligible for **parking** to object storage. `None` = keep every
     /// window hot (no parking).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -81,7 +81,7 @@ impl TimeWindowing {
         self
     }
 
-    /// Keep the `n` most-recent windows hot; older ones are parkable (task-80 cold-tiering).
+    /// Keep the `n` most-recent windows hot; older ones are parkable (cold-tiering).
     pub fn with_hot_windows(mut self, n: usize) -> Self {
         self.hot_windows = Some(n);
         self
@@ -123,7 +123,7 @@ impl TimeWindowing {
         (lo.map(|t| self.window_of(t)), hi.map(|t| self.window_of(t)))
     }
 
-    /// Which windows a `query` must touch (task-81 pruning): those whose **ingest-window** id
+    /// Which windows a `query` must touch (pruning): those whose **ingest-window** id
     /// overlaps the query's range on [`field`](Self::field) **and** whose **event-time zone-map**
     /// overlaps the query's range on `event_time_field`. `windows` is `(window-id, zone-map)` from
     /// the registry; a window with **no** zone-map (`None`) is conservatively always included. An
@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn a_format_declared_millis_window_field_buckets_in_micros() {
-        // task-116: the window field is an `epoch_ms` source column — its raw millis values must be
+        // The window field is an `epoch_ms` source column — its raw millis values must be
         // normalized to canonical micros before bucketing, so windows line up with the index/range
         // path (which also stores micros).
         let w = TimeWindowing::new("ingest", WindowGranularity::Daily).with_event_time("event");

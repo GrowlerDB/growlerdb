@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Source→index convergence check (task-187): assert GrowlerDB matches Iceberg.
+"""Source→index convergence check: assert GrowlerDB matches Iceberg.
 
 At steady state (after ingest drains) two things must hold:
   1. Count convergence — the index's live doc count == the source's DISTINCT-id count.
@@ -7,21 +7,21 @@ At steady state (after ingest drains) two things must hold:
      row.
 
 Why DISTINCT, not raw rows: GrowlerDB collapses duplicate PKs last-write-wins, so raw source rows
-exceed index docs whenever the source has duplicate ids (exactly what the 2026-07-04 validation hit
-via an OOM-restarted generator re-emitting its id sequence). Comparing to the raw `total-records`
-metric is therefore *dup-fooled*; the authoritative target is `COUNT(DISTINCT id)`, queried from
-Trino over the same Iceberg table. (This mirrors the k8s drain gate
-`deploy/k8s/streaming/convergence-gate.sh`, which uses spark-sql for the same distinct count; this
-script adds the sample+hydrate integrity check and the staged-protocol JSON verdict.)
+exceed index docs whenever the source has duplicate ids (e.g. an OOM-restarted generator re-emitting
+its id sequence). Comparing to the raw `total-records` metric is therefore *dup-fooled*; the
+authoritative target is `COUNT(DISTINCT id)`, queried from Trino over the same Iceberg table. (This
+mirrors the k8s drain gate `deploy/k8s/streaming/convergence-gate.sh`, which uses spark-sql for the
+same distinct count; this script adds the sample+hydrate integrity check and the staged-protocol
+JSON verdict.)
 
 Index doc count = the gateway's match-all `total` (what search actually serves), i.e. GrowlerDB's
-own live count — no dependency on the external scale-test exporter. `growlerdb_index_docs` (native,
-task-187) drives the live convergence graph; this point check reads `total` directly.
+own live count — no dependency on the external scale-test exporter. `growlerdb_index_docs` (native)
+drives the live convergence graph; this point check reads `total` directly.
 
 Runs from a kubectl-capable host: gateway via GATEWAY_URL (port-forward or in-cluster), Trino via
-`kubectl exec deploy/trino`. Exits non-zero on failure so it gates the staged protocol (task-185).
-Set TRINO=0 to fall back to the raw `growlerdb_source_records` metric (clearly flagged dup-UNSAFE)
-when Trino isn't deployed.
+`kubectl exec deploy/trino`. Exits non-zero on failure so it gates the staged protocol. Set TRINO=0
+to fall back to the raw `growlerdb_source_records` metric (clearly flagged dup-UNSAFE) when Trino
+isn't deployed.
 """
 import json, os, subprocess, urllib.parse, urllib.request
 

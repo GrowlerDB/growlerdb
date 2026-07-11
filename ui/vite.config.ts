@@ -3,7 +3,7 @@ import { defineConfig } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 
 // The SPA is served at the Engine's root, so assets resolve from `/`. Build → `dist/`,
-// which the Engine serves (task-45).
+// which the Engine serves.
 export default defineConfig({
   plugins: [svelte()],
   base: '/',

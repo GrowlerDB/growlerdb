@@ -1,12 +1,12 @@
-//! Positional parquet **point reads** for hydration pass 1 (task-184, D30 foundations —
+//! Positional parquet **point reads** for hydration pass 1 (the layered locator —
 //! `okf/system/decisions/d30-layered-locator.md`).
 //!
-//! Resolving a `(file, row_position)` locator used to stream the data file's Arrow reader from
-//! row 0, decoding every batch until it passed `max(row_position)` — for a late row in a large
-//! file that decoded nearly the whole file per lookup batch (the D30 design-review blocker: no
-//! point-read machinery existed). Instead, one parquet **footer metadata** read per file uses the
-//! per-row-group row counts to identify the row group(s) holding the requested positions, and the
-//! Arrow reader is scoped with `with_row_groups` + a [`RowSelection`] that skips to the exact
+//! Resolving a `(file, row_position)` locator by streaming the data file's Arrow reader from
+//! row 0 would decode every batch until it passed `max(row_position)` — for a late row in a large
+//! file that decodes nearly the whole file per lookup batch. Instead, one parquet **footer
+//! metadata** read per file uses the per-row-group row counts to identify the row group(s) holding
+//! the requested positions, and the Arrow reader is scoped with `with_row_groups` + a
+//! [`RowSelection`] that skips to the exact
 //! rows. IO and decode are bounded by the touched row groups (and, where the writer emitted an
 //! offset index, the touched pages — the iceberg [`ArrowFileReader`] preloads offset indexes),
 //! not by the file prefix. All columns are projected — hydration returns the full row; the win is

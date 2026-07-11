@@ -24,8 +24,8 @@ import java.util.Set;
  *   <li>{@code INSERT} / {@code UPDATE_AFTER} → upsert (key + fields + locator);
  *   <li>{@code DELETE} / {@code UPDATE_BEFORE} → delete by key;
  *   <li>rows from a {@code replace}/compaction snapshot → <b>skipped</b> (a layout
- *       change, not content) — locators self-heal via verify-and-fall-back
- *       (task-17), so they must not be read as a flood of delete+insert.
+ *       change, not content) — locators self-heal via verify-and-fall-back,
+ *       so they must not be read as a flood of delete+insert.
  * </ul>
  *
  * Rows are processed in commit order by {@code _change_ordinal} (Iceberg assigns it
@@ -56,8 +56,8 @@ public final class ChangelogMapper {
   /**
    * Reduce a changelog window to the effective batch to commit, stamped with the {@code from}
    * checkpoint it resumes from (the window's prior checkpoint, exclusive; {@code null} = from the
-   * start). The Node's continuity guard (task-194) uses {@code from} to refuse a batch that doesn't
-   * pick up exactly where the shard left off.
+   * start). The Node's continuity guard uses {@code from} to refuse a batch that doesn't pick up
+   * exactly where the shard left off.
    */
   public DocBatch toBatch(
       List<ChangelogRow> rows,
@@ -70,8 +70,8 @@ public final class ChangelogMapper {
   /**
    * Reduce a changelog window, additionally stamped with the connector's {@code safeCheckpoint}
    * resume floor (the min committed checkpoint across shards this trigger resumed from; {@code null}
-   * = none yet). The Node prunes idempotency records at/below it — those batches can never be re-sent
-   * (task-204). The floor is the same for every sub-batch of a trigger (unlike {@code from}, which is
+   * = none yet). The Node prunes idempotency records at/below it — those batches can never be
+   * re-sent. The floor is the same for every sub-batch of a trigger (unlike {@code from}, which is
    * this window's start), and always {@code <=} every shard's checkpoint, so pruning stays sound.
    */
   public DocBatch toBatch(

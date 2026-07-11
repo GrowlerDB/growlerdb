@@ -1,7 +1,7 @@
 //! The Node **Write** gRPC service ([Design 06]) — the Rust side of the JVM↔Rust
 //! ingestion boundary. Adapts the in-process [`IndexWriter`] (stage/commit +
-//! `DocOp`, task-59) to the wire `Write` service (task-60 proto), so the Spark
-//! changelog connector (task-11) can apply batches to a shard over gRPC.
+//! `DocOp`) to the wire `Write` service, so the Spark
+//! changelog connector can apply batches to a shard over gRPC.
 //!
 //! [Design 06]: ../../../design/06-service-architecture.md
 
@@ -17,17 +17,17 @@ use tonic::{Code, Request, Response, Status};
 use crate::fence::ReindexFence;
 use crate::shard_handle::ShardHandle;
 
-/// Max decoded size of an inbound `Write` request (task-113). The ingestion connector commits a
+/// Max decoded size of an inbound `Write` request. The ingestion connector commits a
 /// whole changelog window in one request, so a catch-up after downtime — or an initial backfill of
 /// an existing table — can far exceed tonic's default **4 MiB** decode cap (which surfaces as
 /// `OUT_OF_RANGE: decoded message length too large` and kills the streaming query). 256 MiB is a
 /// generous safety margin; the durable fix is to **bound the per-commit window** in the connector so
-/// a single batch can't grow without limit (the rest of task-113).
+/// a single batch can't grow without limit.
 const MAX_WRITE_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 
 /// Map an index [`StoreError`](growlerdb_index::StoreError) from a commit to a gRPC status. A
 /// [`CheckpointGap`](growlerdb_index::StoreError::CheckpointGap) is a **non-retryable**
-/// `FAILED_PRECONDITION` (task-194): the batch doesn't continue from the shard's checkpoint, so the
+/// `FAILED_PRECONDITION`: the batch doesn't continue from the shard's checkpoint, so the
 /// connector must resolve the discontinuity (reindex/reconcile) rather than retry the same batch.
 /// Everything else is an internal failure.
 fn store_error_to_status(e: growlerdb_index::StoreError) -> Status {
@@ -48,19 +48,19 @@ fn store_error_to_status(e: growlerdb_index::StoreError) -> Status {
 pub struct WriteService {
     shard: ShardHandle,
     /// The index this node serves — used only to label the ingestion-throughput metric so the
-    /// console can chart per-index throughput (task-136).
+    /// console can chart per-index throughput.
     index_name: String,
     inflight: Arc<tokio::sync::Semaphore>,
     /// The admission ceiling (`inflight`'s initial permits) — kept so the write-queue-depth gauge can
-    /// report in-flight commits (`max_inflight - available_permits`) as a backpressure signal (task-233).
+    /// report in-flight commits (`max_inflight - available_permits`) as a backpressure signal.
     max_inflight: usize,
-    /// Shared reindex write-fence (task-71): while a reindex rebuilds, writes are rejected with a
+    /// Shared reindex write-fence: while a reindex rebuilds, writes are rejected with a
     /// retryable status so the connector can't advance the shard past the rebuild snapshot (a
     /// delta the swap would drop). Default-open; wired to the Admin service via [`with_fence`].
     ///
     /// [`with_fence`]: Self::with_fence
     fence: ReindexFence,
-    /// Set when the node booted against a **recreated source** (task-114): the source table's
+    /// Set when the node booted against a **recreated source**: the source table's
     /// `table-uuid` no longer matches the one this index was built from, so the index is stale.
     /// Writes and checkpoint reads are then refused with a non-retryable `FAILED_PRECONDITION`
     /// (`SOURCE_RECREATED`) — so the connector stops advancing a stale index and the control-plane
@@ -90,13 +90,13 @@ impl WriteService {
     }
 
     /// Share the reindex [`ReindexFence`] with this service so writes are rejected while a reindex
-    /// is in progress (task-71). Wire the same fence into the Admin service's `with_source`.
+    /// is in progress. Wire the same fence into the Admin service's `with_source`.
     pub fn with_fence(mut self, fence: ReindexFence) -> Self {
         self.fence = fence;
         self
     }
 
-    /// Mark this node as serving a **stale index over a recreated source** (task-114): writes and
+    /// Mark this node as serving a **stale index over a recreated source**: writes and
     /// checkpoint reads are refused so the index can't advance and the drift is surfaced. Set at
     /// serve startup when the recorded source `table-uuid` doesn't match the live table.
     pub fn with_source_recreated(mut self, recreated: bool) -> Self {
@@ -116,7 +116,7 @@ impl WriteService {
     }
 
     /// Wrap as a mountable tonic [`WriteServer`], raising the inbound decode cap to
-    /// [`MAX_WRITE_MESSAGE_BYTES`] so large catch-up/backfill commits aren't rejected (task-113).
+    /// [`MAX_WRITE_MESSAGE_BYTES`] so large catch-up/backfill commits aren't rejected.
     pub fn into_server(self) -> WriteServer<Self> {
         WriteServer::new(self).max_decoding_message_size(MAX_WRITE_MESSAGE_BYTES)
     }
@@ -140,12 +140,12 @@ impl Write for WriteService {
         &self,
         request: Request<WriteRequest>,
     ) -> Result<Response<WriteResponse>, Status> {
-        // Recreated-source guard (task-114): refuse to advance a stale index — non-retryable, so
+        // Recreated-source guard: refuse to advance a stale index — non-retryable, so
         // the connector stops rather than retrying forever (it must reindex).
         if self.source_recreated {
             return Err(Self::source_recreated_status());
         }
-        // Reindex fence (task-71): reject writes while a reindex rebuilds, with a retryable
+        // Reindex fence: reject writes while a reindex rebuilds, with a retryable
         // status, so the connector can't advance the shard past the rebuild snapshot (the swap
         // would drop that delta and regress the checkpoint). The connector retries and resumes
         // once the reindex completes.
@@ -161,7 +161,7 @@ impl Write for WriteService {
 
         // Admission control: refuse rather than queue when saturated.
         let permit = self.admit()?;
-        // Backpressure signal (task-233): in-flight commits after admitting this write. It pins at
+        // Backpressure signal: in-flight commits after admitting this write. It pins at
         // max_inflight when the connector out-runs the commit path — at which point further writes get
         // RESOURCE_EXHAUSTED (visible as the connector's write_retries), so lag climbs. Sampled here on
         // each admitted write (a streaming workload writes continuously).
@@ -192,7 +192,7 @@ impl Write for WriteService {
         let shard = self.shard.current();
         let started = std::time::Instant::now();
         let snapshot = tokio::task::spawn_blocking(move || {
-            // Hold the admission permit for the TRUE duration of the blocking commit (task-194).
+            // Hold the admission permit for the TRUE duration of the blocking commit.
             // `spawn_blocking` tasks can't be cancelled, so when a client gives up (its deadline
             // fires and tonic drops this handler future), the commit keeps running. Moving the permit
             // in — rather than leaving it on the dropped future's frame, where it releases early —
@@ -206,7 +206,7 @@ impl Write for WriteService {
         .await
         .map_err(|e| to_status(Code::Internal, WireError::new("INTERNAL", e.to_string())))?
         .map_err(store_error_to_status)?;
-        // Ingestion throughput + write-latency SLIs (task-39/136/233): committed doc-ops per write and
+        // Ingestion throughput + write-latency SLIs: committed doc-ops per write and
         // the wall-clock stage+commit time, both labelled by index — the latency localizes an ingest
         // ceiling to the commit path when node CPU stays flat.
         growlerdb_telemetry::sli::ingested_docs(&self.index_name, ops);
@@ -221,7 +221,7 @@ impl Write for WriteService {
         &self,
         _request: Request<GetCheckpointRequest>,
     ) -> Result<Response<GetCheckpointResponse>, Status> {
-        // Recreated-source guard (task-114): a stale index must not hand back a resume point — the
+        // Recreated-source guard: a stale index must not hand back a resume point — the
         // `FAILED_PRECONDITION` both stops the connector and lets the control-plane render the shard
         // `source_recreated` (distinct from a transport-level `unreachable`).
         if self.source_recreated {
@@ -358,7 +358,7 @@ mod tests {
         use growlerdb_core::{CompositeKey, Document, LocatedDoc, SourceCheckpoint, Value};
 
         let tmp = tempfile::tempdir().unwrap();
-        // A node booted against a recreated source (task-114) serves DEGRADED: writes and checkpoint
+        // A node booted against a recreated source serves DEGRADED: writes and checkpoint
         // reads are refused with FAILED_PRECONDITION (non-retryable — the connector must reindex,
         // and the control-plane renders the shard `source_recreated`, not `unreachable`).
         let svc = WriteService::new(shard(tmp.path()), "docs", 4).with_source_recreated(true);

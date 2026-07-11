@@ -1,5 +1,5 @@
-// UI preferences (task-91 theme; task-93 accent + density): the design-system knobs, persisted and
-// mirrored onto <html> as `data-theme` / `data-accent` / `data-density`. The stylesheet is entirely
+// UI preferences (theme, accent, density): the design-system knobs, persisted and mirrored onto
+// <html> as `data-theme` / `data-accent` / `data-density`. The stylesheet is entirely
 // variable-driven, so a preference is just a data-attribute flip. Theme defaults to the OS
 // `prefers-color-scheme`; accent + density have fixed defaults. An explicit choice is remembered in
 // localStorage and wins afterwards.

@@ -135,7 +135,7 @@ jobs:
           command: check licenses bans
 
   # Console gate (Svelte SPA under ui/): type-check + unit tests + production build, then a
-  # Playwright E2E pass (task-92). The E2E is fully mocked at the network layer (e2e/mocks.ts),
+  # Playwright E2E pass. The E2E is fully mocked at the network layer (e2e/mocks.ts),
   # so it needs no live Engine/stack — fast and deterministic. Node-only: setup-node instead of
   # the root mise toolchain so this job doesn't pull Rust/protoc it never uses.
   ui:
@@ -226,8 +226,8 @@ jobs:
           docker image prune -f || true
           docker builder prune -f || true
 
-  # Non-Rust lint gates (task-158): spelling, shell, workflows, YAML, Markdown — on every PR/push.
-  # Rust fmt + clippy are in build-test. One job (sequential steps) to avoid hogging the 3 self-hosted
+  # Non-Rust lint gates: spelling, shell, workflows, YAML, Markdown — on every PR/push.
+  # Rust fmt + clippy are in build-test. One job (sequential steps) to avoid hogging the self-hosted
   # runners; linters are installed pinned in-job (no third-party lint actions to trust). Fast (~1 min),
   # so it runs unconditionally — a docs-only PR still gets linted.
   lint:

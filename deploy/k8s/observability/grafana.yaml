@@ -1,4 +1,4 @@
-# Grafana + a labeled "GrowlerDB Scale Test" dashboard for the test cluster (task-183). The console's
+# Grafana + a labeled "GrowlerDB Scale Test" dashboard for the test cluster. The console's
 # baked SLI panels lack units/labels and omit the source-side + size metrics; this gives clearly
 # titled panels: ingest-into-Iceberg vs index-into-GrowlerDB (records/s + bytes/s), source & index
 # size, source→index lag, query vs hydration latency, stale-locator refresh rate, data-files +
@@ -15,7 +15,7 @@ data:
         access: proxy
         url: http://prometheus:9090
         isDefault: true
-      # Logs (task-234) — so pod logs are queryable in the same Grafana as the metrics, and a
+      # Logs — so pod logs are queryable in the same Grafana as the metrics, and a
       # write-latency spike can be correlated with the node/connector log line that explains it.
       - name: Loki
         type: loki
@@ -61,10 +61,10 @@ data:
         {"id":22,"title":"Stability — pod restarts","type":"timeseries","gridPos":{"h":7,"w":12,"x":0,"y":56},"fieldConfig":{"defaults":{"unit":"short"}},"targets":[{"expr":"max by(pod)(kube_pod_container_status_restarts_total{namespace=\"growlerdb\"})","legendFormat":"{{pod}}"}]},
         {"id":23,"title":"Stability — OOMKilled containers","type":"timeseries","gridPos":{"h":7,"w":12,"x":12,"y":56},"fieldConfig":{"defaults":{"unit":"short"}},"targets":[{"expr":"sum by(pod)(kube_pod_container_status_last_terminated_reason{namespace=\"growlerdb\",reason=\"OOMKilled\"})","legendFormat":"{{pod}}"}]},
         {"id":24,"title":"Index size breakdown — stacked (term/postings/positions/fieldnorms=search / fast=cache / store / locator=lookup)","type":"timeseries","gridPos":{"h":8,"w":24,"x":0,"y":63},"fieldConfig":{"defaults":{"unit":"bytes","custom":{"stacking":{"mode":"normal"},"fillOpacity":30}}},"targets":[{"expr":"sum by(component)(growlerdb_index_bytes_component)","legendFormat":"{{component}}"}]},
-        {"id":25,"title":"Write latency (commit) — p50/95/99 [task-233: localizes an ingest ceiling to the commit path]","type":"timeseries","gridPos":{"h":7,"w":12,"x":0,"y":71},"fieldConfig":{"defaults":{"unit":"s"}},"targets":[{"expr":"histogram_quantile(0.50,sum(rate(growlerdb_write_duration_seconds_bucket[2m]))by(le))","legendFormat":"p50"},{"expr":"histogram_quantile(0.95,sum(rate(growlerdb_write_duration_seconds_bucket[2m]))by(le))","legendFormat":"p95"},{"expr":"histogram_quantile(0.99,sum(rate(growlerdb_write_duration_seconds_bucket[2m]))by(le))","legendFormat":"p99"}]},
+        {"id":25,"title":"Write latency (commit) — p50/95/99","type":"timeseries","gridPos":{"h":7,"w":12,"x":0,"y":71},"fieldConfig":{"defaults":{"unit":"s"}},"targets":[{"expr":"histogram_quantile(0.50,sum(rate(growlerdb_write_duration_seconds_bucket[2m]))by(le))","legendFormat":"p50"},{"expr":"histogram_quantile(0.95,sum(rate(growlerdb_write_duration_seconds_bucket[2m]))by(le))","legendFormat":"p95"},{"expr":"histogram_quantile(0.99,sum(rate(growlerdb_write_duration_seconds_bucket[2m]))by(le))","legendFormat":"p99"}]},
         {"id":26,"title":"Write queue depth (in-flight commits) — node-side backpressure","type":"timeseries","gridPos":{"h":7,"w":12,"x":12,"y":71},"fieldConfig":{"defaults":{"unit":"short"}},"targets":[{"expr":"max by(pod)(growlerdb_write_queue_depth)","legendFormat":"{{pod}}"}]},
         {"id":27,"title":"Connector — rows read/s vs write-retries/s (ingest source rate vs backpressure)","type":"timeseries","gridPos":{"h":7,"w":24,"x":0,"y":78},"fieldConfig":{"defaults":{"unit":"ops"}},"targets":[{"expr":"sum(rate(growlerdb_connector_rows_read_total[2m]))","legendFormat":"rows read/s"},{"expr":"sum(rate(growlerdb_connector_write_retries_total[2m]))","legendFormat":"write-retries/s (backpressure)"}]},
-        {"id":28,"title":"Write latency BY PHASE — p95 (apply / location_sync / tantivy_commit / redb) [task-233/237: which phase eats the commit]","type":"timeseries","gridPos":{"h":7,"w":24,"x":0,"y":85},"fieldConfig":{"defaults":{"unit":"s"}},"targets":[{"expr":"histogram_quantile(0.95,sum by(phase,le)(rate(growlerdb_write_phase_duration_seconds_bucket[2m])))","legendFormat":"{{phase}} p95"}]}
+        {"id":28,"title":"Write latency BY PHASE — p95 (apply / location_sync / tantivy_commit / redb)","type":"timeseries","gridPos":{"h":7,"w":24,"x":0,"y":85},"fieldConfig":{"defaults":{"unit":"s"}},"targets":[{"expr":"histogram_quantile(0.95,sum by(phase,le)(rate(growlerdb_write_phase_duration_seconds_bucket[2m])))","legendFormat":"{{phase}} p95"}]}
       ]
     }
 ---

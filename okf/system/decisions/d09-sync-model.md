@@ -18,7 +18,7 @@ one mechanism that both **detects and repairs** silently lost/orphaned rows *reg
 it complements the ingest-path guards ([D31](/system/decisions/d31-ingest-loss-guards.md)) that catch
 the specific under-read class.
 
-Reconcile is **shard-scoped** (task-195): the caller restricts the comparison to the keys a shard
+Reconcile is **shard-scoped**: the caller restricts the comparison to the keys a shard
 owns, via the same registry-vended virtual-bucket map + shard ordinal the gateway and connector route
 by (`ShardRouter::owns`). Without that, running reconcile against one shard of a sharded index would
 re-index the other shards' keys into it, destroying placement — so the whole-table, single-shard form
@@ -38,7 +38,7 @@ that cycle (the always-safe missing-repair still runs) and the next reconcile re
 is momentarily quiescent. Missing-repair is unconditional; only the delete is fenced this way.
 
 **Count-gate (scale).** Reading the whole source every cycle is O(table) — infeasible at 100 TB.
-Reconcile is **count-gated** so the in-sync common case reads no rows (task-198): (1) a **whole-index
+Reconcile is **count-gated** so the in-sync common case reads no rows: (1) a **whole-index
 gate** — the cluster driver first probes each shard `count_only`, and if Σ index docs == the source
 table's `total-records` (a metadata read), the index is in sync and the row-level reconcile is skipped
 entirely (routing-agnostic); (2) a **per-partition gate** — when the source is cleanly

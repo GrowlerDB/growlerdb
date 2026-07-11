@@ -11,11 +11,10 @@ import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 /**
- * task-85 fixture generator: produce a table that genuinely carries an Iceberg
- * <b>merge-on-read positional delete file</b> in its history — the shape needed to settle whether
- * iceberg-rust 0.9.1 mis-reads a delete-in-history source. pyiceberg can't make one (copy-on-write
- * rewrites data files; {@code inspect.files()} shows zero delete files), which is why the earlier
- * pyiceberg fixture could not exercise the delete path at all.
+ * Fixture generator: produce a table that genuinely carries an Iceberg <b>merge-on-read positional
+ * delete file</b> in its history — the shape needed to settle whether iceberg-rust 0.9.1 mis-reads
+ * a delete-in-history source. pyiceberg can't make one (copy-on-write rewrites data files;
+ * {@code inspect.files()} shows zero delete files), so it cannot exercise the delete path at all.
  *
  * <p>Two findings this generator establishes:
  * <ol>

@@ -18,8 +18,7 @@ The automated gates a change passes before merge — the quality process encoded
 - **Lint** — typos, shellcheck, actionlint, yamllint, markdownlint (repo-wide); the console adds
   eslint + prettier + `svelte-check`.
 - **UI** — eslint, prettier, svelte-check, unit tests (all four also in local `just check` via
-  `ui-check`, task-218 fix — the recipe used to skip eslint/prettier, letting CI catch what the
-  local gate missed), plus build + mocked Playwright E2E (CI-only: they need the browser toolchain).
+  `ui-check`), plus build + mocked Playwright E2E (CI-only: they need the browser toolchain).
 - **E2E** — the walking-skeleton (index → search → hydrate) against the real Compose stack.
 - **License/supply-chain** — cargo-deny (licenses, advisories, bans).
 
@@ -27,8 +26,8 @@ The automated gates a change passes before merge — the quality process encoded
 
 Jobs are **path-filtered** (a docs-only PR doesn't compile Rust; the lint job runs unconditionally).
 Runners split by trust ([D34](/system/decisions/d34-runner-safety.md)): **`pull_request` runs on
-GitHub-hosted** runners, while **`push` (main) and nightly run on the home-lab self-hosted** runners
-(sccache, persistent disk) — so untrusted fork-PR code never touches the home lab, and an org policy
+GitHub-hosted** runners, while **`push` (main) and nightly run on the self-hosted** runners
+(sccache, persistent disk) — so untrusted fork-PR code never touches the self-hosted runners, and an org policy
 requires maintainer approval for any outside collaborator's run. The full E2E + Spark integration run
 nightly. See [CLI](/system/build.md) for `just check` (the local mirror).
 

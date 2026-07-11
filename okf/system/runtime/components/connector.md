@@ -26,7 +26,7 @@ batches to the [nodes](/system/runtime/components/node.md)' Write gRPC services 
 
 ## Responsibilities
 
-- **Stream** the changelog read→map→commit in bounded chunks (task-203): pull one partition at a time
+- **Stream** the changelog read→map→commit in bounded chunks: pull one partition at a time
   (`toLocalIterator`) and flush a sub-batch capped at `maxCommitRows`, cut only at snapshot boundaries,
   so driver memory is **O(chunk), not O(window)** — a large post-outage backlog no longer OOMs the
   driver (was `collectAsList` of the whole window → exit 52). The per-trigger under-read gate

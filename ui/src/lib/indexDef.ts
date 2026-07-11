@@ -1,10 +1,10 @@
-// Build an index-definition YAML from the create-form inputs (task-47). Kept pure + tested so
-// the form just collects choices. The Control Plane resolves this against the source schema and
-// hard-blocks D23-violating cached fields (the create error surfaces inline).
+// Build an index-definition YAML from the create-form inputs. Kept pure + tested so the form just
+// collects choices. The Control Plane resolves this against the source schema and hard-blocks
+// cached fields that policy forbids (the create error surfaces inline).
 import type { SourceField } from './api';
 
 /** Map a coarse source type to a default GrowlerDB field type, or `null` if it can't be indexed
- *  in the M0 subset (binary/other → hydrate-only). Strings default to TEXT (full-text). */
+ *  (binary/other → hydrate-only). Strings default to TEXT (full-text). */
 export function defaultFieldType(sourceType: string): string | null {
   switch (sourceType) {
     case 'string':
@@ -22,9 +22,9 @@ export function defaultFieldType(sourceType: string): string | null {
   }
 }
 
-/** Timestamp source `format` choices (task-112). Declaring one on a field forces it to a DATE
- *  column — even an integer/string epoch — so it surfaces in `time_fields` and enables the
- *  Search time filter (task-132). The `value` is the `TimeFormat` serde alias the backend parses. */
+/** Timestamp source `format` choices. Declaring one on a field forces it to a DATE column — even
+ *  an integer/string epoch — so it surfaces in `time_fields` and enables the Search time filter.
+ *  The `value` is the `TimeFormat` serde alias the backend parses. */
 export const TIME_FORMATS: ReadonlyArray<{ value: string; label: string }> = [
   { value: 'epoch_s', label: 'Unix seconds' },
   { value: 'epoch_ms', label: 'Unix milliseconds' },
@@ -47,7 +47,7 @@ export const WINDOW_GRANULARITIES: ReadonlyArray<{ value: string; label: string 
   { value: 'weekly', label: 'Weekly' },
 ];
 
-/** Time-window routing config (task-81/132). The ingest-time `field` is the declared `timeField`;
+/** Time-window routing config. The ingest-time `field` is the declared `timeField`;
  *  `eventTimeField` (optional) keeps a per-window zone-map so event-time queries prune windows;
  *  `hotWindows` (optional) is the cold-tiering policy (most-recent N windows kept hot). */
 export interface WindowingInput {
@@ -62,11 +62,11 @@ export interface DefinitionInput {
   selection: 'ALL' | 'EXPLICIT';
   /** For EXPLICIT: the chosen source fields (their default GrowlerDB type is derived). */
   fields: SourceField[];
-  /** Optional: a column to map as a DATE timestamp (task-112/132). Emitted as a `format`+`fast`
-   *  override so it becomes a time field regardless of its source Arrow type. */
+  /** Optional: a column to map as a DATE timestamp. Emitted as a `format`+`fast` override so it
+   *  becomes a time field regardless of its source Arrow type. */
   timeField?: TimeFieldInput | null;
-  /** Optional: time-window routing (task-81/132). Ignored unless `timeField` is also set — the
-   *  window field is the declared `timeField`. */
+  /** Optional: time-window routing. Ignored unless `timeField` is also set — the window field is
+   *  the declared `timeField`. */
   windowing?: WindowingInput | null;
 }
 

@@ -1,4 +1,4 @@
-//! A **bounded byte-range cache** for read-through cold-window serving (task-80). Wraps the ranged
+//! A **bounded byte-range cache** for read-through cold-window serving. Wraps the ranged
 //! object-store reads an [`ObjectDirectory`](crate::ObjectDirectory) makes so repeated reads — the
 //! term dictionary, the same postings, structural metadata — stay local instead of re-fetching from
 //! object storage. The "warm" behaviour is emergent: query a cold window once and the bytes it
@@ -65,7 +65,7 @@ impl ByteLru {
     }
 }
 
-/// A snapshot of cache activity (task-80 metrics).
+/// A snapshot of cache activity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub struct CacheStats {
     /// Range reads served from the cache.
@@ -76,7 +76,7 @@ pub struct CacheStats {
     pub fetched_bytes: u64,
     /// Bytes currently held in the cache.
     pub cached_bytes: u64,
-    /// Ranges dropped on insert because a single range exceeded the whole cache cap (task-150 / B7):
+    /// Ranges dropped on insert because a single range exceeded the whole cache cap:
     /// such a range is re-fetched cold on *every* read, so a non-zero count signals an undersized
     /// cache relative to the segment size, not a normal miss.
     pub oversize_drops: u64,
@@ -121,7 +121,7 @@ impl RangeCache {
             .lock()
             .expect("range cache not poisoned")
             .get(&key);
-        // Prometheus counters for the cold-tier cache-hit rate (task-143). Emitted at the source
+        // Prometheus counters for the cold-tier cache-hit rate. Emitted at the source
         // (this node-wide LRU has no index in scope — a `tier` label suffices); the panel computes
         // hit% = rate(hits) / (rate(hits) + rate(misses)). No-op unless a metrics recorder is
         // installed, so the `growlerdb-index` crate needn't pull the telemetry facade — just the
@@ -145,7 +145,7 @@ impl RangeCache {
         let mut lru = self.0.lru.lock().expect("range cache not poisoned");
         if bytes.len() > lru.cap {
             // A single range bigger than the whole cache never fits → dropped, and re-fetched cold on
-            // every read. Count it (task-150 / B7) so this is distinguishable from a normal miss.
+            // every read. Count it so this is distinguishable from a normal miss.
             drop(lru);
             self.0.oversize_drops.fetch_add(1, Ordering::Relaxed);
             metrics::counter!("growlerdb_cold_cache_oversize_drops_total").increment(1);
@@ -155,7 +155,7 @@ impl RangeCache {
     }
 
     /// Snapshot every cached `(object-key, start, end, bytes)` currently held — used to build a
-    /// precomputed **hotcache** (task-83): warm a cold window through a fresh cache, then capture the
+    /// precomputed **hotcache**: warm a cold window through a fresh cache, then capture the
     /// exact ranges tantivy touched so a later cold open can preload them in one GET. Recency/counters
     /// are untouched (this is an out-of-band read for packaging, not a query).
     pub fn snapshot_entries(&self) -> Vec<(Arc<str>, u64, u64, OwnedBytes)> {
@@ -166,7 +166,7 @@ impl RangeCache {
             .collect()
     }
 
-    /// A snapshot of hit/miss/byte counters (task-80 metrics).
+    /// A snapshot of hit/miss/byte counters.
     pub fn stats(&self) -> CacheStats {
         CacheStats {
             hits: self.0.hits.load(Ordering::Relaxed),
@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn oversize_range_is_counted_not_cached() {
-        // task-150 / B7: a range bigger than the whole cache is dropped (re-fetched cold every read),
+        // A range bigger than the whole cache is dropped (re-fetched cold every read),
         // and counted distinctly from a normal miss.
         let cache = RangeCache::new(100);
         let obj: Arc<str> = Arc::from("file");

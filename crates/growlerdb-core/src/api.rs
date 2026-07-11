@@ -1,7 +1,7 @@
 //! The minimal in-process **Index API** ([Design 02]) — the seam that the write
 //! path (ingest) and read path (engine) depend on, with storage behind it.
 //!
-//! This is the M0 subset: a single in-process shard, no gRPC, no admin/compaction.
+//! A single in-process shard, no gRPC, no admin/compaction.
 //! The traits live here in `growlerdb-core` so the engine can be written against the
 //! seam while `growlerdb-index` provides the [`LocalIndexStore`] implementation. The
 //! vocabulary types ([`Snapshot`], [`RowLocator`], [`CommitBatch`], [`Hit`], …)
@@ -41,7 +41,7 @@ pub struct LocatedDoc {
 pub enum DocOp {
     /// Index (or replace) the document; carries its source location for the locator.
     Upsert(LocatedDoc),
-    /// Remove the document for this key (logical delete; see task-14).
+    /// Remove the document for this key (logical delete).
     Delete(CompositeKey),
 }
 
@@ -57,7 +57,7 @@ impl DocOp {
 }
 
 /// A batch to commit: a sequence of [`DocOp`]s + the checkpoint they bring the
-/// index to. The M0/M1 realization of [Design 02]'s `DocBatch` (the per-doc source
+/// index to. The realization of [Design 02]'s `DocBatch` (the per-doc source
 /// location is passed explicitly rather than derived during indexing).
 ///
 /// [Design 02]: ../../../design/02-index-api.md
@@ -70,15 +70,15 @@ pub struct CommitBatch {
     /// Opaque batch id, for idempotent retries.
     pub batch_id: String,
     /// The source position this batch resumes **from** (the prior checkpoint, exclusive); `None` =
-    /// from the start of the changelog. The write path's continuity guard (task-194) refuses a batch
+    /// from the start of the changelog. The write path's continuity guard refuses a batch
     /// whose `from` doesn't equal the shard's current checkpoint, so a checkpoint can't advance over
     /// unapplied data. Defaults to `None` (unguarded) for callers that don't drive resumable ingest.
     pub from_checkpoint: Option<SourceCheckpoint>,
     /// The connector's **resume floor**: the position it would restart the changelog read from (the
     /// min committed checkpoint across all shards). The connector never resumes before it and reads
     /// the changelog from it *exclusive*, so a batch at or below it can never be re-sent — the write
-    /// path prunes the idempotency records (`batch_id`s) for those batches to bound the local store
-    /// (task-204). `None` = no floor yet, so nothing is pruned. Unlike [`from_checkpoint`] (this
+    /// path prunes the idempotency records (`batch_id`s) for those batches to bound the local store.
+    /// `None` = no floor yet, so nothing is pruned. Unlike [`from_checkpoint`] (this
     /// window's start, per sub-batch), the floor is identical across a trigger's sub-batches.
     ///
     /// [`from_checkpoint`]: Self::from_checkpoint
@@ -97,7 +97,7 @@ impl CommitBatch {
         }
     }
 
-    /// Set the `from` checkpoint this batch resumes from (task-194 continuity guard). Builder-style
+    /// Set the `from` checkpoint this batch resumes from (continuity guard). Builder-style
     /// so the common non-resumable callers keep the two/three-arg constructors.
     pub fn with_from_checkpoint(mut self, from: Option<SourceCheckpoint>) -> Self {
         self.from_checkpoint = from;
@@ -105,7 +105,7 @@ impl CommitBatch {
     }
 
     /// Set the resume-floor [`safe_checkpoint`](Self::safe_checkpoint) that bounds the idempotency
-    /// store (task-204). Builder-style; defaults to `None` (prune nothing) for callers that don't
+    /// store. Builder-style; defaults to `None` (prune nothing) for callers that don't
     /// drive resumable ingest.
     pub fn with_safe_checkpoint(mut self, safe: Option<SourceCheckpoint>) -> Self {
         self.safe_checkpoint = safe;
@@ -143,7 +143,7 @@ impl CommitBatch {
 }
 
 /// A row's source coordinates: how to fetch the authoritative row for a key. An
-/// **in-memory** bridge between the index's layered locate (D30) and the source's
+/// **in-memory** bridge between the index's layered locate and the source's
 /// hydrate — never persisted or sent on the wire. Locators are best-effort: hydration
 /// verifies the row by key and falls back to a scan when the coordinates went stale
 /// (Iceberg rewrote the file). Anything key-derived (partition values, field names)
@@ -157,26 +157,24 @@ pub struct RowLocator {
 }
 
 /// One search hit: the document's **coordinates** (composite key) and BM25 score.
-/// Never carries sensitive/big-text fields ([D23]).
-///
-/// [D23]: ../../../wiki/21-decisions.md
+/// Never carries sensitive/big-text fields.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
     /// The document's composite key.
     pub key: CompositeKey,
     /// The BM25 score.
     pub score: f32,
-    /// **Cached** display-field values returned with the hit (D23) — the fields
+    /// **Cached** display-field values returned with the hit — the fields
     /// marked `cached`/stored in the index, so a page renders without hydration.
     /// Empty when the index caches no display fields.
     pub fields: std::collections::BTreeMap<String, Value>,
-    /// **Server-side highlights** (task-250): field name → matched fragments, populated only
+    /// **Server-side highlights**: field name → matched fragments, populated only
     /// when the search opted in ([`SearchParams::highlight`]). Reflects the analyzed match
     /// (stemming/positions), unlike a client-side literal-term marker. Empty otherwise.
     pub highlight: std::collections::BTreeMap<String, Vec<HighlightFragment>>,
 }
 
-/// One matched **fragment** of a highlighted field (task-250): an ordered run of
+/// One matched **fragment** of a highlighted field: an ordered run of
 /// [segments](HighlightSegment) — matched terms and their surrounding context. Carried as
 /// segments (not pre-marked HTML) so a client renders `<mark>` with no `innerHTML`/XSS.
 #[derive(Debug, Clone, PartialEq)]
@@ -195,7 +193,7 @@ pub struct HighlightSegment {
     pub marked: bool,
 }
 
-/// Server-side highlight options (task-250): which analyzed **TEXT** fields to snippet and the
+/// Server-side highlight options: which analyzed **TEXT** fields to snippet and the
 /// per-hit bounds. Set on [`SearchParams::highlight`] to opt in; unset ⇒ no highlights.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Highlight {
@@ -208,9 +206,9 @@ pub struct Highlight {
     pub fragment_size: usize,
 }
 
-/// Default max fragments returned per highlighted field (task-250) — a bounded payload.
+/// Default max fragments returned per highlighted field — a bounded payload.
 pub const DEFAULT_HIGHLIGHT_MAX_FRAGMENTS: usize = 3;
-/// Default approximate characters per highlight fragment (task-250) — the snippet window.
+/// Default approximate characters per highlight fragment — the snippet window.
 pub const DEFAULT_HIGHLIGHT_FRAGMENT_SIZE: usize = 150;
 
 impl Highlight {
@@ -259,12 +257,12 @@ impl Projection {
 pub struct HydratedRow {
     /// The composite key this row was fetched for.
     pub key: CompositeKey,
-    /// Projected column name → value (M0 supports scalar columns).
+    /// Projected column name → value (scalar columns).
     pub fields: std::collections::BTreeMap<String, Value>,
 }
 
-/// A search-support **aggregation** request over a fast field (task-24). The full
-/// six-kind set is Tantivy-backed; this is the M2 subset (terms + stats). Results
+/// A search-support **aggregation** request over a fast field. Tantivy-backed
+/// (terms + stats). Results
 /// come back as JSON (`serde_json::Value`) keyed by the request name. Externally tagged on
 /// the wire (`{"Terms": {"field": …, "size": …}}`), so the Engine API can carry an agg spec.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -285,7 +283,7 @@ pub enum Agg {
     ///
     /// Buckets are **UTC-only** at a *fixed* interval — Tantivy's `fixed_interval` histogram has
     /// no timezone or calendar (month/quarter) intervals and no `offset`/`min_doc_count`. A
-    /// client wanting local-time day boundaries must offset client-side. (Documented, task-75.)
+    /// client wanting local-time day boundaries must offset client-side.
     DateHistogram {
         /// The DATE fast field.
         field: String,
@@ -306,7 +304,7 @@ pub enum Agg {
     },
     /// Approximate **percentiles** of a numeric fast field. Backed by **DDSketch** (Tantivy
     /// 0.26.1) — a *relative-error* sketch (not t-digest) — so results are approximate; a
-    /// cross-shard merge unions the sketches (still approximate, correctly merged). (task-75)
+    /// cross-shard merge unions the sketches (still approximate, correctly merged).
     Percentiles {
         /// The numeric fast field.
         field: String,
@@ -325,7 +323,7 @@ pub struct AggRange {
     pub to: Option<f64>,
 }
 
-/// Validate an aggregation spec before it reaches Tantivy (task-75), so bad input is a clear
+/// Validate an aggregation spec before it reaches Tantivy, so bad input is a clear
 /// `InvalidArgument` rather than an opaque internal error. Currently checks `range` buckets:
 /// Tantivy requires each `[from, to)` to be well-formed and the list to be ascending and
 /// non-overlapping. Returns a human-readable message naming the offending aggregation.
@@ -365,7 +363,7 @@ pub enum SortOrder {
     Desc,
 }
 
-/// The reserved sort-key name for **relevance score** (task-66). Used as a [`Sort`]
+/// The reserved sort-key name for **relevance score**. Used as a [`Sort`]
 /// `field` it orders by BM25 `_score` instead of a fast field — alone (`[_score desc]`,
 /// the explicit form of the default) or among other keys (`rank desc, _score desc`).
 /// It is not a real field, so it is exempt from fast-field validation; because a score
@@ -374,13 +372,13 @@ pub enum SortOrder {
 pub const SCORE_SORT_KEY: &str = "_score";
 
 /// One key of a [sort](SearchParams::sort): a numeric/date fast field plus a
-/// direction (task-23). Multiple keys sort lexicographically — earlier keys
+/// direction. Multiple keys sort lexicographically — earlier keys
 /// dominate, later keys break ties. A trailing **composite-key** tiebreaker is
 /// applied implicitly so the resulting order is **total and deterministic** (the
 /// basis for stable paging / `search_after`).
 ///
 /// The field may be the reserved [`SCORE_SORT_KEY`] (`_score`) to sort by relevance
-/// (task-66) rather than a fast field.
+/// rather than a fast field.
 #[derive(Debug, Clone)]
 pub struct Sort {
     /// The fast field to sort by, or [`SCORE_SORT_KEY`] for relevance score.
@@ -402,7 +400,7 @@ pub fn sort_has_score(sort: &[Sort]) -> bool {
     sort.iter().any(Sort::is_score)
 }
 
-/// One sort key's value for a hit (task-23/66): the cell the store orders by and the
+/// One sort key's value for a hit: the cell the store orders by and the
 /// keyset cursor round-trips. Numeric/date keys are [`Num`](SortValue::Num) (DATE as
 /// epoch micros); KEYWORD keys are [`Str`](SortValue::Str); a doc lacking the field is
 /// [`Missing`](SortValue::Missing), which sorts **last**.
@@ -458,7 +456,7 @@ pub struct SearchAfter {
     pub key: CompositeKey,
 }
 
-/// One **collapsed group** ([field collapsing](SearchParams), task-23): the top hit
+/// One **collapsed group** ([field collapsing](SearchParams)): the top hit
 /// of a group of docs sharing the same value of the collapse field, plus that group's
 /// value and how many docs it holds.
 #[derive(Debug, Clone, PartialEq)]
@@ -470,7 +468,7 @@ pub struct CollapsedHit {
     /// Number of docs in this group (over the matched, live result set).
     pub count: usize,
     /// The top hit's [`SortValue`] for each sort key, aligned to the search sort. Carried so
-    /// a Gateway can fold and order collapse groups **across shards** (design/09, task-68) —
+    /// a Gateway can fold and order collapse groups **across shards** (design/09) —
     /// the same role `sort_values` plays for ordinary field-sorted hits.
     pub sort_values: Vec<SortValue>,
 }
@@ -493,7 +491,7 @@ pub struct SearchParams {
     /// Keyset cursor: return the page strictly after this point in the total order.
     /// When set, `offset` is ignored and `sort` must be non-empty.
     pub search_after: Option<SearchAfter>,
-    /// **Highlight** opt-in (task-250): when `Some`, each returned [`Hit`] carries per-field
+    /// **Highlight** opt-in: when `Some`, each returned [`Hit`] carries per-field
     /// [`highlight`](Hit::highlight) fragments of the analyzed match. `None` = no highlights
     /// (the default; highlighting is an extra per-hit cost).
     pub highlight: Option<Highlight>,
@@ -512,7 +510,7 @@ impl SearchParams {
         }
     }
 
-    /// Opt into [server-side highlighting](Highlight) (task-250) for this search.
+    /// Opt into [server-side highlighting](Highlight) for this search.
     pub fn with_highlight(mut self, highlight: Highlight) -> Self {
         self.highlight = Some(highlight);
         self
@@ -556,14 +554,13 @@ impl SearchParams {
     }
 }
 
-/// Per-shard search results (M0 subset): ranked hits + a total count. Aggregations
-/// and scan stats are merged by the engine in later milestones.
+/// Per-shard search results: ranked hits + a total count.
 #[derive(Debug, Clone, Default)]
 pub struct ShardHits {
     /// The ranked hits (this page).
     pub hits: Vec<Hit>,
     /// Total documents matching the query (the live match count), NOT the page size — so it
-    /// can exceed `hits.len()` and be summed across shards (task-68).
+    /// can exceed `hits.len()` and be summed across shards.
     pub total: usize,
 }
 

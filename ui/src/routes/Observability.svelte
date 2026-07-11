@@ -1,7 +1,6 @@
 <script lang="ts">
-  // Observability (task-208 redesign): one screen that answers the product questions
-  // (scale-test-plan.md — "Does GrowlerDB keep up with Iceberg?", "…match Iceberg?",
-  // "index:source size ratio?"). Organised into sub-tabs (Search · Runtime · Data · Ingestion ·
+  // One screen that answers the product questions ("Does GrowlerDB keep up with Iceberg?",
+  // "…match Iceberg?", "index:source size ratio?"). Organised into sub-tabs (Search · Runtime · Data · Ingestion ·
   // Source · Access) with Alerts as a persistent strip. Clean cards (value + sparkline) carry a ⓘ info
   // popover for self-serve help; a few "hero" ECharts overlays show the relationships sparklines
   // can't. Data comes from the /v1/stats Prometheus proxy + the /v1/ingestion control-plane feed.
@@ -973,7 +972,7 @@
             {@const state = worstState(idx.shards)}
             {@const lvl = badgeLevel(state)}
             {@const lag = worstLagMs(idx.shards)}
-            <!-- A windowed index is sharded by time window, not ordinal (task-226): its rows carry a
+            <!-- A windowed index is sharded by time window, not ordinal: its rows carry a
                  window id, so label + render them as windows. -->
             {@const windowed = idx.shards.some((s) => s.window > 0)}
             <li class="idx">
@@ -1298,7 +1297,7 @@
     font-size: 0.85em;
     text-align: right;
   }
-  /* Pill in its own fixed column so every row's status pill starts at the same x (task-208 QA). */
+  /* Pill in its own fixed column so every row's status pill starts at the same x. */
   .idx-state {
     justify-self: start;
   }

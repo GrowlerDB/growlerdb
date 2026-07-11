@@ -1,15 +1,13 @@
-//! The **Node client seam** ([task-30], M3 Phase B1): the [`Node`] trait is the Gateway's
+//! The **Node client seam**: the [`Node`] trait is the Gateway's
 //! view of one Node's query/admin surface, and [`LocalNode`] is the in-process
 //! implementation that delegates straight to this process's services (embedded mode);
 //! [`RemoteNode`] implements the same trait over a gRPC channel for distributed mode, so the
 //! [Gateway](crate::gateway::Gateway) routes through `dyn Node` without caring whether the Node is
 //! in-process or across the network.
 //!
-//! Scope is the surface the Engine API terminates today — search, suggest, hydrate
+//! Scope is the surface the Engine API terminates — search, suggest, hydrate
 //! (`get_by_key`), and `describe_index`. Writes go connector → Node `Write` gRPC directly
-//! (not through the Gateway), and PIT/export grow the trait in later slices.
-//!
-//! [task-30]: ../../../design/06-service-architecture.md
+//! (not through the Gateway).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,17 +29,16 @@ use tonic::{Request, Response, Status};
 
 use crate::{AdminService, LookupService, SearchService, SuggestService};
 
-/// Time to establish a TCP+HTTP/2 connection to a Node before giving up (task-72).
+/// Time to establish a TCP+HTTP/2 connection to a Node before giving up.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Per-request ceiling for a Node RPC — bounds a slow shard at the transport layer, under the
-/// Gateway's own scatter deadline (task-72).
+/// Gateway's own scatter deadline.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A Node's query/admin surface as the [Gateway](crate::gateway::Gateway) sees it:
 /// transport-agnostic RPCs (proto bodies in a tonic [`Request`] so auth metadata flows
 /// through unchanged). [`LocalNode`] implements it in-process; [`RemoteNode`] implements it over
-/// gRPC. Each call targets one Node — one shard in M2/M3-B1; cross-shard scatter-gather lands in the
-/// Gateway with task-29.
+/// gRPC. Each call targets one Node — one shard; cross-shard scatter-gather lands in the Gateway.
 #[tonic::async_trait]
 pub trait Node: Send + Sync {
     /// Run a search against the Node's shard.
@@ -72,7 +69,7 @@ pub trait Node: Send + Sync {
         Err(Status::unimplemented("aggregate"))
     }
 
-    /// Explain how a query scores one document (task-102). Defaults to `Unimplemented` so test
+    /// Explain how a query scores one document. Defaults to `Unimplemented` so test
     /// stubs need not provide it; [`LocalNode`]/[`RemoteNode`] override it.
     async fn explain(
         &self,
@@ -81,7 +78,7 @@ pub trait Node: Send + Sync {
         Err(Status::unimplemented("explain"))
     }
 
-    /// Rebuild this Node's index from source and durably swap it live (task-71). A write-fenced
+    /// Rebuild this Node's index from source and durably swap it live. A write-fenced
     /// **mutation** — unlike the read RPCs the Gateway scatters, this targets the single owning
     /// Node. Defaults to `Unimplemented` so test stubs need not provide it; [`LocalNode`] and
     /// [`RemoteNode`] override it.
@@ -92,8 +89,8 @@ pub trait Node: Send + Sync {
         Err(Status::unimplemented("reindex_index"))
     }
 
-    /// Plan (and optionally apply in-place) an index-definition change against the owning Node
-    /// (task-26): diff a candidate definition vs the served one — in-place metadata changes vs
+    /// Plan (and optionally apply in-place) an index-definition change against the owning Node:
+    /// diff a candidate definition vs the served one — in-place metadata changes vs
     /// changes that force a reindex — and, with `apply`, persist the in-place ones live. A
     /// write-targeted **mutation** like reindex. Defaults to `Unimplemented`; [`LocalNode`] and
     /// [`RemoteNode`] override it.
@@ -104,7 +101,7 @@ pub trait Node: Send + Sync {
         Err(Status::unimplemented("alter_index"))
     }
 
-    /// Compact the owning Node's segments (task-109). Defaults to `Unimplemented`.
+    /// Compact the owning Node's segments. Defaults to `Unimplemented`.
     async fn compact_index(
         &self,
         _req: Request<CompactIndexRequest>,
@@ -112,7 +109,7 @@ pub trait Node: Send + Sync {
         Err(Status::unimplemented("compact_index"))
     }
 
-    /// Back up the owning Node's shard (task-109). Defaults to `Unimplemented`.
+    /// Back up the owning Node's shard. Defaults to `Unimplemented`.
     async fn backup_index(
         &self,
         _req: Request<BackupIndexRequest>,
@@ -120,7 +117,7 @@ pub trait Node: Send + Sync {
         Err(Status::unimplemented("backup_index"))
     }
 
-    /// Read the owning Node's backup status (task-109). Defaults to `Unimplemented`.
+    /// Read the owning Node's backup status. Defaults to `Unimplemented`.
     async fn backup_status(
         &self,
         _req: Request<BackupStatusRequest>,
@@ -262,7 +259,7 @@ impl RemoteNode {
     /// Connect to a Node's gRPC endpoint (e.g. `"http://127.0.0.1:50051"`). Sets a connect and a
     /// per-request timeout so a hung/slow shard surfaces as a call error (counted as a failed
     /// shard → `partial`) rather than blocking forever, complementing the Gateway's scatter
-    /// deadline (task-72).
+    /// deadline.
     pub async fn connect(endpoint: impl Into<String>) -> Result<Self, tonic::transport::Error> {
         let channel = Endpoint::from_shared(endpoint.into())?
             .connect_timeout(CONNECT_TIMEOUT)
@@ -289,7 +286,7 @@ impl RemoteNode {
     }
 
     /// Like [`connect`](Self::connect) but **lazy**: build the channel without establishing the
-    /// connection now. The connection opens on first use and — crucially for resilience (task-122) —
+    /// connection now. The connection opens on first use and — crucially for resilience —
     /// **re-resolves DNS on every (re)connect attempt**, so a shard whose pod crashed and came back
     /// at a *new* IP is reached again automatically, and a still-down shard fails fast at
     /// [`CONNECT_TIMEOUT`] (→ a `partial` query) instead of blocking on a stale connection. Building
@@ -411,7 +408,7 @@ impl Node for RemoteNode {
 mod tests {
     use super::*;
 
-    /// Lazy connect (task-122) must **build without dialing** — so a Gateway can front a shard whose
+    /// Lazy connect must **build without dialing** — so a Gateway can front a shard whose
     /// node is currently down (the build doesn't fail), and the channel reconnects/re-resolves later.
     #[tokio::test]
     async fn connect_lazy_builds_for_an_unreachable_endpoint() {

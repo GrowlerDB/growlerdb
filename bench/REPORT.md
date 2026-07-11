@@ -1,13 +1,12 @@
-# GrowlerDB — quick performance assessment (task-55)
+# GrowlerDB — quick performance assessment
 
 A **ballpark** assessment to adjust now, not the proper pre-GA benchmark. Run against the local
 `just stack` (Polaris + MinIO) on a **4 GiB / 2-CPU dev VM** (lima) — absolute numbers are
 small-scale/cache-warm; the **ratios + the findings are the signal**.
 
-> **v2 (re-run).** Now **1,000,000 readings** (the streaming-build fix, task-84, removed the OOM that
-> capped v1 at 200k), and adds the **top-K documents** comparison — the IoT-realistic *"show me the
-> matching readings"* query, not just a count — so GrowlerDB's coordinate→hydrate model is measured
-> fairly. v1 measured count only.
+Covers **1,000,000 readings** and a **top-K documents** comparison — the IoT-realistic *"show me the
+matching readings"* query, not just a count — so GrowlerDB's coordinate→hydrate model is measured
+fairly.
 
 ## Setup
 
@@ -33,9 +32,8 @@ small-scale/cache-warm; the **ratios + the findings are the signal**.
 | time+filter `status=error` in a 1h window | 772 | **3.1** | 177 | 6.7 |
 
 GrowlerDB ≈ 1.7–3.8 ms · ES ≈ 5–7 ms · Trino ≈ 156–295 ms. **GrowlerDB ~50–170× faster than Trino**
-(index lookup vs full Iceberg scan), ~2–3× faster than ES. At 1M (5× the v1 data) Trino's scan rose
-(~225–295 ms vs ~130–220 ms at 200k) while the index lookups stayed flat — **Trino scales with rows;
-the index doesn't.**
+(index lookup vs full Iceberg scan), ~2–3× faster than ES. At 1M, Trino's scan grows with the data
+(~225–295 ms) while the index lookups stay flat — **Trino scales with rows; the index doesn't.**
 
 ## B. Top-20 **documents** — "show me the matching readings" (median ms)
 
@@ -59,13 +57,12 @@ This is the honest picture for actually *returning readings* — GrowlerDB has t
 
 **Takeaway:** GrowlerDB wins decisively for *filter + display* (cached fields). For *authoritative
 full-fidelity retrieval* it pays an Iceberg round-trip ES avoids — so cache the display fields you
-serve hot, and reserve hydration for governed/audit reads. (v1's count-only numbers overstated
-GrowlerDB for "return the readings"; this corrects that.)
+serve hot, and reserve hydration for governed/audit reads.
 
 ## C. Other measures
 
-- **Streaming build validated at 1M** (task-84): both indexes built cleanly (`telemetry`, `telemetry_cached`),
-  where the pre-fix whole-table read OOM-killed above ~500k on this 4 GiB VM.
+- **Streaming build validated at 1M:** both indexes built cleanly (`telemetry`, `telemetry_cached`)
+  on this 4 GiB VM, where a whole-table read would OOM-kill above ~500k.
 - **Index footprint (1M, Tantivy index):** `telemetry` (no cached) **93 MB** · `telemetry_cached` **176 MB** ·
   ES **155 MB**. GrowlerDB's *plain* index is more compact than ES (no `_source`); with all display
   fields cached it's comparable. (GrowlerDB's `aux.redb` PK→Iceberg locator is extra, on top.)
@@ -74,10 +71,10 @@ GrowlerDB for "return the readings"; this corrects that.)
 
 - **A — the index/scan win is large and scales the right way.** 50–170× faster than Trino, flat
   where Trino grows. Validated at 1M.
-- **B — fixed (task-84): the build now streams** (bounded chunks) and indexes 1M+ without OOM.
+- **B — the build streams** (bounded chunks) and indexes 1M+ without OOM.
 - **C — hydration cost is the real "return the readings" tax.** 80–190 ms per top-K page from Iceberg.
   Mitigations: **cache the hot display fields** (≈ free, shown above); a future read-through/columnar
-  hydration cache; and the cold-tier read path (task-80) already serves cold data without a full
+  hydration cache; and the cold-tier read path already serves cold data without a full
   restore. Worth a hydration-throughput line in the proper assessment.
 - **D — ES `_source` beats GrowlerDB hydration on raw latency** (but not governance). If sub-10 ms
   *authoritative* doc retrieval is a requirement, that's a gap; cached fields close it for display.
@@ -85,6 +82,6 @@ GrowlerDB for "return the readings"; this corrects that.)
 ## For the proper (pre-GA) assessment
 
 - Real hardware (≥32 GiB) → **tens of millions** of events; concurrency / QPS under load; p95/p99;
-  warm vs cold cache; **cold-tier (task-80) read-through latency**; **hydration throughput** at K.
+  warm vs cold cache; **cold-tier read-through latency**; **hydration throughput** at K.
 - Apples-to-apples ES/OpenSearch at scale (shards, `_source` on/off) + a Spark/Trino full-text
-  baseline. Validate the cost model (index %, $/mo) vs task-79 with clean at-scale numbers.
+  baseline. Validate the cost model (index %, $/mo) with clean at-scale numbers.

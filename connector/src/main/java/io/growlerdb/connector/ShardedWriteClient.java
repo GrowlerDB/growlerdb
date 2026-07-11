@@ -17,32 +17,32 @@ import java.util.concurrent.Callable;
  * preserved within a shard, every sub-batch carries the same checkpoint, and each gets a
  * per-shard {@code batch_id} ({@code {id}#s{ordinal}}) so an idempotent replay stays
  * shard-unique. Empty sub-batches are sent too — they advance their shard's checkpoint in
- * lockstep (task-194); the resume checkpoint is the position <i>every</i> shard has durably
- * passed. Sub-batches commit <b>concurrently</b> ({@link ShardFanOut}, task-196), joined
- * per batch so per-shard order across batches is preserved.
+ * lockstep; the resume checkpoint is the position <i>every</i> shard has durably passed.
+ * Sub-batches commit <b>concurrently</b> ({@link ShardFanOut}), joined per batch so per-shard
+ * order across batches is preserved.
  */
 public final class ShardedWriteClient implements BatchWriter {
 
   private final List<WriteClient> shards;
   private final ShardRouter router;
   private final ShardFanOut fanOut;
-  /** Fills in sequence numbers the Nodes don't have (legacy stored checkpoints) at resume. */
+  /** Fills in sequence numbers the Nodes don't have at resume time. */
   private final SnapshotLineage lineage;
 
-  /** Connect a Node per {@code host:port} endpoint, routed by {@code strategy} (legacy). */
+  /** Connect a Node per {@code host:port} endpoint, routed by {@code strategy}. */
   public ShardedWriteClient(List<String> endpoints, ShardRouter.Strategy strategy) {
     this(endpoints, new ShardRouter(endpoints.size(), strategy));
   }
 
-  /** As below, with no table lineage (resume falls back to legacy behavior on missing data). */
+  /** As below, with no table lineage (resume falls back to numeric behavior on missing data). */
   public ShardedWriteClient(List<String> endpoints, ShardRouter router) {
     this(endpoints, router, SnapshotLineage.none());
   }
 
   /**
    * Connect a Node per {@code host:port} endpoint, placing writes with an explicit {@code router}
-   * (task-77: a bucketed router built from the registry's vended map, so write placement matches
-   * the Gateway's read routing). The router's shard count must equal the endpoint count.
+   * (a bucketed router built from the registry's vended map, so write placement matches the
+   * Gateway's read routing). The router's shard count must equal the endpoint count.
    */
   public ShardedWriteClient(List<String> endpoints, ShardRouter router, SnapshotLineage lineage) {
     if (endpoints.isEmpty()) {
@@ -52,7 +52,7 @@ public final class ShardedWriteClient implements BatchWriter {
       throw new IllegalArgumentException(
           "router covers " + router.shards() + " shards but got " + endpoints.size() + " endpoints");
     }
-    // Validate + parse EVERY endpoint before opening any channel (task-152 / B16): a `new WriteClient`
+    // Validate + parse EVERY endpoint before opening any channel: a `new WriteClient`
     // eagerly opens a gRPC channel, so a malformed later endpoint throwing mid-loop would leak the
     // channels of the ones already created. Parsing first means we only start connecting once all
     // endpoints are known-good.
@@ -88,22 +88,21 @@ public final class ShardedWriteClient implements BatchWriter {
     for (int ordinal = 0; ordinal < perShard.size(); ordinal++) {
       final int shard = ordinal;
       final DocBatch sub = perShard.get(shard);
-      // Send EVERY sub-batch, including empties (task-194). A window that routed no rows to a shard
-      // still advances that shard's checkpoint (a redb-only no-op commit on the Node), keeping all
-      // shards in lockstep at the trigger head. Skipping empties let shards drift — which inflated
-      // the min-checkpoint resume re-read AND breaks the Node's continuity guard, whose `from ==
+      // Send EVERY sub-batch, including empties. A window that routed no rows to a shard
+      // still advances that shard's checkpoint (a no-op commit on the Node), keeping all shards in
+      // lockstep at the trigger head. Skipping empties lets shards drift — which inflates the
+      // min-checkpoint resume re-read AND breaks the Node's continuity guard, whose `from ==
       // current` invariant only holds when every shard tracks the same source position.
       writes.add(
           () -> {
             long snapshot = shards.get(shard).write(sub);
-            // Per-shard ack (task-194 AC6): the metric that makes the "1-of-3-landed" loss
-            // signature visible — a shard whose acks stall relative to its siblings is the tell.
-            // Recorded on success only, inside the task.
+            // Per-shard ack metric: a shard whose acks stall relative to its siblings is the tell
+            // for a partial-landing loss signature. Recorded on success only.
             ConnectorMetrics.recordShardAck(shard);
             return snapshot;
           });
     }
-    // Concurrent fan-out with a join-all barrier (task-196): the slowest shard bounds the batch,
+    // Concurrent fan-out with a join-all barrier: the slowest shard bounds the batch,
     // and no next batch starts until every shard settled this one (per-shard order preserved).
     return fanOut.maxSnapshot(writes);
   }
@@ -131,13 +130,13 @@ public final class ShardedWriteClient implements BatchWriter {
               .addAllOps(perShard.get(ordinal))
               .setCheckpoint(batch.getCheckpoint())
               .setBatchId(batch.getBatchId() + "#s" + ordinal);
-      // Carry `from` onto each sub-batch so every shard's continuity guard (task-194) sees the
+      // Carry `from` onto each sub-batch so every shard's continuity guard sees the
       // window's resume point; all shards resume from the same source position.
       if (batch.hasFromCheckpoint()) {
         sub.setFromCheckpoint(batch.getFromCheckpoint());
       }
-      // Carry the resume FLOOR too so each shard prunes idempotency records it can never be re-sent
-      // (task-204). It's the same across shards — the min committed checkpoint the connector resumes
+      // Carry the resume FLOOR too so each shard prunes idempotency records it can never be re-sent.
+      // It's the same across shards — the min committed checkpoint the connector resumes
       // the whole cluster from — so each shard's local prune stays sound.
       if (batch.hasSafeCheckpoint()) {
         sub.setSafeCheckpoint(batch.getSafeCheckpoint());
@@ -149,17 +148,16 @@ public final class ShardedWriteClient implements BatchWriter {
 
   /**
    * The resume checkpoint is the <b>minimum</b> committed snapshot across shards — in
-   * <b>lineage order</b> (Iceberg sequence numbers, task-196): snapshot ids are random longs,
-   * so the old numeric {@code Math.min} picked the wrong shard ~half the time two shards
-   * diverged (task-205). Replaying from the lineage-min re-applies nothing new on shards
-   * already ahead (the Node's window-covering guard no-ops them by position) and misses
-   * nothing on the shard that lagged. {@code null} on any shard ⇒ start from the beginning
-   * (that shard has committed nothing yet).
+   * <b>lineage order</b> (Iceberg sequence numbers): snapshot ids are random longs, so a
+   * numeric {@code Math.min} would pick the wrong shard ~half the time two shards diverged.
+   * Replaying from the lineage-min re-applies nothing new on shards already ahead (the Node's
+   * window-covering guard no-ops them by position) and misses nothing on the shard that lagged.
+   * {@code null} on any shard ⇒ start from the beginning (that shard has committed nothing yet).
    *
    * <p>Sequence numbers come from the Nodes' stored checkpoints, backfilled from the table's
-   * own metadata ({@link SnapshotLineage}) for legacy stored values. Only when a divergent
-   * snapshot is unknown everywhere (expired + never stamped) does this degrade to the old
-   * numeric min — kept as the pre-existing fallback, now with a loud warning.
+   * own metadata ({@link SnapshotLineage}) for stored values that lack one. Only when a divergent
+   * snapshot is unknown everywhere (expired + never stamped) does this degrade to the numeric
+   * min — the fallback, with a loud warning.
    */
   @Override
   public Long checkpointSnapshotId() {
@@ -168,8 +166,8 @@ public final class ShardedWriteClient implements BatchWriter {
 
   /**
    * The lineage-min resume point over {@code clients} (see {@link #checkpointSnapshotId()}), or
-   * {@code null} when any shard has no checkpoint. Shared with the shard-group client
-   * (task-196), whose resume is the same computation over its owned subset.
+   * {@code null} when any shard has no checkpoint. Shared with the shard-group client, whose resume
+   * is the same computation over its owned subset.
    */
   static Long resumeMin(List<WriteClient> clients, SnapshotLineage lineage) {
     List<WriteClient.ShardCheckpoint> checkpoints = new ArrayList<>(clients.size());
@@ -185,8 +183,8 @@ public final class ShardedWriteClient implements BatchWriter {
 
   /**
    * The lineage-min resume point over already-fetched {@code checkpoints} (see
-   * {@link #checkpointSnapshotId()}). Shared with the windowed client (task-219), which fetches a
-   * checkpoint per <i>window</i> rather than per ordinal shard. {@code checkpoints} must be non-empty.
+   * {@link #checkpointSnapshotId()}). Shared with the windowed client, which fetches a checkpoint
+   * per <i>window</i> rather than per ordinal shard. {@code checkpoints} must be non-empty.
    */
   static Long resumeMinOf(List<WriteClient.ShardCheckpoint> checkpoints, SnapshotLineage lineage) {
     // Converged shards need no order at all — the common steady-state (lockstep advance).
@@ -222,7 +220,7 @@ public final class ShardedWriteClient implements BatchWriter {
     return minId;
   }
 
-  /** Drained only when <b>every</b> shard's checkpoint has converged on {@code head} (task-194). */
+  /** Drained only when <b>every</b> shard's checkpoint has converged on {@code head}. */
   @Override
   public boolean drainedTo(long head) {
     for (WriteClient shard : shards) {

@@ -12,7 +12,7 @@ import io.trino.spi.type.VarcharType;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 
-/** The search-then-join column projection behind {@code growlerdb_search} (task-51). */
+/** The search-then-join column projection behind {@code growlerdb_search}. */
 class SearchColumnsTest {
 
   private static SearchHit hit(String id, long day, double score) {
@@ -54,8 +54,8 @@ class SearchColumnsTest {
 
   @Test
   void temporalKeyFieldsProjectAsTimestampMicros() {
-    // A ts_micros key field (task-184) surfaces as a TIMESTAMP(6) column whose native value is
-    // the canonical epoch-micros long itself.
+    // A ts_micros key field surfaces as a TIMESTAMP(6) column whose native value is the canonical
+    // epoch-micros long itself.
     long micros = 1_782_000_123_456_789L;
     SearchHit h =
         SearchHit.newBuilder()

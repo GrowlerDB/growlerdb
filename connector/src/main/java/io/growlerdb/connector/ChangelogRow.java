@@ -5,9 +5,9 @@ import java.util.Map;
 
 /**
  * One Iceberg changelog row, already decoded into wire {@link Value}s — the input
- * to {@link ChangelogMapper}. Reading these from Spark (the {@code _change_type} /
+ * to {@link ChangelogMapper}. Read from Spark (the {@code _change_type} /
  * {@code _change_ordinal} / {@code _commit_snapshot_id} columns + {@code _metadata}
- * file/position) is task-63; this type keeps the mapping free of Spark.
+ * file/position); this type keeps the mapping free of Spark.
  */
 public final class ChangelogRow {
 

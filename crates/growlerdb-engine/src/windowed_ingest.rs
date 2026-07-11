@@ -1,10 +1,10 @@
-//! **Dynamic windowed streaming ingest** (task-219): a node-side `Write` gRPC service that routes
+//! **Dynamic windowed streaming ingest**: a node-side `Write` gRPC service that routes
 //! each incoming doc to its **time-window shard** — creating the window shard on first write and
 //! publishing it so it becomes **live-queryable** (mux + in-process gateway) with no restart. This is
 //! the streaming counterpart to the batch [`write_windowed`](growlerdb_index::LocalIndexStore) that
 //! builds all windows up front; here windows form continuously as the ingest timeline advances.
 //!
-//! Placement is decided elsewhere (the control plane, task-219 stage 2): the connector resolves a
+//! Placement is decided elsewhere (the control plane): the connector resolves a
 //! window's owning node and streams that window's rows here, so a given node only ever receives —
 //! and creates — the windows the control plane assigned to it.
 
@@ -32,7 +32,7 @@ use crate::{AdminService, LocalNode, LookupService, Node, SearchService, Suggest
 /// a catch-up commit spanning many windows can be large.
 const MAX_WRITE_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 
-/// One window's authoritative serving state on this node (task-219): the swappable shard handle, the
+/// One window's authoritative serving state on this node: the swappable shard handle, the
 /// in-process node fronting it (for the node's own REST gateway scatter), and its event-time
 /// zone-map (widened as the window ingests). The search/suggest *services* live in the shared mux
 /// maps ([`SharedSearchWindows`]/[`SharedSuggestWindows`]) the write path keeps in sync.
@@ -54,11 +54,11 @@ pub type WindowSeed = (ShardHandle, Arc<dyn Node>, Option<(i64, i64)>);
 /// event zone-map)`.
 type WindowDescriptor = (i64, Option<(i64, i64)>);
 
-/// Called once per **newly-created** window (task-219) so the CLI can attach its process-level
+/// Called once per **newly-created** window so the CLI can attach its process-level
 /// concerns — auto-compaction of the new hot shard, log lines — that the engine can't own.
 pub type OnNewWindow = Arc<dyn Fn(i64, ShardHandle) + Send + Sync>;
 
-/// A node-side windowed `Write` service (task-219). Serializes writes on the node (so window creation
+/// A node-side windowed `Write` service. Serializes writes on the node (so window creation
 /// can't race), commits each window's sub-batch to its own shard, and publishes a new window to the
 /// query paths. Cheap to clone (all shared state is `Arc`).
 #[derive(Clone)]
@@ -175,7 +175,7 @@ impl WindowedWriteService {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(window, SuggestService::new(handle.clone()));
-        // Hydration (task-225): a new window must also be reachable by keys:get + describe, or a doc
+        // Hydration: a new window must also be reachable by keys:get + describe, or a doc
         // just streamed into it can't be opened in the console and it's invisible to the index total.
         self.lookup
             .write()
@@ -257,7 +257,7 @@ impl WindowedWriteService {
                 max_snapshot = max_snapshot.max(snapshot.0);
             }
         }
-        // Ingestion throughput SLI (task-39/task-226): committed doc-ops this commit, labelled by index
+        // Ingestion throughput SLI: committed doc-ops this commit, labelled by index
         // — the ordinal write path emits this too, so the console Ingestion throughput + the Grafana
         // "index docs/s" panel light up for a windowed index instead of reading a flat 0.
         growlerdb_telemetry::sli::ingested_docs(&self.index_name, ingested);
@@ -283,8 +283,8 @@ impl WindowedWriteService {
             .swap_windowed(nodes, self.windowing.clone(), descriptors);
     }
 
-    /// The windows this node currently serves, as [`ServedWindow`]s for control-plane registration
-    /// (task-219) — read fresh each announce so a window created since boot is advertised.
+    /// The windows this node currently serves, as [`ServedWindow`]s for control-plane registration —
+    /// read fresh each announce so a window created since boot is advertised.
     pub fn served_windows(&self) -> Vec<ServedWindow> {
         self.read_windows()
             .iter()
@@ -330,7 +330,7 @@ impl Write for WindowedWriteService {
             .await
             .map_err(|e| to_status(Code::Internal, WireError::new("INTERNAL", e.to_string())))?
             .map_err(store_error_to_status)?;
-        // Write-latency SLI (task-233): the wall-clock per-commit time across this batch's windows —
+        // Write-latency SLI: the wall-clock per-commit time across this batch's windows —
         // the latency counterpart to the `ingested_docs` throughput counted inside `commit_windowed`.
         growlerdb_telemetry::sli::write(&self.index_name, started.elapsed().as_secs_f64());
 
@@ -344,7 +344,7 @@ impl Write for WindowedWriteService {
         &self,
         request: Request<GetCheckpointRequest>,
     ) -> Result<Response<GetCheckpointResponse>, Status> {
-        // Per-window resume (task-219): the connector reads each window's checkpoint independently.
+        // Per-window resume: the connector reads each window's checkpoint independently.
         let window = request.into_inner().window;
         let Some(handle) = self.read_windows().get(&window).map(|s| s.handle.clone()) else {
             // A window this node hasn't created yet → no checkpoint (the connector starts it fresh).

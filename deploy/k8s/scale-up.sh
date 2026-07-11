@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-command scale-test deploy (task-159; workload-driven task-214): brings up the full GrowlerDB
+# One-command workload-driven scale-test deploy: brings up the full GrowlerDB
 # pipeline on a fresh k3s cluster (provisioned by deploy/iac) in the CORRECT order — the order
 # matters and each step gates the next, which is easy to get wrong by hand:
 #
@@ -24,16 +24,16 @@
 #
 # IMAGE_TAG — the SERVER image the run deploys — must be built from the code under test. `release.yml`
 # only builds `growlerdb:latest`/`:X.Y.Z` on a *release*, so after merging (pre-release) `latest` LAGS
-# main; deploying it silently runs stale code (task-220 — this exact trap wasted a windowed run). The
-# `scale-images` workflow builds `growlerdb:dev` (+ commit SHA) from merged main — pin `IMAGE_TAG=dev`
-# or the commit SHA, NOT `latest`. This script warns on `latest` and prints the deployed binary's
-# `--version` after the nodes come up so you can confirm the code that's actually running.
+# main; deploying it silently runs stale code. The `scale-images` workflow builds `growlerdb:dev`
+# (+ commit SHA) from merged main — pin `IMAGE_TAG=dev` or the commit SHA, NOT `latest`. This script
+# warns on `latest` and prints the deployed binary's `--version` after the nodes come up so you can
+# confirm the code that's actually running.
 set -euo pipefail
 
 WORKLOAD="${WORKLOAD:-http_logs}"
 NAMESPACE="${NAMESPACE:-growlerdb}"
 SHARDS="${SHARDS:-6}"
-GENERATORS="${GENERATORS:-1}"   # generator pod replicas — raise to parallelize ingest (task-231)
+GENERATORS="${GENERATORS:-1}"   # generator pod replicas — raise to parallelize ingest
 IMAGE_TAG="${IMAGE_TAG:-dev}"
 GH_USER="${GH_USER:-}"
 GHCR_PAT="${GHCR_PAT:-}"
@@ -46,10 +46,10 @@ if [ -z "$GHCR_PAT" ] || [ -z "$GH_USER" ]; then
   echo "set GHCR_PAT (read:packages) + GH_USER for the ghcr-pull secret"; exit 1
 fi
 
-# task-220: `latest` is only rebuilt on a RELEASE, so pre-release it lags main → stale server code.
+# `latest` is only rebuilt on a RELEASE, so pre-release it lags main → stale server code.
 # The `scale-images` workflow builds `growlerdb:dev` (+ commit SHA) from merged main; pin one of those.
 if [ "$IMAGE_TAG" = "latest" ]; then
-  printf '\033[1;33m! IMAGE_TAG=latest is only rebuilt on a release — it may LAG merged main (task-220).\n' >&2
+  printf '\033[1;33m! IMAGE_TAG=latest is only rebuilt on a release — it may LAG merged main.\n' >&2
   printf '  Deploy the code under test: IMAGE_TAG=dev (or the commit SHA) built by the scale-images workflow.\033[0m\n' >&2
 fi
 
@@ -71,15 +71,15 @@ $PY "$REPO_ROOT/bench/scale/harness.py" render "$WORKLOAD" \
 # shellcheck source=/dev/null
 source "$RENDER_DIR/workload.env"
 
-# Detect a WINDOWED workload (task-219): its index.yaml declares `windowing:`. A windowed index uses a
+# Detect a WINDOWED workload: its index.yaml declares `windowing:`. A windowed index uses a
 # different node topology — nodes start EMPTY and serve control-plane-ASSIGNED time-window shards (no
 # --shards/--shard-ordinal); the connector streams each row to its window's owning node (resolved from
 # the live control plane) and the gateway hot-reloads windows. The chart renders that topology when
-# index.windowed=true. See okf/quality/known-limitations/windowed-k8s-topology.md (task-219).
+# index.windowed=true. See okf/quality/known-limitations/windowed-k8s-topology.md.
 WINDOWED=false
 if grep -qE '^[[:space:]]*windowing:' "$INDEX_DEF"; then
   WINDOWED=true
-  say "workload '$WORKLOAD' is WINDOWED — deploying the time-windowed node topology (task-219)"
+  say "workload '$WORKLOAD' is WINDOWED — deploying the time-windowed node topology"
 fi
 
 say "1/7 namespace + ghcr-pull image secret"
@@ -114,18 +114,18 @@ for _ in $(seq 1 40); do
   echo "  shards ready: ${ready:-0}/$SHARDS"; [ "${ready:-0}" -ge "$SHARDS" ] && break; sleep 10
 done
 
-# task-220: print the deployed server binary's version so a stale image (e.g. a floating `latest` that
+# Print the deployed server binary's version so a stale image (e.g. a floating `latest` that
 # lags the code under test) can't hide behind a green rollout. The scale-images build stamps
-# GROWLERDB_VERSION=dev-<sha>; an unstamped in-tree build reports 0.0.0 (see task-156).
+# GROWLERDB_VERSION=dev-<sha>; an unstamped in-tree build reports 0.0.0.
 echo "deployed server version (image tag '$IMAGE_TAG'):"
 kubectl -n "$NAMESPACE" exec statefulset/gdb-growlerdb-node -- growlerdb --version 2>/dev/null \
   | sed 's/^/  /' || echo "  (could not read --version)"
 
-# task-222: a WINDOWED gateway only becomes /readyz-ready once ≥1 window exists, and windows are
-# created by the connector's streamed writes — so for a windowed index deploy the connector BEFORE the
-# gateway-ready wait, else that wait always times out (the connector, which makes windows, used to run
-# after it). For an ordinal index the gateway is ready as soon as the shards register, so keep the
-# original order (the connector's --nodes must equal the now-confirmed ready shard count).
+# A WINDOWED gateway only becomes /readyz-ready once ≥1 window exists, and windows are created by the
+# connector's streamed writes — so for a windowed index deploy the connector BEFORE the gateway-ready
+# wait, else that wait always times out. For an ordinal index the gateway is ready as soon as the
+# shards register, so deploy the connector after (its --nodes must equal the now-confirmed ready
+# shard count).
 deploy_connector() {
   say "5/7 streaming connector — fields from the workload's index.yaml, --nodes sized to $SHARDS shards"
   kubectl apply -f "$RENDER_DIR/connector.yaml"

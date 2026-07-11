@@ -20,7 +20,7 @@ search-engine latency instead of object-storage-scan latency.
 - **Segments** — immutable Tantivy segments; the unit of build, merge, backup, and query. They also
   carry the locator's identity + reference layers (key terms and the `_locid` fast field, D30).
   A hit's composite key is stored as the same compact `enc(key)` bytes the delete term uses —
-  one format, computed once per doc (task-212). The doc store is **zstd**-compressed (task-212):
+  one format, computed once per doc. The doc store is **zstd**-compressed:
   lz4 only match-copies, so high-entropy stored values (hex/UUID keys, random-ish cached fields)
   pass through nearly uncompressed — zstd entropy-codes them (~40% store cut measured on hex
   keys). The compressor persists per index in `meta.json`.

@@ -1,11 +1,9 @@
-# Scale-test observability bundle (task-183): a minimal Prometheus + node-exporter for the headless
+# Scale-test observability bundle: a minimal Prometheus + node-exporter for the headless Hetzner
 # test cluster (no kube-prometheus operator). Scrapes GrowlerDB app metrics (control-plane :9101,
 # node :9102, gateway :9103), the scale-test exporter (:9200), pod CPU/mem via the kubelet cAdvisor,
-# and node CPU/disk/net via node-exporter. Deploy: kubectl apply -f deploy/k8s/observability/
+# and node CPU/disk/net via node-exporter, so the console's Observability/Ingestion SLI panels
+# (gateway /v1/stats/* proxy) have a backend. Deploy: kubectl apply -f deploy/k8s/observability/
 # then set the chart's gateway.prometheusUrl=http://prometheus:9090 so the console SLI panels work.
-# Follow-ups (task-183): MinIO + connector JVM scrape, per-shard query latency.
-# Minimal Prometheus for the headless Hetzner test cluster: scrapes the GrowlerDB metrics ports so
-# the console's Observability/Ingestion SLI panels (gateway /v1/stats/* proxy) have a backend.
 apiVersion: v1
 kind: ServiceAccount
 metadata: { name: prometheus, namespace: growlerdb }
@@ -70,11 +68,10 @@ data:
             replacement: ${1}:9103
           - source_labels: [__meta_kubernetes_pod_name]
             target_label: pod
-      # The Spark connector's own ingest-side metrics (task-194/183): rows_read/expected, under-reads,
-      # per-shard acks, stream restarts, write-retries by gRPC code, checkpoint. It exposes /metrics on
-      # :9091 (GROWLERDB_METRICS_PORT) and carries `app: growlerdb-connector`. Scraping this localizes
-      # an ingest-throughput ceiling to the connector vs the nodes (Run 3 found the nodes weren't
-      # CPU-bound, so the connector/commit path is the suspect — task-232).
+      # The Spark connector's own ingest-side metrics: rows_read/expected, under-reads, per-shard acks,
+      # stream restarts, write-retries by gRPC code, checkpoint. It exposes /metrics on :9091
+      # (GROWLERDB_METRICS_PORT) and carries `app: growlerdb-connector`. Scraping this localizes an
+      # ingest-throughput ceiling to the connector vs the nodes.
       - job_name: gdb-connector
         kubernetes_sd_configs: [{ role: pod, namespaces: { names: [growlerdb] } }]
         relabel_configs:

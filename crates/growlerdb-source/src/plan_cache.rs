@@ -1,4 +1,4 @@
-//! Snapshot-pinned **plan cache** for hydration (task-184 / D30 foundations).
+//! Snapshot-pinned **plan cache** for hydration.
 //!
 //! Planning a hydration pass-1 read is `load_table` (one catalog REST call) plus
 //! `scan().plan_files()` (manifest-list + manifest GETs from object storage). The catalog

@@ -1,6 +1,5 @@
 """Generate synthetic IoT telemetry readings into the Iceberg table `growlerdb.telemetry` for
-benchmarking (task-55 quick assessment). Row count via BENCH_ROWS (default 2,000,000), batched by
-BENCH_BATCH.
+benchmarking. Row count via BENCH_ROWS (default 2,000,000), batched by BENCH_BATCH.
 
 Realistic-ish cardinalities (devices/firmware/gateways/sites), weighted status, templated free-text
 `message`, plus a few injected **needles** so needle-in-haystack queries have a real, rare target:

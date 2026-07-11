@@ -8,7 +8,7 @@ test.describe('Indexes', () => {
 
     await expect(page.getByRole('button', { name: 'telemetry' })).toBeVisible();
     await expect(page.getByText('ready', { exact: true })).toBeVisible();
-    // Summary line + reconciled columns (task-140): 1 index, shards "3 × 2" (3 shards, 2 copies —
+    // Summary line + reconciled columns: 1 index, shards "3 × 2" (3 shards, 2 copies —
     // shard 0 has a replica), and a real backup cell (mock reports a present backup at snapshot 42).
     await expect(page.getByText('1 index(es)')).toBeVisible();
     const row = page.locator('.ix-table tbody tr').first();
@@ -55,7 +55,7 @@ test.describe('Indexes', () => {
     await expect(table).toBeVisible();
     // The identifier carries a PK badge.
     await expect(table.locator('tr', { hasText: 'id' }).getByText('PK')).toBeVisible();
-    // A cached fast field; a blocked (D23) field with the warning callout.
+    // A cached fast field; a blocked field with the warning callout.
     await expect(table.getByText('device_id')).toBeVisible();
     await expect(table.locator('tr.blocked', { hasText: 'body' })).toBeVisible();
     await expect(table.getByText('blocked').first()).toBeVisible();

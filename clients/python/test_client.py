@@ -1,4 +1,4 @@
-"""Offline unit tests for the Python client's auth headers (task-152 / G3).
+"""Offline unit tests for the Python client's auth headers.
 
 Runnable without a live stack: `python3 -m unittest test_client` (or `python3 test_client.py`).
 Intercepts the outgoing `urllib` request to assert which headers are set, rather than reaching a node.

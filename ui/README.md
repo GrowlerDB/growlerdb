@@ -2,7 +2,7 @@
 
 A **Svelte SPA** (Vite + TypeScript) that is a _pure client_ of the Engine API — the human
 surface over the same gRPC/REST API programmatic callers use (wiki/20-ui). It never reaches the
-Index or storage directly. This is the **scaffold** (task-45); the four screens (Search,
+Index or storage directly. This is the **scaffold**; the four screens (Search,
 Indexes, Observability, Connectors) are built out in tasks 46–49.
 
 ## Layout
@@ -32,7 +32,7 @@ Two layers, both run in CI (the `ui` job):
 ```sh
 npm run check     # svelte-check (types + a11y)
 npm test          # vitest unit tests for the pure lib/ modules
-npm run e2e        # Playwright screen-level E2E (task-92)
+npm run e2e        # Playwright screen-level E2E
 ```
 
 The **E2E** lives in `e2e/` and is **fully mocked at the network layer** (`e2e/mocks.ts`

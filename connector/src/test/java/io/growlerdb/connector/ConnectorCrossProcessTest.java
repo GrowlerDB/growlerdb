@@ -17,7 +17,7 @@ import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 /**
- * Cross-process integration (task-11, AC2): the JVM connector writes, over the
+ * Cross-process integration: the JVM connector writes, over the
  * <b>real Write gRPC</b>, to a GrowlerDB Node running as a separate process (the Rust
  * {@code growlerdb serve} binary), and the committed docs are then <b>searchable</b> via
  * {@code growlerdb search} — proving the JVM↔Rust boundary end-to-end (mirrors the Rust
@@ -65,7 +65,7 @@ class ConnectorCrossProcessTest {
       spark.sql("UPDATE demo.ns.docs SET body = 'updated' WHERE id = 'doc-1'");
       spark.sql("DELETE FROM demo.ns.docs WHERE id = 'doc-2'");
 
-      // --- first run: empty Node, no checkpoint yet → read from the start --------
+      // First run: empty Node, no checkpoint yet → read from the start.
       Process server = spawnGrowlerDBServe(growlerdbBin, dataDir, port);
       try (WriteClient client = new WriteClient("127.0.0.1", port)) {
         assertEquals(null, client.checkpointSnapshotId(), "no checkpoint before first commit");
@@ -78,8 +78,8 @@ class ConnectorCrossProcessTest {
         stop(server);
       }
 
-      // --- restart the Node, then resume: the checkpoint survived, and replaying
-      // the same window is a no-op (exactly-once after a connector/Node restart) ---
+      // Restart the Node, then resume: the checkpoint survived, and replaying
+      // the same window is a no-op (exactly-once after a connector/Node restart).
       Process restarted = spawnGrowlerDBServe(growlerdbBin, dataDir, port);
       try (WriteClient client = new WriteClient("127.0.0.1", port)) {
         assertEquals(

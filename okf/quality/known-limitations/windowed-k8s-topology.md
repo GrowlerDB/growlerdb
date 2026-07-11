@@ -8,9 +8,9 @@ timestamp: 2026-07-04T14:22:00
 
 # Windowed index k8s deployment topology (resolved)
 
-**Resolved (task-219 / [D33](/system/decisions/d33-windowed-topology.md)).** A **windowed** index is
-now deployable on Kubernetes. Previously the [sharded Helm chart](/system/deployment/helm-k8s.md)
-(Design 14) deployed **hash-sharded** indexes only — every node ran `growlerdb serve --shards N
+**Resolved ([D33](/system/decisions/d33-windowed-topology.md)).** A **windowed** index is
+deployable on Kubernetes. The [sharded Helm chart](/system/deployment/helm-k8s.md)
+otherwise deploys **hash-sharded** indexes only — every node ran `growlerdb serve --shards N
 --shard-ordinal K`, which a windowed index refuses in-engine (`ShardingWindowedUnsupported`) — so the
 temporal workload `http_logs_windowed` (the [windowed sweet spot](/product/functional/windowing-time.md):
 windowed sharding, [cold-tier park/revive](/product/functional/cold-tiering.md), event-time query

@@ -33,8 +33,8 @@
 
   let indexes = $state<IndexSummary[]>([]);
   let enriched = $state<Record<string, Enriched>>({});
-  let lagMap = $state<Record<string, number | null>>({}); // index → snapshots behind source (task-109)
-  let backupMap = $state<Record<string, BackupStatus>>({}); // index → last-backup status (task-140)
+  let lagMap = $state<Record<string, number | null>>({}); // index → snapshots behind source
+  let backupMap = $state<Record<string, BackupStatus>>({}); // index → last-backup status
   let now = $state(Date.now()); // reference time for relative backup ages, stamped at load
   let aliases = $state<Alias[]>([]);
   let listError = $state('');
@@ -42,16 +42,16 @@
 
   let selected = $state<string | null>(null);
 
-  // Create-from-introspection modal (task-47/89).
+  // Create-from-introspection modal.
   let showCreate = $state(false);
   let cName = $state('');
   let cTable = $state('');
   let cSelection = $state<'ALL' | 'EXPLICIT'>('ALL');
   let schema = $state<SourceSchema | null>(null);
   let chosen = $state(new Set<string>());
-  let cTimeField = $state(''); // a source column to map as a DATE timestamp (task-132); '' = none
+  let cTimeField = $state(''); // a source column to map as a DATE timestamp; '' = none
   let cTimeFormat = $state(TIME_FORMATS[1].value); // default: epoch_ms
-  // Time windowing (task-81/132) — only valid once a time field is declared (the ingest field).
+  // Time windowing — only valid once a time field is declared (the ingest field).
   let cWindowing = $state(false);
   let cGranularity = $state('daily');
   let cEventField = $state(''); // optional event-time column for zone-map pruning; '' = none
@@ -81,7 +81,7 @@
       );
       enriched = Object.fromEntries(entries);
       now = Date.now();
-      // Backup column (task-140): last-backup status per index (best-effort — a node without a
+      // Backup column: last-backup status per index (best-effort — a node without a
       // backup target reports `configured: false`, rendered as "Off").
       backupMap = Object.fromEntries(
         await Promise.all(
@@ -94,7 +94,7 @@
           }),
         ),
       );
-      // Lag column (task-109): snapshots the worst-behind shard trails the source head, from ingestion.
+      // Lag column: snapshots the worst-behind shard trails the source head, from ingestion.
       try {
         const lag: Record<string, number | null> = {};
         for (const it of await getIngestion()) {
@@ -497,7 +497,7 @@
     border-bottom: 1px solid var(--line);
     vertical-align: middle;
   }
-  /* Panel border already draws the bottom edge (design-QA T3) — drop the last row's rule. */
+  /* Panel border already draws the bottom edge — drop the last row's rule. */
   .ix-table tbody tr:last-child td {
     border-bottom: 0;
   }
@@ -508,7 +508,7 @@
   .ix-table td.num {
     text-align: right;
   }
-  /* Keep td.name a real table-cell so its border-bottom aligns with the other cells (task-134);
+  /* Keep td.name a real table-cell so its border-bottom aligns with the other cells;
      lay out the dot + name in an inner flex wrapper instead. */
   td.name .name-inner {
     display: flex;

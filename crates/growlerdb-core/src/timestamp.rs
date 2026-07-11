@@ -1,12 +1,12 @@
-//! Timestamp parsing (task-112): turn a source value into GrowlerDB's **canonical internal
+//! Timestamp parsing: turn a source value into GrowlerDB's **canonical internal
 //! representation — epoch microseconds** (the unit Tantivy's `DateTime::from_timestamp_micros` and
 //! Iceberg's default `timestamp` precision use). A field declared with a [`TimeFormat`] in the index
 //! definition is treated as a `DATE` regardless of its source Arrow type, so a plain `int64` epoch
 //! column (the streaming demo's `ts`, in millis) or a digit string can be a real timestamp — driving
-//! range queries, sort, the console time filter (task-101), window pruning (task-81), and date
+//! range queries, sort, the console time filter, window pruning, and date
 //! histograms on one consistent scale.
 //!
-//! Parsing is **loud, not silent** (cf. task-85): a wrong value type, an unparseable string, or an
+//! Parsing is **loud, not silent**: a wrong value type, an unparseable string, or an
 //! overflow is a clear error, never an off-by-10³ or off-by-timezone date.
 //!
 //! Two families of format are supported: **integer-epoch units** (`epoch_seconds`/`millis`/`micros`/
@@ -121,7 +121,7 @@ impl TimeFormat {
             TimeFormat::EpochMicros => Ok(n),
             // Nanos → micros floors to the microsecond (canonical is micros). `div_euclid` (not `/`)
             // so a pre-1970 nanos value floors consistently with the event/window bucketing, which
-            // also uses `div_euclid` — avoids a sign-dependent 1µs mismatch (task-153 / I12).
+            // also uses `div_euclid` — avoids a sign-dependent 1µs mismatch.
             TimeFormat::EpochNanos => Ok(n.div_euclid(1_000)),
             // Unreachable: only the four epoch units route here.
             TimeFormat::Rfc3339 | TimeFormat::DateOnly => unreachable!(),
@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn pre_1970_nanos_floor_consistently_with_windowing() {
-        // task-153 / I12: nanos→micros uses `div_euclid`, so a pre-epoch value floors (like the event/
+        // Nanos→micros uses `div_euclid`, so a pre-epoch value floors (like the event/
         // window bucketing) rather than truncating toward zero (which `/` would do → -1µs, an
         // off-by-one vs the window field).
         assert_eq!(

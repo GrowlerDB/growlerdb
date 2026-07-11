@@ -1,9 +1,8 @@
-/* Design-system foundation (task-93, console revamp): a tokenized palette + density + a themeable
-   accent, from the `GrowlerDB Console.dc.html` mockup. Three knobs on <html> (set by lib/prefs.ts):
-   data-theme (light|dark), data-accent (blue|orange|green), data-density (compact|comfortable).
-   `:root` is the LIGHT default (the mockup's primary); data-theme='dark' overrides. The legacy
-   token names (--fg/--muted/--border/--btn) alias the new ones so pre-revamp screens refresh for
-   free. accent-weak/weakest derive from --accent via color-mix, so an accent swap needs one line. */
+/* Design-system foundation: a tokenized palette + density + a themeable accent. Three knobs on
+   <html> (set by lib/prefs.ts): data-theme (light|dark), data-accent (blue|orange|green),
+   data-density (compact|comfortable). `:root` is the LIGHT default; data-theme='dark' overrides.
+   The --fg/--muted/--border/--btn aliases map to the tokens. accent-weak/weakest derive from
+   --accent via color-mix, so an accent swap needs one line. */
 :root {
   --bg: #eef0f3;
   --panel: #fbfbfc;
@@ -32,7 +31,7 @@
   --rh: 30px;
   --cell: 7px 11px;
 
-  /* Legacy aliases (pre-revamp screens). */
+  /* Aliases. */
   --fg: var(--text);
   --muted: var(--text-2);
   --border: var(--line);
@@ -102,7 +101,7 @@ body {
   text-rendering: optimizeLegibility;
 }
 
-/* Shared design-system animations (task-93): drawers/popovers slide in; status dots pulse. */
+/* Shared design-system animations: drawers/popovers slide in; status dots pulse. */
 @keyframes gb-slide {
   from {
     transform: translateX(14px);
@@ -161,8 +160,8 @@ body {
   outline-offset: 2px;
 }
 
-/* The top bar + brand + user menu are scoped in App.svelte (task-94). `nav` + `button` styles below
-   are shared. Nav items are icon + label pills (design-QA T4): active = accent-weakest pill. */
+/* The top bar + brand + user menu are scoped in App.svelte. `nav` + `button` styles below are
+   shared. Nav items are icon + label pills: active = accent-weakest pill. */
 nav ul {
   display: flex;
   gap: 3px;
@@ -209,7 +208,7 @@ button:hover {
   border-color: var(--accent);
 }
 
-/* Keyboard-shortcuts modal (task-91). The backdrop dims; Escape and the × button close it. */
+/* Keyboard-shortcuts modal. The backdrop dims; Escape and the × button close it. */
 .modal-backdrop {
   position: fixed;
   inset: 0;
@@ -267,7 +266,7 @@ kbd {
   max-width: none;
 }
 /* Every route root is a <section>; it fills the shell, owns its own vertical scroll, and carries
-   the per-screen padding that used to live on `main`. Search opts out (its panes scroll). */
+   the per-screen padding. Search opts out (its panes scroll). */
 #main > section {
   flex: 1;
   min-width: 0;
@@ -297,7 +296,7 @@ input {
   padding: 0.5rem 0.75rem;
 }
 
-/* Query-syntax segmented control (task-90). */
+/* Query-syntax segmented control. */
 .syntax {
   display: inline-flex;
   border: 1px solid var(--border);
@@ -316,7 +315,7 @@ input {
   color: var(--fg);
 }
 
-/* Query autocomplete (task-88): a dropdown anchored under the search input. */
+/* Query autocomplete: a dropdown anchored under the search input. */
 .ac {
   position: relative;
   flex: 1;
@@ -375,7 +374,7 @@ input {
   border-bottom: 1px solid var(--border);
 }
 
-/* Cached display fields rendered inline under a hit (task-86) — a document-like row. */
+/* Cached display fields rendered inline under a hit — a document-like row. */
 .fields {
   display: flex;
   flex-wrap: wrap;
@@ -568,7 +567,7 @@ mark {
   height: 220px;
 }
 
-/* Reindex action in the index detail (task-89 follow-up). */
+/* Reindex action in the index detail. */
 .reindex {
   display: flex;
   flex-wrap: wrap;
@@ -582,7 +581,7 @@ mark {
   font-size: 0.85rem;
 }
 
-/* Aliases panel (task-89). */
+/* Aliases panel. */
 .alias-panel {
   margin-top: 2rem;
   padding-top: 1rem;
@@ -626,8 +625,8 @@ fieldset {
   margin: 0.5rem 0;
 }
 
-/* Screen toolbar (design-QA T1): the slim row that replaces each screen's removed <h1> — a light
-   caption on the left, the screen's actions on the right. */
+/* Screen toolbar: the slim row with a light caption on the left and the screen's actions on the
+   right. */
 .screen-toolbar {
   display: flex;
   align-items: center;
@@ -646,8 +645,8 @@ fieldset {
   flex: 0 0 auto;
 }
 
-/* Panel container (design-QA T3): the one repeated wrapper for data tables / lists / card groups.
-   The radius + overflow:hidden clip child row borders; the head is a mono uppercase caption. */
+/* Panel container: the repeated wrapper for data tables / lists / card groups. The radius +
+   overflow:hidden clip child row borders; the head is a mono uppercase caption. */
 .gb-panel {
   border: 1px solid var(--line);
   border-radius: 9px;

@@ -1,5 +1,5 @@
 <script lang="ts">
-  // A tinted callout (task-93) for governance/degraded/info notes (e.g. blocked cached fields).
+  // A tinted callout for governance/degraded/info notes (e.g. blocked cached fields).
   import type { Snippet } from 'svelte';
   let { tone = 'info', children }: { tone?: 'info' | 'warn'; children: Snippet } = $props();
 </script>

@@ -13,14 +13,13 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Overlapped per-shard fan-out (task-196): runs one blocking per-shard write per pooled thread
- * and joins them <b>all</b> before returning, so a chunk's sub-batches commit concurrently
- * instead of serially — the slowest shard, not the sum of all shards, bounds a chunk's wall
- * clock. The join-all barrier is what keeps the continuity guard's per-shard ordering intact:
- * the next chunk is not fanned out until every shard has settled this one.
+ * Overlapped per-shard fan-out: runs one blocking per-shard write per pooled thread and joins them
+ * <b>all</b> before returning, so a chunk's sub-batches commit concurrently instead of serially —
+ * the slowest shard, not the sum of all shards, bounds a chunk's wall clock. The join-all barrier
+ * is what keeps the continuity guard's per-shard ordering intact: the next chunk is not fanned out
+ * until every shard has settled this one.
  *
- * <p>Failure semantics mirror the sequential loop it replaces, minus the ordering artifact:
- * <b>no fail-fast</b> — shards that can commit do commit (a failed sibling just lags and the
+ * <p>Failure semantics: <b>no fail-fast</b> — shards that can commit do commit (a failed sibling just lags and the
  * resume-from-min machinery covers it) — and after all writes settle, the lowest-ordinal
  * failure propagates with the others attached as suppressed. Retry/backoff and the
  * non-retryable set stay inside {@link WriteClient}, untouched.

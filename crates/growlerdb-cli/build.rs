@@ -1,6 +1,6 @@
-// Bakes the version reported by `growlerdb --version` and the System gRPC service (task-156).
+// Bakes the version reported by `growlerdb --version` and the System gRPC service.
 //
-// Release builds export `GROWLERDB_VERSION` from the git tag (see RELEASING.md / ADR D29 — release
+// Release builds export `GROWLERDB_VERSION` from the git tag (see RELEASING.md — release
 // artifacts are tag-derived while the in-tree workspace version stays `0.0.0`); every other build
 // falls back to the crate's `CARGO_PKG_VERSION` (the workspace `0.0.0`), so a local `--version`
 // honestly reports an unreleased build.

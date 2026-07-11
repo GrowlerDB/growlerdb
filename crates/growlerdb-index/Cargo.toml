@@ -13,13 +13,13 @@ serde.workspace = true
 serde_json.workspace = true
 tantivy.workspace = true
 redb.workspace = true
-# Read-through object-storage serving of cold time-window shards (task-80). `blocking` gives a sync
+# Read-through object-storage serving of cold time-window shards. `blocking` gives a sync
 # operator (its own background runtime) for tantivy's synchronous Directory reads.
 opendal = { version = "0.55", features = ["services-fs", "services-s3", "blocking"] }
 # Binary serde for the mergeable intermediate-aggregation partial (its HLL/t-digest
 # sketches use non-string map keys that JSON can't represent).
 postcard = { version = "1", features = ["use-std"] }
-# Lightweight metrics facade for the cold-cache hit/miss counters (task-143) — emitted at the
+# Lightweight metrics facade for the cold-cache hit/miss counters — emitted at the
 # source; a no-op unless the process installs a recorder (growlerdb-telemetry does).
 metrics = "0.24"
 

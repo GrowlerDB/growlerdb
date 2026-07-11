@@ -1,6 +1,5 @@
-// The signed-in identity (task-103): the verified `GET /v1/me` result, fetched once at app start
-// and shared via a store. This is server truth (the gateway validated the token), replacing the
-// earlier client-side JWT decode for the header + Settings.
+// The signed-in identity: the verified `GET /v1/me` result, fetched once at app start and shared
+// via a store. This is server truth — the gateway validated the token — for the header + Settings.
 import { writable } from 'svelte/store';
 import { me as fetchMe, type Me } from './api';
 

@@ -12,10 +12,10 @@ use growlerdb_core::routing::{BucketMap, Reassignment};
 use growlerdb_core::ResolvedIndex;
 use serde::{Deserialize, Serialize};
 
-/// A fixed dummy argon2 PHC hash used to make [`Registry::verify_credential`] do equivalent work for
-/// an unknown subject as for a real one, closing a username-enumeration timing oracle (task-147 /
-/// I10). Computed once; the salt is fixed (it protects nothing — the hash is never authenticated
-/// against). A parse/hash failure yields an empty string, which `PasswordHash::new` rejects → the
+/// A fixed dummy argon2 PHC hash that makes [`Registry::verify_credential`] do equivalent work for
+/// an unknown subject as for a real one, closing a username-enumeration timing oracle. Computed
+/// once; the salt is fixed (it protects nothing — the hash is never authenticated against). A
+/// parse/hash failure yields an empty string, which `PasswordHash::new` rejects → the
 /// unknown-subject path still returns `false`.
 static DUMMY_CREDENTIAL_HASH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     use argon2::password_hash::{PasswordHasher, SaltString};
@@ -74,7 +74,7 @@ impl ShardAssignment {
     }
 }
 
-/// One time-window shard of a windowed index (task-81): its node placement plus the event-time
+/// One time-window shard of a windowed index: its node placement plus the event-time
 /// **zone-map** the serving node reports, so the Gateway can prune windows by event time without a
 /// fan-out. Used in [`IndexEntry::windows`] (`window-id → WindowAssignment`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,17 +99,17 @@ pub struct IndexEntry {
     /// Where the index is in its lifecycle.
     pub status: IndexStatus,
     /// `shard ordinal → ShardAssignment`. Empty until shards are assigned. `#[serde(default)]`
-    /// so registries written before the shard map load cleanly.
+    /// so registries without a shard map load cleanly.
     #[serde(default)]
     pub shards: BTreeMap<u32, ShardAssignment>,
-    /// `window-id → WindowAssignment` for a **time-windowed** index (task-81): which node serves
+    /// `window-id → WindowAssignment` for a **time-windowed** index: which node serves
     /// each window + its event-time zone-map. Empty for ordinal (hash/partition) indexes.
     #[serde(default)]
     pub windows: BTreeMap<i64, WindowAssignment>,
-    /// Virtual-bucket map (task-77): `bucket_owners[b]` = the shard owning bucket `b`, length
+    /// Virtual-bucket map: `bucket_owners[b]` = the shard owning bucket `b`, length
     /// [`NUM_BUCKETS`](growlerdb_core::routing::NUM_BUCKETS). **Empty ⇒ legacy `fnv % shards`
-    /// routing** (every pre-bucket index), so registries written before this field load as legacy.
-    /// When present, writers and readers route `key → bucket → shard` through it, and a reshard
+    /// routing**, so registries without this field load as legacy. When present, writers and
+    /// readers route `key → bucket → shard` through it, and a reshard
     /// ([`Registry::plan_reshard`]) moves whole buckets.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bucket_owners: Vec<u32>,
@@ -122,54 +122,52 @@ pub struct IndexSummary {
     pub status: IndexStatus,
 }
 
-/// On-disk schema version for `registry.json` (task-70 L2). A versioned envelope means a future
-/// format change can be detected and migrated instead of mis-parsed.
+/// On-disk schema version for `registry.json`. A versioned envelope means a future format change
+/// can be detected and migrated instead of mis-parsed.
 const REGISTRY_VERSION: u32 = 1;
 
-/// How long a windowed node's heartbeat is trusted before it drops out of the CP placement pool
-/// (task-219). Sized at ~3× a node's re-register interval (~10 s) so one missed heartbeat doesn't
-/// eject a healthy node, while a genuinely dead node's windows get re-placed within ~30 s.
+/// How long a windowed node's heartbeat is trusted before it drops out of the CP placement pool.
+/// Sized at ~3× a node's re-register interval (~10 s) so one missed heartbeat doesn't eject a
+/// healthy node, while a genuinely dead node's windows get re-placed within ~30 s.
 pub const NODE_HEARTBEAT_TTL_MS: i64 = 30_000;
 
 /// The persisted `registry.json` document: a `{ version, indexes }` envelope around the catalog,
-/// rather than a bare map — so the format is self-describing and evolvable (task-70).
+/// rather than a bare map — so the format is self-describing and evolvable.
 #[derive(Debug, Serialize, Deserialize)]
 struct RegistryFile {
     version: u32,
     indexes: BTreeMap<String, IndexEntry>,
-    /// Index **aliases** (task-52): `alias → set of member index names`. A stable name a client can
-    /// search/route through; re-pointing it is the atomic reindex-and-swap. Defaulted so older
-    /// registry files (no aliases) load cleanly.
+    /// Index **aliases**: `alias → set of member index names`. A stable name a client can
+    /// search/route through; re-pointing it is the atomic reindex-and-swap. Defaulted so registry
+    /// files without aliases load cleanly.
     #[serde(default)]
     aliases: BTreeMap<String, BTreeSet<String>>,
-    /// Saved searches (task-106): `id → `[`SavedQuery`]. Per-subject persisted query state.
-    /// Defaulted so older registry files load cleanly.
+    /// Saved searches: `id → `[`SavedQuery`]. Per-subject persisted query state. Defaulted so
+    /// registry files without it load cleanly.
     #[serde(default)]
     saved_queries: BTreeMap<String, SavedQuery>,
-    /// Local role bindings (task-104): `subject → roles`. Admin-managed grants that augment the
-    /// roles a token carries; the control plane merges them when authorizing. Defaulted for older
-    /// registry files.
+    /// Local role bindings: `subject → roles`. Admin-managed grants that augment the roles a token
+    /// carries; the control plane merges them when authorizing. Defaulted.
     #[serde(default)]
     role_bindings: BTreeMap<String, Vec<String>>,
-    /// API tokens (task-105): `id → `[`ApiToken`]. Only the SHA-256 hash is stored, never the secret.
-    /// Defaulted for older registry files.
+    /// API tokens: `id → `[`ApiToken`]. Only the SHA-256 hash is stored, never the secret.
+    /// Defaulted.
     #[serde(default)]
     tokens: BTreeMap<String, ApiToken>,
-    /// Built-in local credentials (task-128): `subject → argon2 PHC hash` (salt embedded in the
-    /// string). Never the plaintext password. Powers `/v1/login` for closed mode without an external
-    /// IdP. Defaulted for older registry files.
+    /// Built-in local credentials: `subject → argon2 PHC hash` (salt embedded in the string). Never
+    /// the plaintext password. Powers `/v1/login` for closed mode without an external IdP.
+    /// Defaulted.
     #[serde(default)]
     credentials: BTreeMap<String, String>,
-    /// Per-subject **index allowlist** for built-in login (task-244, extending task-240): `subject →
-    /// allowed index names`. When a subject has a binding, their minted session JWT carries these as
-    /// the `indexes` claim, so per-index RBAC restricts them to exactly this set. Absent/empty =
-    /// unrestricted (the pre-task-244 default). Defaulted for older registry files.
+    /// Per-subject **index allowlist** for built-in login: `subject → allowed index names`. When a
+    /// subject has a binding, their minted session JWT carries these as the `indexes` claim, so
+    /// per-index RBAC restricts them to exactly this set. Absent/empty = unrestricted. Defaulted.
     #[serde(default)]
     index_bindings: BTreeMap<String, Vec<String>>,
 }
 
-/// A persisted API token (task-105): long-lived programmatic credential. Only the secret's hash is
-/// stored — the raw secret is shown once at creation and never persisted.
+/// A persisted API token: long-lived programmatic credential. Only the secret's hash is stored —
+/// the raw secret is shown once at creation and never persisted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiToken {
     /// Server-assigned id (the handle for revoke).
@@ -187,23 +185,22 @@ pub struct ApiToken {
     /// Creation time (epoch ms).
     #[serde(default)]
     pub created_at_ms: i64,
-    /// Optional expiry (epoch ms), task-151 / B13. `None` = never expires (all pre-B13 tokens, via
-    /// serde default). Past this instant the token no longer authenticates and is pruned on the next
-    /// `create_token`, so the token map can't grow without bound.
+    /// Optional expiry (epoch ms). `None` = never expires (via serde default). Past this instant the
+    /// token no longer authenticates and is pruned on the next `create_token`, so the token map
+    /// can't grow without bound.
     #[serde(default)]
     pub expires_at_ms: Option<i64>,
 }
 
 impl ApiToken {
-    /// Whether this token is past its expiry at `now_ms` (task-151 / B13). A token with no expiry is
-    /// never expired.
+    /// Whether this token is past its expiry at `now_ms`. A token with no expiry is never expired.
     pub fn is_expired(&self, now_ms: i64) -> bool {
         self.expires_at_ms.is_some_and(|exp| now_ms >= exp)
     }
 }
 
-/// A persisted saved search (task-106): the full query state the console can restore, scoped to its
-/// `owner` (the verified subject). `state` is an opaque JSON blob the UI round-trips.
+/// A persisted saved search: the full query state the console can restore, scoped to its `owner`
+/// (the verified subject). `state` is an opaque JSON blob the UI round-trips.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedQuery {
     /// Server-assigned stable id (the handle for update/delete).
@@ -238,7 +235,7 @@ pub enum RegistryError {
     #[error("shard {shard} of `{index}` has no replica to promote")]
     NoReplica { index: String, shard: u32 },
     /// `promote_replica` while a primary is still assigned — the caller must fence/clear the old
-    /// primary first, or two nodes serve as primary for one shard (split brain). Task-74 (M1).
+    /// primary first, or two nodes serve as primary for one shard (split brain).
     #[error(
         "shard {shard} of `{index}` still has primary `{primary}`; fence/clear it before promoting"
     )]
@@ -248,13 +245,13 @@ pub enum RegistryError {
         primary: String,
     },
     /// `resolve_window_owner` when no node has heartbeated within the TTL — there is nowhere to place
-    /// the window (task-219). The caller retries once a node registers.
+    /// the window. The caller retries once a node registers.
     #[error(
         "no live node to place window {window} of `{index}` (none heartbeated within the TTL)"
     )]
     NoLiveNode { index: String, window: i64 },
     /// Another process holds the registry's exclusive lock — single-writer is enforced, so a
-    /// second control plane fails fast rather than last-writer-wins clobbering (task-74, H5).
+    /// second control plane fails fast rather than last-writer-wins clobbering.
     #[error("registry `{0}` is locked by another process")]
     Locked(PathBuf),
     /// Reading or writing the persisted registry failed.
@@ -263,27 +260,27 @@ pub enum RegistryError {
     /// Encoding/decoding the persisted registry failed.
     #[error("registry codec: {0}")]
     Codec(#[from] serde_json::Error),
-    /// `set_alias` used a name that's already a registered index (task-52) — an alias and an index
-    /// can't share a name, or routing would be ambiguous.
+    /// `set_alias` used a name that's already a registered index — an alias and an index can't share
+    /// a name, or routing would be ambiguous.
     #[error("alias `{0}` clashes with an existing index name")]
     AliasNameClash(String),
-    /// An operation named an alias that doesn't exist (task-52).
+    /// An operation named an alias that doesn't exist.
     #[error("alias `{0}` not found")]
     AliasNotFound(String),
-    /// An update/delete named a saved query that doesn't exist (or isn't the caller's) (task-106).
+    /// An update/delete named a saved query that doesn't exist (or isn't the caller's).
     #[error("saved query `{0}` not found")]
     SavedQueryNotFound(String),
-    /// A stored bucket map failed validation (task-77) — wrong length or a gap. Indicates a
-    /// corrupt/hand-edited registry, since maps are only ever written through validated paths.
+    /// A stored bucket map failed validation — wrong length or a gap. Indicates a corrupt/hand-edited
+    /// registry, since maps are only ever written through validated paths.
     #[error("invalid bucket map: {0}")]
     InvalidBucketMap(String),
-    /// A built-in credential could not be hashed (task-128) — an argon2 failure, not a wrong password.
+    /// A built-in credential could not be hashed — an argon2 failure, not a wrong password.
     #[error("credential hashing failed: {0}")]
     Credential(String),
 }
 
-/// One entry in a per-index **activity log** (task-110): a timestamped lifecycle event. Stored
-/// append-only and bounded; the `kind` is a stable machine tag, the `message` human-readable.
+/// One entry in a per-index **activity log**: a timestamped lifecycle event. Stored append-only
+/// and bounded; the `kind` is a stable machine tag, the `message` human-readable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivityEvent {
     /// Event time (epoch ms).
@@ -294,19 +291,19 @@ pub struct ActivityEvent {
     pub message: String,
 }
 
-/// Max events retained per index in the activity log (task-110) — oldest are dropped.
+/// Max events retained per index in the activity log — oldest are dropped.
 const ACTIVITY_RETAIN: usize = 200;
 
-/// Debounce window for activity-sidecar flushes (task-151 / B11). An isolated event (none within
-/// this window) flushes immediately — preserving synchronous durability for the common case — while
-/// a burst (e.g. a multi-target alias swap looping `record_activity` per target) coalesces into a
-/// single off-lock write instead of one full-file fsync per event. The burst tail is flushed on
-/// graceful shutdown ([`Registry`]'s `Drop`); a hard crash within the window may lose the last few
-/// events, which is acceptable — the log is a non-critical audit convenience, not catalog state.
+/// Debounce window for activity-sidecar flushes. An isolated event (none within this window)
+/// flushes immediately — preserving synchronous durability for the common case — while a burst
+/// (e.g. a multi-target alias swap looping `record_activity` per target) coalesces into a single
+/// off-lock write instead of one full-file fsync per event. The burst tail is flushed on graceful
+/// shutdown ([`Registry`]'s `Drop`); a hard crash within the window may lose the last few events,
+/// which is acceptable — the log is a non-critical audit convenience, not catalog state.
 const ACTIVITY_FLUSH_DEBOUNCE_MS: i64 = 1000;
 
-/// Coalescing state for the debounced activity-sidecar flush (task-151 / B11), behind its own mutex
-/// so a flush never holds the activity data lock across the fsync.
+/// Coalescing state for the debounced activity-sidecar flush, behind its own mutex so a flush never
+/// holds the activity data lock across the fsync.
 #[derive(Default)]
 struct ActivityFlush {
     /// Epoch ms of the last completed sidecar write (`0` = never written this session).
@@ -323,11 +320,11 @@ pub type Result<T> = std::result::Result<T, RegistryError>;
 /// rename over the target) so a crash never leaves a partially-written registry. Cheap to
 /// share across threads — internally `RwLock`-guarded.
 ///
-/// **Single-writer (task-74):** [`open`](Self::open) takes an exclusive advisory `flock` on a
-/// `.lock` sibling, held for the registry's lifetime, so a second control-plane process fails
-/// fast instead of last-writer-wins clobbering a stale in-memory map. (See design/06.)
+/// **Single-writer:** [`open`](Self::open) takes an exclusive advisory `flock` on a `.lock`
+/// sibling, held for the registry's lifetime, so a second control-plane process fails fast instead
+/// of last-writer-wins clobbering a stale in-memory map.
 ///
-/// **Lock-order invariant (task-151 / B5):** each data map has its own `RwLock`. A mutation holds
+/// **Lock-order invariant:** each data map has its own `RwLock`. A mutation holds
 /// **only the one map it changes**, drops it, then calls [`persist_snapshot`](Self::persist_snapshot)
 /// (which re-reads every map off-lock). The only places that hold two+ data locks at once do so in
 /// this fixed order — `indexes → aliases → saved_queries → role_bindings → tokens → credentials`:
@@ -338,61 +335,61 @@ pub type Result<T> = std::result::Result<T, RegistryError>;
 pub struct Registry {
     path: PathBuf,
     indexes: RwLock<BTreeMap<String, IndexEntry>>,
-    /// Index aliases (task-52): `alias → member index names`. A separate lock from `indexes`;
-    /// every code path acquires **`indexes` before `aliases`** to avoid deadlock.
+    /// Index aliases: `alias → member index names`. A separate lock from `indexes`; every code path
+    /// acquires **`indexes` before `aliases`** to avoid deadlock.
     aliases: RwLock<BTreeMap<String, BTreeSet<String>>>,
-    /// Saved searches (task-106): `id → `[`SavedQuery`]. Lock order is **indexes → aliases →
-    /// saved_queries** everywhere, to avoid deadlock.
+    /// Saved searches: `id → `[`SavedQuery`]. Lock order is **indexes → aliases → saved_queries**
+    /// everywhere, to avoid deadlock.
     saved_queries: RwLock<BTreeMap<String, SavedQuery>>,
     /// Monotonic suffix for generated saved-query ids (uniqueness within a process; combined with a
     /// millisecond timestamp it is unique across restarts too).
     next_saved: std::sync::atomic::AtomicU64,
-    /// Local role bindings (task-104): `subject → roles`. Lock order is **indexes → aliases →
-    /// saved_queries → role_bindings → tokens**.
+    /// Local role bindings: `subject → roles`. Lock order is **indexes → aliases → saved_queries →
+    /// role_bindings → tokens**.
     role_bindings: RwLock<BTreeMap<String, Vec<String>>>,
-    /// API tokens (task-105): `id → `[`ApiToken`].
+    /// API tokens: `id → `[`ApiToken`].
     tokens: RwLock<BTreeMap<String, ApiToken>>,
-    /// Secret-hash → token-id lookup index (task-151 / B13): makes `find_token` — on every
-    /// authenticated request — O(1) instead of a linear scan of `tokens`. **Derived** from `tokens`
-    /// (not persisted); rebuilt on open and after every token mutation. Never held together with the
-    /// `tokens` lock in a nested way (see `find_token` / `rebuild_token_index`), so no deadlock.
+    /// Secret-hash → token-id lookup index: makes `find_token` — on every authenticated request —
+    /// O(1) instead of a linear scan of `tokens`. **Derived** from `tokens` (not persisted); rebuilt
+    /// on open and after every token mutation. Never held together with the `tokens` lock in a
+    /// nested way (see `find_token` / `rebuild_token_index`), so no deadlock.
     token_by_hash: RwLock<std::collections::HashMap<String, String>>,
     /// Monotonic suffix for generated token ids.
     next_token: std::sync::atomic::AtomicU64,
-    /// Built-in local credentials (task-128): `subject → argon2 PHC hash`. Lock order is **last**,
-    /// after `tokens` (indexes → aliases → saved_queries → role_bindings → tokens → credentials).
+    /// Built-in local credentials: `subject → argon2 PHC hash`. Lock order is **last**, after
+    /// `tokens` (indexes → aliases → saved_queries → role_bindings → tokens → credentials).
     credentials: RwLock<BTreeMap<String, String>>,
-    /// Per-subject index allowlist for built-in login (task-244): `subject → allowed index names`.
-    /// Threaded into the session JWT's `indexes` claim so per-index RBAC (task-240) restricts the
-    /// subject. Lock order is **after `credentials`** (… → credentials → index_bindings).
+    /// Per-subject index allowlist for built-in login: `subject → allowed index names`. Threaded
+    /// into the session JWT's `indexes` claim so per-index RBAC restricts the subject. Lock order is
+    /// **after `credentials`** (… → credentials → index_bindings).
     index_bindings: RwLock<BTreeMap<String, Vec<String>>>,
-    /// Per-index activity log (task-110): `index → events`, bounded + append-only. Persisted to a
-    /// **separate** `activity.json` (non-critical, lossy-on-corruption) so the registry's atomic
-    /// envelope stays small. Lock is independent (acquired last).
+    /// Per-index activity log: `index → events`, bounded + append-only. Persisted to a **separate**
+    /// `activity.json` (non-critical, lossy-on-corruption) so the registry's atomic envelope stays
+    /// small. Lock is independent (acquired last).
     activity: RwLock<BTreeMap<String, Vec<ActivityEvent>>>,
     /// Path of the activity sidecar file.
     activity_path: PathBuf,
-    /// Debounce/coalescing state for the activity-sidecar flush (task-151 / B11). Its own mutex also
-    /// serializes concurrent flushes (last snapshot wins the file) — like `flush_lock` for the main
-    /// registry — and is never nested under the activity data lock.
+    /// Debounce/coalescing state for the activity-sidecar flush. Its own mutex also serializes
+    /// concurrent flushes (last snapshot wins the file) — like `flush_lock` for the main registry —
+    /// and is never nested under the activity data lock.
     activity_flush: std::sync::Mutex<ActivityFlush>,
-    /// Per-subject **session epoch** (epoch ms): sessions issued before this instant are stale
-    /// (task-147 / B4). Bumped when a subject's roles change or credential is removed, giving
-    /// revocation / immediate role-downgrade for outstanding session JWTs. Persisted to a separate
-    /// `sessions.json` sidecar (independent lock, acquired last).
+    /// Per-subject **session epoch** (epoch ms): sessions issued before this instant are stale.
+    /// Bumped when a subject's roles change or credential is removed, giving revocation / immediate
+    /// role-downgrade for outstanding session JWTs. Persisted to a separate `sessions.json` sidecar
+    /// (independent lock, acquired last).
     session_epochs: RwLock<BTreeMap<String, i64>>,
     /// Path of the session-epoch sidecar file.
     session_epochs_path: PathBuf,
-    /// Serializes registry-file writes (task-151 / F10): a mutation applies its change in memory,
-    /// releases its data lock, then persists off-lock under this — so routing reads never block on the
-    /// fsync, and two concurrent persists can't lose a change from the file (each snapshots the latest
-    /// memory; the last write wins with the full state).
+    /// Serializes registry-file writes: a mutation applies its change in memory, releases its data
+    /// lock, then persists off-lock under this — so routing reads never block on the fsync, and two
+    /// concurrent persists can't lose a change from the file (each snapshots the latest memory; the
+    /// last write wins with the full state).
     flush_lock: std::sync::Mutex<()>,
-    /// Per-index **node inventory** for CP-driven windowed placement (task-219): `index → (node
-    /// endpoint → last-heartbeat epoch-ms)`. **In-memory only** (like `token_by_hash`) — liveness is
-    /// ephemeral runtime state, not durable topology: after a control-plane restart every node
-    /// re-registers within a heartbeat interval, so persisting it would only add write amplification.
-    /// Window *assignments* (which node owns a window) stay durable in [`IndexEntry::windows`].
+    /// Per-index **node inventory** for CP-driven windowed placement: `index → (node endpoint →
+    /// last-heartbeat epoch-ms)`. **In-memory only** (like `token_by_hash`) — liveness is ephemeral
+    /// runtime state, not durable topology: after a control-plane restart every node re-registers
+    /// within a heartbeat interval, so persisting it would only add write amplification. Window
+    /// *assignments* (which node owns a window) stay durable in [`IndexEntry::windows`].
     node_heartbeats: RwLock<BTreeMap<String, BTreeMap<String, i64>>>,
     /// Held for the process lifetime to keep the exclusive `flock`; released on drop / exit.
     _lock: File,
@@ -401,8 +398,8 @@ pub struct Registry {
 impl Registry {
     /// Open the registry at `path`, loading the existing catalog if present (else empty). Takes an
     /// exclusive lock first (fails fast with [`Locked`](RegistryError::Locked) if another process
-    /// holds it — single-writer, task-74). If the file fails to parse, fall back to the
-    /// last-known-good `.prev` copy with a loud warning rather than hard-failing startup (task-70).
+    /// holds it — single-writer). If the file fails to parse, fall back to the last-known-good
+    /// `.prev` copy with a loud warning rather than hard-failing startup.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         if let Some(parent) = path.parent() {
@@ -429,21 +426,21 @@ impl Registry {
                     BTreeMap::new(),
                 )
             };
-        // Activity log sidecar (task-110): best-effort — a missing/corrupt log starts empty rather
-        // than failing registry startup (it's an audit convenience, not catalog state).
+        // Activity log sidecar: best-effort — a missing/corrupt log starts empty rather than
+        // failing registry startup (it's an audit convenience, not catalog state).
         let activity_path = path.with_file_name("activity.json");
         let activity = std::fs::read(&activity_path)
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
-        // Session-epoch sidecar (task-147 / B4): best-effort load, like the activity log. A missing
-        // file means no revocations are in effect (all outstanding sessions valid until `exp`).
+        // Session-epoch sidecar: best-effort load, like the activity log. A missing file means no
+        // revocations are in effect (all outstanding sessions valid until `exp`).
         let session_epochs_path = path.with_file_name("sessions.json");
         let session_epochs = std::fs::read(&session_epochs_path)
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
-        // Build the B13 hash→id lookup index from the loaded tokens (derived, not persisted).
+        // Build the hash→id lookup index from the loaded tokens (derived, not persisted).
         let token_by_hash: std::collections::HashMap<String, String> = tokens
             .iter()
             .map(|(id, t)| (t.hash.clone(), id.clone()))
@@ -471,8 +468,8 @@ impl Registry {
         })
     }
 
-    /// Read the catalog under the lock, recovering from poisoning (task-74): a panic elsewhere
-    /// while holding the lock must not take down every subsequent create/drop/list/route call.
+    /// Read the catalog under the lock, recovering from poisoning: a panic elsewhere while holding
+    /// the lock must not take down every subsequent create/drop/list/route call.
     fn read_map(&self) -> RwLockReadGuard<'_, BTreeMap<String, IndexEntry>> {
         self.indexes.read().unwrap_or_else(|e| e.into_inner())
     }
@@ -539,8 +536,8 @@ impl Registry {
     }
 
     /// Snapshot every core map under brief read locks and write the registry file **off any data
-    /// lock** (task-151 / F10). A mutation applies its change in memory, releases its write lock, then
-    /// calls this — so routing reads (`resolve`/`shard_map`/`get`/`list`) never block on the fsync,
+    /// lock**. A mutation applies its change in memory, releases its write lock, then calls this —
+    /// so routing reads (`resolve`/`shard_map`/`get`/`list`) never block on the fsync,
     /// and mutations aren't globally serialized behind disk I/O. The `flush_lock` serializes the
     /// writes themselves (they're rare) so a concurrent pair can't lose a change from the file: each
     /// snapshot reads the latest memory, and the last write wins with the full state. Must be called
@@ -582,7 +579,7 @@ impl Registry {
                 bucket_owners: Vec::new(),
             },
         );
-        drop(map); // release the data lock before the fsync (task-151 / F10)
+        drop(map); // release the data lock before the fsync
         self.persist_snapshot()
     }
 
@@ -598,7 +595,7 @@ impl Registry {
     }
 
     /// Remove an index, returning its definition. Errors if absent. Also prunes the index from any
-    /// aliases that point at it (dropping aliases left empty), so an alias never dangles (task-52).
+    /// aliases that point at it (dropping aliases left empty), so an alias never dangles.
     pub fn drop_index(&self, name: &str) -> Result<ResolvedIndex> {
         let mut map = self.write_map();
         let entry = map
@@ -616,9 +613,9 @@ impl Registry {
         Ok(entry.definition)
     }
 
-    /// Point an `alias` at `targets`, replacing any existing target set (task-52). The atomic
-    /// reindex-and-swap is just re-pointing an alias here — one durable write. Errors if the alias
-    /// name collides with an index, or any target index isn't registered.
+    /// Point an `alias` at `targets`, replacing any existing target set. The atomic reindex-and-swap
+    /// is just re-pointing an alias here — one durable write. Errors if the alias name collides with
+    /// an index, or any target index isn't registered.
     pub fn set_alias(
         &self,
         alias: &str,
@@ -641,25 +638,25 @@ impl Registry {
         self.persist_snapshot()
     }
 
-    /// Remove an alias (task-52). Errors if it doesn't exist.
+    /// Remove an alias. Errors if it doesn't exist.
     pub fn drop_alias(&self, alias: &str) -> Result<()> {
         {
             let mut aliases = self.write_aliases();
             if aliases.remove(alias).is_none() {
                 return Err(RegistryError::AliasNotFound(alias.to_string()));
             }
-        } // hold only the map we mutate; persist_snapshot re-reads everything off-lock (B5/F10)
+        } // hold only the map we mutate; persist_snapshot re-reads everything off-lock
         self.persist_snapshot()
     }
 
-    /// The member indexes an `alias` points at, if it is an alias (task-52).
+    /// The member indexes an `alias` points at, if it is an alias.
     pub fn alias_targets(&self, alias: &str) -> Option<Vec<String>> {
         self.read_aliases()
             .get(alias)
             .map(|s| s.iter().cloned().collect())
     }
 
-    /// All aliases as `alias → sorted member names` (task-52).
+    /// All aliases as `alias → sorted member names`.
     pub fn list_aliases(&self) -> BTreeMap<String, Vec<String>> {
         self.read_aliases()
             .iter()
@@ -667,8 +664,8 @@ impl Registry {
             .collect()
     }
 
-    /// Saved searches visible to `owner` (task-106): the owner's own rows plus any `shared` ones,
-    /// newest first. An empty `owner` (anonymous/open gateway) sees only shared rows.
+    /// Saved searches visible to `owner`: the owner's own rows plus any `shared` ones, newest first.
+    /// An empty `owner` (anonymous/open gateway) sees only shared rows.
     pub fn list_saved_queries(&self, owner: &str) -> Vec<SavedQuery> {
         let mut out: Vec<SavedQuery> = self
             .read_saved()
@@ -680,8 +677,8 @@ impl Registry {
         out
     }
 
-    /// Create (empty `id`) or update (existing own `id`) a saved query for `owner` (task-106). The
-    /// server stamps `id`/`owner`/`created_at_ms` on create; an update of another subject's row (or
+    /// Create (empty `id`) or update (existing own `id`) a saved query for `owner`. The server
+    /// stamps `id`/`owner`/`created_at_ms` on create; an update of another subject's row (or
     /// a missing id) is [`SavedQueryNotFound`](RegistryError::SavedQueryNotFound). Returns the row.
     pub fn save_saved_query(&self, mut q: SavedQuery, owner: &str) -> Result<SavedQuery> {
         let indexes = self.read_map();
@@ -716,7 +713,7 @@ impl Registry {
         Ok(q)
     }
 
-    /// Delete `owner`'s saved query `id` (task-106). Deleting a non-existent or non-owned row is
+    /// Delete `owner`'s saved query `id`. Deleting a non-existent or non-owned row is
     /// [`SavedQueryNotFound`](RegistryError::SavedQueryNotFound).
     pub fn delete_saved_query(&self, id: &str, owner: &str) -> Result<()> {
         let indexes = self.read_map();
@@ -735,13 +732,13 @@ impl Registry {
         Ok(())
     }
 
-    /// All local role bindings as `subject → roles` (task-104), sorted by subject.
+    /// All local role bindings as `subject → roles`, sorted by subject.
     pub fn list_role_bindings(&self) -> BTreeMap<String, Vec<String>> {
         self.read_bindings().clone()
     }
 
-    /// The locally-bound roles for `subject` (task-104) — merged into the caller's token roles when
-    /// the control plane authorizes. Empty for an unknown/empty subject.
+    /// The locally-bound roles for `subject` — merged into the caller's token roles when the control
+    /// plane authorizes. Empty for an unknown/empty subject.
     pub fn roles_for(&self, subject: &str) -> Vec<String> {
         if subject.is_empty() {
             return Vec::new();
@@ -752,8 +749,8 @@ impl Registry {
             .unwrap_or_default()
     }
 
-    /// Set (replace) `subject`'s local roles (task-104). Empty `roles` removes the binding. Roles
-    /// are de-duplicated and order-stable; an empty `subject` is rejected.
+    /// Set (replace) `subject`'s local roles. Empty `roles` removes the binding. Roles are
+    /// de-duplicated and order-stable; an empty `subject` is rejected.
     pub fn set_user_roles(&self, subject: &str, roles: Vec<String>) -> Result<()> {
         if subject.trim().is_empty() {
             return Err(RegistryError::SavedQueryNotFound("(empty subject)".into()));
@@ -766,7 +763,7 @@ impl Registry {
             }
         }
         {
-            // Hold only `role_bindings` — persist_snapshot re-reads every map off-lock (B5/F10).
+            // Hold only `role_bindings` — persist_snapshot re-reads every map off-lock.
             let mut bindings = self.write_bindings();
             if deduped.is_empty() {
                 bindings.remove(subject);
@@ -776,14 +773,14 @@ impl Registry {
         }
         self.persist_snapshot()?;
         // A role change must take effect immediately: invalidate outstanding sessions so the subject
-        // re-authenticates with the new roles rather than riding an old token's embedded set (B4).
+        // re-authenticates with the new roles rather than riding an old token's embedded set.
         self.revoke_sessions(subject);
         Ok(())
     }
 
-    /// The index allowlist bound to `subject` for built-in login (task-244) — threaded into the
-    /// session JWT's `indexes` claim so per-index RBAC (task-240) restricts them. Empty (no binding)
-    /// = unrestricted across indexes. Empty for an unknown/empty subject.
+    /// The index allowlist bound to `subject` for built-in login — threaded into the session JWT's
+    /// `indexes` claim so per-index RBAC restricts them. Empty (no binding) = unrestricted across
+    /// indexes. Empty for an unknown/empty subject.
     pub fn indexes_for(&self, subject: &str) -> Vec<String> {
         if subject.is_empty() {
             return Vec::new();
@@ -794,10 +791,10 @@ impl Registry {
             .unwrap_or_default()
     }
 
-    /// Set (replace) `subject`'s index allowlist (task-244). Empty `indexes` removes the binding
-    /// (making the subject unrestricted). Entries are de-duplicated and order-stable; an empty
-    /// `subject` is rejected. Like a role change, this bumps the subject's session epoch so an
-    /// outstanding token minted with the old scope is superseded and they re-authenticate.
+    /// Set (replace) `subject`'s index allowlist. Empty `indexes` removes the binding (making the
+    /// subject unrestricted). Entries are de-duplicated and order-stable; an empty `subject` is
+    /// rejected. Like a role change, this bumps the subject's session epoch so an outstanding token
+    /// minted with the old scope is superseded and they re-authenticate.
     pub fn set_user_indexes(&self, subject: &str, indexes: Vec<String>) -> Result<()> {
         if subject.trim().is_empty() {
             return Err(RegistryError::SavedQueryNotFound("(empty subject)".into()));
@@ -810,7 +807,7 @@ impl Registry {
             }
         }
         {
-            // Hold only `index_bindings` — persist_snapshot re-reads every map off-lock (B5/F10).
+            // Hold only `index_bindings` — persist_snapshot re-reads every map off-lock.
             let mut bindings = self.write_index_bindings();
             if deduped.is_empty() {
                 bindings.remove(subject);
@@ -824,31 +821,31 @@ impl Registry {
         Ok(())
     }
 
-    /// All API tokens (task-105), newest first. The caller strips the `hash` before returning to a
-    /// client — only metadata leaves the control plane.
+    /// All API tokens, newest first. The caller strips the `hash` before returning to a client —
+    /// only metadata leaves the control plane.
     pub fn list_tokens(&self) -> Vec<ApiToken> {
         let mut out: Vec<ApiToken> = self.read_tokens().values().cloned().collect();
         out.sort_by_key(|t| std::cmp::Reverse(t.created_at_ms));
         out
     }
 
-    /// Persist a new API token (task-105). The caller has minted the secret + hash + id; the registry
-    /// stamps `created_at_ms` and returns the stored token.
+    /// Persist a new API token. The caller has minted the secret + hash + id; the registry stamps
+    /// `created_at_ms` and returns the stored token.
     pub fn create_token(&self, mut token: ApiToken) -> Result<ApiToken> {
         let now = now_ms();
         token.created_at_ms = now;
         {
             let mut tokens = self.write_tokens();
-            // Prune expired tokens so the map (and its persisted copy) can't grow without bound (B13).
+            // Prune expired tokens so the map (and its persisted copy) can't grow without bound.
             tokens.retain(|_, t| !t.is_expired(now));
             tokens.insert(token.id.clone(), token.clone());
-        } // release the tokens write lock before rebuilding the index / persisting off-lock (F10)
+        } // release the tokens write lock before rebuilding the index / persisting off-lock
         self.rebuild_token_index();
         self.persist_snapshot()?;
         Ok(token)
     }
 
-    /// Revoke an API token by id (task-105) — effective immediately. Errors if it doesn't exist.
+    /// Revoke an API token by id — effective immediately. Errors if it doesn't exist.
     pub fn revoke_token(&self, id: &str) -> Result<()> {
         {
             let mut tokens = self.write_tokens();
@@ -860,8 +857,8 @@ impl Registry {
         self.persist_snapshot()
     }
 
-    /// Set (or replace) a subject's built-in password (task-128): salted-argon2-hash it and persist.
-    /// Never stores plaintext. Errors only on a hashing/persist failure, not on a re-set.
+    /// Set (or replace) a subject's built-in password: salted-argon2-hash it and persist. Never
+    /// stores plaintext. Errors only on a hashing/persist failure, not on a re-set.
     pub fn set_credential(&self, subject: &str, password: &str) -> Result<()> {
         use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
         use argon2::Argon2;
@@ -871,17 +868,17 @@ impl Registry {
             .map_err(|e| RegistryError::Credential(e.to_string()))?
             .to_string();
         {
-            // Hold only `credentials` — persist_snapshot re-reads every map off-lock (B5/F10).
+            // Hold only `credentials` — persist_snapshot re-reads every map off-lock.
             let mut creds = self.write_credentials();
             creds.insert(subject.to_string(), hash);
         }
         self.persist_snapshot()
     }
 
-    /// Verify a subject's password against its stored argon2 hash (task-128). `false` for an unknown
-    /// subject or a wrong password — the caller can't distinguish the two. To avoid a
-    /// **username-enumeration timing oracle** (task-147 / I10), an unknown subject is verified against
-    /// a fixed dummy hash so both paths perform equivalent Argon2 work before returning `false`.
+    /// Verify a subject's password against its stored argon2 hash. `false` for an unknown subject or
+    /// a wrong password — the caller can't distinguish the two. To avoid a **username-enumeration
+    /// timing oracle**, an unknown subject is verified against a fixed dummy hash so both paths
+    /// perform equivalent Argon2 work before returning `false`.
     pub fn verify_credential(&self, subject: &str, password: &str) -> bool {
         use argon2::password_hash::{PasswordHash, PasswordVerifier};
         use argon2::Argon2;
@@ -901,35 +898,35 @@ impl Registry {
         matched && stored.is_some()
     }
 
-    /// Remove a subject's built-in credential (task-128). No-op if absent.
+    /// Remove a subject's built-in credential. No-op if absent.
     pub fn remove_credential(&self, subject: &str) -> Result<()> {
         {
-            // Hold only `credentials` — persist_snapshot re-reads every map off-lock (B5/F10).
+            // Hold only `credentials` — persist_snapshot re-reads every map off-lock.
             let mut creds = self.write_credentials();
             creds.remove(subject);
         }
         self.persist_snapshot()?;
-        // Deprovision: kill outstanding sessions so a removed user can't keep riding a live JWT (B4).
+        // Deprovision: kill outstanding sessions so a removed user can't keep riding a live JWT.
         self.revoke_sessions(subject);
         Ok(())
     }
 
-    /// Whether any built-in credential exists (task-128) — decides whether to seed an initial admin
-    /// on first closed-mode boot.
+    /// Whether any built-in credential exists — decides whether to seed an initial admin on first
+    /// closed-mode boot.
     pub fn has_credentials(&self) -> bool {
         !self.read_credentials().is_empty()
     }
 
-    /// Whether `subject` has a built-in credential (task-244) — lets a seeder be idempotent about a
-    /// single account (e.g. the demo user) without clobbering an operator-changed password on restart.
+    /// Whether `subject` has a built-in credential — lets a seeder be idempotent about a single
+    /// account (e.g. the demo user) without clobbering an operator-changed password on restart.
     pub fn has_credential(&self, subject: &str) -> bool {
         self.read_credentials().contains_key(subject)
     }
 
-    /// Look up a token by its secret's `hash` (task-105) — used by the authenticator on every
-    /// authenticated request, so O(1) via the B13 index rather than a linear scan. `None` if no such
-    /// **live** token, so a revoked or **expired** (B13) token fails authentication. The two locks are
-    /// taken one-at-a-time (index, released, then tokens) so this never nests with the writer's order.
+    /// Look up a token by its secret's `hash` — used by the authenticator on every authenticated
+    /// request, so O(1) via the derived index rather than a linear scan. `None` if no such **live**
+    /// token, so a revoked or **expired** token fails authentication. The two locks are taken
+    /// one-at-a-time (index, released, then tokens) so this never nests with the writer's order.
     pub fn find_token(&self, hash: &str) -> Option<ApiToken> {
         let id = self
             .token_by_hash
@@ -942,7 +939,7 @@ impl Registry {
         (!token.is_expired(now_ms())).then_some(token)
     }
 
-    /// Rebuild the B13 hash→id index from the current token map. Cheap (tokens are few and change
+    /// Rebuild the hash→id index from the current token map. Cheap (tokens are few and change
     /// rarely), and rebuilding wholesale after each mutation avoids incremental-sync bugs. Must be
     /// called with **no** `tokens` write lock held — it takes `tokens` read then `token_by_hash` write.
     fn rebuild_token_index(&self) {
@@ -957,7 +954,7 @@ impl Registry {
             .unwrap_or_else(|e| e.into_inner()) = index;
     }
 
-    /// A monotonic-ish token id (task-105): `tok-<ms>-<counter>`.
+    /// A monotonic-ish token id: `tok-<ms>-<counter>`.
     pub fn next_token_id(&self) -> String {
         format!(
             "tok-{}-{}",
@@ -967,7 +964,7 @@ impl Registry {
         )
     }
 
-    /// Append a lifecycle event to `index`'s activity log (task-110), trimmed to the retention cap.
+    /// Append a lifecycle event to `index`'s activity log, trimmed to the retention cap.
     /// Best-effort persist — a sidecar write failure never fails the mutation that recorded it.
     pub fn record_activity(
         &self,
@@ -988,12 +985,12 @@ impl Registry {
                 let drop = events.len() - ACTIVITY_RETAIN;
                 events.drain(0..drop);
             }
-        } // drop the data lock before any I/O — the fsync no longer blocks reads/appends (B11).
+        } // drop the data lock before any I/O — the fsync no longer blocks reads/appends.
         self.flush_activity();
     }
 
-    /// Persist the activity sidecar off the data lock, coalescing bursts (task-151 / B11). An
-    /// isolated event flushes immediately (synchronous durability preserved); events arriving within
+    /// Persist the activity sidecar off the data lock, coalescing bursts. An isolated event flushes
+    /// immediately (synchronous durability preserved); events arriving within
     /// [`ACTIVITY_FLUSH_DEBOUNCE_MS`] of the last write are marked `dirty` and folded into the next
     /// flush — a later event past the window, or the [`Drop`] shutdown flush. Best-effort: a write
     /// failure never fails the mutation that recorded the event.
@@ -1024,7 +1021,7 @@ impl Registry {
     }
 
     /// The subject's **session epoch** (epoch ms): a session JWT with `iat` before this is stale and
-    /// must be rejected (task-147 / B4). `0` means no revocation is in effect for this subject.
+    /// must be rejected. `0` means no revocation is in effect for this subject.
     pub fn session_epoch(&self, subject: &str) -> i64 {
         self.session_epochs
             .read()
@@ -1034,10 +1031,10 @@ impl Registry {
             .unwrap_or(0)
     }
 
-    /// Invalidate all of `subject`'s outstanding sessions by advancing its session epoch to now
-    /// (task-147 / B4) — called when the subject's roles change or its credential is removed, so a
-    /// role downgrade / deprovision takes effect immediately (the next call with a stale session is
-    /// rejected and must re-authenticate with the current roles).
+    /// Invalidate all of `subject`'s outstanding sessions by advancing its session epoch to now —
+    /// called when the subject's roles change or its credential is removed, so a role downgrade /
+    /// deprovision takes effect immediately (the next call with a stale session is rejected and must
+    /// re-authenticate with the current roles).
     pub fn revoke_sessions(&self, subject: &str) {
         let mut epochs = self
             .session_epochs
@@ -1049,7 +1046,7 @@ impl Registry {
         }
     }
 
-    /// `index`'s activity events, **newest first**, capped at `limit` (0 = all retained, task-110).
+    /// `index`'s activity events, **newest first**, capped at `limit` (0 = all retained).
     pub fn list_activity(&self, index: &str, limit: usize) -> Vec<ActivityEvent> {
         let log = self.activity.read().unwrap_or_else(|e| e.into_inner());
         let Some(events) = log.get(index) else {
@@ -1059,7 +1056,7 @@ impl Registry {
         events.iter().rev().take(take).cloned().collect()
     }
 
-    /// Resolve a `name` to the concrete indexes a search/route should touch (task-52): an **alias**
+    /// Resolve a `name` to the concrete indexes a search/route should touch: an **alias**
     /// → its members; an exact **index** name → just itself; an **index pattern** (a glob like
     /// `events-*`) → every registered index whose name matches, sorted; anything else → empty.
     /// Patterns are resolved here at read time, so a growing set needs no maintained alias.
@@ -1107,11 +1104,11 @@ impl Registry {
         self.with_shard(index, shard, |a| a.primary = Some(node.into()))
     }
 
-    /// Set `node` as the primary for **all** of `shards` of `index` in a **single** persist (task-202)
-    /// — the batched form of [`assign_primary`]. A node serving K ordinals used to call
-    /// `assign_primary` K times, each a full `registry.json` rewrite, so bringing up an N-shard index
-    /// was O(N) rewrites of an O(N)-sized file = O(N²) bytes. This mutates all K in memory under one
-    /// lock, then persists once. Errors if the index is unregistered.
+    /// Set `node` as the primary for **all** of `shards` of `index` in a **single** persist — the
+    /// batched form of [`assign_primary`]. Calling `assign_primary` per ordinal would be a full
+    /// `registry.json` rewrite each time, so bringing up an N-shard index would be O(N) rewrites of
+    /// an O(N)-sized file = O(N²) bytes. This mutates all K in memory under one lock, then persists
+    /// once. Errors if the index is unregistered.
     pub fn assign_primaries(
         &self,
         index: &str,
@@ -1157,16 +1154,16 @@ impl Registry {
 
     /// **Promote** the first replica of `shard` to primary (the mechanism leader election runs on
     /// primary loss), returning the promoted node. Errors if the index is unregistered, the shard
-    /// has no replica, or — the **fencing precondition** (task-74) — a primary is still assigned:
-    /// the caller must fence/clear the old primary first (`remove_node`), so promotion can't
-    /// produce two primaries for one shard (split brain).
+    /// has no replica, or — the **fencing precondition** — a primary is still assigned: the caller
+    /// must fence/clear the old primary first (`remove_node`), so promotion can't produce two
+    /// primaries for one shard (split brain).
     pub fn promote_replica(&self, index: &str, shard: u32) -> Result<NodeId> {
         let mut map = self.write_map();
         let entry = map
             .get_mut(index)
             .ok_or_else(|| RegistryError::NotFound(index.to_string()))?;
         let assignment = entry.shards.entry(shard).or_default();
-        // Fencing (M1): refuse to promote over a still-assigned primary — clear it first.
+        // Fencing: refuse to promote over a still-assigned primary — clear it first.
         if let Some(primary) = &assignment.primary {
             return Err(RegistryError::PrimaryStillAssigned {
                 index: index.to_string(),
@@ -1192,7 +1189,7 @@ impl Registry {
         self.read_map().get(index).map(|e| e.shards.clone())
     }
 
-    // ---- virtual-bucket map (task-77) ------------------------------------------
+    // ---- virtual-bucket map ----------------------------------------------------
 
     /// The stored [`BucketMap`] for `index`, or `None` when it routes **legacy** (`fnv % shards`).
     /// The single source of truth both the connector (writes) and the Gateway (reads) route
@@ -1236,8 +1233,8 @@ impl Registry {
         }
     }
 
-    /// **Plan** a reshard of `index` to `new_shard_count` (task-77): the bounded, balanced
-    /// bucket→shard reassignment to reach the new count — computed, **not applied**. The returned
+    /// **Plan** a reshard of `index` to `new_shard_count`: the bounded, balanced bucket→shard
+    /// reassignment to reach the new count — computed, **not applied**. The returned
     /// move list is the migration work-list for the online cutover (a later slice). Read-only and
     /// safe to call anytime; errors only if the index is unknown.
     pub fn plan_reshard(&self, index: &str, new_shard_count: u32) -> Result<Reassignment> {
@@ -1260,7 +1257,7 @@ impl Registry {
         self.persist_snapshot()
     }
 
-    // ---- window map (task-81) --------------------------------------------------
+    // ---- window map ------------------------------------------------------------
 
     /// Set the **primary** node for a time `window` of `index` (creating the assignment if absent).
     /// The node calls this when it begins serving a window shard. Errors if the index is absent.
@@ -1308,10 +1305,10 @@ impl Registry {
         self.persist_snapshot()
     }
 
-    // ---- CP-driven windowed placement (task-219) -------------------------------
+    // ---- CP-driven windowed placement ------------------------------------------
 
-    /// Record a node's liveness **heartbeat** for a windowed `index` (task-219): the node calls this
-    /// on registration + on an interval to stay in the placement pool. In-memory only (see
+    /// Record a node's liveness **heartbeat** for a windowed `index`: the node calls this on
+    /// registration + on an interval to stay in the placement pool. In-memory only (see
     /// [`node_heartbeats`](Self::node_heartbeats)); `now_ms` is the control plane's wall clock. No
     /// index existence check — a node may heartbeat before its first window is placed.
     pub fn register_node(&self, index: &str, endpoint: &str, now_ms: i64) {
@@ -1338,8 +1335,8 @@ impl Registry {
     }
 
     /// Resolve the node that owns `window` of `index`, **placing it on first ask** — the CP-driven
-    /// windowed assignment (task-219). The connector/writer calls this to learn where to route a row
-    /// whose window it just computed.
+    /// windowed assignment. The connector/writer calls this to learn where to route a row whose
+    /// window it just computed.
     ///
     /// - **Idempotent:** a window already assigned to a **live** node returns that node (`created =
     ///   false`), so repeated asks are stable.
@@ -1403,8 +1400,8 @@ impl Registry {
 }
 
 impl Drop for Registry {
-    /// Flush any activity events a debounce window left in memory (task-151 / B11) so a graceful
-    /// shutdown doesn't lose the tail of a burst. Best-effort; runs before `_lock`'s flock releases.
+    /// Flush any activity events a debounce window left in memory so a graceful shutdown doesn't
+    /// lose the tail of a burst. Best-effort; runs before `_lock`'s flock releases.
     fn drop(&mut self) {
         let dirty = self
             .activity_flush
@@ -1422,11 +1419,11 @@ impl Drop for Registry {
 
 /// Load the catalog from `path`, parsing the `{ version, indexes }` envelope. On a parse failure
 /// (a corrupt file), fall back to the last-known-good `.prev` copy with a loud warning instead of
-/// hard-failing — bricking the control plane on a single bad file would be worse (task-70).
+/// hard-failing — bricking the control plane on a single bad file would be worse.
 /// Match an index `pattern` (a `*`-glob like `events-*` / `*-2025` / `a*b`) against `name`.
 /// `*` matches any (possibly empty) run of characters; there is no `?`. Index names are ASCII
 /// identifiers, so byte-slicing on the literal segments is safe. Public so clients filtering a
-/// listed index set (e.g. CLI retention, task-52) match patterns the same way `resolve` does.
+/// listed index set (e.g. CLI retention) match patterns the same way `resolve` does.
 pub fn glob_match(pattern: &str, name: &str) -> bool {
     let parts: Vec<&str> = pattern.split('*').collect();
     if parts.len() == 1 {
@@ -1500,7 +1497,7 @@ fn load(path: &std::path::Path) -> Result<LoadedRegistry> {
     }
 }
 
-/// Persist the activity sidecar (task-110) durably (temp + rename + fsync).
+/// Persist the activity sidecar durably (temp + rename + fsync).
 fn persist_activity(
     path: &std::path::Path,
     log: &BTreeMap<String, Vec<ActivityEvent>>,
@@ -1516,7 +1513,7 @@ fn persist_sessions(path: &std::path::Path, epochs: &BTreeMap<String, i64>) -> R
     Ok(())
 }
 
-/// Epoch milliseconds (task-106 saved-query timestamps).
+/// Epoch milliseconds.
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1531,8 +1528,8 @@ mod tests {
 
     #[test]
     fn credentials_hash_verify_and_persist() {
-        // task-128: built-in credentials are salted-argon2-hashed, verified, persisted, and the
-        // plaintext is never written to disk.
+        // Built-in credentials are salted-argon2-hashed, verified, persisted, and the plaintext is
+        // never written to disk.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("registry.json");
         {
@@ -1559,9 +1556,9 @@ mod tests {
 
     #[test]
     fn activity_debounces_bursts_but_persists_isolated_events_and_survives_reload() {
-        // task-151 / B11: an isolated activity event flushes to the sidecar immediately (durability
-        // preserved), a same-window burst coalesces (later events aren't fsynced per-event), and the
-        // debounced tail is flushed on graceful shutdown so nothing is lost across a restart.
+        // An isolated activity event flushes to the sidecar immediately (durability preserved), a
+        // same-window burst coalesces (later events aren't fsynced per-event), and the debounced
+        // tail is flushed on graceful shutdown so nothing is lost across a restart.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("registry.json");
         let activity_path = dir.path().join("activity.json");
@@ -1596,8 +1593,8 @@ mod tests {
 
     #[test]
     fn persist_snapshot_captures_every_map_across_mutations() {
-        // task-151 / F10: each mutation persists the FULL snapshot (all maps), not just the one it
-        // changed — so interleaved mutations to different maps all survive a restart.
+        // Each mutation persists the FULL snapshot (all maps), not just the one it changed — so
+        // interleaved mutations to different maps all survive a restart.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("registry.json");
         {
@@ -1607,7 +1604,7 @@ mod tests {
             reg.set_user_roles("alice", vec!["admin".into()]).unwrap(); // role_bindings
             reg.set_credential("alice", "pw").unwrap(); // credentials
             reg.set_user_indexes("alice", vec!["docs".into(), "catalog".into()])
-                .unwrap(); // index_bindings (task-244)
+                .unwrap(); // index_bindings
         }
         let reg2 = Registry::open(&path).unwrap();
         assert!(reg2.get("docs").is_some(), "index survived");
@@ -1631,8 +1628,8 @@ mod tests {
 
     #[test]
     fn index_bindings_scope_a_subject_and_revoke_sessions_on_change() {
-        // task-244: a subject's index allowlist is de-duplicated, revokes outstanding sessions on
-        // change (so a re-scoped session must re-authenticate), and clears when set empty.
+        // A subject's index allowlist is de-duplicated, revokes outstanding sessions on change (so a
+        // re-scoped session must re-authenticate), and clears when set empty.
         let dir = tempfile::tempdir().unwrap();
         let reg = Registry::open(dir.path().join("registry.json")).unwrap();
         assert!(
@@ -1672,8 +1669,8 @@ mod tests {
 
     #[test]
     fn window_placement_is_least_loaded_idempotent_and_deterministic() {
-        // task-219: CP-driven placement spreads windows evenly over live nodes, deterministically,
-        // and is idempotent for an already-placed live window.
+        // CP-driven placement spreads windows evenly over live nodes, deterministically, and is
+        // idempotent for an already-placed live window.
         let tmp = tempfile::tempdir().unwrap();
         let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
         reg.create(resolved("logs")).unwrap();
@@ -1706,8 +1703,8 @@ mod tests {
 
     #[test]
     fn window_placement_reaps_a_dead_owner_and_re_places() {
-        // task-219: a window whose owner stops heartbeating (past the TTL) is re-placed on a live
-        // node; with no live node at all, placement errors so the caller retries.
+        // A window whose owner stops heartbeating (past the TTL) is re-placed on a live node; with
+        // no live node at all, placement errors so the caller retries.
         let tmp = tempfile::tempdir().unwrap();
         let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
         reg.create(resolved("logs")).unwrap();
@@ -2014,7 +2011,7 @@ mod tests {
         let reg = Registry::open(&path).unwrap();
         reg.create(resolved("docs")).unwrap();
 
-        // One call assigns every ordinal to the node (task-202 batched bring-up, one persist).
+        // One call assigns every ordinal to the node (batched bring-up, one persist).
         reg.assign_primaries("docs", &[0, 1, 2], "node-a").unwrap();
         let entry = reg.get("docs").unwrap();
         for ord in 0..3u32 {
@@ -2060,7 +2057,7 @@ mod tests {
         assert_eq!(a.primary, Some(NodeId::from("node-b")));
         assert_eq!(a.replicas, vec![NodeId::from("node-c")]);
 
-        // Promoting with a primary still assigned is refused — fence it first (task-74).
+        // Promoting with a primary still assigned is refused — fence it first.
         assert!(matches!(
             reg.promote_replica("docs", 0),
             Err(RegistryError::PrimaryStillAssigned { .. })
@@ -2077,8 +2074,8 @@ mod tests {
 
     #[test]
     fn promote_replica_fences_against_split_brain() {
-        // The split-brain-avoidance precondition (task-74 M1): with a live primary assigned,
-        // promote_replica refuses — the lease driver must clear/fence the old primary first.
+        // The split-brain-avoidance precondition: with a live primary assigned, promote_replica
+        // refuses — the lease driver must clear/fence the old primary first.
         let tmp = tempfile::tempdir().unwrap();
         let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
         reg.create(resolved("docs")).unwrap();
@@ -2106,7 +2103,7 @@ mod tests {
 
     #[test]
     fn open_is_single_writer() {
-        // A second open of the same registry fails fast while the first holds the lock (task-74).
+        // A second open of the same registry fails fast while the first holds the lock.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("registry.json");
         let first = Registry::open(&path).unwrap();
@@ -2121,7 +2118,7 @@ mod tests {
 
     #[test]
     fn locks_recover_from_poisoning() {
-        // A panic while holding the write lock must not wedge the registry (task-74 M4).
+        // A panic while holding the write lock must not wedge the registry.
         use std::sync::Arc;
         let tmp = tempfile::tempdir().unwrap();
         let reg = Arc::new(Registry::open(tmp.path().join("registry.json")).unwrap());
@@ -2210,8 +2207,8 @@ mod tests {
 
     #[test]
     fn tokens_are_found_by_hash_expire_and_survive_reload() {
-        // task-151 / B13: O(1) hash lookup, expiry enforcement + pruning, and a derived index that's
-        // rebuilt on open.
+        // O(1) hash lookup, expiry enforcement + pruning, and a derived index that's rebuilt on
+        // open.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("registry.json");
         let mk = |id: &str, hash: &str, expires: Option<i64>| ApiToken {
@@ -2253,9 +2250,9 @@ mod tests {
 
     #[test]
     fn concurrent_auth_mutations_dont_deadlock_and_persist() {
-        // task-151 / B5: every mutation holds only the map it changes (persist_snapshot re-reads the
-        // rest off-lock), so hammering different auth maps concurrently completes without a
-        // lock-order deadlock and each change is durably persisted.
+        // Every mutation holds only the map it changes (persist_snapshot re-reads the rest
+        // off-lock), so hammering different auth maps concurrently completes without a lock-order
+        // deadlock and each change is durably persisted.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("registry.json");
         let reg = Registry::open(&path).unwrap();

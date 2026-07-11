@@ -1,4 +1,4 @@
-# microk8s (a 3-node cluster) — resilience / chaos cluster (task-115).
+# microk8s (a 3-node cluster) — resilience / chaos cluster.
 # HA posture: a 3-shard index, one primary pod per shard spread across the 3 nodes; the gateway
 # fronts the live control-plane and hot-reloads; a lost shard/host serves honest partial results and
 # self-heals from its PV. Pair with: helm install ... -f values-microk8s.yaml
@@ -20,7 +20,7 @@ imagePullSecrets:
   - name: ghcr-pull
 
 # 3 shards → one primary pod per shard; anti-affinity (node.spreadReplicas, default true) puts each
-# on a different mini-PC, so losing one box drops at most one shard (partial results) and it self-heals.
+# on a different node, so losing one host drops at most one shard (partial results) and it self-heals.
 index:
   name: docs
   sourceTable: growlerdb.docs
@@ -51,8 +51,8 @@ gateway:
   podDisruptionBudget:
     enabled: true
     minAvailable: 1
-  # Reach the console from the LAN without an Ingress controller. Home LAN → auth left open for the
-  # chaos drills; enable gateway.auth.oidc before exposing publicly.
+  # Reach the console from the LAN without an Ingress controller. Auth is left open for the chaos
+  # drills; enable gateway.auth.oidc before exposing publicly.
   service:
     type: NodePort
 

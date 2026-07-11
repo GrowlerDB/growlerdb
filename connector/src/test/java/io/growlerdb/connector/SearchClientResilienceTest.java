@@ -18,7 +18,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 /**
- * Resilience of the read-path {@link SearchClient} (task-152 / F12) — the mirror of
+ * Resilience of the read-path {@link SearchClient}, the mirror of
  * {@link WriteClientResilienceTest}. A wedged Node/Gateway must fail fast at the deadline instead of
  * hanging the query thread, and a transient blip must be retried (a read is idempotent).
  */

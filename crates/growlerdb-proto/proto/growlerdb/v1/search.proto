@@ -10,7 +10,7 @@ option java_package = "io.growlerdb.proto.v1";
 
 import "growlerdb/v1/common.proto";
 
-// One sort key — a numeric/date fast field + direction (task-23).
+// One sort key — a numeric/date fast field + direction.
 message Sort {
   string field = 1;       // a numeric/date fast field
   bool descending = 2;    // false = ascending
@@ -18,8 +18,8 @@ message Sort {
 
 // One sort-key value of a hit (mirrors `growlerdb_core::SortValue`): the cell the
 // store/Gateway orders by. A doc lacking the field is `missing` (sorts last). Carried
-// on each `SearchHit` so the Gateway can merge field-sorted pages across shards
-// (task-29) — without it a cross-shard field sort has no values to order by.
+// on each `SearchHit` so the Gateway can merge field-sorted pages across shards —
+// without it a cross-shard field sort has no values to order by.
 message SortValue {
   oneof kind {
     double num = 1;       // numeric/date (DATE = epoch micros)
@@ -37,7 +37,7 @@ enum ScoreMode {
   SCORE_GLOBAL = 1;       // global term stats (reserved; not yet implemented)
 }
 
-// How the `query` string is parsed (task-22/task-90). Both grammars exist in core; the request
+// How the `query` string is parsed. Both grammars exist in core; the request
 // chooses. Default LUCENE keeps existing clients unchanged.
 enum QuerySyntax {
   LUCENE = 0;            // Lucene syntax (default): AND/OR/NOT, &&/||, leading -
@@ -45,46 +45,46 @@ enum QuerySyntax {
 }
 
 message SearchRequest {
-  string query = 1;       // Lucene/KQL query string (task-22)
+  string query = 1;       // Lucene/KQL query string
   uint32 limit = 2;       // page size (top-K)
   uint32 offset = 3;      // from/size paging; ignored when search_after is set
   // Sort keys, in priority order (earlier keys dominate; a composite-key
   // tiebreaker is applied implicitly). Empty = rank by score, descending.
   repeated Sort sort = 4;
-  // Opaque keyset cursor from a prior response's next_cursor (task-23): return
+  // Opaque keyset cursor from a prior response's next_cursor: return
   // the page strictly after it. Empty = first page. Requires a non-empty sort.
   bytes search_after = 5;
-  // Field collapsing (task-23): collapse results to the top hit per distinct value
+  // Field collapsing: collapse results to the top hit per distinct value
   // of this fast field, with a per-hit group + count. Empty = no collapse. When
   // set, requires a non-empty sort and ignores offset/search_after paging.
   string collapse = 6;
-  // Point-in-time handle (task-65) from OpenPit: read against that frozen
+  // Point-in-time handle from OpenPit: read against that frozen
   // snapshot instead of the latest. 0 = read the latest committed state.
   uint64 pit_id = 7;
   // Multi-shard scoring mode (design/09). Default SCORE_LOCAL; SCORE_GLOBAL is
   // reserved for the two-phase global-stats path and currently behaves as LOCAL.
   ScoreMode score_mode = 8;
-  // Time-window selector for distributed windowed routing (task-82): the window id this
+  // Time-window selector for distributed windowed routing: the window id this
   // request targets when a Node serves multiple windows over one endpoint. Gateway-set per
   // scattered shard (see WindowNode); 0 = not windowed / single shard, ignored by a
   // single-shard SearchService. Clients never set this.
   int64 window = 9;
-  // Query-string grammar (task-90). Default LUCENE; KQL parses the same `query` with the KQL
+  // Query-string grammar. Default LUCENE; KQL parses the same `query` with the KQL
   // grammar. Only the search path honors it today (aggregate/export stay Lucene).
   QuerySyntax syntax = 10;
-  // Target index name (task-99): scope the search to one named index. A serving Gateway fronts a
+  // Target index name: scope the search to one named index. A serving Gateway fronts a
   // single index; if this is non-empty and names a different index than the one served here, the
   // Gateway answers NOT_FOUND rather than silently searching the wrong index. Empty = the index
   // this endpoint serves (back-compat). Alias resolution is done client-side (alias → target).
   string index = 11;
-  // Opt-in **server-side highlighting** (task-250): when set, each hit carries `highlight` —
+  // Opt-in **server-side highlighting**: when set, each hit carries `highlight` —
   // per-field fragments of the analyzed match (stemming/positions reflected). Off by default
   // (highlighting reads stored text + runs a snippet generator, a per-hit cost). Unset ⇒ no
   // highlights (the console falls back to its client-side term marker).
   HighlightRequest highlight = 12;
 }
 
-// Server-side highlight options (task-250). Only analyzed **TEXT** fields whose text is available
+// Server-side highlight options. Only analyzed **TEXT** fields whose text is available
 // (the field is `cached`/stored) can be highlighted; a requested field that is neither is skipped.
 message HighlightRequest {
   // The TEXT fields to highlight. Empty = a sensible default: every analyzed TEXT field the index
@@ -98,7 +98,7 @@ message HighlightRequest {
 }
 
 // One matched fragment of a highlighted field, as XSS-safe **segments** rather than pre-marked
-// HTML (task-250): a client renders each segment's `text`, wrapping `marked` ones in `<mark>`/`<em>`
+// HTML: a client renders each segment's `text`, wrapping `marked` ones in `<mark>`/`<em>`
 // with no `innerHTML`. Mirrors the console's `Segment` shape so the wire and the client-side
 // fallback render identically.
 message HighlightSegment {
@@ -127,11 +127,11 @@ message SearchHit {
   // The hit's value for each request sort key, in order. Set for field-sorted
   // searches (so the Gateway can merge across shards); empty when ranked by score.
   repeated SortValue sort_values = 5;
-  // Cached display-field values returned **with the hit** (D23, task-86): the fields the index
+  // Cached display-field values returned **with the hit**: the fields the index
   // marks `cached`, so a results page renders document-like rows without a hydration round-trip.
   // Empty when the index caches no display fields. The authoritative row is still GetByKey.
   repeated Field fields = 6;
-  // Server-side **highlights** (task-250): field name → matched fragments, present only when the
+  // Server-side **highlights**: field name → matched fragments, present only when the
   // request opted in via `SearchRequest.highlight`. Reflects the analyzed match (stemming/positions),
   // unlike the console's client-side literal-term marker. Empty when highlighting wasn't requested
   // or the hit had no matching fragment in any highlightable field.
@@ -142,22 +142,22 @@ message SearchResponse {
   repeated SearchHit hits = 1;
   // Total documents matching the query (live count), NOT the page size — a 10k-match
   // query with limit=10 reports total=10000. A Gateway sums it across shards for a true
-  // global total (task-68). For a collapsed search this is the number of groups on the page.
+  // global total. For a collapsed search this is the number of groups on the page.
   uint64 total = 2;
-  // Opaque cursor to fetch the next page via search_after (task-23). Empty when
+  // Opaque cursor to fetch the next page via search_after. Empty when
   // the query is unsorted or the page is empty (no more results).
   bytes next_cursor = 3;
   // Set by the Gateway when at least one shard failed to respond, so the page is
-  // incomplete — a down shard is a flagged gap, never a silent one (task-29).
+  // incomplete — a down shard is a flagged gap, never a silent one.
   bool partial = 4;
   // Shards the Gateway actually queried for this response (a time/window filter prunes shards it
-  // can prove won't match, task-81), and `shards_total` the index's full shard count. The console
-  // shows a "scanned/total" ratio (task-133). Both 0 from a bare Node (no shard scope).
+  // can prove won't match), and `shards_total` the index's full shard count. The console
+  // shows a "scanned/total" ratio. Both 0 from a bare Node (no shard scope).
   uint32 shards_scanned = 5;
   uint32 shards_total = 6;
 }
 
-// Open a point-in-time snapshot (task-65): subsequent reads carrying the returned
+// Open a point-in-time snapshot: subsequent reads carrying the returned
 // pit_id observe that frozen state until ClosePit (or TTL expiry).
 message OpenPitRequest {}
 message OpenPitResponse {
@@ -168,7 +168,7 @@ message OpenPitResponse {
 message ClosePitRequest { uint64 pit_id = 1; }
 message ClosePitResponse { bool closed = 1; }   // false if it was already gone
 
-// Stream a full result set at a consistent snapshot (task-65 scroll export): keyset
+// Stream a full result set at a consistent snapshot: keyset
 // `search_after` paging under the hood, so no gaps/dupes even under concurrent writes.
 message ExportRequest {
   string query = 1;            // Lucene/KQL query string
@@ -179,7 +179,7 @@ message ExportRequest {
   uint64 pit_id = 4;
 }
 
-// Run aggregations over the docs a query matches (task-24). `aggs` is a JSON object of
+// Run aggregations over the docs a query matches. `aggs` is a JSON object of
 // name → agg spec (externally-tagged `Agg`, e.g. `{"by_city": {"Terms": {"field": "city",
 // "size": 10}}}`); `results` is name → result JSON.
 message AggregateRequest {
@@ -188,11 +188,11 @@ message AggregateRequest {
   // When set, the Node returns the **mergeable intermediate** result in `partial` (binary)
   // instead of finalizing — the Gateway sets this to scatter, merge, then finalize.
   bool partial = 3;
-  // Time-window selector for distributed windowed routing (task-82), mirroring
+  // Time-window selector for distributed windowed routing, mirroring
   // SearchRequest.window: gateway-set per scattered window; 0 = not windowed,
   // ignored by a single-shard node. Clients never set this.
   int64 window = 4;
-  // Target index name (task-240 multi-index routing): scope the aggregation to one named index on
+  // Target index name: scope the aggregation to one named index on
   // a multi-index Gateway. Empty = the endpoint's default/only index (back-compat). Mirrors
   // SearchRequest.index; an unknown index on a serving Gateway answers NOT_FOUND.
   string index = 5;
@@ -202,8 +202,8 @@ message AggregateResponse {
   string results = 1;  // finalized JSON (name -> result); set when the request wasn't partial
   bytes partial = 2;   // mergeable intermediate bytes; set when the request was partial
   // Number of shards that failed to respond (Gateway-set; 0 = complete). When > 0 the
-  // merged aggregation under-counts those shards' docs — a flagged gap, never silent
-  // (task-67). Named distinctly because `partial` above is the mergeable-bytes channel.
+  // merged aggregation under-counts those shards' docs — a flagged gap, never silent.
+  // Named distinctly because `partial` above is the mergeable-bytes channel.
   uint32 failed_shards = 3;
 }
 
@@ -218,17 +218,17 @@ service Search {
   rpc Export(ExportRequest) returns (stream SearchResponse);
   // Aggregate over the docs a query matches.
   rpc Aggregate(AggregateRequest) returns (AggregateResponse);
-  // Explain how a query scores one specific document (task-102): BM25 clause tree + analyzed terms.
+  // Explain how a query scores one specific document: BM25 clause tree + analyzed terms.
   rpc Explain(ExplainRequest) returns (ExplainResponse);
 }
 
-// Explain a single document's score for a query (task-102). Opt-in, per-hit: default search never
+// Explain a single document's score for a query. Opt-in, per-hit: default search never
 // computes this. The coordinate names the doc; the gateway routes to its owning shard.
 message ExplainRequest {
   string query = 1;             // Lucene/KQL query string
   Coordinates coordinates = 2;  // the document to explain
   QuerySyntax syntax = 3;       // grammar (Lucene default)
-  string index = 4;             // target index (task-99 scoping); empty = the served index
+  string index = 4;             // target index scoping; empty = the served index
 }
 
 // One node of the BM25 score-explanation tree (mirrors Tantivy's `Explanation`): a description, the
@@ -268,11 +268,11 @@ message ExplainResponse {
 message GetByKeyRequest {
   repeated Coordinates keys = 1;   // document coordinates to hydrate
   repeated string columns = 2;     // projection; empty = all source columns
-  // Time-window selector for distributed windowed routing (task-225): the Gateway broadcasts a
+  // Time-window selector for distributed windowed routing: the Gateway broadcasts a
   // hydration to every window (a key can live in any of them) and each WindowNode stamps its id here,
   // so the receiving multiplexer dispatches to the right shard. 0 (unset) on a single-shard/ordinal node.
   int64 window = 3;
-  // Target index name (task-240 multi-index routing): scope the hydration to one named index on a
+  // Target index name: scope the hydration to one named index on a
   // multi-index Gateway. Empty = the endpoint's default/only index (back-compat). Mirrors
   // SearchRequest.index; an unknown index on a serving Gateway answers NOT_FOUND.
   string index = 4;
@@ -288,7 +288,7 @@ message GetByKeyResponse {
   repeated HydratedRow rows = 1;   // in request order; a missing key is an error
   // Number of shards that failed to respond (Gateway-set; 0 = complete). A dropped
   // shard means some requested keys were skipped — an incomplete hydration, never a
-  // silent "not found" (task-67). Complements SearchResponse.partial.
+  // silent "not found". Complements SearchResponse.partial.
   uint32 failed_shards = 2;
 }
 
@@ -298,7 +298,7 @@ service Lookup {
   rpc GetByKey(GetByKeyRequest) returns (GetByKeyResponse);
 }
 
-// Term suggestions over an indexed field's dictionary (task-25).
+// Term suggestions over an indexed field's dictionary.
 enum SuggestKind {
   PREFIX = 0;   // autocomplete: terms starting with `text`
   FUZZY = 1;    // did-you-mean: terms within `max_edits` of `text`
@@ -310,11 +310,11 @@ message SuggestRequest {
   uint32 limit = 3;        // max suggestions (0 ⇒ a server default)
   SuggestKind kind = 4;    // PREFIX (default) or FUZZY
   uint32 max_edits = 5;    // FUZZY edit distance (0 ⇒ default; clamped)
-  // Time-window selector for distributed windowed routing (task-82), mirroring
+  // Time-window selector for distributed windowed routing, mirroring
   // SearchRequest.window: gateway-set per scattered window; 0 = not windowed,
   // ignored by a single-shard SuggestService. Clients never set this.
   int64 window = 6;
-  // Target index name (task-240 multi-index routing): scope the suggestion to one named index on a
+  // Target index name: scope the suggestion to one named index on a
   // multi-index Gateway. Empty = the endpoint's default/only index (back-compat). Mirrors
   // SearchRequest.index; an unknown index on a serving Gateway answers NOT_FOUND.
   string index = 7;
@@ -329,7 +329,7 @@ message Suggestion {
 message SuggestResponse {
   repeated Suggestion suggestions = 1;   // best first
   // Number of shards that failed to respond (Gateway-set; 0 = complete). When > 0 the
-  // merged suggestions under-count those shards — a flagged gap, never silent (task-67).
+  // merged suggestions under-count those shards — a flagged gap, never silent.
   uint32 failed_shards = 2;
 }
 

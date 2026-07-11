@@ -1,5 +1,5 @@
-// Sparkline geometry (task-93): turn a series into an SVG polyline `points` string, scaled to fit
-// a `w × h` box with a small vertical inset. Pure + tested so the Sparkline component is trivial.
+// Sparkline geometry: turn a series into an SVG polyline `points` string, scaled to fit a `w × h`
+// box with a small vertical inset. Pure + tested so the Sparkline component is trivial.
 
 /** `points` attribute for an SVG `<polyline>` over `values` in a `w × h` box (inset `pad` px top/
  *  bottom). A flat or single-point series draws a centred horizontal line. */

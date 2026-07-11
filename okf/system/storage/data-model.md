@@ -14,7 +14,7 @@ How an Iceberg row becomes an indexed document.
   routes the document, tie-breaks pagination, and is the handle for
   [hydration](/product/functional/hydration.md).
 - **Key value types** — key fields may be string, integer, boolean, or **temporal** (date /
-  timestamp, normalized to canonical **epoch microseconds UTC** at extraction — task-184); floats
+  timestamp, normalized to canonical **epoch microseconds UTC** at extraction); floats
   are rejected at definition time (unstable identity, NaN diverges cross-language). The type-tagged
   key encoding is a frozen cross-language contract (Rust `CompositeKey::encode` ↔ the JVM
   connector's `ShardRouter`), locked by golden parity vectors on both sides. A temporal key also
@@ -24,7 +24,7 @@ How an Iceberg row becomes an indexed document.
 - **Field types** — TEXT (analyzed), KEYWORD (exact), IP (CIDR), DATE, numeric, etc.; per-field
   analyzers; nested structures are **flattened** to dotted paths. A declared **timestamp** field
   (canonical epoch micros) enables [windowing](/product/functional/windowing-time.md).
-- **TEXT indexing detail** (task-216) — per-field `record: BASIC | FREQ | POSITION` (what each
+- **TEXT indexing detail** — per-field `record: BASIC | FREQ | POSITION` (what each
   posting carries; default `POSITION`, full fidelity) and `fieldnorms: bool` (BM25 length
   normalization; default on). Positions exist only for phrase queries and are usually the
   largest slice of a text field's inverted index — `FREQ` drops them while keeping full BM25;
@@ -33,7 +33,7 @@ How an Iceberg row becomes an indexed document.
 - **Cached display fields** — values stored *with* the hit so a results page renders without
   hydration; sensitive fields are never cached.
 - **Fast fields** — columnar-stored fields that are sortable / filterable / facetable / collapsible.
-  A fast numeric/date/IP field is **columnar-only by default** (task-215): range, exact-match,
+  A fast numeric/date/IP field is **columnar-only by default**: range, exact-match,
   sort, and exists all run on the fast field, so an inverted index alongside it would be dead
   weight (a per-doc-unique timestamp is the worst case — pure term-dict + postings bloat).
   `indexed: true` alongside `fast: true` keeps both; `indexed: false` without `fast` is rejected

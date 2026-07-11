@@ -1,15 +1,13 @@
-//! The **public gRPC Engine-API front** ([task-30] B1): tonic service adapters that
+//! The **public gRPC Engine-API front**: tonic service adapters that
 //! implement the Engine-API service traits by routing through the [`Gateway`] — the gRPC
 //! counterpart to the [REST front](crate::rest), so native gRPC clients (and the
 //! [SDK](https://docs.rs/growlerdb-client)) can target the Gateway instead of a Node directly.
 //!
 //! Scope mirrors the REST front: the **query + describe + aggregate** surface (`search`,
 //! `suggest`, `get_by_key`, `describe_index`, `aggregate`). PIT/export and admin *mutations*
-//! are intentionally **not** routed here — single-shard scroll + cross-shard affinity land
-//! with task-29, and alter / reindex are Node-direct / Control-Plane operations. Those methods
+//! are intentionally **not** routed here — single-shard scroll + cross-shard affinity are
+//! not yet routed, and alter / reindex are Node-direct / Control-Plane operations. Those methods
 //! return `Unimplemented` with a pointer, rather than silently degrading.
-//!
-//! [task-30]: ../../../design/06-service-architecture.md
 
 use std::sync::Arc;
 
@@ -166,7 +164,7 @@ impl Admin for GatewayAdmin {
         &self,
         _req: Request<ReconcileIndexRequest>,
     ) -> Result<Response<ReconcileIndexResponse>, Status> {
-        // Per-shard op (task-195): a reconcile is scoped to a shard's owned keys, so it must be
+        // Per-shard op: a reconcile is scoped to a shard's owned keys, so it must be
         // driven directly against each node (with that node's ordinal + bucket map), not fanned
         // through the gateway.
         Err(not_routed("ReconcileIndex"))

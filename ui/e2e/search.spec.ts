@@ -11,7 +11,7 @@ test.describe('Search & Explore', () => {
 
     await expect(page.getByText('2 result(s)')).toBeVisible();
     await expect(page.locator('.results .id').first()).toContainText('evt-1');
-    // Cached display fields (task-86) render as cells in the results table row.
+    // Cached display fields render as cells in the results table row.
     await expect(page.locator('.results .hit').first()).toContainText('sensor-1');
 
     // Open the document drawer for the first hit → authoritative Iceberg row (Fields tab).
@@ -20,7 +20,7 @@ test.describe('Search & Explore', () => {
     await expect(drawer).toBeVisible();
     await expect(drawer.getByRole('heading', { name: 'evt-1' })).toBeVisible();
     await expect(drawer).toContainText('temperature within range');
-    // Explain tab shows the real BM25 tree, analyzed terms, timings, and shard counts (task-102).
+    // Explain tab shows the real BM25 tree, analyzed terms, timings, and shard counts.
     await drawer.getByRole('tab', { name: 'Explain' }).click();
     await expect(drawer.getByText('BM25 score')).toBeVisible();
     await expect(drawer.getByText('TermQuery(status:ok)')).toBeVisible();

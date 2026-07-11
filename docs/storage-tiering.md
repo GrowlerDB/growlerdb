@@ -16,8 +16,8 @@ GrowlerDB keeps indexes on **local NVMe** for low-latency search, and can **tier
 immutable data to **object storage** to cut steady-state cost. Tiering is powerful for the right
 workload and counterproductive for the wrong one — this page is the decision guide.
 
-> Status: the **windowing** that tiering builds on is in progress (task-81); **parking/revive**
-> (task-80) and the object-storage-*served* backend (D3) are on the roadmap. The guidance below is
+> Status: the **windowing** that tiering builds on is in progress; **parking/revive**
+> and the object-storage-*served* backend are on the roadmap. The guidance below is
 > the design contract so you can model deployments against it.
 
 ## The one rule: tiering needs immutability
@@ -37,9 +37,9 @@ see [event-time vs ingest-time](#late-arriving-data-event-vs-ingest-time).
 
 ## How tiering works (the model)
 
-1. **Window** the index by an ingest-time field into contiguous shards (e.g. daily) — task-81.
+1. **Window** the index by an ingest-time field into contiguous shards (e.g. daily).
 2. **Hot window** (recent) stays on NVMe; **cold windows** (aged past a policy) are **parked**:
-   backed up to object storage and evicted from local disk — task-80, built on the
+   backed up to object storage and evicted from local disk, built on the
    [backup/restore](install#run-modes) machinery.
 3. A query **prunes** to the windows its time filter touches; if it touches a parked window, that
    window is **revived** (restored to NVMe) before serving.

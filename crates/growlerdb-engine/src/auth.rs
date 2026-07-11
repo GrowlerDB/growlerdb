@@ -1,10 +1,7 @@
-//! The **auth seam** ([Engine API], task-19): a pluggable authorization hook the
-//! gRPC/REST services consult before serving a request, plus the request context it
-//! inspects. The default [`AllowAll`] permits everything — real AuthN/AuthZ
-//! (OIDC/JWT/RBAC + tenant scoping) is **M4**; this milestone only stands up the seam
-//! so the services are written against it and a deployment can drop in policy later.
-//!
-//! [Engine API]: ../../../design/01-engine-api.md
+//! The **auth seam**: a pluggable authorization hook the gRPC/REST services consult
+//! before serving a request, plus the request context it inspects. The default
+//! [`AllowAll`] permits everything so the services are written against the seam and a
+//! deployment can drop in policy (OIDC/JWT/RBAC + tenant scoping) later.
 
 use std::sync::Arc;
 
@@ -12,7 +9,7 @@ use growlerdb_proto::to_status;
 use growlerdb_proto::v1::Error as WireError;
 use tonic::{Code, Request, Status};
 
-/// Metadata key carrying the caller principal (M2: opaque; an OIDC/JWT `sub` in M4). The
+/// Metadata key carrying the caller principal (an OIDC/JWT `sub`). The
 /// [AuthN layer](crate::authn) stamps the *verified* principal here, overriding any
 /// caller-asserted value, so this seam always reads a trusted identity once AuthN is on.
 pub(crate) const PRINCIPAL_KEY: &str = "x-growlerdb-principal";
@@ -22,15 +19,15 @@ pub(crate) const TENANT_KEY: &str = "x-growlerdb-tenant";
 /// [AuthN layer](crate::authn) stamps these from validated token/key claims; an
 /// [RBAC policy](crate::rbac) maps them to operation scopes.
 pub(crate) const ROLES_KEY: &str = "x-growlerdb-roles";
-/// Metadata key carrying the caller's **index allowlist** (comma-separated) for per-index RBAC
-/// (task-240). The [AuthN layer](crate::authn) stamps this from a validated token's `indexes` claim;
+/// Metadata key carrying the caller's **index allowlist** (comma-separated) for per-index RBAC.
+/// The [AuthN layer](crate::authn) stamps this from a validated token's `indexes` claim;
 /// when non-empty, an [RBAC policy](crate::rbac) restricts the caller to those indexes, so a token
-/// scoped to index A cannot read index B. Empty/absent = unrestricted across indexes (back-compat).
+/// scoped to index A cannot read index B. Empty/absent = unrestricted across indexes.
 pub(crate) const INDEXES_KEY: &str = "x-growlerdb-indexes";
 
 /// What an [`AuthHook`] inspects: the RPC method and the principal/tenant the
-/// transport extracted from request metadata. `tenant` is the seam future query
-/// execution will AND into the filter (tenant isolation); unused under [`AllowAll`].
+/// transport extracted from request metadata. `tenant` is the seam query execution
+/// ANDs into the filter (tenant isolation); unused under [`AllowAll`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuthContext {
     /// The RPC method being called (e.g. `"Search"`, `"GetByKey"`).
@@ -42,14 +39,14 @@ pub struct AuthContext {
     /// The caller's verified roles (empty if none) — what an [RBAC policy](crate::rbac)
     /// maps to operation scopes.
     pub roles: Vec<String>,
-    /// The **resolved target index** of the request, if the caller is index-scoped (task-240
-    /// multi-index RBAC). `Some` when the [`Gateway`](crate::gateway::Gateway) resolved the request's
+    /// The **resolved target index** of the request, if the caller is index-scoped.
+    /// `Some` when the [`Gateway`](crate::gateway::Gateway) resolved the request's
     /// `index` field to a served index before authorizing; `None` for index-agnostic calls (cluster
     /// ops, or an un-routed call). A [per-index policy](crate::rbac) uses this to deny a token valid
     /// for one index from reading another.
     pub index: Option<String>,
-    /// The caller's **index allowlist** from the token's `indexes` claim (task-240). When non-empty
-    /// the caller may only operate on these indexes; empty = unrestricted (back-compat). Enforced by
+    /// The caller's **index allowlist** from the token's `indexes` claim. When non-empty
+    /// the caller may only operate on these indexes; empty = unrestricted. Enforced by
     /// an [RBAC policy](crate::rbac) against `index`.
     pub allowed_indexes: Vec<String>,
 }
@@ -79,7 +76,7 @@ pub trait AuthHook: Send + Sync {
     fn authorize(&self, ctx: &AuthContext) -> Result<(), AuthDenied>;
 }
 
-/// The default no-op hook: permits every request. Enforcement is M4.
+/// The default no-op hook: permits every request.
 #[derive(Debug, Clone, Default)]
 pub struct AllowAll;
 
@@ -111,7 +108,7 @@ pub fn authorize<T>(
     authorize_index(auth, method, None, request)
 }
 
-/// As [`authorize`], but carrying the request's **resolved target index** (task-240 per-index RBAC):
+/// As [`authorize`], but carrying the request's **resolved target index** (per-index RBAC):
 /// the [`Gateway`](crate::gateway::Gateway) resolves a read/write's `index` field to a served index,
 /// then authorizes against it so a [per-index policy](crate::rbac) can deny a token scoped to one
 /// index from operating on another. `index = None` behaves exactly like [`authorize`].
@@ -158,7 +155,7 @@ pub fn authorize_index<T>(
 
 /// The verified tenant claim a request carries (the `x-growlerdb-tenant` the
 /// [AuthN layer](crate::authn) stamps), or `None`. Drives [tenant scoping](crate::rbac) —
-/// the mandatory per-read filter (task-38).
+/// the mandatory per-read filter.
 pub(crate) fn tenant_of<T>(request: &Request<T>) -> Option<String> {
     request
         .metadata()

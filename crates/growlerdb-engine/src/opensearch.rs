@@ -1,4 +1,4 @@
-//! Optional **OpenSearch-compatible `_search` adapter** (task-50, [D4]). Translates a *documented
+//! Optional **OpenSearch-compatible `_search` adapter**. Translates a *documented
 //! subset* of the OpenSearch Query DSL into GrowlerDB's native query string (which parses to the
 //! canonical [`Query`](growlerdb_core::Query) AST), runs it through the [`Gateway`], and shapes the
 //! results as OpenSearch documents: `_id` synthesized from the **composite key**, `_source` filled
@@ -10,7 +10,6 @@
 //! outside it returns a clear error (`501` unsupported / `400` malformed) rather than silently
 //! mis-translating.
 //!
-//! [D4]: ../../../wiki/21-decisions.md
 //! [`GetByKey`]: crate::gateway::Gateway::get_by_key
 
 use std::sync::Arc;
@@ -358,7 +357,7 @@ pub fn translate_sort(sort: &JsonValue) -> Result<Vec<WireSort>, AdapterError> {
     Ok(out)
 }
 
-/// Translate an OpenSearch `highlight` clause into the native [`HighlightRequest`] (task-250). We
+/// Translate an OpenSearch `highlight` clause into the native [`HighlightRequest`]. We
 /// map the field set and the two bounds we support — `number_of_fragments` → `max_fragments` and
 /// `fragment_size` → `fragment_size` (top-level or per-field; a per-field value wins). Everything
 /// else in the OpenSearch highlight DSL (custom tags, `type`, `order`, …) is ignored: GrowlerDB
@@ -396,7 +395,7 @@ pub fn translate_highlight(clause: &JsonValue) -> HighlightRequest {
     }
 }
 
-/// Render a wire [`HighlightField`]'s fragments to the OpenSearch response shape (task-250): a
+/// Render a wire [`HighlightField`]'s fragments to the OpenSearch response shape: a
 /// vector of strings, one per fragment, with `marked` segments wrapped in `<em>…</em>` (the
 /// OpenSearch default tag) and all text HTML-escaped so the fragment is safe to render.
 fn highlight_field_html(field: &HighlightField) -> Vec<String> {
@@ -445,7 +444,7 @@ fn value_string(v: &v1::Value) -> String {
         Some(Kind::Int(i)) => i.to_string(),
         Some(Kind::Float(f)) => f.to_string(),
         Some(Kind::Bool(b)) => b.to_string(),
-        // Canonical epoch micros (task-184), rendered like an Int.
+        // Canonical epoch micros, rendered like an Int.
         Some(Kind::TsMicros(t)) => t.to_string(),
         None => String::new(),
     }
@@ -457,7 +456,7 @@ fn value_to_json(v: v1::Value) -> JsonValue {
         Some(Kind::Int(i)) => json!(i),
         Some(Kind::Float(f)) => json!(f),
         Some(Kind::Bool(b)) => JsonValue::Bool(b),
-        // Canonical epoch micros (task-184), rendered like an Int.
+        // Canonical epoch micros, rendered like an Int.
         Some(Kind::TsMicros(t)) => json!(t),
         None => JsonValue::Null,
     }
@@ -475,7 +474,7 @@ struct OsSearchBody {
     size: Option<u32>,
     #[serde(default)]
     sort: Option<JsonValue>,
-    /// OpenSearch highlight clause (task-250): `{ "fields": { "body": {} } }`. Present ⇒ the search
+    /// OpenSearch highlight clause: `{ "fields": { "body": {} } }`. Present ⇒ the search
     /// opts into server-side highlighting and the response carries a per-hit `highlight` object.
     #[serde(default)]
     highlight: Option<JsonValue>,
@@ -507,7 +506,7 @@ async fn run_search(
     let start = std::time::Instant::now();
     let body = body.map(|Json(b)| b).unwrap_or_default();
     // OpenSearch `_all` (from `/_search`) means "no specific index": route to the endpoint's default
-    // index (task-240). An empty `index` field triggers the Gateway's default/sole-index resolution
+    // index. An empty `index` field triggers the Gateway's default/sole-index resolution
     // (a multi-index endpoint with no default answers `InvalidArgument`).
     let index = if index == "_all" {
         String::new()
@@ -527,7 +526,7 @@ async fn run_search(
         Ok(s) => s.unwrap_or_default(),
         Err(e) => return adapter_error(e),
     };
-    // Translate the OpenSearch `highlight` clause (task-250) into the native opt-in. Present ⇒ the
+    // Translate the OpenSearch `highlight` clause into the native opt-in. Present ⇒ the
     // response carries a per-hit `highlight` object of matched fragments.
     let highlight = body.highlight.as_ref().map(translate_highlight);
 
@@ -542,9 +541,9 @@ async fn run_search(
             pit_id: 0,
             score_mode: v1::ScoreMode::ScoreLocal as i32,
             window: 0,
-            // The adapter translates the DSL to a Lucene query string (task-90).
+            // The adapter translates the DSL to a Lucene query string.
             syntax: v1::QuerySyntax::Lucene as i32,
-            // Scope to the path's `{index}` (task-99); empty for `/_search` (the served index).
+            // Scope to the path's `{index}`; empty for `/_search` (the served index).
             index: index.clone(),
             highlight,
         },
@@ -570,7 +569,7 @@ async fn run_search(
                 keys,
                 columns: Vec::new(),
                 window: 0,
-                // Hydrate against the same index the search resolved (task-240).
+                // Hydrate against the same index the search resolved.
                 index: index.clone(),
             },
             &headers,
@@ -604,7 +603,7 @@ async fn run_search(
             "_score": hit.score,
             "_source": source,
         });
-        // Server-side highlights (task-250): render the segment fragments into the OpenSearch
+        // Server-side highlights: render the segment fragments into the OpenSearch
         // `highlight` shape — field → array of `<em>`-marked fragment strings. Only present when
         // the request carried a `highlight` clause and a field actually matched.
         if !hit.highlight.is_empty() {
@@ -878,7 +877,7 @@ mod tests {
 
     #[test]
     fn highlight_clause_maps_fields_and_bounds() {
-        // `fields` + top-level bounds; a per-field bound overrides the top-level one (task-250).
+        // `fields` + top-level bounds; a per-field bound overrides the top-level one.
         let req = translate_highlight(&json!({
             "number_of_fragments": 2,
             "fields": { "body": { "fragment_size": 80 }, "title": {} }

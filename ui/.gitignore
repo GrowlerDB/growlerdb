@@ -12,7 +12,7 @@ dist
 dist-ssr
 *.local
 
-# Playwright E2E (task-92)
+# Playwright E2E
 /test-results/
 /playwright-report/
 /blob-report/
@@ -29,5 +29,5 @@ dist-ssr
 *.sln
 *.sw?
 
-# Stray build artifacts must never be committed into the source tree (task-168)
+# Stray build artifacts must never be committed into the source tree
 *.jar

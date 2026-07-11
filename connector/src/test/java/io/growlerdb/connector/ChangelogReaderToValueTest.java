@@ -10,7 +10,7 @@ import java.time.ZoneOffset;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@link ChangelogReader#toValue} temporal mapping (task-184): Spark date/timestamp scalars must
+ * {@link ChangelogReader#toValue} temporal mapping: Spark date/timestamp scalars must
  * become {@code ts_micros} — canonical <b>epoch microseconds UTC</b> — matching what the Rust
  * source extracts for the same Iceberg value, so a temporal key hashes/routes identically on both
  * sides (see {@link ShardRouterParityTest} for the byte-level contract).
@@ -29,7 +29,7 @@ class ChangelogReaderToValueTest {
 
   @Test
   void sparkTimestampMapsToEpochMicros() {
-    // 1_782_000_123_456_789 µs — the same instant used by the cross-language golden vectors.
+    // The same instant used by the cross-language golden vectors.
     long micros = 1_782_000_123_456_789L;
     Instant instant = Instant.ofEpochSecond(micros / 1_000_000L, (micros % 1_000_000L) * 1_000L);
     assertEquals(micros, ChangelogReader.toValue(instant).getTsMicros());

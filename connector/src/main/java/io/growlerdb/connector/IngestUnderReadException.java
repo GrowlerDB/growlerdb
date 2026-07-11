@@ -2,11 +2,11 @@ package io.growlerdb.connector;
 
 /**
  * Thrown by {@link ConnectorJob#runOnce} when the changelog it read for a trigger window carries
- * <b>fewer rows than the source snapshots in that window committed</b> (task-194) — an
- * <b>under-read</b>: the changelog scan missed rows a snapshot physically appended. This is the
- * silent 6-row loss under a compaction race that this guard closes: an empty/short window would
- * otherwise jump the in-memory cursor to head and a later batch would stamp a later checkpoint over
- * the gap, making the loss permanent and evidence-erasing.
+ * <b>fewer rows than the source snapshots in that window committed</b> — an <b>under-read</b>: the
+ * changelog scan missed rows a snapshot physically appended. This guard closes a silent row loss
+ * under a compaction race: an empty/short window would otherwise jump the in-memory cursor to head
+ * and a later batch would stamp a later checkpoint over the gap, making the loss permanent and
+ * evidence-erasing.
  *
  * <p>The expected count is {@code Σ summary['added-records']} over the window's {@code append}
  * snapshots — the source of truth for how many records physically landed — and the observed count is
@@ -23,7 +23,7 @@ package io.growlerdb.connector;
  * snapshots and every append row is an INSERT, so the count is exact. Windows containing
  * {@code overwrite}/{@code delete} snapshots (row-level updates/deletes, where the changelog's net
  * diff legitimately diverges from physical {@code added-records}) are exempt; the systematic backstop
- * there is the reconcile job (task-195).
+ * there is the reconcile job.
  */
 public final class IngestUnderReadException extends RuntimeException {
 

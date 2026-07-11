@@ -14,10 +14,10 @@ import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 
 /**
- * The connector pipeline for a single source→Node hop (task-11): read the Iceberg
- * changelog since a checkpoint ({@link ChangelogReader}, task-63) → reduce to a
- * {@link DocBatch} ({@link ChangelogMapper}, task-13) → commit it over the Write
- * gRPC ({@link WriteClient} → {@code growlerdb serve}, task-61/12).
+ * The connector pipeline for a single source→Node hop: read the Iceberg
+ * changelog since a checkpoint ({@link ChangelogReader}) → reduce to a
+ * {@link DocBatch} ({@link ChangelogMapper}) → commit it over the Write
+ * gRPC ({@link WriteClient} → {@code growlerdb serve}).
  *
  * <p>{@link #runOnce} is one micro-batch: it reads the window from {@code
  * startSnapshotId} (the last committed checkpoint) to the table's current snapshot,
@@ -26,17 +26,16 @@ import org.apache.spark.sql.SparkSession;
  *
  * <p><b>Exactly-once:</b> the batch carries its {@link SourceCheckpoint} and a
  * deterministic {@code batch_id} (the snapshot range), so the Node commits the write
- * and the checkpoint atomically and a replay is a no-op. Obtaining the resume
- * checkpoint <i>from</i> the Node ({@code GetCheckpoint}) so it survives connector
- * restarts is task-16; here it is passed in.
+ * and the checkpoint atomically and a replay is a no-op. The resume checkpoint is
+ * passed in, obtained from the Node so it survives connector restarts.
  */
 public final class ConnectorJob {
 
   /**
-   * Default per-commit changelog-row cap (task-113). A catch-up window is committed in sub-batches of
+   * Default per-commit changelog-row cap. A catch-up window is committed in sub-batches of
    * at most this many rows (cut at snapshot boundaries), so an arbitrarily large backlog never lands
    * as one oversized {@code Write} that blows the gRPC message limit / spikes peak memory. 50k rows
-   * is well under the Node's raised decode cap even with wide documents.
+   * is well under the Node's decode cap even with wide documents.
    */
   public static final long DEFAULT_MAX_COMMIT_ROWS = 50_000;
 
@@ -46,7 +45,7 @@ public final class ConnectorJob {
   private final List<String> identifierColumns;
   private final Set<Long> replaceSnapshotIds;
   private final long maxCommitRows;
-  /** Shard-group mode (task-196): executor-side filter to this worker's owned rows; null = all. */
+  /** Shard-group mode: executor-side filter to this worker's owned rows; null = all. */
   private final OwnedRowFilter ownedFilter;
 
   /**
@@ -71,7 +70,7 @@ public final class ConnectorJob {
     this(catalog, table, mapping, identifierColumns, replaceSnapshotIds, DEFAULT_MAX_COMMIT_ROWS);
   }
 
-  /** As above, plus the per-commit changelog-row cap (task-113 bounded catch-up). */
+  /** As above, plus the per-commit changelog-row cap for bounded catch-up. */
   public ConnectorJob(
       String catalog,
       String table,
@@ -100,7 +99,7 @@ public final class ConnectorJob {
   }
 
   /**
-   * A copy of this job scoped to one worker of a parallel connector set (task-196): the
+   * A copy of this job scoped to one worker of a parallel connector set: the
    * changelog is filtered executor-side to the rows whose keys route to {@code owned} shards,
    * so each worker's driver maps ~1/W of the window. The under-read gate still counts the
    * UNFILTERED changelog (it asserts the global window).
@@ -129,7 +128,7 @@ public final class ConnectorJob {
       return new Result(startSnapshotId, -1L, 0, false);
     }
 
-    // Lineage guard (task-114): a resume checkpoint that is NOT an ancestor of the current head means
+    // Lineage guard: a resume checkpoint that is NOT an ancestor of the current head means
     // the source was dropped+recreated (or rolled back) — a changelog read from it would otherwise
     // die with Iceberg's cryptic "Starting snapshot N is not a parent ancestor of end snapshot M".
     // Fail fast with a clear, actionable error instead; the index is stale and must be reindexed (the
@@ -141,15 +140,15 @@ public final class ConnectorJob {
     Dataset<Row> changelog =
         ChangelogReader.changelog(spark, catalog, table, startSnapshotId, identifierColumns);
 
-    // Expected-row-count gate (task-194): the silent 6-row loss was an under-read — the changelog
-    // scan returned fewer rows than the window's snapshots committed, the empty/short window jumped
-    // the in-memory cursor to head, and a later batch stamped a later checkpoint over the gap
-    // (permanent, evidence-erasing). Close it here: `added-records` in each snapshot's summary is the
-    // authoritative count of records that physically landed; assert the changelog carried at least
-    // that many BEFORE any write. A shortfall throws (no cursor advance) — the trigger re-reads the
-    // window on restart, so a transient scan race self-heals while a real gap stays a loud stall.
+    // Expected-row-count gate: guards against an under-read — a changelog scan that returns fewer
+    // rows than the window's snapshots committed, letting the empty/short window jump the in-memory
+    // cursor to head so a later batch stamps a later checkpoint over the gap (permanent,
+    // evidence-erasing). `added-records` in each snapshot's summary is the authoritative count of
+    // records that physically landed; assert the changelog carried at least that many BEFORE any
+    // write. A shortfall throws (no cursor advance) — the trigger re-reads the window on restart, so a
+    // transient scan race self-heals while a real gap stays a loud stall.
     //
-    // `observed` is a DISTRIBUTED count (task-203) — Spark aggregates it across executors without
+    // `observed` is a DISTRIBUTED count — Spark aggregates it across executors without
     // pulling the window to the driver, so counting a large post-outage backlog can't OOM. (This
     // scan of the changelog is recomputed by the streaming pass below; the incremental scan is
     // bounded to the window, so the double read is cheap next to materializing it in the driver.)
@@ -158,34 +157,34 @@ public final class ConnectorJob {
     try {
       assertNotUnderRead(qualifiedName(), startSnapshotId, current, observed, expected);
     } catch (IngestUnderReadException e) {
-      ConnectorMetrics.recordUnderRead(); // a metric that survives the (rotating) log (task-194 AC6)
+      ConnectorMetrics.recordUnderRead(); // a metric that survives the (rotating) log
       throw e;
     }
 
-    // Bounded catch-up (task-113 + task-203): rather than one giant Write for the whole window — or
+    // Bounded catch-up: rather than one giant Write for the whole window — or
     // even materializing the whole window in the driver — STREAM it read→map→commit. `rowIterator`
     // pulls one partition at a time (`toLocalIterator`) and `streamCommits` flushes a sub-batch
     // capped at `maxCommitRows` (cut only at snapshot boundaries), so driver memory is O(chunk), not
-    // O(window): a post-outage backlog no longer OOMs (exit 52). Each sub-batch checkpoints at its
+    // O(window): a post-outage backlog no longer OOMs. Each sub-batch checkpoints at its
     // end snapshot, so the Node commits write+checkpoint atomically and a restart mid-catch-up
     // resumes from the last committed snapshot (exactly-once; `batch_id` dedups the boundary). The
     // final commit advances to the table head even if the tail window had no rows.
     //
-    // The connector's resume FLOOR for this trigger: the position it resumed from (task-204). It is
+    // The connector's resume FLOOR for this trigger: the position it resumed from. It is
     // the min committed checkpoint across shards (or a head every shard acked), so every shard is at
     // or past it and the connector reads the changelog from it *exclusive* — no batch at/below it can
     // ever be re-sent. Stamped identically on every sub-batch so the Node can drop those shards'
     // idempotency records. `null` (an empty shard set) leaves it unset → the Node prunes nothing.
-    // Shard-group mode (task-196): drop rows other workers own, executor-side, AFTER the gate
+    // Shard-group mode: drop rows other workers own, executor-side, AFTER the gate
     // count above (the gate asserts the whole window; ownership is per key, so per-key op pairs
     // and LWW stay intact within this worker's subset).
     if (ownedFilter != null) {
       changelog = changelog.filter(ownedFilter);
     }
 
-    // Every checkpoint is stamped with its lineage sequence number (task-196) — the order the
+    // Every checkpoint is stamped with its lineage sequence number — the order the
     // Node's window-covering guard, resume-min, and idempotency pruning rely on; snapshot ids
-    // themselves are random longs (task-205). Loaded per trigger via the Iceberg Java API (the
+    // themselves are random longs. Loaded per trigger via the Iceberg Java API (the
     // `.snapshots` metadata table doesn't expose it); degrades to unstamped (exact-match
     // semantics) if the table can't be loaded or is format v1.
     SnapshotLineage lineage = SnapshotLineage.forTable(spark, catalog + "." + table);
@@ -210,7 +209,7 @@ public final class ConnectorJob {
           lastCommitted[0] = writeClient.write(batch);
           totalOps[0] += batch.getOpsCount();
         });
-    // Per-trigger observability (task-194 AC6): rows read vs. the gate's expected, and the head we
+    // Per-trigger observability: rows read vs. the gate's expected, and the head we
     // advanced to — a metric, not just a printf, so a stalled/short trigger is visible after the log
     // rotates. `expected < 0` means the gate didn't apply (overwrite/delete window); recordTrigger
     // skips the expected counter then.
@@ -238,7 +237,7 @@ public final class ConnectorJob {
 
   /**
    * Streaming form of {@link #plan}: cut the same bounded, snapshot-aligned commits, but feed each
-   * to {@code sink} as it closes instead of buffering the whole plan (task-203). Only the current
+   * to {@code sink} as it closes instead of buffering the whole plan. Only the current
    * chunk (≤ {@code maxCommitRows} rows, or one whole snapshot if it exceeds the cap) is held at a
    * time, so a caller streaming rows from {@link ChangelogReader#rowIterator} keeps driver memory
    * O(chunk). Always emits at least one commit (possibly empty) advancing to {@code current}, so the
@@ -309,7 +308,7 @@ public final class ConnectorJob {
 
   /**
    * The table's current snapshot id, or {@code null} if it has none yet. Resolved from the table's
-   * <b>{@code main} branch ref</b> (lineage head), not {@code ORDER BY committed_at} (task-194).
+   * <b>{@code main} branch ref</b> (lineage head), not {@code ORDER BY committed_at}.
    * Snapshot {@code committed_at} is wall-clock: under a two-writer clock skew (the connector reads
    * while a maintenance job commits) the newest-by-time snapshot need not be the lineage tip, so the
    * old ordering could return a head that is not actually current — a head-shadowing no-op stall.
@@ -341,14 +340,14 @@ public final class ConnectorJob {
    * (compaction): the changelog scan skips {@code replace} snapshots and every {@code append} row is
    * an INSERT, so {@code changelog rows == Σ added-records}. A window containing an {@code overwrite}
    * or {@code delete} snapshot (row-level updates/deletes) makes the changelog's net diff diverge
-   * from physical {@code added-records}, so we return {@code -1} and let reconcile (task-195) be the
+   * from physical {@code added-records}, so we return {@code -1} and let reconcile be the
    * backstop there.
    */
   /** Walk hit an ancestor absent from the (possibly time-filtered) snapshot map — retry unbounded. */
   private static final long INCOMPLETE_LINEAGE = Long.MIN_VALUE;
 
   long expectedAppendedRecords(SparkSession spark, Long startSnapshotId, long current) {
-    // Bounded metadata scan (task-203): don't collect the WHOLE `.snapshots` history to the driver
+    // Bounded metadata scan: don't collect the WHOLE `.snapshots` history to the driver
     // every trigger. The window's snapshots are descendants of `startSnapshotId`, so they committed
     // at/after it — filter the collect to `committed_at >= committed_at(startSnapshotId)`, bounding
     // it to the window rather than all history. Under multi-writer clock skew a descendant can record
@@ -362,7 +361,7 @@ public final class ConnectorJob {
       total = sumWindowAddedRecords(loadSnapshotLineage(spark, null), startSnapshotId, current);
     }
     // INCOMPLETE after the unbounded retry ⇒ lineage genuinely not materialized (e.g. expired) —
-    // treat as the historical "skip the gate" sentinel, same as an overwrite/delete window.
+    // treat as the "skip the gate" sentinel, same as an overwrite/delete window.
     return total == INCOMPLETE_LINEAGE ? -1 : total;
   }
 
@@ -383,7 +382,7 @@ public final class ConnectorJob {
 
   /**
    * {@code snapshot_id -> (parent_id, operation, added-records)} for the lineage-walk, optionally
-   * bounded to snapshots with {@code committed_at >= fromMillis} (the window, task-203); {@code null}
+   * bounded to snapshots with {@code committed_at >= fromMillis} (the window); {@code null}
    * collects the full history.
    */
   private java.util.Map<Long, Row> loadSnapshotLineage(SparkSession spark, Long fromMillis) {
@@ -454,7 +453,7 @@ public final class ConnectorJob {
   }
 
   /**
-   * The expected-row-count gate decision (task-194): throw {@link IngestUnderReadException} when the
+   * The expected-row-count gate decision: throw {@link IngestUnderReadException} when the
    * changelog returned fewer rows ({@code observed}) than the window's append snapshots committed
    * ({@code expected}). A negative {@code expected} means the count isn't soundly comparable for this
    * window (it contained an overwrite/delete snapshot, or its lineage wasn't fully materialized), so

@@ -1,4 +1,4 @@
-// Result export (task-46). The Engine doesn't expose a REST export endpoint yet, so the UI
+// Result export. The Engine doesn't expose a REST export endpoint yet, so the UI
 // exports the result set it's holding as JSON or CSV — a client-side download.
 
 export function toJson(rows: unknown[]): string {
@@ -7,7 +7,7 @@ export function toJson(rows: unknown[]): string {
 
 /** Flatten `rows` to CSV. Columns are the union of keys (stable order of first appearance);
  *  values with `"`, `,`, or newlines are quoted per RFC 4180, and values that would be interpreted
- *  as a spreadsheet formula are neutralized (task-153 / I8). */
+ *  as a spreadsheet formula are neutralized. */
 export function toCsv(rows: Record<string, unknown>[]): string {
   if (rows.length === 0) return '';
   const cols: string[] = [];

@@ -1,5 +1,5 @@
-# IoT telemetry benchmark index (task-55): full-text on `message` + keyword fields for filters, fast
-# LONG fields for time-range + reading value. The inverted index turns scans into lookups — the comparison point.
+# IoT telemetry benchmark index: full-text on `message` + keyword fields for filters, fast
+# LONG fields for time-range + reading value. The inverted index turns scans into lookups.
 name: telemetry
 source:
   iceberg:

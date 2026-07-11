@@ -4,7 +4,7 @@ import io.growlerdb.proto.v1.Value;
 import io.growlerdb.proto.v1.WindowingConfig;
 
 /**
- * JVM port of the engine's window routing (task-219): compute the time-window id a document falls in,
+ * JVM port of the engine's window routing: compute the time-window id a document falls in,
  * <b>byte-identically</b> to {@code growlerdb_core::TimeWindowing::window_of ∘ field_micros} — so the
  * connector streams each row to the same window's owning node the engine will store it in. A mismatch
  * would route a row to the wrong node (the CP placed the window on node A, but the row lands on B).
@@ -51,8 +51,7 @@ public final class WindowRouter {
    * Canonical epoch micros for a window value — mirrors {@code field_micros ∘ TimeFormat::to_micros}.
    * A missing/native-non-int value maps to {@code 0} (the engine's {@code unwrap_or(0)} → window 0),
    * so behavior matches exactly; string date formats aren't supported for connector-side routing yet
-   * (the temporal scale workload uses a numeric epoch), and are a loud error rather than a silent
-   * misroute.
+   * and are a loud error rather than a silent misroute.
    */
   static long toMicros(Value v, String format) {
     if (format.isEmpty()) {

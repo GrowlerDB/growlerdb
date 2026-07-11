@@ -25,8 +25,8 @@ How a [query](/product/functional/search/query.md) executes against the index.
 - **Hydration point reads** — resolving a [hydration](/product/functional/hydration.md) locator's
   `(file, row position)` is a **targeted parquet read**: one footer-metadata read per data file,
   row-group scoping to the group(s) holding the requested positions, and a row selection to the
-  exact rows — cost is bounded by the touched row groups, not the file size (previously the file
-  streamed from row 0 up to the requested position). Requests coalesce per file; key verification
+  exact rows — cost is bounded by the touched row groups, not the file size (rather than the file
+  streaming from row 0 up to the requested position). Requests coalesce per file; key verification
   and the predicate fallback are unchanged; files carrying delete files keep the delete-applying
   streaming read. Foundation for every
   [D30](/system/decisions/d30-layered-locator.md) location strategy.

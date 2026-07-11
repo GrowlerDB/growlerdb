@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Scale-harness smoke test (task-159): shake out the workloads + harness before the cloud run.
+# Scale-harness smoke test: shake out the workloads + harness before the cloud run.
 #
 #   1. OFFLINE (always): parse + schema-check EVERY workload (`harness.py validate`). Catches a broken
 #      index.yaml / queries.json / name mismatch without a cluster. Fails the smoke on any invalid.
@@ -36,7 +36,7 @@ done
 [ "$fail" -eq 0 ] || { echo "SMOKE FAILED: a workload is invalid"; exit 1; }
 
 echo
-echo "== 2) render the streaming k8s manifests (task-214) =="
+echo "== 2) render the streaming k8s manifests =="
 # Every workload whose corpus has a stream() must render valid generator/connector manifests —
 # the render itself yaml-parses its output, so this catches template/derivation breakage offline.
 rendered=0

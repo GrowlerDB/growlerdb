@@ -1,13 +1,13 @@
-# GrowlerDB index for the TIME-WINDOWED http_logs variant (task-159 temporal case). Same corpus as
+# GrowlerDB index for the TIME-WINDOWED http_logs variant (temporal case). Same corpus as
 # `http_logs`, but the index is partitioned into DAILY time windows on `ts` (the event time), so the
 # run exercises GrowlerDB's temporal sweet spot: windowed sharding, cold-tier park/revive, event-time
 # query pruning (a time-bounded query skips windows it can prove won't match), and per-window routing
 # — vs the sibling `http_logs` workload, which is the non-temporal (hash-routed) design boundary.
 #
 # The source table `growlerdb.http_logs_windowed` is Iceberg-partitioned on an IDENTITY `day` column
-# (= ts // 86400), so GrowlerDB's per-partition machinery engages too — count-gated reconcile
-# (task-198) and the `growlerdb_source_partition_skew` metric (task-208.2d) both key on identity
-# partitions. `ts` is the windowing field: a fast DATE (epoch seconds) so time-range pruning works.
+# (= ts // 86400), so GrowlerDB's per-partition machinery engages too — count-gated reconcile and the
+# `growlerdb_source_partition_skew` metric both key on identity partitions. `ts` is the windowing
+# field: a fast DATE (epoch seconds) so time-range pruning works.
 name: http_logs_windowed
 source:
   iceberg:
