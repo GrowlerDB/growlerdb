@@ -94,6 +94,57 @@ impl UpstreamTlsArgs {
     }
 }
 
+/// Client-side TLS to the **control plane**, from the environment so every process that dials the
+/// control plane (node, gateway, CLI) configures it uniformly without threading flags through each
+/// call site. Enabled by `GROWLERDB_CP_TLS_CA` (PEM CA verifying the control-plane server cert);
+/// `GROWLERDB_CP_TLS_CERT`/`_KEY` add a client identity for mTLS, and `GROWLERDB_CP_TLS_DOMAIN`
+/// (default `localhost`) is the expected server SAN. Unset ⇒ plaintext (the loopback demo).
+fn cp_client_tls_from_env() -> anyhow::Result<Option<tonic::transport::ClientTlsConfig>> {
+    use tonic::transport::{Certificate, ClientTlsConfig, Identity};
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let Some(ca) = var("GROWLERDB_CP_TLS_CA") else {
+        return Ok(None);
+    };
+    let read = |label: &str, path: &str| {
+        std::fs::read(path).map_err(|e| anyhow::anyhow!("reading {label} `{path}`: {e}"))
+    };
+    let domain = var("GROWLERDB_CP_TLS_DOMAIN").unwrap_or_else(|| "localhost".to_string());
+    let mut tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(read("GROWLERDB_CP_TLS_CA", &ca)?))
+        .domain_name(domain);
+    // A client cert+key is optional (server-only TLS) unless the control plane requires mTLS.
+    if let Some(cert) = var("GROWLERDB_CP_TLS_CERT") {
+        let key = var("GROWLERDB_CP_TLS_KEY").ok_or_else(|| {
+            anyhow::anyhow!("GROWLERDB_CP_TLS_KEY is required with GROWLERDB_CP_TLS_CERT")
+        })?;
+        tls = tls.identity(Identity::from_pem(
+            read("GROWLERDB_CP_TLS_CERT", &cert)?,
+            read("GROWLERDB_CP_TLS_KEY", &key)?,
+        ));
+    }
+    Ok(Some(tls))
+}
+
+/// Connect a control-plane client to `endpoint`, attaching the shared service token
+/// (`GROWLERDB_SERVICE_TOKEN`) and applying client TLS ([`cp_client_tls_from_env`]) when configured.
+/// The single construction path for every control-plane caller. `lazy` builds the channel without
+/// dialing now (for background reloaders that tolerate an unreachable control plane at boot).
+async fn connect_cp(
+    endpoint: &str,
+    lazy: bool,
+) -> anyhow::Result<growlerdb_proto::service_token::CpClient> {
+    let tls = cp_client_tls_from_env()?;
+    let token = growlerdb_proto::service_token::service_token_from_env();
+    if lazy {
+        growlerdb_proto::service_token::connect_lazy(endpoint, tls, token.as_deref())
+            .map_err(|e| anyhow::anyhow!("connecting to control plane `{endpoint}`: {e}"))
+    } else {
+        growlerdb_proto::service_token::connect(endpoint, tls, token.as_deref())
+            .await
+            .map_err(|e| anyhow::anyhow!("connecting to control plane `{endpoint}`: {e}"))
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "growlerdb",
@@ -434,6 +485,15 @@ enum Command {
         /// Env: `GROWLERDB_ADMIN_PASSWORD`.
         #[arg(long, env = "GROWLERDB_ADMIN_PASSWORD")]
         admin_password: Option<String>,
+        /// Shared service token gating the internal control-plane RPCs (registration, shard-map
+        /// reads, placement). When set, every RPC must carry a matching token; unset ⇒ the control
+        /// plane is open (bare local dev). Separate from user auth (`--login-secret` / RBAC) and
+        /// enforced regardless of it. Node/gateway must present the same token. Env:
+        /// `GROWLERDB_SERVICE_TOKEN`.
+        #[arg(long, env = "GROWLERDB_SERVICE_TOKEN")]
+        service_token: Option<String>,
+        #[command(flatten)]
+        tls: ServerTlsArgs,
     },
 }
 
@@ -447,9 +507,7 @@ async fn reconcile_cluster(control_plane: &str, index: &str, full: bool) -> anyh
     use growlerdb_proto::v1::admin_client::AdminClient;
     use growlerdb_proto::v1::{GetIndexRequest, ReconcileIndexRequest, ReconcileIndexResponse};
 
-    let mut cp = growlerdb_proto::ControlPlaneClient::connect(control_plane.to_string())
-        .await
-        .map_err(|e| anyhow::anyhow!("connecting to control plane `{control_plane}`: {e}"))?;
+    let mut cp = connect_cp(control_plane, false).await?;
     let idx = cp
         .get_index(GetIndexRequest {
             name: index.to_string(),
@@ -795,6 +853,8 @@ async fn main() -> anyhow::Result<()> {
             auth_secret,
             admin_user,
             admin_password,
+            service_token,
+            tls,
         } => {
             control_plane(
                 &cli.data_dir,
@@ -807,6 +867,8 @@ async fn main() -> anyhow::Result<()> {
                 auth_secret,
                 admin_user,
                 admin_password,
+                service_token,
+                tls.load()?,
             )
             .await?;
         }
@@ -2540,7 +2602,7 @@ fn routing_plan_from_get_index(
 /// ordinal order — the gRPC analog of [`resolve_sharded_routing`] (which reads a registry file).
 /// Returns the connected nodes, the key router, and the [`RoutingFingerprint`] for hot-reload.
 async fn resolve_sharded_routing_cp(
-    client: &mut growlerdb_proto::ControlPlaneClient<tonic::transport::Channel>,
+    client: &mut growlerdb_proto::service_token::CpClient,
     index: &str,
     node_tls: Option<tonic::transport::ClientTlsConfig>,
 ) -> anyhow::Result<(
@@ -2733,9 +2795,7 @@ async fn gateway_from_control_plane(
     let attempt = || {
         let node_tls = node_tls.clone();
         async move {
-            let mut client = growlerdb_proto::ControlPlaneClient::connect(cp.to_string())
-                .await
-                .map_err(|e| anyhow::anyhow!("connecting to control plane `{cp}`: {e}"))?;
+            let mut client = connect_cp(cp, false).await?;
             let resp = client
                 .get_index(growlerdb_proto::v1::GetIndexRequest {
                     name: index.to_string(),
@@ -2781,10 +2841,7 @@ async fn wait_for_control_plane(cp: &str) {
     let mut warned = false;
     retry_until_ok(
         || async {
-            growlerdb_proto::ControlPlaneClient::connect(cp.to_string())
-                .await
-                .map(|_| ())
-                .map_err(|e| anyhow::anyhow!("connecting to control plane `{cp}`: {e}"))
+            connect_cp(cp, false).await.map(|_| ())
         },
         std::time::Duration::from_secs(GW_CP_STARTUP_INTERVAL_SECS),
         |n, e| {
@@ -2819,9 +2876,9 @@ impl growlerdb_engine::RouteResolver for CpRouteResolver {
         &self,
         index: &str,
     ) -> Result<Option<std::sync::Arc<growlerdb_engine::IndexRoute>>, String> {
-        let mut client = growlerdb_proto::ControlPlaneClient::connect(self.cp.clone())
+        let mut client = connect_cp(&self.cp, false)
             .await
-            .map_err(|e| format!("connecting to control plane `{}`: {e}", self.cp))?;
+            .map_err(|e| e.to_string())?;
         let resp = match client
             .get_index(growlerdb_proto::v1::GetIndexRequest {
                 name: index.to_string(),
@@ -2895,15 +2952,14 @@ fn spawn_index_route_reloader(
     windowed: bool,
 ) {
     tokio::spawn(async move {
-        let mut client: Option<growlerdb_proto::ControlPlaneClient<tonic::transport::Channel>> =
-            None;
+        let mut client: Option<growlerdb_proto::service_token::CpClient> = None;
         tokio::time::sleep(jittered(std::time::Duration::from_secs(secs), 0.5)).await;
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
         tick.tick().await; // the immediate first tick is the startup state
         loop {
             tick.tick().await;
             if client.is_none() {
-                match growlerdb_proto::ControlPlaneClient::connect(cp.clone()).await {
+                match connect_cp(&cp, false).await {
                     Ok(c) => client = Some(c),
                     Err(e) => {
                         eprintln!("gateway: route reloader reconnect to {cp} failed: {e}");
@@ -2987,11 +3043,9 @@ where
 /// used for the REST index-management proxy so a gateway rolled alongside the control-plane waits
 /// rather than exiting. (The routing build already waited for the CP, so this normally connects on
 /// the first try; the retry only covers a CP blip in between.)
-async fn connect_cp_with_retry(
-    cp: &str,
-) -> growlerdb_proto::ControlPlaneClient<tonic::transport::Channel> {
+async fn connect_cp_with_retry(cp: &str) -> growlerdb_proto::service_token::CpClient {
     loop {
-        match growlerdb_proto::ControlPlaneClient::connect(cp.to_string()).await {
+        match connect_cp(cp, false).await {
             Ok(c) => return c,
             Err(e) => {
                 eprintln!("gateway: waiting for control plane `{cp}` (index management): {e}");
@@ -3018,8 +3072,7 @@ fn spawn_control_plane_reloader(
     tokio::spawn(async move {
         // Connect lazily and reconnect inside the loop: a single connect blip must
         // NOT end the reloader forever — otherwise topology freezes after one transient CP outage.
-        let mut client: Option<growlerdb_proto::ControlPlaneClient<tonic::transport::Channel>> =
-            None;
+        let mut client: Option<growlerdb_proto::service_token::CpClient> = None;
         let mut last: Option<RoutingFingerprint> = Some(startup_fp);
         // One-time phase offset so fleet-wide gateways don't all poll the CP on the same tick.
         tokio::time::sleep(jittered(std::time::Duration::from_secs(secs), 0.5)).await;
@@ -3029,7 +3082,7 @@ fn spawn_control_plane_reloader(
             tick.tick().await;
             // (Re)establish the client if we don't have one; a failure just retries next tick.
             if client.is_none() {
-                match growlerdb_proto::ControlPlaneClient::connect(cp.clone()).await {
+                match connect_cp(&cp, false).await {
                     Ok(c) => client = Some(c),
                     Err(e) => {
                         eprintln!("gateway: control-plane reloader reconnect to {cp} failed: {e}");
@@ -3082,8 +3135,7 @@ fn spawn_windowed_control_plane_reloader(
     startup_fp: WindowFingerprint,
 ) {
     tokio::spawn(async move {
-        let mut client: Option<growlerdb_proto::ControlPlaneClient<tonic::transport::Channel>> =
-            None;
+        let mut client: Option<growlerdb_proto::service_token::CpClient> = None;
         let mut last: Option<WindowFingerprint> = Some(startup_fp);
         tokio::time::sleep(jittered(std::time::Duration::from_secs(secs), 0.5)).await;
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
@@ -3091,7 +3143,7 @@ fn spawn_windowed_control_plane_reloader(
         loop {
             tick.tick().await;
             if client.is_none() {
-                match growlerdb_proto::ControlPlaneClient::connect(cp.clone()).await {
+                match connect_cp(&cp, false).await {
                     Ok(c) => client = Some(c),
                     Err(e) => {
                         eprintln!("gateway: windowed reloader reconnect to {cp} failed: {e}");
@@ -3377,9 +3429,7 @@ async fn register_served_index(
     windows: Vec<growlerdb_proto::v1::ServedWindow>,
 ) -> anyhow::Result<()> {
     let definition_json = serde_json::to_string(resolved)?;
-    let mut client = growlerdb_proto::ControlPlaneClient::connect(control_plane.to_string())
-        .await
-        .map_err(|e| anyhow::anyhow!("connecting to control plane `{control_plane}`: {e}"))?;
+    let mut client = connect_cp(control_plane, false).await?;
     client
         .register_served_index(growlerdb_proto::v1::RegisterServedIndexRequest {
             definition_json,
@@ -3396,9 +3446,7 @@ async fn register_served_index(
 /// Heartbeat this windowed node into the control-plane **placement pool** so the CP can
 /// place newly-seen windows on it (answering the connector's `ResolveWindowOwner`).
 async fn register_node(control_plane: &str, index: &str, endpoint: &str) -> anyhow::Result<()> {
-    let mut client = growlerdb_proto::ControlPlaneClient::connect(control_plane.to_string())
-        .await
-        .map_err(|e| anyhow::anyhow!("connecting to control plane `{control_plane}`: {e}"))?;
+    let mut client = connect_cp(control_plane, false).await?;
     client
         .register_node(growlerdb_proto::v1::RegisterNodeRequest {
             index: index.to_string(),
@@ -3533,6 +3581,8 @@ async fn control_plane(
     auth_secret: Option<String>,
     admin_user: String,
     admin_password: Option<String>,
+    service_token: Option<String>,
+    tls: Option<tonic::transport::ServerTlsConfig>,
 ) -> anyhow::Result<()> {
     use std::sync::Arc;
     use tonic::transport::Server;
@@ -3628,14 +3678,36 @@ async fn control_plane(
         "control plane: registry on {socket} (registry at {})",
         registry_path.display()
     );
+    // Service-credential gate: closes the internal RPCs (registration, shard-map reads, placement)
+    // to callers outside the mesh, independent of user auth — so `--login-secret` (open user-auth)
+    // no longer leaves the internal RPCs reachable without a credential. Unset ⇒ open (bare dev).
+    match &service_token {
+        Some(t) if !t.is_empty() => {
+            println!(
+                "control plane: service-token gate ON (internal RPCs require the shared token)"
+            )
+        }
+        _ => eprintln!(
+            "control plane: WARNING no --service-token — internal RPCs are open (set \
+             GROWLERDB_SERVICE_TOKEN to close them)"
+        ),
+    }
+    if tls.is_some() {
+        println!("control plane: serving over TLS");
+    }
     // Keep the ingestion-lag + shard-availability gauges fresh for Prometheus regardless of console
     // polling.
     svc.spawn_ingestion_metrics_sampler(15);
     // Registry opened → ready.
     let readiness = spawn_health(metrics_addr).await?;
     readiness.mark_ready();
-    Server::builder()
-        .add_service(svc.into_server())
+    let service = growlerdb_engine::intercept_service_token(svc.into_server(), service_token);
+    let mut builder = Server::builder();
+    if let Some(tls) = tls {
+        builder = builder.tls_config(tls)?;
+    }
+    builder
+        .add_service(service)
         .serve_with_shutdown(socket, async {
             let _ = tokio::signal::ctrl_c().await;
         })
@@ -3824,9 +3896,7 @@ async fn retention_cmd(
     keep: usize,
     dry_run: bool,
 ) -> anyhow::Result<()> {
-    let mut client = growlerdb_proto::ControlPlaneClient::connect(control_plane.to_string())
-        .await
-        .map_err(|e| anyhow::anyhow!("connecting to control plane `{control_plane}`: {e}"))?;
+    let mut client = connect_cp(control_plane, false).await?;
     let names: Vec<String> = client
         .list_indexes(growlerdb_proto::v1::ListIndexesRequest {})
         .await
