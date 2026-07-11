@@ -30,6 +30,12 @@ x-growlerdb-env: &growlerdb-env
   # deliberately baked in so `just stack` demonstrates real login + per-index RBAC — NOT a
   # production credential. Rotate/replace it (and set your own demo password) for any real deployment.
   GROWLERDB_AUTH_SECRET: demo-stack-hs256-secret-change-me
+  # Shared service token gating the internal control-plane RPCs (registration, shard-map reads,
+  # placement). The control-plane requires it and every service that dials the control-plane
+  # (node, node-catalog, gateway, connector) presents it, so the demo mesh authenticates and the
+  # control plane is CLOSED by default — no unauthenticated internal access. A DEMO value baked in
+  # like GROWLERDB_AUTH_SECRET; rotate it for any real deployment.
+  GROWLERDB_SERVICE_TOKEN: demo-stack-service-token-change-me
 
 services:
   minio:
@@ -220,10 +226,11 @@ services:
     profiles: ["stack"]
     <<: *growlerdb-image
     # `--login-secret`: enable the `/v1/login` RPC (mints session JWTs from the registry
-    # credential store) and seed the built-in users, but keep the control plane's OWN authorization
-    # OPEN — the enforcement point is the gateway (`--builtin-auth`) on the public data plane, so the
-    # internal node/gateway control-plane RPCs (registration, shard-map reads), which carry no service
-    # credential, stay reachable. The demo user is seeded via the env below.
+    # credential store) and seed the built-in users, but keep the control plane's OWN *user*
+    # authorization OPEN — the user-enforcement point is the gateway (`--builtin-auth`) on the public
+    # data plane. The internal node/gateway/connector RPCs (registration, shard-map reads, placement)
+    # are separately closed with the shared GROWLERDB_SERVICE_TOKEN (x-growlerdb-env anchor), which the
+    # control-plane reads from the env — so those RPCs require the mesh credential. Demo user seeded below.
     command: ["control-plane", "--addr", "0.0.0.0:50071", "--metrics-addr", "0.0.0.0:9101", "--login-secret"]
     environment:
       <<: *growlerdb-env
@@ -444,6 +451,10 @@ services:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_REGION: us-east-1
+      # Present the shared service token on the connector's control-plane calls (ResolveWindowOwner /
+      # GetIndex) so the closed demo control-plane authenticates it. Must match GROWLERDB_SERVICE_TOKEN
+      # in the x-growlerdb-env anchor above.
+      GROWLERDB_SERVICE_TOKEN: demo-stack-service-token-change-me
     entrypoint: ["/opt/spark/bin/spark-submit"]
     command:
       - --master
