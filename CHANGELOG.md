@@ -31,29 +31,29 @@ The initial GA surface.
 - Composite, partition-aware document keys; field collapsing; keyset (`search_after`) paging;
   point-in-time reads; suggestions/autocomplete; aggregations.
 
-**Distribution (M3)**
+**Distribution**
 - Control plane (index registry), stateful searcher/index nodes, and a query Gateway
   (scatter-gather + top-K merge). Node self-registration with the control plane.
 - Sharding (hash by key; partition routing when the source is partitioned); partial-result
   flagging when a shard is down.
 
-**Security & multi-tenancy (M4)**
+**Security & multi-tenancy**
 - AuthN at the Gateway: OIDC/JWT (JWKS), API keys, mTLS between services. Forged caller-asserted
   identity headers are dropped and replaced with the verified claim at the trust boundary.
 - Control-plane RBAC (viewer / index-admin / operator / service roles).
 - Tenant scoping: a mandatory, non-widenable `tenant_field = <verified claim>` filter on every
   read; cross-tenant isolation verified end-to-end.
 
-**Observability (M4)**
+**Observability**
 - OpenTelemetry traces + metrics + structured JSON logs; OTLP export; Prometheus `/metrics`;
   health/readiness probes; a bundled LGTM stack and GrowlerDB SLI dashboards in Compose.
 
-**Console UI (M6)**
+**Console UI**
 - A Svelte SPA served by the Gateway: Search & Explore, Indexes (create via source
   introspection / drop), Ingestion (per-shard source-head vs. committed-checkpoint lag), and
   Observability (native ECharts SLI panels).
 
-**Ecosystem (M7)**
+**Ecosystem**
 - Optional OpenSearch-compatible `_search` adapter (`gateway --opensearch`): a documented DSL
   subset → native query; `_id` from the composite key, `_source` via hydration. See
   [docs/opensearch-adapter.md](docs/opensearch-adapter.md).

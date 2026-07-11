@@ -1,4 +1,4 @@
-# typos allowlist (task-158). Every entry below was flagged by `typos` but is NOT a typo — it's a
+# typos allowlist. Every entry below was flagged by `typos` but is NOT a typo — it's a
 # technical term or deliberate test fixture. Keeping the checker on catches *real* typos in new code.
 [default.extend-words]
 # "ANDed" (logical AND-ed) tokenizes to "Ded"
