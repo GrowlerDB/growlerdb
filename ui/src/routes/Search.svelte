@@ -880,6 +880,7 @@
       {scoped}
       query={lastQuery}
       {syntax}
+      index={scopeIndex}
       onClose={() => (selected = null)}
     />
   {/key}

@@ -25,12 +25,14 @@
     scoped,
     query = '',
     syntax = 'lucene',
+    index = '',
     onClose,
   }: {
     hit: SearchHit;
     scoped: ScopedTerms;
     query?: string;
     syntax?: QuerySyntax;
+    index?: string;
     onClose: () => void;
   } = $props();
 
@@ -57,7 +59,7 @@
 
   onMount(async () => {
     try {
-      const rows = await getByKey([hit.coordinates ?? {}]);
+      const rows = await getByKey([hit.coordinates ?? {}], [], index);
       row = rows[0] ?? null;
       if (!row) error = t('search.notFound');
     } catch (err) {
@@ -72,7 +74,7 @@
     if (tab === 'explain' && !explainRequested && hit.coordinates) {
       explainRequested = true;
       explaining = true;
-      explain(query, hit.coordinates, syntax)
+      explain(query, hit.coordinates, syntax, index)
         .then((d) => (exp = d))
         .catch((e) => (explainErr = String(e)))
         .finally(() => (explaining = false));
