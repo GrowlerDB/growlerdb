@@ -25,7 +25,7 @@ CI `GITHUB_TOKEN` is also **least-privilege** (`permissions: contents: read` on 
 API for the same reason.
 
 **Why.** Public + unguarded self-hosted runners = **arbitrary code execution on the home lab**
-(the runners at `192.168.68.101-103`) from any fork PR — it inverts the private-repo trust
+(the self-hosted runners) from any fork PR — it inverts the private-repo trust
 assumption the whole self-hosted model relied on. The approval gate closes *auto*-execution; the
 hosted split is defense-in-depth so a maintainer approving a plausible-looking PR still can't hand
 the home lab to attacker-controlled code. GitHub-hosted minutes are **free for public repos**, so
