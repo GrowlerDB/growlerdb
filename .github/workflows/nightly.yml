@@ -32,8 +32,8 @@ jobs:
       RUSTC_WRAPPER: sccache
       SCCACHE_CACHE_SIZE: "12G"
     steps:
-      - uses: actions/checkout@v5
-      - uses: jdx/mise-action@v4
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
       # See ci.yml: guarantee a usable cargo on self-hosted runners.
       - name: Ensure Rust toolchain
         run: |
@@ -44,8 +44,8 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
-      - uses: mozilla-actions/sccache-action@v0.0.6
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.6
       # The catalog vends an S3 endpoint of `minio:9000`; map it for host clients.
       - name: Map minio hostname
         run: echo "127.0.0.1 minio" | sudo tee -a /etc/hosts
@@ -76,8 +76,8 @@ jobs:
   connector-heavy:
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v5
-      - uses: jdx/mise-action@v4
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
       - name: Ensure Rust toolchain
         run: |
           if ! command -v rustup >/dev/null 2>&1; then
@@ -87,9 +87,9 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Cache Maven repository
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/.m2/repository
           key: m2-${{ hashFiles('connector/pom.xml') }}
