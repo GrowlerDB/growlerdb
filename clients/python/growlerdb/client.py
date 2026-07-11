@@ -42,15 +42,9 @@ class Client:
 
     Covers Search, GetByKey, Suggest, and Admin.
 
-    Authentication: pass ``token`` — an OIDC bearer or a GrowlerDB API
-    token — and it is sent as ``Authorization: Bearer <token>``, which the gateway
-    verifies (the identity + roles come from the *verified* token, not from the client).
-    This is the only mechanism that works against a closed (auth-required) gateway.
-
-    The self-asserted ``x-growlerdb-principal`` / ``x-growlerdb-tenant`` headers are
-    **dev-only** and are sent **only** when ``dev_identity_headers=True``. A real gateway
-    ignores them (identity comes from the token); a gateway misconfigured to trust them
-    would let any client impersonate any principal/tenant, so they are off by default.
+    Pass ``token`` — an OIDC bearer or a GrowlerDB API token — sent as
+    ``Authorization: Bearer <token>``. Identity and roles come from the verified token,
+    never from the client, so a caller cannot assert who they are.
     """
 
     def __init__(
@@ -58,26 +52,11 @@ class Client:
         base_url: str,
         *,
         token: Optional[str] = None,
-        principal: Optional[str] = None,
-        tenant: Optional[str] = None,
-        dev_identity_headers: bool = False,
         timeout: float = 10.0,
     ):
         self.base_url = base_url.rstrip("/")
         self.token = token
-        self.principal = principal
-        self.tenant = tenant
-        self.dev_identity_headers = dev_identity_headers
         self.timeout = timeout
-        if (principal or tenant) and not dev_identity_headers:
-            # Loud, since silently dropping them would look like an auth bug.
-            import warnings
-
-            warnings.warn(
-                "principal/tenant are ignored unless dev_identity_headers=True "
-                "(self-asserted identity is dev-only; use token= for real auth)",
-                stacklevel=2,
-            )
 
     # ---- read APIs -------------------------------------------------------------
 
@@ -141,15 +120,9 @@ class Client:
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(self.base_url + path, data=data, method="POST")
         req.add_header("content-type", "application/json")
-        # Verified auth (the gateway trusts the token, not the caller's word).
+        # Identity comes from the verified token, not the caller's word.
         if self.token:
             req.add_header("authorization", f"Bearer {self.token}")
-        # Self-asserted identity: dev-only, never sent unless explicitly opted in.
-        if self.dev_identity_headers:
-            if self.principal:
-                req.add_header("x-growlerdb-principal", self.principal)
-            if self.tenant:
-                req.add_header("x-growlerdb-tenant", self.tenant)
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 return json.loads(resp.read() or b"{}")

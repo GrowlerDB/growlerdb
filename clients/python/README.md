@@ -48,10 +48,8 @@ server-side (identity + roles come from the token, not the client):
 client = Client("https://gw.example.com", token=os.environ["GROWLERDB_TOKEN"])
 ```
 
-The self-asserted `principal=`/`tenant=` (the `x-growlerdb-*` headers) are **dev-only**
-and are sent **only** with `dev_identity_headers=True`. A real gateway ignores them; a
-gateway misconfigured to trust them would let any client impersonate any principal, so
-they are off by default (and passing them without the flag warns).
+The client never self-asserts identity — there is no `principal`/`tenant` header to send.
+Identity always comes from the verified token, so a caller cannot impersonate one.
 
 ## Coverage / compatibility
 
