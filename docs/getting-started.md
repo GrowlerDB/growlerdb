@@ -139,10 +139,11 @@ GrowlerDB.
 ## 4. Explore in the console
 
 Open <http://localhost:8081>. Pick the **`catalog`** index in the top-left selector, type a query like
-`category:(guide OR reference)`, and hit **Search**. Each hit renders its **cached fields inline**
-(author, category, rating, title, views) — no drawer round-trip — with the matched terms highlighted:
+`category:(guide OR reference)`, and hit **Search**. Results are a **datatable** — one row per hit
+with its **cached fields as columns** (author, category, rating, title, views) — no drawer round-trip,
+matched terms highlighted per cell:
 
-![GrowlerDB console — Search: category:(guide OR reference) over the catalog index returns five hits, each showing cached fields inline with matched terms highlighted](img/console-search.png)
+![GrowlerDB console — Search: category:(guide OR reference) over the catalog index returns five hits in a datatable, each row showing its cached fields as columns with matched terms highlighted](img/console-search.png)
 
 > **Tip:** the top-left selector now switches between the **`docs`** and **`catalog`** indexes — pick
 > the one you want to query. In the console's Lucene box a bare word (`search`) queries that index's
