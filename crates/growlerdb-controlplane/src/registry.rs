@@ -1583,11 +1583,18 @@ mod tests {
         let reg = Registry::open(dir.path().join("registry.json")).unwrap();
         let t = 1_000_000;
         // Limit of 2 for the test: two distinct nodes are admitted.
-        assert!(reg.register_node_capped("idx", "node-a:50051", t, 2).is_ok());
-        assert!(reg.register_node_capped("idx", "node-b:50051", t, 2).is_ok());
+        assert!(reg
+            .register_node_capped("idx", "node-a:50051", t, 2)
+            .is_ok());
+        assert!(reg
+            .register_node_capped("idx", "node-b:50051", t, 2)
+            .is_ok());
         assert_eq!(reg.distinct_live_nodes(t), 2);
         // A third *new* node is rejected (returns the current count).
-        assert_eq!(reg.register_node_capped("idx", "node-c:50051", t, 2), Err(2));
+        assert_eq!(
+            reg.register_node_capped("idx", "node-c:50051", t, 2),
+            Err(2)
+        );
         // But an already-live node re-heartbeats fine — no new capacity, never disrupt the cluster.
         assert!(reg
             .register_node_capped("idx", "node-a:50051", t + 100, 2)
