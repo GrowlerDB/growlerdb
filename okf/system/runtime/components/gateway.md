@@ -12,6 +12,11 @@ timestamp: 2026-07-04T14:22:00
 The **stateless** public [Engine API](/product/interfaces/rest.md) (gRPC + REST). It fronts the
 [nodes](/system/runtime/components/node.md), and serves the [console UI](/system/runtime/components/console-ui.md).
 
+The gateway assembly is a reusable library entry point — `growlerdb_cli::gateway(GatewayConfig)` (the
+`growlerdb-cli` crate is lib + thin bin). `GatewayConfig.authn` injects an [`Authenticator`](/system/decisions/d06-authn-authz.md)
+that takes precedence over the flag-driven auth, so an out-of-tree build can supply its own (e.g. SSO)
+without forking — the [extension seam](/system/decisions/d37-extension-seams.md) in practice.
+
 ## Responsibilities
 
 - **Routing** — builds shard routing from the [control plane](/system/runtime/components/control-plane.md)
