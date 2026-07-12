@@ -35,6 +35,13 @@ Please search existing [issues](https://github.com/GrowlerDB/growlerdb/issues) a
 [GitHub Security Advisories](https://github.com/GrowlerDB/growlerdb/security/advisories/new) — see
 [SECURITY.md](SECURITY.md) for details.
 
+## 💼 Commercial & enterprise
+
+For **commercial/OEM licensing**, the **enterprise add-ons** (SSO/SAML, audit, advanced HA, managed
+multi-tenancy), or operating **beyond the open-source scale limit**, email
+**[support@growlerdb.com](mailto:support@growlerdb.com)** — tell us your use case and we'll scope the
+right agreement. See [COMM-LICENSE.md](COMM-LICENSE.md) for what a commercial license covers.
+
 ## 🤝 Contributing
 
 Want to contribute a fix or feature? See [CONTRIBUTING.md](CONTRIBUTING.md) for the branch → gate → PR
