@@ -38,9 +38,20 @@ local-dev defaults):
 | `GROWLERDB_S3_SECRET_KEY` | `minioadmin` | Object-store secret key. |
 | `GROWLERDB_S3_REGION` | `us-east-1` | Object-store region. |
 | `GROWLERDB_BACKUP_BUCKET` | — | Bucket for `backup`/`restore` (reuses the `GROWLERDB_S3_*` credentials/endpoint). |
+| `GROWLERDB_LICENSE` | — | Enterprise scale-limit license token (set on the **control plane**). Unset ⇒ the free tier. |
 
 In Kubernetes these are wired from a ConfigMap (non-secret) + a Secret (credentials) by the
 [Helm chart](deployment#kubernetes-helm); the credentials should come from a `Secret`, never inline.
+
+### Scale limit & licensing {#scale-limit}
+
+The open-source tier runs up to **3 index nodes** per deployment at no cost. Beyond that, the control
+plane refuses to admit **new** nodes until an Enterprise license raises the cap — **existing nodes and
+data are never disrupted** (a re-registering node always passes; only genuinely new capacity is gated).
+Set the signed license via `GROWLERDB_LICENSE` on the control plane; an invalid token is ignored with a
+warning and falls back to the free tier. Licenses are verified **offline** — no phone-home. See
+[`COMM-LICENSE.md`](https://github.com/GrowlerDB/growlerdb/blob/main/COMM-LICENSE.md) for how to obtain
+one.
 
 ## The index definition
 

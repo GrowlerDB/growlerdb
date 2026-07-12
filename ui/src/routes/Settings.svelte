@@ -23,8 +23,10 @@
     listTokens,
     createToken,
     revokeToken,
+    getLicense,
     type RoleBinding,
     type ApiTokenMeta,
+    type LicenseInfo,
   } from '../lib/api';
   import { build } from '../lib/build';
   import Segmented from '../lib/components/Segmented.svelte';
@@ -42,6 +44,26 @@
   let newRoles = $state<Set<string>>(new Set(['reader'])); // roles to grant a new user
   let usersErr = $state('');
   let usersLoaded = false;
+
+  // Scale-limit license status — visible to any signed-in user.
+  let license = $state<LicenseInfo | null>(null);
+  let licenseLoaded = false;
+  $effect(() => {
+    if (!licenseLoaded) {
+      licenseLoaded = true;
+      getLicense()
+        .then((l) => (license = l))
+        .catch(() => {});
+    }
+  });
+  let licenseEntries = $derived(
+    license
+      ? ([
+          ...(license.licensee ? [[t('settings.licensee'), license.licensee]] : []),
+          [t('settings.nodes'), `${license.current_nodes} / ${license.max_nodes}`],
+        ] as [string, string][])
+      : ([] as [string, string][]),
+  );
 
   /** Toggle a role in a selection set (returns a new Set so Svelte tracks the change). */
   function toggleInSet(set: Set<string>, role: string): Set<string> {
@@ -345,6 +367,20 @@
         </form>
       {:else}
         <p class="muted small">{t('settings.tokensNote')}</p>
+      {/if}
+    </div>
+
+    <div class="card">
+      <h2>{t('settings.entLicense')}</h2>
+      {#if license}
+        <p class="lic-badge">
+          <Badge tone={license.licensed ? 'accent' : 'default'}>
+            {license.licensed ? t('settings.licenseEnterprise') : t('settings.licenseFree')}
+          </Badge>
+        </p>
+        <KeyValue entries={licenseEntries} />
+      {:else}
+        <p class="muted">—</p>
       {/if}
     </div>
 

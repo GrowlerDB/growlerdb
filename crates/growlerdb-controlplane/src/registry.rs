@@ -1320,6 +1320,57 @@ impl Registry {
             .insert(endpoint.to_string(), now_ms);
     }
 
+    /// Like [`register_node`](Self::register_node), but **refuses to admit a *new* node** once
+    /// `max_nodes` distinct live endpoints are already registered — the scale limit. Re-registering
+    /// an already-live endpoint always succeeds (it's a heartbeat, not new capacity), so an existing
+    /// cluster is never disrupted. Atomic under the write lock. On rejection returns the current
+    /// distinct live node count.
+    pub fn register_node_capped(
+        &self,
+        index: &str,
+        endpoint: &str,
+        now_ms: i64,
+        max_nodes: usize,
+    ) -> std::result::Result<(), usize> {
+        let mut hb = self
+            .node_heartbeats
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let known = hb.values().any(|m| {
+            m.get(endpoint)
+                .is_some_and(|&t| now_ms - t <= NODE_HEARTBEAT_TTL_MS)
+        });
+        if !known {
+            let distinct: std::collections::HashSet<&str> = hb
+                .values()
+                .flat_map(|m| m.iter())
+                .filter(|(_, &t)| now_ms - t <= NODE_HEARTBEAT_TTL_MS)
+                .map(|(e, _)| e.as_str())
+                .collect();
+            if distinct.len() >= max_nodes {
+                return Err(distinct.len());
+            }
+        }
+        hb.entry(index.to_string())
+            .or_default()
+            .insert(endpoint.to_string(), now_ms);
+        Ok(())
+    }
+
+    /// Count of distinct live node endpoints across all indexes — the deployment's node usage, for
+    /// the scale-limit meter and the license view.
+    pub fn distinct_live_nodes(&self, now_ms: i64) -> usize {
+        self.node_heartbeats
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .flat_map(|m| m.iter())
+            .filter(|(_, &t)| now_ms - t <= NODE_HEARTBEAT_TTL_MS)
+            .map(|(e, _)| e.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    }
+
     /// The endpoints of nodes whose heartbeat is within [`NODE_HEARTBEAT_TTL_MS`] of `now_ms` — the
     /// **live** placement pool for `index` (sorted, so tie-breaks are deterministic).
     pub fn live_nodes(&self, index: &str, now_ms: i64) -> Vec<String> {
@@ -1525,6 +1576,35 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use growlerdb_core::{IndexDefinition, SourceField, SourceSchema, SourceType};
+
+    #[test]
+    fn scale_limit_caps_new_nodes_but_allows_reheartbeats() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = Registry::open(dir.path().join("registry.json")).unwrap();
+        let t = 1_000_000;
+        // Limit of 2 for the test: two distinct nodes are admitted.
+        assert!(reg
+            .register_node_capped("idx", "node-a:50051", t, 2)
+            .is_ok());
+        assert!(reg
+            .register_node_capped("idx", "node-b:50051", t, 2)
+            .is_ok());
+        assert_eq!(reg.distinct_live_nodes(t), 2);
+        // A third *new* node is rejected (returns the current count).
+        assert_eq!(
+            reg.register_node_capped("idx", "node-c:50051", t, 2),
+            Err(2)
+        );
+        // But an already-live node re-heartbeats fine — no new capacity, never disrupt the cluster.
+        assert!(reg
+            .register_node_capped("idx", "node-a:50051", t + 100, 2)
+            .is_ok());
+        // A node also serving a second index isn't double-counted.
+        assert!(reg
+            .register_node_capped("idx2", "node-a:50051", t + 100, 2)
+            .is_ok());
+        assert_eq!(reg.distinct_live_nodes(t + 100), 2);
+    }
 
     #[test]
     fn credentials_hash_verify_and_persist() {

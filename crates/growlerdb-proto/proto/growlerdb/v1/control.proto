@@ -402,6 +402,18 @@ message IngestionStatusResponse {
   repeated IndexIngestion items = 1;
 }
 
+message GetLicenseRequest {}
+message GetLicenseResponse {
+  // True when a valid Enterprise license is installed (else the free tier).
+  bool licensed = 1;
+  // Who the license is issued to (empty on the free tier).
+  string licensee = 2;
+  // The entitled node cap (free-tier limit, or the license's max_nodes).
+  uint32 max_nodes = 3;
+  // Distinct live index nodes currently registered.
+  uint32 current_nodes = 4;
+}
+
 // Cluster-wide index lifecycle over the registry.
 service ControlPlane {
   rpc CreateIndex(CreateIndexRequest) returns (CreateIndexResponse);
@@ -433,6 +445,8 @@ service ControlPlane {
   rpc ResolveWindowOwner(ResolveWindowOwnerRequest) returns (ResolveWindowOwnerResponse);
   // Ingestion (sync) status: source head vs. each shard's committed checkpoint.
   rpc IngestionStatus(IngestionStatusRequest) returns (IngestionStatusResponse);
+  // Scale-limit license status: the entitlement + current node usage, for the console.
+  rpc GetLicense(GetLicenseRequest) returns (GetLicenseResponse);
   // Saved searches: per-subject persisted query state. List returns the caller's own
   // plus any shared; Save creates (empty id) or updates (own row); Delete removes an own row.
   rpc ListSavedQueries(ListSavedQueriesRequest) returns (ListSavedQueriesResponse);
