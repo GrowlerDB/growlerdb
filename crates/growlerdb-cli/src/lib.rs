@@ -3610,6 +3610,28 @@ async fn control_plane(
     let registry_path = std::path::Path::new(data_dir).join("registry.json");
     std::fs::create_dir_all(data_dir)?;
     let registry = Arc::new(growlerdb_controlplane::Registry::open(&registry_path)?);
+
+    // Optional scale-limit license from GROWLERDB_LICENSE (a signed entitlement). An invalid one
+    // warns and falls back to the free tier rather than failing startup.
+    let license = match std::env::var("GROWLERDB_LICENSE") {
+        Ok(token) if !token.trim().is_empty() => {
+            match growlerdb_engine::License::verify(token.trim()) {
+                Ok(lic) => {
+                    println!(
+                        "control plane: Enterprise license for `{}` — node limit {}",
+                        lic.licensee, lic.max_nodes
+                    );
+                    Some(lic)
+                }
+                Err(e) => {
+                    eprintln!("control plane: WARNING ignoring invalid GROWLERDB_LICENSE ({e}); using the free tier");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
     // With OIDC, the control plane validates bearers itself and enforces RBAC — so
     // admin-gated user management is real, and local role bindings merge against a verified subject.
     let svc = if let Some(issuer) = oidc_issuer {
@@ -3690,6 +3712,7 @@ async fn control_plane(
         eprintln!("control plane: WARNING authorization disabled (no --oidc-issuer / --builtin-auth); it is open");
         growlerdb_engine::ControlPlaneService::new(registry, IcebergConfig::from_env())
     };
+    let svc = svc.with_license(license);
 
     println!(
         "control plane: registry on {socket} (registry at {})",

@@ -130,6 +130,9 @@ pub struct ControlPlaneService {
     session_secret: Option<Vec<u8>>,
     /// Shared login throttle — `Arc` so the per-connection clones share lockout state.
     login_throttle: Arc<LoginThrottle>,
+    /// Optional scale-limit [license](crate::license). `None` ⇒ the free tier
+    /// ([`FREE_NODE_LIMIT`](crate::license::FREE_NODE_LIMIT)); a valid license raises the node cap.
+    license: Option<crate::license::License>,
 }
 
 impl ControlPlaneService {
@@ -148,7 +151,23 @@ impl ControlPlaneService {
             authn: None,
             session_secret: None,
             login_throttle: Arc::new(LoginThrottle::new()),
+            license: None,
         }
+    }
+
+    /// Install a verified scale-limit [license](crate::license), raising the node cap above the free
+    /// tier. `None` keeps the free tier.
+    pub fn with_license(mut self, license: Option<crate::license::License>) -> Self {
+        self.license = license;
+        self
+    }
+
+    /// The entitled node cap: the license's `max_nodes`, or [`FREE_NODE_LIMIT`](crate::license::FREE_NODE_LIMIT).
+    fn entitled_nodes(&self) -> usize {
+        self.license
+            .as_ref()
+            .map(|l| l.max_nodes as usize)
+            .unwrap_or(crate::license::FREE_NODE_LIMIT)
     }
 
     /// Install an [authenticator](crate::authn) so the control plane validates the bearer itself —
@@ -1261,9 +1280,20 @@ impl ControlPlane for ControlPlaneService {
             return Err(Status::invalid_argument("index and endpoint are required"));
         }
         // A liveness heartbeat into the CP placement pool; the CP stamps its own clock so a
-        // skewed node clock can't fake liveness. In-memory only — no persist.
-        self.registry
-            .register_node(&req.index, &req.endpoint, now_ms());
+        // skewed node clock can't fake liveness. In-memory only — no persist. The scale limit caps
+        // *new* nodes at the entitlement (free tier or license); re-heartbeats of a live node always
+        // pass, so an existing cluster is never disrupted.
+        let limit = self.entitled_nodes();
+        if let Err(current) =
+            self.registry
+                .register_node_capped(&req.index, &req.endpoint, now_ms(), limit)
+        {
+            return Err(Status::resource_exhausted(format!(
+                "scale limit reached: {current} nodes registered, entitlement is {limit} (free tier \
+                 is {}). An Enterprise license raises the limit — see COMM-LICENSE.md.",
+                crate::license::FREE_NODE_LIMIT
+            )));
+        }
         Ok(Response::new(RegisterNodeResponse {}))
     }
 
