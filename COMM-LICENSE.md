@@ -16,9 +16,10 @@ You need one if any of the following apply:
    A commercial license grants an **exception to AGPL section 13** for your product.
 2. **AGPL non-compliance.** Your organization's policy prohibits AGPL, or you cannot meet the AGPL's
    requirement to offer corresponding source to users who interact with the software over a network.
-3. **Enterprise capabilities.** You want to run GrowlerDB's **commercial add-ons** (advanced HA and
-   cold-tier/tiered storage, enterprise identity — SSO/SAML/SCIM, audit logging, managed
-   multi-tenancy), which are licensed commercially rather than under the AGPL.
+3. **Enterprise capabilities.** You want to run GrowlerDB's **commercial add-ons** (advanced HA —
+   zero-downtime windowed/multi-shard replica sets, cross-region DR; enterprise identity —
+   SSO/SAML/SCIM; audit logging; managed multi-tenancy), or to operate **beyond the open-source
+   scale limits** (node count / index size / data volume), which require a commercial license.
 
 If none of these apply — you're using the open-source core and complying with the AGPL — you do **not**
 need a commercial license.

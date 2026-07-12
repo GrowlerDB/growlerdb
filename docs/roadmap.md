@@ -14,7 +14,8 @@ internal [GA criteria](ga-criteria) — what's shipped, what's known-limited, an
 - **Text search over Apache Iceberg** — index → search → hydrate the authoritative rows, with a native
   query language and an [OpenSearch-compatible `_search` adapter](opensearch-adapter).
 - **Distributed**: control plane + sharded/windowed nodes + gateway, with scatter-gather + top-K merge.
-- **Time-windowed indexes** with event-time query pruning (aged windows are immutable and prunable).
+- **Time-windowed indexes** with event-time query pruning and [cold-tiering](storage-tiering) (aged
+  windows served read-through from object storage).
 - **Security**: gateway AuthN (OIDC/JWT, API keys, mTLS), control-plane RBAC, verified tenant isolation.
 - **Operations**: health/readiness probes, an observability stack (metrics + logs + SLI dashboards),
   backup/restore, single-shard read replicas, and reconciliation that converges the index to the source.
@@ -27,14 +28,16 @@ under large source snapshots.
 ## Open source vs Enterprise
 
 The **engine is open source** under **AGPL-3.0** — indexing, search, hydration, the query language,
-distributed sharded/windowed search, the OpenSearch adapter, the console, basic security (OIDC login,
-RBAC, verified tenant isolation, TLS), and backup/restore + single-shard replicas.
+distributed sharded/windowed search, cold-tiering (aged windows read-through from object storage),
+the OpenSearch adapter, the console, basic security (OIDC login, RBAC, verified tenant isolation, TLS),
+and backup/restore + single-shard replicas.
 
-A **commercial license** covers advanced operational, scale, and governance capabilities aimed at
-larger deployments: **cold-tier / tiered storage** (for very large corpora past the local-disk
-ceiling), **zero-downtime windowed / multi-shard replica HA**, cross-region DR, enterprise identity
-(SSO/SAML/SCIM), audit logging, and managed multi-tenancy. A commercial license is also available for
-**embedding GrowlerDB in a closed product** (an exception to AGPL's copyleft).
+A **commercial license** covers advanced operational and governance capabilities aimed at larger
+deployments: **zero-downtime windowed / multi-shard replica HA**, cross-region DR, enterprise identity
+(SSO/SAML/SCIM), audit logging, and managed multi-tenancy. The free tier is bounded by **scale**
+(nodes / index size / data volume); an Enterprise license unlocks larger deployments. A commercial
+license is also available for **embedding GrowlerDB in a closed product** (an exception to AGPL's
+copyleft).
 
 ## Known limitations
 
@@ -50,10 +53,8 @@ ceiling), **zero-downtime windowed / multi-shard replica HA**, cross-region DR, 
   post-GA.
 - **Vector / hybrid retrieval is not shipped.** Embeddings, ANN/KNN, reranking (the RAG path) are
   designed but deferred.
-- **The open-source engine is bound by local disk capacity.** Cold-tier / tiered storage — serving
-  aged windows read-through from object storage for very large corpora — is part of the commercial
-  offering (see [Open source vs Enterprise](#open-source-vs-enterprise)). See the scale-ceiling notes
-  for the honest map toward very large (100 TB) deployments.
+- **Non-windowed indexes have no cold tier** (disk-capacity bound); cold-tiering applies to windowed
+  indexes. See the scale-ceiling notes for the honest map toward very large (100 TB) deployments.
 
 ## After GA
 
@@ -61,7 +62,7 @@ Near-term, in rough priority:
 
 1. **Published scale benchmarks** — staged ingest step-ups + storage milestones, GrowlerDB search+hydrate
    vs an Iceberg/Trino table-scan baseline.
-2. **Per-key hydration routing** — drop the current broadcast fan-out for point lookups.
+2. **Cold-tier validation at scale** + per-key hydration routing (drop the current broadcast fan-out).
 3. **Ingest throughput** — parallel windowed connectors toward higher sustained rates.
 4. **Vector + hybrid search** — embeddings, ANN, filtered KNN, reranking.
 5. **More sources** — a second table format (Delta read) and a near-real-time hot tier.
