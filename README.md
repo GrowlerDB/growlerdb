@@ -139,9 +139,30 @@ Full docs are the **GitHub Pages site at <https://growlerdb.github.io/growlerdb/
 - [Migrating from Elasticsearch/OpenSearch](https://growlerdb.github.io/growlerdb/migration-from-elasticsearch) · [Deployment](https://growlerdb.github.io/growlerdb/deployment) · [Roadmap & known limitations](https://growlerdb.github.io/growlerdb/roadmap) · [GA criteria](https://growlerdb.github.io/growlerdb/ga-criteria)
 - [Security policy](SECURITY.md) · [Releasing](RELEASING.md) · [Changelog](CHANGELOG.md)
 
+## Open source & commercial
+
+GrowlerDB is **open core**. The full engine — distributed search/hydration, AuthN/RBAC, the console,
+and everything in this repo — is **open source under AGPL-3.0**, free for internal and self-hosted
+production use up to the **open-source scale limit** (currently **3 nodes**). No sign-up, no
+phone-home: entitlements are verified offline.
+
+A **[commercial license](COMM-LICENSE.md)** from **GrowlerDB LLC** covers the cases the AGPL doesn't:
+
+- **Scale** — operating **beyond the open-source node limit**.
+- **Embedding / OEM** — shipping GrowlerDB inside a proprietary product or SaaS without AGPL copyleft.
+- **AGPL-incompatible use** — when your organization's policy can't take AGPL.
+- **Enterprise add-ons** — SSO/SAML/SCIM, audit logging, advanced HA (cross-region DR), and managed
+  multi-tenancy, distributed separately from this AGPL core.
+
+Beyond the limit, the cluster keeps running — existing nodes re-register normally; only *new*
+capacity is gated. See the console's **Settings → Enterprise license** for current usage.
+
+**📬 Talk to us** — for commercial/OEM licensing, enterprise features, or operating at scale, email
+**[support@growlerdb.com](mailto:support@growlerdb.com)** with your use case and we'll scope the right
+agreement. (Pricing isn't public yet — reach out and we'll work it out with you.)
+
 ## License & contributing
 
-AGPL-3.0-only (see [LICENSE](LICENSE)); a [commercial license](COMM-LICENSE.md) is available for
-embedding/OEM, AGPL-incompatible use, and the enterprise add-ons. Contributions are under a
-**license-grant [CLA](CLA.md)** — see [CONTRIBUTING.md](CONTRIBUTING.md)
-and the [Code of Conduct](CODE_OF_CONDUCT.md).
+AGPL-3.0-only (see [LICENSE](LICENSE)); a [commercial license](COMM-LICENSE.md) is available as
+described above. Contributions are under a **license-grant [CLA](CLA.md)** — see
+[CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md).

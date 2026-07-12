@@ -41,6 +41,7 @@ need a commercial license.
 
 ## Getting a license
 
-Commercial and OEM licensing, and pricing, are handled by **GrowlerDB LLC**. Contact us through the
-channels in [`SUPPORT.md`](SUPPORT.md). Tell us your use case (embedding, SaaS, enterprise features,
-scale) and we'll scope the right agreement.
+Commercial and OEM licensing, and pricing, are handled by **GrowlerDB LLC**. Email
+**[support@growlerdb.com](mailto:support@growlerdb.com)** (or see the channels in
+[`SUPPORT.md`](SUPPORT.md)). Tell us your use case (embedding, SaaS, enterprise features, scale) and
+we'll scope the right agreement.
