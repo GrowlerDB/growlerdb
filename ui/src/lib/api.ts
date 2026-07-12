@@ -233,6 +233,21 @@ export async function passwordLogin(username: string, password: string): Promise
 
 /** Fetch `GET /v1/config`. Defaults to **open** (un-gated) if the request fails, so a transient
  *  error can't lock anyone out — the API still enforces auth on each call regardless. */
+/** Scale-limit license status (licensee, entitled + current node count). */
+export interface LicenseInfo {
+  licensed: boolean;
+  licensee: string;
+  max_nodes: number;
+  current_nodes: number;
+}
+
+/** Fetch the scale-limit license status via `/v1/license` (proxied to the control plane). */
+export async function getLicense(): Promise<LicenseInfo> {
+  const res = await apiFetch('/v1/license');
+  if (!res.ok) throw new Error(`license failed (${res.status})`);
+  return (await res.json()) as LicenseInfo;
+}
+
 export async function serverConfig(): Promise<ServerConfig> {
   try {
     const res = await apiFetch('/v1/config');

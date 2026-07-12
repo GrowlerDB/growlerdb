@@ -19,18 +19,19 @@ use growlerdb_proto::v1::{
     CreateTokenResponse, DeleteSavedQueryRequest, DeleteSavedQueryResponse, DescribeSourceRequest,
     DescribeSourceResponse, DropAliasRequest, DropAliasResponse, DropIndexRequest,
     DropIndexResponse, Error as WireError, FieldMapping, GetCheckpointRequest, GetIndexRequest,
-    GetIndexResponse, IndexIngestion, IndexSummary as WireSummary, IngestionStatusRequest,
-    IngestionStatusResponse, ListActivityRequest, ListActivityResponse, ListAliasesRequest,
-    ListAliasesResponse, ListIndexesRequest, ListIndexesResponse, ListRolesRequest,
-    ListRolesResponse, ListSavedQueriesRequest, ListSavedQueriesResponse, ListTokensRequest,
-    ListTokensResponse, ListUsersRequest, ListUsersResponse, LoginRequest, LoginResponse,
-    MoveBucketRequest, MoveBucketResponse, PlanReshardRequest, PlanReshardResponse,
-    RegisterNodeRequest, RegisterNodeResponse, RegisterServedIndexRequest,
-    RegisterServedIndexResponse, ReindexIndexRequest, ResolveWindowOwnerRequest,
-    ResolveWindowOwnerResponse, RevokeTokenRequest, RevokeTokenResponse, RoleBinding,
-    RoutingStrategy as WireRouting, SaveSavedQueryRequest, SaveSavedQueryResponse,
-    SavedQuery as WireSavedQuery, SetAliasRequest, SetAliasResponse, SetUserRolesRequest,
-    SetUserRolesResponse, ShardIngestion, ShardStatus, SourceFieldInfo, WindowingConfig,
+    GetIndexResponse, GetLicenseRequest, GetLicenseResponse, IndexIngestion,
+    IndexSummary as WireSummary, IngestionStatusRequest, IngestionStatusResponse,
+    ListActivityRequest, ListActivityResponse, ListAliasesRequest, ListAliasesResponse,
+    ListIndexesRequest, ListIndexesResponse, ListRolesRequest, ListRolesResponse,
+    ListSavedQueriesRequest, ListSavedQueriesResponse, ListTokensRequest, ListTokensResponse,
+    ListUsersRequest, ListUsersResponse, LoginRequest, LoginResponse, MoveBucketRequest,
+    MoveBucketResponse, PlanReshardRequest, PlanReshardResponse, RegisterNodeRequest,
+    RegisterNodeResponse, RegisterServedIndexRequest, RegisterServedIndexResponse,
+    ReindexIndexRequest, ResolveWindowOwnerRequest, ResolveWindowOwnerResponse, RevokeTokenRequest,
+    RevokeTokenResponse, RoleBinding, RoutingStrategy as WireRouting, SaveSavedQueryRequest,
+    SaveSavedQueryResponse, SavedQuery as WireSavedQuery, SetAliasRequest, SetAliasResponse,
+    SetUserRolesRequest, SetUserRolesResponse, ShardIngestion, ShardStatus, SourceFieldInfo,
+    WindowingConfig,
 };
 use growlerdb_proto::{to_status, ControlPlane, ControlPlaneServer, WriteClient};
 use growlerdb_source::{IcebergConfig, IcebergReader};
@@ -1295,6 +1296,23 @@ impl ControlPlane for ControlPlaneService {
             )));
         }
         Ok(Response::new(RegisterNodeResponse {}))
+    }
+
+    async fn get_license(
+        &self,
+        request: Request<GetLicenseRequest>,
+    ) -> Result<Response<GetLicenseResponse>, Status> {
+        self.gate("GetLicense", &request)?;
+        Ok(Response::new(GetLicenseResponse {
+            licensed: self.license.is_some(),
+            licensee: self
+                .license
+                .as_ref()
+                .map(|l| l.licensee.clone())
+                .unwrap_or_default(),
+            max_nodes: self.entitled_nodes() as u32,
+            current_nodes: self.registry.distinct_live_nodes(now_ms()) as u32,
+        }))
     }
 
     async fn resolve_window_owner(

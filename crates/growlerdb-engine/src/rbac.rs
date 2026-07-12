@@ -63,7 +63,9 @@ pub fn scope_for_method(method: &str) -> Option<Scope> {
         // `ListUsers` is NOT here: enumerating every subject + its role bindings is authorization-
         // topology disclosure, so it needs Admin, not any reader.
         "DescribeIndex" | "GetIndex" | "ListIndexes" | "ListAliases" | "DescribeSource"
-        | "IngestionStatus" | "GetCheckpoint" | "ListRoles" | "ListActivity" => Scope::IndexRead,
+        | "IngestionStatus" | "GetCheckpoint" | "ListRoles" | "ListActivity" | "GetLicense" => {
+            Scope::IndexRead
+        }
         "Write" => Scope::IndexWrite,
         // Administer indexes + manage user role bindings + API tokens + list users.
         "CreateIndex" | "DropIndex" | "AlterIndex" | "ReindexIndex" | "SetAlias" | "DropAlias"

@@ -145,6 +145,7 @@ pub fn control_router(client: CpClient) -> Router {
         .route("/v1/index:activity", post(list_activity_handler))
         .route("/v1/ingestion", get(ingestion_status_handler))
         .route("/v1/ingestion/{name}", get(ingestion_status_one_handler))
+        .route("/v1/license", get(license_handler))
         .route(
             "/v1/saved-queries",
             get(list_saved_queries_handler).post(save_saved_query_handler),
@@ -332,6 +333,34 @@ async fn list_indexes_handler(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(IndexListDto::from(resp.into_inner())))
+}
+
+/// Scale-limit license status for the console settings page (proxied to the control plane).
+#[derive(serde::Serialize)]
+struct LicenseDto {
+    licensed: bool,
+    licensee: String,
+    max_nodes: u32,
+    current_nodes: u32,
+}
+
+async fn license_handler(
+    State(client): State<ControlClient>,
+    headers: HeaderMap,
+) -> Result<Json<LicenseDto>, ApiError> {
+    let req = grpc_request(v1::GetLicenseRequest {}, &headers);
+    let r = client
+        .clone()
+        .get_license(req)
+        .await
+        .map_err(ApiError::from)?
+        .into_inner();
+    Ok(Json(LicenseDto {
+        licensed: r.licensed,
+        licensee: r.licensee,
+        max_nodes: r.max_nodes,
+        current_nodes: r.current_nodes,
+    }))
 }
 
 async fn get_index_handler(
