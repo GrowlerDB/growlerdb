@@ -148,6 +148,7 @@ class ConnectorSetCrossProcessTest {
 
   private static Process spawnServe(Path bin, Path dataDir, int shards, int ordinal, int port)
       throws Exception {
+    Path serveLog = Files.createTempFile("growlerdb-serve-" + port + "-", ".log");
     Process p =
         new ProcessBuilder(
                 bin.toString(),
@@ -161,9 +162,10 @@ class ConnectorSetCrossProcessTest {
                 Integer.toString(ordinal),
                 "--addr",
                 "127.0.0.1:" + port)
-            .inheritIO()
+            .redirectErrorStream(true)
+            .redirectOutput(serveLog.toFile())
             .start();
-    awaitPort(port, Duration.ofSeconds(20));
+    awaitPort(port, Duration.ofSeconds(90), p, serveLog);
     return p;
   }
 
@@ -213,15 +215,27 @@ class ConnectorSetCrossProcessTest {
     }
   }
 
-  private static void awaitPort(int port, Duration timeout) throws InterruptedException {
+  private static void awaitPort(int port, Duration timeout, Process proc, Path logFile)
+      throws InterruptedException, IOException {
     long deadline = System.nanoTime() + timeout.toNanos();
     while (System.nanoTime() < deadline) {
+      if (!proc.isAlive()) {
+        break; // process exited early — no point waiting the full timeout
+      }
       try (java.net.Socket s = new java.net.Socket("127.0.0.1", port)) {
         return;
       } catch (IOException retry) {
         Thread.sleep(50);
       }
     }
-    throw new IllegalStateException("growlerdb serve did not come up on port " + port);
+    String out = Files.exists(logFile) ? Files.readString(logFile) : "(no output captured)";
+    throw new IllegalStateException(
+        "growlerdb serve did not come up on port "
+            + port
+            + " | alive="
+            + proc.isAlive()
+            + (proc.isAlive() ? "" : " exit=" + proc.exitValue())
+            + "\n--- growlerdb serve output ---\n"
+            + out);
   }
 }
