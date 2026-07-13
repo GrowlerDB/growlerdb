@@ -409,6 +409,8 @@ just stack-down
 
 ## Where to next
 
+- **[Connect your own Iceberg table](external-iceberg)** — run Compose against your own external table
+  on S3 (real AWS S3 or an in-house lakehouse), including the connector setup.
 - Index your own table: define an index over its columns + key, drop the [index definition](reference)
   in via the console's **Indexes → Create** (it introspects your source schema).
 - [Migrate from Elasticsearch/OpenSearch](migration-from-elasticsearch).

@@ -22,6 +22,12 @@ Profiles: `seed` (sample tables), `stack` (GrowlerDB + LGTM), `pipeline` (the st
 Redpanda). Long-running services carry `restart:` policies (self-heal); chaos drills exercise recovery
 ([reliability](/quality/reliability.md)).
 
+**External lakehouse (`external.yml`):** a companion file (`deploy/compose/external.yml` + `.env`) runs
+only GrowlerDB (control-plane + node + gateway, off the published image) against a user's **own**
+external Iceberg REST catalog + S3 store — no bundled MinIO/Polaris/seed. It's the "day 2" step after
+the demo; see the [getting-started site](/product/interfaces/website.md) *Connecting your own Iceberg
+table* page for the walkthrough and limitations (REST-only catalog, static S3 keys, forced path-style).
+
 **Two demo indexes:** the `seed` profile writes `growlerdb.docs` (3 rows, the minimal
 E2E table) *and* the richer `growlerdb.catalog` (10 rows — one field of every type). The `stack`
 profile serves each from its own node (`node` → `docs`, `node-catalog` → `catalog`, built from
