@@ -1,0 +1,116 @@
+name: growlerdb-external
+
+# Run GrowlerDB against YOUR OWN external Iceberg table — a REST catalog + S3-compatible
+# object store you already operate (real AWS S3, an in-house lakehouse, etc.). This is the
+# "day 2" companion to the demo docker-compose.yml: it bundles NO MinIO/Polaris/seed. Every
+# connection setting comes from a .env file (copy .env.external.example -> .env).
+#
+# It runs the query/hydration side (control plane + node + gateway). Ongoing ingestion is a
+# separate Spark connector job — see docs/external-iceberg.md for the full walkthrough,
+# caveats (REST-only catalog, static S3 keys, path-style access), and the connector command.
+#
+#   cp .env.external.example .env      # then edit it
+#   docker compose -f external.yml up
+#
+# Uses the published image by default (override with GROWLERDB_IMAGE).
+
+x-growlerdb-image: &growlerdb-image
+  image: ${GROWLERDB_IMAGE:-ghcr.io/growlerdb/growlerdb:0.2.0}
+  restart: unless-stopped
+
+# Every GrowlerDB service reads the same catalog + object-store settings from the environment
+# (overriding the binary's local-dev defaults). Required vars use ${VAR:?...} so Compose fails
+# fast with a clear message if .env is missing them.
+x-growlerdb-env: &growlerdb-env
+  GROWLERDB_CATALOG_URI: ${GROWLERDB_CATALOG_URI:?set your REST catalog URI in .env}
+  GROWLERDB_WAREHOUSE: ${GROWLERDB_WAREHOUSE:?set your warehouse/catalog name in .env}
+  GROWLERDB_CATALOG_CREDENTIAL: ${GROWLERDB_CATALOG_CREDENTIAL:-}
+  GROWLERDB_CATALOG_SCOPE: ${GROWLERDB_CATALOG_SCOPE:-}
+  GROWLERDB_S3_ENDPOINT: ${GROWLERDB_S3_ENDPOINT:?set your S3 endpoint in .env}
+  GROWLERDB_S3_ACCESS_KEY: ${GROWLERDB_S3_ACCESS_KEY:?set your S3 access key in .env}
+  GROWLERDB_S3_SECRET_KEY: ${GROWLERDB_S3_SECRET_KEY:?set your S3 secret key in .env}
+  GROWLERDB_S3_REGION: ${GROWLERDB_S3_REGION:-us-east-1}
+  # Rotate these for anything beyond a local experiment (mesh + login secrets).
+  GROWLERDB_SERVICE_TOKEN: ${GROWLERDB_SERVICE_TOKEN:?set a shared mesh token in .env}
+  GROWLERDB_AUTH_SECRET: ${GROWLERDB_AUTH_SECRET:?set a gateway auth secret in .env}
+
+services:
+  controlplane:
+    <<: *growlerdb-image
+    command: ["control-plane", "--addr", "0.0.0.0:50071", "--metrics-addr", "0.0.0.0:9101", "--login-secret"]
+    environment:
+      <<: *growlerdb-env
+      # Seeds one login user on first boot (the gateway enforces it via --builtin-auth).
+      GROWLERDB_DEMO_USER: ${GROWLERDB_LOGIN_USER:-admin}
+      GROWLERDB_DEMO_PASSWORD: ${GROWLERDB_LOGIN_PASSWORD:?set a login password in .env}
+      GROWLERDB_DEMO_INDEXES: ${GROWLERDB_INDEX_NAME:?set your index name in .env}
+    ports:
+      - "50071:50071"
+      - "9101:9101"
+    volumes:
+      - cp-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9101/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # Builds an index from your table's current snapshot (auto-mapping every column), then serves
+  # it. For explicit field mapping, mount an index-definition YAML and add `--def /index.yaml`
+  # (see docs/configuration.md). Continuous updates come from the connector (external-iceberg.md).
+  node:
+    <<: *growlerdb-image
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        growlerdb index ${GROWLERDB_SOURCE_TABLE:?set namespace.table in .env} --name ${GROWLERDB_INDEX_NAME:?set your index name in .env} &&
+        growlerdb serve ${GROWLERDB_INDEX_NAME} --addr 0.0.0.0:50051 --rest-addr 0.0.0.0:8080 --metrics-addr 0.0.0.0:9102
+        --register http://controlplane:50071 --advertise-addr http://node:50051
+    environment:
+      <<: *growlerdb-env
+    depends_on:
+      controlplane:
+        condition: service_healthy
+    ports:
+      - "50051:50051"
+      - "9102:9102"
+    volumes:
+      - node-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9102/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+
+  # The public Engine API + console (host :8081). Clients hit this.
+  gateway:
+    <<: *growlerdb-image
+    command:
+      - "gateway"
+      - "--builtin-auth"     # validate the control-plane's session JWTs + enforce RBAC
+      - "--all-indexes"      # front every registered index over one endpoint
+      - "--addr"
+      - "0.0.0.0:50061"
+      - "--rest-addr"
+      - "0.0.0.0:8080"
+      - "--metrics-addr"
+      - "0.0.0.0:9103"
+      - "--ui-dir"
+      - "/usr/share/growlerdb/ui"
+      - "--control-plane"
+      - "http://controlplane:50071"
+      - "--opensearch"       # optional OpenSearch-compatible <index>/_search
+    environment:
+      <<: *growlerdb-env
+    depends_on:
+      node:
+        condition: service_healthy
+      controlplane:
+        condition: service_healthy
+    ports:
+      - "50061:50061"
+      - "8081:8080"
+
+volumes:
+  cp-data:
+  node-data:
