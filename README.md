@@ -17,7 +17,7 @@
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/GrowlerDB/growlerdb?sort=semver)](https://github.com/GrowlerDB/growlerdb/releases)
 
-📖 **Documentation: <https://growlerdb.github.io/growlerdb/>** — [Getting started](https://growlerdb.github.io/growlerdb/getting-started) · [Install & run modes](https://growlerdb.github.io/growlerdb/install) · [Configuration](https://growlerdb.github.io/growlerdb/configuration) · [API reference](https://growlerdb.github.io/growlerdb/reference)
+📖 **Documentation: <https://docs.growlerdb.com/>** — [Getting started](https://docs.growlerdb.com/getting-started) · [Install & run modes](https://docs.growlerdb.com/install) · [Configuration](https://docs.growlerdb.com/configuration) · [API reference](https://docs.growlerdb.com/reference)
 
 GrowlerDB keeps Apache Iceberg as the system of record and maintains a fast, derived
 full-text index of your Iceberg data. Search returns the matching **primary keys
@@ -114,7 +114,7 @@ curl -s localhost:8081/v1/search -H "authorization: Bearer $token" \
 Tear it all down with `just stack-down`.
 
 👉 Full walkthrough (first search → hydrate → console → OpenSearch adapter):
-**[getting-started tutorial](https://growlerdb.github.io/growlerdb/getting-started)**.
+**[getting-started tutorial](https://docs.growlerdb.com/getting-started)**.
 
 ## Develop
 
@@ -131,12 +131,12 @@ just run -- --help      # run the growlerdb CLI
 
 ## Documentation
 
-Full docs are the **GitHub Pages site at <https://growlerdb.github.io/growlerdb/>** (built from
+Full docs are the **GitHub Pages site at <https://docs.growlerdb.com/>** (built from
 [`docs/`](docs/)):
 
-- [Getting started](https://growlerdb.github.io/growlerdb/getting-started) — zero to first search.
-- [Install & run modes](https://growlerdb.github.io/growlerdb/install) · [Configuration](https://growlerdb.github.io/growlerdb/configuration) · [API & query reference](https://growlerdb.github.io/growlerdb/reference)
-- [Migrating from Elasticsearch/OpenSearch](https://growlerdb.github.io/growlerdb/migration-from-elasticsearch) · [Deployment](https://growlerdb.github.io/growlerdb/deployment) · [Roadmap & known limitations](https://growlerdb.github.io/growlerdb/roadmap) · [GA criteria](https://growlerdb.github.io/growlerdb/ga-criteria)
+- [Getting started](https://docs.growlerdb.com/getting-started) — zero to first search.
+- [Install & run modes](https://docs.growlerdb.com/install) · [Configuration](https://docs.growlerdb.com/configuration) · [API & query reference](https://docs.growlerdb.com/reference)
+- [Migrating from Elasticsearch/OpenSearch](https://docs.growlerdb.com/migration-from-elasticsearch) · [Deployment](https://docs.growlerdb.com/deployment) · [Roadmap & known limitations](https://docs.growlerdb.com/roadmap) · [GA criteria](https://docs.growlerdb.com/ga-criteria)
 - [Security policy](SECURITY.md) · [Releasing](RELEASING.md) · [Changelog](CHANGELOG.md)
 
 ## Open source & commercial

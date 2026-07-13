@@ -6,10 +6,10 @@ Thanks for using GrowlerDB! Here's where to go depending on what you need.
 
 Start with the docs — most questions are answered there:
 
-- **[Getting started](https://growlerdb.github.io/growlerdb/getting-started)** — bring up the local stack and run your first search
-- **[Install & run modes](https://growlerdb.github.io/growlerdb/install)**
-- **[Configuration](https://growlerdb.github.io/growlerdb/configuration)**
-- **[API reference](https://growlerdb.github.io/growlerdb/reference)**
+- **[Getting started](https://docs.growlerdb.com/getting-started)** — bring up the local stack and run your first search
+- **[Install & run modes](https://docs.growlerdb.com/install)**
+- **[Configuration](https://docs.growlerdb.com/configuration)**
+- **[API reference](https://docs.growlerdb.com/reference)**
 
 The compiled source of truth for how GrowlerDB works is the [OKF](okf/index.md).
 

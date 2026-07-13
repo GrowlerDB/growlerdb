@@ -4,9 +4,9 @@ title: GrowlerDB
 description: Open-source text search engine over Apache Iceberg.
 remote_theme: just-the-docs/just-the-docs
 
-# Project-site URL (repo Pages live under /<repo>).
-url: https://growlerdb.github.io
-baseurl: /growlerdb
+# Custom domain: docs served at the root of the docs subdomain (see docs/CNAME).
+url: https://docs.growlerdb.com
+baseurl: ""
 
 # just-the-docs options
 search_enabled: true
