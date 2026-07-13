@@ -3,6 +3,7 @@
   // catch malformed Markdown. This is the initial baseline — tighten as docs are cleaned up.
   "config": {
     "MD013": false, // line-length — prose wraps freely
+    "MD024": { "siblings_only": true }, // duplicate-heading — changelogs repeat Added/Fixed/Security per version
     "MD060": false, // table-column-style — cosmetic column alignment
     "MD033": false, // inline HTML — used intentionally in docs
     "MD041": false, // first-line-heading — Jekyll front matter precedes the H1
@@ -17,5 +18,5 @@
     "MD004": false  // unordered-list-style
   },
   "globs": ["**/*.md"],
-  "ignores": ["node_modules", "target", "ui/dist", "**/node_modules"]
+  "ignores": ["node_modules", "target", "ui/dist", "**/node_modules", "**/.terraform"]
 }
