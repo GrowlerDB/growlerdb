@@ -17,12 +17,28 @@
     {
       "path": "id",
       "ty": "TEXT",
-      "analyzer": null
+      "analyzer": null,
+      "fast": false,
+      "indexed": true,
+      "record": "POSITION",
+      "fieldnorms": true,
+      "cached": false,
+      "sensitive": false
     },
     {
       "path": "body",
       "ty": "TEXT",
-      "analyzer": null
+      "analyzer": null,
+      "fast": false,
+      "indexed": true,
+      "record": "POSITION",
+      "fieldnorms": true,
+      "cached": false,
+      "sensitive": false
     }
-  ]
+  ],
+  "equality_deletes": "NONE",
+  "warnings": [],
+  "shard_count": 1,
+  "location_strategy": "COORDINATES"
 }
