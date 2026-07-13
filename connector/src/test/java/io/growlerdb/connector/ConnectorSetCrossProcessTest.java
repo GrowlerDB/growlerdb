@@ -163,7 +163,9 @@ class ConnectorSetCrossProcessTest {
                 "127.0.0.1:" + port)
             .inheritIO()
             .start();
-    awaitPort(port, Duration.ofSeconds(20));
+    // A debug `growlerdb` build starting under CPU contention on a 2-core GitHub-hosted runner
+    // can take well past the old 20s; give generous headroom (this is nightly, not latency-critical).
+    awaitPort(port, Duration.ofSeconds(90));
     return p;
   }
 
