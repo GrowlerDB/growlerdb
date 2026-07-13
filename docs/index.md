@@ -36,6 +36,7 @@ onto a lakehouse instead of duplicating it.
 | [Getting started](getting-started) | Compose stack → your first search → hydrate → console. |
 | [Install & run modes](install) | Build from source; embedded, `serve`, `gateway`, `control-plane`. |
 | [Configuration](configuration) | CLI flags, env vars, and the index-definition YAML (fields, key, tenant). |
+| [Connecting your own Iceberg table](external-iceberg) | Compose against your own external table on S3, plus the connector. |
 | [Reference](reference) | Query language, the REST/gRPC API, and the OpenSearch `_search` adapter. |
 | [Migrating from Elasticsearch / OpenSearch](migration-from-elasticsearch) | Concepts + the two integration paths. |
 | [Deployment](deployment) | Local Compose and Kubernetes (Helm). |
