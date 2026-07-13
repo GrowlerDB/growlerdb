@@ -27,7 +27,7 @@ env:
 jobs:
   # Every #[ignore]d e2e test against the real Compose stack — not just the per-PR smoke.
   e2e-full:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_CACHE_SIZE: "12G"
@@ -74,7 +74,7 @@ jobs:
   # writes to the real `growlerdb serve` binary over gRPC). Both are @Tag-excluded from `mvn verify`,
   # so they only ever run here.
   connector-heavy:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
