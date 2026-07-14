@@ -1,0 +1,10 @@
+// Custom overrides for the just-the-docs theme. This file is imported last by the theme's
+// stylesheet, so rules here win.
+
+// Inline code: the theme's default padding (`:not(pre,figure) > code { padding: 0.2em 0.15em }`)
+// is too tight horizontally, so the highlight background crowds the text — noticeable in tables
+// (e.g. Configuration → Global flags). Match the theme's selector and give it breathing room.
+// The `:not(pre, figure)` guard keeps fenced code blocks untouched.
+:not(pre, figure) > code {
+  padding: 0.4em 0.4em;
+}
