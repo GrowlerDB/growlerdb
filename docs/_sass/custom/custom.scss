@@ -1,0 +1,10 @@
+// Custom overrides for the just-the-docs theme. This file is imported last by the theme's
+// stylesheet, so rules here win.
+
+// Inline code: the theme's default horizontal padding is tight, so the highlight background
+// crowds the text — noticeable in tables (e.g. Configuration → Global flags). Give it a bit
+// of breathing room. Only inline code carries `.highlighter-rouge`; fenced code blocks
+// (`pre > code`) don't, so they're untouched.
+code.highlighter-rouge {
+  padding: 0.2em 0.4em;
+}
