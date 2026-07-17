@@ -77,4 +77,10 @@ echo "== 4) capture tool selftest =="
 "$PY" capture.py --selftest || { echo "SMOKE FAILED: capture.py selftest"; exit 1; }
 
 echo
+echo "== 5) cold-tier validator selftest =="
+# The park/revive validator (TASK-229) drives live cluster IO, but its park->read-through->revive
+# state machine is exercised offline with scripted fakes so regressions surface without a cluster.
+"$PY" coldtier_validate.py --selftest || { echo "SMOKE FAILED: coldtier_validate.py selftest"; exit 1; }
+
+echo
 echo "SMOKE OK: all workloads valid."

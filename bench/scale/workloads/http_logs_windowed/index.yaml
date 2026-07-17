@@ -18,6 +18,11 @@ key:
 windowing:
   field: ts
   granularity: daily
+  # Cold-tiering: keep the 3 most-recent daily windows hot (local NVMe); older windows auto-park to
+  # object storage and serve read-through (TASK-229). No-op unless the deployment enables cold-tiering
+  # (Helm `coldTier.enabled` + a backup bucket); the synthetic corpus advances a daily timeline, so a
+  # run continuously ages windows past this horizon.
+  hot_windows: 3
 mapping:
   selection: EXPLICIT
   fields:

@@ -83,4 +83,6 @@ spec:
                 echo "waiting for minio..."; sleep 2;
               done
               mc mb -p local/growlerdb-warehouse
+              # Cold-tier backup target (TASK-229) — separate from the Iceberg warehouse bucket.
+              mc mb -p local/growlerdb-backups
               echo "buckets ready"
