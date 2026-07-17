@@ -132,6 +132,18 @@ impl WindowedWriteService {
         WriteServer::new(self).max_decoding_message_size(MAX_WRITE_MESSAGE_BYTES)
     }
 
+    /// A snapshot of the windows this node currently serves and their swappable handles — the **live**
+    /// set (boot windows plus any created at runtime by ingest). The background cold-tier *park* loop
+    /// reads this each tick to decide which aged windows to demote; swapping a returned handle to a
+    /// cold read-through shard is immediately visible to every query path sharing it. Ascending by
+    /// window id (oldest first), matching [`window_shards`](LocalIndexStore::window_shards).
+    pub fn window_handles(&self) -> Vec<(i64, ShardHandle)> {
+        self.read_windows()
+            .iter()
+            .map(|(w, st)| (*w, st.handle.clone()))
+            .collect()
+    }
+
     fn read_windows(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<i64, WindowState>> {
         self.windows.read().unwrap_or_else(|e| e.into_inner())
     }

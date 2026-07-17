@@ -100,6 +100,23 @@ reconcile:
     requests: { cpu: 100m, memory: 128Mi }
     limits: { cpu: "1", memory: 512Mi }
 
+# ---- Cold-tiering (object-storage read-through for aged windows) ------------------------------
+# WINDOWED indexes only. When enabled, each node backs up windows past the index's `hot_windows`
+# policy to `backupBucket` and serves them **read-through** from object storage, evicting the local
+# Tantivy bulk while keeping the tiny locator local — cheap long retention without losing
+# searchability. A cold window that gets hot traffic again auto-promotes back to local NVMe. Backup
+# uses the same `GROWLERDB_S3_*` endpoint/region/credentials as the Iceberg source (`iceberg` +
+# `credentials`). Off by default. (Backup/restore is available via the `growlerdb` CLI regardless;
+# this wires the automatic background parking.)
+coldTier:
+  enabled: false
+  # Object-store bucket for backups + cold-window bytes. REQUIRED when enabled.
+  backupBucket: ""
+  # How often each node demotes aged windows to cold (seconds). 0 disables the background park loop.
+  parkIntervalSecs: 3600
+  # Local byte-range cache shared across all cold windows on a node, in bytes (default 1 GiB).
+  coldCacheBytes: 1073741824
+
 # ---- Observability ---------------------------------------------------------------------------
 # Every component serves Prometheus `/metrics` + `/healthz` + `/readyz` on its metrics port. Set an
 # OTLP collector base URL to also export traces (the binary reads `GROWLERDB_OTLP_ENDPOINT`); e.g. a
