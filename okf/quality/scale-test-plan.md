@@ -236,40 +236,42 @@ against drift.
 
 ## Capturing results (for the analysis)
 
-At the end of the run — **before `terraform destroy`** — capture the graphs/metrics so they can go
-into the write-up:
+At the end of the run — **before `terraform destroy`** — capture the metrics/logs, because Prometheus
++ Loki are **in-cluster and ephemeral**: an un-captured post-mortem dies with the cluster. This is
+**automated** by `bench/scale/capture.py` (`just capture "<purpose>"`), so it isn't a manual
+screenshot ritual racing teardown.
 
-- **Console screenshots** (port-forward the gateway, open the UI): **Indexes** (doc count + shards),
-  **Search & Explore** (a representative query + `took`), **Observability** (the SLI panels), and
-  **Ingestion** (source-head vs committed lag).
-- **Metric charts** (Prometheus/Grafana `query_range` over the run window), one image each:
-  - doc-count / `gdb_source_records` growth vs `gdb_index_docs`;
-  - **query latency** p50/p95/p99 (`growlerdb_query_duration_seconds`) and **hydration latency**
-    (`growlerdb_hydration_duration_seconds`) — side by side;
-  - **throughput** into Iceberg (`deriv(gdb_source_records)`) and into GrowlerDB
-    (`rate(growlerdb_ingested_docs_total)`);
-  - **write latency** (`growlerdb_write_duration_seconds`) + **write-queue depth**
-    (`growlerdb_write_queue_depth`) + the **connector** rows-read vs write-retries — the write-path
-    trio that localizes an ingest ceiling to the commit path vs node compute vs the
-    connector;
-  - **source→index lag** (`gdb_source_index_lag_rows` / `growlerdb_ingest_lag_ms`);
-  - **index bytes** per shard (`growlerdb_index_bytes`);
-  - **hydration latency overlaid with Iceberg-compaction markers**
-    (`gdb_iceberg_last_compaction_timestamp_seconds` / drops in `gdb_source_data_files`) — the
-    compaction↔hydration relationship, plus `growlerdb_stale_locators_total` (expected ≈ flat —
-    the background re-map self-heals) and `growlerdb_locator_remapped_rows_total` on the same
-    axis to show *where* the healing cost moved.
-- **Raw numbers**: the harness JSON report (per-query p50/95/99 + QPS) and the recorded **run cost**.
-- **Logs:** the bundle runs **Loki + Promtail**, so every pod's logs are queryable in
-  the same Grafana as the metrics (correlate a write-latency spike with the node/connector log line).
-  Capture the relevant streams (connector, the hot node, gateway) **before `terraform destroy`** —
-  Prometheus + Loki are in-cluster and ephemeral, so an un-captured post-mortem dies with the cluster
-  (the destroy step is gated behind the capture).
-- **Staged results artifact** (the [staged protocol](#staged-scale-protocol-step-ups--milestones)):
-  `bench/scale/staged_run.py` drives the ingest step-ups + storage milestones and writes
-  `results.json` (each milestone's snapshot, query load, convergence, and the Trino comparison);
-  `bench/scale/results_table.py results.json` renders the **milestone×metric table** + the **1 TB /
-  100k-rec/s extrapolation** (measured vs modeled, ±residual band). Check both into the write-up.
+**What it collects**, into a timestamped run directory:
 
-Save all of it alongside the published numbers so the analysis shows honest end-to-end behavior with
-maintenance running.
+- **Metric time-series** — Prometheus `query_range` over the run window for the graph set: doc-count
+  growth (`growlerdb_source_records` vs `growlerdb_index_docs`); **query latency** p50/p95/p99
+  (`growlerdb_query_duration_seconds`) + **hydration latency** (`growlerdb_hydration_duration_seconds`);
+  **throughput** into Iceberg (`deriv(growlerdb_source_records)`) and GrowlerDB
+  (`rate(growlerdb_ingested_docs_total)`); the **write-path trio** (`growlerdb_write_duration_seconds`,
+  `growlerdb_write_queue_depth`, connector retries) that localizes an ingest ceiling; **source→index
+  lag** (`growlerdb_ingest_lag_ms`); **index bytes** (`growlerdb_index_bytes`); the locator-heal
+  signals (`growlerdb_stale_locators_total` ≈ flat, `growlerdb_locator_remapped_rows_total`); and the
+  **cold-tier cache** hit-ratio. Dumped as JSON (diff-able, re-plottable) rather than one-off images.
+- **Logs** — the connector / hot node / gateway streams from **Loki** (`LOKI_URL`), to correlate a
+  latency spike with the log line.
+- **Raw numbers + cost** — the harness `results.json` (per-query p50/95/99 + QPS) and the recorded
+  **run cost** (`--cost`).
+- **Screenshots** — *optional* dashboard images (`--screenshots`, Grafana render API), **bounded** by
+  count + a size budget. They can grow large without much value, so they are **off by default and
+  never committed**.
+
+**Durable record vs heavy artifacts.** The per-run directory (`bench/scale/runs/<run>/` — metric/log
+dumps, `audit.json`, optional screenshots) is **gitignored**; archive/upload it if a run matters. The
+**committed** record is `bench/scale/RUNLOG.md` — a bounded, append-only ledger with **one compact row
+per run** (start time, duration, **purpose**, run **parameters**, a result summary), so the history of
+*what was validated, when, why, and with what config* stays in git without bloat.
+
+**Teardown is gated on capture:** run `just capture …` and confirm the ledger row + run dir before
+`terraform destroy`.
+
+**Staged results artifact** (the [staged protocol](#staged-scale-protocol-step-ups--milestones)):
+`bench/scale/staged_run.py` drives the ingest step-ups + storage milestones and writes `results.json`
+(each milestone's snapshot, query load, convergence, and the Trino comparison); pass it to `capture.py`
+(`--results`) to fold it into the run dir, and `bench/scale/results_table.py results.json` renders the
+**milestone×metric table** + the **1 TB / 100k-rec/s extrapolation** (measured vs modeled). Check the
+table into the write-up.
