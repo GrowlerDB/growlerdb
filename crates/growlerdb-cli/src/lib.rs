@@ -1165,16 +1165,136 @@ fn spawn_prewarm(
     });
 }
 
-/// Background **park** loop for a windowed node — the hot→cold counterpart of [`spawn_prewarm`].
-/// Each interval it reads the node's *live* window set (boot windows plus any created at runtime by
-/// ingest), applies the index's `hot_windows` policy via [`cold_windows`], and demotes each aged
-/// hot window to cold read-through: back it up through the live serving handle (no second writer),
-/// swap the handle to a read-through shard, evict the local bulk, and start a pre-warm watcher so a
-/// window that gets hot again auto-revives. Idempotent — an already-cold window is skipped. A no-op
-/// when `interval_secs == 0`. Same discipline as the other background loops: a transient failure is
-/// logged + counted and retried next interval; the loop never dies.
+/// **One park pass** over a windowed node's live window set: demote every aged hot window (past the
+/// `hot_windows` policy) among `live` to cold read-through — back it up through the live serving
+/// handle (borrow, no second writer), swap the handle to a read-through shard that **shares** the
+/// window's still-open `aux.redb`, and evict the local bulk. Returns the windows **newly** parked
+/// this pass (already-cold windows are skipped), so the caller can start a pre-warm watcher on each.
+/// A per-window failure is logged + counted and skipped; the pass never aborts. `live` is `(window
+/// id, handle)`; `def_json` is the serialized index definition for the backup manifest.
 ///
 /// [`cold_windows`]: growlerdb_core::TimeWindowing::cold_windows
+#[allow(clippy::too_many_arguments)]
+async fn park_once(
+    live: &[(i64, growlerdb_engine::ShardHandle)],
+    store: &growlerdb_index::LocalIndexStore,
+    object_store: &growlerdb_backup::Operator,
+    cache: &growlerdb_index::RangeCache,
+    resolved: &growlerdb_core::ResolvedIndex,
+    windowing: &growlerdb_core::TimeWindowing,
+    index: &str,
+    def_json: &str,
+) -> Vec<i64> {
+    use growlerdb_index::ShardId;
+    use std::sync::Arc;
+    let ids: Vec<i64> = live.iter().map(|(w, _)| *w).collect();
+    // Aged windows outside the `hot_windows` policy — exactly the manual `park` victims.
+    let victims: Vec<i64> = windowing.cold_windows(&ids, None).to_vec();
+    let mut parked = Vec::new();
+    for w in victims {
+        let Some(handle) = live.iter().find(|(x, _)| *x == w).map(|(_, h)| h.clone()) else {
+            continue;
+        };
+        // Already parked (read-through, no writer) → nothing to do.
+        if handle.current().is_read_only() {
+            continue;
+        }
+        let label = format!("{index} w{w}");
+        let window_dir = store.shard_path(&ShardId::window(index, w));
+        // Staging sits beside the window dir (same filesystem → segment files hard-link).
+        let staging = window_dir.with_file_name(format!(".cold-staging-{index}-w{w}"));
+        let prefix = format!("cold/{index}/w{w}");
+        // Back up + cold-tier THROUGH the live serving shard (borrow — no second writer). The window
+        // keeps serving hot until the swap below.
+        let hot = handle.current();
+        let marker = match growlerdb_backup::cold_park_in_place(
+            &hot,
+            index,
+            w,
+            &window_dir,
+            &staging,
+            object_store,
+            &prefix,
+            Some(def_json.to_string()),
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("park `{label}`: cold-park failed ({e}) — staying hot");
+                growlerdb_telemetry::sli::background_failure("park");
+                continue;
+            }
+        };
+        // Keep the window's `aux.redb` handle to hand to the cold shard: redb allows one open per
+        // file, and the handle still holds this hot shard until the swap below, so the cold shard
+        // must SHARE the open handle, not race a second `Database::open`.
+        let reuse_db = hot.db_handle();
+        drop(hot);
+        // Open the read-through cold shard (object-storage reads → blocking) and hot-swap it in, so
+        // queries never see a gap; then evict the now-redundant local bulk.
+        let object_prefix = marker.object_prefix.clone();
+        let hotcache_key = marker.hotcache_key.clone();
+        let bundle_key = marker.bundle_key.clone();
+        let bundle_manifest_key = marker.bundle_manifest_key.clone();
+        let (store2, resolved2, wdir2, op2, cache2) = (
+            store.clone(),
+            resolved.clone(),
+            window_dir.clone(),
+            object_store.clone(),
+            cache.clone(),
+        );
+        let opened = tokio::task::spawn_blocking(move || {
+            let bundle = bundle_key.as_deref().zip(bundle_manifest_key.as_deref());
+            store2.open_cold_shard(
+                &resolved2,
+                &wdir2,
+                op2,
+                &object_prefix,
+                cache2,
+                hotcache_key.as_deref(),
+                bundle,
+                Some(reuse_db),
+            )
+        })
+        .await;
+        match opened {
+            Ok(Ok(shard)) => {
+                handle.swap(Arc::new(shard));
+                // Marker durable + read-through shard live → drop the local bulk. `aux.redb` stays as
+                // the cold footprint.
+                if let Err(e) = growlerdb_backup::evict_local_index(&window_dir) {
+                    eprintln!(
+                        "park `{label}`: local bulk evict failed ({e}) — parked, cleanup deferred"
+                    );
+                    growlerdb_telemetry::sli::background_failure("park");
+                }
+                eprintln!(
+                    "park `{label}`: cold-parked (snapshot {}) — now serving read-through",
+                    marker.snapshot
+                );
+                growlerdb_telemetry::sli::background_success("park");
+                parked.push(w);
+            }
+            Ok(Err(e)) => {
+                eprintln!("park `{label}`: open-cold failed after backup ({e}) — window still hot locally");
+                growlerdb_telemetry::sli::background_failure("park");
+            }
+            Err(e) => {
+                eprintln!("park `{label}`: open-cold task panicked ({e})");
+                growlerdb_telemetry::sli::background_failure("park");
+            }
+        }
+    }
+    parked
+}
+
+/// Background **park** loop for a windowed node — the hot→cold counterpart of [`spawn_prewarm`].
+/// Each interval it reads the node's *live* window set (boot windows plus any created at runtime by
+/// ingest) and runs one [`park_once`] pass, then starts a pre-warm watcher on each window it parked
+/// so one that gets hot again auto-revives. A no-op when `interval_secs == 0`. Same discipline as the
+/// other background loops: transient failures are logged + counted and retried next interval; the
+/// loop never dies.
 #[allow(clippy::too_many_arguments)]
 fn spawn_park(
     write: growlerdb_engine::WindowedWriteService,
@@ -1200,118 +1320,34 @@ fn spawn_park(
         }
     };
     tokio::spawn(async move {
-        use growlerdb_index::ShardId;
-        use std::sync::Arc;
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         tick.tick().await; // skip the immediate first tick
         loop {
             tick.tick().await;
-            // The live window set (ascending, oldest first) and each window's swappable handle.
             let live = write.window_handles();
-            let ids: Vec<i64> = live.iter().map(|(w, _)| *w).collect();
-            // Aged windows outside the `hot_windows` policy — exactly the manual `park` victims.
-            let victims: Vec<i64> = windowing.cold_windows(&ids, None).to_vec();
-            for w in victims {
-                let Some(handle) = live.iter().find(|(x, _)| *x == w).map(|(_, h)| h.clone())
-                else {
-                    continue;
-                };
-                // Already parked (read-through, no writer) → nothing to do.
-                if handle.current().is_read_only() {
-                    continue;
-                }
-                let label = format!("{index} w{w}");
-                let window_dir = store.shard_path(&ShardId::window(&index, w));
-                // Staging sits beside the window dir (same filesystem → segment files hard-link).
-                let staging = window_dir.with_file_name(format!(".cold-staging-{index}-w{w}"));
-                let prefix = format!("cold/{index}/w{w}");
-                // Back up + cold-tier THROUGH the live serving shard (borrow — no second writer). The
-                // window keeps serving hot until the swap below.
-                let hot = handle.current();
-                let marker = match growlerdb_backup::cold_park_in_place(
-                    &hot,
-                    &index,
-                    w,
-                    &window_dir,
-                    &staging,
-                    &object_store,
-                    &prefix,
-                    Some(def_json.clone()),
-                )
-                .await
-                {
-                    Ok(m) => m,
-                    Err(e) => {
-                        eprintln!("park `{label}`: cold-park failed ({e}) — staying hot");
-                        growlerdb_telemetry::sli::background_failure("park");
-                        continue;
-                    }
-                };
-                // Keep the window's `aux.redb` handle to hand to the cold shard: redb allows one open
-                // per file, and the handle still holds this hot shard until the swap below, so the
-                // cold shard must SHARE the open handle, not race a second `Database::open`.
-                let reuse_db = hot.db_handle();
-                drop(hot);
-                // Open the read-through cold shard (object-storage reads → blocking) and hot-swap it
-                // in, so queries never see a gap; then evict the now-redundant local bulk.
-                let object_prefix = marker.object_prefix.clone();
-                let hotcache_key = marker.hotcache_key.clone();
-                let bundle_key = marker.bundle_key.clone();
-                let bundle_manifest_key = marker.bundle_manifest_key.clone();
-                let (store2, resolved2, wdir2, op2, cache2) = (
-                    store.clone(),
-                    resolved.clone(),
-                    window_dir.clone(),
-                    object_store.clone(),
-                    cache.clone(),
-                );
-                let opened = tokio::task::spawn_blocking(move || {
-                    let bundle = bundle_key.as_deref().zip(bundle_manifest_key.as_deref());
-                    store2.open_cold_shard(
-                        &resolved2,
-                        &wdir2,
-                        op2,
-                        &object_prefix,
-                        cache2,
-                        hotcache_key.as_deref(),
-                        bundle,
-                        Some(reuse_db),
-                    )
-                })
-                .await;
-                match opened {
-                    Ok(Ok(shard)) => {
-                        handle.swap(Arc::new(shard));
-                        // Marker durable + read-through shard live → drop the local bulk. `aux.redb`
-                        // stays as the cold footprint.
-                        if let Err(e) = growlerdb_backup::evict_local_index(&window_dir) {
-                            eprintln!("park `{label}`: local bulk evict failed ({e}) — parked, cleanup deferred");
-                            growlerdb_telemetry::sli::background_failure("park");
-                        }
-                        eprintln!(
-                            "park `{label}`: cold-parked (snapshot {}) — now serving read-through",
-                            marker.snapshot
-                        );
-                        growlerdb_telemetry::sli::background_success("park");
-                        // Let a re-heated window promote itself back to hot.
-                        spawn_prewarm(
-                            handle,
-                            store.clone(),
-                            object_store.clone(),
-                            resolved.clone(),
-                            index.clone(),
-                            w,
-                            compact_interval_secs,
-                        );
-                    }
-                    Ok(Err(e)) => {
-                        eprintln!("park `{label}`: open-cold failed after backup ({e}) — window still hot locally");
-                        growlerdb_telemetry::sli::background_failure("park");
-                    }
-                    Err(e) => {
-                        eprintln!("park `{label}`: open-cold task panicked ({e})");
-                        growlerdb_telemetry::sli::background_failure("park");
-                    }
+            let parked = park_once(
+                &live,
+                &store,
+                &object_store,
+                &cache,
+                &resolved,
+                &windowing,
+                &index,
+                &def_json,
+            )
+            .await;
+            // Each newly-parked window gets a pre-warm watcher so it can promote itself back to hot.
+            for w in parked {
+                if let Some(handle) = live.iter().find(|(x, _)| *x == w).map(|(_, h)| h.clone()) {
+                    spawn_prewarm(
+                        handle,
+                        store.clone(),
+                        object_store.clone(),
+                        resolved.clone(),
+                        index.clone(),
+                        w,
+                        compact_interval_secs,
+                    );
                 }
             }
         }
@@ -4623,5 +4659,134 @@ mod tests {
         // Keeping more than match → nothing dropped; a pattern matching nothing → empty.
         assert!(retention_plan(&names, "events-*", 9).is_empty());
         assert!(retention_plan(&names, "metrics-*", 0).is_empty());
+    }
+
+    /// Build a hot window shard under `store` (index `index`, window `w`) holding one doc keyed `id`,
+    /// and return its swappable handle — the shape `park_once` operates on.
+    fn hot_window(
+        store: &growlerdb_index::LocalIndexStore,
+        index: &str,
+        idx: &growlerdb_core::ResolvedIndex,
+        w: i64,
+        id: &str,
+    ) -> growlerdb_engine::ShardHandle {
+        use growlerdb_core::{
+            CommitBatch, CompositeKey, Document, IndexWriter, LocatedDoc, SourceCheckpoint, Value,
+        };
+        use growlerdb_index::ShardId;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+        let shard = store.create_shard(&ShardId::window(index, w), idx).unwrap();
+        let key = CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]);
+        let mut fields = BTreeMap::new();
+        fields.insert("id".to_string(), Value::from(id));
+        let doc = LocatedDoc {
+            doc: Document::new(key, fields),
+            iceberg_file: "f".into(),
+            row_position: 0,
+        };
+        IndexWriter::write(
+            &shard,
+            &CommitBatch::from_upserts(vec![doc], SourceCheckpoint::iceberg(1), "b"),
+        )
+        .unwrap();
+        // A real windowed shard carries an event-time zone-map; set one so the cold marker does too.
+        shard.set_event_bounds(Some(w), Some(w)).unwrap();
+        growlerdb_engine::ShardHandle::new(Arc::new(shard))
+    }
+
+    /// End-to-end drive of a single `park_once` pass (the core the background loop runs each tick):
+    /// aged windows past the `hot_windows` policy are demoted to cold read-through — the handle swaps
+    /// to a read-only shard sharing the window's `aux.redb`, the local bulk is evicted, and the
+    /// window stays searchable — while the most-recent window is left hot. Then it is idempotent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn park_once_demotes_aged_windows_and_keeps_them_searchable_read_through() {
+        use growlerdb_core::{Query, TimeWindowing, WindowGranularity};
+        use growlerdb_index::ShardId;
+
+        let idx = resolved("events");
+        let root = tempfile::tempdir().unwrap();
+        let store = growlerdb_index::LocalIndexStore::open(root.path()).unwrap();
+
+        // Three windows oldest→newest, each a hot shard with one doc.
+        let windows = [1_000i64, 2_000, 3_000];
+        let live: Vec<(i64, growlerdb_engine::ShardHandle)> = windows
+            .iter()
+            .map(|&w| (w, hot_window(&store, "events", &idx, w, &format!("d{w}"))))
+            .collect();
+
+        let backup_root = tempfile::tempdir().unwrap();
+        let object_store = growlerdb_backup::fs_store(backup_root.path()).unwrap();
+        let cache = growlerdb_index::RangeCache::new(8 * 1024 * 1024);
+        // Keep the most-recent 1 window hot → w1000 and w2000 are victims.
+        let windowing = TimeWindowing::new("ts", WindowGranularity::Daily).with_hot_windows(1);
+        let def_json = serde_json::to_string(&idx).unwrap();
+
+        let parked = park_once(
+            &live,
+            &store,
+            &object_store,
+            &cache,
+            &idx,
+            &windowing,
+            "events",
+            &def_json,
+        )
+        .await;
+        assert_eq!(
+            parked,
+            vec![1_000, 2_000],
+            "the two oldest windows are demoted; the newest is kept hot"
+        );
+
+        // The two oldest now serve read-only (cold read-through); the newest stays hot.
+        assert!(live[0].1.current().is_read_only());
+        assert!(live[1].1.current().is_read_only());
+        assert!(
+            !live[2].1.current().is_read_only(),
+            "the most-recent window (within the hot policy) is untouched"
+        );
+
+        // Each parked window: marker written, local bulk evicted, aux kept, still searchable.
+        for &w in &[1_000i64, 2_000] {
+            let wd = store.shard_path(&ShardId::window("events", w));
+            assert!(
+                store.cold_marker("events", w).unwrap().is_some(),
+                "w{w}: cold marker written"
+            );
+            assert!(
+                !wd.join("index").exists(),
+                "w{w}: local Tantivy bulk evicted"
+            );
+            assert!(wd.join("aux.redb").exists(), "w{w}: aux.redb kept local");
+
+            let handle = live.iter().find(|(x, _)| *x == w).unwrap().1.clone();
+            let cold = handle.current();
+            let hits = tokio::task::spawn_blocking(move || {
+                cold.search_all(&Query::parse(&format!("id:d{w}")).unwrap(), 10)
+                    .unwrap()
+                    .len()
+            })
+            .await
+            .unwrap();
+            assert_eq!(hits, 1, "w{w}: still searchable read-through after parking");
+        }
+
+        // Idempotent: a second pass finds both victims already cold and parks nothing.
+        let again = park_once(
+            &live,
+            &store,
+            &object_store,
+            &cache,
+            &idx,
+            &windowing,
+            "events",
+            &def_json,
+        )
+        .await;
+        assert!(
+            again.is_empty(),
+            "second pass is a no-op (windows already cold)"
+        );
     }
 }
