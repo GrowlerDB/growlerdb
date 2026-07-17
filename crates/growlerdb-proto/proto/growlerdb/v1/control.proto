@@ -179,6 +179,11 @@ message FieldMapping {
   bool cached = 5;       // value returned inline with the hit
   bool pk = 6;           // identifier or partition key
   string blocked = 7;    // reason this field can't be cached ("" = not blocked)
+  // DATE fields: the source TimeFormat (serde snake_case: "epoch_seconds"/"epoch_millis"/
+  // "epoch_micros"/"epoch_nanos"/"rfc3339"/"date"), or "" for a native DATE already in canonical
+  // micros. A live-CP gateway reads it so the `_search` adapter converts a range/exact bound written
+  // in that unit to canonical micros — for EVERY temporal field, not just the windowing one.
+  string field_format = 8;
 }
 
 // One shard's placement + coarse state for the console's Shards tab: the primary node
@@ -196,6 +201,9 @@ message ShardStatus {
   int64 event_min = 6;
   int64 event_max = 7;
   bool has_event_bounds = 8;
+  bool cold = 9;             // windowed: this window is served read-through from object storage
+                            // (parked). Flips at runtime as park/pre-warm swap the tier, so a
+                            // live-CP gateway's /v1/cold reflects it. Always false for an ordinal shard.
 }
 
 // The windowing config of a windowed index, carried on GetIndexResponse so a live-CP
@@ -318,6 +326,9 @@ message ServedWindow {
   int64 event_min = 2;         // event-time zone-map lower bound (meaningful iff has_event_bounds)
   int64 event_max = 3;         // event-time zone-map upper bound
   bool has_event_bounds = 4;   // false when the window has no event-time field / no docs yet
+  bool cold = 5;               // true when the node currently serves this window read-through from
+                               // object storage (parked); flips at runtime as park/pre-warm swap the
+                               // tier, so the cluster gateway's /v1/cold reflects live state
 }
 
 message RegisterServedIndexRequest {

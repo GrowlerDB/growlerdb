@@ -1946,7 +1946,7 @@ async fn serve_windowed(
         tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             type Built = (
                 Vec<Arc<dyn Node>>,
-                Vec<(i64, Option<(i64, i64)>)>,
+                Vec<(i64, Option<(i64, i64)>, bool)>,
                 Vec<growlerdb_proto::v1::ServedWindow>,
                 Vec<i64>,
                 std::collections::BTreeMap<i64, SearchService>,
@@ -2047,12 +2047,14 @@ async fn serve_windowed(
                 windowed_suggest.insert(w, suggest_svc);
                 windowed_lookup.insert(w, lookup_svc);
                 windowed_admin.insert(w, admin_svc);
-                descriptors.push((w, zone));
+                let is_cold = cold_ids.contains(&w);
+                descriptors.push((w, zone, is_cold));
                 served.push(growlerdb_proto::v1::ServedWindow {
                     window: w,
                     event_min: zone.map(|(lo, _)| lo).unwrap_or(0),
                     event_max: zone.map(|(_, hi)| hi).unwrap_or(0),
                     has_event_bounds: zone.is_some(),
+                    cold: is_cold,
                 });
             }
             Ok::<Built, anyhow::Error>((
@@ -2086,7 +2088,7 @@ async fn serve_windowed(
     let window_seed: std::collections::BTreeMap<i64, growlerdb_engine::WindowSeed> = nodes
         .iter()
         .zip(descriptors.iter())
-        .map(|(node, (w, zone))| (*w, (handle_by_window[w].clone(), node.clone(), *zone)))
+        .map(|(node, (w, zone, _cold))| (*w, (handle_by_window[w].clone(), node.clone(), *zone)))
         .collect();
     let search_windows: growlerdb_engine::SharedSearchWindows =
         Arc::new(std::sync::RwLock::new(windowed_search));
@@ -2134,9 +2136,10 @@ async fn serve_windowed(
     }
 
     // Tag the Gateway with cold-tier status (per-window tier + the shared cache) for `GET /v1/cold`.
-    let mut gateway = Gateway::windowed(nodes, windowing.clone(), descriptors);
+    let mut gateway = Gateway::windowed(nodes, windowing.clone(), descriptors)
+        .with_date_formats(resolved.date_formats());
     if let Some(cache) = &cache {
-        gateway = gateway.with_cold_tier(cold_ids, cache.clone());
+        gateway = gateway.with_cold_tier(cache.clone());
     }
     let gateway = Arc::new(gateway);
 
@@ -2934,14 +2937,17 @@ fn windowing_from_get_index(
 /// reload is a follow-up (needs a windowed swap on the Gateway).
 /// (window, primary endpoint) pairs identifying a windowed topology — the windowed analog of
 /// [`RoutingFingerprint`], so the reloader logs only when the window→node set changes.
-type WindowFingerprint = Vec<(i64, String)>;
+// `(window id, primary endpoint, cold)` per window. `cold` is in the fingerprint so a tier flip
+// (park/pre-warm) — same window, same placement — still triggers a gateway topology reload, keeping
+// `/v1/cold` live instead of frozen at the boot tier.
+type WindowFingerprint = Vec<(i64, String, bool)>;
 
 /// The windowed routing resolved from a live-CP `GetIndex`: one [`WindowNode`] per window (deduped by
 /// endpoint), the windowing config, the per-window zone-map descriptors, and the fingerprint.
 type CpWindowedRouting = (
     Vec<std::sync::Arc<dyn growlerdb_engine::Node>>,
     growlerdb_core::TimeWindowing,
-    Vec<(i64, Option<(i64, i64)>)>,
+    Vec<(i64, Option<(i64, i64)>, bool)>,
     WindowFingerprint,
 );
 
@@ -2992,11 +2998,12 @@ async fn resolve_windowed_routing_cp(
         descriptors.push((
             s.window,
             s.has_event_bounds.then_some((s.event_min, s.event_max)),
+            s.cold,
         ));
     }
     let mut fingerprint: WindowFingerprint = windows
         .iter()
-        .map(|s| (s.window, s.primary.clone()))
+        .map(|s| (s.window, s.primary.clone(), s.cold))
         .collect();
     fingerprint.sort();
     Ok((nodes, windowing, descriptors, fingerprint))
@@ -3010,10 +3017,28 @@ async fn windowed_gateway_from_get_index(
 ) -> anyhow::Result<(growlerdb_engine::Gateway, WindowFingerprint)> {
     let (nodes, windowing, descriptors, fp) =
         resolve_windowed_routing_cp(index, resp, node_tls).await?;
+    // Temporal-field units from the CP's field mapping, so the gateway's `_search` adapter converts
+    // range bounds to canonical micros (keeping pruning + node execution consistent).
+    let date_formats = date_formats_from_get_index(resp);
     Ok((
-        growlerdb_engine::Gateway::windowed(nodes, windowing, descriptors),
+        growlerdb_engine::Gateway::windowed(nodes, windowing, descriptors)
+            .with_date_formats(date_formats),
         fp,
     ))
+}
+
+/// Every temporal field's declared unit, from a live-CP `GetIndex`'s field mappings — so the
+/// gateway's `_search` adapter converts a range/exact bound on **any** date field (not just the
+/// windowing one) to canonical micros before planning.
+fn date_formats_from_get_index(
+    resp: &growlerdb_proto::v1::GetIndexResponse,
+) -> growlerdb_engine::opensearch::FieldFormats {
+    resp.fields
+        .iter()
+        .filter_map(|f| {
+            growlerdb_core::TimeFormat::from_wire(&f.field_format).map(|fmt| (f.path.clone(), fmt))
+        })
+        .collect()
 }
 
 /// Build a sharded [`Gateway`](growlerdb_engine::Gateway) for `index` from the live Control-Plane at
@@ -3485,7 +3510,7 @@ async fn gateway_windowed_from_registry(
             }
         };
         nodes.push(growlerdb_engine::WindowNode::new(Arc::new(remote), *w).shared());
-        descriptors.push((*w, wa.event_min.zip(wa.event_max)));
+        descriptors.push((*w, wa.event_min.zip(wa.event_max), wa.cold));
     }
     Ok(growlerdb_engine::Gateway::windowed(
         nodes,
@@ -4588,6 +4613,37 @@ mod tests {
             },
         )
         .is_err());
+    }
+
+    #[test]
+    fn date_formats_from_get_index_covers_every_temporal_field() {
+        use growlerdb_core::TimeFormat;
+        // Field mappings carry each date field's declared unit; non-date fields (blank format) and
+        // unknown units are skipped. The windowing field is no longer special — every date field is
+        // resolved so a `_search` bound on any of them converts to canonical micros.
+        let field = |path: &str, ty: &str, fmt: &str| growlerdb_proto::v1::FieldMapping {
+            path: path.into(),
+            r#type: ty.into(),
+            field_format: fmt.into(),
+            ..Default::default()
+        };
+        let resp = growlerdb_proto::v1::GetIndexResponse {
+            fields: vec![
+                field("ingest", "date", "epoch_millis"),
+                field("event", "date", "epoch_seconds"),
+                field("native_ts", "date", ""), // native micros → no conversion
+                field("body", "text", ""),      // non-temporal
+                field("weird", "date", "furlongs"), // unparseable unit → skipped
+            ],
+            ..Default::default()
+        };
+        let formats = date_formats_from_get_index(&resp);
+        assert_eq!(formats.get("ingest"), Some(&TimeFormat::EpochMillis));
+        assert_eq!(formats.get("event"), Some(&TimeFormat::EpochSeconds));
+        assert_eq!(formats.get("native_ts"), None);
+        assert_eq!(formats.get("body"), None);
+        assert_eq!(formats.get("weird"), None);
+        assert_eq!(formats.len(), 2);
     }
 
     fn resolved(name: &str) -> growlerdb_core::ResolvedIndex {

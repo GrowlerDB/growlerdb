@@ -104,6 +104,28 @@ fn scalar_token(field: &str, v: &JsonValue) -> Result<String, AdapterError> {
     token(field, &s)
 }
 
+/// Each temporal field's declared unit, by path — from the served index definition, so a
+/// range/exact bound written in that unit (OpenSearch semantics) is converted to canonical micros
+/// **here, once**, before planning. Both window pruning and segment execution are micros-native, so
+/// converting at this boundary keeps them consistent. Empty for an index with no temporal fields.
+pub type FieldFormats = std::collections::HashMap<String, growlerdb_core::TimeFormat>;
+
+/// A range **bound** token. On a temporal field a numeric bound is in the field's declared unit
+/// (e.g. `epoch_s` seconds) — convert it to canonical micros, exactly as ingestion normalized the
+/// stored value, so the range and the data share a scale. A string bound (ISO-8601 / `YYYY-MM-DD`) is
+/// absolute and passes through for the query parser to resolve; a non-temporal field is unchanged.
+fn bound_token(field: &str, v: &JsonValue, formats: &FieldFormats) -> Result<String, AdapterError> {
+    if let Some(fmt) = formats.get(field) {
+        if let Some(n) = v.as_i64() {
+            let micros = fmt
+                .to_micros(field, &growlerdb_core::Value::Int(n))
+                .map_err(|e| AdapterError::bad(format!("`range` on `{field}`: {e}")))?;
+            return Ok(micros.to_string());
+        }
+    }
+    scalar_token(field, v)
+}
+
 /// The single `{ field: spec }` of a leaf clause (e.g. `term`, `match`). Errors if not exactly one.
 fn one_field(obj: &JsonValue, clause: &str) -> Result<(String, JsonValue), AdapterError> {
     let map = obj
@@ -124,7 +146,7 @@ fn leaf_value<'a>(spec: &'a JsonValue, key: &str) -> &'a JsonValue {
 }
 
 /// Translate one DSL query clause into a Lucene query-string fragment. Recursive (for `bool`).
-pub fn translate_query(dsl: &JsonValue) -> Result<String, AdapterError> {
+pub fn translate_query(dsl: &JsonValue, formats: &FieldFormats) -> Result<String, AdapterError> {
     let obj = dsl
         .as_object()
         .ok_or_else(|| AdapterError::bad("query must be an object"))?;
@@ -139,7 +161,8 @@ pub fn translate_query(dsl: &JsonValue) -> Result<String, AdapterError> {
 
         "term" => {
             let (field, spec) = one_field(body, "term")?;
-            let tok = scalar_token(&field, leaf_value(&spec, "value"))?;
+            // A temporal exact-match value is in the field's declared unit → canonical micros.
+            let tok = bound_token(&field, leaf_value(&spec, "value"), formats)?;
             Ok(format!("{field}:{tok}"))
         }
 
@@ -153,7 +176,7 @@ pub fn translate_query(dsl: &JsonValue) -> Result<String, AdapterError> {
             }
             let toks = arr
                 .iter()
-                .map(|v| scalar_token(&field, v))
+                .map(|v| bound_token(&field, v, formats))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(format!("{field}:({})", toks.join(" OR ")))
         }
@@ -221,10 +244,10 @@ pub fn translate_query(dsl: &JsonValue) -> Result<String, AdapterError> {
 
         "range" => {
             let (field, spec) = one_field(body, "range")?;
-            translate_range(&field, &spec)
+            translate_range(&field, &spec, formats)
         }
 
-        "bool" => translate_bool(body),
+        "bool" => translate_bool(body, formats),
 
         other => Err(AdapterError::unsupported(format!(
             "query type `{other}` is not supported by the adapter (supported: match, match_phrase, \
@@ -233,17 +256,22 @@ pub fn translate_query(dsl: &JsonValue) -> Result<String, AdapterError> {
     }
 }
 
-fn translate_range(field: &str, spec: &JsonValue) -> Result<String, AdapterError> {
+fn translate_range(
+    field: &str,
+    spec: &JsonValue,
+    formats: &FieldFormats,
+) -> Result<String, AdapterError> {
     let get = |k: &str| spec.get(k);
+    let tok = |v: &JsonValue| bound_token(field, v, formats);
     // Lower bound: gte (inclusive) or gt (exclusive); upper: lte / lt.
     let (lower, lower_inc) = match (get("gte"), get("gt")) {
-        (Some(v), _) => (Some(scalar_token(field, v)?), true),
-        (None, Some(v)) => (Some(scalar_token(field, v)?), false),
+        (Some(v), _) => (Some(tok(v)?), true),
+        (None, Some(v)) => (Some(tok(v)?), false),
         (None, None) => (None, true),
     };
     let (upper, upper_inc) = match (get("lte"), get("lt")) {
-        (Some(v), _) => (Some(scalar_token(field, v)?), true),
-        (None, Some(v)) => (Some(scalar_token(field, v)?), false),
+        (Some(v), _) => (Some(tok(v)?), true),
+        (None, Some(v)) => (Some(tok(v)?), false),
         (None, None) => (None, true),
     };
     if lower.is_none() && upper.is_none() {
@@ -258,7 +286,10 @@ fn translate_range(field: &str, spec: &JsonValue) -> Result<String, AdapterError
     Ok(format!("{field}:{open}{lo} TO {hi}{close}"))
 }
 
-fn translate_clauses(v: Option<&JsonValue>) -> Result<Vec<String>, AdapterError> {
+fn translate_clauses(
+    v: Option<&JsonValue>,
+    formats: &FieldFormats,
+) -> Result<Vec<String>, AdapterError> {
     let Some(v) = v else { return Ok(vec![]) };
     // A clause list accepts a single object or an array of objects (OpenSearch allows both).
     let items: Vec<&JsonValue> = match v {
@@ -266,19 +297,19 @@ fn translate_clauses(v: Option<&JsonValue>) -> Result<Vec<String>, AdapterError>
         JsonValue::Object(_) => vec![v],
         _ => return Err(AdapterError::bad("bool clause must be an object or array")),
     };
-    items.iter().map(|c| translate_query(c)).collect()
+    items.iter().map(|c| translate_query(c, formats)).collect()
 }
 
-fn translate_bool(body: &JsonValue) -> Result<String, AdapterError> {
+fn translate_bool(body: &JsonValue, formats: &FieldFormats) -> Result<String, AdapterError> {
     // `filter` is treated like `must` (a required conjunct) — the read-path adapter doesn't model
     // the non-scoring distinction. `must`/`filter` AND together; `must_not` negates. `should` is
     // honored for *matching* only when there is no must/filter (OpenSearch's default
     // minimum_should_match); with a must/filter present it is scoring-only and not expressible in
     // the query string, so it's dropped from the predicate (documented in the support matrix).
-    let must = translate_clauses(body.get("must"))?;
-    let filter = translate_clauses(body.get("filter"))?;
-    let should = translate_clauses(body.get("should"))?;
-    let must_not = translate_clauses(body.get("must_not"))?;
+    let must = translate_clauses(body.get("must"), formats)?;
+    let filter = translate_clauses(body.get("filter"), formats)?;
+    let should = translate_clauses(body.get("should"), formats)?;
+    let must_not = translate_clauses(body.get("must_not"), formats)?;
 
     let mut required: Vec<String> = must.into_iter().chain(filter).map(group).collect();
     if required.is_empty() && !should.is_empty() {
@@ -514,9 +545,10 @@ async fn run_search(
         index
     };
 
-    // Translate the DSL (absent query => match_all).
+    // Translate the DSL (absent query => match_all). Temporal range/exact bounds are converted to
+    // canonical micros here using the served index's declared field units.
     let query = match &body.query {
-        Some(q) => match translate_query(q) {
+        Some(q) => match translate_query(q, gw.date_formats()) {
             Ok(s) => s,
             Err(e) => return adapter_error(e),
         },
@@ -688,9 +720,46 @@ mod tests {
     /// Translate a DSL clause and assert it parses into the canonical native AST — the AC
     /// "the `_search` DSL subset maps to the native AST", checked end-to-end.
     fn xlate(dsl: serde_json::Value) -> String {
-        let s = translate_query(&dsl).expect("should translate");
+        let s = translate_query(&dsl, &FieldFormats::default()).expect("should translate");
         Query::parse(&s).unwrap_or_else(|e| panic!("`{s}` should parse to the AST: {e}"));
         s
+    }
+
+    /// `xlate` with a declared temporal-field map, to assert the adapter converts range bounds.
+    fn xlate_with(dsl: serde_json::Value, formats: &FieldFormats) -> String {
+        let s = translate_query(&dsl, formats).expect("should translate");
+        Query::parse(&s).unwrap_or_else(|e| panic!("`{s}` should parse to the AST: {e}"));
+        s
+    }
+
+    #[test]
+    fn adapter_converts_temporal_range_bounds_to_micros() {
+        let mut fmts = FieldFormats::default();
+        fmts.insert("ts".into(), growlerdb_core::TimeFormat::EpochSeconds);
+        // A range written in the field's DECLARED unit (seconds) becomes canonical micros in the
+        // query string — so window pruning + segment execution (both micros-native) stay consistent.
+        assert_eq!(
+            xlate_with(
+                json!({ "range": { "ts": { "gte": 893964000, "lte": 894050400 } } }),
+                &fmts
+            ),
+            "ts:[893964000000000 TO 894050400000000]"
+        );
+        // An exact `term` on the temporal field converts too.
+        assert_eq!(
+            xlate_with(json!({ "term": { "ts": { "value": 893964000 } } }), &fmts),
+            "ts:893964000000000"
+        );
+        // A non-temporal field is untouched.
+        assert_eq!(
+            xlate(json!({ "range": { "age": { "gte": 18, "lt": 65 } } })),
+            "age:[18 TO 65}"
+        );
+        // With NO declared format for the field, a numeric bound stays raw (native-micros contract).
+        assert_eq!(
+            xlate(json!({ "range": { "ts": { "gte": 893964000, "lte": 894050400 } } })),
+            "ts:[893964000 TO 894050400]"
+        );
     }
 
     #[test]
@@ -806,7 +875,8 @@ mod tests {
 
     #[test]
     fn unsupported_clause_is_a_clear_error() {
-        let err = translate_query(&json!({ "fuzzy": { "x": "y" } })).unwrap_err();
+        let err = translate_query(&json!({ "fuzzy": { "x": "y" } }), &FieldFormats::default())
+            .unwrap_err();
         assert_eq!(err.kind, "unsupported");
         assert!(err.reason.contains("fuzzy"));
     }
@@ -830,9 +900,11 @@ mod tests {
     #[test]
     fn unsafe_token_values_are_rejected() {
         // Whitespace / metacharacters in a term value → clear unsupported error, not mis-encoding.
-        let err = translate_query(&json!({ "term": { "f": "a b" } })).unwrap_err();
+        let err = translate_query(&json!({ "term": { "f": "a b" } }), &FieldFormats::default())
+            .unwrap_err();
         assert_eq!(err.kind, "unsupported");
-        let err = translate_query(&json!({ "term": { "f": "a:b" } })).unwrap_err();
+        let err = translate_query(&json!({ "term": { "f": "a:b" } }), &FieldFormats::default())
+            .unwrap_err();
         assert_eq!(err.kind, "unsupported");
     }
 
