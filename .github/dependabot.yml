@@ -30,6 +30,13 @@ updates:
     groups:
       maven-minor-patch:
         update-types: [minor, patch]
+    # Hold Spark at 4.1.x: Spark 4.2.0 turned `catalog.View` from an interface into a
+    # class, so Iceberg 1.11.0's `SparkView` fails to load (IncompatibleClassChange) and
+    # the connector integration tests all error out. Spark and Iceberg must move together;
+    # lift this once an Iceberg release supports Spark 4.2 (bump both in one PR).
+    ignore:
+      - dependency-name: "org.apache.spark:*"
+        versions: [">=4.2.0"]
 
   - package-ecosystem: maven
     directory: /connector-trino
