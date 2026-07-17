@@ -34,11 +34,23 @@ jobs:
         run: df -h / "$HOME" "$RUNNER_TEMP" || true
       # JDK 21 + Maven both come from mise (mise.toml), so this doesn't depend on the
       # self-hosted runner shipping a system `mvn` (it doesn't).
-      - name: Build + test (Spark connector, JDK 21)
+      #
+      # Runs unit AND the Spark **integration** group in the PR gate. The integration tests are the
+      # in-JVM Spark/Iceberg ones that catch a binary-incompatible dependency bump — e.g. Spark 4.2.0
+      # (#103) passed the old unit-only gate but broke every integration test (Iceberg 1.11's
+      # `SparkView` no longer loaded). `-Dtest.excludedGroups=e2e` narrows the pom's default
+      # `integration,e2e` exclusion to just `e2e`, so unit + integration both run; only the
+      # cross-process `e2e` group (needs the built `growlerdb` binary) stays nightly.
+      - name: Build + test (Spark connector, JDK 21) — unit + Spark integration
         working-directory: connector
         run: |
           mise install
-          mise exec -- mvn -B -q verify
+          mise exec -- mvn -B -q verify -Dtest.excludedGroups=e2e
+          # Guard the silent-zero trap: a groups/config regression could select ZERO integration
+          # tests and still pass green (the exact failure mode that hides a broken bump). Require the
+          # Spark integration suite to have actually produced a report.
+          test -f target/surefire-reports/io.growlerdb.connector.ConnectorJobIntegrationTest.txt \
+            || { echo "::error::Spark connector integration tests did not run — check the pom test groups"; exit 1; }
       # The Trino connector is a separate module on JDK 23 (Trino 470's SPI bytecode) — its own
       # mise.toml provisions the newer JDK, so `mise install` here picks it up independently.
       - name: Build + test (Trino connector, JDK 23)
