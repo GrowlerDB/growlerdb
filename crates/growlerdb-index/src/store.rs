@@ -342,6 +342,19 @@ impl LocalIndexStore {
         self.create_shard(id, index)
     }
 
+    /// Open a hot shard **reusing an already-open `aux.redb` handle** — the pre-warm (cold→hot)
+    /// transition passes the retiring cold shard's [`db_handle`](Shard::db_handle) so promoting a
+    /// window in place never opens a second redb handle on the same file (redb allows only one). The
+    /// window's `aux.redb` was already local while cold, so it is the same handle either way.
+    pub fn open_shard_reusing_db(
+        &self,
+        id: &ShardId,
+        index: &ResolvedIndex,
+        db: Arc<Database>,
+    ) -> Result<Shard> {
+        self.build_shard_with_db(self.root.join(id.rel_path()), index, Some(db))
+    }
+
     /// Open a **cold** window shard **read-through**: its Tantivy index is served from
     /// object storage under `prefix` in `op` (via [`ObjectDirectory`] + the shared range `cache`),
     /// while its `aux.redb` (locator + event-time zone-map) stays **local** under `aux_dir` — kept
@@ -359,6 +372,7 @@ impl LocalIndexStore {
         cache: RangeCache,
         hotcache_key: Option<&str>,
         bundle: Option<(&str, &str)>,
+        reuse_db: Option<Arc<Database>>,
     ) -> Result<Shard> {
         let schema = IndexSchema::from_resolved(index);
         let mut dir = ObjectDirectory::open(op.clone(), prefix)
@@ -397,7 +411,12 @@ impl LocalIndexStore {
         }
         let tantivy = tantivy::Index::open(dir).map_err(|e| StoreError::Segment(e.into()))?;
         let core = SegmentReader::live(&tantivy).map_err(StoreError::Segment)?;
-        let db = Database::open(aux_dir.join("aux.redb"))?;
+        // Reuse the retiring hot shard's `aux.redb` handle when parking a window in place (redb
+        // allows only one open per file); otherwise open it fresh (cold-at-startup / offline path).
+        let db = match reuse_db {
+            Some(db) => db,
+            None => Arc::new(Database::open(aux_dir.join("aux.redb"))?),
+        };
         // A cold shard's `location.arr` stays local beside aux.redb (D30: the array is
         // tiny and never parked). Read-only here — cold shards take no writes.
         let location = LocationStore::open(&aux_dir.join(LOCATION_FILE))?;
@@ -602,6 +621,19 @@ impl LocalIndexStore {
     }
 
     fn build_shard(&self, dir: PathBuf, index: &ResolvedIndex) -> Result<Shard> {
+        self.build_shard_with_db(dir, index, None)
+    }
+
+    /// Build a hot shard, optionally **reusing** an already-open `aux.redb` handle (`reuse_db`)
+    /// instead of opening a second one — the in-process pre-warm (cold→hot) transition passes the
+    /// retiring cold shard's handle so the two never race redb's one-open-per-file rule. `None`
+    /// opens/creates the db fresh (the normal build/create path).
+    fn build_shard_with_db(
+        &self,
+        dir: PathBuf,
+        index: &ResolvedIndex,
+        reuse_db: Option<Arc<Database>>,
+    ) -> Result<Shard> {
         std::fs::create_dir_all(&dir)?;
         let schema = IndexSchema::from_resolved(index);
         let index_dir = dir.join("index");
@@ -609,8 +641,14 @@ impl LocalIndexStore {
             .open_or_create_index(&schema, &index_dir)
             .map_err(StoreError::Segment)?;
         let core = SegmentReader::live(&tantivy).map_err(StoreError::Segment)?;
-        let db = Database::create(dir.join("aux.redb"))?;
-        Self::migrate_batch_index(&db)?;
+        let db = match reuse_db {
+            Some(db) => db, // already open + migrated (shared across a tier swap)
+            None => {
+                let db = Arc::new(Database::create(dir.join("aux.redb"))?);
+                Self::migrate_batch_index(&db)?;
+                db
+            }
+        };
         // Open (or create) the dense location array beside aux.redb and load the
         // interned file table into the in-memory bidirectional map.
         let location = LocationStore::open(&dir.join(LOCATION_FILE))?;
@@ -1183,7 +1221,12 @@ pub struct Shard {
     /// The live reader (auto-reloads on commit); all non-PIT reads go through it.
     core: SegmentReader,
     schema: IndexSchema,
-    db: Database,
+    /// The redb aux store (locator + interned files + checkpoints). Behind an `Arc` because redb
+    /// permits only **one** open handle per file per process, yet an in-process hot↔cold tier swap
+    /// (park / pre-warm) has both the retiring and the arriving shard live at once — they **share**
+    /// this one handle across the swap (`aux.redb` stays local and unchanged through it) rather than
+    /// racing a second `Database::open`.
+    db: Arc<Database>,
     /// The dense **location array** (`location.arr`, the D30 location layer). Writes
     /// happen under the writer lock (the commit path); reads are lock-free.
     location: LocationStore,
@@ -1299,6 +1342,22 @@ enum Continuity {
 }
 
 impl Shard {
+    /// Whether this shard is a **read-only cold read-through** shard (served from object storage
+    /// via [`open_cold_shard`](LocalIndexStore::open_cold_shard), no local writer). A hot shard
+    /// has a writer; a cold one does not. Background writers (auto-compaction, locator re-map)
+    /// key off this to stand down the moment a window is parked underneath a live handle.
+    pub fn is_read_only(&self) -> bool {
+        self.writer.is_none()
+    }
+
+    /// A clone of this shard's shared `aux.redb` handle, to hand to the shard arriving in an
+    /// in-process tier swap ([`open_cold_shard`](LocalIndexStore::open_cold_shard) /
+    /// [`open_shard_reusing_db`](LocalIndexStore::open_shard_reusing_db)) so the two never race a
+    /// second `Database::open` on the same file during the overlap.
+    pub fn db_handle(&self) -> Arc<Database> {
+        self.db.clone()
+    }
+
     /// The **checkpoint-continuity guard** (window-covering): decide what a batch whose window
     /// is `(from, end]` means for a shard sitting at `current`.
     ///
@@ -7444,7 +7503,7 @@ mod window_store_tests {
         let aux_dir = window_dir.clone();
         let counts = tokio::task::spawn_blocking(move || {
             let cold = store
-                .open_cold_shard(&idx, &aux_dir, op, "cold", cache, None, None)
+                .open_cold_shard(&idx, &aux_dir, op, "cold", cache, None, None, None)
                 .unwrap();
             let d1 = cold
                 .search_all(&growlerdb_core::Query::parse("id:d1").unwrap(), 10)

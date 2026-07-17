@@ -312,16 +312,28 @@ pub async fn revive(store: &Operator, prefix: &str, shard_dir: &Path) -> Result<
     restore(store, prefix, shard_dir).await
 }
 
-/// **Cold-park** a window shard for *read-through* serving: back its bulk up to `store`
-/// under `prefix`, then evict only the local Tantivy `index/` dir while **keeping `aux.redb`**, and
-/// drop a [`ColdMarker`] in `window_dir`. Unlike [`park`] (full evict → unqueryable until restored),
-/// the window stays **searchable in place** — `open_cold_shard` serves the index read-through from
-/// `<prefix>/data/index` with the local aux. Returns the marker (the caller writes it via the index
-/// store / uses it to register the window). The shard is consumed so its handles close before the
-/// `index/` dir is removed.
+/// Evict a parked window's local Tantivy **bulk** (`window_dir/index`) while keeping the local
+/// `aux.redb` + `location.arr` (the cold footprint `open_cold_shard` still reads). The LAST step of a
+/// park — run only *after* the [`ColdMarker`] is durable, so a crash mid-park always leaves a
+/// fully-serving hot shard, never a markerless empty window.
+pub fn evict_local_index(window_dir: &Path) -> std::io::Result<()> {
+    let index_subdir = window_dir.join("index");
+    if index_subdir.exists() {
+        std::fs::remove_dir_all(&index_subdir)?;
+    }
+    Ok(())
+}
+
+/// The **cold-park core** (borrows the shard, does NOT evict): back the window's bulk up to `store`
+/// under `prefix`, build the precomputed hotcache + split bundle, and drop a durable [`ColdMarker`]
+/// in `window_dir`. Returns the marker. Eviction of the local `index/` bulk is the caller's step
+/// (via [`evict_local_index`]) — split out so a live node can park a window it is *serving* (backing
+/// up through its shared read handle) without a second writer on the index directory, then swap the
+/// handle to a read-through shard before evicting. Both [`cold_park`] and [`cold_park_in_place`] wrap
+/// this.
 #[allow(clippy::too_many_arguments)]
-pub async fn cold_park(
-    shard: Shard,
+async fn cold_park_to_store(
+    shard: &Shard,
     index: &str,
     window: i64,
     window_dir: &Path,
@@ -334,7 +346,7 @@ pub async fn cold_park(
     // without opening it.
     let zone = shard.event_bounds()?;
     let mut manifest = backup(
-        &shard,
+        shard,
         index,
         &format!("w{window}"),
         staging,
@@ -343,10 +355,6 @@ pub async fn cold_park(
         definition_json,
     )
     .await?;
-    // Backup committed → close handles (redb + tantivy) before touching the directory. The local
-    // `index/` is NOT evicted yet: eviction is the LAST step (after the marker is durable) so a crash
-    // mid-park leaves a fully-serving hot shard, never a markerless empty window.
-    drop(shard);
     let base = prefix.trim_end_matches('/');
     let object_prefix = format!("{base}/data/index");
     // Precomputed hotcache: warm the just-parked index once and store the structural reads
@@ -427,14 +435,74 @@ pub async fn cold_park(
         window_dir.join(growlerdb_index::COLD_MARKER),
         serde_json::to_vec_pretty(&marker)?,
     )?;
-    // Evict the local bulk LAST, now that the marker is durably written — before this
-    // point a crash leaves a hot shard; after it, discovery serves the window cold read-through.
-    // `aux.redb` stays as the cold footprint.
-    let index_subdir = window_dir.join("index");
-    if index_subdir.exists() {
-        std::fs::remove_dir_all(&index_subdir)?;
-    }
     Ok(marker)
+}
+
+/// **Cold-park** a window shard for *read-through* serving: back its bulk up to `store`
+/// under `prefix`, then evict only the local Tantivy `index/` dir while **keeping `aux.redb`**, and
+/// drop a [`ColdMarker`] in `window_dir`. Unlike [`park`] (full evict → unqueryable until restored),
+/// the window stays **searchable in place** — `open_cold_shard` serves the index read-through from
+/// `<prefix>/data/index` with the local aux. Returns the marker. The shard is **consumed** so its
+/// handles (redb + tantivy) close before the `index/` dir is removed — the offline CLI path, where
+/// nothing else is serving the window.
+#[allow(clippy::too_many_arguments)]
+pub async fn cold_park(
+    shard: Shard,
+    index: &str,
+    window: i64,
+    window_dir: &Path,
+    staging: &Path,
+    store: &Operator,
+    prefix: &str,
+    definition_json: Option<String>,
+) -> Result<ColdMarker> {
+    let marker = cold_park_to_store(
+        &shard,
+        index,
+        window,
+        window_dir,
+        staging,
+        store,
+        prefix,
+        definition_json,
+    )
+    .await?;
+    // Backup + marker durable → close handles before touching the directory, then evict the local
+    // bulk LAST: a crash before the marker leaves a fully-serving hot shard; after it, discovery
+    // serves the window cold read-through.
+    drop(shard);
+    evict_local_index(window_dir)?;
+    Ok(marker)
+}
+
+/// **Cold-park a window a live node is serving**, backing up through a shared read handle to the
+/// shard (`&Shard`, no second writer). Returns the [`ColdMarker`]; the caller must then swap the
+/// window's handle to a read-through shard ([`open_cold_shard`](growlerdb_index::LocalIndexStore::open_cold_shard))
+/// and call [`evict_local_index`] — in that order, so queries never see a gap (the hot shard serves
+/// until the swap; the read-through shard reads object storage + the still-local `aux.redb`, so
+/// evicting the local `index/` after the swap is safe). The marker is durable before this returns.
+#[allow(clippy::too_many_arguments)]
+pub async fn cold_park_in_place(
+    shard: &Shard,
+    index: &str,
+    window: i64,
+    window_dir: &Path,
+    staging: &Path,
+    store: &Operator,
+    prefix: &str,
+    definition_json: Option<String>,
+) -> Result<ColdMarker> {
+    cold_park_to_store(
+        shard,
+        index,
+        window,
+        window_dir,
+        staging,
+        store,
+        prefix,
+        definition_json,
+    )
+    .await
 }
 
 /// Promote a cold (read-through) window back to a **local hot shard**: materialize

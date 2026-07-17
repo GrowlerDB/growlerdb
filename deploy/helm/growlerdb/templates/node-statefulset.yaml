@@ -82,6 +82,7 @@ spec:
             - name: POD_NAMESPACE
               valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
             {{- include "growlerdb.icebergEnv" . | nindent 12 }}
+            {{- include "growlerdb.coldTierEnv" . | nindent 12 }}
             {{- include "growlerdb.observabilityEnv" . | nindent 12 }}
           ports:
             - { name: grpc, containerPort: {{ .Values.node.grpcPort }} }

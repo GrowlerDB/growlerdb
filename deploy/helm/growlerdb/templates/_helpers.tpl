@@ -93,6 +93,21 @@ app.kubernetes.io/instance: {{ .Release.Name }}
   valueFrom: { secretKeyRef: { name: {{ include "growlerdb.secretName" . }}, key: s3SecretKey } }
 {{- end -}}
 
+{{/* Cold-tiering env for the node: the object-store backup bucket, the background park cadence, and
+     the shared read-through cache size. Emitted only when cold-tiering is enabled; the bucket is
+     required then (parking has nowhere to write without it). Reuses the same GROWLERDB_S3_* endpoint
+     /region/credentials as the Iceberg source (from `growlerdb.icebergEnv`). */}}
+{{- define "growlerdb.coldTierEnv" -}}
+{{- if .Values.coldTier.enabled }}
+- name: GROWLERDB_BACKUP_BUCKET
+  value: {{ required "coldTier.backupBucket is required when coldTier.enabled" .Values.coldTier.backupBucket | quote }}
+- name: GROWLERDB_PARK_INTERVAL_SECS
+  value: {{ .Values.coldTier.parkIntervalSecs | int64 | quote }}
+- name: GROWLERDB_COLD_CACHE_BYTES
+  value: {{ .Values.coldTier.coldCacheBytes | int64 | quote }}
+{{- end }}
+{{- end -}}
+
 {{/* Observability env shared by every component: export OTLP traces when an endpoint is
      configured. Metrics/health are served on each component's metrics port regardless. */}}
 {{- define "growlerdb.observabilityEnv" -}}

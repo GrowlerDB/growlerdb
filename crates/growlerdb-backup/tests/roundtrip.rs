@@ -6,8 +6,8 @@
 use std::collections::BTreeMap;
 
 use growlerdb_backup::{
-    backup, cold_park, fs_store, park, promote_cold, read_manifest, refresh, restore, revive,
-    BackupError, FileEntry, Manifest, MANIFEST_FORMAT,
+    backup, cold_park, cold_park_in_place, evict_local_index, fs_store, park, promote_cold,
+    read_manifest, refresh, restore, revive, BackupError, FileEntry, Manifest, MANIFEST_FORMAT,
 };
 use growlerdb_core::{
     CommitBatch, CompositeKey, Document, IndexDefinition, IndexWriter, LocatedDoc, Query,
@@ -344,6 +344,7 @@ async fn cold_park_evicts_bulk_keeps_aux_and_serves_read_through() {
                 cache,
                 hotcache_key.as_deref(),
                 bundle,
+                None, // the hot shard was consumed by cold_park → open aux.redb fresh
             )
             .unwrap();
         let hits = cold
@@ -709,4 +710,118 @@ async fn missing_backup_is_a_not_found() {
     // The caller treats NotFound as "no backup → rebuild from Iceberg".
     let err = read_manifest(&store, "backups/absent").await.unwrap_err();
     assert!(matches!(err, BackupError::NotFound(_)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_park_in_place_backs_up_without_evicting_and_leaves_shard_usable() {
+    // The serving-node park path: `cold_park_in_place` BORROWS the shard (no second writer) and does
+    // NOT evict — so a live node backs up + marks the window durable while still serving it, then
+    // swaps to a read-through shard and evicts. Mirrors what `spawn_park` does in-process.
+    let idx = docs_index();
+    let w: i64 = 1_700_000_000_000;
+    let id = ShardId::window("docs", w);
+
+    let root = tempfile::tempdir().unwrap();
+    let local = LocalIndexStore::open(root.path()).unwrap();
+    let shard = local.create_shard(&id, &idx).unwrap();
+    IndexWriter::write(
+        &shard,
+        &CommitBatch::from_upserts(
+            vec![doc("doc-1", "alpha"), doc("doc-2", "beta alpha")],
+            SourceCheckpoint::iceberg(7),
+            "b1",
+        ),
+    )
+    .unwrap();
+    shard.set_event_bounds(Some(10), Some(99)).unwrap();
+    let window_dir = local.shard_path(&id);
+
+    // A hot shard has a writer.
+    assert!(!shard.is_read_only(), "hot shard is writable");
+
+    let backup_root = tempfile::tempdir().unwrap();
+    let store = fs_store(backup_root.path()).unwrap();
+    let staging = root.path().join(".cold-staging");
+    let prefix = "cold/docs/w1700000000000";
+    // Borrow the shard — it is NOT consumed.
+    let marker = cold_park_in_place(
+        &shard,
+        "docs",
+        w,
+        &window_dir,
+        &staging,
+        &store,
+        prefix,
+        Some(serde_json::to_string(&idx).unwrap()),
+    )
+    .await
+    .unwrap();
+
+    // Marker is durable, but the local bulk is UNTOUCHED (caller controls eviction) and the borrowed
+    // shard is still fully usable — it kept serving across the backup.
+    assert!(window_dir.join("cold.json").exists(), "marker written");
+    assert!(
+        window_dir.join("index").exists(),
+        "cold_park_in_place does NOT evict — the window keeps serving hot until the caller swaps"
+    );
+    assert_eq!(
+        shard
+            .search_all(&Query::parse("body:alpha").unwrap(), 10)
+            .unwrap()
+            .len(),
+        2,
+        "borrowed shard still serves after in-place park"
+    );
+
+    // Now the caller's finishing move: swap in the read-through shard, then evict the local bulk.
+    let cache = RangeCache::new(8 * 1024 * 1024);
+    let store2 = store.clone();
+    let wd = window_dir.clone();
+    let object_prefix = marker.object_prefix.clone();
+    let hotcache_key = marker.hotcache_key.clone();
+    let bundle_key = marker.bundle_key.clone();
+    let bundle_manifest_key = marker.bundle_manifest_key.clone();
+    let idx2 = idx.clone();
+    // The hot `shard` is still alive here (as it is in `spawn_park`, held by the live handle until
+    // the swap), so the cold shard must SHARE its open `aux.redb` handle rather than open a second.
+    let reuse_db = shard.db_handle();
+    let read_through_ok = tokio::task::spawn_blocking(move || {
+        let bundle = bundle_key.as_deref().zip(bundle_manifest_key.as_deref());
+        let cold = local
+            .open_cold_shard(
+                &idx2,
+                &wd,
+                store2,
+                &object_prefix,
+                cache,
+                hotcache_key.as_deref(),
+                bundle,
+                Some(reuse_db),
+            )
+            .unwrap();
+        // A cold read-through shard has no writer.
+        assert!(cold.is_read_only(), "cold read-through shard is read-only");
+        cold.search_all(&Query::parse("body:alpha").unwrap(), 10)
+            .unwrap()
+            .len()
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        read_through_ok, 2,
+        "read-through shard serves the same hits"
+    );
+
+    // Drop the live shard's handles, then evict the local bulk (the last park step).
+    drop(shard);
+    evict_local_index(&window_dir).unwrap();
+    assert!(
+        !window_dir.join("index").exists(),
+        "bulk evicted after swap"
+    );
+    assert!(window_dir.join("aux.redb").exists(), "aux kept local");
+    assert!(
+        window_dir.join("location.arr").exists(),
+        "the location array stays local across an in-place park"
+    );
 }
