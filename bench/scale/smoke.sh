@@ -71,4 +71,10 @@ else
 fi
 
 echo
+echo "== 4) capture tool selftest =="
+# The pre-teardown capture tool has no cluster deps to smoke against, but its audit/ledger/bounding
+# logic must not regress (it's what saves a run's data before the ephemeral cluster is destroyed).
+"$PY" capture.py --selftest || { echo "SMOKE FAILED: capture.py selftest"; exit 1; }
+
+echo
 echo "SMOKE OK: all workloads valid."

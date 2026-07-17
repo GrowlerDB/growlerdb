@@ -214,3 +214,11 @@ scale-images REGISTRY="ghcr.io/growlerdb" TAG="dev":
 # harness bugs before the cloud run. Full load→index→convergence needs the stack (see bench/scale).
 smoke:
     bench/scale/smoke.sh
+
+# Capture a scale/cluster-validation run BEFORE `terraform destroy`: metric time-series (Prometheus),
+# pod logs (Loki), the harness results + run cost, and an audit record → a gitignored run dir under
+# bench/scale/runs/, plus one compact row appended to the committed bench/scale/RUNLOG.md ledger.
+# Needs PROM_URL (+ optional LOKI_URL/GRAFANA_URL) reachable (port-forwards). Screenshots are opt-in
+# (`--screenshots`) and bounded. e.g. `just capture "cold-tier validation" --window-min 90 --cost '$5'`.
+capture PURPOSE *ARGS:
+    python bench/scale/capture.py --purpose {{ quote(PURPOSE) }} {{ ARGS }}
