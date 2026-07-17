@@ -103,10 +103,22 @@ for _ in $(seq 1 40); do
 done
 
 say "4/7 GrowlerDB (helm) — $SHARDS $([ "$WINDOWED" = true ] && echo 'windowed nodes' || echo 'shards') serving $INDEX"
+# Cold-tiering (TASK-229): windowed runs exercise automatic park/revive. On by default for a windowed
+# workload — backups land in the in-cluster MinIO `growlerdb-backups` bucket (created by minio.yaml),
+# aged windows park per the index def's `hot_windows`. Disable with COLD_TIER=false.
+COLD_TIER="${COLD_TIER:-true}"
+COLD_ARGS=()
+if [ "$WINDOWED" = true ] && [ "$COLD_TIER" = true ]; then
+  COLD_ARGS=(--set coldTier.enabled=true
+             --set coldTier.backupBucket="${COLD_BUCKET:-growlerdb-backups}"
+             --set coldTier.parkIntervalSecs="${COLD_PARK_INTERVAL_SECS:-120}")
+  say "cold-tiering ON — park every ${COLD_PARK_INTERVAL_SECS:-120}s → bucket ${COLD_BUCKET:-growlerdb-backups} (hot_windows from the index def)"
+fi
 helm upgrade --install gdb "$HELM_CHART" -f "$HELM_CHART/values-scale.yaml" -n "$NAMESPACE" \
   --set image.tag="$IMAGE_TAG" --set index.shards="$SHARDS" \
   --set index.windowed="$WINDOWED" \
   --set index.name="$INDEX" --set index.sourceTable="$TABLE" \
+  "${COLD_ARGS[@]}" \
   --set-file index.definition="$INDEX_DEF"
 echo "waiting for $SHARDS node $([ "$WINDOWED" = true ] && echo pods || echo shards) to become Ready ..."
 for _ in $(seq 1 40); do

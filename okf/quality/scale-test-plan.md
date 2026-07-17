@@ -175,8 +175,16 @@ A **bounded ~1–3 day** run, phased so each phase's numbers are isolated, then 
 3. **Steady-ingest soak** — a delta stream held for several hours/overnight to exercise compaction,
    checkpoint lag, and stability.
 4. **Query load** — ramp to target QPS; measure latency **warm**, then flush caches and measure **cold**.
-5. **Cold-tier revive** — park older partitions, measure revive-on-demand.
-6. **Teardown** — IaC `destroy` back to baseline (~minutes); the run cost is recorded.
+5. **Cold-tier park/revive** ([TASK-229](/system/decisions/d39-automatic-cold-tiering.md)) — on a
+   **windowed** run, cold-tiering is on by default (`scale-up.sh` sets `coldTier.enabled` +
+   `parkIntervalSecs`; the windowed index def keeps the 3 most-recent windows hot). The synthetic
+   corpus ages windows continuously, so older ones **auto-park** to the in-cluster `growlerdb-backups`
+   bucket and serve read-through; sustained query traffic **auto-revives** a re-heated window. Drive +
+   measure it with `python bench/scale/coldtier_validate.py` (polls `GET /v1/cold`; asserts auto-park,
+   cold read-through correctness, and auto-revive; records revive latency + cold-cache SLIs to
+   `coldtier_results.json`). Disable with `COLD_TIER=false`.
+6. **Teardown** — capture first (`just capture`), then IaC `destroy` back to baseline (~minutes); the
+   run cost is recorded.
 
 ## How it runs on Hetzner
 
