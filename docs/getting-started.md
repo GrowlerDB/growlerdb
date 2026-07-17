@@ -377,13 +377,54 @@ curl -s localhost:8081/v1/search -H 'content-type: application/json' -H "authori
 `cat-11` now appears — the full **insert (Trino) → reindex (from source) → search** loop, with Trino
 and GrowlerDB reading one source of truth. Hydrate it with `keys:get` (section 3) to see every column.
 
-> **Continuous sync instead of manual reindex.** Reindex is a full rebuild you trigger by hand. For a
-> table that changes continuously, GrowlerDB reads the Iceberg **changelog** and ingests incrementally
-> — the streaming demo (`just pipeline`) wires generator → Redpanda → Iceberg → connector → index so
-> new rows appear without a reindex. Watch it on the console's **Observability → Ingestion** screen and
-> in `deploy/compose/pipeline/README.md`.
+## 9. The other sync path: continuous streaming (no reindex)
 
-## 9. Tear down
+Section 8 showed the **batch** path — you insert into the lake, then trigger a full **reindex** by
+hand. That's right for a table that changes occasionally. For a table that changes **continuously**,
+you don't want to reindex on every write: GrowlerDB reads the Iceberg **changelog** and ingests each
+new snapshot **incrementally**, so rows become searchable on their own. The shipped **Spark
+connector** (`ConnectorApp --stream`) drives this — the same ingestion path used in production,
+resuming exactly-once from the node's committed checkpoint.
+
+The `just pipeline` demo wires the whole streaming loop end to end — a generator → Redpanda (Kafka) →
+Iceberg → the connector → a live `telemetry_stream` index — so you can watch data flow and search it
+as it arrives, **with no reindex step**. It's a self-contained stack (a different node config than the
+`docs`/`catalog` demo), so stop the batch stack first:
+
+```sh
+just stack-down          # free port 8081 + the node from the batch demo
+just pipeline            # deps + Polaris bootstrap + build the connector jar + bring it all up
+```
+
+`just pipeline` builds the connector jar on first run (a minute or two), then starts the generator,
+sink, and Spark connector. Give it ~30 s for the first micro-batch, then — **without reindexing** —
+search the live index for readings that are still arriving:
+
+```sh
+curl -s localhost:8081/v1/search -H 'content-type: application/json' -H "authorization: Bearer $TOKEN" \
+  -d '{"index":"telemetry_stream","query":"status:critical","limit":5}'
+```
+
+Run it again a few seconds later and `total` climbs — new rows appeared **on their own**, because the
+connector picked up each Iceberg changelog snapshot and ingested it. Watch the same thing visually on
+the console's **Observability → Ingestion** screen: the per-shard **lag** (source head − committed
+checkpoint) sawtooths up between the connector's 5 s micro-batches and drops as each one commits, and
+the `telemetry_stream` doc count on the **Indexes** screen keeps climbing. Raise the generator's
+`RATE` (default 50/s) to push ingest throughput up.
+
+So the two paths, side by side:
+
+| | **Batch** (section 8) | **Streaming** (this section) |
+|---|---|---|
+| Trigger | manual `POST /v1/index:reindex` | automatic — connector reads the Iceberg changelog |
+| Rebuilds | the whole index from source | incremental, only the new snapshots |
+| Fits | occasional / bulk changes | continuously-changing tables |
+| Demo | `just stack` | `just pipeline` |
+
+Full details + tuning knobs are in [`deploy/compose/pipeline/README.md`](https://github.com/GrowlerDB/growlerdb/blob/main/deploy/compose/pipeline/README.md).
+Tear the streaming demo down with `just pipeline-down`.
+
+## 10. Tear down
 
 ```sh
 just stack-down
