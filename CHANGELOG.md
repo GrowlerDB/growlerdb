@@ -61,7 +61,7 @@ control and data plane.
 > Versions 0.1.0–0.1.1 were pre-public builds under Apache-2.0, not published as releases —
 > retained here for history. **0.2.0 is the first public release.**
 
-## 0.1.1 — 2026-07-09
+## [0.1.1] - 2026-07-09
 
 ### Security
 
@@ -71,7 +71,7 @@ control and data plane.
   ECharts `6.1` (console XSS advisory). A medium transitive `thrift` advisory (via `parquet`, in the
   own-data metadata-parse path) is tracked for the arrow/parquet 59 upgrade.
 
-## 0.1.0 — 2026-07-08
+## [0.1.0] - 2026-07-08
 
 The initial public (Beta) surface.
 

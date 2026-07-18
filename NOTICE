@@ -1,0 +1,14 @@
+GrowlerDB
+Copyright (C) 2026 GrowlerDB LLC and the GrowlerDB contributors.
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License, version 3 only (AGPL-3.0-only),
+as published by the Free Software Foundation. See the LICENSE file for the full text.
+
+A commercial license is available from GrowlerDB LLC for uses the AGPL does not fit
+(embedding/OEM, AGPL-incompatible use, the enterprise add-ons) — see COMM-LICENSE.md.
+
+"GrowlerDB" and the GrowlerDB logo are trademarks of GrowlerDB LLC — see TRADEMARK.md.
+
+This product includes third-party open-source software; their licenses and notices
+are retained in the respective dependencies (see the SBOM published with each release).
