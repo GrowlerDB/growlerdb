@@ -318,6 +318,23 @@ impl Engine {
                         .map_err(|e| e.to_string())
                 })
                 .await?;
+            // A shard that caught up to the source snapshot but wrote **zero rows** — a sparse
+            // shard in a multi-shard build that owns none of the keys, or a currently-empty source —
+            // must still record the snapshot it reflects. Otherwise it never commits a checkpoint and
+            // reports `uninitialized` forever (a grey "unknown" health pill for the whole index),
+            // even though it is genuinely in sync (TASK-121). If nothing above advanced the
+            // checkpoint, anchor it with a checkpoint-only commit. Guarded on a real snapshot
+            // (`snapshot_id != 0`) so a source with no snapshot stays honestly uninitialized.
+            if snapshot_id != 0 && shard.current_checkpoint()?.is_none() {
+                IndexWriter::write(
+                    &shard,
+                    &CommitBatch::from_upserts(
+                        vec![],
+                        SourceCheckpoint::iceberg(snapshot_id),
+                        format!("snapshot-{snapshot_id}-anchor"),
+                    ),
+                )?;
+            }
             // Anchor the built index to its source's Iceberg `table-uuid` so a later `serve` can
             // detect a drop+recreate of the source and refuse to serve stale data.
             shard.set_source_uuid(&reader.table_uuid(table).await?)?;
