@@ -11,8 +11,6 @@ Start with the docs — most questions are answered there:
 - **[Configuration](https://docs.growlerdb.com/configuration)**
 - **[API reference](https://docs.growlerdb.com/reference)**
 
-The compiled source of truth for how GrowlerDB works is the [OKF](okf/index.md).
-
 ## 💬 Questions & discussion
 
 For usage questions, ideas, and general discussion, use

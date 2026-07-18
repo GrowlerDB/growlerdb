@@ -22,6 +22,24 @@ nav_order: 3
 For the fastest path that needs none of the build steps below, jump to
 [Getting started](getting-started) (`just stack`).
 
+## Prebuilt images & binaries (no build)
+
+Don't want to build from source? Every release publishes signed, ready-to-run artifacts:
+
+```sh
+# Container image — multi-arch (amd64 + arm64), cosign-signed, with an SBOM.
+docker pull ghcr.io/growlerdb/growlerdb:latest      # or pin a version, e.g. :0.2.0
+docker run --rm ghcr.io/growlerdb/growlerdb:latest --help
+```
+
+- **Release binaries** — the `growlerdb` binary + checksums for each platform are attached to every
+  [GitHub Release](https://github.com/GrowlerDB/growlerdb/releases).
+- **Helm chart** — published to GHCR as an OCI artifact: `oci://ghcr.io/growlerdb/charts/growlerdb`
+  (see [Deployment](deployment)).
+
+The image tags follow SemVer — `:X.Y.Z` (immutable) plus moving `:X.Y`, `:X`, and `:latest`, so you
+can pin exactly or float.
+
 ## Build from source
 
 ```sh

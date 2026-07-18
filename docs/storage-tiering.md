@@ -1,7 +1,7 @@
 ---
 title: Storage & tiering
 layout: default
-nav_order: 10
+nav_order: 11
 ---
 
 # Storage tiering: hot vs cold (and when to use which)

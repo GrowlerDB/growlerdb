@@ -21,3 +21,5 @@ __pycache__/
 /bench/scale/.render/
 .claude/
 /bench/scale/runs/
+# Packaged tarballs (Helm charts, npm packs) — build artifacts, never committed
+*.tgz

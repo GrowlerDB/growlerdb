@@ -1,6 +1,5 @@
-# The repository "Sponsor" button. GrowlerDB is bootstrapped and independent; the primary way to
-# support it financially is commercial/OEM licensing + support. Individual sponsorship can be added
-# once GitHub Sponsors is enabled for the maintainer.
-custom:
-  - "https://github.com/GrowlerDB/growlerdb/blob/main/COMM-LICENSE.md"
+# The repository "Sponsor" button. GrowlerDB is bootstrapped and independent. We deliberately do NOT
+# point the Sponsor button at the commercial-license sales page — that isn't sponsorship. Individual
+# sponsorship can be enabled here once GitHub Sponsors is set up for the maintainer; commercial/OEM
+# licensing + support is described in SUPPORT.md / COMM-LICENSE.md instead.
 # github: [qikijames]   # uncomment once GitHub Sponsors is set up
