@@ -116,6 +116,9 @@ pub struct IndexSchema {
     /// order. The optional [`TimeFormat`] is set only for fields declared as timestamps; it tells
     /// [`add_typed_value`] to normalize the source epoch to canonical micros at build.
     fields: Vec<(String, Field, FieldType, Option<TimeFormat>)>,
+    /// The mapped fields a query can sort by — numeric/date/keyword fields declared `fast`,
+    /// precomputed here (the tuple above drops the `fast` flag). See [`sort_fields`](Self::sort_fields).
+    sortable_fields: Vec<String>,
     /// The tenant-scoping field, if the index is tenant-scoped.
     tenant_field: Option<String>,
     /// The index's **location strategy** (D30). Under
@@ -138,7 +141,18 @@ impl IndexSchema {
         let key_field = builder.add_bytes_field(KEY_FIELD, STORED);
         let key_enc_field = builder.add_bytes_field(KEY_ENC_FIELD, INDEXED);
         let mut fields = Vec::with_capacity(idx.fields.len());
+        // Sortable fields: `fast` + a sortable type (numeric/date/keyword) — the exact set the
+        // sort path's `ensure_sortable` accepts. Collected here where the `fast` flag is still in scope.
+        let mut sortable_fields = Vec::new();
         for f in &idx.fields {
+            if f.fast
+                && matches!(
+                    f.ty,
+                    FieldType::Long | FieldType::Double | FieldType::Date | FieldType::Keyword
+                )
+            {
+                sortable_fields.push(f.path.clone());
+            }
             let handle = match f.ty {
                 FieldType::Text => {
                     // Per-field indexing detail: record level (positions are the phrase-query
@@ -186,6 +200,7 @@ impl IndexSchema {
             key_enc_field,
             loc_id_field,
             fields,
+            sortable_fields,
             tenant_field: idx.tenant_field().map(str::to_string),
             location_strategy: idx.location_strategy,
         }
@@ -213,6 +228,15 @@ impl IndexSchema {
             .filter(|(_, _, ty, _)| *ty == FieldType::Date)
             .map(|(path, _, _, _)| path.as_str())
             .collect()
+    }
+
+    /// The fields a query can **sort** by — numeric/date/keyword fields declared `fast`, in
+    /// definition order (precomputed at build time in [`from_resolved`](Self::from_resolved)). This
+    /// exactly matches the sort path's `ensure_sortable` check
+    /// (`fast` + `I64`/`F64`/`Date`/`Str`), so the console only ever offers a sort field the engine
+    /// will accept — a non-fast keyword like `author` is excluded rather than 400ing at query time.
+    pub fn sort_fields(&self) -> Vec<&str> {
+        self.sortable_fields.iter().map(String::as_str).collect()
     }
 
     /// The bytes-indexed `enc(key)` field — used to **delete by key** (the Tantivy-native
@@ -2159,6 +2183,49 @@ mapping:
                 .unwrap()
                 .len(),
         );
+    }
+
+    #[test]
+    fn sort_fields_lists_only_fast_numeric_date_keyword_fields() {
+        // The console builds its sort menu from `sort_fields`; it must exactly match what the sort
+        // path accepts (fast + numeric/date/keyword). A cached-but-not-fast keyword like `author`
+        // must NOT appear — offering it produced a 400 at query time.
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("author", SourceType::String),
+                SourceField::new("tag", SourceType::String),
+                SourceField::new("views", SourceType::Long),
+                SourceField::new("rating", SourceType::Double),
+                SourceField::new("archived", SourceType::Bool),
+                SourceField::new("body", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        let idx = IndexDefinition::from_yaml(
+            r#"
+name: catalog
+source: { iceberg: { catalog: growlerdb, table: growlerdb.catalog } }
+mapping:
+  selection: EXPLICIT
+  fields:
+    - { path: id, type: KEYWORD }
+    - { path: author, type: KEYWORD }
+    - { path: tag, type: KEYWORD, fast: true }
+    - { path: views, type: LONG, fast: true }
+    - { path: rating, type: DOUBLE, fast: true }
+    - { path: archived, type: BOOL, fast: true }
+    - { path: body, type: TEXT }
+"#,
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+        let schema = IndexSchema::from_resolved(&idx);
+        // Included: fast keyword/long/double, in definition order. Excluded: non-fast keywords
+        // (`id`, `author`), a fast BOOL (`archived`), and TEXT (`body`).
+        assert_eq!(schema.sort_fields(), vec!["tag", "views", "rating"]);
     }
 
     #[test]

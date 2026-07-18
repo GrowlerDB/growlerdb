@@ -29,6 +29,10 @@ message IndexStats {
   // Mapped DATE field names: the time columns a console time filter can range a query on; ranging
   // the windowing field also prunes windows. Same for every shard of an index.
   repeated string time_fields = 7;
+  // Mapped field names a query can sort by — numeric/date/keyword fields declared `fast`. The
+  // console offers exactly these as sort options, so it never sends an unsortable field (which the
+  // engine rejects). Same for every shard of an index.
+  repeated string sort_fields = 8;
 }
 
 message DescribeIndexResponse {
