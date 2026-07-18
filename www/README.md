@@ -27,13 +27,15 @@ https://…   ─▶ 200, this index.html (Let's Encrypt cert)
 
 ## Deploy / update the page
 
-`index.html` is dependency-free (inline CSS, an inline SVG favicon, the social image pulled from
-`docs.growlerdb.com`). To publish an edit, copy it to the Apache document root on the VM and reload:
+The page is a **self-contained static bundle** (Brand v1.0): `index.html` (inline CSS), `favicon.svg`
+(the waterline mark), and `fonts/` (self-hosted Archivo / Instrument Sans / Geist Mono woff2 — no font
+CDN). The only external reference is the social image, pulled from `docs.growlerdb.com`. To publish,
+sync the bundle (minus this README) to the Apache document root:
 
 ```sh
 # from the repo root, on a host with SSH access to the VM
-scp www/index.html <user>@34.145.3.247:/var/www/growlerdb.com/index.html
-# (Apache serves it directly — no reload needed for a static file)
+rsync -av --exclude README.md www/ <user>@34.145.3.247:/var/www/growlerdb.com/
+# (Apache serves it directly — no reload needed for static files)
 ```
 
 TLS is managed by certbot on the VM (`certbot renew` runs on a timer); the Apache vhost handles the
@@ -54,6 +56,9 @@ loads over HTTPS with a valid certificate.
 
 ## Editing
 
-Keep the wordmark, colors (`#e8590c` accent on `#1e1e1e`), and tagline in sync with
-[`../docs/img/social-preview.svg`](../docs/img/social-preview.svg) and the README banner. Open
-`index.html` directly in a browser to preview before deploying.
+The page follows **Brand v1.0** — see [`../okf/product/brand/`](../okf/product/brand/index.md)
+(identity, voice, surfaces). Keep the waterline mark, the dark palette (glacier `#7fa9d4` interactive,
+melt `#46b8c8` identity, on `#141517`), the Archivo / Instrument Sans / Geist Mono type, and the copy
+in sync with it. Maturity stays **Beta / pre-1.0** — never the "GA / v1.0" the design mocks show (see
+the [D40 caveat](../okf/system/decisions/d40-brand-system.md)). Open `index.html` directly in a browser
+to preview before deploying.
