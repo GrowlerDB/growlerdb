@@ -51,8 +51,8 @@ type WindowStates = Arc<RwLock<BTreeMap<i64, WindowState>>>;
 pub type WindowSeed = (ShardHandle, Arc<dyn Node>, Option<(i64, i64)>);
 
 /// One window's routing descriptor for [`Gateway::swap_windowed`](crate::Gateway): `(window id,
-/// event zone-map)`.
-type WindowDescriptor = (i64, Option<(i64, i64)>);
+/// event zone-map, cold)` — `cold` = served read-through from object storage (parked).
+type WindowDescriptor = (i64, Option<(i64, i64)>, bool);
 
 /// Called once per **newly-created** window so the CLI can attach its process-level
 /// concerns — auto-compaction of the new hot shard, log lines — that the engine can't own.
@@ -288,7 +288,12 @@ impl WindowedWriteService {
         let (nodes, descriptors): (Vec<Arc<dyn Node>>, Vec<WindowDescriptor>) = {
             let map = self.read_windows();
             map.iter()
-                .map(|(w, st)| (st.node.clone(), (*w, st.zone)))
+                .map(|(w, st)| {
+                    (
+                        st.node.clone(),
+                        (*w, st.zone, st.handle.current().is_read_only()),
+                    )
+                })
                 .unzip()
         };
         self.gateway
@@ -305,6 +310,9 @@ impl WindowedWriteService {
                 event_min: st.zone.map(|(lo, _)| lo).unwrap_or(0),
                 event_max: st.zone.map(|(_, hi)| hi).unwrap_or(0),
                 has_event_bounds: st.zone.is_some(),
+                // The window's live tier: read-through (no writer) ⇒ cold. Reported each heartbeat,
+                // so a park/pre-warm swap surfaces in the cluster gateway's /v1/cold.
+                cold: st.handle.current().is_read_only(),
             })
             .collect()
     }

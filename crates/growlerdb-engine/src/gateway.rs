@@ -129,6 +129,11 @@ pub struct Gateway {
     password_login: bool,
     authz: Option<SharedAuth>,
     cold: Option<ColdTier>,
+    /// Each temporal field's declared unit (by path), so the `_search` adapter converts a range/exact
+    /// bound written in that unit to canonical micros before planning — keeping window pruning and
+    /// segment execution (both micros-native) consistent. Populated from the served definition
+    /// ([`with_date_formats`](Self::with_date_formats)); empty ⇒ no conversion (bounds are micros).
+    date_formats: crate::opensearch::FieldFormats,
     /// The index name this Gateway serves, in **single-index** mode. A request whose `index`
     /// is non-empty and names a *different* index is answered `NOT_FOUND` instead of silently searching
     /// this one. `None` (the default, and all tests) means "serve any request" — no index scoping. In
@@ -210,7 +215,7 @@ impl IndexRoute {
         &self,
         shards: Vec<Arc<dyn Node>>,
         windowing: TimeWindowing,
-        windows: Vec<(i64, Option<(i64, i64)>)>,
+        windows: Vec<WindowDescriptor>,
     ) {
         if shards.is_empty() || shards.len() != windows.len() {
             eprintln!(
@@ -257,17 +262,21 @@ pub struct RoutingState {
 /// `shards`**, each shard's window id and event-time zone-map. Lets the Gateway prune a
 /// time-filtered search to the windows that can match before scatter-gather. `None` on a normal
 /// (hash/partition) Gateway.
+/// One window's routing descriptor: `(window id, event zone-map, cold)` — `cold` = served
+/// read-through from object storage (parked). Aligned 1:1 with a route's `shards`.
+pub type WindowDescriptor = (i64, Option<(i64, i64)>, bool);
+
 #[derive(Clone)]
 pub struct WindowRouting {
     windowing: TimeWindowing,
-    /// `(window id, event zone-map)` for `shards[i]`.
-    windows: Vec<(i64, Option<(i64, i64)>)>,
+    /// Per-shard [`WindowDescriptor`] for `shards[i]`.
+    windows: Vec<WindowDescriptor>,
 }
 
 impl WindowRouting {
     /// A windowed routing descriptor: the [`TimeWindowing`] config + per-shard
     /// `(window id, event zone-map)`, for building an [`IndexRoute`] over a windowed index.
-    pub fn new(windowing: TimeWindowing, windows: Vec<(i64, Option<(i64, i64)>)>) -> Self {
+    pub fn new(windowing: TimeWindowing, windows: Vec<WindowDescriptor>) -> Self {
         Self { windowing, windows }
     }
 }
@@ -297,11 +306,12 @@ fn collect_and_pins(
     }
 }
 
-/// Cold-tier observability for a windowed Gateway: which windows are served **read-through**
-/// from object storage, plus the shared byte-range cache they read through (for hit/miss/byte stats).
+/// The shared read-through byte-range cache of an **in-process** (node) windowed Gateway — kept so
+/// `/v1/cold` can report its hit/miss/byte stats. Per-window hot/cold tier is NOT here: it comes from
+/// the routing descriptors (a node's live shards, or the tiers each node reports to the cluster
+/// gateway), so a runtime park/pre-warm is reflected without re-wiring this.
 #[derive(Clone)]
 struct ColdTier {
-    cold: std::collections::HashSet<i64>,
     cache: growlerdb_index::RangeCache,
 }
 
@@ -352,6 +362,7 @@ impl Gateway {
             password_login: false,
             authz: None,
             cold: None,
+            date_formats: crate::opensearch::FieldFormats::default(),
             served_index: None,
             fanout: fanout_semaphore(GatewayLimits::default().max_concurrent_fanout),
         }
@@ -374,6 +385,7 @@ impl Gateway {
             password_login: false,
             authz: None,
             cold: None,
+            date_formats: crate::opensearch::FieldFormats::default(),
             served_index: None,
             fanout: fanout_semaphore(GatewayLimits::default().max_concurrent_fanout),
         }
@@ -428,7 +440,7 @@ impl Gateway {
         &self,
         shards: Vec<Arc<dyn Node>>,
         windowing: TimeWindowing,
-        windows: Vec<(i64, Option<(i64, i64)>)>,
+        windows: Vec<WindowDescriptor>,
     ) {
         self.single().swap_windowed(shards, windowing, windows);
     }
@@ -568,7 +580,7 @@ impl Gateway {
     pub fn windowed(
         shards: Vec<Arc<dyn Node>>,
         windowing: TimeWindowing,
-        windows: Vec<(i64, Option<(i64, i64)>)>,
+        windows: Vec<WindowDescriptor>,
     ) -> Self {
         debug_assert_eq!(
             shards.len(),
@@ -633,7 +645,7 @@ impl Gateway {
         rs.shards
             .iter()
             .zip(&wr.windows)
-            .filter(|(_, (w, zone))| wr.windowing.keeps(*w, *zone, &query))
+            .filter(|(_, (w, zone, _cold))| wr.windowing.keeps(*w, *zone, &query))
             .map(|(s, _)| s.clone())
             .collect()
     }
@@ -706,16 +718,25 @@ impl Gateway {
 
     /// Tag a windowed Gateway with its **cold-tier** state: the set of `cold_windows`
     /// served read-through + the shared read-through `cache`, surfaced by [`cold_status`](Self::cold_status).
-    pub fn with_cold_tier(
-        mut self,
-        cold_windows: impl IntoIterator<Item = i64>,
-        cache: growlerdb_index::RangeCache,
-    ) -> Self {
-        self.cold = Some(ColdTier {
-            cold: cold_windows.into_iter().collect(),
-            cache,
-        });
+    /// Wire the shared read-through cache so `/v1/cold` can report its stats (an in-process node
+    /// gateway). The per-window tier is carried by the routing descriptors, not here.
+    pub fn with_cold_tier(mut self, cache: growlerdb_index::RangeCache) -> Self {
+        self.cold = Some(ColdTier { cache });
         self
+    }
+
+    /// Declare the served index's temporal-field units so the `_search` adapter converts range/exact
+    /// bounds written in those units to canonical micros before planning. From the served definition
+    /// ([`ResolvedIndex::date_formats`](growlerdb_core::ResolvedIndex::date_formats), or the field
+    /// mappings on `GetIndex` for a live-CP gateway).
+    pub fn with_date_formats(mut self, formats: crate::opensearch::FieldFormats) -> Self {
+        self.date_formats = formats;
+        self
+    }
+
+    /// The served index's temporal-field units, for the `_search` adapter's bound conversion.
+    pub fn date_formats(&self) -> &crate::opensearch::FieldFormats {
+        &self.date_formats
     }
 
     /// Cold-tier status: each window's hot/cold tier + event zone-map, plus the shared
@@ -723,21 +744,24 @@ impl Gateway {
     pub fn cold_status(&self) -> Option<ColdStatus> {
         let rs = self.routing();
         let wr = rs.window_routing.as_ref()?;
-        let cold = self.cold.as_ref();
-        let is_cold = |w: i64| cold.is_some_and(|c| c.cold.contains(&w));
+        // The per-window tier comes from the routing descriptors — for the in-process node gateway
+        // that is its live shard set; for the cluster gateway it is the tier each node reports every
+        // heartbeat (so a runtime park/pre-warm shows up here, not just the boot snapshot). The shared
+        // read-through cache (and its hit/miss stats) is local to a node, so only an in-process
+        // gateway that was wired [`with_cold_tier`] reports cache stats.
         let windows: Vec<WindowStatus> = wr
             .windows
             .iter()
-            .map(|(w, zone)| WindowStatus {
+            .map(|(w, zone, cold)| WindowStatus {
                 window: *w,
-                cold: is_cold(*w),
+                cold: *cold,
                 event_min: zone.map(|z| z.0),
                 event_max: zone.map(|z| z.1),
             })
             .collect();
         let cold_count = windows.iter().filter(|w| w.cold).count();
         Some(ColdStatus {
-            cache: cold.map(|c| c.cache.stats()),
+            cache: self.cold.as_ref().map(|c| c.cache.stats()),
             hot: windows.len() - cold_count,
             cold: cold_count,
             windows,
@@ -3752,9 +3776,9 @@ mod tests {
             TimeWindowing::new("ingest", WindowGranularity::Daily).with_event_time("event");
         // Window 10 carries a late event (zone widened down to day 2); 11 and 20 are tight.
         let windows = vec![
-            (day(10), Some((day(2), day(10)))),
-            (day(11), Some((day(11), day(11)))),
-            (day(20), Some((day(20), day(20)))),
+            (day(10), Some((day(2), day(10))), false),
+            (day(11), Some((day(11), day(11))), false),
+            (day(20), Some((day(20), day(20))), false),
         ];
         let gw = Gateway::windowed(shards, windowing, windows);
 
@@ -3822,8 +3846,8 @@ mod tests {
             vec![node("d10"), node("d11")],
             windowing.clone(),
             vec![
-                (day(10), Some((day(10), day(10)))),
-                (day(11), Some((day(11), day(11)))),
+                (day(10), Some((day(10), day(10))), false),
+                (day(11), Some((day(11), day(11))), false),
             ],
         );
         let search = |q: String| {
@@ -3859,9 +3883,9 @@ mod tests {
             vec![node("d10"), node("d11"), node("d12")],
             windowing,
             vec![
-                (day(10), Some((day(10), day(10)))),
-                (day(11), Some((day(11), day(11)))),
-                (day(12), Some((day(12), day(12)))),
+                (day(10), Some((day(10), day(10))), false),
+                (day(11), Some((day(11), day(11))), false),
+                (day(12), Some((day(12), day(12))), false),
             ],
         );
         // Now it fans out to all three, and a time filter prunes precisely to the new window.
@@ -3888,14 +3912,15 @@ mod tests {
         let shards = vec![node("d10"), node("d11"), node("d12")];
         let windowing =
             TimeWindowing::new("ingest", WindowGranularity::Daily).with_event_time("event");
+        // Per-window tier travels in the descriptors: windows 10 and 11 are parked (read-through),
+        // 12 is hot. `with_cold_tier` only wires the shared cache for its stats.
         let windows = vec![
-            (day(10), Some((day(10), day(10) + 5))),
-            (day(11), Some((day(11), day(11)))),
-            (day(12), None),
+            (day(10), Some((day(10), day(10) + 5)), true),
+            (day(11), Some((day(11), day(11))), true),
+            (day(12), None, false),
         ];
-        // Windows 10 and 11 are parked (read-through); 12 is hot.
         let gw = Gateway::windowed(shards, windowing, windows)
-            .with_cold_tier([day(10), day(11)], RangeCache::new(1024 * 1024));
+            .with_cold_tier(RangeCache::new(1024 * 1024));
 
         let status = gw.cold_status().expect("windowed gateway has cold status");
         assert_eq!((status.hot, status.cold), (1, 2));

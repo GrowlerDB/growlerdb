@@ -331,6 +331,13 @@ fn field_mappings(def: &ResolvedIndex) -> Vec<FieldMapping> {
                 cached: f.cached,
                 pk: is_pk(&f.path),
                 blocked,
+                // DATE fields carry their source unit so a live-CP gateway's `_search` adapter can
+                // convert a bound written in that unit to canonical micros (every temporal field).
+                field_format: f
+                    .format
+                    .map(time_format_str)
+                    .unwrap_or_default()
+                    .to_string(),
             }
         })
         .collect()
@@ -343,35 +350,46 @@ fn shard_statuses(entry: &IndexEntry) -> Vec<ShardStatus> {
     // `bounds` is the window's event-time zone-map — carried so the live-CP gateway can prune;
     // `None`/absent for an ordinal shard.
     let from =
-        |ordinal: u32, window: i64, a: &ShardAssignment, bounds: Option<(i64, i64)>| ShardStatus {
-            ordinal,
-            window,
-            primary: a.primary.as_ref().map(|n| n.0.clone()).unwrap_or_default(),
-            replicas: a.replicas.iter().map(|n| n.0.clone()).collect(),
-            state: if a.is_assigned() {
-                "active"
-            } else {
-                "building"
+        |ordinal: u32, window: i64, a: &ShardAssignment, bounds: Option<(i64, i64)>, cold: bool| {
+            ShardStatus {
+                ordinal,
+                window,
+                primary: a.primary.as_ref().map(|n| n.0.clone()).unwrap_or_default(),
+                replicas: a.replicas.iter().map(|n| n.0.clone()).collect(),
+                state: if a.is_assigned() {
+                    "active"
+                } else {
+                    "building"
+                }
+                .to_string(),
+                event_min: bounds.map(|(lo, _)| lo).unwrap_or(0),
+                event_max: bounds.map(|(_, hi)| hi).unwrap_or(0),
+                has_event_bounds: bounds.is_some(),
+                cold,
             }
-            .to_string(),
-            event_min: bounds.map(|(lo, _)| lo).unwrap_or(0),
-            event_max: bounds.map(|(_, hi)| hi).unwrap_or(0),
-            has_event_bounds: bounds.is_some(),
         };
     if entry.windows.is_empty() {
         entry
             .shards
             .iter()
-            .map(|(ord, a)| from(*ord, 0, a, None))
+            .map(|(ord, a)| from(*ord, 0, a, None, false))
             .collect()
     } else {
         // Windowed index: one cell per time window (oldest first), ordinal is its position; carry the
-        // per-window event-time zone-map so a live-CP windowed gateway can prune.
+        // per-window event-time zone-map (pruning) + the live cold/hot tier (for /v1/cold).
         entry
             .windows
             .iter()
             .enumerate()
-            .map(|(i, (w, wa))| from(i as u32, *w, &wa.assignment, wa.event_min.zip(wa.event_max)))
+            .map(|(i, (w, wa))| {
+                from(
+                    i as u32,
+                    *w,
+                    &wa.assignment,
+                    wa.event_min.zip(wa.event_max),
+                    wa.cold,
+                )
+            })
             .collect()
     }
 }
@@ -1265,6 +1283,10 @@ impl ControlPlane for ControlPlaneService {
                         .set_window_bounds(&name, w.window, Some(w.event_min), Some(w.event_max))
                         .map_err(registry_status)?;
                 }
+                // Track the window's live tier (hot/cold) so the gateway's /v1/cold reflects parking.
+                self.registry
+                    .set_window_cold(&name, w.window, w.cold)
+                    .map_err(registry_status)?;
             }
         }
         self.registry.activate(&name).map_err(registry_status)?;
@@ -2398,12 +2420,14 @@ mod tests {
                     event_min: 5,
                     event_max: 80,
                     has_event_bounds: true,
+                    cold: false,
                 },
                 ServedWindow {
                     window: 200, // no docs yet → no zone-map reported
                     event_min: 0,
                     event_max: 0,
                     has_event_bounds: false,
+                    cold: true, // parked
                 },
             ],
         }))
@@ -2425,6 +2449,10 @@ mod tests {
         // No reported bounds → zone-map stays None (gateway conservatively always queries it).
         let w200 = wm.get(&200).unwrap();
         assert_eq!((w200.event_min, w200.event_max), (None, None));
+        // The reported per-window tier round-trips through the registry (drives the gateway's
+        // /v1/cold): window 100 was reported hot, 200 parked.
+        assert!(!w100.cold, "window 100 reported hot");
+        assert!(w200.cold, "window 200 reported cold");
     }
 
     #[tokio::test(flavor = "current_thread")]
