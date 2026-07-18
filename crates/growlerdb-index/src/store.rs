@@ -5426,6 +5426,31 @@ mapping:
         );
     }
 
+    /// A shard whose FIRST commit is an empty batch (0 rows routed here, e.g. a sparse
+    /// multi-shard build) must still record the source checkpoint — else it reports
+    /// `uninitialized` forever (TASK-121). Advances from `None`, not just N -> M.
+    #[test]
+    fn first_empty_batch_records_the_source_checkpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard = open_empty(tmp.path());
+        assert_eq!(
+            shard.current_checkpoint().unwrap(),
+            None,
+            "fresh shard has no checkpoint"
+        );
+        // The build commits an empty batch (this shard owns 0 of the source rows).
+        IndexWriter::write(
+            &shard,
+            &CommitBatch::from_upserts(vec![], SourceCheckpoint::iceberg(5), "snapshot-5-1"),
+        )
+        .unwrap();
+        assert_eq!(
+            shard.current_checkpoint().unwrap(),
+            Some(SourceCheckpoint::iceberg(5)),
+            "an empty first build must still record the source snapshot it caught up to"
+        );
+    }
+
     /// The empty-batch checkpoint advance (the redb-only path) prunes too — its
     /// `safe_checkpoint` reaches the same helper as a document commit.
     #[test]

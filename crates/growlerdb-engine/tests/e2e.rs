@@ -168,6 +168,53 @@ async fn sharded_build_partitions_the_table_disjointly() {
     assert!(ids1.iter().all(|id| router.route(&doc_key(id)) == 1));
 }
 
+/// **Empty-shard health (TASK-121)** — a shard that owns **zero** of the source rows (a sparse
+/// multi-shard build: more shards than the 3-row table can fill) must still record the source
+/// snapshot it caught up to. Otherwise it never commits a checkpoint and reports `uninitialized`
+/// forever — a grey "unknown" health pill for the whole index — even though it is genuinely in sync.
+#[tokio::test]
+#[ignore = "requires the local dev stack (just up) + `127.0.0.1 minio` in /etc/hosts"]
+async fn a_sparse_shard_with_no_rows_records_the_source_snapshot() {
+    // 3 seeded rows across 5 shards ⇒ at least one ordinal owns no rows.
+    let shards = 5u32;
+    let router = ShardRouter::hashed(shards);
+    let owned: std::collections::HashSet<u32> = ["doc-1", "doc-2", "doc-3"]
+        .iter()
+        .map(|id| router.route(&doc_key(id)))
+        .collect();
+    let empty = (0..shards)
+        .find(|o| !owned.contains(o))
+        .expect("some ordinal owns no rows across 5 shards");
+
+    let t = tempfile::tempdir().unwrap();
+    let e = Engine::open(t.path(), IcebergConfig::local()).unwrap();
+    let out = e
+        .index_shard("growlerdb.docs", None, None, shards, empty)
+        .await
+        .expect("build the empty shard");
+    assert_eq!(
+        out.doc_count, 0,
+        "this ordinal owns none of the seeded rows"
+    );
+
+    // Re-open the built shard and assert it recorded the source checkpoint — so the ingestion
+    // view reports it `in_sync` (green), not `uninitialized`.
+    let json =
+        std::fs::read_to_string(t.path().join("docs").join("index.json")).expect("index.json");
+    let resolved: ResolvedIndex = serde_json::from_str(&json).expect("parse index.json");
+    let store = LocalIndexStore::open(t.path()).expect("open store");
+    let shard = store
+        .open_shard(&ShardId::single("docs"), &resolved)
+        .expect("open the built shard");
+    assert!(
+        shard
+            .current_checkpoint()
+            .expect("read checkpoint")
+            .is_some(),
+        "an empty shard must record the source snapshot it caught up to (TASK-121)"
+    );
+}
+
 /// An update + a delete round-trip reflected in search.
 ///
 /// Builds the index from the real seeded table, then applies a changelog-style

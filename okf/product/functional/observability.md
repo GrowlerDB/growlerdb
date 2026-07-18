@@ -20,7 +20,7 @@ The user-facing view of system health: **SLI dashboards + alerts** in the
   - **Search** — query rate, error rate, latency (p50/95/99), hydrate rate/latency, stale/drift, cold-cache hit.
   - **Runtime** — processes up, and (with the cluster metrics stack) API request/error/status/latency and per-node CPU/mem/disk.
   - **Data** — GrowlerDB size, segments, index-size-by-component, Iceberg-match; the index:source overlay.
-  - **Ingestion** — the *Iceberg-append-vs-GrowlerDB-index* overlay, throughput, lag, and a per-index → per-shard drill-down (the old standalone Ingestion screen, folded in).
+  - **Ingestion** — the *Iceberg-append-vs-GrowlerDB-index* overlay, throughput, lag, and a per-index → per-shard drill-down (the old standalone Ingestion screen, folded in). A shard that has built and caught up to the source snapshot reports **`in_sync`** even when it holds **zero rows** (a sparse shard in a multi-shard index, or a currently-empty source records the snapshot it caught up to), so a legitimately-empty shard shows green, not a grey `uninitialized`.
   - **Source** — source size, [source-health](/system/source-health.md) (small-file / snapshot signals), commit rate.
   - **Access** — sign-in / failure / session / logout signals.
 - Each card is a clean value + sparkline; **hover** reads the value at a point, a **ⓘ** gives
