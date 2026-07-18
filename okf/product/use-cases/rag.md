@@ -27,9 +27,13 @@ The assistant needs **hybrid lexical + semantic** retrieval that returns **gover
 **Why it fits.** Hybrid retrieval on **one governed store**; keys into authoritative data; freshness;
 no separate vector store to sync; access control enforced at hydration.
 
-> **Status.** The **vector / hybrid** capability (embeddings + KNN + fusion) is a **planned**
-> capability, not yet shipped — see [known limitations](/quality/known-limitations/index.md). The
-> lexical retrieval, governance, and freshness pieces are available today.
+> **Status.** The **vector / hybrid** capability (embeddings + KNN + fusion) is **in active build**
+> (M5) — decided and being implemented, not yet shipped; see
+> [known limitations](/quality/known-limitations/index.md). It is **open-core**
+> ([D41](/system/decisions/d41-vector-open-core.md)) and **retrieval-first**
+> ([D42](/system/decisions/d42-retrieval-first.md)): GrowlerDB returns governed chunks/coordinates; the
+> LLM answer stays with the app/agent. The lexical retrieval, governance, and freshness pieces are
+> available today.
 
 **Requirements exercised.** Hybrid search · vector + lexical · governed retrieval · low-latency top-K ·
 freshness.
