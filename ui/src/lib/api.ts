@@ -542,6 +542,8 @@ export interface IndexStats {
   checkpoint: string;
   /** Mapped DATE columns — candidates for the search time filter. Absent when none. */
   time_fields?: string[];
+  /** Mapped sortable fields (numeric/date/keyword, `fast`) — the sort menu's options. Absent when none. */
+  sort_fields?: string[];
 }
 
 export interface SourceField {
