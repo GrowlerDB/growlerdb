@@ -2331,6 +2331,17 @@ impl Shard {
             .collect()
     }
 
+    /// The field names a query can sort by — numeric/date/keyword fields declared `fast`. The
+    /// console lists exactly these so it never offers a non-sortable field (see
+    /// `IndexSchema::sort_fields`).
+    pub fn sort_fields(&self) -> Vec<String> {
+        self.schema
+            .sort_fields()
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
     pub fn index_dir(&self) -> &Path {
         &self.index_dir
     }

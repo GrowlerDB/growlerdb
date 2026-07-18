@@ -177,6 +177,8 @@ function defaults(): Required<Overrides> {
         num_docs: 12345,
         generation_count: 2,
         checkpoint: 'snap-42',
+        // Sortable fast fields the console's sort menu offers (device_id is a fast keyword).
+        sort_fields: ['device_id'],
       },
     },
     describeSource: {

@@ -67,6 +67,10 @@
   let scopeIndex = $state(''); // '' = the index this endpoint serves
   const SEARCH_INDEX_KEY = 'growlerdb.searchIndex'; // remember the last chosen index
   let sortField = $state(''); // '' = relevance (_score)
+  // Sortable field names for the current index — the server's authoritative list (numeric/date/
+  // keyword `fast` fields). Sorting on anything else is rejected by the engine, so the menu only
+  // offers these; loaded with the index metadata.
+  let sortFields = $state<string[]>([]);
   let cursor = $state<string | undefined>(undefined); // next_cursor for keyset "Load more"
   // Monotonic search generation: overlapping searches (typing + facet/sort changes)
   // race, so a slow earlier response must not clobber a fresh later one. Each run bumps it; a
@@ -78,12 +82,9 @@
   const sortKeys = $derived<SortKey[] | undefined>(
     sorted ? [{ field: sortField, desc: true }] : undefined,
   );
-  // Field names available to sort by — the cached display fields present on the current hits.
-  const sortableFields = $derived.by(() => {
-    const names = new Set<string>();
-    for (const h of hits) for (const k of Object.keys(h.fields ?? {})) names.add(k);
-    return [...names].sort();
-  });
+  // Field names available to sort by — the current index's sortable fast fields (server-authoritative),
+  // so the menu never offers a field the engine can't sort on (e.g. a non-fast keyword like `author`).
+  const sortableFields = $derived([...sortFields].sort());
 
   // Option lists for the styled dropdowns.
   const scopeOptions = $derived([
@@ -146,17 +147,22 @@
     run(0);
   }
 
-  /** Load the selected index's DATE columns so the time filter can list them. The
-   *  backend populates `time_fields` on every describe path — including the default-served index
-   *  (empty `scopeIndex`) — so an empty list means the index genuinely has no DATE column and the
-   *  time filter stays (correctly) disabled, rather than us re-deriving it from the mapping. */
-  async function loadTimeFields() {
+  /** Load the selected index's metadata from `describe`: its DATE columns (for the time filter) and
+   *  its sortable fields (for the sort menu). The backend populates both on every describe path —
+   *  including the default-served index (empty `scopeIndex`) — so an empty list means the index
+   *  genuinely has none, rather than us re-deriving it from the mapping. */
+  async function loadIndexMeta() {
     try {
       const stats = await describeIndex(scopeIndex);
       timeFields = stats?.time_fields ?? [];
       if (timeFields.length > 0 && !timeFields.includes(timeField)) timeField = timeFields[0];
+      sortFields = stats?.sort_fields ?? [];
+      // Drop a stale sort selection (e.g. after switching to an index without that field), so the
+      // menu and the next query never carry a field this index can't sort on.
+      if (sortField && !sortFields.includes(sortField)) sortField = '';
     } catch {
       timeFields = [];
+      sortFields = [];
     }
   }
 
@@ -173,7 +179,7 @@
     const savedIndex = read(SEARCH_INDEX_KEY);
     if (savedIndex && indexOptions.includes(savedIndex)) scopeIndex = savedIndex;
     else if (indexOptions.length > 0) scopeIndex = indexOptions[0];
-    await loadTimeFields();
+    await loadIndexMeta();
     try {
       saved = await loadSavedSearches();
     } catch {
@@ -380,7 +386,7 @@
   /** Scope index changed: reload its time fields, then re-run. */
   async function onScopeChange() {
     persist(SEARCH_INDEX_KEY, scopeIndex); // remember the choice across reloads
-    await loadTimeFields();
+    await loadIndexMeta();
     rerun();
   }
 
@@ -432,7 +438,7 @@
     timePreset = st.timePreset ?? '';
     timeFrom = st.timeFrom ?? '';
     timeTo = st.timeTo ?? '';
-    await loadTimeFields();
+    await loadIndexMeta();
     run(0);
   }
 

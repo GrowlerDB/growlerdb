@@ -2015,6 +2015,9 @@ struct IndexStatsDto {
     /// Mapped DATE columns — the console time filter ranges a query on one of these.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     time_fields: Vec<String>,
+    /// Mapped sortable fields (numeric/date/keyword, `fast`) — the console's sort menu.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    sort_fields: Vec<String>,
 }
 
 impl From<v1::IndexStats> for IndexStatsDto {
@@ -2026,6 +2029,7 @@ impl From<v1::IndexStats> for IndexStatsDto {
             generation_count: s.generation_count,
             checkpoint: s.checkpoint,
             time_fields: s.time_fields,
+            sort_fields: s.sort_fields,
         }
     }
 }

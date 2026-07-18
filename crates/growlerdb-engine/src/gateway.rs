@@ -1518,6 +1518,7 @@ impl Gateway {
                     merged.name = s.name.clone();
                     merged.checkpoint = s.checkpoint.clone();
                     merged.time_fields = s.time_fields.clone(); // same mapping on every shard
+                    merged.sort_fields = s.sort_fields.clone(); // same mapping on every shard
                     any = true;
                 }
                 merged.num_docs += s.num_docs;

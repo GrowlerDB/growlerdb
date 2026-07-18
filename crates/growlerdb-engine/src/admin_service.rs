@@ -338,6 +338,7 @@ impl Admin for AdminService {
                 checkpoint: render_checkpoint(shard.current_checkpoint()?),
                 size_bytes: shard.size_bytes(), // per-shard on-disk size (skew signal)
                 time_fields: shard.date_fields(), // DATE columns for the console time filter
+                sort_fields: shard.sort_fields(), // sortable fast fields for the console sort menu
             })
         })
         .await?
