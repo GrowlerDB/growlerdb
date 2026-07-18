@@ -22,10 +22,16 @@
   --scrim: rgba(18, 22, 30, 0.45);
   --shadow: rgba(18, 22, 30, 0.1);
   --field: #fff;
-  --accent: #2e6fd6;
+  --accent: #4a7fd9; /* glacier — brand primary on light surfaces */
   --on-accent: #fff;
   --accent-weak: color-mix(in srgb, var(--accent) 15%, transparent);
   --accent-weakest: color-mix(in srgb, var(--accent) 7%, transparent);
+  /* melt — the brand identity accent (mark tile, the "db", topbar/user-chip). Icon/identity only,
+     never body text/links on light. --melt-weak backs the melt-tinted user avatar. */
+  --melt: #46b8c8;
+  --melt-weak: color-mix(in srgb, var(--melt) 16%, transparent);
+  /* Search-hit highlight: amber wash (brand amber at 22%), text keeps its own colour. */
+  --mark-bg: rgba(217, 160, 74, 0.22);
 
   /* Density (row height + cell padding) — compact by default. */
   --rh: 30px;
@@ -38,7 +44,7 @@
   --btn: var(--panel2);
 
   font-family:
-    'IBM Plex Sans',
+    'Instrument Sans',
     system-ui,
     -apple-system,
     Segoe UI,
@@ -47,24 +53,26 @@
   color-scheme: light;
 }
 
+/* Brand v1.0 dark palette (D40) — the default theme. Soft neutral grays, never pure black/white;
+   glacier-light interactive accent, melt identity, amber warnings. */
 [data-theme='dark'] {
-  --bg: #202123;
-  --panel: #27282b;
-  --panel2: #2f3135;
-  --line: #383a3f;
-  --line-strong: #494c53;
-  --text: #e7e8ea;
-  --text-2: #a0a4ac;
-  --text-3: #71757d;
-  --ok: #4cb27a;
-  --ok-weak: rgba(76, 178, 122, 0.16);
-  --warn: #f0a63a;
-  --warn-weak: rgba(240, 166, 58, 0.18);
-  --danger: #e57373;
+  --bg: #141517;
+  --panel: #1c1d20;
+  --panel2: #232529;
+  --line: #2e3035;
+  --line-strong: #3f4147;
+  --text: #e8e9eb;
+  --text-2: #b9bcc2;
+  --text-3: #8b8f97;
+  --ok: #4fb87e;
+  --ok-weak: rgba(79, 184, 126, 0.16);
+  --warn: #d9a04a; /* amber */
+  --warn-weak: rgba(217, 160, 74, 0.18);
+  --danger: #d9604a;
   --scrim: rgba(0, 0, 0, 0.55);
   --shadow: rgba(0, 0, 0, 0.4);
-  --field: #1c1e20;
-  --accent: #5a8de0; /* ~16% lightened for contrast on dark surfaces */
+  --field: #17181b;
+  --accent: #7fa9d4; /* glacier-light — interactive accent on dark */
   --on-accent: #14161a;
   color-scheme: dark;
 }
@@ -122,9 +130,9 @@ body {
   }
 }
 
-/* Monospace for data/identifiers/queries/scores (IBM Plex Mono). */
+/* Monospace for data/identifiers/queries/scores (Geist Mono). */
 .mono {
-  font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace;
+  font-family: 'Geist Mono', ui-monospace, SFMono-Regular, monospace;
 }
 
 /* Visible only to screen readers (labels for icon/short controls). */
@@ -180,7 +188,7 @@ nav a {
   color: var(--text-2);
   text-decoration: none;
   font:
-    600 12.5px 'IBM Plex Sans',
+    600 12.5px 'Instrument Sans',
     system-ui,
     sans-serif;
 }
@@ -275,8 +283,14 @@ kbd {
   padding: 1.5rem;
 }
 
+h1,
+h2 {
+  font-family: 'Archivo', 'Instrument Sans', system-ui, sans-serif;
+  letter-spacing: -0.02em;
+}
 h1 {
   font-size: 1.4rem;
+  font-weight: 700;
   margin: 0 0 1rem;
 }
 
@@ -510,8 +524,8 @@ input {
   word-break: break-word;
 }
 mark {
-  background: var(--accent-weak);
-  color: var(--accent);
+  background: var(--mark-bg);
+  color: inherit;
   border-radius: 2px;
 }
 
@@ -655,9 +669,9 @@ fieldset {
 }
 .gb-panel-head {
   font:
-    600 9.5px 'IBM Plex Mono',
+    600 9.5px 'Geist Mono',
     monospace;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--text-3);
   padding: 10px 15px;

@@ -18,6 +18,9 @@
     "e2e": "playwright test"
   },
   "dependencies": {
+    "@fontsource/archivo": "^5.2.8",
+    "@fontsource/geist-mono": "^5.2.8",
+    "@fontsource/instrument-sans": "^5.2.8",
     "echarts": "^6.1.0"
   },
   "devDependencies": {

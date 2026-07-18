@@ -46,6 +46,6 @@
     overflow-wrap: anywhere;
   }
   .dc-kv.mono dd {
-    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-family: 'Geist Mono', ui-monospace, monospace;
   }
 </style>

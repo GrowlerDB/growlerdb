@@ -1083,7 +1083,7 @@
     gap: 0.5rem;
   }
   .eyebrow {
-    font-family: 'IBM Plex Mono', monospace;
+    font-family: 'Geist Mono', monospace;
     font-size: 0.62rem;
     letter-spacing: 0.08em;
     text-transform: uppercase;

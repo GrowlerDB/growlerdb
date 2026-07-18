@@ -1103,7 +1103,7 @@
   .rail-vlabel {
     writing-mode: vertical-rl;
     font:
-      600 9.5px 'IBM Plex Mono',
+      600 9.5px 'Geist Mono',
       monospace;
     letter-spacing: 0.08em;
     text-transform: uppercase;
@@ -1152,7 +1152,7 @@
   }
   .tf-label {
     font:
-      600 9px 'IBM Plex Mono',
+      600 9px 'Geist Mono',
       monospace;
     letter-spacing: 0.08em;
     text-transform: uppercase;

@@ -118,7 +118,7 @@
   }
   .dc-select-label {
     font:
-      600 9px 'IBM Plex Mono',
+      600 9px 'Geist Mono',
       monospace;
     letter-spacing: 0.08em;
     text-transform: uppercase;
@@ -129,7 +129,7 @@
     white-space: nowrap;
   }
   .dc-select-value.mono {
-    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-family: 'Geist Mono', ui-monospace, monospace;
     font-size: 0.92em;
   }
   .dc-select-caret {
@@ -168,7 +168,7 @@
     font-weight: 600;
   }
   .dc-option .mono {
-    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-family: 'Geist Mono', ui-monospace, monospace;
     font-size: 0.92em;
   }
   .dc-check {
