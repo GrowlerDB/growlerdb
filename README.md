@@ -1,17 +1,8 @@
 # GrowlerDB
 
-```
-                                              06303                         63696  9693
-                                                 66       66                    09    06
-   6630309  90 396996 3093609  00333 6603 66639  33    663  39  960369339 90000996    33060963
-   03   03    60      39   36    66  0 96  90    39    66969993   39     033    06    69    66
-   33  0      36      93   33     9  3  6  6     63    93         60     909    33    33    99
-   9936603  390669    3369930     6003  9903    36006  60990966 990096    6930933690  6009096
-  39     36
-  06963336
-```
+![GrowlerDB — full-text search over Apache Iceberg](docs/img/social-preview.png)
 
-**Open-source text search engine over Apache Iceberg** (and other datastores).
+**Search your lake. Keep one truth.** — open-source full-text search over Apache Iceberg (and other datastores).
 
 [![CI](https://github.com/GrowlerDB/growlerdb/actions/workflows/ci.yml/badge.svg)](https://github.com/GrowlerDB/growlerdb/actions/workflows/ci.yml)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
@@ -23,7 +14,7 @@ GrowlerDB keeps Apache Iceberg as the system of record and maintains a fast, der
 full-text index of your Iceberg data. Search returns the matching **primary keys
 (document coordinates)**, which resolve back to the authoritative rows in Iceberg.
 
-![The GrowlerDB console — full-text search over an Iceberg table, returning ranked document keys](docs/img/console-search.png)
+![The GrowlerDB console — full-text search over an Iceberg table, returning ranked coordinates](docs/img/console-search.png)
 
 > Status: **Beta** (0.x) — pre-1.0, production-tested, on the road to 1.0. The full surface —
 > distributed search/hydration, AuthN/RBAC + tenant isolation, observability, the console UI, an
@@ -36,7 +27,7 @@ full-text index of your Iceberg data. Search returns the matching **primary keys
 
 - **No second copy of your data.** Your lakehouse stays the system of record; the index is a derived,
   rebuildable artifact — not a parallel datastore to provision, reconcile, and keep from drifting.
-- **The lake is the source of truth.** A search returns document **keys**; hydration returns the live,
+- **The lake is the source of truth.** A search returns **coordinates**; hydration returns the live,
   catalog-governed Iceberg row — not a search-time `_source` copy that goes stale.
 - **No reindex-the-world migrations.** Point an index at a table and go; the changelog connector keeps
   it current from the Iceberg changelog. No `_bulk` re-load to stand up or re-shard.
@@ -72,7 +63,7 @@ Tempo). Editable diagram source: [`docs/img/architecture.excalidraw`](docs/img/a
 
 ## Features
 
-- **Search over Iceberg** — index a source table; search returns document keys that **hydrate to
+- **Search over Iceberg** — index a source table; search returns coordinates that **hydrate to
   authoritative rows from Iceberg** (`/v1/search` → `/v1/keys:get`).
 - **Query language** — native structured AST + a Lucene/KQL string parser.
 - **Distributed** — control plane (registry), stateful searcher/index nodes, and a scatter-gather
@@ -117,7 +108,7 @@ Open the console at **<http://localhost:8081>**, sign in with **`demo` / `demo`*
 the UI.
 
 Prefer the API? The demo runs with built-in auth, so log in for a session token, then search the
-seeded `docs` index (results are **document keys**, which hydrate to the authoritative rows in
+seeded `docs` index (results are **coordinates**, which hydrate to the authoritative rows in
 Iceberg):
 
 ```sh

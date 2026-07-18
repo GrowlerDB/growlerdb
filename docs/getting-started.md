@@ -140,7 +140,7 @@ curl -s localhost:8081/v1/keys:get \
 }
 ```
 
-That round-trip — **search returns keys, keys hydrate to rows from the lake** — is the core of
+That round-trip — **search returns coordinates, which hydrate to rows from the lake** — is the core of
 GrowlerDB.
 
 ## 4. Explore in the console
