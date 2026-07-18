@@ -15,6 +15,16 @@ heading_anchors: true
 color_scheme: growlerdb
 logo: "/assets/brand/lockup.svg"
 
+# Social unfurl (jekyll-seo-tag): shared links get a title card + description + the brand social
+# image. og:image resolves to an absolute URL via `url` above. A large-image Twitter card.
+twitter:
+  card: summary_large_image
+defaults:
+  - scope:
+      path: ""
+    values:
+      image: /img/social-preview.png
+
 aux_links:
   "GitHub →":
     - "https://github.com/GrowlerDB/growlerdb"
@@ -26,9 +36,10 @@ nav_external_links:
 
 footer_content: "GrowlerDB — AGPL-3.0. Search returns coordinates; rows hydrate from Iceberg."
 
-# Needed for the GitHub Pages native build to apply a remote theme.
+# Needed for the GitHub Pages native build to apply a remote theme + emit social/OG meta.
 plugins:
   - jekyll-remote-theme
+  - jekyll-seo-tag
 
 # Don't publish docs-tooling files as pages.
 exclude:
