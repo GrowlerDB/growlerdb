@@ -1,13 +1,46 @@
-// Custom overrides for the just-the-docs theme. This file is imported last by the theme's
-// stylesheet, so rules here win.
+// Custom overrides for the just-the-docs theme (Brand v1.0 — D40). Imported last, so CSS rules
+// here win. Colours come from the `growlerdb` color scheme; this file wires the self-hosted brand
+// typography (Archivo / Instrument Sans / Geist Mono — no font CDN) and a few brand tweaks.
 
-// Inline code: restyle the highlight — more padding (the theme default `0.2em 0.15em` crowds the
-// text, noticeable in tables like Configuration → Global flags), a softer text/background pair, and
-// a slightly smaller size so it sits better inline. Matches the theme's selector; the theme's border
-// + radius still apply (not overridden). The `:not(pre, figure)` guard keeps code blocks untouched.
+// -- Self-hosted brand fonts (woff2 under /assets/fonts) --------------------------------------
+@font-face { font-family: 'Archivo'; font-weight: 600; font-display: swap; src: url('/assets/fonts/archivo-latin-600-normal.woff2') format('woff2'); }
+@font-face { font-family: 'Archivo'; font-weight: 700; font-display: swap; src: url('/assets/fonts/archivo-latin-700-normal.woff2') format('woff2'); }
+@font-face { font-family: 'Archivo'; font-weight: 800; font-display: swap; src: url('/assets/fonts/archivo-latin-800-normal.woff2') format('woff2'); }
+@font-face { font-family: 'Instrument Sans'; font-weight: 400; font-display: swap; src: url('/assets/fonts/instrument-sans-latin-400-normal.woff2') format('woff2'); }
+@font-face { font-family: 'Instrument Sans'; font-weight: 500; font-display: swap; src: url('/assets/fonts/instrument-sans-latin-500-normal.woff2') format('woff2'); }
+@font-face { font-family: 'Instrument Sans'; font-weight: 600; font-display: swap; src: url('/assets/fonts/instrument-sans-latin-600-normal.woff2') format('woff2'); }
+@font-face { font-family: 'Geist Mono'; font-weight: 400; font-display: swap; src: url('/assets/fonts/geist-mono-latin-400-normal.woff2') format('woff2'); }
+@font-face { font-family: 'Geist Mono'; font-weight: 500; font-display: swap; src: url('/assets/fonts/geist-mono-latin-500-normal.woff2') format('woff2'); }
+
+// Body / UI: Instrument Sans. Headings: Archivo (tightened). Code: Geist Mono.
+body {
+  font-family: 'Instrument Sans', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+h1, h2, h3, h4, h5, h6, .site-title {
+  font-family: 'Archivo', 'Instrument Sans', system-ui, sans-serif;
+  letter-spacing: -0.02em;
+}
+code, kbd, samp, pre, .highlight, tt {
+  font-family: 'Geist Mono', ui-monospace, SFMono-Regular, monospace;
+}
+
+// Inline code: a touch more padding than the theme default (`0.2em 0.15em` crowds the text,
+// noticeable in tables), on the brand nested surface, in Geist Mono. The `:not(pre, figure)` guard
+// keeps code blocks untouched (they already use the scheme's `$code-background-color`).
 :not(pre, figure) > code {
-  padding: 0.4em 0.4em;
-  color: #f3f3f3;
-  background-color: #1f1f1f;
-  font-size: 0.9em;
+  padding: 0.2em 0.4em;
+  color: #e8e9eb;
+  background-color: #232529;
+  font-size: 0.86em;
+}
+
+// Header lockup image: keep it legible without crowding the nav rail.
+.site-logo {
+  height: 28px;
+  background-size: contain;
+}
+
+// Links lighten one step on hover, matching the other brand surfaces.
+a:hover {
+  color: #94b8dd;
 }

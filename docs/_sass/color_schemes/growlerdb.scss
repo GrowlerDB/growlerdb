@@ -1,0 +1,21 @@
+// GrowlerDB Brand v1.0 dark scheme for just-the-docs (D40 — see okf/product/brand).
+// A color scheme only sets the theme's SCSS colour variables; the theme wires them into the
+// rendered CSS. Neutral dark surfaces, glacier-light links/buttons, melt reserved for identity.
+
+$body-background-color: #141517; // page background
+$sidebar-color: #1c1d20; // left nav rail
+$search-background-color: #1c1d20; // search box + results panel
+$table-background-color: #1c1d20; // table rows
+$code-background-color: #232529; // code blocks + inline code
+$feedback-color: #232529; // "edit this page" / footer accents
+
+$body-text-color: #e8e9eb;
+$body-heading-color: #fcfcfc; // headings in brand white
+$nav-child-link-color: #b9bcc2;
+$search-result-preview-color: #8b8f97;
+
+$link-color: #7fa9d4; // glacier-light
+$btn-primary-color: #7fa9d4;
+$base-button-color: #232529;
+
+$border-color: #2e3035;
