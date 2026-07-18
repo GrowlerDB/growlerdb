@@ -104,7 +104,9 @@ TOKEN=$(curl -s localhost:8081/v1/login -H 'content-type: application/json' \
 The gateway serves the Engine API at `:8081`. Search returns ranked **document coordinates**:
 
 ```sh
-curl -s localhost:8081/v1/search -H 'content-type: application/json' -H "authorization: Bearer $TOKEN" \
+curl -s localhost:8081/v1/search \
+  -H 'content-type: application/json' \
+  -H "authorization: Bearer $TOKEN" \
   -d '{"index":"docs","query":"title:iceberg","limit":5}'
 ```
 
@@ -122,7 +124,9 @@ You get the matching keys + scores — no row contents, just the **coordinates**
 Now hydrate the authoritative row from Iceberg by that key:
 
 ```sh
-curl -s localhost:8081/v1/keys:get -H 'content-type: application/json' -H "authorization: Bearer $TOKEN" \
+curl -s localhost:8081/v1/keys:get \
+  -H 'content-type: application/json' \
+  -H "authorization: Bearer $TOKEN" \
   -d '{"index":"docs","keys":[{"identifier":[{"name":"id","value":"doc-2"}]}]}'
 ```
 
@@ -174,7 +178,9 @@ trying out the [query language](reference): every operator below returns a small
 Because two indexes are served, **name the index in every request**:
 
 ```sh
-curl -s localhost:8081/v1/search -H 'content-type: application/json' -H "authorization: Bearer $TOKEN" \
+curl -s localhost:8081/v1/search \
+  -H 'content-type: application/json' \
+  -H "authorization: Bearer $TOKEN" \
   -d '{"index":"catalog","query":"body:hydrate","limit":10}'
 ```
 
@@ -230,7 +236,9 @@ Send `"syntax":"kql"` to use **KQL** instead of Lucene — the difference is low
 `not` operators (field/range/`*` syntax is the same):
 
 ```sh
-curl -s localhost:8081/v1/search -H 'content-type: application/json' -H "authorization: Bearer $TOKEN" \
+curl -s localhost:8081/v1/search \
+  -H 'content-type: application/json' \
+  -H "authorization: Bearer $TOKEN" \
   -d '{"index":"catalog","syntax":"kql","query":"category:guide or category:adr","limit":10}'
 ```
 
@@ -243,7 +251,9 @@ curl -s localhost:8081/v1/search -H 'content-type: application/json' -H "authori
 them. Sort by one instead of relevance:
 
 ```sh
-curl -s localhost:8081/v1/search -H 'content-type: application/json' -H "authorization: Bearer $TOKEN" \
+curl -s localhost:8081/v1/search \
+  -H 'content-type: application/json' \
+  -H "authorization: Bearer $TOKEN" \
   -d '{"index":"catalog","query":"*:*","sort":[{"field":"views","desc":true}],"limit":3}'
 ```
 
@@ -259,7 +269,9 @@ The stack enables the [OpenSearch-compatible adapter](opensearch-adapter), so Op
 work against the same data:
 
 ```sh
-curl -s localhost:8081/docs/_search -H 'content-type: application/json' -H "authorization: Bearer $TOKEN" \
+curl -s localhost:8081/docs/_search \
+  -H 'content-type: application/json' \
+  -H "authorization: Bearer $TOKEN" \
   -d '{"query":{"match":{"body":"search"}},"size":5}'
 ```
 
@@ -365,7 +377,9 @@ Back with the ordinary demo `$TOKEN` (reader is enough to query), search for a t
 — its `body` is the only one mentioning *trino*:
 
 ```sh
-curl -s localhost:8081/v1/search -H 'content-type: application/json' -H "authorization: Bearer $TOKEN" \
+curl -s localhost:8081/v1/search \
+  -H 'content-type: application/json' \
+  -H "authorization: Bearer $TOKEN" \
   -d '{"index":"catalog","query":"body:trino","limit":5}'
 ```
 
@@ -420,7 +434,9 @@ TOKEN=$(curl -s localhost:8081/v1/login -H 'content-type: application/json' \
 Now — **without reindexing** — search the live index for readings that are still arriving:
 
 ```sh
-curl -s localhost:8081/v1/search -H 'content-type: application/json' -H "authorization: Bearer $TOKEN" \
+curl -s localhost:8081/v1/search \
+  -H 'content-type: application/json' \
+  -H "authorization: Bearer $TOKEN" \
   -d '{"index":"telemetry_stream","query":"status:critical","limit":5}'
 ```
 
