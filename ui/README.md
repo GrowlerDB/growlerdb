@@ -1,15 +1,36 @@
 # GrowlerDB console (UI)
 
-A **Svelte SPA** (Vite + TypeScript) that is a _pure client_ of the Engine API — the human
-surface over the same gRPC/REST API programmatic callers use (wiki/20-ui). It never reaches the
-Index or storage directly. This is the **scaffold**; the four screens (Search,
-Indexes, Observability, Connectors) are built out in tasks 46–49.
+A **Svelte SPA** (Vite + TypeScript) that is a _pure client_ of the Engine API — the human surface
+over the same gRPC/REST API programmatic callers use. It never reaches the index or storage directly;
+the [gateway](../okf/product/interfaces/ui.md) serves it at the same origin as the REST API. Themed by
+[Brand v1.0](../BRAND.md) (dark-first; Archivo / Instrument Sans / Geist Mono).
+
+![The GrowlerDB console — full-text search over the catalog index, returning ranked coordinates with their cached fields](../docs/img/console-search.png)
+
+## Screens
+
+- **Search / Explore** — Lucene/KQL query, faceted refinement, sort + keyset paging, per-hit BM25
+  explain, highlighted matches, hydrate a row in the drawer, saved queries, and JSON/CSV export.
+- **Indexes** — every index with docs / shards / sync lag / backup / alias; **Create index** points at
+  a source table and introspects its schema; per-index detail does reindex / alter / compact / backup /
+  drop + alias management.
+- **Observability** — live SLI panels (query rate·errors·latency, hydration, ingestion lag, cold-cache),
+  a health roll-up, and server-side alert state; deep dashboards link to Grafana.
+- **Settings** — appearance (theme·accent·density), connection, identity + roles, API tokens, the
+  Enterprise-license card, and About.
+- **Login gate** — shown in closed mode (built-in credential or OIDC) when unauthenticated.
+
+![The GrowlerDB console — Observability: live SLIs, the query-latency chart, and SLI cards](../docs/img/console-observability.png)
+
+![The GrowlerDB console — Settings: appearance, connection, users & roles, API tokens, license, and about](../docs/img/console-settings.png)
 
 ## Layout
 
-- `src/App.svelte` — nav shell (skip link, keyboard-navigable nav, `main` landmark).
-- `src/routes/` — screen components (Search, Indexes, Ingestion, Observability are built out; a few
-  sub-panels, e.g. Settings → API tokens, are labeled placeholders in-UI).
+- `src/App.svelte` — the topbar/nav shell (brand lockup, health pill, account menu; skip link,
+  keyboard-navigable nav, `main` landmark).
+- `src/routes/` — the screen components (Search, Indexes, IndexDetail, Observability, Settings) + the
+  hydrate drawer.
+- `src/app.css` — the design-system tokens (Brand v1.0 palette + type), theme/accent/density knobs.
 - `src/lib/auth.ts` — OIDC **authorization-code + PKCE** login; forwards the bearer token.
 - `src/lib/api.ts` — Engine API client; attaches `Authorization: Bearer <token>`.
 - `src/lib/i18n.ts` + `src/lib/locales/` — message catalog + `t()`; **no hardcoded strings**.
