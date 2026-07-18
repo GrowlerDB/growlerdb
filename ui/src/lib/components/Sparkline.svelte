@@ -118,7 +118,7 @@
     z-index: 5;
   }
   .dc-spark-val {
-    font-family: 'IBM Plex Mono', monospace;
+    font-family: 'Geist Mono', monospace;
     font-size: 0.72rem;
     font-weight: 600;
     color: var(--text);

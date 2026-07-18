@@ -484,7 +484,7 @@
     text-align: left;
     color: var(--text-3);
     font:
-      600 9.5px 'IBM Plex Mono',
+      600 9.5px 'Geist Mono',
       monospace;
     letter-spacing: 0.06em;
     text-transform: uppercase;
