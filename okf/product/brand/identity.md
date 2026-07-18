@@ -82,7 +82,10 @@ accents. Search-hit `<mark>` background is `rgba(217,160,74,0.22)`, text inherit
 
 This trio **replaces IBM Plex Sans/Mono in the console** and the system-font stack on the website.
 Fonts are Google Fonts (Archivo 600/700/800, Instrument Sans 400/500/600, Geist Mono 400/500/600) —
-**self-hosted for the console**.
+**self-hosted** on every surface (console, website, docs). **Disable ligatures + contextual
+alternates on code/mono** (`font-variant-ligatures: none; font-feature-settings: 'liga' 0, 'calt' 0`):
+Geist Mono's `calt` otherwise collapses the space before a `--` (rendering `docs --name` as
+`docs--name`) and merges operators like `://` / `->`.
 
 ## Radius & spacing
 

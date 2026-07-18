@@ -22,6 +22,11 @@ h1, h2, h3, h4, h5, h6, .site-title {
 }
 code, kbd, samp, pre, .highlight, tt {
   font-family: 'Geist Mono', ui-monospace, SFMono-Regular, monospace;
+  // Disable ligatures + contextual alternates: Geist Mono's `calt` collapses the space before a
+  // `--` (so `docs --name` rendered as `docs--name`) and would merge operators in code. Off for
+  // code, where every character must render literally.
+  font-variant-ligatures: none;
+  font-feature-settings: 'liga' 0, 'calt' 0;
 }
 
 // Inline code: a touch more padding than the theme default (`0.2em 0.15em` crowds the text,

@@ -130,9 +130,15 @@ body {
   }
 }
 
-/* Monospace for data/identifiers/queries/scores (Geist Mono). */
+/* Monospace for data/identifiers/queries/scores (Geist Mono). Ligatures + contextual alternates
+   off: Geist Mono's `calt` collapses the space before a `--` and would merge operators
+   (`://`, `->`, `!=`) — code/keys/queries must render every character literally. */
 .mono {
   font-family: 'Geist Mono', ui-monospace, SFMono-Regular, monospace;
+  font-variant-ligatures: none;
+  font-feature-settings:
+    'liga' 0,
+    'calt' 0;
 }
 
 /* Visible only to screen readers (labels for icon/short controls). */
