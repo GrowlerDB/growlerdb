@@ -20,9 +20,9 @@
   <text x="72" y="428" font-size="22" fill="#B9BCC2" font-family="&#39;Instrument Sans&#39;, system-ui, sans-serif">Iceberg is the system of record · search returns coordinates → rows hydrate from the lake</text>
   
   <g font-family="&#39;Geist Mono&#39;, ui-monospace, monospace">
-    <rect x="72" y="512" width="286" height="38" rx="19" fill="#1C1D20" stroke="#3F4147"></rect>
+    <rect x="72" y="512" width="186" height="38" rx="19" fill="#1C1D20" stroke="#3F4147"></rect>
     <circle cx="96" cy="531" r="4" fill="#46B8C8"></circle>
-    <text x="110" y="536" font-size="14" fill="#46B8C8">v1.0 — generally available</text>
-    <text x="380" y="536" font-size="15" fill="#8B8F97">growlerdb.com</text>
+    <text x="110" y="536" font-size="14" fill="#46B8C8">beta · pre-1.0</text>
+    <text x="280" y="536" font-size="15" fill="#8B8F97">growlerdb.com</text>
   </g>
 </svg>
