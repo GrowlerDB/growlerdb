@@ -43,3 +43,7 @@ Compiled knowledge about GrowlerDB — architecture, decisions (ADRs), and proce
 lives in the [`okf/`](okf/) knowledge base (Open Knowledge Format), the living source
 of truth. If a change contradicts what's documented there, update the OKF too — don't
 silently diverge.
+
+Anything touching a user-facing surface (console, website, docs, social) should follow the
+**brand** — see [`BRAND.md`](BRAND.md) (logo, palette, type, voice/terminology), a companion to
+[`okf/product/brand/`](okf/product/brand/index.md).
