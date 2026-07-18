@@ -20,6 +20,9 @@ Getting started, install (Compose + Helm), configuration, the
 [query language](/docs/query-language.md), [comparison & positioning](/docs/comparison.md),
 [performance (directional)](/docs/performance.md), storage tiering, and GA criteria/readiness.
 
+Both the docs site and the apex landing page follow [Brand v1.0](/product/brand/index.md) — see
+[brand surfaces](/product/brand/surfaces.md) for the homepage design and the docs theme.
+
 ## Notes
 
 Publishing the site (Pages) and pointing the domain is part of going public — see the GA-release work.

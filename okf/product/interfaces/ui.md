@@ -25,5 +25,10 @@ The **GrowlerDB console** — a Svelte single-page app (in `ui/`) served by the
 
 ## Notes
 
+The console is themed by [Brand v1.0](/product/brand/index.md): its `ui/src/app.css` tokens take the
+brand's dark-first neutral palette (glacier-light interactive accents, a melt topbar) and the Archivo /
+Instrument Sans / Geist Mono trio — a re-skin, not a redesign (see
+[brand identity](/product/brand/identity.md) for the token mapping).
+
 Deploy-specific config (e.g. the Grafana link) is served at runtime via `/v1/config`, not baked in —
 the SPA is built once and served by every deployment.

@@ -9,3 +9,4 @@ What users can do with GrowlerDB — the "what," described independently of how 
 * [Use cases](/product/use-cases/) - the grounding domain scenarios
 * [Functional](/product/functional/) - the capabilities (search, hydration, index management, ingestion, auth, …)
 * [Non-functional](/product/non-functional/) - the quality attributes GrowlerDB targets
+* [Brand](/product/brand/) - the visual & verbal identity (logo, palette, type, voice) applied across every surface
