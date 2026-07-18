@@ -897,6 +897,16 @@ pub struct ResolvedIndex {
 }
 
 impl ResolvedIndex {
+    /// Each temporal field's declared [`TimeFormat`] by path — so the `_search` adapter can convert a
+    /// range/exact bound written in that unit (e.g. `epoch_s`) to canonical micros before the query is
+    /// planned, keeping window pruning and segment execution (both micros-native) consistent.
+    pub fn date_formats(&self) -> std::collections::HashMap<String, crate::timestamp::TimeFormat> {
+        self.fields
+            .iter()
+            .filter_map(|f| f.format.map(|fmt| (f.path.clone(), fmt)))
+            .collect()
+    }
+
     /// The tenant-scoping field, if this index is tenant-scoped. When `Some`, every
     /// read must carry a verified tenant claim and is filtered to `tenant_field = claim`.
     pub fn tenant_field(&self) -> Option<&str> {

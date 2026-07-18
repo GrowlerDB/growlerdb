@@ -72,6 +72,13 @@ same auth + tenant scoping as the native API.
   OpenSearch `highlight` object (`field → ["…<em>term</em>…"]`, HTML-escaped). Custom pre/post tags,
   `type`, and `order` are ignored — GrowlerDB emits `<em>`-marked, escaped fragments.
 - **`query`** absent → match-all.
+- **Temporal bounds.** A `range`/`term`/`terms` value against a **date** field is interpreted in
+  that field's **declared unit** (`epoch_seconds`/`_millis`/`_micros`/`_nanos`, …) and converted to
+  the canonical epoch-micros GrowlerDB stores — so `{"range": {"ts": {"gte": 1700000000}}}` on a
+  seconds field matches, rather than being read as micros and pruning to nothing. This holds for
+  **every** date search field, not just a windowed index's windowing field: the gateway learns each
+  field's unit from the control plane's index mapping. Fields declared as native micros (no format)
+  pass through unchanged.
 
 ## Caveats (documented limitations, not bugs)
 

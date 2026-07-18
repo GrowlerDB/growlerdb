@@ -70,6 +70,22 @@ pub enum TimeParseError {
 }
 
 impl TimeFormat {
+    /// Parse the **wire name** a temporal format serializes to (the snake-case strings carried on
+    /// `GetIndexResponse` field mappings), so a live-CP consumer can reconstruct the format. Accepts
+    /// both the canonical name (`epoch_seconds`) and the short alias (`epoch_s`). `None` for an
+    /// unknown/empty string (a formatless native-micros field).
+    pub fn from_wire(s: &str) -> Option<TimeFormat> {
+        Some(match s {
+            "epoch_seconds" | "epoch_s" => TimeFormat::EpochSeconds,
+            "epoch_millis" | "epoch_ms" => TimeFormat::EpochMillis,
+            "epoch_micros" | "epoch_us" => TimeFormat::EpochMicros,
+            "epoch_nanos" | "epoch_ns" => TimeFormat::EpochNanos,
+            "rfc3339" | "iso8601" => TimeFormat::Rfc3339,
+            "date" => TimeFormat::DateOnly,
+            _ => return None,
+        })
+    }
+
     /// Convert a source [`Value`] to **canonical epoch microseconds** for `path` (used only in the
     /// error message). For an epoch unit, accepts an integer or a digit string (common in JSON-ish
     /// sources); for a string format, accepts the matching `YYYY-MM-DD[THH:MM:SS±ZZ]` text. Anything

@@ -88,6 +88,11 @@ pub struct WindowAssignment {
     /// Max event-time this window covers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_max: Option<i64>,
+    /// True when the serving node currently holds this window **cold** (read-through from object
+    /// storage, parked). Reported per-heartbeat, so it flips as park/pre-warm swap the tier — the
+    /// cluster Gateway reads it for `/v1/cold`. Defaults false (hot).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cold: bool,
 }
 
 /// A registered index: its resolved definition, lifecycle status, and **shard map**
@@ -1281,6 +1286,13 @@ impl Registry {
                 w.event_max = Some(w.event_max.map_or(max, |m| m.max(max)));
             }
         })
+    }
+
+    /// Record whether the serving node currently holds `window` **cold** (read-through from object
+    /// storage). Reported every heartbeat, so it tracks park/pre-warm tier swaps; the Gateway reads
+    /// it for `/v1/cold`. Errors if the index is absent.
+    pub fn set_window_cold(&self, index: &str, window: i64, cold: bool) -> Result<()> {
+        self.with_window(index, window, |w| w.cold = cold)
     }
 
     /// The window map for `index` (`window-id → WindowAssignment`), if registered. A clone, for the
