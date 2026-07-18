@@ -73,7 +73,7 @@ control and data plane.
 
 ## 0.1.0 — 2026-07-08
 
-The initial GA surface.
+The initial public (Beta) surface.
 
 ### Added
 

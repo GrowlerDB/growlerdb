@@ -20,7 +20,9 @@ are design targets until measured.
   [IaC](/system/deployment/iac.md)) measures ingest throughput and query p50/p95/p99 at QPS over tens
   of millions of events, warm and cold — see the [scale test plan](/quality/scale-test-plan.md) for
   the workload, duration, cluster, and run-duration cost model.
-- **Published numbers** feed the release; a **CI regression gate** guards against regressions.
+- **Published numbers** feed the release; a **CI regression gate** guards against regressions. The
+  harness's current directional report (GrowlerDB vs Elasticsearch vs Trino on 1M rows) is published as
+  a public **Performance** page on the docs site; the formal at-scale numbers are the pre-1.0 gate.
 
 ## Notes
 

@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GrowlerDB — open-source full-text search over Apache Iceberg</title>
+<meta name="description" content="GrowlerDB is an open-source full-text search engine over Apache Iceberg. Iceberg stays the system of record; search returns document keys that hydrate back to authoritative rows.">
+<link rel="canonical" href="https://growlerdb.com/">
+<!-- Social unfurl -->
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="GrowlerDB">
+<meta property="og:title" content="GrowlerDB — full-text search over Apache Iceberg">
+<meta property="og:description" content="Open-source text search over your Iceberg lakehouse. No second copy of your data; search returns keys that hydrate to authoritative rows.">
+<meta property="og:url" content="https://growlerdb.com/">
+<meta property="og:image" content="https://docs.growlerdb.com/img/social-preview.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="GrowlerDB — full-text search over Apache Iceberg">
+<meta name="twitter:description" content="Open-source text search over your Iceberg lakehouse. Search returns keys that hydrate to authoritative rows.">
+<meta name="twitter:image" content="https://docs.growlerdb.com/img/social-preview.png">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231e1e1e'/%3E%3Ctext x='16' y='23' font-family='Georgia,serif' font-size='20' fill='%23e8590c' text-anchor='middle'%3EG%3C/text%3E%3C/svg%3E">
+<style>
+  :root{
+    --bg:#1e1e1e; --panel:#262523; --ink:#e5ddd2; --muted:#a29b90;
+    --accent:#e8590c; --line:#3a3733; --cream:#e5ddd2;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  a{color:var(--accent)}
+  .wrap{max-width:960px; margin:0 auto; padding:0 24px}
+  header{padding:88px 0 40px; text-align:center}
+  .mark{font-size:clamp(40px,8vw,72px); font-weight:800; letter-spacing:-.02em; margin:0}
+  .mark b{color:var(--accent); font-weight:800}
+  .tag{font-size:clamp(18px,3.2vw,26px); color:var(--cream); margin:18px 0 8px; font-weight:500}
+  .sub{color:var(--muted); font-size:16px; margin:0 auto; max-width:620px}
+  .sub code{color:var(--ink)}
+  .cta{display:flex; gap:14px; justify-content:center; flex-wrap:wrap; margin:36px 0 8px}
+  .btn{
+    display:inline-block; padding:13px 24px; border-radius:8px; text-decoration:none;
+    font-weight:600; font-size:15px; border:1px solid var(--line);
+  }
+  .btn.primary{background:var(--accent); color:#fff; border-color:var(--accent)}
+  .btn.primary:hover{background:#d24f08}
+  .btn.ghost{background:transparent; color:var(--ink)}
+  .btn.ghost:hover{border-color:var(--accent); color:var(--accent)}
+  .flow{
+    display:grid; grid-template-columns:repeat(3,1fr); gap:16px;
+    margin:56px 0; padding:0;
+  }
+  .step{
+    background:var(--panel); border:1px solid var(--line); border-radius:10px;
+    padding:22px 20px;
+  }
+  .step .n{color:var(--accent); font-weight:700; font-size:13px; letter-spacing:.08em; text-transform:uppercase}
+  .step h3{margin:8px 0 6px; font-size:17px}
+  .step p{margin:0; color:var(--muted); font-size:14.5px}
+  .why{margin:56px 0 8px}
+  .why h2{font-size:22px; margin:0 0 20px; text-align:center}
+  .why ul{list-style:none; padding:0; margin:0; display:grid; gap:14px}
+  .why li{background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px 18px}
+  .why li b{color:var(--cream)}
+  footer{border-top:1px solid var(--line); margin-top:64px; padding:28px 0 56px; text-align:center; color:var(--muted); font-size:14px}
+  footer a{color:var(--muted); text-decoration:underline}
+  @media (max-width:640px){ .flow{grid-template-columns:1fr} header{padding:56px 0 28px} }
+</style>
+</head>
+<body>
+<header class="wrap">
+  <h1 class="mark">Growler<b>DB</b></h1>
+  <p class="tag">Open-source full-text search over Apache Iceberg</p>
+  <p class="sub">Iceberg stays the system of record. GrowlerDB maintains a fast, derived full-text
+    index — search returns document <b>keys</b> that hydrate back to the authoritative rows in your lake.</p>
+  <div class="cta">
+    <a class="btn primary" href="https://docs.growlerdb.com/getting-started">Get started</a>
+    <a class="btn ghost" href="https://docs.growlerdb.com/">Documentation</a>
+    <a class="btn ghost" href="https://github.com/GrowlerDB/growlerdb">GitHub</a>
+  </div>
+  <p class="sub" style="margin-top:14px; font-size:14px">Beta (0.x) — pre-1.0, production-tested, on the road to 1.0. AGPL-3.0.</p>
+</header>
+
+<main class="wrap">
+  <section class="flow" aria-label="How it works">
+    <div class="step">
+      <div class="n">1 · Index</div>
+      <h3>Point at Iceberg</h3>
+      <p>The connector streams your Iceberg changelog into a derived full-text index — no second copy to keep in sync by hand.</p>
+    </div>
+    <div class="step">
+      <div class="n">2 · Search</div>
+      <h3>Query returns keys</h3>
+      <p>Full-text, filters, ranges, aggregations. A search returns ranked document coordinates — not a stale copy of your data.</p>
+    </div>
+    <div class="step">
+      <div class="n">3 · Hydrate</div>
+      <h3>Rows from the lake</h3>
+      <p>Resolve keys back to the authoritative, governed rows in Iceberg by primary key. One source of truth.</p>
+    </div>
+  </section>
+
+  <section class="why">
+    <h2>Why GrowlerDB instead of Elasticsearch or OpenSearch?</h2>
+    <ul>
+      <li><b>No second copy of your data.</b> Your lakehouse stays the system of record; the index is derived and rebuildable — not a parallel datastore to reconcile.</li>
+      <li><b>The lake is the source of truth.</b> Hydration returns the live, catalog-governed Iceberg row, not a search-time snapshot that drifts.</li>
+      <li><b>No reindex-the-world migrations.</b> Point at a table and go; the connector keeps the index current from the Iceberg changelog.</li>
+    </ul>
+  </section>
+</main>
+
+<footer class="wrap">
+  <a href="https://docs.growlerdb.com/">Docs</a> ·
+  <a href="https://docs.growlerdb.com/performance">Performance</a> ·
+  <a href="https://docs.growlerdb.com/migration-from-elasticsearch">Migrate from Elasticsearch</a> ·
+  <a href="https://github.com/GrowlerDB/growlerdb">Source</a>
+  <div style="margin-top:12px">GrowlerDB — AGPL-3.0. Search returns keys; rows hydrate from Iceberg.</div>
+</footer>
+</body>
+</html>

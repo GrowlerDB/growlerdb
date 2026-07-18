@@ -25,11 +25,12 @@ full-text index of your Iceberg data. Search returns the matching **primary keys
 
 ![The GrowlerDB console — full-text search over an Iceberg table, returning ranked document keys](docs/img/console-search.png)
 
-> Status: **GA line** (0.x). The full surface — distributed search/hydration, AuthN/RBAC +
-> tenant isolation, observability, the console UI, an OpenSearch-compatible `_search` adapter, and
-> Compose + Helm deployment — is in place and tested (including backup/restore and single-shard
-> replicas). Road to 1.0: published benchmark numbers, full Polaris data-plane authz, and an external
-> security review. See [docs/ga-criteria.md](docs/ga-criteria.md).
+> Status: **Beta** (0.x) — pre-1.0, production-tested, on the road to 1.0. The full surface —
+> distributed search/hydration, AuthN/RBAC + tenant isolation, observability, the console UI, an
+> OpenSearch-compatible `_search` adapter, and Compose + Helm deployment — is in place and tested
+> (including backup/restore and single-shard replicas). Road to 1.0: a formal at-scale benchmark
+> suite (directional numbers are already published — see [Performance](https://docs.growlerdb.com/performance)),
+> full Polaris data-plane authz, and an external security review. See [docs/ga-criteria.md](docs/ga-criteria.md).
 
 ## Architecture
 
@@ -136,6 +137,7 @@ Full docs are the **GitHub Pages site at <https://docs.growlerdb.com/>** (built 
 
 - [Getting started](https://docs.growlerdb.com/getting-started) — zero to first search.
 - [Install & run modes](https://docs.growlerdb.com/install) · [Configuration](https://docs.growlerdb.com/configuration) · [API & query reference](https://docs.growlerdb.com/reference)
+- [Performance (directional)](https://docs.growlerdb.com/performance) — GrowlerDB vs Elasticsearch vs Trino.
 - [Migrating from Elasticsearch/OpenSearch](https://docs.growlerdb.com/migration-from-elasticsearch) · [Deployment](https://docs.growlerdb.com/deployment) · [Roadmap & known limitations](https://docs.growlerdb.com/roadmap) · [GA criteria](https://docs.growlerdb.com/ga-criteria)
 - [Security policy](SECURITY.md) · [Releasing](RELEASING.md) · [Changelog](CHANGELOG.md)
 

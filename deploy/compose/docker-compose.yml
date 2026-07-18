@@ -237,11 +237,15 @@ services:
       # Demo login: a well-known baked-in credential, scoped to exactly the two demo indexes
       # so per-index RBAC is EXERCISED, not bypassed. Seeded on first boot only.
       #   user `demo` / password `demo`, roles [reader, operator], indexes [docs, catalog].
-      # Change these for any non-demo use. (The initial `admin` user is still seeded with a generated,
-      # printed-once password — see the control-plane logs.)
+      # Change these for any non-demo use.
       GROWLERDB_DEMO_USER: demo
       GROWLERDB_DEMO_PASSWORD: demo
       GROWLERDB_DEMO_INDEXES: docs,catalog
+      # A well-known admin password for the walkthrough's Admin-scoped steps (reindex, §8) — so the
+      # tutorial can log in as `admin`/`admin` deterministically instead of grepping a generated
+      # password out of the logs. DEMO ONLY; set your own for any real deployment. (Without this the
+      # control plane seeds `admin` with a generated, printed-once password.)
+      GROWLERDB_ADMIN_PASSWORD: admin
     depends_on:
       polaris:
         condition: service_started
@@ -294,8 +298,11 @@ services:
   # `--all-indexes` gateway routes `{"index":"catalog", ...}` requests here automatically — no gateway
   # change needed. Demonstrates multi-index routing end to end and backs the getting-started
   # "query playground". Seed creates the table first (the `just stack` recipe seeds before this profile).
+  # In its OWN `catalog` profile (not `stack`): `just stack` activates both, but the streaming demo
+  # (`just pipeline`, which activates `stack`+`pipeline`) must NOT pull it in — there is no seeded
+  # `growlerdb.catalog` source there, so it could never build and would block the gateway forever.
   node-catalog:
-    profiles: ["stack"]
+    profiles: ["catalog"]
     <<: *growlerdb-image
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -357,11 +364,11 @@ services:
     depends_on:
       node:
         condition: service_healthy
-      # Wait for the catalog node too so both demo indexes (docs + catalog) are registered by the
-      # time the gateway is up — the `--all-indexes` gateway routes lazily, so this only makes the
-      # getting-started query playground deterministic on first bring-up.
-      node-catalog:
-        condition: service_healthy
+      # NOTE: no hard dependency on `node-catalog` — the `--all-indexes` gateway resolves each index
+      # lazily from the control plane and hot-reloads per index, so `catalog` becomes queryable as
+      # soon as node-catalog registers (a second or two after bring-up). A hard `depends_on` here
+      # would also drag node-catalog into the streaming demo (`depends_on` ignores profiles), where
+      # it has no source table and would block the gateway — see node-catalog's `catalog` profile.
       controlplane:
         condition: service_healthy
     ports:

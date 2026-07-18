@@ -25,5 +25,6 @@ the go/no-go is honest. It doubles as the pre-release checklist.
 
 ## Notes
 
-Remaining road-to-1.0 items (independent security review, published at-scale benchmarks) are tracked
-against the GA criteria and surfaced in [known limitations](/quality/known-limitations/index.md).
+Remaining road-to-1.0 items (independent security review, the formal at-scale benchmark suite —
+directional numbers are already published as a public Performance page) are tracked against the GA
+criteria and surfaced in [known limitations](/quality/known-limitations/index.md).

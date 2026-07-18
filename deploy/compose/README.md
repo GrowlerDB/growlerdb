@@ -3,8 +3,10 @@
 GrowlerDB's runtime dependencies for development and tests:
 
 - **MinIO** — S3-compatible object storage (`:9000` API, `:9001` console; `minioadmin`/`minioadmin`).
-- **Apache Polaris** — Iceberg REST catalog (`:8181`).
-- **seed** — creates the sample `growlerdb.docs` Iceberg table (3 rows).
+- **Apache Polaris** — Iceberg REST catalog (`:8181`), backed by a persistent Postgres metastore
+  (`polaris-db`).
+- **seed** — creates the sample Iceberg tables: `growlerdb.docs` (3 rows), the richer
+  `growlerdb.catalog` (10 rows), and `growlerdb.readings`.
 
 ## One-time host setup
 
@@ -20,14 +22,14 @@ echo "127.0.0.1 minio" | sudo tee -a /etc/hosts
 From the repo root:
 
 ```sh
-just up      # MinIO + Polaris, bootstrap the `growlerdb` catalog, and seed growlerdb.docs
+just up      # MinIO + Polaris, bootstrap the `growlerdb` catalog, and seed the sample tables
 just seed    # re-bootstrap the catalog + re-seed (stack already up)
 just down    # tear everything down (removes volumes)
 ```
 
 `just up` runs, in order: `docker compose up` (minio/polaris) → `setup-polaris.sh`
 (creates the `growlerdb` catalog + grants admin to root) → the `seed` service
-(pyiceberg, in-network, writes `growlerdb.docs`).
+(pyiceberg, in-network, writes `growlerdb.docs` + `growlerdb.catalog` + `growlerdb.readings`).
 
 ## Full stack — GrowlerDB + LGTM (Kubernetes alternative)
 
@@ -36,17 +38,23 @@ a single-host alternative to the Kubernetes deployment, and the environment inte
 run against.
 
 ```sh
-just stack        # deps + catalog + seed, then control-plane + node + gateway + LGTM
+just stack        # deps + seed, then control-plane + node + node-catalog + gateway + LGTM
 just stack-down   # tear it all down (removes volumes)
 ```
+
+`just stack` activates two Compose profiles: `stack` (control-plane, node, gateway, LGTM) and
+`catalog` (the second `node-catalog`). The streaming demo (`just pipeline`) activates `stack` +
+`pipeline` and deliberately leaves `node-catalog` out — there is no seeded `growlerdb.catalog` source
+there.
 
 Services (all on the compose network; published to the host):
 
 | Service | Role | Host endpoint |
 |---|---|---|
-| **gateway** | public Engine API + the **console UI** | **console `http://localhost:8081`**, REST `/v1`, gRPC `:50061` |
+| **gateway** | public Engine API + the **console UI** (built-in auth, all-indexes routing) | **console `http://localhost:8081`**, REST `/v1`, gRPC `:50061` |
 | **node** | builds + serves the `docs` index | gRPC `:50051`, health `:9102` |
-| **controlplane** | cluster index registry | gRPC `:50071`, health `:9101` |
+| **node-catalog** | builds + serves the richer `catalog` index (`catalog` profile) | gRPC `:50052`, health `:9104` |
+| **controlplane** | cluster index registry + `/v1/login` (seeds `demo`/`demo` + `admin`/`admin`) | gRPC `:50071`, health `:9101` |
 | **lgtm** | Grafana + Loki/Tempo/Mimir + OTLP | Grafana `http://localhost:3000`, OTLP `:4318` |
 
 Open the **console at http://localhost:8081** — the gateway serves the built Svelte UI
@@ -72,8 +80,10 @@ registry until something calls `CreateIndex`).
   matching traffic (failed queries / connector writes / locator refreshes).
 - Health/readiness (`/healthz`, `/readyz`) and Prometheus `/metrics` are on each service's
   `--metrics-addr` port; Docker healthchecks gate `depends_on` (the gateway waits for a ready node).
-- Smoke test once up: `curl localhost:9103/readyz` (gateway ready), then a REST query through
-  the cluster: `curl -s localhost:8081/v1/search -d '{"query":"hello","limit":10}'`.
+- Smoke test once up: `curl localhost:9103/readyz` (gateway ready). REST queries need a **login
+  token** and an **index name** now (the stack serves `docs` + `catalog` with built-in auth) — see the
+  [getting-started tutorial](../../docs/getting-started.md) §2–§3 for the `/v1/login` → `/v1/search`
+  flow.
 
 ## Notes / gotchas (learned the hard way)
 
@@ -83,5 +93,6 @@ registry until something calls `CreateIndex`).
   catalog's storage endpoint must be the in-network `minio:9000` — hence the
   `/etc/hosts` line for host clients.
 - **Seed runs in-network** (the `seed` compose service) so it resolves `minio`.
-- In-memory Polaris metastore: state is wiped on `down`/restart; `just up`
-  re-bootstraps the catalog every time (idempotent).
+- **Polaris is persistent** (Postgres-backed `polaris-db`), so a restart no longer wipes the catalog
+  or orphans the index. The `down`/`stack-down` recipes pass `-v` to drop volumes for an intentional
+  clean reset; `setup-polaris.sh` re-bootstraps the catalog idempotently.

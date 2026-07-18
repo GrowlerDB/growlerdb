@@ -6,6 +6,13 @@
 # accidentally flip it back. The pipeline producer services (redpanda/generator/sink/connector) live
 # in docker-compose.yml under the `pipeline` profile; `just pipeline` activates both.
 services:
+  # The streaming demo serves only `telemetry_stream`, so scope the baked-in demo user to it (the
+  # base stack scopes `demo` to docs,catalog). Without this a `demo`-token search on telemetry_stream
+  # is rejected by per-index RBAC (403). Same well-known demo/demo credential; admin/admin still works.
+  controlplane:
+    environment:
+      GROWLERDB_DEMO_INDEXES: telemetry_stream
+
   node:
     # Retry the initial build until the sink has created growlerdb.telemetry_stream — the node may
     # start before the first reading lands, so this makes startup race-free.

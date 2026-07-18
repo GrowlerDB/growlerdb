@@ -158,7 +158,7 @@ stack:
     # in parallel and they race to name the same tag ("image already exists") on Docker's containerd
     # store. Build the shared image ONCE, then start without --build.
     docker compose -f deploy/compose/docker-compose.yml build node
-    docker compose -f deploy/compose/docker-compose.yml --profile stack up -d
+    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile catalog up -d
 
 # bring up Trino to explore the Iceberg source with SQL and compare with GrowlerDB
 # Then: `docker compose -f deploy/compose/docker-compose.yml exec trino trino`
@@ -168,7 +168,7 @@ trino:
 
 # tear the full stack (and volumes) down
 stack-down:
-    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile seed --profile trino down -v
+    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile catalog --profile seed --profile trino down -v
 
 # chaos drill: crash a core service on the running stack, assert it self-heals.
 # SERVICE defaults to `node`; e.g. `just chaos gateway`. Requires `just stack` up first.
