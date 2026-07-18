@@ -6,6 +6,52 @@ All notable changes to GrowlerDB are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-18
+
+The **Brand v1.0 + launch-readiness** release: a unified brand across the console, website, and docs;
+automatic cold-tiering; and the pre-announcement docs / API-reference / quickstart hardening.
+
+### Added
+
+- **Cold-tiering — automatic park/revive.** Each node parks its own aged windows to cold read-through
+  from object storage on a background timer, and pre-warms a cold window back to NVMe when it gets hot
+  traffic again; wired on the node StatefulSet via Helm `coldTier.*`. (ADR D39)
+- **Brand v1.0** — a unified visual + verbal identity (the waterline mark, a dark-first neutral palette
+  with glacier/melt accents, the Archivo / Instrument Sans / Geist Mono type trio, and the
+  voice/terminology) applied across the console, website, docs, and social card; canonical vector
+  assets in `brand/`. (ADR D40)
+- **`sort_fields`** on `POST /v1/index:describe` — the sortable (fast numeric/date/keyword) fields, so
+  a client's sort menu only offers fields the engine can actually sort on.
+- **Docs**: a directional **Performance** page (GrowlerDB vs Elasticsearch vs Trino), a **Comparison &
+  positioning** page, the **aggregations/facets** surface + the full **REST reference** (11
+  previously-undocumented routes), a **Trino connector** README, **BRAND.md**, and a prebuilt-artifact
+  (image + binaries + Helm OCI) install quickstart.
+
+### Changed
+
+- **Console re-skinned to Brand v1.0** — design tokens, self-hosted fonts, and the waterline lockup
+  replace the previous IBM-Plex look; a re-skin, not a redesign (all behaviour preserved). **Dark is
+  now the default theme.**
+- **Website** (apex `growlerdb.com`) and the **docs site** themed to Brand v1.0, with social unfurl
+  (OG/Twitter) cards + the brand favicon.
+- **Maturity wording** standardized to **Beta (0.x) — pre-1.0**; dropped the "GA line" claim while the
+  external security review and formal benchmarks are pending.
+- **Spark connector** aligned to Spark 4.1.3 / Iceberg 1.11.0 with the matching
+  `iceberg-spark-runtime-4.1` (was a `-4.0` runtime against 4.1.3).
+
+### Fixed
+
+- An **empty-but-built shard** now records the source snapshot it caught up to — it reports `in_sync`
+  (green) instead of leaving the whole index on a grey `uninitialized` health pill. (TASK-121)
+- The console **sort menu** no longer offers non-sortable fields, which returned a `400`. (TASK-294)
+- **Geist Mono** ligatures no longer collapse the space before a `--` (or merge `://` / operators) in
+  rendered code. (TASK-295)
+- A shard's **client error now surfaces** from a multi-shard fan-out instead of being masked. (TASK-209)
+- **Cold-tier** runtime cold tracking + temporal-search units across all fields. (TASK-272/273)
+- **Getting-started streaming quickstart** repaired: `telemetry_stream` RBAC/token, `node-catalog` no
+  longer blocks the gateway in pipeline mode, and the `jq` / `mise` prerequisites are documented.
+  (TASK-279)
+
 ## [0.2.0] - 2026-07-12
 
 The **public-launch** release — multi-index querying, server-side highlighting, an authenticated demo
@@ -123,5 +169,6 @@ The initial public (Beta) surface.
   into the image, chart `appVersion`, binaries, and CLI `--version` while the tree stays `0.0.0`;
   the image gets an immutable `X.Y.Z` plus moving `X.Y`/`X`/`latest`. See [RELEASING.md](RELEASING.md).
 
-[Unreleased]: https://github.com/GrowlerDB/growlerdb/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/GrowlerDB/growlerdb/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/GrowlerDB/growlerdb/releases/tag/v0.2.0
