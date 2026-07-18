@@ -32,7 +32,7 @@ cluster.
 ## Stack
 
 - **JDK 21** (pinned via `mise` — see `mise.toml`), **Maven** (a prerequisite; system `mvn` or `brew install maven`).
-- **Spark 4.0** + **Iceberg 1.10** (`iceberg-spark-runtime-4.0_2.13`) — `provided` (supplied by `spark-submit`).
+- **Spark 4.1** (`4.1.3`) + **Iceberg 1.11** (`1.11.0`, `iceberg-spark-runtime-4.1_2.13`) — `provided` (supplied by `spark-submit`). The Iceberg spark-runtime jar is coupled to the Spark **minor** line; the pom's `spark.compat.version` tracks it.
 - **gRPC-Java** stubs generated from the shared `growlerdb.v1` protos in [`crates/growlerdb-proto/proto/`](../crates/growlerdb-proto/proto/growlerdb/v1) — single source of truth with the Rust server.
 
 ## Build

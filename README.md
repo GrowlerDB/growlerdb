@@ -32,6 +32,22 @@ full-text index of your Iceberg data. Search returns the matching **primary keys
 > suite (directional numbers are already published — see [Performance](https://docs.growlerdb.com/performance)),
 > full Polaris data-plane authz, and an external security review. See [docs/ga-criteria.md](docs/ga-criteria.md).
 
+## Why GrowlerDB instead of Elasticsearch / OpenSearch?
+
+- **No second copy of your data.** Your lakehouse stays the system of record; the index is a derived,
+  rebuildable artifact — not a parallel datastore to provision, reconcile, and keep from drifting.
+- **The lake is the source of truth.** A search returns document **keys**; hydration returns the live,
+  catalog-governed Iceberg row — not a search-time `_source` copy that goes stale.
+- **No reindex-the-world migrations.** Point an index at a table and go; the changelog connector keeps
+  it current from the Iceberg changelog. No `_bulk` re-load to stand up or re-shard.
+
+And **vs. Trino / Spark full-text-on-Iceberg**: those scan the table (seconds at scale); GrowlerDB
+answers from a real inverted index in **single-digit milliseconds** and hydrates only the matching rows
+— [directional numbers](https://docs.growlerdb.com/performance) put it ~2–3× faster than Elasticsearch
+on filtered search and ~50–170× faster than a Trino scan. See the full
+[**comparison & positioning**](https://docs.growlerdb.com/comparison) page for when GrowlerDB is (and
+isn't) the right fit.
+
 ## Architecture
 
 ![GrowlerDB architecture — your data lands in Apache Iceberg (the system of record); the Spark Structured Streaming connector reads the Iceberg changelog and streams batches to index nodes that build Tantivy segments; a client query hits the gateway, which scatter-gathers across shard nodes and hydrates the ranked keys back to authoritative Iceberg rows](docs/img/architecture.png)
@@ -82,6 +98,7 @@ crates/
   growlerdb-client       Rust client library
 ui/             the Svelte console (served by the Gateway)
 connector/      JVM Spark ingestion connector (separate Maven build; not a cargo member)
+connector-trino/  Trino plugin — a `search` table function (query→keys+score) to JOIN in SQL (experimental)
 deploy/compose  local dev/test stack (MinIO + Polaris + LGTM)
 deploy/helm     Helm chart (Kubernetes sharded-cluster topology)
 docs/           user documentation (GitHub Pages site, built from this folder)
@@ -137,7 +154,7 @@ Full docs are the **GitHub Pages site at <https://docs.growlerdb.com/>** (built 
 
 - [Getting started](https://docs.growlerdb.com/getting-started) — zero to first search.
 - [Install & run modes](https://docs.growlerdb.com/install) · [Configuration](https://docs.growlerdb.com/configuration) · [API & query reference](https://docs.growlerdb.com/reference)
-- [Performance (directional)](https://docs.growlerdb.com/performance) — GrowlerDB vs Elasticsearch vs Trino.
+- [Why GrowlerDB — comparison & positioning](https://docs.growlerdb.com/comparison) · [Performance (directional)](https://docs.growlerdb.com/performance) — vs Elasticsearch & Trino.
 - [Migrating from Elasticsearch/OpenSearch](https://docs.growlerdb.com/migration-from-elasticsearch) · [Deployment](https://docs.growlerdb.com/deployment) · [Roadmap & known limitations](https://docs.growlerdb.com/roadmap) · [GA criteria](https://docs.growlerdb.com/ga-criteria)
 - [Security policy](SECURITY.md) · [Releasing](RELEASING.md) · [Changelog](CHANGELOG.md)
 

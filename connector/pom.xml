@@ -24,8 +24,11 @@
          scraped off a tiny in-process HTTP server. simpleclient is small + shade-friendly. -->
     <prometheus.version>0.16.0</prometheus.version>
 
-    <!-- Spark/Iceberg are `provided` (supplied by spark-submit). Pinned here per the locked stack. -->
+    <!-- Spark/Iceberg are `provided` (supplied by spark-submit). Pinned here per the locked stack.
+         The Iceberg spark-runtime jar is coupled to the Spark *minor* line: `spark.compat.version`
+         MUST equal the major.minor of `spark.version` (Iceberg publishes `iceberg-spark-runtime-<minor>`). -->
     <spark.version>4.1.3</spark.version>
+    <spark.compat.version>4.1</spark.compat.version>
     <scala.binary.version>2.13</scala.binary.version>
     <iceberg.version>1.11.0</iceberg.version>
 
@@ -75,7 +78,7 @@
     </dependency>
     <dependency>
       <groupId>org.apache.iceberg</groupId>
-      <artifactId>iceberg-spark-runtime-4.0_${scala.binary.version}</artifactId>
+      <artifactId>iceberg-spark-runtime-${spark.compat.version}_${scala.binary.version}</artifactId>
       <version>${iceberg.version}</version>
       <scope>provided</scope>
     </dependency>

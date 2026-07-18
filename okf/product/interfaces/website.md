@@ -9,14 +9,16 @@ timestamp: 2026-07-04T14:22:00
 
 # Website (growlerdb.com)
 
-The public **documentation site** and project landing page, built from `docs/` (a just-the-docs
-Jekyll site) and served via GitHub Pages at **growlerdb.com**.
+The public **documentation site**, built from `docs/` (a just-the-docs Jekyll site) and served via
+GitHub Pages at **docs.growlerdb.com**. The bare apex **growlerdb.com** is a separate one-page landing
+(`www/index.html`, hosted on a GCP VM behind Apache + Let's Encrypt) that links into the docs and repo.
 
 ## Contents
 
 Getting started, install (Compose + Helm), configuration, the
-[REST & gRPC reference](/docs/rest-api.md), the [query language](/docs/query-language.md), storage
-tiering, and GA criteria/readiness.
+[REST & gRPC reference](/docs/rest-api.md) (incl. the aggregations/facets surface), the
+[query language](/docs/query-language.md), [comparison & positioning](/docs/comparison.md),
+[performance (directional)](/docs/performance.md), storage tiering, and GA criteria/readiness.
 
 ## Notes
 
@@ -24,8 +26,10 @@ Publishing the site (Pages) and pointing the domain is part of going public — 
 Deep design/system knowledge lives here in the OKF; the website is the user-facing docs surface.
 
 The **getting-started** quickstart is validated end-to-end on a fresh box (Ubuntu 24.04 + macOS):
-newcomers need only **Docker + Compose v2 + `just`** (dual-OS prereqs), on a **host or VM — not a
-container** (Docker bind mounts don't resolve there), with **~4 GB RAM**. `just stack` builds the
+the core walkthrough (§1–§8) needs only **Docker + Compose v2 + `just` + `jq`** (dual-OS prereqs), on a
+**host or VM — not a container** (Docker bind mounts don't resolve there), with **~4 GB RAM**. The
+streaming demo (§9) additionally needs **`mise`** on the host to build the Spark connector jar (JDK 21
++ Maven). `just stack` builds the
 shared `growlerdb-local:dev` image **once** before starting the control-plane/node/gateway, avoiding
 a same-tag parallel-build race on Docker's containerd store; `setup-polaris.sh` parses the Polaris
 token with `sed` (no python3 dependency). CI's `e2e` runs the engine in-process, so it doesn't
