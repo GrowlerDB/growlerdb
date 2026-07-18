@@ -1,7 +1,7 @@
 ---
 title: GA criteria
 layout: default
-nav_order: 9
+nav_order: 10
 ---
 
 # GA criteria & readiness
@@ -45,7 +45,7 @@ honestly.
 
 | Criterion | Status | Evidence |
 |---|---|---|
-| Representative benchmark suite + published numbers | ⚠️ Partial | Validated at scale on k3s: empty-start windowed topology with CP-driven placement, **exact source↔index convergence** (Trino distinct == index docs), ingest keep-up to ~19k rows/s, sub-linear windowed top-K, and bounded commit latency under large snapshots. The **published GA benchmark numbers** (staged step-ups + storage milestones + Iceberg/Trino comparison) are the one perf item before a 1.0 claim |
+| Representative benchmark suite + published numbers | ⚠️ Partial | **Directional numbers are published** ([Performance](performance) — GrowlerDB vs Elasticsearch 8.15 vs Trino on 1M rows). Also validated at scale on k3s: empty-start windowed topology with CP-driven placement, **exact source↔index convergence** (Trino distinct == index docs), ingest keep-up to ~19k rows/s, sub-linear windowed top-K, and bounded commit latency under large snapshots. The **formal at-scale benchmark suite** (staged step-ups + storage milestones + Iceberg/Trino comparison) is the one perf item before a 1.0 claim |
 
 ## Release & docs
 
@@ -60,9 +60,10 @@ honestly.
 The **P1 GA surface** — core search loop, distribution, security/multi-tenancy (incl. verified
 tenant isolation), observability, the console, the OpenSearch adapter, the release pipeline, and
 **backup/restore + single-shard replica sync** — is **in place, tested, and validated at scale on real
-hardware**. The remaining items before a confident **1.0** are, honestly: the **published benchmark
-numbers** (the topology + convergence are validated; the numbers themselves are the
-deliverable), **full Polaris data-plane authz** (P2), and an **independent security review**.
+hardware**. The remaining items before a confident **1.0** are, honestly: the **formal at-scale
+benchmark suite** (directional numbers are already published — see [Performance](performance); the
+topology + convergence are validated; the staged step-up numbers are the remaining deliverable),
+**full Polaris data-plane authz** (P2), and an **independent security review**.
 See the [public roadmap](roadmap) for the post-GA OSS line (cold-tier validation, per-key hydration
 routing, connector parallelism) and the [commercial line](roadmap#open-source-vs-enterprise)
 (zero-downtime windowed / multi-shard replica HA). This is the go/no-go gate for cutting GA.

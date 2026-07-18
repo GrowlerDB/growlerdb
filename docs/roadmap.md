@@ -1,7 +1,7 @@
 ---
 title: Roadmap & known limitations
 layout: default
-nav_order: 10
+nav_order: 11
 ---
 
 # Roadmap & known limitations
@@ -41,9 +41,11 @@ copyleft).
 
 ## Known limitations
 
-- **Published benchmark numbers are pending.** The topology, convergence, and latency behaviour are
-  validated at scale, but the formal staged benchmark suite (with an Iceberg/Trino baseline) is still
-  being produced — treat performance figures as directional until then.
+- **Directional benchmark numbers are published; the formal at-scale suite is pending.** A
+  directional comparison (GrowlerDB vs Elasticsearch 8.15 vs Trino on 1M rows) is on the
+  [Performance](performance) page, and the topology, convergence, and latency behaviour are validated
+  at scale — but the formal staged benchmark suite (with an Iceberg/Trino baseline at multiple scales)
+  is still being produced. Treat the current figures as directional until then.
 - **Read-HA for windowed / multi-shard indexes is limited.** Read replicas are single-shard today; a
   lost windowed-node's windows are unavailable until it recovers (its data is rebuildable from source).
   Zero-downtime windowed / multi-shard replica sets are part of the commercial offering (see

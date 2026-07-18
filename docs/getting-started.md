@@ -12,16 +12,19 @@ observability stack). Time: ~10 minutes, mostly the first image build.
 
 ## Prerequisites
 
-You need **Docker with the Compose v2 plugin** and **[`just`](https://github.com/casey/just)** — the
-stack runs entirely in containers, so no language toolchains are required. Run it on a **Linux host
-or a VM, or macOS with Docker Desktop** — *not* inside a container (Docker bind mounts won't resolve
-there). **~4 GB RAM** is enough.
+You need **Docker with the Compose v2 plugin**, **[`just`](https://github.com/casey/just)**, and
+**`jq`** (the REST examples pipe JSON through it). The **core walkthrough (§1–§8) runs entirely in
+containers** — no language toolchains required. The **streaming demo (§9)** is the one exception: it
+builds the Spark connector jar on the host, which needs **[`mise`](https://mise.jdx.dev)** (it
+provisions JDK 21 + Maven on demand) — installed in §9, not needed before then. Run it on a **Linux
+host or a VM, or macOS with Docker Desktop** — *not* inside a container (Docker bind mounts won't
+resolve there). **~4 GB RAM** is enough.
 
 ### Ubuntu / Debian
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y docker.io docker-compose-v2 docker-buildx just git curl
+sudo apt-get install -y docker.io docker-compose-v2 docker-buildx just jq git curl
 sudo systemctl enable --now docker
 # optional: run docker without sudo (log out/in afterwards)
 sudo usermod -aG docker "$USER"
@@ -31,7 +34,7 @@ sudo usermod -aG docker "$USER"
 
 ```sh
 brew install --cask docker   # Docker Desktop — bundles Compose v2 + buildx; launch it once
-brew install just
+brew install just jq
 ```
 
 ### Then, on either OS — one `/etc/hosts` entry
@@ -333,16 +336,13 @@ an **Admin-scoped** operation: in [`rbac.rs`](https://github.com/GrowlerDB/growl
 `operator`** (Search, IndexRead, Ops — *not* Admin). So the demo token **cannot** reindex; it gets a
 `403` (`` `ReindexIndex` requires the `admin` scope ``). Use the built-in **admin** user instead.
 
-The control plane seeds an `admin` user on first boot and, since no password is set in the demo env,
-**prints a generated one once** in its logs. Grab it, then log in as `admin` for an admin-scoped token:
+The demo stack seeds a built-in **`admin`** user with a well-known password (`admin`), set via
+`GROWLERDB_ADMIN_PASSWORD` in `deploy/compose/docker-compose.yml` — a deliberately well-known **demo**
+credential, not a production account. Log in as `admin` for an admin-scoped token:
 
 ```sh
-# The admin password, printed once at first startup:
-docker compose -f deploy/compose/docker-compose.yml logs controlplane | grep -A1 'generated password'
-
-# Mint an admin token (same /v1/login endpoint, admin credential):
 ADMIN_TOKEN=$(curl -s localhost:8081/v1/login -H 'content-type: application/json' \
-  -d '{"username":"admin","password":"<paste-the-printed-password>"}' | jq -r .token)
+  -d '{"username":"admin","password":"admin"}' | jq -r .token)
 ```
 
 Now reindex `catalog` with the admin bearer — GrowlerDB re-reads the Iceberg table (all 11 rows) and
@@ -391,14 +391,33 @@ Iceberg → the connector → a live `telemetry_stream` index — so you can wat
 as it arrives, **with no reindex step**. It's a self-contained stack (a different node config than the
 `docs`/`catalog` demo), so stop the batch stack first:
 
+> **This step builds the Spark connector jar on your host** (not in a container), so it needs
+> **[`mise`](https://mise.jdx.dev)** — it provisions JDK 21 + Maven on demand. Install it once and
+> restart your shell before running `just pipeline`:
+>
+> ```sh
+> curl https://mise.run | sh      # then restart your shell (or `source` your profile)
+> ```
+
 ```sh
 just stack-down          # free port 8081 + the node from the batch demo
 just pipeline            # deps + Polaris bootstrap + build the connector jar + bring it all up
 ```
 
 `just pipeline` builds the connector jar on first run (a minute or two), then starts the generator,
-sink, and Spark connector. Give it ~30 s for the first micro-batch, then — **without reindexing** —
-search the live index for readings that are still arriving:
+sink, and Spark connector. Give it **~30 s** for the first micro-batch to land and the node to build
+the `telemetry_stream` index — the gateway comes up once that node is ready.
+
+Tearing down the batch stack **invalidated your earlier `$TOKEN`** — a fresh stack signs session
+tokens with a new key, and here the demo user is re-seeded scoped to `telemetry_stream` (not
+`docs`/`catalog`). Once the gateway is up, **log in again** for a token that can query it:
+
+```sh
+TOKEN=$(curl -s localhost:8081/v1/login -H 'content-type: application/json' \
+  -d '{"username":"demo","password":"demo"}' | jq -r .token)
+```
+
+Now — **without reindexing** — search the live index for readings that are still arriving:
 
 ```sh
 curl -s localhost:8081/v1/search -H 'content-type: application/json' -H "authorization: Bearer $TOKEN" \
