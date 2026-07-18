@@ -63,7 +63,9 @@ OpenSearch-shaped documents (`_id` from the key, `_source` via hydration). Suppo
 - **Writes** (`_bulk`, index/update/delete APIs) — ingestion is via the changelog connector, not a
   write API. Point your pipeline at the Iceberg table.
 - **Aggregations / scripting / mappings / ingest pipelines / percolators** — not served by the
-  adapter; use the native aggregation API where available, and define mappings as index definitions.
+  adapter. Use the [native aggregation API](rest-api#aggregations--facets) (terms, stats,
+  date-histogram, range — gRPC `Aggregate`, plus REST `/v1/facets`) and define mappings as index
+  definitions.
 - **Exact scoring parity** — BM25 ranks results, but per-clause scoring nuances differ.
 
 ## Multi-tenancy

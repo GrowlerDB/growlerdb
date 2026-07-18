@@ -85,6 +85,27 @@ curl -s localhost:8081/v1/keys:get -H 'content-type: application/json' -d '{
 ### `POST /v1/suggest`
 Prefix / fuzzy term suggestions for a field (`{ "field", "text", "limit", "fuzzy", "max_edits" }`).
 
+### `POST /v1/explain`
+Explain **why one specific document** scores as it does for a query — the BM25 clause tree plus the
+analyzed terms per field. Opt-in and per-hit (the default search path never computes it); this backs
+the console's per-hit "explain" popover.
+
+```sh
+curl -s localhost:8081/v1/explain -H 'content-type: application/json' -d '{
+  "index": "docs", "query": "title:iceberg",
+  "coordinates": { "identifier": [ { "name": "id", "value": "doc-2" } ] }
+}'
+```
+```json
+{ "found": true, "matched": true, "score": 0.81,
+  "detail": { "description": "weight(title:iceberg)", "score": 0.81, "details": [ … ] },
+  "analyzed": [ { "field": "title", "terms": ["iceberg"] } ],
+  "timings": { "index_ms": 0.4, "hydration_ms": 0.0, "total_ms": 0.5 },
+  "shards_scanned": 1, "shards_total": 1 }
+```
+Accepts `"syntax": "kql"` like search. `found` is whether the coordinate exists; `matched` whether the
+query matches it (`detail`/score are present only when it matches).
+
 ### `POST /v1/index:describe`
 Per-index stats merged across shards (`num_docs`, `snapshot`, `checkpoint`, …) when the gateway
 fronts the index.
@@ -107,6 +128,69 @@ live when `apply` is `true`; changes that alter the indexed representation (fiel
 **not** applied — run `/v1/index:reindex` for those. Single-shard (embedded) only — a multi-shard
 gateway returns `501`; a node started without source access returns `501`.
 
+## Aggregations & facets
+
+GrowlerDB aggregates over the documents a query matches, merging buckets across shards. There are two
+surfaces: the **full aggregation API over gRPC** (`Aggregate`), and a **REST facets convenience**
+(`/v1/facets`) that runs a terms aggregation per field for a left-rail facet UI.
+
+### gRPC `Aggregate` (full surface)
+
+`Aggregate(AggregateRequest) returns (AggregateResponse)` on the `Search` service. `aggs` is a JSON
+object of **name → agg spec**, where each spec is the externally-tagged `Agg` enum. Supported
+aggregations:
+
+| Agg | Spec | Notes |
+|---|---|---|
+| **Terms** | `{ "Terms": { "field", "size" } }` | Top-`size` buckets of a fast field by descending doc count. |
+| **Stats** | `{ "Stats": { "field" } }` | `count` / `min` / `max` / `sum` / `avg` over a numeric fast field. |
+| **DateHistogram** | `{ "DateHistogram": { "field", "fixed_interval" } }` | Fixed-width time buckets of a DATE fast field (e.g. `"1d"`, `"3600s"`). **UTC-only, fixed interval** — no calendar (month/quarter) intervals, timezone, or `offset` (offset client-side). |
+| **Range** | `{ "Range": { "field", "ranges": [ { "from", "to" }, … ] } }` | Buckets over user-defined `[from, to)` ranges of a numeric fast field; omit a bound to leave it open. |
+
+Aggregations require **aggregatable (fast) fields** — declare `fast: true` on the field in the index
+definition. Request/response (`results` is a JSON object of name → result):
+
+```json
+// AggregateRequest
+{ "query": "status:critical",
+  "aggs": "{ \"by_metric\": { \"Terms\": { \"field\": \"metric\", \"size\": 10 } }, \"over_time\": { \"DateHistogram\": { \"field\": \"ts\", \"fixed_interval\": \"1h\" } } }",
+  "index": "telemetry" }
+
+// AggregateResponse.results (parsed)
+{ "by_metric": { "buckets": [ { "key": "vibration", "doc_count": 812 }, … ],
+                 "sum_other_doc_count": 40, "doc_count_error_upper_bound": 0 },
+  "over_time": { "buckets": [ { "key": 1719792000000000, "doc_count": 128 }, … ] } }
+```
+
+**Shard-undercount flag.** `AggregateResponse.failed_shards` is `0` on a complete result; when `> 0`
+that many shards didn't respond and the merged buckets **under-count** those shards' documents — a
+flagged gap, never silent. Terms buckets also carry Tantivy's `doc_count_error_upper_bound`
+(cross-shard top-N is exact only within the over-fetch window) and `sum_other_doc_count` (the long
+tail below the top-`size`). `Aggregate` needs the **Search** scope, same as a query.
+
+### `POST /v1/facets`
+
+A REST convenience for faceted navigation: for each requested field it runs one **terms** aggregation
+(reusing the distributed `Aggregate` path — no parallel facet engine), scoped to the docs the `query`
+matches, so counts reflect the current refinement. Non-aggregatable fields are **skipped** (not an
+error). Full aggregations (stats / date-histogram / range) are gRPC-only — REST exposes only terms
+facets.
+
+```sh
+curl -s localhost:8081/v1/facets -H 'content-type: application/json' -d '{
+  "index": "catalog", "query": "*:*",
+  "fields": ["category", "author"], "size": 10
+}'
+```
+```json
+{ "facets": [
+    { "field": "category", "buckets": [ { "value": "guide", "count": 4 },
+                                        { "value": "reference", "count": 3 } ] },
+    { "field": "author",   "buckets": [ { "value": "carol", "count": 3 }, … ] } ] }
+```
+Up to 12 fields per call; `size` defaults to 10 (capped at 100). When a shard fails the response adds
+`"partial": true` (omitted on a complete result). Needs the **Search** scope.
+
 ## Index management (gateway `--control-plane`)
 
 | Method | Path | Purpose |
@@ -117,10 +201,70 @@ gateway returns `501`; a node started without source access returns `501`.
 | `DELETE` | `/v1/indexes/{name}` | Drop an index. |
 | `POST` | `/v1/source:describe` | Introspect a source table's schema (`{ "table": "ns.table" }`) — the create-form helper. |
 | `GET` | `/v1/ingestion` · `/v1/ingestion/{name}` | Per-index sync status: source head vs. each shard's committed checkpoint (lag). |
+| `GET` | `/v1/aliases` | List alias → index mappings. |
+| `POST` | `/v1/aliases` | Point an alias at an index (`{ "alias", "index" }`) — **admin**. |
+| `DELETE` | `/v1/aliases/{alias}` | Remove an alias — **admin**. |
+| `GET` | `/v1/index:activity` (`POST`) | Recent index-lifecycle activity. |
+| `GET` | `/v1/license` | Enterprise-license status (licensee, nodes in use vs. limit). |
+
+Reads (`GET`) need the **index-read** scope; alias writes need **admin**.
 
 ```sh
 curl -s localhost:8081/v1/ingestion | python3 -m json.tool
 ```
+
+## Index maintenance
+
+Node-local maintenance of the **served shard**. Reindex/alter are documented above; these operate on
+segments and backups. Maintenance operations require operator/admin privileges.
+
+### `POST /v1/index:compact`
+Merge the served shard's segments. Returns the live segment count before and after
+(`{ "index": "<name>" }` ⇒ empty for the served index).
+```json
+{ "segments_before": 7, "segments_after": 1 }
+```
+
+### `POST /v1/index:backup`
+Back up the served shard to object storage (`{ "index", "prefix" }`). Returns
+`{ "snapshot", "file_count", "created_ms", "prefix" }`. **`501`** when the node has no backup target
+configured.
+
+### `POST /v1/index:backup-status`
+Last-backup status (`{ "index" }`): `{ "configured", "present", "snapshot", "created_ms",
+"file_count" }` — `configured: false` when the node has no backup target.
+
+## Saved queries
+
+Per-user saved searches backing the console's saved-query menu. All need the **search** scope.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/saved-queries` | List the caller's saved queries. |
+| `POST` | `/v1/saved-queries` | Create one. |
+| `PUT` | `/v1/saved-queries/{id}` | Update one. |
+| `DELETE` | `/v1/saved-queries/{id}` | Delete one. |
+
+## Users, roles & tokens (admin)
+
+Administer the built-in credential store (the control-plane's `--login-secret`/`--builtin-auth`
+accounts). Listing roles needs **index-read**; everything else needs the **admin** scope.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/users` | List users. |
+| `PUT` | `/v1/users/{subject}/roles` | Set a user's roles (`{ "roles": ["reader", …] }`). |
+| `GET` | `/v1/roles` | List the known roles and their scopes. |
+| `GET` | `/v1/tokens` | List issued API tokens (metadata, never the secret). |
+| `POST` | `/v1/tokens` | Mint an API token. |
+| `DELETE` | `/v1/tokens/{id}` | Revoke a token. |
+
+## Storage tiering
+
+### `GET /v1/cold`
+Cold-tier status for a **windowed** index: each window's hot/cold tier plus the shared read-through
+cache's hit/miss/byte stats. **`404`** on a non-windowed index (nothing to tier). See
+[Storage & tiering](storage-tiering).
 
 ## Metrics proxy (gateway `--prometheus`)
 
@@ -136,7 +280,7 @@ OpenSearch documents. See [OpenSearch adapter](opensearch-adapter).
 
 Same surface over gRPC (proto package `growlerdb.v1`):
 
-- **Gateway** — `Search`, `Suggest`, `Lookup` (GetByKey), `Admin`.
+- **Gateway** — `Search`, `Suggest`, `Aggregate`, `Explain`, `Lookup` (GetByKey), `Admin`.
 - **Node** (`serve`) — the above plus `Write` (apply changelog batches + `GetCheckpoint`) and
   `System`.
 - **Control plane** — `ControlPlane`: `CreateIndex` / `DropIndex` / `ListIndexes` / `GetIndex` /

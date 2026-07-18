@@ -1,7 +1,7 @@
 ---
 title: Storage & tiering
 layout: default
-nav_order: 9
+nav_order: 10
 ---
 
 # Storage tiering: hot vs cold (and when to use which)
@@ -16,15 +16,17 @@ GrowlerDB keeps indexes on **local NVMe** for low-latency search, and can **tier
 immutable data to **object storage** to cut steady-state cost. Tiering is powerful for the right
 workload and counterproductive for the wrong one — this page is the decision guide.
 
-> Status: the **windowing** that tiering builds on is in progress; **parking/revive**
-> and the object-storage-*served* backend are on the roadmap. The guidance below is
-> the design contract so you can model deployments against it.
+> Status: **shipped.** Time-windowing, **automatic in-place parking**, and **read-through serving
+> from object storage** are live and validated on a windowed k3s cluster. A cold window stays
+> **queryable** — a query that touches it is served read-through (slower, never unavailable), and a
+> cold window that gets hot traffic again **pre-warms** back to NVMe. Inspect what's parked via
+> `GET /v1/cold` or the console **Storage tiers** panel.
 
 ## The one rule: tiering needs immutability
 
-Cold tiering works by **sealing an old time-window shard, shipping byte-identical segments, and
-evicting it to object storage** — revived on demand. That only holds if the old data **never
-changes**. So:
+Cold tiering works by **sealing an old time-window shard and shipping its byte-identical segments to
+object storage**, where they are served **read-through** (the local Tantivy bulk is evicted; a small
+locator + hot cache stay on NVMe). That only holds if the old data **never changes**. So:
 
 | Your table | Index config | Why |
 |---|---|---|
@@ -38,28 +40,34 @@ see [event-time vs ingest-time](#late-arriving-data-event-vs-ingest-time).
 ## How tiering works (the model)
 
 1. **Window** the index by an ingest-time field into contiguous shards (e.g. daily).
-2. **Hot window** (recent) stays on NVMe; **cold windows** (aged past a policy) are **parked**:
-   backed up to object storage and evicted from local disk, built on the
-   [backup/restore](install#run-modes) machinery.
-3. A query **prunes** to the windows its time filter touches; if it touches a parked window, that
-   window is **revived** (restored to NVMe) before serving.
+2. **Hot window** (recent) stays on NVMe. Each node **automatically parks** its own windows once they
+   age past the `hot_windows` policy (a background timer): the window's Tantivy **bulk** is shipped to
+   object storage and evicted from local disk, while a small **locator** (`aux.redb` + `location.arr`)
+   and a hot cache stay on NVMe. Parking is **in-place and non-interrupting** — the window keeps
+   answering queries across the hot→cold swap. It's opt-in per deployment and node-local (the parked
+   data lives on the node's own object-storage prefix).
+3. A query **prunes** to the windows its time filter touches. If it touches a cold window, that window
+   is served **read-through from object storage** — byte-range reads through a cache-bounded object
+   directory, so the **query always completes** (cold is just slower). A cold window that starts
+   getting hot traffic again **pre-warms** back to NVMe automatically. (The `growlerdb` CLI's `park` /
+   `revive` also let you back a window up and fully restore it to NVMe on demand.)
 
-A 30-day-hot window over a 180-day corpus keeps ~⅙ of the index on NVMe — modeled at roughly
+A 30-day-hot window over a 180-day corpus keeps ~⅙ of the index's bulk on NVMe — modeled at roughly
 **70–85% lower steady-state NVMe spend** for time-series workloads where ~90% of queries hit recent
 data.
 
 ## Limitations (be honest before you design around it)
 
-- **No direct query-from-object-storage (today).** "Cold" means *parked + revive-before-serve*, not
-  queried in place. A query hitting a parked window pays a **cold-start** (download + open: seconds
-  to minutes by size) and needs free NVMe to revive into. The object-storage-served backend (D3)
-  that would query cold data in place with caching is **deferred**.
+- **Cold reads are slower, not unavailable.** A cold window is queried **in place** (read-through from
+  object storage), so the query always completes — but a cold hit pays object-store GET/egress and
+  range-read latency vs. an NVMe hit, warming into the cache as it goes. Window pruning means most
+  queries never touch cold at all; the cold-cache hit-rate is exposed as an SLI.
 - **Whole-shard granularity.** You park a *whole cold window-shard*, not rows within a shard — which
   is why time-windowing is the prerequisite (cold data must be isolated into its own shards). A
   single shard mixing hot + cold data can't be partially tiered.
-- **Revive economics.** Reaching back into cold data costs object-store GET/egress + the revive
-  time. Tiering pays off only when cold data is **genuinely rarely** queried; a workload that
-  frequently reads old data will thrash (revive → query → re-park).
+- **Cold-read economics.** Reaching back into cold data costs object-store GET/egress and slower
+  range reads. Tiering pays off only when cold data is **genuinely rarely** queried; a workload that
+  frequently reads old data will thrash the hot⇄cold pre-warm cycle and lose the savings.
 - **Mutating data can't be tiered** (the rule above) — it stays hot.
 - **Late backfills erode pruning.** A large late backfill widens a window's event-time zone-map, so
   event-time queries prune it less and scan it more (never *wrong*, just slower). Route known bulk
@@ -80,5 +88,5 @@ window (it gets scanned, never mis-answered).
 - [ ] Is old data **immutable** once written? → tiering is viable.
 - [ ] Is it **time-partitionable** (a reliable ingest-time field)? → required for windowing.
 - [ ] Are old windows **rarely queried**? → tiering pays off.
-- [ ] Do you accept a **cold-start** on the occasional deep query? → required (until D3).
+- [ ] Do you accept **slower (read-through) latency** on the occasional deep query into cold data? → required.
 - [ ] Mutating / CDC entity table, or hot across the whole range? → **keep it hot, hash-shard**.
