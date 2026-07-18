@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" font-family="Archivo, &#39;Instrument Sans&#39;, system-ui, sans-serif">
+  
+  <rect width="1200" height="630" fill="#141517"></rect>
+  
+  <rect x="0" y="402" width="1200" height="1" fill="#2E3035"></rect>
+  <circle cx="1080" cy="472" r="210" fill="#46B8C8" opacity="0.22"></circle>
+  <clipPath id="bergTop"><rect x="870" y="262" width="420" height="140.6"></rect></clipPath>
+  <circle cx="1080" cy="472" r="210" fill="#46B8C8" clip-path="url(#bergTop)"></circle>
+  
+  <rect x="72" y="64" width="52" height="52" rx="12" fill="#46B8C8"></rect>
+  <clipPath id="mark"><circle cx="98" cy="90" r="16"></circle></clipPath>
+  <g clip-path="url(#mark)">
+    <rect x="82" y="74" width="32" height="14.1" fill="#FCFCFC"></rect>
+    <rect x="82" y="88.1" width="32" height="17.9" fill="#FCFCFC" opacity="0.42"></rect>
+  </g>
+  <text x="140" y="103" font-size="38" font-weight="800" letter-spacing="-1.1" fill="#FCFCFC">growler<tspan fill="#46B8C8">db</tspan></text>
+  
+  <text x="72" y="298" font-size="64" font-weight="800" letter-spacing="-1.9" fill="#FCFCFC">Full-text search over</text>
+  <text x="72" y="366" font-size="64" font-weight="800" letter-spacing="-1.9" fill="#FCFCFC">Apache Iceberg</text>
+  <text x="72" y="428" font-size="22" fill="#B9BCC2" font-family="&#39;Instrument Sans&#39;, system-ui, sans-serif">Iceberg is the system of record · search returns coordinates → rows hydrate from the lake</text>
+  
+  <g font-family="&#39;Geist Mono&#39;, ui-monospace, monospace">
+    <rect x="72" y="512" width="286" height="38" rx="19" fill="#1C1D20" stroke="#3F4147"></rect>
+    <circle cx="96" cy="531" r="4" fill="#46B8C8"></circle>
+    <text x="110" y="536" font-size="14" fill="#46B8C8">v1.0 — generally available</text>
+    <text x="380" y="536" font-size="15" fill="#8B8F97">growlerdb.com</text>
+  </g>
+</svg>
