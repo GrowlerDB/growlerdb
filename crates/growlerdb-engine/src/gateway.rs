@@ -952,14 +952,16 @@ impl Gateway {
 
         // Gather under the deadline; a shard that errors, panics, or runs past the deadline (and
         // is aborted) simply doesn't contribute a body — `failed` counts those.
-        let bodies = gather_responses(set, self.limits.deadline).await;
+        let Fanout { bodies, errors } = gather_responses(set, self.limits.deadline).await;
         let failed = total_shards - bodies.len();
         // Every shard failed/timed out ⇒ an honest error, not a success-shaped empty page a
-        // client could mistake for "no matches".
+        // client could mistake for "no matches". A uniform client error (e.g. a bad query shape)
+        // surfaces verbatim as a 4xx instead of an opaque 500 — see `all_shards_failed`.
         if bodies.is_empty() {
-            return Err(Status::unavailable(format!(
-                "all {total_shards} shards failed to respond"
-            )));
+            return Err(all_shards_failed(
+                format!("all {total_shards} shards failed to respond"),
+                errors,
+            ));
         }
         // Each shard reports its true match count; sum them for the global total. Shards are
         // normally disjoint, but during a **reshard** a moved bucket briefly lives on both
@@ -1074,12 +1076,13 @@ impl Gateway {
             });
         }
 
-        let bodies = gather_responses(set, self.limits.deadline).await;
+        let Fanout { bodies, errors } = gather_responses(set, self.limits.deadline).await;
         let failed = total_shards - bodies.len();
         if bodies.is_empty() {
-            return Err(Status::unavailable(format!(
-                "all {total_shards} shards failed to respond"
-            )));
+            return Err(all_shards_failed(
+                format!("all {total_shards} shards failed to respond"),
+                errors,
+            ));
         }
         let reps: Vec<growlerdb_proto::v1::SearchHit> =
             bodies.into_iter().flat_map(|r| r.hits).collect();
@@ -1147,12 +1150,13 @@ impl Gateway {
             });
         }
 
-        let bodies = gather_responses(set, self.limits.deadline).await;
+        let Fanout { bodies, errors } = gather_responses(set, self.limits.deadline).await;
         let failed = total_shards - bodies.len();
         if bodies.is_empty() {
-            return Err(Status::unavailable(format!(
-                "all {total_shards} shards failed to respond"
-            )));
+            return Err(all_shards_failed(
+                format!("all {total_shards} shards failed to respond"),
+                errors,
+            ));
         }
         let mut counts: BTreeMap<String, u64> = BTreeMap::new();
         for body in bodies {
@@ -1233,12 +1237,13 @@ impl Gateway {
                     }
                 });
             }
-            let bodies = gather_responses(set, self.limits.deadline).await;
+            let Fanout { bodies, errors } = gather_responses(set, self.limits.deadline).await;
             let failed = total - bodies.len();
             if !body.keys.is_empty() && bodies.is_empty() {
-                return Err(Status::unavailable(format!(
-                    "all {total} windows failed to respond to the hydration"
-                )));
+                return Err(all_shards_failed(
+                    format!("all {total} windows failed to respond to the hydration"),
+                    errors,
+                ));
             }
             let rows: Vec<growlerdb_proto::v1::HydratedRow> =
                 bodies.into_iter().flat_map(|r| r.rows).collect();
@@ -1291,13 +1296,14 @@ impl Gateway {
             });
         }
 
-        let bodies = gather_responses(set, self.limits.deadline).await;
+        let Fanout { bodies, errors } = gather_responses(set, self.limits.deadline).await;
         let failed = queried - bodies.len();
         // Every shard we needed failed/timed out ⇒ error, not an empty (success-shaped) hydration.
         if queried > 0 && bodies.is_empty() {
-            return Err(Status::unavailable(format!(
-                "all {queried} shards holding requested keys failed to respond"
-            )));
+            return Err(all_shards_failed(
+                format!("all {queried} shards holding requested keys failed to respond"),
+                errors,
+            ));
         }
         let rows: Vec<growlerdb_proto::v1::HydratedRow> =
             bodies.into_iter().flat_map(|r| r.rows).collect();
@@ -1437,14 +1443,15 @@ impl Gateway {
                 shard.aggregate(r).await
             });
         }
-        let bodies = gather_responses(set, self.limits.deadline).await;
+        let Fanout { bodies, errors } = gather_responses(set, self.limits.deadline).await;
         let failed = total_shards - bodies.len();
         // Every shard failed/timed out ⇒ error, not a zero-count aggregation that reads as a
         // real (but empty) result.
         if bodies.is_empty() {
-            return Err(Status::unavailable(format!(
-                "all {total_shards} shards failed to respond"
-            )));
+            return Err(all_shards_failed(
+                format!("all {total_shards} shards failed to respond"),
+                errors,
+            ));
         }
         let partials: Vec<Vec<u8>> = bodies.into_iter().map(|r| r.partial).collect();
 
@@ -1493,12 +1500,13 @@ impl Gateway {
             });
         }
 
-        let bodies = gather_responses(set, self.limits.deadline).await;
+        let Fanout { bodies, errors } = gather_responses(set, self.limits.deadline).await;
         let failed = total_shards - bodies.len();
         if bodies.is_empty() {
-            return Err(Status::unavailable(format!(
-                "all {total_shards} shards failed to respond"
-            )));
+            return Err(all_shards_failed(
+                format!("all {total_shards} shards failed to respond"),
+                errors,
+            ));
         }
         let mut merged = IndexStats::default();
         let mut any = false;
@@ -1634,11 +1642,22 @@ impl Gateway {
 /// and return whatever arrived. A shard that errors, panics, or is aborted simply doesn't
 /// contribute a body — so the caller derives `failed = spawned - bodies.len()` and flags
 /// `partial` (or returns `UNAVAILABLE` when nothing arrived).
+/// The outcome of a scatter/gather fan-out: the bodies of the shards that answered, plus the
+/// error [`Status`]es of the shards that answered with an error. A shard that panicked or was
+/// aborted at the deadline contributes to neither (there is no status to carry). The errors let
+/// the caller distinguish a **bad request** (every shard rejects the same query the same way)
+/// from a **transient/server failure** — see [`all_shards_failed`].
+struct Fanout<T> {
+    bodies: Vec<T>,
+    errors: Vec<Status>,
+}
+
 async fn gather_responses<T: Send + 'static>(
     mut set: tokio::task::JoinSet<Result<Response<T>, Status>>,
     deadline: Option<Duration>,
-) -> Vec<T> {
+) -> Fanout<T> {
     let mut bodies = Vec::new();
+    let mut errors = Vec::new();
     let until = deadline.map(|d| tokio::time::Instant::now() + d);
     loop {
         let joined = match until {
@@ -1655,11 +1674,42 @@ async fn gather_responses<T: Send + 'static>(
                 None => break,
             },
         };
-        if let Ok(Ok(resp)) = joined {
-            bodies.push(resp.into_inner());
+        match joined {
+            Ok(Ok(resp)) => bodies.push(resp.into_inner()),
+            Ok(Err(status)) => errors.push(status), // a shard rejected/failed the RPC
+            Err(_join_err) => {}                    // panicked or aborted — no status to surface
         }
     }
-    bodies
+    Fanout { bodies, errors }
+}
+
+/// gRPC codes that map to a **4xx**: the request itself is at fault, so a retry won't help.
+/// Exactly the codes the OpenSearch adapter renders as 4xx (`rest.rs` code→HTTP) — notably
+/// **not** `Unimplemented` (501) or the `_ => 500` fallthrough (e.g. `OutOfRange`), which are
+/// server-side, so a fan-out that saw only those keeps the retryable `unavailable`.
+fn is_client_error(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::InvalidArgument
+            | tonic::Code::FailedPrecondition
+            | tonic::Code::NotFound
+            | tonic::Code::PermissionDenied
+            | tonic::Code::Unauthenticated
+    )
+}
+
+/// The error to return when a fan-out produced **no usable body**. Every shard ran the *same*
+/// request against the *same* schema, so a bad query fails them all identically: when every
+/// reported failure is a client error (4xx), surface the first verbatim so the caller learns
+/// *why* (e.g. `ip_cidr requires an IP field`, `sort needs a … fast field`) instead of an
+/// opaque, retryable 500. If any failure is server-side/transient — or shards vanished without a
+/// status (panic/deadline) leaving no reported error at all — keep the retryable `unavailable`,
+/// which is honest about "the query might be fine; the cluster couldn't answer it".
+fn all_shards_failed(fallback: String, errors: Vec<Status>) -> Status {
+    if !errors.is_empty() && errors.iter().all(|s| is_client_error(s.code())) {
+        return errors.into_iter().next().unwrap();
+    }
+    Status::unavailable(fallback)
 }
 
 /// A collapse group's stable key — the canonical index string of the hit's `group` value (the
@@ -2082,6 +2132,133 @@ mod tests {
         let ids: Vec<String> = resp.hits.iter().map(id_of).collect();
         assert_eq!(ids, vec!["a1", "a2"]);
         assert!(resp.partial);
+    }
+
+    /// A Node that fails **every** RPC with a fixed status — models a shard that rejects a
+    /// query (a bad query shape ⇒ `InvalidArgument`) or is genuinely down (`Unavailable`).
+    struct RejectNode {
+        code: tonic::Code,
+        message: &'static str,
+    }
+
+    #[tonic::async_trait]
+    impl Node for RejectNode {
+        async fn search(
+            &self,
+            _: Request<SearchRequest>,
+        ) -> Result<Response<SearchResponse>, Status> {
+            Err(Status::new(self.code, self.message))
+        }
+        async fn suggest(
+            &self,
+            _: Request<SuggestRequest>,
+        ) -> Result<Response<SuggestResponse>, Status> {
+            Err(Status::new(self.code, self.message))
+        }
+        async fn get_by_key(
+            &self,
+            _: Request<GetByKeyRequest>,
+        ) -> Result<Response<GetByKeyResponse>, Status> {
+            Err(Status::new(self.code, self.message))
+        }
+        async fn describe_index(
+            &self,
+            _: Request<DescribeIndexRequest>,
+        ) -> Result<Response<DescribeIndexResponse>, Status> {
+            Err(Status::new(self.code, self.message))
+        }
+    }
+
+    /// TASK-209 regression: on a multi-shard index a genuinely-unsupported query makes *every*
+    /// shard reject it with the same client error (a bad query shape is uniform — same schema on
+    /// each shard). The fan-out must surface that **4xx verbatim**, not collapse it into an
+    /// opaque, retryable `unavailable` (which the OpenSearch adapter renders as a 500). Both the
+    /// http_logs `cidr_clientip` and `topk_hydrated` shapes that failed on the live scale run are
+    /// this case: `ip_cidr` on a mis-mapped TEXT field, and a sort on a non-`fast` field.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn all_shards_rejecting_a_bad_query_surface_the_client_4xx_not_a_500() {
+        // cidr_clientip against a field the deployed index auto-mapped to TEXT instead of IP.
+        let cidr_msg = "ip_cidr requires an IP field, got `client_ip`";
+        let gw = Gateway::sharded(vec![
+            Arc::new(RejectNode {
+                code: tonic::Code::InvalidArgument,
+                message: cidr_msg,
+            }),
+            Arc::new(RejectNode {
+                code: tonic::Code::InvalidArgument,
+                message: cidr_msg,
+            }),
+        ]);
+        let err = gw
+            .search(Request::new(SearchRequest {
+                query: "client_ip:211.0.0.0/8".into(),
+                limit: 0,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a bad query must be an error, not an empty page");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "4xx, not 5xx");
+        assert_eq!(
+            err.message(),
+            cidr_msg,
+            "the shard's reason is surfaced verbatim"
+        );
+
+        // topk_hydrated: a sort on a field the deployed index built non-`fast`.
+        let sort_msg = "sort needs a numeric/date/keyword fast field, got `response_time_ms`";
+        let gw = Gateway::sharded(vec![
+            Arc::new(RejectNode {
+                code: tonic::Code::InvalidArgument,
+                message: sort_msg,
+            }),
+            Arc::new(RejectNode {
+                code: tonic::Code::InvalidArgument,
+                message: sort_msg,
+            }),
+        ]);
+        let err = gw
+            .search(Request::new(SearchRequest {
+                query: "user_agent:Chrome".into(),
+                limit: 20,
+                sort: rank_sort(true),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a non-fast sort must be an error");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(err.message(), sort_msg);
+    }
+
+    /// The 4xx surfacing is gated on *every* failure being a client error. A single server-side
+    /// or transient failure in the mix (or all of them) keeps the retryable `unavailable`, so a
+    /// real outage is never mislabeled as the client's fault.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_server_error_among_the_failures_keeps_unavailable() {
+        // One shard rejects the query (client error), the other is genuinely down (server error).
+        let gw = Gateway::sharded(vec![
+            Arc::new(RejectNode {
+                code: tonic::Code::InvalidArgument,
+                message: "bad query",
+            }),
+            Arc::new(RejectNode {
+                code: tonic::Code::Internal,
+                message: "boom",
+            }),
+        ]);
+        let err = gw
+            .search(Request::new(SearchRequest {
+                query: "x".into(),
+                limit: 10,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("all shards failed");
+        assert_eq!(
+            err.code(),
+            tonic::Code::Unavailable,
+            "a server error must not be masked as a 4xx"
+        );
+        assert!(err.message().contains("shards failed to respond"));
     }
 
     /// A Node returning **field-sorted** hits, each carrying its `sort_values` (numeric;

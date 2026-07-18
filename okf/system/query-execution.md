@@ -21,7 +21,13 @@ How a [query](/product/functional/search/query.md) executes against the index.
 - **Cost guards** — a leading wildcard is cost-guarded, Node page fetches are capped, and segment
   reads are bounds-clamped, so a pathological query can't run away.
 - **Cross-shard merge** — the [gateway](/system/distribution.md) merges shard top-K, dedupes, and
-  reports a true cross-shard `total`.
+  reports a true cross-shard `total`. A shard that fails or times out is dropped and the page is
+  flagged `partial`; when **every** shard fails, the gateway distinguishes cause by the shards'
+  own error codes. Because each shard runs the same query against the same schema, a bad query
+  (e.g. a CIDR on a non-IP field, a sort on a non-`fast` field) fails them all with the same
+  **client error**, which the gateway surfaces verbatim as a 4xx — so the caller learns *why*
+  rather than seeing an opaque, retryable 500. If any failure is server-side/transient (or shards
+  vanished without a status), the total failure stays a retryable `unavailable`.
 - **Hydration point reads** — resolving a [hydration](/product/functional/hydration.md) locator's
   `(file, row position)` is a **targeted parquet read**: one footer-metadata read per data file,
   row-group scoping to the group(s) holding the requested positions, and a row selection to the

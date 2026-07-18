@@ -798,6 +798,39 @@ mod tests {
         assert_eq!(s, "status:(active OR pending)");
     }
 
+    /// TASK-209: the http_logs `cidr_clientip` workload query — a `term` whose value is a CIDR
+    /// block on an IP field. `/` is not a query metacharacter, so it passes through the token
+    /// filter and the parser recognizes the `addr/prefix` shape as a native `IpCidr` (routed to
+    /// the field's IP range). On a correctly-mapped IP field this returns matches; the failure
+    /// the scale run hit was an auto-mapped TEXT field, now surfaced as a clean 4xx by the gateway.
+    #[test]
+    fn cidr_term_on_an_ip_field_parses_to_ip_cidr() {
+        let s = xlate(json!({ "term": { "client_ip": "211.0.0.0/8" } }));
+        assert_eq!(s, "client_ip:211.0.0.0/8");
+        assert_eq!(
+            Query::parse(&s).unwrap(),
+            Query::IpCidr {
+                field: "client_ip".into(),
+                cidr: "211.0.0.0/8".into()
+            }
+        );
+    }
+
+    /// TASK-209: the http_logs `topk_hydrated` workload sort — top-k by a numeric field, desc.
+    /// Translates to a single descending `WireSort`; the server orders on the field's `fast`
+    /// column (a non-`fast` field is the rejected-query case the gateway now reports as a 4xx).
+    #[test]
+    fn topk_hydrated_sort_translates_to_a_descending_wire_sort() {
+        let out = translate_sort(&json!([{ "response_time_ms": "desc" }])).unwrap();
+        assert_eq!(
+            out,
+            vec![WireSort {
+                field: "response_time_ms".into(),
+                descending: true
+            }]
+        );
+    }
+
     #[test]
     fn match_single_and_multi_token() {
         assert_eq!(
