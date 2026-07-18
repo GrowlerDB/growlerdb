@@ -30,9 +30,9 @@
       text: v('--text-2', '#666'),
       faint: v('--text-3', '#999'),
       line: v('--line', '#ddd'),
-      accent: v('--accent', '#2e6fd6'),
-      ok: v('--ok', '#2f9e63'),
-      warn: v('--warn', '#dd7d12'),
+      accent: v('--accent', '#7fa9d4'),
+      ok: v('--ok', '#4fb87e'),
+      warn: v('--warn', '#d9a04a'),
       panel: v('--panel', '#fff'),
     };
   }
@@ -48,7 +48,7 @@
       color: [c.accent, c.ok, c.warn, c.faint, '#7c6ff0', '#12a5b8', '#d6558f', '#8a8f98'],
       textStyle: {
         color: c.text,
-        fontFamily: 'IBM Plex Sans, system-ui, sans-serif',
+        fontFamily: 'Instrument Sans, system-ui, sans-serif',
         fontSize: 11,
       },
       // containLabel makes the grid reserve exactly enough room for the axis labels, so wide

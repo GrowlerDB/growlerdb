@@ -222,7 +222,7 @@
   .dfields dd {
     margin: 0.1rem 0 0;
     word-break: break-word;
-    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-family: 'Geist Mono', ui-monospace, monospace;
     font-size: 0.95em;
   }
   .ex-total {

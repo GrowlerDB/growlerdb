@@ -38,12 +38,6 @@
   // Mirror the persisted design-system prefs (theme + accent + density) onto <html>.
   applyPrefs();
 
-  // Retro pixel "G" brand glyph: a 7×7 bitmap rendered as a 4px CSS grid.
-  // 0 = off, 1 = lit (--accent), 2 = lit at 50% (the glyph's softened corners). Decorative.
-  const BRAND_G = ['0211110', '1100011', '1100000', '1100211', '1100011', '1100011', '0111210']
-    .join('')
-    .split('');
-
   const navItems: { route: Route; key: string }[] = [
     { route: '/', key: 'nav.search' },
     { route: '/indexes', key: 'nav.indexes' },
@@ -220,12 +214,16 @@
   {:else}
     <header class="topbar">
       <a class="brand" href="/" onclick={(e) => go(e, '/')} aria-label={t('app.home')}>
-        <span class="brand-mark" aria-hidden="true">
-          {#each BRAND_G as cell, i (i)}
-            <i class:on={cell !== '0'} class:half={cell === '2'}></i>
-          {/each}
-        </span>
-        {t('app.title')}
+        <!-- Waterline mark (the brand berg crossing the waterline) — see brand/favicon.svg. -->
+        <svg class="brand-mark" width="26" height="26" viewBox="0 0 32 32" aria-hidden="true">
+          <rect width="32" height="32" rx="7.3" fill="#46b8c8" />
+          <clipPath id="brand-berg"><circle cx="16" cy="16" r="10" /></clipPath>
+          <g clip-path="url(#brand-berg)">
+            <rect x="6" y="6" width="20" height="8.8" fill="#fcfcfc" />
+            <rect x="6" y="14.8" width="20" height="11.2" fill="#fcfcfc" opacity="0.42" />
+          </g>
+        </svg>
+        <span class="wordmark" aria-hidden="true">growler<span class="db">db</span></span>
       </a>
 
       <button
@@ -380,8 +378,6 @@
     display: inline-flex;
     align-items: center;
     gap: 0.5rem;
-    font-weight: 700;
-    letter-spacing: 0.01em;
     /* A link to home — keep the header's text styling, add a pointer + focus. */
     color: inherit;
     text-decoration: none;
@@ -391,18 +387,19 @@
     opacity: 0.85;
   }
   .brand-mark {
-    display: grid;
-    grid-template-columns: repeat(7, 4px);
-    grid-auto-rows: 4px;
-    gap: 1px;
     flex: 0 0 auto;
+    display: block;
   }
-  .brand-mark i.on {
-    background: var(--accent);
-    border-radius: 1px;
+  /* Wordmark lockup: Archivo 800, lowercase, tight; the "db" carries the melt identity colour. */
+  .wordmark {
+    font-family: 'Archivo', 'Instrument Sans', system-ui, sans-serif;
+    font-weight: 800;
+    font-size: 15.5px;
+    letter-spacing: -0.03em;
+    color: var(--text);
   }
-  .brand-mark i.half {
-    opacity: 0.5;
+  .wordmark .db {
+    color: var(--melt);
   }
   .health {
     display: inline-flex;
@@ -440,7 +437,7 @@
   }
   .user-name {
     font:
-      500 12px 'IBM Plex Sans',
+      500 12px 'Instrument Sans',
       system-ui,
       sans-serif;
     color: var(--text);
@@ -459,12 +456,13 @@
     color: var(--text-3);
     font-size: 0.7rem;
   }
+  /* User chip avatar carries the melt identity tint (not the interactive glacier accent). */
   .avatar {
     width: 26px;
     height: 26px;
     border-radius: 50%;
-    background: var(--accent-weak);
-    color: var(--accent);
+    background: var(--melt-weak);
+    color: var(--melt);
     display: inline-flex;
     align-items: center;
     justify-content: center;
