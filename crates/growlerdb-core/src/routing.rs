@@ -89,9 +89,15 @@ impl ShardRouter {
 
     /// Build the router an index's **registry routing config** describes — the single
     /// interpretation both the Gateway (reads) and the connector (writes) use, so they can't drift:
-    /// an **empty** `bucket_owners` ⇒ legacy `fnv % shard_count`; a non-empty one ⇒ bucketed over
-    /// that map. Errors if a stored map is malformed or its shard count disagrees with `shard_count`
-    /// (the assigned-shard count) — a mismatch would silently misroute, so fail loudly instead.
+    /// an **empty** `bucket_owners` ⇒ legacy `fnv % shard_count` (only an index no node has
+    /// announced yet — registration adopts a map); a non-empty one ⇒ bucketed over that map.
+    ///
+    /// When a map is present it is the **sole** source of truth for the routed shard count —
+    /// `shard_count` (the assigned/registered count) is deliberately ignored: during an online
+    /// grow the new build targets register *before* the cutover, so the assigned count runs ahead
+    /// of the routed count, and sizing (or arity-checking) the router by it would either misroute
+    /// keys to still-empty shards or refuse to build routing at all for the whole rebuild window.
+    /// Errors only if a stored map is malformed.
     pub fn from_registry(
         strategy: RoutingStrategy,
         bucket_owners: &[u32],
@@ -101,12 +107,6 @@ impl ShardRouter {
             return Ok(Self::new(shard_count, strategy));
         }
         let map = BucketMap::from_owners(bucket_owners.to_vec())?;
-        if map.shards() != shard_count.max(1) {
-            return Err(format!(
-                "bucket map covers {} shards but the index has {shard_count} assigned",
-                map.shards()
-            ));
-        }
         Ok(Self::bucketed(strategy, map))
     }
 
@@ -776,7 +776,7 @@ mod tests {
     }
 
     #[test]
-    fn from_registry_picks_legacy_or_bucketed_and_rejects_mismatch() {
+    fn from_registry_picks_legacy_or_bucketed_and_the_map_wins() {
         // Empty bucket map ⇒ legacy router over the assigned shard count.
         let legacy = ShardRouter::from_registry(RoutingStrategy::Hash, &[], 4).unwrap();
         assert_eq!(legacy, ShardRouter::hashed(4));
@@ -791,9 +791,18 @@ mod tests {
             );
         }
 
-        // A map whose shard count disagrees with the assigned count is rejected (would misroute).
-        assert!(ShardRouter::from_registry(RoutingStrategy::Hash, &owners, 5).is_err());
-        // A malformed map (wrong length) is rejected too.
+        // Mid-grow, the assigned count runs AHEAD of the routed count (build targets register
+        // before the cutover): the map wins, keys keep routing over the current 4 shards, and a
+        // gateway starting during the rebuild window can still construct routing.
+        let mid_grow = ShardRouter::from_registry(RoutingStrategy::Hash, &owners, 5).unwrap();
+        assert_eq!(mid_grow.shards(), 4);
+        for id in ["a", "b", "c"] {
+            assert_eq!(
+                mid_grow.route(&key(&[], id)),
+                ShardRouter::hashed(4).route(&key(&[], id))
+            );
+        }
+        // A malformed map (wrong length) is still rejected.
         assert!(ShardRouter::from_registry(RoutingStrategy::Hash, &[0, 1, 2], 3).is_err());
     }
 
