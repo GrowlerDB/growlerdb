@@ -26,6 +26,16 @@ async fn stub_prometheus() -> String {
             }),
         )
         .route(
+            "/api/v1/query",
+            get(|RawQuery(q): RawQuery| async move {
+                Json(serde_json::json!({
+                    "status": "success",
+                    "echo": q.unwrap_or_default(),
+                    "data": { "resultType": "vector", "result": [] },
+                }))
+            }),
+        )
+        .route(
             "/api/v1/alerts",
             get(|| async {
                 Json(serde_json::json!({ "status": "success", "data": { "alerts": [] } }))
@@ -95,6 +105,16 @@ async fn query_range_forwards_path_and_query() {
     // The upstream echoed our query string back → the proxy forwarded it verbatim.
     assert!(body.contains("\"status\":\"success\""));
     assert!(body.contains("query=up") && body.contains("step=15s"));
+
+    // The instant-query route forwards the same way (previously untested).
+    let req = HttpRequest::builder()
+        .uri("/v1/stats/query?query=up")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = text(resp).await;
+    assert!(body.contains("\"status\":\"success\"") && body.contains("query=up"));
 
     // Alerts passthrough.
     let resp = app

@@ -2,7 +2,9 @@
 //! to the Control Plane over gRPC. Stand up a real `ControlPlaneService` (over a temp registry)
 //! on a tonic server, point the REST `control_router` at it via a gRPC client, and drive the
 //! list/get/drop lifecycle over HTTP. `CreateIndex`/`DescribeSource` need a live Iceberg source,
-//! so they're exercised against the Compose stack, not here.
+//! so only their validation/error paths run in default CI (inline in `control_service.rs`);
+//! their happy paths currently have no automated coverage and are exercised manually against
+//! the Compose stack.
 
 use std::sync::Arc;
 
@@ -91,7 +93,19 @@ fn bearer(subject: &str, roles: &[&str]) -> String {
 /// (`with_authn`) — the sound model, since nothing between the REST handler and the control plane
 /// stamps identity. `enforce_rbac` also installs the RBAC policy for admin-gated routes.
 async fn authn_control_app(root: &std::path::Path, enforce_rbac: bool) -> Router {
+    authn_control_app_seeded(root, enforce_rbac, &[]).await
+}
+
+/// [`authn_control_app`] with pre-registered indexes, for RBAC tests over index lifecycle routes.
+async fn authn_control_app_seeded(
+    root: &std::path::Path,
+    enforce_rbac: bool,
+    seed: &[&str],
+) -> Router {
     let registry = Arc::new(Registry::open(root.join("registry.json")).unwrap());
+    for name in seed {
+        registry.create(resolved(name)).unwrap();
+    }
     let authn = Arc::new(JwtAuthenticator::from_hs256_secret(
         TEST_SECRET,
         BUILTIN_SESSION_ISSUER,
@@ -456,4 +470,224 @@ async fn activity_log_records_lifecycle_events() {
     let body = text(resp).await;
     assert!(body.contains("alias.swapped"), "{body}");
     assert!(body.contains("live"), "{body}");
+}
+
+/// The alias REST routes' read + delete halves (`POST /v1/aliases` is covered by the activity
+/// test): list reflects a swap, delete removes it, and a missing alias 404s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aliases_list_and_delete_over_rest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = control_app(&["events_v1"], tmp.path()).await;
+
+    let set = HttpRequest::builder()
+        .method("POST")
+        .uri("/v1/aliases")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"alias":"events","targets":["events_v1"]}"#.to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(set).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+
+    // GET lists the swap.
+    let resp = app.clone().oneshot(get("/v1/aliases")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = text(resp).await;
+    assert!(
+        body.contains("\"events\"") && body.contains("events_v1"),
+        "{body}"
+    );
+
+    // DELETE removes it; the list is empty; deleting again 404s.
+    let resp = app
+        .clone()
+        .oneshot(delete("/v1/aliases/events"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let resp = app.clone().oneshot(get("/v1/aliases")).await.unwrap();
+    let body = text(resp).await;
+    assert!(!body.contains("events_v1"), "{body}");
+    let resp = app
+        .clone()
+        .oneshot(delete("/v1/aliases/events"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// `GET /v1/license` on an unlicensed (community) deployment: 200 with the honest state — the
+/// console's License panel reads exactly this.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn license_over_rest_reports_the_unlicensed_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = control_app(&[], tmp.path()).await;
+    let resp = app.clone().oneshot(get("/v1/license")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = text(resp).await;
+    assert!(body.contains("\"licensed\":false"), "{body}");
+    assert!(body.contains("max_nodes"), "{body}");
+}
+
+/// `POST /v1/login` — the REAL REST handler (the MCP suite exercises login only against a mock):
+/// a good credential mints a session token, a bad one is 401, and both ride the same route the
+/// console uses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn login_over_rest_mints_a_token_and_rejects_bad_credentials() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A CP configured for builtin login: session secret + one seeded credential.
+    let registry = Arc::new(Registry::open(tmp.path().join("registry.json")).unwrap());
+    registry.set_credential("alice", "pw").unwrap();
+    registry
+        .set_user_roles("alice", vec!["admin".to_string()])
+        .unwrap();
+    let svc = ControlPlaneService::new(registry, IcebergConfig::local())
+        .with_session_secret(TEST_SECRET.to_vec());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(
+        Server::builder()
+            .add_service(ControlPlaneServer::new(svc))
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
+    let endpoint = format!("http://{addr}");
+    let mut app = None;
+    for _ in 0..50 {
+        if let Ok(client) =
+            growlerdb_proto::service_token::connect(endpoint.clone(), None, None).await
+        {
+            app = Some(rest::control_router(client));
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let app = app.expect("control plane never came up");
+
+    let login = |body: &str| {
+        HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/login")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    // Good credential → 200 with a token + roles.
+    let resp = app
+        .clone()
+        .oneshot(login(r#"{"username":"alice","password":"pw"}"#))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = text(resp).await;
+    assert!(body.contains("\"token\""), "{body}");
+    assert!(body.contains("admin"), "{body}");
+
+    // Wrong password → 401, no token.
+    let resp = app
+        .clone()
+        .oneshot(login(r#"{"username":"alice","password":"nope"}"#))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// RBAC over the index lifecycle REST routes: a reader can look but not drop an index or swap an
+/// alias (403 before any mutation); an admin can. (The users/tokens routes have their own
+/// admin-gate tests; this closes the same gap for `DropIndex`/`SetAlias`.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn index_drop_and_alias_swap_are_admin_gated_over_rest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = authn_control_app_seeded(tmp.path(), true, &["docs"]).await;
+
+    let with_auth = |req: axum::http::request::Builder, who: &str, roles: &[&str]| {
+        req.header("authorization", bearer(who, roles))
+    };
+    let drop_req = |who: &str, roles: &[&str]| {
+        with_auth(
+            HttpRequest::builder()
+                .method("DELETE")
+                .uri("/v1/indexes/docs"),
+            who,
+            roles,
+        )
+        .body(Body::empty())
+        .unwrap()
+    };
+    let alias_req = |who: &str, roles: &[&str]| {
+        with_auth(
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/v1/aliases")
+                .header("content-type", "application/json"),
+            who,
+            roles,
+        )
+        .body(Body::from(
+            r#"{"alias":"d","targets":["docs"]}"#.to_string(),
+        ))
+        .unwrap()
+    };
+
+    // Reader: reads work, mutations are 403 and change nothing.
+    let list = with_auth(
+        HttpRequest::builder().uri("/v1/indexes"),
+        "rita",
+        &["reader"],
+    )
+    .body(Body::empty())
+    .unwrap();
+    assert_eq!(
+        app.clone().oneshot(list).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(drop_req("rita", &["reader"]))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(alias_req("rita", &["reader"]))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let list = with_auth(
+        HttpRequest::builder().uri("/v1/indexes"),
+        "rita",
+        &["reader"],
+    )
+    .body(Body::empty())
+    .unwrap();
+    let body = text(app.clone().oneshot(list).await.unwrap()).await;
+    assert!(
+        body.contains("docs"),
+        "the reader's denied drop mutated nothing: {body}"
+    );
+
+    // Admin: both mutations succeed.
+    assert_eq!(
+        app.clone()
+            .oneshot(alias_req("ada", &["admin"]))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(drop_req("ada", &["admin"]))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
 }
