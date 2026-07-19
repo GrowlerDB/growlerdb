@@ -15,7 +15,9 @@
 
 use std::net::{IpAddr, Ipv6Addr};
 use std::ops::Bound;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use crate::vector::{BruteForceIndex, SegmentAnn, VectorIndex, ANN_SUFFIX};
 
 use growlerdb_core::{
     sort_has_score, CompositeKey, DocBatch, Document, FieldType, Highlight, HighlightFragment,
@@ -36,7 +38,8 @@ use tantivy::schema::{
     Schema, TextFieldIndexing, TextOptions, Value, FAST, INDEXED, STORED, STRING,
 };
 use tantivy::{
-    DateTime, DocSet, Index, IndexReader, ReloadPolicy, TantivyDocument, Term, TERMINATED,
+    DateTime, DocAddress, DocSet, Index, IndexReader, ReloadPolicy, TantivyDocument, Term,
+    TERMINATED,
 };
 
 /// Name of the stored field holding a doc's `enc(CompositeKey)` bytes — hit identity,
@@ -93,6 +96,14 @@ pub enum IndexError {
     /// A query was rejected by a cost guard (leading wildcard, broad regex, …).
     #[error("query rejected (cost guard): {0}")]
     CostGuard(String),
+
+    /// Reading or writing a per-segment ANN sidecar (or any segment-adjacent file) failed.
+    #[error("segment io: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// An ANN sidecar could not be parsed (bad frame / postcard decode).
+    #[error("ann sidecar: {0}")]
+    Vector(#[from] crate::vector::VectorIndexError),
 }
 
 /// Convenience result alias for the index crate.
@@ -126,6 +137,20 @@ pub struct IndexSchema {
     /// populates [`LOC_ID_FIELD`] and writes no location slots — the schema **keeps**
     /// the field either way (see [`from_resolved`](Self::from_resolved)).
     location_strategy: LocationStrategy,
+    /// The VECTOR fields, in definition order — the ANN-build inputs (TASK-42). Each carries the
+    /// stored-bytes field handle plus the [`VectorSpec`](growlerdb_core::VectorSpec)'s `dims`/`metric`
+    /// the per-segment ANN index is built with. Empty for a non-vector index (the ANN build is then
+    /// skipped entirely).
+    vector_fields: Vec<VectorFieldInfo>,
+}
+
+/// One VECTOR field's ANN-build inputs: its path, the stored-bytes Tantivy field handle, and the
+/// embedding `dims` + distance `metric` from its [`VectorSpec`](growlerdb_core::VectorSpec).
+struct VectorFieldInfo {
+    path: String,
+    field: Field,
+    dims: usize,
+    metric: growlerdb_core::VectorMetric,
 }
 
 impl IndexSchema {
@@ -144,6 +169,8 @@ impl IndexSchema {
         // Sortable fields: `fast` + a sortable type (numeric/date/keyword) — the exact set the
         // sort path's `ensure_sortable` accepts. Collected here where the `fast` flag is still in scope.
         let mut sortable_fields = Vec::new();
+        // VECTOR fields, captured with their `dims`/`metric` for the per-segment ANN build.
+        let mut vector_fields = Vec::new();
         for f in &idx.fields {
             if f.fast
                 && matches!(
@@ -187,6 +214,16 @@ impl IndexSchema {
                 // FAST so the ANN build (TASK-42) can read it columnar. Not sortable.
                 FieldType::Vector => builder.add_bytes_field(&f.path, STORED | FAST),
             };
+            if f.ty == FieldType::Vector {
+                if let Some(spec) = &f.vector {
+                    vector_fields.push(VectorFieldInfo {
+                        path: f.path.clone(),
+                        field: handle,
+                        dims: spec.dims,
+                        metric: spec.metric,
+                    });
+                }
+            }
             fields.push((f.path.clone(), handle, f.ty, f.format));
         }
         // The D30 locator-ID fast field, added after the mapped fields so the internal
@@ -206,7 +243,15 @@ impl IndexSchema {
             sortable_fields,
             tenant_field: idx.tenant_field().map(str::to_string),
             location_strategy: idx.location_strategy,
+            vector_fields,
         }
+    }
+
+    /// Whether this index has any VECTOR field — i.e. whether a per-segment ANN sidecar is built.
+    /// The store's commit/compaction paths skip the ANN build entirely when this is false, so a
+    /// non-vector index pays nothing.
+    pub fn has_vector_fields(&self) -> bool {
+        !self.vector_fields.is_empty()
     }
 
     /// The index's [location strategy](LocationStrategy) (D30) — how the store's commit
@@ -412,12 +457,19 @@ fn vec_f32_to_le_bytes(v: &[f32]) -> Vec<u8> {
 
 /// Decode raw little-endian `f32` bytes back into a vector — inverse of
 /// [`vec_f32_to_le_bytes`]. A trailing partial element (input length not a multiple of 4)
-/// is dropped. Test-only until the ANN read path (TASK-42) consumes stored vectors.
-#[cfg(test)]
+/// is dropped. Read by the per-segment ANN build (TASK-42), which reconstitutes each doc's
+/// stored embedding from these bytes.
 fn le_bytes_to_vec_f32(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
+}
+
+/// The file name of a segment's ANN sidecar: `<segment-uuid>.ann`, beside the lexical segment
+/// files in the index directory. Registered in the segment's backup file set so it travels with
+/// the lexical segment.
+fn ann_sidecar_name(segment_uuid: &str) -> String {
+    format!("{segment_uuid}.{ANN_SUFFIX}")
 }
 
 /// Normalize an `IpAddr` to the IPv6 form Tantivy stores (IPv4 → v4-mapped v6).
@@ -512,6 +564,12 @@ impl TantivySegmentCore {
         }
 
         writer.commit()?;
+        // Build the per-segment ANN sidecar(s) over the just-committed vectors (TASK-42), so a
+        // freshly built segment set carries its KNN index like the store's commit path does.
+        if schema.has_vector_fields() {
+            let reader = self.open(dir)?;
+            reader.build_ann_sidecars(schema, dir)?;
+        }
         Ok(batch.docs.len() as u64)
     }
 
@@ -519,7 +577,11 @@ impl TantivySegmentCore {
     pub fn open(&self, dir: &Path) -> Result<SegmentReader> {
         let index = Index::open_in_dir(dir)?;
         let reader = index.reader()?;
-        Ok(SegmentReader { index, reader })
+        Ok(SegmentReader {
+            index,
+            reader,
+            index_dir: Some(dir.to_path_buf()),
+        })
     }
 
     /// Open the shard's **single** Tantivy index at `dir`, creating it empty if absent.
@@ -570,28 +632,36 @@ pub struct ExplainHit {
 pub struct SegmentReader {
     index: Index,
     reader: IndexReader,
+    /// The local directory holding the index's files, when known — where the per-segment ANN
+    /// sidecars (`<segment-uuid>.ann`) live. Set for a local (mmap) index; `None` for a reader
+    /// whose directory isn't a local path (a cold read-through object directory), where KNN finds
+    /// no local sidecar and returns no vector hits.
+    index_dir: Option<PathBuf>,
 }
 
 impl SegmentReader {
     /// A read handle over `index` that **auto-reloads on commit** — the shard's live
-    /// reader; reads see each commit's new segment (and its native deletes).
-    pub fn live(index: &Index) -> Result<Self> {
+    /// reader; reads see each commit's new segment (and its native deletes). `index_dir` is the
+    /// local directory the index's files (and ANN sidecars) live in.
+    pub fn live(index: &Index, index_dir: impl Into<PathBuf>) -> Result<Self> {
         Ok(SegmentReader {
             index: index.clone(),
             reader: index.reader()?,
+            index_dir: Some(index_dir.into()),
         })
     }
 
     /// A read handle **pinned** to `index`'s current commit — never reloads, so its
     /// searcher is a stable snapshot and Tantivy keeps the referenced segment files
     /// alive even as later commits/compaction run. This is a point-in-time pin.
-    pub fn snapshot(index: &Index) -> Result<Self> {
+    pub fn snapshot(index: &Index, index_dir: impl Into<PathBuf>) -> Result<Self> {
         Ok(SegmentReader {
             index: index.clone(),
             reader: index
                 .reader_builder()
                 .reload_policy(ReloadPolicy::Manual)
                 .try_into()?,
+            index_dir: Some(index_dir.into()),
         })
     }
 
@@ -781,9 +851,126 @@ impl SegmentReader {
     /// Used for the search response's `total` (the true match count, distinct from page size).
     /// Validates fields like [`search`](Self::search), so a bad query errors clearly.
     pub fn count(&self, query: &Query) -> Result<u64> {
+        // A top-level KNN query has no Tantivy representation — count its resolved neighbors.
+        if let Query::Knn { field, vector, k } = query {
+            return Ok(self.knn_search(field, vector, *k)?.len() as u64);
+        }
         let tantivy_query = self.build(query)?;
         let searcher = self.reader.searcher();
         Ok(searcher.search(tantivy_query.as_ref(), &Count)? as u64)
+    }
+
+    /// Build the **per-segment ANN sidecar(s)** (TASK-42, [D19]) for every VECTOR field in
+    /// `schema`, writing `<segment-uuid>.ann` beside each Tantivy segment in `dir`. Idempotent: a
+    /// segment whose sidecar already exists is skipped, so this can run after every commit and only
+    /// the newly-sealed segments are indexed. A sidecar is built over **all** docs in a segment
+    /// (including deleted/superseded ones) — deletes write a new `.del` without rewriting the
+    /// segment or its sidecar, so [`knn_search`](Self::knn_search) filters results by the segment's
+    /// live alive-bitset at query time instead.
+    ///
+    /// [D19]: ../../../okf/system/decisions/d19-ann-library.md
+    pub fn build_ann_sidecars(&self, schema: &IndexSchema, dir: &Path) -> Result<()> {
+        if schema.vector_fields.is_empty() {
+            return Ok(());
+        }
+        let searcher = self.reader.searcher();
+        for (seg_ord, seg) in searcher.segment_readers().iter().enumerate() {
+            let path = dir.join(ann_sidecar_name(&seg.segment_id().uuid_string()));
+            if path.exists() {
+                continue; // content-stable per segment id — already built
+            }
+            let mut sidecar = SegmentAnn::new();
+            for vf in &schema.vector_fields {
+                let mut items: Vec<(u32, Vec<f32>)> = Vec::new();
+                for doc_id in 0..seg.max_doc() {
+                    let doc: TantivyDocument =
+                        searcher.doc(DocAddress::new(seg_ord as u32, doc_id))?;
+                    if let Some(bytes) = doc.get_first(vf.field).and_then(|v| v.as_bytes()) {
+                        let v = le_bytes_to_vec_f32(bytes);
+                        if !v.is_empty() {
+                            items.push((doc_id, v));
+                        }
+                    }
+                }
+                if !items.is_empty() {
+                    sidecar.insert(
+                        vf.path.clone(),
+                        &BruteForceIndex::build(vf.dims, vf.metric, &items),
+                    );
+                }
+            }
+            if !sidecar.is_empty() {
+                std::fs::write(&path, sidecar.to_frame())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Execute a **top-level KNN** query: the `k` documents whose stored embedding for `field` is
+    /// nearest to `vector`, ranked by descending KNN score. Loads each Tantivy segment's ANN
+    /// sidecar, runs `knn`, filters to **live** docs (the segment's alive-bitset), maps each
+    /// segment-local docid back to its stored composite key exactly as a lexical hit resolves
+    /// (`DocAddress` → stored `_key`), then merges across segments and keeps the global top-`k`.
+    /// `field` must be a VECTOR (stored-bytes) field; a missing sidecar (e.g. a cold read-through
+    /// reader, or a segment with no vectors) contributes no hits rather than erroring.
+    pub fn knn_search(&self, field: &str, vector: &[f32], k: usize) -> Result<Vec<Hit>> {
+        let schema = self.index.schema();
+        let tv_field = schema
+            .get_field(field)
+            .map_err(|_| IndexError::UnknownField(field.to_string()))?;
+        // A VECTOR field is the only bytes field a user names; the internal `_key` bytes field is
+        // never a query target. Reject anything that isn't a stored-bytes (vector) field.
+        if !matches!(
+            schema.get_field_entry(tv_field).field_type(),
+            TvFieldType::Bytes(_)
+        ) {
+            return Err(IndexError::QueryType(format!(
+                "field `{field}` is not a VECTOR field — KNN needs a vector field"
+            )));
+        }
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(dir) = self.index_dir.as_ref() else {
+            return Ok(Vec::new()); // no local sidecar directory (e.g. cold read-through)
+        };
+        let key_field = schema.get_field(KEY_FIELD)?;
+        let searcher = self.reader.searcher();
+        let mut hits: Vec<Hit> = Vec::new();
+        for (seg_ord, seg) in searcher.segment_readers().iter().enumerate() {
+            let path = dir.join(ann_sidecar_name(&seg.segment_id().uuid_string()));
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue; // no sidecar for this segment
+            };
+            let Some(index) = SegmentAnn::from_frame(&bytes)?.field(field) else {
+                continue; // this segment's sidecar holds no index for the field
+            };
+            let alive = seg.alive_bitset();
+            // Ask for enough neighbors that, after dropping deleted/superseded docs, at least `k`
+            // live ones remain if the segment has them.
+            let want = k.saturating_add(seg.num_deleted_docs() as usize);
+            for (doc_id, score) in index.knn(vector, want) {
+                if alive.is_none_or(|b| b.is_alive(doc_id)) {
+                    let address = DocAddress::new(seg_ord as u32, doc_id);
+                    let doc: TantivyDocument = searcher.doc(address)?;
+                    hits.push(Hit {
+                        key: stored_key(&doc, key_field)?,
+                        score,
+                        fields: self.cached_fields(&doc),
+                        highlight: Default::default(),
+                    });
+                }
+            }
+        }
+        // Global top-`k`: descending score, composite key as a stable tiebreaker.
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.key.encode().cmp(&b.key.encode()))
+        });
+        hits.truncate(k);
+        Ok(hits)
     }
 
     /// Execute a [`Query`] AST as BM25, returning ranked **coordinates + scores**.
@@ -813,6 +1000,20 @@ impl SegmentReader {
         sort: &[Sort],
         after: Option<&SearchAfter>,
     ) -> Result<Vec<(Hit, Vec<SortValue>)>> {
+        // A top-level KNN query is resolved over the per-segment ANN sidecars, not compiled to a
+        // Tantivy query. It ranks by KNN score (no field sort, no keyset cursor — fusion with a
+        // lexical query is a later task), so hand back score-ranked hits with empty sort values;
+        // the store's paging then slices the window like any score-ranked result.
+        if let Query::Knn { field, vector, k } = query {
+            if !sort.is_empty() || after.is_some() {
+                return Err(IndexError::QueryType(
+                    "KNN search cannot be combined with a field sort or keyset cursor".into(),
+                ));
+            }
+            let mut khits = self.knn_search(field, vector, *k)?;
+            khits.truncate(limit);
+            return Ok(khits.into_iter().map(|h| (h, Vec::new())).collect());
+        }
         // With a keyset cursor, AND the user query with a predicate that admits only
         // docs strictly after the cursor in the total order. The cursor needs a primary
         // sort key to range over.
@@ -1719,6 +1920,15 @@ impl SegmentReader {
                 }
                 Ok(Box::new(BooleanQuery::new(clauses)))
             }
+            // KNN is resolved over the per-segment ANN sidecars, not compiled to a Tantivy query —
+            // it is a top-level retrieval clause ([`knn_search`](Self::knn_search) / the
+            // `search_sorted` fast path handle it). Reaching here means it was nested inside a
+            // lexical query (a `Bool`/`Boost`), which is fusion — a later task.
+            Query::Knn { .. } => Err(IndexError::QueryType(
+                "KNN cannot be combined lexically — run it as a top-level KNN search (score \
+                 fusion with lexical results is not yet supported)"
+                    .into(),
+            )),
         }
     }
 
@@ -2057,8 +2267,8 @@ fn default_text_field(schema: &Schema) -> Option<Field> {
 mod tests {
     use super::*;
     use growlerdb_core::{
-        CompositeKey, Document, IndexDefinition, MatchOp, Query, SourceField, SourceSchema,
-        SourceType, Value,
+        CompositeKey, DocBatch, Document, IndexDefinition, MatchOp, Query, SourceField,
+        SourceSchema, SourceType, Value,
     };
     use std::collections::BTreeMap;
 
@@ -2099,6 +2309,110 @@ mapping:
         fields.insert("id".to_string(), id.into());
         fields.insert("body".to_string(), body.into());
         Document::new(key, fields)
+    }
+
+    /// A `docs` index with an added VECTOR field (`body_vec`, dims 3, cosine).
+    fn vector_index() -> ResolvedIndex {
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("body", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        IndexDefinition::from_yaml(
+            r#"
+name: docs
+source: { iceberg: { catalog: growlerdb, table: growlerdb.docs } }
+mapping:
+  selection: EXPLICIT
+  fields:
+    - { path: id, type: KEYWORD }
+    - { path: body, type: TEXT }
+    - { path: body_vec, type: VECTOR, vector: { dims: 3, metric: COSINE, source_field: body } }
+"#,
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap()
+    }
+
+    fn vec_doc(id: i64, body: &str, v: Vec<f32>) -> Document {
+        let key = CompositeKey::new(vec![], vec![("id".into(), id.into())]);
+        let mut fields = BTreeMap::new();
+        fields.insert("id".to_string(), id.into());
+        fields.insert("body".to_string(), body.into());
+        fields.insert("body_vec".to_string(), Value::Vector(v));
+        Document::new(key, fields)
+    }
+
+    fn hit_id(hit: &Hit) -> i64 {
+        match hit.key.get("id") {
+            Some(Value::Int(i)) => *i,
+            other => panic!("expected an int id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn knn_search_returns_nearest_docs_by_vector() {
+        let schema = IndexSchema::from_resolved(&vector_index());
+        let batch = DocBatch::new(vec![
+            vec_doc(1, "x", vec![1.0, 0.0, 0.0]),
+            vec_doc(2, "y", vec![0.0, 1.0, 0.0]),
+            vec_doc(3, "xy", vec![0.9, 0.1, 0.0]),
+            vec_doc(4, "z", vec![0.0, 0.0, 1.0]),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        TantivySegmentCore
+            .build(&schema, &batch, dir.path())
+            .unwrap();
+
+        // The build wrote a per-segment ANN sidecar (the multi-threaded writer may split the batch
+        // across several segments, one sidecar each).
+        let anns: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".ann"))
+            .collect();
+        assert!(!anns.is_empty(), "at least one per-segment ANN sidecar");
+
+        let reader = TantivySegmentCore.open(dir.path()).unwrap();
+
+        // Nearest to +x → doc 1 (exact) then doc 3 (mostly +x), best-first.
+        let hits = reader.knn_search("body_vec", &[1.0, 0.0, 0.0], 2).unwrap();
+        assert_eq!(hits.iter().map(hit_id).collect::<Vec<_>>(), vec![1, 3]);
+        assert!(hits[0].score >= hits[1].score);
+
+        // The same through the `Query::Knn` execution path resolves the right key.
+        let via_query = reader
+            .search(
+                &Query::Knn {
+                    field: "body_vec".into(),
+                    vector: vec![0.0, 0.0, 1.0],
+                    k: 1,
+                },
+                1,
+            )
+            .unwrap();
+        assert_eq!(via_query.len(), 1);
+        assert_eq!(hit_id(&via_query[0]), 4);
+
+        // `count` of a KNN query is the number of resolved neighbors.
+        assert_eq!(
+            reader
+                .count(&Query::Knn {
+                    field: "body_vec".into(),
+                    vector: vec![1.0, 0.0, 0.0],
+                    k: 3,
+                })
+                .unwrap(),
+            3
+        );
+
+        // A non-vector field is a clear type error, not an empty result.
+        assert!(reader.knn_search("body", &[1.0, 0.0, 0.0], 1).is_err());
     }
 
     fn batch() -> DocBatch {
