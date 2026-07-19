@@ -36,6 +36,11 @@ x-growlerdb-env: &growlerdb-env
   # control plane is CLOSED by default — no unauthenticated internal access. A DEMO value baked in
   # like GROWLERDB_AUTH_SECRET; rotate it for any real deployment.
   GROWLERDB_SERVICE_TOKEN: demo-stack-service-token-change-me
+  # Where the local embedder (Candle) loads its model from: `${GROWLERDB_MODEL_DIR}/<model-id>/`.
+  # The node + node-catalog bind-mount the host model dir at /models (the `model-fetch` one-shot
+  # provisions bge-small-en-v1.5 there once per machine), so ingest embeds the VECTOR field locally —
+  # no API key. Gateway/control-plane don't embed and ignore it.
+  GROWLERDB_MODEL_DIR: /models
 
 services:
   minio:
@@ -66,6 +71,36 @@ services:
       mc alias set local http://minio:9000 minioadmin minioadmin &&
       mc mb -p local/growlerdb-warehouse &&
       echo 'buckets ready'
+      "
+
+  # One-shot: provision the local embedding model (bge-small-en-v1.5, ~130 MB) into the HOST bind
+  # mount ONCE per machine, so `growlerdb index` can embed the catalog `body_vec` VECTOR field with
+  # the in-process Candle embedder — fully local, no API key. Mirrors `createbuckets`: a tiny image
+  # (alpine + curl) running an inline `/bin/sh -c`. Idempotent — if the 3 model files are already
+  # present it echoes and exits 0 (so re-running `just stack` is instant and the copy is reused,
+  # shared with host `cargo test`/eval via the same GROWLERDB_MODEL_DIR). Runs as root (default in
+  # alpine) so it can WRITE the bind mount; node/node-catalog gate on its success before they build.
+  # The model is NOT baked into deploy/Dockerfile (the release image) — provisioning is host-side.
+  # `$$` escapes `$` from compose interpolation, so the vars expand in the shell, not in compose.
+  model-fetch:
+    profiles: ["stack"]
+    image: alpine:3.20
+    volumes:
+      - ${MODEL_HOST_DIR:-./model-cache}:/models
+    entrypoint: >
+      /bin/sh -c "
+      set -e;
+      dir=/models/bge-small-en-v1.5;
+      base=https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main;
+      if [ -f \"$$dir/config.json\" ] && [ -f \"$$dir/tokenizer.json\" ] && [ -f \"$$dir/model.safetensors\" ]; then
+        echo 'model present, skipping'; exit 0;
+      fi;
+      apk add --no-cache curl;
+      mkdir -p \"$$dir\";
+      curl -fSL --retry 3 -o \"$$dir/config.json\"       \"$$base/config.json\";
+      curl -fSL --retry 3 -o \"$$dir/tokenizer.json\"    \"$$base/tokenizer.json\";
+      curl -fSL --retry 3 -o \"$$dir/model.safetensors\" \"$$base/model.safetensors\";
+      echo 'model fetched'
       "
 
   # Iceberg REST catalog. Image/env are version-sensitive; verify on first bring-up.
@@ -282,11 +317,17 @@ services:
         condition: service_started
       controlplane:
         condition: service_healthy
+      # Wait for the local embedding model so the `growlerdb index` build step can embed any VECTOR
+      # field in-process (no API key). The one-shot completes once, then the copy is reused.
+      model-fetch:
+        condition: service_completed_successfully
     ports:
       - "50051:50051"
       - "9102:9102"
     volumes:
       - node-data:/data
+      # Read the local embedding model (bge-small-en-v1.5) at /models; GROWLERDB_MODEL_DIR points here.
+      - ${MODEL_HOST_DIR:-./model-cache}:/models
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9102/readyz"]
       interval: 5s
@@ -317,12 +358,18 @@ services:
         condition: service_started
       controlplane:
         condition: service_healthy
+      # The `catalog` index has a `body_vec` VECTOR field, so its build embeds `body` locally — wait
+      # for the model to be provisioned before building.
+      model-fetch:
+        condition: service_completed_successfully
     ports:
       - "50052:50052"
       - "9104:9104"
     volumes:
       - node-catalog-data:/data
       - ./catalog.yaml:/catalog.yaml:ro
+      # The local embedding model (bge-small-en-v1.5) at /models; GROWLERDB_MODEL_DIR points here.
+      - ${MODEL_HOST_DIR:-./model-cache}:/models
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9104/readyz"]
       interval: 5s

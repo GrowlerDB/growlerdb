@@ -40,3 +40,14 @@ The [getting-started](/product/interfaces/website.md) **query playground** exerc
 index through the gateway — every Lucene/KQL operator (term, phrase, keyword, set, numeric/float/date
 range, CIDR, wildcard, prefix, fuzzy, boost, bool, `NOT`, match-all, regex) against known rows. With
 two indexes served and no default configured, every search / `keys:get` request must name its index.
+
+**Local-embeddings vector demo:** the `catalog` index carries a `body_vec`
+[VECTOR field](/product/functional/search/vector.md) over its `body`, embedded at ingest with the local
+**bge-small-en-v1.5** model — so the demo exercises **semantic + hybrid search**, the console **Ask**
+screen, and the [MCP server](/product/interfaces/mcp-server.md) against real data, **keyless** (no API
+key, no egress). The model is provisioned **once per machine** by a `model-fetch` one-shot into a
+host-bind-mounted `${GROWLERDB_MODEL_DIR:-~/.cache/growlerdb/models}` (idempotent — skipped when already
+present, and shared with local `cargo`/eval runs), mounted on `node` + `node-catalog` (which embed at
+ingest and query time; the gateway does not — [D43](/system/decisions/d43-node-local-query-embedding.md)).
+The published image stays lean — the model is **not** baked in. Per [D42](/system/decisions/d42-retrieval-first.md)
+the demo is retrieval-only: it returns governed coordinates + citations and never calls an LLM.

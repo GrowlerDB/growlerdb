@@ -1,6 +1,13 @@
 # GrowlerDB dev tasks. The toolchain is provided by mise (see mise.toml).
 # Run `mise install` once, then these recipes. `just check` mirrors CI.
 
+# Host directory holding the local embedding model (bge-small-en-v1.5), bind-mounted into the node
+# containers at /models. Compose can't expand `~`, so resolve it HERE and export it to every recipe's
+# environment as MODEL_HOST_DIR — the `stack` recipe's `model-fetch` one-shot writes the model here
+# once per machine and node/node-catalog read it (GROWLERDB_MODEL_DIR=/models). Override the location
+# with GROWLERDB_MODEL_DIR; it's reused across `just stack`/`just pipeline` and host `cargo test`.
+export MODEL_HOST_DIR := env_var_or_default('GROWLERDB_MODEL_DIR', env_var('HOME') / '.cache/growlerdb/models')
+
 # one-time: add toolchain components not in the minimal profile
 setup:
     rustup component add rustfmt clippy
@@ -151,6 +158,8 @@ connector-e2e:
 # Endpoints: Gateway REST http://localhost:8081/v1 · gRPC :50061 · Grafana http://localhost:3000
 # NOTE: host clients/tests still need `127.0.0.1 minio` in /etc/hosts (see README).
 stack:
+    @echo "Model dir: {{ MODEL_HOST_DIR }} (bge-small-en-v1.5 fetched once, reused)"
+    mkdir -p "$MODEL_HOST_DIR"
     docker compose -f deploy/compose/docker-compose.yml up -d minio createbuckets polaris
     deploy/compose/setup-polaris.sh
     docker compose -f deploy/compose/docker-compose.yml --profile seed run --rm --build seed
