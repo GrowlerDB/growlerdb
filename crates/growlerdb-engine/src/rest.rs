@@ -2720,10 +2720,24 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    // The env lock is deliberately held across the router await: the POINT is serializing the
+    // whole env-mutating test against any other env test in the crate (see `crate::env_guard`).
+    #[allow(clippy::await_holding_lock)]
     async fn config_dto_has_no_secret_field() {
         // The unauthenticated /v1/config the browser fetches must NEVER carry an outbound
         // provider API key (external embedding/rerank secrets are server-side only — see okf/system/decisions/d43-node-local-query-embedding.md).
         // Even with keys present in the server's env, the response exposes no key/secret field.
+        // Env mutation is process-global: hold the crate env lock, and clean up via RAII so an
+        // assert failure can't leak the vars into other tests.
+        let _env = crate::env_guard();
+        struct Unset;
+        impl Drop for Unset {
+            fn drop(&mut self) {
+                std::env::remove_var("GROWLERDB_EMBEDDING_API_KEY");
+                std::env::remove_var("GROWLERDB_RERANK_API_KEY");
+            }
+        }
+        let _unset = Unset;
         std::env::set_var("GROWLERDB_EMBEDDING_API_KEY", "sk-must-not-leak-embed");
         std::env::set_var("GROWLERDB_RERANK_API_KEY", "sk-must-not-leak-rerank");
 
@@ -2753,8 +2767,7 @@ mod tests {
             );
         }
 
-        std::env::remove_var("GROWLERDB_EMBEDDING_API_KEY");
-        std::env::remove_var("GROWLERDB_RERANK_API_KEY");
+        // Env cleanup happens via the `Unset` RAII guard above (survives assert failures).
     }
 
     #[tokio::test(flavor = "current_thread")]

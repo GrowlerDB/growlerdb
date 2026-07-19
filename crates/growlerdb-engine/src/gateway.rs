@@ -1222,12 +1222,30 @@ impl Gateway {
             )));
         }
 
-        // Lexical arm: the query text as a BM25 query.
+        // Lexical arm: the query text as a BM25 query, with `filter` ANDed in. The filter must
+        // constrain the FUSED result — before this, it bound only the semantic arm, so a doc the
+        // filter excludes could still surface via its lexical rank (surprising whenever the
+        // filter encodes a data-scoping restriction). Composed textually in the request's own
+        // grammar (Lucene `AND` / KQL `and`); an empty query text means the filter alone drives
+        // the lexical arm.
+        let lexical_query = {
+            let (q, f) = (body.query_text.trim(), body.filter.trim());
+            let conj = if body.syntax == growlerdb_proto::v1::QuerySyntax::Kql as i32 {
+                "and"
+            } else {
+                "AND"
+            };
+            match (q.is_empty(), f.is_empty()) {
+                (_, true) => body.query_text.clone(),
+                (true, false) => f.to_string(),
+                (false, false) => format!("({q}) {conj} ({f})"),
+            }
+        };
         let lexical_req = Request::from_parts(
             meta.clone(),
             Extensions::default(),
             SearchRequest {
-                query: body.query_text.clone(),
+                query: lexical_query,
                 limit: k_each as u32,
                 index: body.index.clone(),
                 syntax: body.syntax,
@@ -4643,17 +4661,23 @@ mod tests {
     /// A Node with canned **lexical** (`search`) and **semantic** (`semantic_search`) hit sets —
     /// enough to prove the Gateway's cross-shard semantic merge and hybrid RRF fusion without a
     /// real shard/embedder.
+    #[derive(Default)]
     struct VectorNode {
         lexical: Vec<(&'static str, f64)>,
         semantic: Vec<(&'static str, f64)>,
+        /// When set, records the lexical arm's query string (for hybrid-filter assertions).
+        seen_lexical: Option<Arc<std::sync::Mutex<String>>>,
     }
 
     #[tonic::async_trait]
     impl Node for VectorNode {
         async fn search(
             &self,
-            _: Request<SearchRequest>,
+            req: Request<SearchRequest>,
         ) -> Result<Response<SearchResponse>, Status> {
+            if let Some(seen) = &self.seen_lexical {
+                *seen.lock().unwrap() = req.get_ref().query.clone();
+            }
             let hits: Vec<SearchHit> = self.lexical.iter().map(|(id, s)| mk_hit(id, *s)).collect();
             let total = hits.len() as u64;
             Ok(Response::new(SearchResponse {
@@ -4700,10 +4724,12 @@ mod tests {
         let a = Arc::new(VectorNode {
             lexical: vec![],
             semantic: vec![("a1", 0.9), ("a2", 0.2)],
+            ..Default::default()
         });
         let b = Arc::new(VectorNode {
             lexical: vec![],
             semantic: vec![("b1", 0.8), ("b2", 0.7)],
+            ..Default::default()
         });
         let gw = Gateway::sharded(vec![a, b]);
         let resp = gw
@@ -4729,6 +4755,7 @@ mod tests {
         let node = Arc::new(VectorNode {
             lexical: vec![("both", 5.0), ("lex", 4.0)],
             semantic: vec![("both", 0.9), ("vec", 0.8)],
+            ..Default::default()
         });
         let gw = Gateway::new(node);
         let resp = gw
@@ -4752,5 +4779,53 @@ mod tests {
                 "{want} missing from {ids:?}"
             );
         }
+    }
+
+    /// Hybrid `filter` constrains BOTH arms: the semantic arm carries it as the KNN filter, and
+    /// the lexical arm gets it ANDed into its query (in the request's grammar) — so the fused
+    /// result can never surface a doc the filter excludes via its lexical rank alone.
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_filter_binds_the_lexical_arm_too() {
+        let seen = Arc::new(std::sync::Mutex::new(String::new()));
+        let node = Arc::new(VectorNode {
+            lexical: vec![("lex", 4.0)],
+            semantic: vec![("vec", 0.8)],
+            seen_lexical: Some(seen.clone()),
+        });
+        let gw = Gateway::new(node.clone());
+        gw.hybrid_search(Request::new(HybridSearchRequest {
+            vector_field: "body_vec".into(),
+            query_text: "hello".into(),
+            filter: "tenant:acme".into(),
+            k: 5,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        assert_eq!(*seen.lock().unwrap(), "(hello) AND (tenant:acme)");
+
+        // KQL syntax composes with its own conjunction; a filter-only hybrid (empty query text)
+        // sends the filter alone.
+        gw.hybrid_search(Request::new(HybridSearchRequest {
+            vector_field: "body_vec".into(),
+            query_text: "hello".into(),
+            filter: "tenant:acme".into(),
+            syntax: growlerdb_proto::v1::QuerySyntax::Kql as i32,
+            k: 5,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        assert_eq!(*seen.lock().unwrap(), "(hello) and (tenant:acme)");
+        gw.hybrid_search(Request::new(HybridSearchRequest {
+            vector_field: "body_vec".into(),
+            query_text: "".into(),
+            filter: "tenant:acme".into(),
+            k: 5,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        assert_eq!(*seen.lock().unwrap(), "tenant:acme");
     }
 }

@@ -120,9 +120,19 @@ pub(crate) fn clear_key_cache() {
 /// key-derived string might reach a log or a human.
 pub fn redact(key: &str) -> String {
     // Only expose a tail once there's enough entropy in front of it that four visible chars
-    // can't reconstruct the secret; short keys are fully masked.
-    if key.len() > 8 {
-        format!("***{}", &key[key.len() - 4..])
+    // can't reconstruct the secret; short keys are fully masked. Take the tail by CHARS, not a
+    // byte slice — a multibyte key whose last four bytes split a UTF-8 boundary would panic,
+    // and this runs on error/log paths where a panic takes the request down with it.
+    if key.chars().count() > 8 {
+        let tail: String = key
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!("***{tail}")
     } else {
         "***".to_string()
     }
@@ -178,6 +188,11 @@ mod tests {
         assert_eq!(r, "***0001");
         // Short key → fully masked.
         assert_eq!(redact("sk-abc"), "***");
+        // A multibyte key whose last four BYTES split a UTF-8 boundary must not panic (this
+        // runs on log/error paths) and must still mask the body.
+        let r = redact("clé-secrète-très-longue-🔑🔑");
+        assert_eq!(r, "***e-🔑🔑");
+        assert!(!r.contains("secrète"), "redact leaked key body: {r}");
     }
 
     #[test]

@@ -54,6 +54,20 @@ pub use opensearch::opensearch_router;
 pub use rbac::{scope_for_method, RbacPolicy, Scope};
 pub use remap::{remap_shard, remap_tick, RemapOutcome, RemapState};
 pub use search_service::SearchService;
+/// Serialize every test that mutates a process-global env var (`GROWLERDB_*_API_KEY`, ...).
+/// `set_var`/`remove_var` are process-wide, so env-touching tests across modules race under
+/// `cargo test`'s parallelism unless they share ONE crate-level lock (the same lesson the embed
+/// crate learned; per-module locks re-introduce the cross-file race). Every such test takes this
+/// guard — currently only `rest::tests::config_dto_has_no_secret_field`, but any future env test
+/// must too.
+#[cfg(test)]
+pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
 pub use service_auth::{
     intercept as intercept_service_token, layer as service_token_layer, ServiceTokenAuth,
 };
