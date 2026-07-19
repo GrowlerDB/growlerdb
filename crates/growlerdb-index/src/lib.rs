@@ -11,6 +11,7 @@ pub mod range_cache;
 pub mod segment;
 mod sidecar;
 pub mod store;
+pub mod vector;
 
 pub use location::{LocationStore, ENTRY_BYTES, LOCATION_FILE};
 pub use object_directory::ObjectDirectory;
@@ -23,6 +24,7 @@ pub use store::{
     LocalIndexStore, PreWarmPolicy, RemapStats, SealedSegment, Shard, ShardId, StoreError,
     COLD_MARKER,
 };
+pub use vector::{BruteForceIndex, SegmentAnn, VectorIndex, VectorIndexError, ANN_SUFFIX};
 
 /// Crate version, from Cargo metadata.
 pub fn version() -> &'static str {

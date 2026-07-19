@@ -19,6 +19,12 @@ All notable changes to GrowlerDB are documented here. The format is based on
   model is provisioned out of band into `${GROWLERDB_MODEL_DIR:-~/.cache/growlerdb/models}/<model-id>/`;
   when absent, embedding falls back to a deterministic dev embedder so ingest and offline CI keep
   working. Behind a default-on `bge` build feature (a slim build can drop the ML dependency). (TASK-41)
+- **Per-segment ANN index + semantic (KNN) retrieval.** Each segment's vectors are indexed into a
+  GrowlerDB-owned `<segment>.ann` sidecar (built after commit + compaction, backed up / restored with
+  the lexical segment). A top-level KNN query embeds the query text (same embedder as ingest) and
+  returns the nearest documents as coordinates that hydrate. KNN is not yet tenant-filtered, so it is
+  refused **fail-closed** on tenant-scoped indexes and exposed only on the native engine API (RRF
+  fusion + filtered KNN follow). (ADR D19 · TASK-42)
 
 ## [0.3.0] - 2026-07-18
 

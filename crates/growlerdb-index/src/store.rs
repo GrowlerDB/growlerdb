@@ -410,7 +410,11 @@ impl LocalIndexStore {
             dir = dir.with_bundle(std::sync::Arc::new(state));
         }
         let tantivy = tantivy::Index::open(dir).map_err(|e| StoreError::Segment(e.into()))?;
-        let core = SegmentReader::live(&tantivy).map_err(StoreError::Segment)?;
+        // A cold shard reads through an object directory (no local index files); point the reader
+        // at `aux_dir` so the ANN KNN path has a directory to probe (it finds no local sidecar and
+        // returns no vector hits — cold-tier KNN is served from the parked bundle, a later step).
+        let core =
+            SegmentReader::live(&tantivy, aux_dir.to_path_buf()).map_err(StoreError::Segment)?;
         // Reuse the retiring hot shard's `aux.redb` handle when parking a window in place (redb
         // allows only one open per file); otherwise open it fresh (cold-at-startup / offline path).
         let db = match reuse_db {
@@ -640,7 +644,7 @@ impl LocalIndexStore {
         let tantivy = TantivySegmentCore
             .open_or_create_index(&schema, &index_dir)
             .map_err(StoreError::Segment)?;
-        let core = SegmentReader::live(&tantivy).map_err(StoreError::Segment)?;
+        let core = SegmentReader::live(&tantivy, index_dir.clone()).map_err(StoreError::Segment)?;
         let db = match reuse_db {
             Some(db) => db, // already open + migrated (shared across a tier swap)
             None => {
@@ -1696,6 +1700,12 @@ impl Shard {
         // harmless no-op fsync.
         flush_chunk!();
 
+        // Build the per-segment ANN sidecars over the vectors just committed (TASK-42). Idempotent
+        // + skipped for a non-vector index; runs after the final flush so the reloaded searcher sees
+        // every new segment. The sidecars are content-stable and registered in `sealed_segments`, so
+        // backup/restore carries them with the lexical segments.
+        self.build_ann_sidecars()?;
+
         // 2) redb: checkpoint + snapshot + batch ids + new file-table interns.
         let t_redb = std::time::Instant::now();
         let snapshot = self.current_snapshot()? + 1;
@@ -2153,7 +2163,8 @@ impl Shard {
     pub fn open_pit(&self) -> Result<Pit> {
         // A pinned Tantivy snapshot (its segment ref-counting keeps the files alive
         // through later commits/compaction) + a redb view (as-of-S locator/snapshot).
-        let core = SegmentReader::snapshot(&self.index).map_err(StoreError::Segment)?;
+        let core = SegmentReader::snapshot(&self.index, self.index_dir.clone())
+            .map_err(StoreError::Segment)?;
         let view = self.read_view()?;
         let snapshot = view.snapshot()?;
         let entry = PitEntry {
@@ -2289,6 +2300,11 @@ impl Shard {
                 .map_err(|e| StoreError::Segment(e.into()))?;
             drop(writer); // release the lock so ingest can commit before the next bounded pass
             self.core.reload().map_err(StoreError::Segment)?;
+            // A merge produced a new segment id → build its ANN sidecar (TASK-42). The merged-away
+            // segments' sidecars are now orphaned; `garbage_collect_files` only reclaims Tantivy's
+            // own managed files, so a stale `.ann` may linger on disk (harmless — `sealed_segments`
+            // lists only current segments' files, so backup never carries an orphan).
+            self.build_ann_sidecars()?;
         }
         Ok(())
     }
@@ -2417,6 +2433,23 @@ impl Shard {
     /// the restore manifest separately — it is not itself a sealed segment.
     ///
     /// [`index_dir`]: Self::index_dir
+    ///
+    /// Build the per-segment **ANN sidecars** (TASK-42, [D19]) for the newly-sealed segments — one
+    /// `<segment-uuid>.ann` beside each Tantivy segment, over its stored vectors. Idempotent (a
+    /// segment with an existing sidecar is skipped) and a no-op for a non-vector index, so it can
+    /// run after every commit and after each compaction pass. Must be called with the live reader
+    /// already reloaded onto the target commit, so the searcher sees the segments to index.
+    ///
+    /// [D19]: ../../../okf/system/decisions/d19-ann-library.md
+    fn build_ann_sidecars(&self) -> Result<()> {
+        if !self.schema.has_vector_fields() {
+            return Ok(());
+        }
+        self.core
+            .build_ann_sidecars(&self.schema, &self.index_dir)
+            .map_err(StoreError::Segment)
+    }
+
     pub fn sealed_segments(&self) -> Result<Vec<SealedSegment>> {
         let segments = self.index.searchable_segments().map_err(IndexError::from)?;
         Ok(segments
@@ -2432,6 +2465,14 @@ impl Shard {
                     .into_iter()
                     .filter(|f| self.index_dir.join(f).exists())
                     .collect();
+                // The per-segment ANN sidecar (`<segment-uuid>.ann`, TASK-42) is a GrowlerDB-owned
+                // artifact not listed by `list_files`, but it belongs to this segment and must ship
+                // with it — register it so backup/restore carries it (content-stable per segment id,
+                // so it hard-links/dedupes like the lexical files).
+                let ann = PathBuf::from(format!("{}.ann", meta.id().uuid_string()));
+                if self.index_dir.join(&ann).exists() {
+                    files.push(ann);
+                }
                 files.sort();
                 SealedSegment {
                     id: meta.id().uuid_string(),
@@ -7558,5 +7599,147 @@ mod window_store_tests {
             (1, 1),
             "cold shard searches read-through from object storage with local aux"
         );
+    }
+}
+
+#[cfg(test)]
+mod ann_tests {
+    use super::*;
+    use growlerdb_core::{
+        CommitBatch, CompositeKey, Document, IndexDefinition, LocatedDoc, Query, SourceCheckpoint,
+        SourceField, SourceSchema, SourceType, Value,
+    };
+    use std::collections::BTreeMap;
+
+    /// A `docs` shard with a VECTOR field (`body_vec`, dims 3, cosine).
+    fn vector_shard(tmp: &std::path::Path) -> Shard {
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("body", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        let idx = IndexDefinition::from_yaml(
+            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD }, { path: body, type: TEXT }, { path: body_vec, type: VECTOR, vector: { dims: 3, metric: COSINE, source_field: body } } ] }\n",
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+        LocalIndexStore::open(tmp)
+            .unwrap()
+            .create_shard(&ShardId::single("docs"), &idx)
+            .unwrap()
+    }
+
+    fn put_vec(shard: &Shard, id: &str, v: Vec<f32>, snap: i64) {
+        let key = CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]);
+        let mut f = BTreeMap::new();
+        f.insert("id".to_string(), Value::from(id));
+        f.insert("body".to_string(), Value::from(id));
+        f.insert("body_vec".to_string(), Value::Vector(v));
+        let doc = LocatedDoc {
+            doc: Document::new(key, f),
+            iceberg_file: "f".into(),
+            row_position: 0,
+        };
+        IndexWriter::write(
+            shard,
+            &CommitBatch::from_upserts(
+                vec![doc],
+                SourceCheckpoint::iceberg(snap),
+                format!("b{snap}"),
+            ),
+        )
+        .unwrap();
+    }
+
+    fn knn_ids(hits: &[Hit]) -> Vec<String> {
+        hits.iter()
+            .map(|h| h.key.get("id").unwrap().to_index_string())
+            .collect()
+    }
+
+    #[test]
+    fn knn_over_shard_returns_nearest_and_sidecar_survives_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard = vector_shard(tmp.path());
+        put_vec(&shard, "x", vec![1.0, 0.0, 0.0], 1);
+        put_vec(&shard, "y", vec![0.0, 1.0, 0.0], 2);
+        put_vec(&shard, "xy", vec![0.9, 0.1, 0.0], 3);
+        put_vec(&shard, "z", vec![0.0, 0.0, 1.0], 4);
+        // Fuse the per-commit segments so a single merged segment (a fresh id) must rebuild its
+        // ANN sidecar — exercising the compaction path.
+        shard.compact(&CompactionPolicy::default()).unwrap();
+
+        // A top-level KNN query returns the nearest documents by vector, best-first.
+        let hits = shard
+            .search_all(
+                &Query::Knn {
+                    field: "body_vec".into(),
+                    vector: vec![1.0, 0.0, 0.0],
+                    k: 2,
+                },
+                2,
+            )
+            .unwrap();
+        assert_eq!(knn_ids(&hits), vec!["x", "xy"]);
+
+        // Every current segment lists its `.ann` sidecar among its backup files.
+        let segs = shard.sealed_segments().unwrap();
+        let ann_files: Vec<_> = segs
+            .iter()
+            .flat_map(|s| s.files.iter())
+            .filter(|f| f.extension().map(|e| e == "ann").unwrap_or(false))
+            .collect();
+        assert_eq!(ann_files.len(), 1, "the merged segment has one ANN sidecar");
+        for f in &ann_files {
+            assert!(shard.index_dir().join(f).exists());
+        }
+
+        // Backup carries the sidecar (registered in the sealed file set).
+        let staging = tempfile::tempdir().unwrap();
+        let snap = shard.backup_snapshot(staging.path()).unwrap();
+        assert!(
+            snap.files
+                .iter()
+                .any(|f| f.extension().map(|e| e == "ann").unwrap_or(false)),
+            "backup file list includes the ANN sidecar"
+        );
+
+        // The backed-up bytes reconstruct a working KNN index: open the staged index dir and
+        // re-run the query straight off the restored sidecar.
+        let restored = TantivySegmentCore
+            .open(&staging.path().join("index"))
+            .unwrap();
+        let restored_hits = restored
+            .knn_search("body_vec", &[0.0, 0.0, 1.0], 1)
+            .unwrap();
+        assert_eq!(knn_ids(&restored_hits), vec!["z"]);
+    }
+
+    #[test]
+    fn knn_respects_supersede_via_alive_bitset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard = vector_shard(tmp.path());
+        put_vec(&shard, "a", vec![1.0, 0.0, 0.0], 1);
+        // Supersede `a` with a vector pointing the other way; the old version is deleted in its
+        // segment, so KNN toward +x must NOT surface the stale embedding.
+        put_vec(&shard, "a", vec![0.0, 0.0, 1.0], 2);
+        let hits = shard
+            .search_all(
+                &Query::Knn {
+                    field: "body_vec".into(),
+                    vector: vec![1.0, 0.0, 0.0],
+                    k: 5,
+                },
+                5,
+            )
+            .unwrap();
+        // Only the live `a` remains, and its current (+z) embedding scores low against +x — but it
+        // is the sole live doc, so it's the only hit (the superseded +x version is filtered out).
+        assert_eq!(knn_ids(&hits), vec!["a"]);
+        assert_eq!(hits.len(), 1);
     }
 }

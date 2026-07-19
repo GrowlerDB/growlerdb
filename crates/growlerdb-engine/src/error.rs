@@ -1,6 +1,6 @@
 //! The engine's error type.
 
-use growlerdb_core::{DefError, ParseError};
+use growlerdb_core::{DefError, EmbedError, ParseError};
 use growlerdb_index::StoreError;
 use growlerdb_source::SourceError;
 
@@ -26,6 +26,23 @@ pub enum EngineError {
     /// The query string could not be parsed.
     #[error(transparent)]
     Query(#[from] ParseError),
+    /// A semantic (KNN) search named a field that isn't a VECTOR field on this index.
+    #[error(
+        "field `{0}` is not a VECTOR field on this index — semantic search needs a vector field"
+    )]
+    NotVectorField(String),
+    /// Producing the query embedding for a semantic search failed.
+    #[error(transparent)]
+    Embed(#[from] EmbedError),
+    /// Semantic (KNN) search was attempted on a **tenant-scoped** index. KNN does not yet
+    /// enforce the mandatory, non-widenable `tenant = <claim>` filter (that is filtered KNN,
+    /// TASK-43), so it is refused **fail-closed** on tenant-scoped indexes rather than risk
+    /// returning cross-tenant rows.
+    #[error(
+        "index `{0}` is tenant-scoped — semantic (KNN) search is not yet tenant-filtered and is \
+         refused here to prevent cross-tenant results (filtered KNN is pending)"
+    )]
+    SemanticTenantScopedUnsupported(String),
     /// The aux store / index operation failed.
     #[error(transparent)]
     Store(#[from] StoreError),

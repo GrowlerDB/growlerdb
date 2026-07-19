@@ -8,12 +8,12 @@ use std::hash::{Hash, Hasher};
 
 use growlerdb_core::{
     CommitBatch, CompositeKey, Hit, HydratedRow, IcebergSource, IndexDefinition, IndexReader,
-    IndexWriter, KeySpec, LocatedDoc, Mapping, Projection, ResolvedIndex, ScanMode, SearchParams,
-    ShardRouter, Snapshot, Source, SourceCheckpoint, Value,
+    IndexWriter, KeySpec, LocatedDoc, Mapping, Projection, Query, ResolvedIndex, ScanMode,
+    SearchParams, ShardRouter, Snapshot, Source, SourceCheckpoint, Value,
 };
 // Ingest embeds via the BGE-capable factory (real local model, or the hash-embedder fallback),
 // not core's built-in `default_embedder`.
-use growlerdb_embed::embed_located_docs;
+use growlerdb_embed::{embed_located_docs, embedder_for};
 use growlerdb_index::{LocalIndexStore, Shard, ShardId};
 use growlerdb_source::{IcebergConfig, IcebergReader};
 
@@ -498,6 +498,68 @@ impl Engine {
         Ok(SearchOutcome { hits, rows })
     }
 
+    /// **Semantic (KNN) search** over a VECTOR field: embed `query_text` with the field's
+    /// configured embedder (the same [`embedder_for`] factory used at ingest, so the query and the
+    /// documents share one embedding space), then run a top-level [`Query::Knn`] returning the `k` nearest
+    /// documents' coordinates + KNN scores. When `hydrate` is set, also fetch the authoritative
+    /// rows from Iceberg (projected by `projection`), exactly as [`search`](Self::search) does.
+    ///
+    /// This is the native, end-to-end semantic path (embed → KNN → nearest coordinates); the
+    /// query-string / REST DSL surface for it is a later task. `field` must be a VECTOR field on
+    /// the index.
+    pub async fn semantic_search(
+        &self,
+        index: &str,
+        field: &str,
+        query_text: &str,
+        k: usize,
+        hydrate: bool,
+        projection: Projection,
+    ) -> Result<SearchOutcome, EngineError> {
+        let resolved = self.load_definition(index)?;
+        // Fail closed on tenant-scoped indexes: KNN does not yet inject the mandatory
+        // `tenant = <claim>` filter (filtered KNN is TASK-43), so returning nearest neighbors
+        // here could cross tenant boundaries. Refuse rather than leak.
+        if resolved.tenant_field().is_some() {
+            return Err(EngineError::SemanticTenantScopedUnsupported(
+                index.to_string(),
+            ));
+        }
+        // The named field must be a VECTOR field — its `VectorSpec` drives the query embedder.
+        let spec = resolved
+            .fields
+            .iter()
+            .find(|f| f.path == field)
+            .and_then(|f| f.vector.as_ref())
+            .ok_or_else(|| EngineError::NotVectorField(field.to_string()))?;
+
+        // Embed the query text with the SAME factory ingest uses (real BGE when a model is
+        // provisioned, else the deterministic hash fallback) — the query and the stored document
+        // vectors must come from the same model or KNN compares across incompatible spaces.
+        let embedder = embedder_for(spec);
+        let mut vectors = embedder.embed(&[query_text.to_string()])?;
+        let vector = vectors.pop().unwrap_or_default();
+
+        let shard = self.store.open_shard(&ShardId::single(index), &resolved)?;
+        let query = Query::Knn {
+            field: field.to_string(),
+            vector,
+            k,
+        };
+        let hits = shard.search_all(&query, k)?;
+
+        let rows = if hydrate {
+            let keys: Vec<CompositeKey> = hits.iter().map(|h| h.key.clone()).collect();
+            let table = source_table(&resolved);
+            let reader = IcebergReader::connect(&self.iceberg).await?;
+            Some(hydrate::get_by_key(&shard, &reader, &table, &keys, &projection).await?)
+        } else {
+            None
+        };
+
+        Ok(SearchOutcome { hits, rows })
+    }
+
     /// Build a default index definition for `table` (auto-map all fields).
     fn default_definition(
         &self,
@@ -694,6 +756,123 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    /// Seed a `docs` index that adds a LOCAL VECTOR field (`body_vec`), ingesting the docs with
+    /// their bodies embedded exactly as ingest would (via `embed_located_docs`), so a query
+    /// embedded by the same model shares their space.
+    fn seed_vector_index(root: &Path) {
+        use growlerdb_core::embed_located_docs;
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("body", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        let resolved = IndexDefinition::from_yaml(
+            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD }, { path: body, type: TEXT }, { path: body_vec, type: VECTOR, vector: { dims: 64, source_field: body } } ] }\n",
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+
+        let store = LocalIndexStore::open(root).unwrap();
+        let shard = store
+            .create_shard(&ShardId::single("docs"), &resolved)
+            .unwrap();
+        std::fs::write(
+            root.join("docs").join("index.json"),
+            serde_json::to_vec_pretty(&resolved).unwrap(),
+        )
+        .unwrap();
+
+        let mut docs = vec![
+            doc("doc-1", "apache iceberg lakehouse tables", 0),
+            doc("doc-2", "full text search relevance ranking", 1),
+            doc("doc-3", "vector embeddings semantic retrieval", 2),
+        ];
+        // Embed each doc's `body` into `body_vec`, exactly as the ingest transform does.
+        embed_located_docs(&resolved, &mut docs);
+        IndexWriter::write(
+            &shard,
+            &CommitBatch::from_upserts(docs, SourceCheckpoint::iceberg(1), "b1"),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn semantic_search_returns_nearest_coordinates_end_to_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_vector_index(tmp.path());
+        let engine = Engine::open(tmp.path(), IcebergConfig::local()).unwrap();
+
+        // A query whose tokens overlap doc-3's body embeds nearest to it (HashEmbedder is a
+        // bag-of-tokens, so shared tokens ⇒ high cosine).
+        let out = engine
+            .semantic_search(
+                "docs",
+                "body_vec",
+                "semantic retrieval embeddings",
+                1,
+                false,
+                Projection::All,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.hits.len(), 1);
+        assert_eq!(out.hits[0].key.get("id"), Some(&Value::from("doc-3")));
+        assert!(out.rows.is_none());
+
+        // Naming a non-vector field is a clear error.
+        let err = engine
+            .semantic_search("docs", "body", "x", 1, false, Projection::All)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::NotVectorField(f) if f == "body"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn semantic_search_is_refused_fail_closed_on_a_tenant_scoped_index() {
+        // KNN doesn't yet enforce the tenant filter, so it must refuse rather than risk a
+        // cross-tenant result — the guard fires before any shard read.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("body", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        let resolved = IndexDefinition::from_yaml(
+            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\ntenant_field: id\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD }, { path: body, type: TEXT }, { path: body_vec, type: VECTOR, vector: { dims: 64, source_field: body } } ] }\n",
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+        assert!(resolved.tenant_field().is_some());
+        let store = LocalIndexStore::open(root).unwrap();
+        store
+            .create_shard(&ShardId::single("docs"), &resolved)
+            .unwrap();
+        std::fs::write(
+            root.join("docs").join("index.json"),
+            serde_json::to_vec_pretty(&resolved).unwrap(),
+        )
+        .unwrap();
+
+        let engine = Engine::open(root, IcebergConfig::local()).unwrap();
+        let err = engine
+            .semantic_search("docs", "body_vec", "x", 1, false, Projection::All)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::SemanticTenantScopedUnsupported(i) if i == "docs"
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -140,6 +140,23 @@ pub enum Query {
         /// Multiplicative score factor.
         boost: f32,
     },
+    /// **K-nearest-neighbor** retrieval over a VECTOR field: the `k` documents whose stored
+    /// embedding is closest to `vector` under the field's configured
+    /// [metric](crate::index_def::VectorMetric). The query vector is **already resolved** — query
+    /// *text* → embedding happens at the search-service layer via the index's
+    /// [`Embedder`](crate::embed::Embedder), so the core AST carries the raw vector, not text.
+    /// Executed against the per-segment ANN sidecar and ranked by KNN score. This is a
+    /// **top-level** retrieval clause: fusing it with a lexical query (RRF) is a later task, so it
+    /// is not representable inside a `Bool`/`Boost`, nor in the query-string / OpenSearch / gRPC
+    /// surfaces (those carry a query string, which never parses to `Knn`).
+    Knn {
+        /// Target VECTOR field.
+        field: String,
+        /// The query embedding — length must match the field's `dims`.
+        vector: Vec<f32>,
+        /// Number of nearest neighbors to return.
+        k: usize,
+    },
 }
 
 /// Query-string syntax mode ([Design 03]).
