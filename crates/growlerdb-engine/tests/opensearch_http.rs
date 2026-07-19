@@ -256,3 +256,28 @@ async fn unsupported_clause_returns_clear_error() {
         .unwrap()
         .contains("wildcard"));
 }
+
+/// `POST /_search` (no index in the path — OpenSearch "_all"): resolves to the endpoint's
+/// default/sole index and runs the same translated search. Previously the only uncovered
+/// OpenSearch route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_all_routes_to_the_default_index() {
+    let seen = Arc::new(Mutex::new(String::new()));
+    let node = CaptureNode {
+        seen_query: seen.clone(),
+    };
+    let gw = Arc::new(Gateway::new(Arc::new(node)));
+    let app = opensearch_router(gw);
+
+    let (status, body) = post(
+        app,
+        "/_search",
+        json!({ "query": { "match": { "title": "hello" } } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // The DSL reached the engine through the sole-index resolution, same as /{index}/_search.
+    assert_eq!(*seen.lock().unwrap(), "title:hello");
+    assert_eq!(body["hits"]["total"]["value"], 1);
+    assert_eq!(body["hits"]["hits"][0]["_source"]["title"], "hello");
+}

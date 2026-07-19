@@ -130,7 +130,8 @@ async fn spawn_node(token: Option<&str>) -> String {
     let shard = data_plane_shard(tmp.path());
     std::mem::forget(tmp);
     let search = SearchService::new(shard.clone());
-    let admin = AdminService::new(shard, "docs");
+    let admin = AdminService::new(shard.clone(), "docs");
+    let write = growlerdb_engine::WriteService::new(shard, "docs", 4);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(
@@ -140,9 +141,37 @@ async fn spawn_node(token: Option<&str>) -> String {
             ))
             .add_service(search.into_server())
             .add_service(admin.into_server())
+            .add_service(write.into_server())
             .serve_with_incoming(TcpListenerStream::new(listener)),
     );
     format!("http://{addr}")
+}
+
+/// A raw `Write.GetCheckpoint` against the layered Node, with/without the token — Write is the
+/// data-plane RPC whose exposure mattered most (an open Node accepted arbitrary writes), and the
+/// connector's `WriteClient` stamps the same header this test does.
+async fn write_checkpoint(endpoint: &str, token: Option<&str>) -> Result<(), tonic::Status> {
+    use growlerdb_proto::v1::write_client::WriteClient;
+    let mut client = None;
+    for _ in 0..50 {
+        if let Ok(channel) = tonic::transport::Endpoint::from_shared(endpoint.to_string())
+            .unwrap()
+            .connect()
+            .await
+        {
+            client = Some(WriteClient::with_interceptor(
+                channel,
+                growlerdb_proto::service_token::ServiceTokenInterceptor::new(token),
+            ));
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    client
+        .expect("node never came up")
+        .get_checkpoint(growlerdb_proto::v1::GetCheckpointRequest { window: 0 })
+        .await
+        .map(|_| ())
 }
 
 async fn describe(
@@ -183,6 +212,14 @@ async fn node_data_plane_enforces_the_token_and_remote_node_stamps_it() {
     // Matching token ⇒ the same RPC succeeds (RemoteNode stamped it on the request).
     let resp = describe(&ep, Some("mesh")).await.expect("token accepted");
     assert_eq!(resp.stats.expect("stats present").num_docs, 1);
+
+    // The Write service sits behind the SAME layer: tokenless ⇒ unauthenticated, right token ⇒
+    // allowed — the auth-denied coverage for Write the endpoint audit flagged as missing.
+    let err = write_checkpoint(&ep, None).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    write_checkpoint(&ep, Some("mesh"))
+        .await
+        .expect("the tokened write client reaches Write");
 }
 
 #[tokio::test(flavor = "multi_thread")]

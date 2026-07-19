@@ -189,3 +189,97 @@ async fn connect(url: &str) -> WriteClient<Channel> {
     }
     panic!("growlerdb serve did not come up at {url}");
 }
+
+/// A minimal HTTP/1.0 GET over std TCP (no HTTP client dep): returns (status, body).
+fn http_get(addr: &str, path: &str) -> std::io::Result<(u16, String)> {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(addr)?;
+    s.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    write!(s, "GET {path} HTTP/1.0\r\nHost: {addr}\r\n\r\n")?;
+    let mut buf = String::new();
+    s.read_to_string(&mut buf)?;
+    let status = buf
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let body = buf
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b)
+        .unwrap_or("")
+        .to_string();
+    Ok((status, body))
+}
+
+/// The observability surface of the REAL running binary (previously covered only by in-crate
+/// router tests): `--metrics-addr` serves `/healthz` + `/readyz` (both 200 once standalone serve
+/// is up) and Prometheus `/metrics`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn growlerdb_serve_exposes_health_and_metrics() {
+    let tmp = tempfile::tempdir().unwrap();
+    let resolved = docs_index();
+    std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
+    std::fs::write(
+        tmp.path().join("docs/index.json"),
+        serde_json::to_vec(&resolved).unwrap(),
+    )
+    .unwrap();
+
+    let free = || {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let (grpc, metrics) = (free(), free());
+    let metrics_addr = format!("127.0.0.1:{metrics}");
+    let _server = Server(
+        Command::new(env!("CARGO_BIN_EXE_growlerdb"))
+            .args([
+                "--data-dir",
+                tmp.path().to_str().unwrap(),
+                "--metrics-addr",
+                &metrics_addr,
+                "serve",
+                "docs",
+                "--addr",
+                &format!("127.0.0.1:{grpc}"),
+            ])
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn growlerdb serve"),
+    );
+
+    // Standalone serve flips ready once the shard is open; poll /readyz to 200.
+    let mut ready = false;
+    for _ in 0..100 {
+        if let Ok((200, _)) = http_get(&metrics_addr, "/readyz") {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(ready, "/readyz reports 200 once the shard is open");
+
+    let (status, _) = http_get(&metrics_addr, "/healthz").expect("healthz reachable");
+    assert_eq!(status, 200, "/healthz is 200 on a live process");
+
+    // A fresh process exposes an empty exposition; commit one batch so a real SLI records,
+    // then the page carries growlerdb metrics.
+    let mut client = connect(&format!("http://127.0.0.1:{grpc}")).await;
+    client
+        .write(WriteRequest {
+            batch: Some(batch().into()),
+        })
+        .await
+        .expect("write to record an SLI");
+    let mut saw_metrics = false;
+    for _ in 0..50 {
+        let (status, body) = http_get(&metrics_addr, "/metrics").expect("metrics reachable");
+        assert_eq!(status, 200);
+        if body.contains("growlerdb") {
+            saw_metrics = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(saw_metrics, "/metrics exposes growlerdb SLIs after a write");
+}

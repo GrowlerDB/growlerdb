@@ -2812,6 +2812,55 @@ mod tests {
             .all(|(_, n)| *n == growlerdb_core::routing::NUM_BUCKETS as usize));
     }
 
+    /// A real bucket move end to end (previously only the validation paths ran): build on the
+    /// target, cut the map over, trim the source — and routing reflects the relocation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn move_bucket_relocates_and_trims() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path());
+        let def_json = serde_json::to_string(&resolved("docs")).unwrap();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stub = |log: &Arc<std::sync::Mutex<Vec<(u32, usize)>>>| StubNodeAdmin {
+            reindexed: log.clone(),
+            gate: None,
+        };
+        let ep0 = spawn_stub_node(stub(&log)).await;
+        let ep1 = spawn_stub_node(stub(&log)).await;
+        register(&svc, &def_json, &ep0, 2, 0).await;
+        register(&svc, &def_json, &ep1, 2, 1).await;
+
+        let owner0 = svc.registry.bucket_map("docs").unwrap().owner(0);
+        let target = 1 - owner0;
+        let resp = svc
+            .move_bucket(Request::new(MoveBucketRequest {
+                index: "docs".into(),
+                bucket: 0,
+                to_shard: target,
+            }))
+            .await
+            .expect("a staffed bucketed index must support a bucket move")
+            .into_inner();
+        assert_eq!(
+            (resp.bucket, resp.from_shard, resp.to_shard),
+            (0, owner0, target)
+        );
+
+        // The stored map routes bucket 0 to the target now; every other bucket is untouched.
+        let map = svc.registry.bucket_map("docs").unwrap();
+        assert_eq!(map.owner(0), target);
+        assert_eq!(map.shards(), 2);
+
+        // Build hit the target first, then the source trim — each with the full owner map.
+        let calls = log.lock().unwrap().clone();
+        assert_eq!(
+            calls.iter().map(|(o, _)| *o).collect::<Vec<_>>(),
+            vec![target, owner0]
+        );
+        assert!(calls
+            .iter()
+            .all(|(_, n)| *n == growlerdb_core::routing::NUM_BUCKETS as usize));
+    }
+
     /// The cutover CAS: a placement op whose map changed under it mid-build is refused loudly
     /// instead of last-write-wins reverting the concurrent op's ownership.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
