@@ -25,7 +25,10 @@ pub use store::{
     LocalIndexStore, PreWarmPolicy, RemapStats, SealedSegment, Shard, ShardId, StoreError,
     COLD_MARKER,
 };
-pub use vector::{BruteForceIndex, SegmentAnn, VectorIndex, VectorIndexError, ANN_SUFFIX};
+pub use vector::{
+    BruteForceIndex, HnswIndex, SegmentAnn, StoredAnnIndex, VectorIndex, VectorIndexError,
+    ANN_SUFFIX, HNSW_MIN_VECTORS,
+};
 
 /// Crate version, from Cargo metadata.
 pub fn version() -> &'static str {

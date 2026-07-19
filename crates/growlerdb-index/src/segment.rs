@@ -17,7 +17,7 @@ use std::net::{IpAddr, Ipv6Addr};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
-use crate::vector::{BruteForceIndex, SegmentAnn, VectorIndex, ANN_SUFFIX};
+use crate::vector::{SegmentAnn, StoredAnnIndex, ANN_SUFFIX};
 
 use growlerdb_core::{
     sort_has_score, CompositeKey, DocBatch, Document, FieldType, Highlight, HighlightFragment,
@@ -941,9 +941,11 @@ impl SegmentReader {
                     }
                 }
                 if !items.is_empty() {
+                    // Auto-select brute-force (exact) vs HNSW (approximate) by this segment's
+                    // vector count for the field — transparent to the query path.
                     sidecar.insert(
                         vf.path.clone(),
-                        &BruteForceIndex::build(vf.spec.dims, vf.spec.metric, &items),
+                        &StoredAnnIndex::build(vf.spec.dims, vf.spec.metric, &items),
                     );
                 }
             }
@@ -1016,28 +1018,54 @@ impl SegmentReader {
                 continue; // this segment's sidecar holds no index for the field
             };
             let alive = seg.alive_bitset();
-            // With a filter, brute-force still ranks candidates but an arbitrary fraction may be
-            // filtered out, so request **all** of the segment's candidates and let the alive+allowed
-            // gate plus the global top-`k` decide — filtering can't starve the result below `k` when
-            // matches exist. Without a filter, keep the fast path: enough that dropping
-            // deleted/superseded docs still leaves `k` live ones.
-            let want = if allowed.is_some() {
-                index.len()
-            } else {
-                k.saturating_add(seg.num_deleted_docs() as usize)
-            };
-            for (doc_id, score) in index.knn(vector, want) {
-                let address = DocAddress::new(seg_ord as u32, doc_id);
-                if alive.is_none_or(|b| b.is_alive(doc_id))
-                    && allowed.as_ref().is_none_or(|a| a.contains(&address))
-                {
-                    let doc: TantivyDocument = searcher.doc(address)?;
-                    hits.push(Hit {
-                        key: stored_key(&doc, key_field)?,
-                        score,
-                        fields: self.cached_fields(&doc),
-                        highlight: Default::default(),
-                    });
+            match allowed.as_ref() {
+                // **Filtered KNN is exact** — this is the tenant-isolation path, so it must not
+                // depend on the ANN tier's recall. An approximate index (HNSW) returns only
+                // ~ef_search candidates, not all N, so `index.knn(vector, index.len())` could
+                // silently drop filter-allowed matches that rank outside that window. Instead we
+                // score the alive+allowed subset **directly from stored vectors** (the same
+                // `get_first(field).as_bytes()` → `le_bytes_to_vec_f32` path the sidecar is built
+                // from), using the field's metric. Exact regardless of the tier, and cheap because
+                // the filter already limits the candidate set.
+                Some(a) => {
+                    let metric = index.metric();
+                    for address in a.iter().filter(|addr| addr.segment_ord as usize == seg_ord) {
+                        let doc_id = address.doc_id;
+                        if alive.is_some_and(|b| !b.is_alive(doc_id)) {
+                            continue; // deleted/superseded
+                        }
+                        let doc: TantivyDocument = searcher.doc(*address)?;
+                        let Some(bytes) = doc.get_first(tv_field).and_then(|v| v.as_bytes()) else {
+                            continue; // this allowed doc has no vector for the field
+                        };
+                        let v = le_bytes_to_vec_f32(bytes);
+                        if v.is_empty() {
+                            continue;
+                        }
+                        hits.push(Hit {
+                            key: stored_key(&doc, key_field)?,
+                            score: crate::vector::score(metric, vector, &v),
+                            fields: self.cached_fields(&doc),
+                            highlight: Default::default(),
+                        });
+                    }
+                }
+                // Unfiltered fast path: the ANN index ranks; request enough that dropping
+                // deleted/superseded docs still leaves `k` live ones.
+                None => {
+                    let want = k.saturating_add(seg.num_deleted_docs() as usize);
+                    for (doc_id, score) in index.knn(vector, want) {
+                        if alive.is_none_or(|b| b.is_alive(doc_id)) {
+                            let address = DocAddress::new(seg_ord as u32, doc_id);
+                            let doc: TantivyDocument = searcher.doc(address)?;
+                            hits.push(Hit {
+                                key: stored_key(&doc, key_field)?,
+                                score,
+                                fields: self.cached_fields(&doc),
+                                highlight: Default::default(),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -2504,6 +2532,83 @@ mapping:
         assert!(reader
             .knn_search("body", &[1.0, 0.0, 0.0], 1, None)
             .is_err());
+    }
+
+    /// TASK-301 regression: **filtered KNN is exact on an HNSW-tier segment.** The approximate HNSW
+    /// index returns only ~`ef_search` top-similarity candidates, so relying on it for the filtered
+    /// path would silently drop filter-allowed matches that rank far down by similarity (the
+    /// tenant-isolation hazard). We build one segment with > `HNSW_MIN_VECTORS` vectors (forcing the
+    /// HNSW tier), where the only filter-matching docs sit *below* the top-similarity window, and
+    /// assert the filtered result is the exact top-k over that allowed subset — never under-filled.
+    #[test]
+    fn filtered_knn_is_exact_on_hnsw_tier_segment() {
+        let schema = IndexSchema::from_resolved(&vector_index());
+
+        // 4096 "common" docs pointing at +x (cosine ≈ 1 — they own the top-similarity window) and
+        // 50 "rare" docs pointing mostly at +y with a *tiny*, strictly-increasing +x component
+        // (cosine ≈ 0.01·(j+1), well below any common doc). Only the rare docs match `body:rare`.
+        let common = crate::vector::HNSW_MIN_VECTORS; // 4096 → total 4146, one HNSW-tier segment
+        let rare = 50usize;
+        let mut docs = Vec::with_capacity(common + rare);
+        for i in 0..common {
+            docs.push(vec_doc(i as i64, "common", vec![1.0, 0.0, 0.0]));
+        }
+        for j in 0..rare {
+            let x = 0.01 * (j as f32 + 1.0);
+            docs.push(vec_doc(10_000 + j as i64, "rare", vec![x, 1.0, 0.0]));
+        }
+        let batch = DocBatch::new(docs);
+
+        // Force a SINGLE segment (single-threaded writer) so all 4146 vectors land in one sidecar
+        // and it is built at the HNSW tier — a multi-threaded split could shard them into
+        // sub-threshold brute-force segments and mask the bug.
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::builder()
+            .schema(schema.schema.clone())
+            .settings(TantivySegmentCore::new_index_settings())
+            .create_in_dir(dir.path())
+            .unwrap();
+        let mut writer: tantivy::IndexWriter =
+            index.writer_with_num_threads(1, WRITER_HEAP_BYTES).unwrap();
+        for doc in &batch.docs {
+            writer.add_document(schema.to_tantivy(doc)).unwrap();
+        }
+        writer.commit().unwrap();
+        let reader = TantivySegmentCore.open(dir.path()).unwrap();
+        reader.build_ann_sidecars(&schema, dir.path()).unwrap();
+
+        // Confirm the single sidecar really is the HNSW tier (else the test proves nothing).
+        let anns: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".ann"))
+            .collect();
+        assert_eq!(anns.len(), 1, "expected exactly one segment/sidecar");
+        let frame = std::fs::read(anns[0].path()).unwrap();
+        let stored = SegmentAnn::from_frame(&frame).unwrap().field("body_vec");
+        assert!(
+            matches!(stored, Some(StoredAnnIndex::Hnsw(_))),
+            "sidecar must be HNSW tier for this regression to be meaningful"
+        );
+
+        // Filtered KNN for a +x query, constrained to `body:rare`. The exact top-10 of the allowed
+        // subset are the 10 largest-x rare docs — ids 10049..10040, best-first.
+        let k = 10;
+        let hits = reader
+            .knn_search("body_vec", &[1.0, 0.0, 0.0], k, Some(&q("body:rare")))
+            .unwrap();
+        let got: Vec<i64> = hits.iter().map(hit_id).collect();
+        let expected: Vec<i64> = (0..k as i64).map(|n| 10_000 + 49 - n).collect();
+        assert_eq!(
+            got, expected,
+            "filtered KNN must return the exact allowed top-k"
+        );
+        assert!(
+            hits.windows(2).all(|w| w[0].score >= w[1].score),
+            "results must be best-first"
+        );
+        // And it must not be under-filled: exactly `k` matches (50 allowed ≥ 10).
+        assert_eq!(hits.len(), k);
     }
 
     fn batch() -> DocBatch {
