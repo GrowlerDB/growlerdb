@@ -1260,6 +1260,15 @@ fn spawn_prewarm(
 /// A per-window failure is logged + counted and skipped; the pass never aborts. `live` is `(window
 /// id, handle)`; `def_json` is the serialized index definition for the backup manifest.
 ///
+/// The armed form of the [`park_once`] test seam: a callback run with the window id.
+#[cfg(test)]
+type ParkTestHook = Box<dyn Fn(i64) + Send>;
+#[cfg(test)]
+/// Test-only interleave seam for [`park_once`]: runs after a window's backup completes and
+/// before its handle swaps to cold — exactly the window the write-race check closes. Armed by
+/// the race test; `None` (always, in production builds) is a no-op.
+static PARK_TEST_AFTER_BACKUP: std::sync::Mutex<Option<ParkTestHook>> = std::sync::Mutex::new(None);
+
 /// [`cold_windows`]: growlerdb_core::TimeWindowing::cold_windows
 #[allow(clippy::too_many_arguments)]
 async fn park_once(
@@ -1313,11 +1322,15 @@ async fn park_once(
                 continue;
             }
         };
+        #[cfg(test)]
+        if let Some(hook) = PARK_TEST_AFTER_BACKUP.lock().unwrap().as_ref() {
+            hook(w);
+        }
         // Keep the window's `aux.redb` handle to hand to the cold shard: redb allows one open per
         // file, and the handle still holds this hot shard until the swap below, so the cold shard
-        // must SHARE the open handle, not race a second `Database::open`.
+        // must SHARE the open handle, not race a second `Database::open`. Keep the hot `Arc` too:
+        // if a write raced the backup (checked post-swap below), we swap it right back.
         let reuse_db = hot.db_handle();
-        drop(hot);
         // Open the read-through cold shard (object-storage reads → blocking) and hot-swap it in, so
         // queries never see a gap; then evict the now-redundant local bulk.
         let object_prefix = marker.object_prefix.clone();
@@ -1348,6 +1361,27 @@ async fn park_once(
         match opened {
             Ok(Ok(shard)) => {
                 handle.swap(Arc::new(shard));
+                // Write-race check, AFTER the swap so it can't itself race: the backup snapshotted
+                // the shard at `marker.snapshot`, but the window stayed writable until the swap —
+                // a write committing in between (a broadcast delete, late data) advanced the kept
+                // `aux.redb` checkpoint while its segments exist only in the local `index/` bulk
+                // we are about to evict. Serving the cold copy would silently lose that write (the
+                // checkpoint says it's covered, so the connector never re-sends). Post-swap the
+                // window is read-only, so this comparison is stable: on a mismatch, swap the fully
+                // intact hot shard back and re-park next tick (which re-backs-up at the newer
+                // snapshot).
+                let live_snapshot = handle.current().current_snapshot().unwrap_or(u64::MAX);
+                if live_snapshot != marker.snapshot {
+                    handle.swap(hot);
+                    eprintln!(
+                        "park `{label}`: a write raced the backup (snapshot {} → {live_snapshot}) \
+                         — staying hot, re-parking next tick",
+                        marker.snapshot
+                    );
+                    growlerdb_telemetry::sli::background_failure("park");
+                    continue;
+                }
+                drop(hot);
                 // Marker durable + read-through shard live → drop the local bulk. `aux.redb` stays as
                 // the cold footprint.
                 if let Err(e) = growlerdb_backup::evict_local_index(&window_dir) {
@@ -4972,5 +5006,109 @@ mod tests {
             again.is_empty(),
             "second pass is a no-op (windows already cold)"
         );
+    }
+
+    /// The park↔write race, interleaved deterministically: a write that commits **between a
+    /// window's backup and its cold swap** advances the kept `aux.redb` checkpoint while its
+    /// segments exist only in the local bulk the park would evict — serving the cold copy would
+    /// silently lose the write (the checkpoint claims it's covered, so the connector never
+    /// re-sends). `park_once` must detect the snapshot mismatch post-swap, swap the hot shard
+    /// back, and succeed on the next (un-raced) pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_racing_the_park_backup_keeps_the_window_hot_and_loses_nothing() {
+        use growlerdb_core::{Query, TimeWindowing, WindowGranularity};
+
+        let idx = resolved("events");
+        let root = tempfile::tempdir().unwrap();
+        let store = growlerdb_index::LocalIndexStore::open(root.path()).unwrap();
+        // Two windows; hot policy keeps 1 → w1000 is the park victim.
+        let live: Vec<(i64, growlerdb_engine::ShardHandle)> = [1_000i64, 2_000]
+            .iter()
+            .map(|&w| (w, hot_window(&store, "events", &idx, w, &format!("d{w}"))))
+            .collect();
+        let backup_root = tempfile::tempdir().unwrap();
+        let object_store = growlerdb_backup::fs_store(backup_root.path()).unwrap();
+        let cache = growlerdb_index::RangeCache::new(8 * 1024 * 1024);
+        let windowing = TimeWindowing::new("ts", WindowGranularity::Daily).with_hot_windows(1);
+        let def_json = serde_json::to_string(&idx).unwrap();
+
+        // Arm the interleave: after w1000's backup, a late write commits through the still-hot
+        // handle (exactly what a broadcast delete / late upsert does in production).
+        let victim = live[0].1.clone();
+        *PARK_TEST_AFTER_BACKUP.lock().unwrap() = Some(Box::new(move |w| {
+            use growlerdb_core::{
+                CommitBatch, CompositeKey, Document, IndexWriter, LocatedDoc, SourceCheckpoint,
+                Value,
+            };
+            assert_eq!(w, 1_000);
+            let key = CompositeKey::new(vec![], vec![("id".into(), Value::from("late"))]);
+            let mut fields = std::collections::BTreeMap::new();
+            fields.insert("id".to_string(), Value::from("late"));
+            IndexWriter::write(
+                &*victim.current(),
+                &CommitBatch::from_upserts(
+                    vec![LocatedDoc {
+                        doc: Document::new(key, fields),
+                        iceberg_file: "f".into(),
+                        row_position: 0,
+                    }],
+                    SourceCheckpoint::iceberg(2),
+                    "late-batch",
+                ),
+            )
+            .unwrap();
+        }));
+
+        let parked = park_once(
+            &live,
+            &store,
+            &object_store,
+            &cache,
+            &idx,
+            &windowing,
+            "events",
+            &def_json,
+        )
+        .await;
+        *PARK_TEST_AFTER_BACKUP.lock().unwrap() = None;
+
+        // The raced window was NOT parked: the mismatch was detected, the hot shard swapped back,
+        // and the raced write is still served.
+        assert!(parked.is_empty(), "the raced park must abort");
+        assert!(
+            !live[0].1.current().is_read_only(),
+            "the window stays hot after the aborted park"
+        );
+        let hits = live[0]
+            .1
+            .current()
+            .search_all(&Query::parse("id:late").unwrap(), 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1, "the raced write is not lost");
+
+        // The next pass (no race) parks cleanly — and the cold copy includes the late write.
+        let parked = park_once(
+            &live,
+            &store,
+            &object_store,
+            &cache,
+            &idx,
+            &windowing,
+            "events",
+            &def_json,
+        )
+        .await;
+        assert_eq!(parked, vec![1_000]);
+        assert!(live[0].1.current().is_read_only());
+        // Cold read-through search = blocking object-store reads → off the async runtime.
+        let cold = live[0].1.current();
+        let hits = tokio::task::spawn_blocking(move || {
+            cold.search_all(&Query::parse("id:late").unwrap(), 10)
+                .unwrap()
+                .len()
+        })
+        .await
+        .unwrap();
+        assert_eq!(hits, 1, "the re-parked cold copy serves the late write");
     }
 }
