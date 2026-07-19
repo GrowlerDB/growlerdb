@@ -21,12 +21,14 @@ import java.util.concurrent.ConcurrentMap;
  * batch {@code write_windowed}.
  *
  * <p>Unlike {@link ShardedWriteClient} (fixed ordinal shards, lockstep empty-batches), windows form
- * continuously and each advances independently: sub-batches carry <b>no</b> {@code from}/{@code safe}
- * checkpoint (matching {@code TimeWindowing::partition_batch}, which uses {@code from = None}), so a
- * window that skipped a batch doesn't trip the node's continuity guard. The resume point is the min
+ * continuously and each advances independently: sub-batches carry <b>no</b> {@code from} checkpoint
+ * (matching {@code TimeWindowing::partition_batch}, which uses {@code from = None}), so a window
+ * that skipped a batch doesn't trip the node's continuity guard. The resume point is the min
  * committed checkpoint across the windows that have committed (idempotent replay; {@code batch_id}
- * dedups). Deletes carry no window value, so they broadcast to every touched/known window (the owner
- * re-broadcasts to its own windows); append-mostly sources rarely delete.
+ * dedups). The {@code safe} checkpoint (the connector's global resume floor) <b>is</b> carried, so
+ * each window prunes its idempotency records instead of growing them without bound. Deletes carry
+ * no window value, so they broadcast to every touched/known window (the owner re-broadcasts to its
+ * own windows); append-mostly sources rarely delete.
  */
 public final class WindowedWriteClient implements BatchWriter {
 
@@ -60,10 +62,11 @@ public final class WindowedWriteClient implements BatchWriter {
    * Split {@code batch} into one sub-batch per time window, routing each upsert by its window field
    * ({@link WindowRouter}) and broadcasting deletes to every touched window plus every {@code
    * knownWindow} (a delete carries no window value; the owner re-broadcasts to its own windows).
-   * Each sub-batch carries the same checkpoint and a per-window {@code batch_id} ({@code {id}#w{window}}),
-   * and — matching {@code TimeWindowing::partition_batch} — <b>no</b> {@code from}/{@code safe}
-   * checkpoint, so a window that skipped a batch isn't gap-rejected by the node's continuity guard.
-   * Pure (no I/O), so the placement is unit-tested without a live cluster.
+   * Each sub-batch carries the same checkpoint, the same {@code safe} resume floor (global across
+   * windows, so each prunes its idempotency records), and a per-window {@code batch_id}
+   * ({@code {id}#w{window}}) — and, matching {@code TimeWindowing::partition_batch}, <b>no</b>
+   * {@code from} checkpoint, so a window that skipped a batch isn't gap-rejected by the node's
+   * continuity guard. Pure (no I/O), so the placement is unit-tested without a live cluster.
    */
   static SortedMap<Long, DocBatch> partition(
       DocBatch batch, WindowRouter router, java.util.Set<Long> knownWindows) {
@@ -93,13 +96,15 @@ public final class WindowedWriteClient implements BatchWriter {
     for (long window : targets) {
       List<DocOp> ops = new ArrayList<>(byWindow.getOrDefault(window, List.of()));
       ops.addAll(deletes);
-      out.put(
-          window,
+      DocBatch.Builder sub =
           DocBatch.newBuilder()
               .addAllOps(ops)
               .setCheckpoint(batch.getCheckpoint())
-              .setBatchId(batch.getBatchId() + "#w" + window)
-              .build());
+              .setBatchId(batch.getBatchId() + "#w" + window);
+      if (batch.hasSafeCheckpoint()) {
+        sub.setSafeCheckpoint(batch.getSafeCheckpoint());
+      }
+      out.put(window, sub.build());
     }
     return out;
   }

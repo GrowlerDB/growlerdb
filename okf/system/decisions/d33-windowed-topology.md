@@ -20,8 +20,10 @@ map and the in-process gateway hot-swaps (`Gateway::swap_windowed`, window routi
 swappable `RoutingState`). The connector computes each row's window id **byte-identically to the
 engine** (`WindowRouter` ≡ `window_of ∘ field_micros`, the window field's `TimeFormat` carried on
 `GetIndex`), resolves the owner, and streams the window's sub-batch with `from = None` (so a window
-that skipped a batch isn't gap-rejected). The cluster gateway learns windows over the live control
-plane and hot-reloads them; per-window checkpoints let the connector resume each window independently.
+that skipped a batch isn't gap-rejected) but **with the `safe` resume floor carried** (it is global
+across windows, so each window prunes its idempotency records instead of growing them without
+bound). The cluster gateway learns windows over the live control plane and hot-reloads them;
+per-window checkpoints let the connector resume each window independently.
 
 **Why.** Hash sharding (D12) fixes a shard set at build time and refuses a windowed index in-engine
 (`ShardingWindowedUnsupported`); the temporal sweet spot needs windows that **form continuously** as
