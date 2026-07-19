@@ -21,6 +21,11 @@ apart.
 
 ## Tenant isolation
 
+- **Tenant isolation is opt-in, per index.** An index is tenant-scoped only when its definition names a
+  `tenant_field` (a KEYWORD field); leave it unset (the default) and the index is single-tenant — no
+  claim is required, no predicate is injected, and every read (lexical, semantic, and hybrid) runs
+  unscoped. A self-hosted / single-tenant deployment pays nothing for tenancy and never has to reason
+  about it. The rest of this section describes what a **tenant-scoped** index does.
 - A tenant predicate is **injected from the caller's verified token claims**, never user-supplied, and
   ANDed into the query — so a forged header or query-widening cannot cross tenants, and an
   unauthenticated request is rejected before it reaches a shard.
