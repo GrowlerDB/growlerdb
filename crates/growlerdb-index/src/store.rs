@@ -51,10 +51,6 @@ use crate::segment::{
     ExplainHit, IndexError, IndexSchema, SegmentReader, TantivySegmentCore, WRITER_HEAP_BYTES,
 };
 
-/// `expect` message for a write attempted on a read-only **cold** shard — a programming
-/// error: cold shards are served only on the read path (the gateway never routes writes to them).
-const COLD_READONLY: &str = "write attempted on a read-only cold shard";
-
 /// A page of hits, each paired with its per-key sort values, plus the next-page keyset
 /// cursor — the value-carrying counterpart of `(Vec<Hit>, Option<SearchAfter>)`. Lets the
 /// Engine API put `sort_values` on every wire hit for cross-shard merge (design/09).
@@ -222,6 +218,16 @@ pub enum StoreError {
     /// (typically a reindex/reconcile). Carries `(from, current)` for the operator.
     #[error("checkpoint gap: batch resumes from {from} but this shard is at {current}")]
     CheckpointGap { from: String, current: String },
+    /// A write-path operation reached a **read-only cold** shard — a parked window served
+    /// read-through from object storage, which has no writer. Routing normally shields cold
+    /// shards from writes (background writers stand down via
+    /// [`is_read_only`](Shard::is_read_only)), but late data or an admin call can still land
+    /// here — refused cleanly so the caller can surface it, never a panic. The remedy is to
+    /// revive (pre-warm) the window back to the hot tier first.
+    #[error(
+        "cannot {0} a read-only cold shard: the window is parked — revive (pre-warm) it first"
+    )]
+    ReadOnlyShard(&'static str),
     /// The on-disk index for this name was built with a **different schema** than the definition
     /// now being opened against it: a mapped field was added/removed/renamed, or a field's type or
     /// fast-ness changed, so the derived Tantivy schema (its field set/types) no longer matches the
@@ -540,11 +546,14 @@ impl LocalIndexStore {
             written.push(wb.window);
         }
         if !deletes.is_empty() {
+            // Carry the connector's resume floor so each window's idempotency records prune
+            // (`from` stays absent by design — see `partition_batch`).
             let del_batch = CommitBatch::new(
                 deletes,
                 batch.checkpoint.clone(),
                 format!("{}#del", batch.batch_id),
-            );
+            )
+            .with_safe_checkpoint(batch.safe_checkpoint.clone());
             for w in self.window_shards(&index.name)? {
                 let shard = self.create_shard(&ShardId::window(&index.name, w), index)?;
                 IndexWriter::write(&shard, &del_batch)?;
@@ -1548,7 +1557,7 @@ impl Shard {
         let mut writer = self
             .writer
             .as_ref()
-            .expect(COLD_READONLY)
+            .ok_or(StoreError::ReadOnlyShard("commit a batch to"))?
             .lock()
             .expect("writer not poisoned");
         // Authoritative continuity decision: the stage-time check ran lock-free,
@@ -2106,7 +2115,7 @@ impl Shard {
         let mut writer = self
             .writer
             .as_ref()
-            .expect(COLD_READONLY)
+            .ok_or(StoreError::ReadOnlyShard("reconcile-delete on"))?
             .lock()
             .expect("writer not poisoned");
 
@@ -2293,7 +2302,7 @@ impl Shard {
             let mut writer = self
                 .writer
                 .as_ref()
-                .expect(COLD_READONLY)
+                .ok_or(StoreError::ReadOnlyShard("compact"))?
                 .lock()
                 .expect("writer not poisoned");
             let metas = self
@@ -2533,7 +2542,7 @@ impl Shard {
         let _guard = self
             .writer
             .as_ref()
-            .expect(COLD_READONLY)
+            .ok_or(StoreError::ReadOnlyShard("backup"))?
             .lock()
             .expect("writer lock poisoned");
         let snapshot = self.current_snapshot()?;
@@ -7715,6 +7724,18 @@ mod window_store_tests {
                 .search_all(&growlerdb_core::Query::parse("id:d2").unwrap(), 10)
                 .unwrap()
                 .len();
+            // Write-path calls against the read-only cold shard are refused cleanly —
+            // never a panic (late data / an admin call can still reach a parked window).
+            let write_err = IndexWriter::write(
+                &cold,
+                &CommitBatch::new(vec![doc("d9", 0, 0)], SourceCheckpoint::iceberg(9), "b9"),
+            )
+            .expect_err("a cold shard must refuse writes");
+            assert!(matches!(write_err, StoreError::ReadOnlyShard(_)));
+            let backup_err = cold
+                .backup_snapshot(std::path::Path::new("/nonexistent-staging"))
+                .expect_err("a cold shard must refuse backup");
+            assert!(matches!(backup_err, StoreError::ReadOnlyShard(_)));
             (d1, d2)
         })
         .await
@@ -7723,6 +7744,63 @@ mod window_store_tests {
             counts,
             (1, 1),
             "cold shard searches read-through from object storage with local aux"
+        );
+    }
+
+    #[test]
+    fn windowed_batches_prune_idempotency_records_at_the_safe_floor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalIndexStore::open(tmp.path()).unwrap();
+        let idx = events_index();
+        let day = |n: i64| n * DAY;
+        let w10 = format!("b1#w{}", day(10));
+
+        // Batch 1 (no floor yet): its idempotency record is retained on the window shard.
+        store
+            .write_windowed(
+                &idx,
+                &CommitBatch::new(
+                    vec![doc("d1", day(10) + 1, day(10))],
+                    SourceCheckpoint::iceberg_ordered(101, 1),
+                    "b1",
+                ),
+            )
+            .unwrap();
+        {
+            // Scoped: redb allows one open handle per file, and batch 2 reopens this shard.
+            let shard = store
+                .create_shard(&ShardId::window("events", day(10)), &idx)
+                .unwrap();
+            assert!(shard.batch_snapshot(&w10).unwrap().is_some());
+        }
+
+        // Batch 2 carries the connector's resume floor (≥ batch 1's checkpoint): the window
+        // sub-batch propagates it, so batch 1's record prunes. Without the carry, windowed
+        // shards' idempotency tables grew without bound.
+        store
+            .write_windowed(
+                &idx,
+                &CommitBatch::new(
+                    vec![doc("d2", day(10) + 2, day(10))],
+                    SourceCheckpoint::iceberg_ordered(102, 2),
+                    "b2",
+                )
+                .with_safe_checkpoint(Some(SourceCheckpoint::iceberg_ordered(101, 1))),
+            )
+            .unwrap();
+        let shard = store
+            .create_shard(&ShardId::window("events", day(10)), &idx)
+            .unwrap();
+        assert!(
+            shard.batch_snapshot(&w10).unwrap().is_none(),
+            "the record at the floor is pruned"
+        );
+        assert!(
+            shard
+                .batch_snapshot(&format!("b2#w{}", day(10)))
+                .unwrap()
+                .is_some(),
+            "the batch above the floor is retained"
         );
     }
 }

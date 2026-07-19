@@ -97,4 +97,29 @@ class WindowedWriteClientTest {
     // Nowhere to route a delete before any window exists → an empty partition (skipped, not an error).
     assertTrue(WindowedWriteClient.partition(batch(delete("x")), router(), Set.of()).isEmpty());
   }
+
+  @Test
+  void carriesTheSafeFloorButNeverFrom() {
+    // The safe checkpoint (global resume floor) must reach every window sub-batch so each
+    // prunes its idempotency records; `from` stays absent (windows advance independently and
+    // would false-Gap on it).
+    DocBatch withFloors =
+        DocBatch.newBuilder()
+            .addOps(upsert("a", 10 * DAY))
+            .addOps(upsert("b", 11 * DAY))
+            .setCheckpoint(SourceCheckpoint.newBuilder().setIcebergSnapshot(9).setIcebergSequenceNumber(9))
+            .setFromCheckpoint(
+                SourceCheckpoint.newBuilder().setIcebergSnapshot(8).setIcebergSequenceNumber(8))
+            .setSafeCheckpoint(
+                SourceCheckpoint.newBuilder().setIcebergSnapshot(5).setIcebergSequenceNumber(5))
+            .setBatchId("b1")
+            .build();
+    SortedMap<Long, DocBatch> parts = WindowedWriteClient.partition(withFloors, router(), Set.of());
+    assertEquals(2, parts.size());
+    for (DocBatch sub : parts.values()) {
+      assertTrue(sub.hasSafeCheckpoint(), "resume floor carried per window");
+      assertEquals(5, sub.getSafeCheckpoint().getIcebergSnapshot());
+      assertTrue(!sub.hasFromCheckpoint(), "windowed sub-batches use from=None");
+    }
+  }
 }

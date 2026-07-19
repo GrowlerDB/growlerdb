@@ -24,12 +24,24 @@ pod. A separate job pod cannot mount that volume (and generally won't even land 
 the orchestrator pattern does not transfer. In-process parking is the only option that touches the data
 where it lives, and it also makes operation automatic for free by mirroring pre-warm.
 
-**Safety.** Victims are aged windows outside the hot horizon — immutable, not receiving writes. Only
-one node owns the current (actively written) window and it is that node's most-recent window, so a
+**Safety.** Victims are aged windows outside the hot horizon — immutable, not receiving row writes.
+Only one node owns the current (actively written) window and it is that node's most-recent window, so a
 per-node "keep the most recent N hot" policy never parks a window still being written. The backup +
 durable marker land **before** any local eviction, so a crash mid-park always leaves a fully-serving
 hot shard, never a markerless empty window. The two background writers (auto-compaction, locator
 re-map) stand down the moment a window becomes read-only (no writer), so an in-place swap is race-free.
+
+**Writes that still reach a parked window.** Two ingest paths can target a parked window, and both
+are handled without panicking the write path (a write into a cold shard is a clean
+`StoreError::ReadOnlyShard`, never a poison batch the connector retries forever):
+
+- **Broadcast deletes** (a delete carries no window value, so `WindowedWriteService` broadcasts it to
+  every window) **skip** parked windows, with a warning: a deleted key residing in a parked window
+  stays visible there until the window is revived or dropped — accepted for the append-mostly
+  sources windowing targets.
+- **Late data** whose ingest-time routes to an already-parked window is refused loudly as
+  `WINDOW_PARKED` (`FAILED_PRECONDITION`, non-retryable): revive (pre-warm) the window or widen
+  `hot_windows`; retrying can never succeed while the window is cold.
 
 **Deployment.** The Helm chart wires this on the node StatefulSet (`coldTier.*`): the backup bucket,
 park cadence, and read-through cache size — the object store is the same `GROWLERDB_S3_*` target as the
