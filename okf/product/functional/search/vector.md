@@ -116,6 +116,6 @@ a no-op; see [RBAC & tenancy](/product/functional/rbac-and-tenancy.md).)
 > the `Embedder` seam, per-document vector storage, the per-segment ANN sidecar (backed up), top-level
 > KNN, filtered / tenant-scoped KNN, RRF hybrid fusion, the authenticated multi-shard gateway
 > surface** (gRPC + REST, node-local embedding), the **console** search-mode UX + grounded Ask screen,
-> and the **opt-in reranker**. **Distributed windowed** semantic search and the approximate (HNSW) index
-> (a scale optimization) follow — see
+> the **opt-in reranker** (local + external providers), and the **approximate HNSW index** (auto-selected
+> at scale, filtered KNN stays exact). Only **distributed windowed** semantic search remains — see
 > [known limitations](/quality/known-limitations/index.md). The interface and stored format are stable.

@@ -72,6 +72,14 @@ All notable changes to GrowlerDB are documented here. The format is based on
   `/v1/config`. Selecting `EXTERNAL` without a key **fails closed** (a clear error, no silent fallback).
   The **local** BGE/reranker default needs zero keys. No LLM keys — GrowlerDB never calls an LLM (D42).
   (ADR D20/D21 · TASK-299)
+- **Approximate ANN index (HNSW) at scale.** The per-segment ANN sidecar now auto-selects an
+  **HNSW** index (pure-Rust `instant-distance`) when a segment holds more than `HNSW_MIN_VECTORS` (4096)
+  vectors for a field, and stays exact **brute-force** below that — transparent (same sidecar, same
+  `knn` semantics, no config/API change). On a 10k × 128-d benchmark, HNSW is ~2.9× faster per query at
+  **recall@10 ≈ 0.96** vs. the exact scan. **Filtered / tenant-scoped KNN stays exact** on both tiers
+  (it scores the filter-allowed subset directly, so a selective filter never under-fills on an HNSW
+  segment). "Scale is the gate": approximation only engages where an exact scan gets expensive.
+  (ADR D19 · TASK-301)
 
 ### Fixed
 

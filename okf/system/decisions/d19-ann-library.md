@@ -21,13 +21,17 @@ GrowlerDB-owned artifact above. The HNSW graph itself comes from an **open Rust 
 ANN-index build task (TASK-42). Brute-force KNN over a stored-vector fast field is the small-N fallback
 behind the same trait. Either way it stays **one segment lifecycle** for both modalities.
 
-**As built (TASK-42).** The `VectorIndex` trait (`build` / `knn` / serialize) is realized by the
-**brute-force exact** `BruteForceIndex` (`growlerdb-index/src/vector.rs`) as the shipped
-implementation: at the current per-segment N it is exact (no recall loss), stably serializable
-(postcard), expresses all three `VectorMetric`s (Cosine/Dot/L2) from one stored representation, and
-adds **no new dependency** (so no `deny.toml` change). An HNSW crate can replace it behind the same
-trait later with no change to callers — the sidecar stores each field's index as opaque bytes and each
-index self-describes its `dims`/`metric`. The artifact is a **versioned per-segment sidecar**
+**As built (TASK-42, TASK-301).** The `VectorIndex` trait (`build` / `knn` / serialize) has **two
+implementations, auto-selected by segment size** (`growlerdb-index/src/vector.rs`): the **brute-force
+exact** `BruteForceIndex` at small N (exact, no recall loss, no dependency), and an **approximate
+`HnswIndex`** (pure-Rust `instant-distance`) once a segment holds more than `HNSW_MIN_VECTORS` (4096)
+vectors for a field — ~2.9× faster queries at ≈0.96 recall@10 on a 10k×128 benchmark. Both express all
+three `VectorMetric`s and serialize into the sidecar as a **tagged** `StoredAnnIndex` enum (postcard),
+so read-back dispatches to the right impl; `knn_search`'s call site is unchanged. **Filtered /
+tenant-scoped KNN stays exact on both tiers** — it scores the filter-allowed subset directly from the
+stored vectors, so an approximate index never under-fills a selective (tenant) filter. "Scale is the
+gate": approximation engages only where an exact scan gets expensive. The artifact is a **versioned
+per-segment sidecar**
 (`<segment-uuid>.ann`, magic `GDBv` + `u16` version, like the cold-tier `sidecar.rs`) holding one
 `VectorIndex` per vector field. It is built after commit (and rebuilt after each compaction merge over
 the newly-sealed segment), registered in `sealed_segments()` so backup/restore carries it, and read at
