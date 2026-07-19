@@ -50,12 +50,19 @@ At **ingest**, for each `LOCAL` vector field GrowlerDB embeds the `source_field`
 through the [`Embedder`](/system/decisions/d20-embedding-model.md) seam and stores the resulting vector
 in the document's segment (backed up and restored with the lexical segment). The `Embedder` trait is the
 integration point ([D41](/system/decisions/d41-vector-open-core.md) keeps it open; external providers
-attach here). The embedding is stored per document today; the **ANN index**
+attach here). The embedding is stored per document; the **ANN index**
 ([D19](/system/decisions/d19-ann-library.md)), **RRF fusion + filtered KNN**, and the optional
-[reranker](/system/decisions/d21-reranker.md) are the retrieval half, built next.
+[reranker](/system/decisions/d21-reranker.md) are the retrieval half.
 
-> **Status.** In active build (M5). The **field type, local-default embedding at ingest, the `Embedder`
-> seam, and per-document vector storage** are the first increment. Query-time semantic / hybrid KNN,
-> fusion, and reranking follow — see [known limitations](/quality/known-limitations/index.md). The
-> initial local embedder is a stand-in until the BGE runtime lands; the interface and stored format are
-> stable.
+The default local embedder is **bge-small-en-v1.5** run **in-process on [Candle](https://github.com/huggingface/candle)**
+— pure Rust, no native/C dependency, no network. The model (`config.json`, `tokenizer.json`,
+`model.safetensors`) is provisioned out of band into `${GROWLERDB_MODEL_DIR:-~/.cache/growlerdb/models}/<model-id>/`;
+when it isn't present, embedding transparently falls back to a deterministic dev embedder (so ingest and
+offline CI keep working) with a one-time warning. The BGE runtime is behind a default-on build feature, so
+a slim build can drop the ML dependency entirely. Automatic model download is intentionally not part of the
+runtime — provisioning stays explicit, keeping the default deployment offline.
+
+> **Status.** In active build (M5). The **field type, local BGE embedding at ingest (Candle), the
+> `Embedder` seam, and per-document vector storage** are shipped. Query-time semantic / hybrid KNN,
+> fusion, and reranking are the retrieval half — see
+> [known limitations](/quality/known-limitations/index.md). The interface and stored format are stable.

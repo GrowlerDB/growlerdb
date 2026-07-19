@@ -1,0 +1,38 @@
+[package]
+name = "growlerdb-embed"
+description = "GrowlerDB local embedding runtime — a real BGE (BERT) embedder on Candle, with a hash-embedder fallback."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+growlerdb-core.workspace = true
+tracing.workspace = true
+
+# The local BGE runtime (BERT on Candle, pure Rust, no native/C deps). Behind a default-on
+# `bge` feature so a `--no-default-features` build carries ZERO ML deps and the factory
+# transparently falls back to the dev HashEmbedder.
+candle-core = { version = "0.9", optional = true }
+candle-nn = { version = "0.9", optional = true }
+candle-transformers = { version = "0.9", optional = true }
+# WordPiece tokenizer loaded from a local tokenizer.json. default-features=false drops the
+# native `onig` regex (C lib) and the indicatif progress bar; we opt into the pure-Rust
+# `fancy-regex` backend instead (tokenizers requires exactly one) so the build stays
+# native-dependency-free.
+tokenizers = { version = "0.21", optional = true, default-features = false, features = ["fancy-regex"] }
+# Parse the model's config.json into candle's BERT `Config`.
+serde_json = { workspace = true, optional = true }
+
+[features]
+default = ["bge"]
+bge = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+    "dep:serde_json",
+]
+
+[dev-dependencies]
+tempfile.workspace = true
