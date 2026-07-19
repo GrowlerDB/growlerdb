@@ -485,6 +485,15 @@ fn registry_status(e: RegistryError) -> Status {
             Code::InvalidArgument,
             WireError::new("INVALID_ARGUMENT", detail),
         ),
+        RegistryError::PlacementConflict(index) => to_status(
+            Code::FailedPrecondition,
+            WireError::new(
+                "PLACEMENT_CONFLICT",
+                format!(
+                    "placement of `{index}` changed while this operation ran — re-plan and retry"
+                ),
+            ),
+        ),
         RegistryError::NotFound(name) => to_status(
             Code::NotFound,
             WireError::new("NOT_FOUND", format!("index `{name}` not found")),
@@ -746,12 +755,16 @@ impl ControlPlane for ControlPlaneService {
             .registry
             .shard_map(&req.index)
             .ok_or_else(|| registry_status(RegistryError::NotFound(req.index.clone())))?;
-        // The count the data is **currently routed over** — the stored bucket map's shard count, not
-        // the registered-node count (which already includes the new shards). A legacy index has no
-        // map; its first reshard adopts a balanced map over its current shard count.
-        let current_count = self
-            .registry
-            .bucket_map(&req.index)
+        // The count the data is **currently routed over** — the stored bucket map's shard count,
+        // NEVER the registered-node count: registration already includes the new (empty) build
+        // targets, and deriving the current count from it would make growth impossible (register
+        // the new shards → current == new → rejected) while pre-cutover registration flipped
+        // routing. Registration adopts a map on first announce, so a registered ordinal index
+        // always has one; the fallback covers only a CP-created index no node ever announced
+        // (apply then fails on missing endpoints below anyway).
+        let current_map = self.registry.bucket_map(&req.index);
+        let current_count = current_map
+            .as_ref()
             .map(|m| m.shards())
             .unwrap_or(shard_map.len() as u32);
         let growth = plan_growth_reshard(&plan, &shard_map, current_count, req.new_shard_count)
@@ -764,9 +777,12 @@ impl ControlPlane for ControlPlaneService {
             reindex_shard_on_node(endpoint, &req.index, &owners, *ord).await?;
         }
 
-        // 3. Cutover: commit the new bucket map atomically. Reads/writes now route through it.
+        // 3. Cutover: commit the new bucket map atomically — compare-and-swap against the map
+        //    this plan was derived from, so a concurrent placement op (another reshard, a bucket
+        //    move) that committed during the minutes-long build turns this into a loud
+        //    FAILED_PRECONDITION instead of silently reverting its ownership.
         self.registry
-            .set_bucket_map(&req.index, &growth.map)
+            .set_bucket_map(&req.index, current_map.as_ref(), &growth.map)
             .map_err(registry_status)?;
 
         // 4. Trim the old shards' now-dead buckets (best-effort — the index is already correct; this
@@ -856,9 +872,10 @@ impl ControlPlane for ControlPlaneService {
         // 1. Build the target shard to **include** the bucket — the source shard is untouched and
         //    still serves it, so reads never miss; the brief overlap is deduped by the Gateway.
         reindex_shard_on_node(&to_endpoint, &req.index, &owners, req.to_shard).await?;
-        // 2. Cutover: commit the relocated map. The bucket now routes to the target.
+        // 2. Cutover: commit the relocated map — CAS against the map this move was planned from
+        //    (see apply_reshard), so a reshard finishing mid-move can't be silently reverted.
         self.registry
-            .set_bucket_map(&req.index, &new_map)
+            .set_bucket_map(&req.index, Some(&map), &new_map)
             .map_err(registry_status)?;
         // 3. Trim the source shard (best-effort) — it no longer owns the bucket.
         if let Err(e) = reindex_shard_on_node(&from_endpoint, &req.index, &owners, from_shard).await
@@ -1276,6 +1293,13 @@ impl ControlPlane for ControlPlaneService {
             // One persist for all this node's ordinals, not one rewrite per ordinal.
             self.registry
                 .assign_primaries(&name, &owned, req.endpoint.clone())
+                .map_err(registry_status)?;
+            // Every ordinal index is bucketed from its first announce (no long-lived legacy
+            // routing): adopt a balanced map over the DECLARED total once. A later announce —
+            // in particular a growth build target registering with `--shards N+k` mid-reshard —
+            // finds the map present and leaves live routing untouched until the cutover.
+            self.registry
+                .adopt_bucket_map_if_absent(&name, shard_count)
                 .map_err(registry_status)?;
         } else {
             // Windowed: place each served window on this node and record its event-time
@@ -2226,7 +2250,7 @@ mod tests {
 
         // Now bucketed: moving a bucket onto the shard it already lives on is rejected too.
         svc.registry
-            .set_bucket_map("docs", &BucketMap::balanced(2))
+            .set_bucket_map("docs", None, &BucketMap::balanced(2))
             .unwrap();
         let here = svc.registry.bucket_map("docs").unwrap().owner(4);
         let err = svc
@@ -2619,5 +2643,223 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), Code::NotFound);
+    }
+
+    // ---- online reshard, end to end against stub nodes ---------------------------------------
+
+    /// A stub Node `Admin` that records reindex calls (and can block on a gate) — stands in for
+    /// the real per-node rebuild so the FULL grow path (register → plan → apply → cutover → trim)
+    /// runs without Iceberg. Every other RPC is unimplemented.
+    #[derive(Clone, Default)]
+    struct StubNodeAdmin {
+        /// `(shard_ordinal, owners.len())` per reindex call, in arrival order.
+        reindexed: Arc<std::sync::Mutex<Vec<(u32, usize)>>>,
+        /// When set: signal `entered` on a reindex call, then wait for `release` — lets a test
+        /// deterministically interleave a concurrent placement commit mid-build.
+        gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    }
+
+    #[tonic::async_trait]
+    impl growlerdb_proto::Admin for StubNodeAdmin {
+        async fn describe_index(
+            &self,
+            _r: Request<growlerdb_proto::v1::DescribeIndexRequest>,
+        ) -> Result<Response<growlerdb_proto::v1::DescribeIndexResponse>, Status> {
+            Err(Status::unimplemented("stub"))
+        }
+        async fn alter_index(
+            &self,
+            _r: Request<growlerdb_proto::v1::AlterIndexRequest>,
+        ) -> Result<Response<growlerdb_proto::v1::AlterIndexResponse>, Status> {
+            Err(Status::unimplemented("stub"))
+        }
+        async fn reindex_index(
+            &self,
+            r: Request<growlerdb_proto::v1::ReindexIndexRequest>,
+        ) -> Result<Response<growlerdb_proto::v1::ReindexIndexResponse>, Status> {
+            let req = r.into_inner();
+            self.reindexed
+                .lock()
+                .unwrap()
+                .push((req.shard_ordinal, req.bucket_owners.len()));
+            if let Some((entered, release)) = &self.gate {
+                entered.notify_one();
+                release.notified().await;
+            }
+            Ok(Response::new(growlerdb_proto::v1::ReindexIndexResponse {
+                doc_count: 0,
+                snapshot: 1,
+            }))
+        }
+        async fn reconcile_index(
+            &self,
+            _r: Request<growlerdb_proto::v1::ReconcileIndexRequest>,
+        ) -> Result<Response<growlerdb_proto::v1::ReconcileIndexResponse>, Status> {
+            Err(Status::unimplemented("stub"))
+        }
+        async fn compact_index(
+            &self,
+            _r: Request<growlerdb_proto::v1::CompactIndexRequest>,
+        ) -> Result<Response<growlerdb_proto::v1::CompactIndexResponse>, Status> {
+            Err(Status::unimplemented("stub"))
+        }
+        async fn backup_index(
+            &self,
+            _r: Request<growlerdb_proto::v1::BackupIndexRequest>,
+        ) -> Result<Response<growlerdb_proto::v1::BackupIndexResponse>, Status> {
+            Err(Status::unimplemented("stub"))
+        }
+        async fn backup_status(
+            &self,
+            _r: Request<growlerdb_proto::v1::BackupStatusRequest>,
+        ) -> Result<Response<growlerdb_proto::v1::BackupStatusResponse>, Status> {
+            Err(Status::unimplemented("stub"))
+        }
+    }
+
+    /// Serve `stub` on an ephemeral port; return its routable endpoint.
+    async fn spawn_stub_node(stub: StubNodeAdmin) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(growlerdb_proto::AdminServer::new(stub))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        format!("http://{addr}")
+    }
+
+    async fn register(svc: &ControlPlaneService, def_json: &str, ep: &str, total: u32, ord: u32) {
+        svc.register_served_index(Request::new(RegisterServedIndexRequest {
+            definition_json: def_json.to_string(),
+            endpoint: ep.into(),
+            shard_count: total,
+            shard_ordinals: vec![ord],
+            windows: vec![],
+        }))
+        .await
+        .unwrap();
+    }
+
+    /// The full online grow for a **normally-created** index: nodes announce (adopting the
+    /// bucket map), the growth build target registers with the new total WITHOUT flipping live
+    /// routing, and apply builds → cuts over → trims. This is the path that used to deadlock:
+    /// deriving the current count from the registered-node count made `current == new` the
+    /// moment the build target registered, so no real index could ever reshard.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_normally_registered_index_completes_an_online_grow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path());
+        let def_json = serde_json::to_string(&resolved("docs")).unwrap();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stub = |log: &Arc<std::sync::Mutex<Vec<(u32, usize)>>>| StubNodeAdmin {
+            reindexed: log.clone(),
+            gate: None,
+        };
+
+        // The index's original two nodes announce → the balanced(2) map is adopted.
+        let ep0 = spawn_stub_node(stub(&log)).await;
+        let ep1 = spawn_stub_node(stub(&log)).await;
+        register(&svc, &def_json, &ep0, 2, 0).await;
+        register(&svc, &def_json, &ep1, 2, 1).await;
+        assert_eq!(
+            svc.registry.bucket_map("docs"),
+            Some(BucketMap::balanced(2))
+        );
+
+        // Bring up + register the growth build target with the NEW total (as apply requires).
+        // Live routing must NOT change: the map still covers 2 shards.
+        let ep2 = spawn_stub_node(stub(&log)).await;
+        register(&svc, &def_json, &ep2, 3, 2).await;
+        assert_eq!(
+            svc.registry.bucket_map("docs"),
+            Some(BucketMap::balanced(2))
+        );
+
+        // Plan derives from the STORED map (2 shards), not the registered count (3): real moves.
+        let plan = svc
+            .plan_reshard(Request::new(PlanReshardRequest {
+                index: "docs".into(),
+                new_shard_count: 3,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!plan.moved.is_empty(), "growth plan has buckets to move");
+
+        // Apply: build the new shard, cut over, trim the old ones.
+        let resp = svc
+            .apply_reshard(Request::new(ApplyReshardRequest {
+                index: "docs".into(),
+                new_shard_count: 3,
+            }))
+            .await
+            .expect("a normally-registered index must be able to grow")
+            .into_inner();
+        assert_eq!(resp.built_shards, vec![2]);
+        assert_eq!(resp.trimmed_shards, vec![0, 1]);
+        assert_eq!(svc.registry.bucket_map("docs").unwrap().shards(), 3);
+
+        // The stubs really received the rebuild (shard 2 first) then the trims, each with the
+        // full owner map.
+        let calls = log.lock().unwrap().clone();
+        assert_eq!(
+            calls.iter().map(|(o, _)| *o).collect::<Vec<_>>(),
+            vec![2, 0, 1]
+        );
+        assert!(calls
+            .iter()
+            .all(|(_, n)| *n == growlerdb_core::routing::NUM_BUCKETS as usize));
+    }
+
+    /// The cutover CAS: a placement op whose map changed under it mid-build is refused loudly
+    /// instead of last-write-wins reverting the concurrent op's ownership.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_placement_op_racing_another_cutover_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = Arc::new(service(tmp.path()));
+        let def_json = serde_json::to_string(&resolved("docs")).unwrap();
+
+        // Both stubs block their reindex until released — the deterministic interleave point
+        // (the move's build lands on whichever shard is the target).
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let gated = || StubNodeAdmin {
+            reindexed: Arc::default(),
+            gate: Some((entered.clone(), release.clone())),
+        };
+        let ep0 = spawn_stub_node(gated()).await;
+        let ep1 = spawn_stub_node(gated()).await;
+        register(&svc, &def_json, &ep0, 2, 0).await;
+        register(&svc, &def_json, &ep1, 2, 1).await;
+
+        // Start a bucket move onto shard 1; it reads the map, then blocks in the build.
+        let mover = {
+            let svc = svc.clone();
+            let owner0 = svc.registry.bucket_map("docs").unwrap().owner(0);
+            tokio::spawn(async move {
+                svc.move_bucket(Request::new(MoveBucketRequest {
+                    index: "docs".into(),
+                    bucket: 0,
+                    to_shard: 1 - owner0, // whichever shard doesn't own bucket 0
+                }))
+                .await
+            })
+        };
+        entered.notified().await;
+
+        // A concurrent placement op commits while the move is mid-build.
+        let current = svc.registry.bucket_map("docs").unwrap();
+        let other = current.with_owner(5, 1 - current.owner(5)).unwrap();
+        svc.registry
+            .set_bucket_map("docs", Some(&current), &other)
+            .unwrap();
+
+        // The mover finishes its build and hits the CAS: loud FAILED_PRECONDITION, and the
+        // concurrent commit survives untouched.
+        release.notify_one();
+        let err = mover.await.unwrap().unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(svc.registry.bucket_map("docs").unwrap(), other);
     }
 }

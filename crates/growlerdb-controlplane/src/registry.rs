@@ -237,6 +237,10 @@ pub enum RegistryError {
     /// filesystem path component).
     #[error("invalid definition: {0}")]
     InvalidDefinition(String),
+    /// A [`set_bucket_map`](Registry::set_bucket_map) whose expected prior map no longer matches:
+    /// another placement op (reshard / bucket move) committed in between. Re-plan and retry.
+    #[error("placement of `{0}` changed while this operation ran — re-plan and retry")]
+    PlacementConflict(String),
     /// An operation named an index that is not registered.
     #[error("index `{0}` not found")]
     NotFound(String),
@@ -1219,16 +1223,51 @@ impl Registry {
         }
     }
 
-    /// Store `map` as `index`'s bucket→shard assignment (adopting bucketed routing), then persist.
-    /// Errors if the index is unknown.
-    pub fn set_bucket_map(&self, index: &str, map: &BucketMap) -> Result<()> {
+    /// Store `map` as `index`'s bucket→shard assignment, then persist — **compare-and-swap**:
+    /// `expected` must match the stored map (`None` = expects no map yet) or the write is refused
+    /// with [`PlacementConflict`](RegistryError::PlacementConflict). Placement ops
+    /// (apply-reshard, move-bucket) read the map, run a minutes-long source rebuild, and commit
+    /// here; without the CAS two concurrent ops would last-write-wins clobber each other — e.g. a
+    /// finished move-bucket committing a map derived from *before* a reshard's cutover would
+    /// revert the entire reshard's ownership while the data already lives under the new map.
+    pub fn set_bucket_map(
+        &self,
+        index: &str,
+        expected: Option<&BucketMap>,
+        map: &BucketMap,
+    ) -> Result<()> {
         let mut indexes = self.write_map();
         let entry = indexes
             .get_mut(index)
             .ok_or_else(|| RegistryError::NotFound(index.to_string()))?;
+        let expected_owners = expected.map(|m| m.owners()).unwrap_or(&[]);
+        if entry.bucket_owners != expected_owners {
+            return Err(RegistryError::PlacementConflict(index.to_string()));
+        }
         entry.bucket_owners = map.owners().to_vec();
         drop(indexes);
         self.persist_snapshot()
+    }
+
+    /// Adopt a [balanced](BucketMap::balanced) bucket map over `shard_count` if the index has
+    /// none yet; a no-op (Ok(false)) when a map is already stored. Called on every served-index
+    /// registration, so **every ordinal index is bucketed from its first announce** — there is no
+    /// long-lived "legacy" routing state. Check-and-set under one write lock, so concurrent
+    /// first-registrations can't race; crucially, a node registering as a **growth build target**
+    /// (`--shards N+k` during a reshard) finds the map already present and leaves live routing
+    /// untouched until the reshard's cutover.
+    pub fn adopt_bucket_map_if_absent(&self, index: &str, shard_count: u32) -> Result<bool> {
+        let mut indexes = self.write_map();
+        let entry = indexes
+            .get_mut(index)
+            .ok_or_else(|| RegistryError::NotFound(index.to_string()))?;
+        if !entry.bucket_owners.is_empty() {
+            return Ok(false);
+        }
+        entry.bucket_owners = BucketMap::balanced(shard_count.max(1)).owners().to_vec();
+        drop(indexes);
+        self.persist_snapshot()?;
+        Ok(true)
     }
 
     /// The bucket map `index` routes through **today** — its stored map, or the
@@ -1935,16 +1974,47 @@ mod tests {
             // No stored map ⇒ legacy routing.
             assert!(reg.bucket_map("docs").is_none());
 
-            // Storing a balanced(4) map adopts buckets; it reads back identically.
+            // Storing a balanced(4) map adopts buckets; it reads back identically. The CAS
+            // expectation is `None` — no map stored yet.
             let map = BucketMap::balanced(4);
-            reg.set_bucket_map("docs", &map).unwrap();
+            reg.set_bucket_map("docs", None, &map).unwrap();
             assert_eq!(reg.bucket_map("docs"), Some(map.clone()));
+
+            // CAS: a writer whose expectation is stale (still `None`, or a different map) is
+            // refused — a concurrent placement op committed in between.
+            let stale = reg.set_bucket_map("docs", None, &BucketMap::balanced(5));
+            assert!(matches!(stale, Err(RegistryError::PlacementConflict(_))));
+            let other = BucketMap::balanced(2);
+            let stale = reg.set_bucket_map("docs", Some(&other), &BucketMap::balanced(5));
+            assert!(matches!(stale, Err(RegistryError::PlacementConflict(_))));
+            // The matching expectation commits.
+            reg.set_bucket_map("docs", Some(&map), &BucketMap::balanced(5))
+                .unwrap();
+            reg.set_bucket_map("docs", Some(&BucketMap::balanced(5)), &map)
+                .unwrap();
         }
         // Survives a reopen (persisted in registry.json).
         let reg = Registry::open(&path).unwrap();
         assert_eq!(reg.bucket_map("docs"), Some(BucketMap::balanced(4)));
         // Unknown index ⇒ None, not an error.
         assert!(reg.bucket_map("nope").is_none());
+    }
+
+    #[test]
+    fn adopt_bucket_map_is_first_registration_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
+        reg.create(resolved("docs")).unwrap();
+
+        // First announce (a 2-shard index) adopts balanced(2).
+        assert!(reg.adopt_bucket_map_if_absent("docs", 2).unwrap());
+        assert_eq!(reg.bucket_map("docs"), Some(BucketMap::balanced(2)));
+
+        // A re-announce is a no-op, and — the reshard-critical case — a growth build target
+        // registering with the NEW total must not touch live routing before the cutover.
+        assert!(!reg.adopt_bucket_map_if_absent("docs", 2).unwrap());
+        assert!(!reg.adopt_bucket_map_if_absent("docs", 3).unwrap());
+        assert_eq!(reg.bucket_map("docs"), Some(BucketMap::balanced(2)));
     }
 
     #[test]
