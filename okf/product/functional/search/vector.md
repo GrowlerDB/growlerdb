@@ -80,15 +80,26 @@ This is where semantic recall complements exact-term precision: on a real-model 
 queries (zero lexical term overlap), hybrid strictly beats lexical-only. The optional
 [reranker](/system/decisions/d21-reranker.md) is the remaining refinement.
 
+**On the authenticated gateway.** Semantic and hybrid search are exposed on the multi-shard gateway
+(gRPC `SemanticSearch` + REST `/v1/search:semantic` and `/v1/search:hybrid`), not just the embedded
+engine. The **query is embedded on each node**, not the gateway ([D43](/system/decisions/d43-node-local-query-embedding.md)):
+a node already holds the embedding model and the field's config for ingest, and embedding is
+deterministic, so per-shard embedding yields the same vector — and the gateway stays free of the ML
+dependency. The gateway is pure orchestration: it scatters the query, gathers each shard's top-K,
+merges by score (semantic), and — for hybrid — also runs the lexical fan-out and **RRF-fuses** the two
+merged lists.
+
 **Tenant safety.** The mandatory, non-widenable [`tenant = <claim>` filter](/product/functional/rbac-and-tenancy.md)
-is now enforced on the vector path too: the tenant `Term` rides **inside** the KNN as a filter (the
-lexical arm gets the usual `and_filter`), so neighbors are intersected with the caller's tenant docs and
-cannot cross tenants. A tenant-scoped index with **no** verified claim still **fails closed** (refuses)
-rather than returning nearest neighbors unscoped. Semantic / hybrid search remain on the native engine
-API for now — exposing them on the authenticated gateway is a later surface, but the tenant enforcement
-that makes that safe is in place.
+is enforced on the vector path too, **at the node**: the verified tenant `Term` rides **inside** the KNN
+as a filter (the lexical arm gets the usual `and_filter`), so neighbors are intersected with the caller's
+tenant docs and cannot cross tenants — a query-supplied filter cannot widen past the claim. A
+tenant-scoped index with **no** verified claim **fails closed** (refuses) rather than returning nearest
+neighbors unscoped. (Tenancy stays opt-in — a single-tenant index carries no `tenant_field` and this is
+a no-op; see [RBAC & tenancy](/product/functional/rbac-and-tenancy.md).)
 
 > **Status.** In active build (M5). Shipped: the **field type, local BGE embedding at ingest (Candle),
 > the `Embedder` seam, per-document vector storage, the per-segment ANN sidecar (backed up), top-level
-> KNN, filtered / tenant-scoped KNN, and RRF hybrid fusion**. The optional **reranker** follows — see
+> KNN, filtered / tenant-scoped KNN, RRF hybrid fusion, and the authenticated multi-shard gateway
+> surface** (gRPC + REST, node-local embedding). The optional **reranker**, the **console** search-mode
+> UX, and **distributed windowed** semantic search follow — see
 > [known limitations](/quality/known-limitations/index.md). The interface and stored format are stable.

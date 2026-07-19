@@ -2329,6 +2329,14 @@ impl Shard {
         self.schema.tenant_field()
     }
 
+    /// The [`VectorSpec`](growlerdb_core::VectorSpec) of the VECTOR field named `field`, or `None`
+    /// if `field` is not a VECTOR field on this shard's index. The node's semantic-search handler
+    /// reads this to embed a query with the field's configured embedder (the same space its
+    /// documents were embedded in at ingest).
+    pub fn vector_spec(&self, field: &str) -> Option<&growlerdb_core::VectorSpec> {
+        self.schema.vector_spec(field)
+    }
+
     /// The index's **location strategy** (D30): `COORDINATES` (per-row
     /// location data in the layered locator) or `PREDICATE` (store-less — hydration
     /// re-finds rows by a pruned key scan). The engine's hydration path branches on

@@ -207,10 +207,44 @@ message AggregateResponse {
   uint32 failed_shards = 3;
 }
 
+// **Semantic (KNN) search** over a VECTOR field. The query travels as *text*: the Node embeds
+// `query_text` with the vector field's configured embedder (node-side embedding — the Gateway
+// carries no ML model), builds a top-level KNN, and returns the `k` nearest documents' coordinates
+// + KNN scores in a `SearchResponse` (`SearchHit.score` carries the KNN score). A tenant-scoped
+// index injects the mandatory tenant filter *inside* the KNN (fail-closed with no claim).
+message SemanticSearchRequest {
+  string index = 1;         // target index name; empty = the endpoint's default/only index
+  string vector_field = 2;  // the VECTOR field to embed + search
+  string query_text = 3;    // the query text the Node embeds (node-side embedding)
+  uint32 k = 4;             // number of nearest neighbors
+  string filter = 5;        // optional lexical/fast-field filter STRING, parsed into the KNN's filter
+  QuerySyntax syntax = 6;   // grammar for `filter` (Lucene default)
+  // Time-window selector for distributed windowed routing, mirroring SearchRequest.window:
+  // gateway-set per scattered window; 0 = not windowed, ignored by a single-shard node.
+  int64 window = 7;
+}
+
+// **Hybrid search** — a Gateway-only orchestration surface (no node RPC): the Gateway runs BOTH a
+// lexical (BM25) `Search` over `query_text` AND a `SemanticSearch` over `vector_field`, then
+// Reciprocal-Rank-Fuses the two ranked lists. The Gateway embeds nothing; each Node embeds its own
+// arm. Reuses `SearchResponse` (the fused ranking; `SearchHit.score` carries the RRF score).
+message HybridSearchRequest {
+  string index = 1;         // target index name; empty = the endpoint's default/only index
+  string vector_field = 2;  // the VECTOR field the semantic arm embeds + searches
+  string query_text = 3;    // drives BOTH arms: lexical query string + text the Nodes embed
+  uint32 k = 4;             // number of fused results to return
+  string filter = 5;        // optional lexical/fast-field filter STRING for the semantic arm's KNN
+  QuerySyntax syntax = 6;   // grammar for `query_text` (lexical arm) + `filter` (Lucene default)
+  uint32 rrf_k = 7;         // RRF constant (0 ⇒ the standard default, 60)
+}
+
 // Read-side query service over a shard (adapts the in-process IndexReader).
 service Search {
   // Execute a query string and return ranked coordinates + scores.
   rpc Search(SearchRequest) returns (SearchResponse);
+  // Semantic (KNN) search over a VECTOR field: the Node embeds `query_text` and returns the
+  // nearest documents' coordinates + KNN scores.
+  rpc SemanticSearch(SemanticSearchRequest) returns (SearchResponse);
   // Open / close a point-in-time snapshot for consistent reads + export.
   rpc OpenPit(OpenPitRequest) returns (OpenPitResponse);
   rpc ClosePit(ClosePitRequest) returns (ClosePitResponse);

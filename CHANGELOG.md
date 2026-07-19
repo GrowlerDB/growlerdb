@@ -32,6 +32,12 @@ All notable changes to GrowlerDB are documented here. The format is based on
   so tenant-scoped semantic/hybrid search is filtered rather than refused — still fail-closed when a
   scoped index has no verified claim. On a real-model paraphrase eval, hybrid strictly beats
   lexical-only. Engine-facade for now (gateway exposure is a later surface). (TASK-43)
+- **Semantic + hybrid search on the authenticated gateway.** Exposed multi-shard over gRPC
+  (`SemanticSearch`) and REST (`/v1/search:semantic`, `/v1/search:hybrid`). The query is embedded on
+  each **node** (the gateway carries no embedding model — [D43](okf/system/decisions/d43-node-local-query-embedding.md));
+  the gateway scatters, merges by score, and RRF-fuses the lexical + vector arms for hybrid. The
+  mandatory tenant filter is enforced at the node on the vector path (fail-closed without a claim), so
+  tenant isolation holds on semantic/hybrid exactly as on lexical. (TASK-302)
 
 ## [0.3.0] - 2026-07-18
 

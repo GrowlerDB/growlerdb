@@ -21,7 +21,7 @@ use growlerdb_proto::v1::{
     BackupIndexResponse, BackupStatusRequest, BackupStatusResponse, CompactIndexRequest,
     CompactIndexResponse, DescribeIndexRequest, DescribeIndexResponse, ExplainRequest,
     ExplainResponse, GetByKeyRequest, GetByKeyResponse, ReindexIndexRequest, ReindexIndexResponse,
-    SearchRequest, SearchResponse, SuggestRequest, SuggestResponse,
+    SearchRequest, SearchResponse, SemanticSearchRequest, SuggestRequest, SuggestResponse,
 };
 use growlerdb_proto::{Admin, Lookup, Search, Suggest};
 use tonic::transport::{Channel, Endpoint};
@@ -44,6 +44,18 @@ pub trait Node: Send + Sync {
     /// Run a search against the Node's shard.
     async fn search(&self, req: Request<SearchRequest>)
         -> Result<Response<SearchResponse>, Status>;
+
+    /// Semantic (KNN) search against the Node's shard: the Node embeds the request's `query_text`
+    /// with the vector field's embedder and returns the nearest documents' coordinates + KNN
+    /// scores. Defaults to `Unimplemented` so simple Node impls (and test stubs / windowed nodes
+    /// that don't yet serve vector search) need not provide it; [`LocalNode`]/[`RemoteNode`]
+    /// override it.
+    async fn semantic_search(
+        &self,
+        _req: Request<SemanticSearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        Err(Status::unimplemented("semantic_search"))
+    }
     /// Term suggestions (autocomplete / did-you-mean).
     async fn suggest(
         &self,
@@ -168,6 +180,13 @@ impl Node for LocalNode {
         req: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         Search::search(&self.search, req).await
+    }
+
+    async fn semantic_search(
+        &self,
+        req: Request<SemanticSearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        Search::semantic_search(&self.search, req).await
     }
 
     async fn suggest(
@@ -331,6 +350,13 @@ impl Node for RemoteNode {
     ) -> Result<Response<SearchResponse>, Status> {
         // tonic clients take `&mut self`; cloning is cheap (it shares the channel).
         self.search.clone().search(req).await
+    }
+
+    async fn semantic_search(
+        &self,
+        req: Request<SemanticSearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        self.search.clone().semantic_search(req).await
     }
 
     async fn suggest(

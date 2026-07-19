@@ -12,7 +12,7 @@ use growlerdb_proto::v1::{
     Error as WireError, ExplainClause, ExplainRequest, ExplainResponse, ExplainTimings,
     ExportRequest, Field, HighlightField, HighlightFragment as WireHighlightFragment,
     HighlightSegment as WireHighlightSegment, OpenPitRequest, OpenPitResponse, QuerySyntax,
-    SearchHit, SearchRequest, SearchResponse,
+    SearchHit, SearchRequest, SearchResponse, SemanticSearchRequest,
 };
 use growlerdb_proto::{to_status, Search, SearchServer};
 use tokio_stream::wrappers::ReceiverStream;
@@ -193,6 +193,87 @@ impl Search for SearchService {
         .map_err(store_status)?;
 
         Ok(Response::new(resp))
+    }
+
+    /// **Semantic (KNN) search** over a VECTOR field ([TASK-302]) — the node-side arm of the
+    /// authenticated gateway's semantic/hybrid search. The query arrives as *text*: this Node
+    /// embeds it with the vector field's configured embedder (the same [`embedder_for`] factory
+    /// ingest uses, so the query shares the documents' embedding space — no ML model at the
+    /// Gateway), builds a top-level [`Query::Knn`], and returns the nearest documents' coordinates
+    /// + KNN scores. Tenant scoping is enforced **fail-closed**: on a tenant-scoped index the
+    /// caller must present a verified claim (else `PermissionDenied`), injected *inside* the KNN
+    /// filter so no query-widening can escape it.
+    ///
+    /// [`embedder_for`]: growlerdb_embed::embedder_for
+    #[tracing::instrument(name = "node.semantic_search", skip_all, err)]
+    async fn semantic_search(
+        &self,
+        request: Request<SemanticSearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        auth::authorize(&self.auth, "Search", &request)?;
+        // Count a semantic search as query load too, so a cold window's promote-when-hot decision
+        // reflects it (mirrors the lexical path).
+        self.shard.record_search();
+        let tenant = auth::tenant_of(&request);
+        let req = request.into_inner();
+        let invalid =
+            |e: String| to_status(Code::InvalidArgument, WireError::new("INVALID_ARGUMENT", e));
+
+        let k = req.k as usize;
+        // Self-defend against an unbounded `k` the same way the lexical path guards `offset+limit`:
+        // a direct Node RPC bypasses the Gateway ceiling, so a giant `k` would build an enormous
+        // top-k and OOM the process.
+        if k > MAX_NODE_FETCH {
+            return Err(invalid(format!(
+                "k ({k}) exceeds the maximum page fetch ({MAX_NODE_FETCH})"
+            )));
+        }
+        let field = req.vector_field;
+
+        let shard = self.shard.current();
+        // The named field must be a VECTOR field — its `VectorSpec` drives the query embedder.
+        let spec = shard
+            .vector_spec(&field)
+            .ok_or_else(|| invalid(format!("`{field}` is not a VECTOR field on this index")))?
+            .clone();
+
+        // Embed the query text with the SAME factory ingest uses (real BGE when provisioned, else
+        // the deterministic hash fallback) — the query and the stored document vectors must come
+        // from one model or KNN compares across incompatible spaces.
+        let embedder = growlerdb_embed::embedder_for(&spec);
+        let mut vectors = embedder
+            .embed(&[req.query_text])
+            .map_err(|e| to_status(Code::Internal, WireError::new("INTERNAL", e.to_string())))?;
+        let vector = vectors.pop().unwrap_or_default();
+
+        // Parse the optional lexical/fast-field filter string into the KNN's `filter`.
+        let filter = if req.filter.trim().is_empty() {
+            None
+        } else {
+            let parsed = if req.syntax == QuerySyntax::Kql as i32 {
+                Query::parse_kql(&req.filter)
+            } else {
+                Query::parse(&req.filter)
+            }
+            .map_err(|e| invalid(e.to_string()))?;
+            Some(Box::new(parsed))
+        };
+
+        let query = Query::Knn {
+            field,
+            vector,
+            k,
+            filter,
+        };
+        // Tenant scoping (fail-closed): a tenant-scoped index injects the mandatory tenant Term
+        // *inside* the KNN filter; a scoped index with no claim is refused.
+        let query = tenant_scope_knn(&shard, query, tenant.as_deref())?;
+
+        let hits = tokio::task::spawn_blocking(move || shard.search_all(&query, k))
+            .await
+            .map_err(internal)?
+            .map_err(store_status)?;
+        Ok(Response::new(knn_response(hits)))
     }
 
     /// Explain how `query` scores one document. Locates the doc by coordinate, asks the
@@ -472,6 +553,55 @@ fn tenant_scope(shard: &Shard, query: Query, tenant: Option<&str>) -> Result<Que
     Ok(query.and_filter(field, tenant))
 }
 
+/// Apply **tenant scoping** to a [`Knn`](Query::Knn) read — the KNN analogue of [`tenant_scope`].
+/// If `shard` is tenant-scoped, the request must carry a verified `tenant` claim, and the
+/// mandatory `tenant_field = tenant` Term is AND-ed *inside* the KNN's filter (via
+/// [`with_knn_filter`](Query::with_knn_filter)), where the neighbor set is intersected with it —
+/// the caller can neither read nor widen past it. A tenant-scoped index with no claim is refused
+/// (`PermissionDenied`) — fail closed. Unscoped indexes pass through unchanged.
+fn tenant_scope_knn(shard: &Shard, query: Query, tenant: Option<&str>) -> Result<Query, Status> {
+    let Some(field) = shard.tenant_field() else {
+        return Ok(query);
+    };
+    let tenant = tenant.ok_or_else(|| {
+        to_status(
+            Code::PermissionDenied,
+            WireError::new(
+                "PERMISSION_DENIED",
+                format!("index is tenant-scoped on `{field}`; request carries no verified tenant"),
+            ),
+        )
+    })?;
+    Ok(query.with_knn_filter(Query::Term {
+        field: Some(field.to_string()),
+        value: tenant.to_string(),
+    }))
+}
+
+/// Build a [`SearchResponse`] from KNN hits: coordinates + KNN score (in `SearchHit.score`), plus
+/// any cached display fields. KNN is a top-`k` retrieval with no separate match count, so `total`
+/// is the number of hits returned; the Gateway re-merges these across shards to a global top-`k`.
+fn knn_response(hits: Vec<growlerdb_core::Hit>) -> SearchResponse {
+    SearchResponse {
+        total: hits.len() as u64,
+        hits: hits
+            .iter()
+            .map(|h| SearchHit {
+                coordinates: Some((&h.key).into()),
+                score: h.score as f64,
+                group: None,
+                group_count: 0,
+                sort_values: Vec::new(),
+                fields: hit_fields(&h.fields),
+                highlight: hit_highlight(&h.highlight),
+            })
+            .collect(),
+        next_cursor: Vec::new(),
+        partial: false,
+        ..Default::default()
+    }
+}
+
 /// Convert Tantivy's serialized `Explanation` JSON (`{value, description, details}`) into the
 /// wire [`ExplainClause`] tree. Returns `None` for a non-object (e.g. null = unmatched).
 fn json_to_clause(v: &serde_json::Value) -> Option<ExplainClause> {
@@ -615,7 +745,7 @@ mod tests {
         SourceCheckpoint, SourceField, SourceSchema, SourceType, Value,
     };
     use growlerdb_index::{LocalIndexStore, Shard, ShardId};
-    use growlerdb_proto::v1::{SearchRequest, Sort as WireSort};
+    use growlerdb_proto::v1::{SearchRequest, SemanticSearchRequest, Sort as WireSort};
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -1394,6 +1524,236 @@ mod tests {
             .segments
             .iter()
             .any(|s| !s.marked && s.text.contains("fox")));
+    }
+
+    // ---- Semantic (KNN) search over the node ---------------------------------
+
+    /// A non-tenant `docs` shard with a LOCAL VECTOR field (`body_vec`), each doc's body embedded
+    /// exactly as ingest would (via the same [`growlerdb_embed`] factory the node handler uses), so
+    /// a query embedded by that factory shares their space in CI (HashEmbedder fallback).
+    fn vector_service(root: &std::path::Path) -> SearchService {
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("body", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        let idx = IndexDefinition::from_yaml(
+            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD }, { path: body, type: TEXT }, { path: body_vec, type: VECTOR, vector: { dims: 64, source_field: body } } ] }\n",
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+        let shard = LocalIndexStore::open(root)
+            .unwrap()
+            .create_shard(&ShardId::single("docs"), &idx)
+            .unwrap();
+        let vdoc = |id: &str, body: &str| {
+            let key = CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]);
+            let mut f = BTreeMap::new();
+            f.insert("id".to_string(), Value::from(id));
+            f.insert("body".to_string(), Value::from(body));
+            LocatedDoc {
+                doc: Document::new(key, f),
+                iceberg_file: "f".into(),
+                row_position: 0,
+            }
+        };
+        let mut docs = vec![
+            vdoc("doc-1", "apache iceberg lakehouse tables"),
+            vdoc("doc-2", "full text search relevance ranking"),
+            vdoc("doc-3", "vector embeddings semantic retrieval"),
+        ];
+        growlerdb_embed::embed_located_docs(&idx, &mut docs);
+        IndexWriter::write(
+            &shard,
+            &CommitBatch::from_upserts(docs, SourceCheckpoint::iceberg(1), "b1"),
+        )
+        .unwrap();
+        SearchService::new(Arc::new(shard))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn semantic_search_returns_nearest_knn_hits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = vector_service(tmp.path());
+        // A query whose tokens overlap doc-3's body embeds nearest to it (HashEmbedder is a
+        // bag-of-tokens, so shared tokens ⇒ high similarity).
+        let resp = svc
+            .semantic_search(Request::new(SemanticSearchRequest {
+                vector_field: "body_vec".into(),
+                query_text: "semantic retrieval embeddings".into(),
+                k: 1,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.hits.len(), 1);
+        assert_eq!(id_of(&resp.hits[0]), "doc-3");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn semantic_search_on_a_non_vector_field_is_invalid_argument() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = vector_service(tmp.path());
+        let err = svc
+            .semantic_search(Request::new(SemanticSearchRequest {
+                vector_field: "body".into(), // a TEXT field, not VECTOR
+                query_text: "x".into(),
+                k: 1,
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("body"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn semantic_search_filter_constrains_the_knn_candidates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = vector_service(tmp.path());
+        // Even asking for the whole set, a keyword filter on `id` restricts the KNN to doc-1.
+        let resp = svc
+            .semantic_search(Request::new(SemanticSearchRequest {
+                vector_field: "body_vec".into(),
+                query_text: "vector embeddings semantic retrieval".into(),
+                k: 10,
+                filter: "id:doc-1".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let ids: Vec<String> = resp.hits.iter().map(id_of).collect();
+        assert_eq!(ids, vec!["doc-1"], "the filter constrains the KNN to doc-1");
+    }
+
+    /// A tenant-scoped vector shard (`tenant` KEYWORD + `body_vec` LOCAL VECTOR): tenant `t1` has
+    /// docs t1-a/t1-b; tenant `t2` has t2-a whose body matches t1-a's (an equally-near neighbor).
+    fn tenant_vector_service(root: &std::path::Path) -> SearchService {
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("tenant", SourceType::String),
+                SourceField::new("body", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        let idx = IndexDefinition::from_yaml(
+            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\ntenant_field: tenant\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD }, { path: tenant, type: KEYWORD }, { path: body, type: TEXT }, { path: body_vec, type: VECTOR, vector: { dims: 64, source_field: body } } ] }\n",
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+        let shard = LocalIndexStore::open(root)
+            .unwrap()
+            .create_shard(&ShardId::single("docs"), &idx)
+            .unwrap();
+        let tdoc = |id: &str, tenant: &str, body: &str| {
+            let key = CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]);
+            let mut f = BTreeMap::new();
+            f.insert("id".to_string(), Value::from(id));
+            f.insert("tenant".to_string(), Value::from(tenant));
+            f.insert("body".to_string(), Value::from(body));
+            LocatedDoc {
+                doc: Document::new(key, f),
+                iceberg_file: "f".into(),
+                row_position: 0,
+            }
+        };
+        let mut docs = vec![
+            tdoc("t1-a", "t1", "vector embeddings semantic retrieval"),
+            tdoc("t1-b", "t1", "apache iceberg lakehouse tables"),
+            tdoc("t2-a", "t2", "vector embeddings semantic retrieval"),
+        ];
+        growlerdb_embed::embed_located_docs(&idx, &mut docs);
+        IndexWriter::write(
+            &shard,
+            &CommitBatch::from_upserts(docs, SourceCheckpoint::iceberg(1), "b1"),
+        )
+        .unwrap();
+        SearchService::new(Arc::new(shard))
+    }
+
+    fn semantic_tenant_req(
+        field: &str,
+        query_text: &str,
+        k: u32,
+        tenant: Option<&str>,
+    ) -> Request<SemanticSearchRequest> {
+        let mut req = Request::new(SemanticSearchRequest {
+            vector_field: field.into(),
+            query_text: query_text.into(),
+            k,
+            ..Default::default()
+        });
+        if let Some(t) = tenant {
+            req.metadata_mut()
+                .insert("x-growlerdb-tenant", t.parse().unwrap());
+        }
+        req
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tenant_scoped_semantic_search_returns_only_the_callers_tenant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = tenant_vector_service(tmp.path());
+        // t2-a is an equally-near neighbor, but the claim `t1` must exclude it — only t1 docs.
+        let resp = svc
+            .semantic_search(semantic_tenant_req(
+                "body_vec",
+                "semantic retrieval embeddings",
+                5,
+                Some("t1"),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.hits.is_empty());
+        for h in &resp.hits {
+            assert!(
+                id_of(h).starts_with("t1-"),
+                "every hit must belong to tenant t1, got {}",
+                id_of(h)
+            );
+        }
+        assert!(!resp.hits.iter().any(|h| id_of(h) == "t2-a"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tenant_scoped_semantic_search_requires_a_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = tenant_vector_service(tmp.path());
+        // A scoped index with NO claim fails closed — never returns cross-tenant neighbors.
+        let err = svc
+            .semantic_search(semantic_tenant_req("body_vec", "x", 5, None))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_tenant_filter_clause_cannot_widen_the_knn_past_the_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = tenant_vector_service(tmp.path());
+        // t1 tries to OR in t2's rows via the filter; the mandatory tenant Term inside the KNN
+        // still binds, so t2-a never leaks.
+        let mut req =
+            semantic_tenant_req("body_vec", "semantic retrieval embeddings", 10, Some("t1"));
+        req.get_mut().filter = "tenant:t2 OR id:t1-a".into();
+        let resp = svc.semantic_search(req).await.unwrap().into_inner();
+        for h in &resp.hits {
+            assert!(
+                id_of(h).starts_with("t1-"),
+                "t2's docs must never leak, got {}",
+                id_of(h)
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

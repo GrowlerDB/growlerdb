@@ -27,7 +27,7 @@ use growlerdb_proto::v1::{
     DescribeIndexResponse, ExplainRequest, ExplainResponse, ExportRequest, GetByKeyRequest,
     GetByKeyResponse, OpenPitRequest, OpenPitResponse, ReconcileIndexRequest,
     ReconcileIndexResponse, ReindexIndexRequest, ReindexIndexResponse, SearchRequest,
-    SearchResponse, SuggestRequest, SuggestResponse,
+    SearchResponse, SemanticSearchRequest, SuggestRequest, SuggestResponse,
 };
 use growlerdb_proto::{
     Admin, AdminServer, Lookup, LookupServer, Search, SearchServer, Suggest, SuggestServer,
@@ -100,6 +100,17 @@ impl Search for WindowedSearchService {
         let window = request.get_ref().window;
         let svc = self.route(window)?;
         Search::search(&svc, request).await
+    }
+
+    async fn semantic_search(
+        &self,
+        request: Request<SemanticSearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        // The window selector picks the shard, exactly like `search`; the inner SearchService
+        // embeds + runs the KNN against it.
+        let window = request.get_ref().window;
+        let svc = self.route(window)?;
+        Search::semantic_search(&svc, request).await
     }
 
     async fn aggregate(

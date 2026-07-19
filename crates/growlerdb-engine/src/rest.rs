@@ -48,6 +48,8 @@ pub fn router(gateway: Arc<Gateway>) -> Router {
         .route("/v1/config", get(config_handler))
         .route("/v1/me", get(me_handler))
         .route("/v1/search", post(search_handler))
+        .route("/v1/search:semantic", post(semantic_handler))
+        .route("/v1/search:hybrid", post(hybrid_handler))
         .route("/v1/explain", post(explain_handler))
         .route("/v1/facets", post(facets_handler))
         .route("/v1/suggest", post(suggest_handler))
@@ -1222,6 +1224,33 @@ async fn search_handler(
     Ok(Json(SearchRespDto::from(resp.into_inner())))
 }
 
+/// `POST /v1/search:semantic` — **semantic (KNN) search** over a VECTOR field. The Gateway
+/// scatters the request to each shard; **each Node embeds `query_text`** (node-side embedding),
+/// runs the KNN, and the Gateway merges the nearest hits. Reuses [`SearchRespDto`] (the hit
+/// `score` carries the KNN score). Tenant scoping is enforced Node-side, fail-closed.
+async fn semantic_handler(
+    State(gw): State<Arc<Gateway>>,
+    headers: HeaderMap,
+    Json(dto): Json<SemanticSearchDto>,
+) -> Result<Json<SearchRespDto>, ApiError> {
+    let req = grpc_request(dto.into_proto(), &headers);
+    let resp = gw.semantic_search(req).await.map_err(ApiError::from)?;
+    Ok(Json(SearchRespDto::from(resp.into_inner())))
+}
+
+/// `POST /v1/search:hybrid` — **hybrid search**: the Gateway runs both a lexical (BM25) and a
+/// semantic (KNN) arm over `query_text` and Reciprocal-Rank-Fuses them. Reuses [`SearchRespDto`]
+/// (the hit `score` carries the fused RRF score).
+async fn hybrid_handler(
+    State(gw): State<Arc<Gateway>>,
+    headers: HeaderMap,
+    Json(dto): Json<HybridSearchDto>,
+) -> Result<Json<SearchRespDto>, ApiError> {
+    let req = grpc_request(dto.into_proto(), &headers);
+    let resp = gw.hybrid_search(req).await.map_err(ApiError::from)?;
+    Ok(Json(SearchRespDto::from(resp.into_inner())))
+}
+
 /// `GET /v1/me` — the verified caller's identity + roles, for the console's header/Settings.
 /// Authenticates the bearer at the gateway and returns the trusted `{ subject, display_name, email,
 /// tenant, roles }`. On an open gateway (no `--oidc-issuer`) returns the anonymous shape; a
@@ -1817,6 +1846,99 @@ impl SearchDto {
     }
 }
 
+/// Grammar selector shared by the search DTOs: `"kql"` → KQL, anything else → Lucene (default).
+fn syntax_to_proto(syntax: &str) -> i32 {
+    if syntax.eq_ignore_ascii_case("kql") {
+        growlerdb_proto::v1::QuerySyntax::Kql as i32
+    } else {
+        growlerdb_proto::v1::QuerySyntax::Lucene as i32
+    }
+}
+
+/// `POST /v1/search:semantic` body: embed `query_text` over `vector_field` and return the `k`
+/// nearest documents. `filter` is an optional lexical/fast-field constraint on the KNN.
+#[derive(Deserialize)]
+struct SemanticSearchDto {
+    /// The VECTOR field to embed + search.
+    vector_field: String,
+    /// The query text the Node embeds (node-side embedding).
+    query_text: String,
+    /// Number of nearest neighbors (0 ⇒ a bounded default page, like `/v1/search`).
+    #[serde(default)]
+    k: u32,
+    /// Optional lexical/fast-field filter string, parsed into the KNN's filter.
+    #[serde(default)]
+    filter: String,
+    /// Filter grammar: `"lucene"` (default) or `"kql"`.
+    #[serde(default)]
+    syntax: String,
+    /// Target index name. Empty = the endpoint's default index.
+    #[serde(default)]
+    index: String,
+}
+
+impl SemanticSearchDto {
+    fn into_proto(self) -> v1::SemanticSearchRequest {
+        v1::SemanticSearchRequest {
+            index: self.index,
+            vector_field: self.vector_field,
+            query_text: self.query_text,
+            k: if self.k == 0 {
+                DEFAULT_PAGE_SIZE
+            } else {
+                self.k
+            },
+            filter: self.filter,
+            syntax: syntax_to_proto(&self.syntax),
+            // The window selector is gateway-internal; a client request never sets it.
+            window: 0,
+        }
+    }
+}
+
+/// `POST /v1/search:hybrid` body: run BOTH a lexical (BM25) and a semantic (KNN) arm over
+/// `query_text` and Reciprocal-Rank-Fuse them.
+#[derive(Deserialize)]
+struct HybridSearchDto {
+    /// The VECTOR field the semantic arm embeds + searches.
+    vector_field: String,
+    /// Drives both arms: the lexical query string and the text the Nodes embed.
+    query_text: String,
+    /// Number of fused results (0 ⇒ a bounded default page).
+    #[serde(default)]
+    k: u32,
+    /// Optional lexical/fast-field filter string for the semantic arm's KNN.
+    #[serde(default)]
+    filter: String,
+    /// Grammar for the lexical `query_text` + `filter`: `"lucene"` (default) or `"kql"`.
+    #[serde(default)]
+    syntax: String,
+    /// RRF constant (0 ⇒ the standard default, 60).
+    #[serde(default)]
+    rrf_k: u32,
+    /// Target index name. Empty = the endpoint's default index.
+    #[serde(default)]
+    index: String,
+}
+
+impl HybridSearchDto {
+    fn into_proto(self) -> v1::HybridSearchRequest {
+        v1::HybridSearchRequest {
+            index: self.index,
+            vector_field: self.vector_field,
+            query_text: self.query_text,
+            k: if self.k == 0 {
+                DEFAULT_PAGE_SIZE
+            } else {
+                self.k
+            },
+            filter: self.filter,
+            syntax: syntax_to_proto(&self.syntax),
+            rrf_k: self.rrf_k,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct SearchRespDto {
     hits: Vec<HitDto>,
@@ -2394,6 +2516,101 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["1", "2"]);
         assert_eq!(body["total"], 2);
+    }
+
+    /// A `docs` shard with a LOCAL VECTOR field (`body_vec`), each doc's body embedded via the
+    /// same factory the node's semantic handler uses, so a query shares their space in CI.
+    fn vector_shard(root: &std::path::Path) -> Arc<Shard> {
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("body", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        let idx = IndexDefinition::from_yaml(
+            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD }, { path: body, type: TEXT }, { path: body_vec, type: VECTOR, vector: { dims: 64, source_field: body } } ] }\n",
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+        let shard = LocalIndexStore::open(root)
+            .unwrap()
+            .create_shard(&ShardId::single("docs"), &idx)
+            .unwrap();
+        let vdoc = |id: &str, body: &str| {
+            let key = CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]);
+            let mut f = BTreeMap::new();
+            f.insert("id".to_string(), Value::from(id));
+            f.insert("body".to_string(), Value::from(body));
+            LocatedDoc {
+                doc: Document::new(key, f),
+                iceberg_file: "f".into(),
+                row_position: 0,
+            }
+        };
+        let mut docs = vec![
+            vdoc("doc-1", "apache iceberg lakehouse tables"),
+            vdoc("doc-2", "vector embeddings semantic retrieval"),
+        ];
+        growlerdb_embed::embed_located_docs(&idx, &mut docs);
+        IndexWriter::write(
+            &shard,
+            &CommitBatch::from_upserts(docs, SourceCheckpoint::iceberg(1), "b1"),
+        )
+        .unwrap();
+        Arc::new(shard)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rest_semantic_search_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app(vector_shard(tmp.path()), crate::auth::default_auth());
+        let (status, body) = post(
+            &app,
+            "/v1/search:semantic",
+            json!({ "vector_field": "body_vec", "query_text": "semantic retrieval embeddings", "k": 1 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let ids: Vec<&str> = body["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["coordinates"]["identifier"][0]["value"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["doc-2"], "nearest neighbor is the matching body");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rest_hybrid_search_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app(vector_shard(tmp.path()), crate::auth::default_auth());
+        let (status, body) = post(
+            &app,
+            "/v1/search:hybrid",
+            json!({ "vector_field": "body_vec", "query_text": "vector embeddings semantic retrieval", "k": 10 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let hits = body["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "hybrid returns fused hits");
+        // The doc matching both lexically and semantically fuses to the top.
+        assert_eq!(hits[0]["coordinates"]["identifier"][0]["value"], "doc-2");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rest_semantic_search_on_a_non_vector_field_is_400() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app(vector_shard(tmp.path()), crate::auth::default_auth());
+        let (status, _) = post(
+            &app,
+            "/v1/search:semantic",
+            json!({ "vector_field": "body", "query_text": "x", "k": 1 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test(flavor = "current_thread")]

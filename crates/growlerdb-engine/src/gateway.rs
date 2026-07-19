@@ -40,9 +40,9 @@ use growlerdb_proto::v1::{
     AggregateRequest, AggregateResponse, AlterIndexRequest, AlterIndexResponse, BackupIndexRequest,
     BackupIndexResponse, BackupStatusRequest, BackupStatusResponse, CompactIndexRequest,
     CompactIndexResponse, Coordinates, DescribeIndexRequest, DescribeIndexResponse, ExplainRequest,
-    ExplainResponse, GetByKeyRequest, GetByKeyResponse, IndexStats, ReindexIndexRequest,
-    ReindexIndexResponse, SearchRequest, SearchResponse, SuggestRequest, SuggestResponse,
-    Suggestion,
+    ExplainResponse, GetByKeyRequest, GetByKeyResponse, HybridSearchRequest, IndexStats,
+    ReindexIndexRequest, ReindexIndexResponse, SearchHit, SearchRequest, SearchResponse,
+    SemanticSearchRequest, SuggestRequest, SuggestResponse, Suggestion,
 };
 use tonic::{Extensions, Request, Response, Status};
 
@@ -1121,6 +1121,161 @@ impl Gateway {
         }))
     }
 
+    /// Run a **semantic (KNN) search** ([TASK-302]). The Gateway is pure orchestration: it
+    /// resolves + authorizes the index, then scatters the `SemanticSearchRequest` to each shard —
+    /// **each Node embeds the query text itself** (the Gateway carries no ML model) — and merges the
+    /// KNN hits into one global top-`k` by score (the same score-merge + dedupe the lexical path
+    /// uses). Single-shard forwards verbatim. Tenant scoping is enforced Node-side, fail-closed.
+    pub async fn semantic_search(
+        &self,
+        mut req: Request<SemanticSearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        let index = req.get_ref().index.clone();
+        let route = self.guard_and_resolve("Search", &index, &mut req).await?;
+        // Page-fetch ceiling on `k`, mirroring the lexical path's `offset+limit` guard: an
+        // unbounded `k` would make every shard build a giant top-k and OOM the Gateway.
+        let k = req.get_ref().k as usize;
+        if self.limits.max_fetch > 0 && k > self.limits.max_fetch {
+            return Err(Status::invalid_argument(format!(
+                "k ({k}) exceeds the maximum page fetch ({}); request fewer neighbors",
+                self.limits.max_fetch
+            )));
+        }
+        let rs = route.routing();
+        let shards_total = rs.shards.len() as u32;
+        let shards = rs.shards.clone();
+        if shards.len() == 1 {
+            let mut resp = self.under_deadline(shards[0].semantic_search(req)).await?;
+            let r = resp.get_mut();
+            r.shards_scanned = 1;
+            r.shards_total = shards_total;
+            return Ok(resp);
+        }
+        let (meta, _ext, body) = req.into_parts();
+
+        let total_shards = shards.len();
+        let mut set = tokio::task::JoinSet::new();
+        for shard in &shards {
+            let shard = shard.clone();
+            let r = Request::from_parts(meta.clone(), Extensions::default(), body.clone());
+            let permit = self.fanout.clone();
+            set.spawn(async move {
+                let _permit = permit.acquire_owned().await; // bound concurrent fan-out
+                shard.semantic_search(r).await
+            });
+        }
+
+        let Fanout { bodies, errors } = gather_responses(set, self.limits.deadline).await;
+        let failed = total_shards - bodies.len();
+        if bodies.is_empty() {
+            return Err(all_shards_failed(
+                format!("all {total_shards} shards failed to respond"),
+                errors,
+            ));
+        }
+        let mut hits = Vec::new();
+        let mut total_matches = 0u64;
+        for r in bodies {
+            total_matches += r.total;
+            hits.extend(r.hits);
+        }
+        // KNN hits are score-ranked (no field sort) — merge by score desc + key tiebreak, dedupe
+        // (a reshard can briefly place a key on two shards), and keep the global top-`k`. Identical
+        // to the lexical `search_inner` score branch.
+        let hits = merge_score_topk(hits, k);
+        Ok(Response::new(SearchResponse {
+            hits,
+            total: total_matches,
+            next_cursor: Vec::new(),
+            partial: failed > 0,
+            shards_scanned: total_shards as u32,
+            shards_total,
+        }))
+    }
+
+    /// Run a **hybrid search** ([TASK-302]): fan out BOTH a lexical (BM25) [`search`](Self::search)
+    /// over `query_text` AND a [`semantic_search`](Self::semantic_search) over `vector_field`, each
+    /// already merged into a ranked list across shards, then **Reciprocal-Rank-Fuse** the two lists
+    /// at the Gateway. The Gateway embeds nothing — each Node embeds its own semantic arm. A doc
+    /// strong in *both* modalities fuses above one strong in only one. The two arms carry the same
+    /// auth metadata, so authz/tenant scoping binds each independently.
+    pub async fn hybrid_search(
+        &self,
+        req: Request<HybridSearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        let (meta, _ext, body) = req.into_parts();
+        let k = body.k as usize;
+        let rrf_k = if body.rrf_k == 0 {
+            HYBRID_RRF_K
+        } else {
+            body.rrf_k as usize
+        };
+        // Over-fetch each arm so the fusion has depth: a doc ranked past `k` in one arm can still
+        // win once the other arm's rank is added in.
+        let k_each = k.max(10).saturating_mul(2);
+        if self.limits.max_fetch > 0 && k_each > self.limits.max_fetch {
+            return Err(Status::invalid_argument(format!(
+                "hybrid k ({k}) over-fetches {k_each} per arm, exceeding the maximum page fetch ({})",
+                self.limits.max_fetch
+            )));
+        }
+
+        // Lexical arm: the query text as a BM25 query.
+        let lexical_req = Request::from_parts(
+            meta.clone(),
+            Extensions::default(),
+            SearchRequest {
+                query: body.query_text.clone(),
+                limit: k_each as u32,
+                index: body.index.clone(),
+                syntax: body.syntax,
+                ..Default::default()
+            },
+        );
+        // Semantic arm: the same text embedded Node-side over the vector field, same filter.
+        let semantic_req = Request::from_parts(
+            meta.clone(),
+            Extensions::default(),
+            SemanticSearchRequest {
+                index: body.index.clone(),
+                vector_field: body.vector_field.clone(),
+                query_text: body.query_text.clone(),
+                k: k_each as u32,
+                filter: body.filter.clone(),
+                syntax: body.syntax,
+                window: 0,
+            },
+        );
+
+        // The semantic arm defines the request (its vector field, index resolution, and authz), so
+        // surface its error verbatim. The lexical arm tolerates an unparseable/empty query — the
+        // fusion then just reflects the semantic ranking (mirroring the engine's MatchAll-fallback
+        // intent), rather than failing the whole hybrid on a query the vector arm handled fine.
+        let semantic = self.semantic_search(semantic_req).await?.into_inner();
+        let lexical = self.search(lexical_req).await.map(Response::into_inner);
+
+        let empty: &[SearchHit] = &[];
+        let lex_hits = lexical.as_ref().map(|r| r.hits.as_slice()).unwrap_or(empty);
+        let partial = semantic.partial || lexical.as_ref().map(|r| r.partial).unwrap_or(false);
+        let shards_scanned = semantic
+            .shards_scanned
+            .max(lexical.as_ref().map(|r| r.shards_scanned).unwrap_or(0));
+        let shards_total = semantic
+            .shards_total
+            .max(lexical.as_ref().map(|r| r.shards_total).unwrap_or(0));
+
+        let fused = rrf_fuse_hits(&[lex_hits, semantic.hits.as_slice()], rrf_k, k);
+        let total = fused.len() as u64;
+        Ok(Response::new(SearchResponse {
+            hits: fused,
+            total,
+            next_cursor: Vec::new(),
+            partial,
+            shards_scanned,
+            shards_total,
+        }))
+    }
+
     /// Run a suggest. Multi-shard: merge suggestions by text (summing counts), best (highest
     /// count) first, truncated to `limit`.
     pub async fn suggest(
@@ -1793,6 +1948,83 @@ fn merge_field_sorted(
         a.1.cmp(&b.1) // composite key ascending — the final, unique tiebreaker
     });
     decorated.into_iter().map(|(_, _, h)| h).collect()
+}
+
+/// The standard **RRF constant** (`k = 60`, Cormack et al. SIGIR 2009) for the Gateway's hybrid
+/// fusion — the same value the engine's embedded `rrf_fuse` uses. Dampens how much a top rank in
+/// any single arm contributes, so a doc must rank well across arms to rise.
+const HYBRID_RRF_K: usize = 60;
+
+/// Merge score-ranked hits from many shards into one global top-`k`: order by score descending
+/// with the encoded composite key as the deterministic tiebreaker, dedupe by key (a reshard can
+/// briefly place a key on two shards), and keep the first `k` (0 = keep all). This is the KNN /
+/// pure-relevance merge — the same rule the lexical `search_inner` score branch applies.
+fn merge_score_topk(hits: Vec<SearchHit>, k: usize) -> Vec<SearchHit> {
+    let mut decorated: Vec<(Vec<u8>, SearchHit)> =
+        hits.into_iter().map(|h| (hit_key(&h), h)).collect();
+    decorated.sort_by(|a, b| {
+        b.1.score
+            .partial_cmp(&a.1.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<SearchHit> = Vec::new();
+    for (key, hit) in decorated {
+        if !seen.insert(key) {
+            continue;
+        }
+        out.push(hit);
+        if k > 0 && out.len() == k {
+            break;
+        }
+    }
+    out
+}
+
+/// **Reciprocal Rank Fusion** of several ranked [`SearchHit`] lists into one ranking — the
+/// Gateway-side analogue of the engine's `rrf_fuse` (over `Hit`), operating on the already
+/// cross-shard-merged wire hits. For each list, the hit at 0-based `rank` contributes
+/// `1 / (k_rrf + rank + 1)` to that document's fused score (keyed by its encoded composite key);
+/// contributions sum across lists. The fused list sorts by score descending with the encoded key
+/// as a stable tiebreaker, then truncates to `limit` (0 = keep all). A doc present in only one arm
+/// still appears; one high in *both* outranks it. The representative hit prefers one carrying
+/// display `fields`/`highlight` (a lexical hit) over a bare vector hit, so it renders without
+/// hydration.
+fn rrf_fuse_hits(lists: &[&[SearchHit]], k_rrf: usize, limit: usize) -> Vec<SearchHit> {
+    let mut acc: HashMap<Vec<u8>, (f64, SearchHit)> = HashMap::new();
+    for list in lists {
+        for (rank, hit) in list.iter().enumerate() {
+            let contribution = 1.0 / (k_rrf as f64 + rank as f64 + 1.0);
+            let entry = acc
+                .entry(hit_key(hit))
+                .or_insert_with(|| (0.0, hit.clone()));
+            entry.0 += contribution;
+            if entry.1.fields.is_empty()
+                && entry.1.highlight.is_empty()
+                && (!hit.fields.is_empty() || !hit.highlight.is_empty())
+            {
+                entry.1 = hit.clone();
+            }
+        }
+    }
+    let mut fused: Vec<(Vec<u8>, SearchHit)> = acc
+        .into_iter()
+        .map(|(key, (score, mut hit))| {
+            hit.score = score;
+            (key, hit)
+        })
+        .collect();
+    fused.sort_by(|a, b| {
+        b.1.score
+            .partial_cmp(&a.1.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    if limit > 0 {
+        fused.truncate(limit);
+    }
+    fused.into_iter().map(|(_, h)| h).collect()
 }
 
 #[cfg(test)]
@@ -4371,6 +4603,145 @@ mod tests {
             assert_eq!(
                 id_of(&gw.search(req).await.unwrap().into_inner().hits[0]),
                 tag
+            );
+        }
+    }
+
+    // ---- Semantic + hybrid orchestration -------------------------------------
+
+    /// Build a wire [`SearchHit`] for `id` at `score` (KNN or BM25 score — the field is
+    /// modality-agnostic).
+    fn mk_hit(id: &str, score: f64) -> SearchHit {
+        use growlerdb_proto::v1::{value::Kind, Coordinates, Field, Value};
+        SearchHit {
+            coordinates: Some(Coordinates {
+                partition: vec![],
+                identifier: vec![Field {
+                    name: "id".into(),
+                    value: Some(Value {
+                        kind: Some(Kind::Str(id.into())),
+                    }),
+                }],
+            }),
+            score,
+            group: None,
+            group_count: 0,
+            sort_values: Vec::new(),
+            fields: vec![],
+            highlight: Default::default(),
+        }
+    }
+
+    /// A Node with canned **lexical** (`search`) and **semantic** (`semantic_search`) hit sets —
+    /// enough to prove the Gateway's cross-shard semantic merge and hybrid RRF fusion without a
+    /// real shard/embedder.
+    struct VectorNode {
+        lexical: Vec<(&'static str, f64)>,
+        semantic: Vec<(&'static str, f64)>,
+    }
+
+    #[tonic::async_trait]
+    impl Node for VectorNode {
+        async fn search(
+            &self,
+            _: Request<SearchRequest>,
+        ) -> Result<Response<SearchResponse>, Status> {
+            let hits: Vec<SearchHit> = self.lexical.iter().map(|(id, s)| mk_hit(id, *s)).collect();
+            let total = hits.len() as u64;
+            Ok(Response::new(SearchResponse {
+                hits,
+                total,
+                ..Default::default()
+            }))
+        }
+        async fn semantic_search(
+            &self,
+            _: Request<SemanticSearchRequest>,
+        ) -> Result<Response<SearchResponse>, Status> {
+            let hits: Vec<SearchHit> = self.semantic.iter().map(|(id, s)| mk_hit(id, *s)).collect();
+            let total = hits.len() as u64;
+            Ok(Response::new(SearchResponse {
+                hits,
+                total,
+                ..Default::default()
+            }))
+        }
+        async fn suggest(
+            &self,
+            _: Request<SuggestRequest>,
+        ) -> Result<Response<SuggestResponse>, Status> {
+            Err(Status::unimplemented("suggest"))
+        }
+        async fn get_by_key(
+            &self,
+            _: Request<GetByKeyRequest>,
+        ) -> Result<Response<GetByKeyResponse>, Status> {
+            Err(Status::unimplemented("get_by_key"))
+        }
+        async fn describe_index(
+            &self,
+            _: Request<DescribeIndexRequest>,
+        ) -> Result<Response<DescribeIndexResponse>, Status> {
+            Err(Status::unimplemented("describe_index"))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn semantic_search_merges_multi_shard_to_global_top_k() {
+        // Two shards' KNN candidates; the global top-2 by score spans both shards.
+        let a = Arc::new(VectorNode {
+            lexical: vec![],
+            semantic: vec![("a1", 0.9), ("a2", 0.2)],
+        });
+        let b = Arc::new(VectorNode {
+            lexical: vec![],
+            semantic: vec![("b1", 0.8), ("b2", 0.7)],
+        });
+        let gw = Gateway::sharded(vec![a, b]);
+        let resp = gw
+            .semantic_search(Request::new(SemanticSearchRequest {
+                vector_field: "body_vec".into(),
+                query_text: "q".into(),
+                k: 2,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let ids: Vec<String> = resp.hits.iter().map(id_of).collect();
+        // Global top-2 by score: a1 (0.9) then b1 (0.8) — a2/b2 drop off.
+        assert_eq!(ids, vec!["a1", "b1"]);
+        assert_eq!(resp.shards_scanned, 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_search_rrf_fuses_both_arms_and_the_both_modality_doc_wins() {
+        // `both` appears in BOTH arms; `lex` only lexically; `vec` only semantically. RRF sums the
+        // two arms so `both` outranks the single-modality docs, and all three appear.
+        let node = Arc::new(VectorNode {
+            lexical: vec![("both", 5.0), ("lex", 4.0)],
+            semantic: vec![("both", 0.9), ("vec", 0.8)],
+        });
+        let gw = Gateway::new(node);
+        let resp = gw
+            .hybrid_search(Request::new(HybridSearchRequest {
+                vector_field: "body_vec".into(),
+                query_text: "q".into(),
+                k: 10,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let ids: Vec<String> = resp.hits.iter().map(id_of).collect();
+        assert_eq!(
+            ids[0], "both",
+            "the both-modality doc fuses to the top: {ids:?}"
+        );
+        for want in ["both", "lex", "vec"] {
+            assert!(
+                ids.contains(&want.to_string()),
+                "{want} missing from {ids:?}"
             );
         }
     }
