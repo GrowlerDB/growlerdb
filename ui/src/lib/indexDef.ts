@@ -40,6 +40,27 @@ export interface TimeFieldInput {
   format: string;
 }
 
+/** Default embedding model for a vectorized field — the small English BGE model the local runtime
+ *  targets (mirrors the backend `DEFAULT_EMBED_MODEL`). */
+export const DEFAULT_EMBED_MODEL = 'bge-small-en-v1.5';
+/** Default embedding dimensionality — the width of {@link DEFAULT_EMBED_MODEL}'s output
+ *  (mirrors the backend `DEFAULT_EMBED_DIMS`). */
+export const DEFAULT_EMBED_DIMS = 384;
+
+/** Vectorize-a-field config: a TEXT `sourceField` is embedded into a new VECTOR field `path`.
+ *  Emitted as a `{ path, type: VECTOR, vector: { source_field, model, dims } }` mapping entry so
+ *  the index supports semantic/hybrid search. */
+export interface VectorFieldInput {
+  /** The VECTOR field path (name) to create, e.g. `body_vec`. */
+  path: string;
+  /** The TEXT source column whose value is embedded to produce the vector. */
+  sourceField: string;
+  /** Embedding model id — defaults to {@link DEFAULT_EMBED_MODEL}. */
+  model: string;
+  /** Embedding dimensionality — defaults to {@link DEFAULT_EMBED_DIMS}. */
+  dims: number;
+}
+
 /** Window granularities the backend accepts (`WindowGranularity`, lowercase serde). */
 export const WINDOW_GRANULARITIES: ReadonlyArray<{ value: string; label: string }> = [
   { value: 'hourly', label: 'Hourly' },
@@ -68,6 +89,9 @@ export interface DefinitionInput {
   /** Optional: time-window routing. Ignored unless `timeField` is also set — the window field is
    *  the declared `timeField`. */
   windowing?: WindowingInput | null;
+  /** Optional: vectorize a TEXT source column into a VECTOR field for semantic/hybrid search.
+   *  Ignored unless both its `path` and `sourceField` are set. */
+  vectorField?: VectorFieldInput | null;
 }
 
 /** Compose the index-definition YAML. The `catalog` is the table's namespace (the deployment's
@@ -90,6 +114,20 @@ export function buildDefinition(input: DefinitionInput): string {
   const overrideEntry = (t: TimeFieldInput) =>
     `{ path: ${t.path}, format: ${t.format}, fast: true }`;
 
+  // Optional vectorized field: a new VECTOR field derived from a TEXT source column. Only honored
+  // when both the field path and its source column are set. Emitted as its own mapping entry
+  // (never auto-derived — a vector has no source column of its own).
+  const vec =
+    input.vectorField && input.vectorField.path && input.vectorField.sourceField
+      ? input.vectorField
+      : null;
+  const vectorEntries = vec
+    ? [
+        `{ path: ${vec.path}, type: VECTOR, vector: ` +
+          `{ source_field: ${vec.sourceField}, model: ${vec.model}, dims: ${vec.dims} } }`,
+      ]
+    : [];
+
   const lines = [
     `name: ${input.name}`,
     `source: { iceberg: { catalog: ${catalog}, table: ${input.table} } }`,
@@ -104,11 +142,11 @@ export function buildDefinition(input: DefinitionInput): string {
   }
 
   if (input.selection === 'ALL') {
-    // Under ALL, `fields[]` are per-path overrides — so the only entries we need are time fields.
-    if (timeOverrides.length) {
-      lines.push(
-        `mapping: { selection: ALL, fields: [ ${timeOverrides.map(overrideEntry).join(', ')} ] }`,
-      );
+    // Under ALL, `fields[]` are per-path overrides/additions — so the only entries we need are the
+    // time-field overrides and any vectorized field (a derived VECTOR field, never auto-mapped).
+    const extra = [...timeOverrides.map(overrideEntry), ...vectorEntries];
+    if (extra.length) {
+      lines.push(`mapping: { selection: ALL, fields: [ ${extra.join(', ')} ] }`);
     } else {
       lines.push('mapping: { selection: ALL }');
     }
@@ -121,6 +159,8 @@ export function buildDefinition(input: DefinitionInput): string {
     const entries = mapped.map((f) => `{ path: ${f.path}, type: ${f.type} }`);
     // Include time fields even if unchecked, so they get indexed under the allowlist.
     entries.push(...timeOverrides.map(overrideEntry));
+    // The vectorized field (if any) is a new derived VECTOR field, appended last.
+    entries.push(...vectorEntries);
     lines.push(`mapping: { selection: EXPLICIT, fields: [ ${entries.join(', ')} ] }`);
   }
   return lines.join('\n') + '\n';

@@ -1,8 +1,11 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { t } from '../lib/i18n';
   import {
     search,
+    searchSemantic,
+    searchHybrid,
+    moreLikeThis,
     suggest,
     facets,
     listIndexes,
@@ -14,7 +17,9 @@
     type SortKey,
     type FacetGroup,
     type HighlightSegment,
+    type VectorFieldInfo,
   } from '../lib/api';
+  import { RRF_PRESETS, DEFAULT_RRF_K } from '../lib/vectorSearch';
   import { currentFieldToken, withCompletion } from '../lib/autocomplete';
   import { queryTermsByField, fieldTerms, type ScopedTerms } from '../lib/highlight';
   import { formatEpochMicros } from '../lib/results';
@@ -46,6 +51,14 @@
 
   let query = $state('');
   let syntax = $state<QuerySyntax>('lucene');
+  // Retrieval mode: lexical BM25 (default), semantic KNN, or hybrid (RRF-fused). Semantic/hybrid
+  // are only offered when the scoped index has a VECTOR field.
+  type SearchMode = 'lexical' | 'semantic' | 'hybrid';
+  let mode = $state<SearchMode>('lexical');
+  // The scoped index's VECTOR fields (from describe) + the selected one; the RRF fusion constant.
+  let vectorFields = $state<VectorFieldInfo[]>([]);
+  let vectorField = $state(''); // '' = none selected (index has no vector field)
+  let rrfK = $state(DEFAULT_RRF_K);
   let lastQuery = $state('');
   let scoped = $state<ScopedTerms>({ fields: {}, bare: [] });
   let hits = $state<SearchHit[]>([]);
@@ -97,6 +110,35 @@
   ]);
   // The active query syntax, shown as a pill inside the query field.
   const syntaxLabel = $derived(syntax === 'kql' ? t('search.kql') : t('search.lucene'));
+
+  // Vector search wiring. Semantic/Hybrid modes appear only when the index has a VECTOR field.
+  const hasVector = $derived(vectorFields.length > 0);
+  const modeOptions = $derived([
+    { value: 'lexical', label: t('search.modeLexical') },
+    ...(hasVector
+      ? [
+          { value: 'semantic', label: t('search.modeSemantic') },
+          { value: 'hybrid', label: t('search.modeHybrid') },
+        ]
+      : []),
+  ]);
+  const vectorFieldOptions = $derived(
+    vectorFields.map((v) => ({ value: v.name, label: v.dims ? `${v.name} · ${v.dims}d` : v.name })),
+  );
+  const rrfOptions = RRF_PRESETS.map((n) => ({ value: String(n), label: String(n) }));
+  // The VectorFieldInfo for the current selection — carries the `source_field` "more like this" seeds from.
+  const selectedVec = $derived(vectorFields.find((v) => v.name === vectorField));
+
+  // Re-run when the retrieval mode changes (like the sort/scope dropdowns do). Guarded against
+  // firing on unrelated state by tracking only `mode`; `searched` is read untracked.
+  let prevMode: SearchMode = 'lexical';
+  $effect(() => {
+    const m = mode;
+    if (m !== prevMode) {
+      prevMode = m;
+      if (untrack(() => searched)) run(0);
+    }
+  });
 
   // Time filter: the index's DATE columns + the chosen field/range. A resolved range is
   // ANDed into the query as `field:[fromUs TO toUs]` in canonical epoch **micros** — the
@@ -160,9 +202,20 @@
       // Drop a stale sort selection (e.g. after switching to an index without that field), so the
       // menu and the next query never carry a field this index can't sort on.
       if (sortField && !sortFields.includes(sortField)) sortField = '';
+      // Vector fields drive the semantic/hybrid modes + the vector-field picker.
+      vectorFields = stats?.vector_fields ?? [];
+      if (vectorFields.length > 0 && !vectorFields.some((v) => v.name === vectorField)) {
+        vectorField = vectorFields[0].name;
+      } else if (vectorFields.length === 0) {
+        vectorField = '';
+      }
+      // An index with no vector field can't serve semantic/hybrid — fall back to lexical.
+      if (vectorFields.length === 0 && mode !== 'lexical') mode = 'lexical';
     } catch {
       timeFields = [];
       sortFields = [];
+      vectorFields = [];
+      if (mode !== 'lexical') mode = 'lexical';
     }
   }
 
@@ -260,23 +313,116 @@
   function clauseOf(f: { field: string; value: string }): string {
     return `${f.field}:"${f.value.replace(/(["\\])/g, '\\$1')}"`;
   }
-  /** The query actually sent: the typed query ANDed with each active filter (score-neutral). */
-  function effectiveQuery(): string {
+  /** The active refinement clauses (time range + facet filters), independent of the typed query.
+   *  Lexical mode ANDs these into the query; semantic/hybrid pass them as the `filter` param. */
+  function filterClauses(): string[] {
     const parts: string[] = [];
-    if (query.trim()) parts.push(`(${query.trim()})`);
     const r = timeRange();
     // DATE columns are indexed in epoch micros; timeRange() is epoch ms → ×1000. Pruned
     // server-side.
     if (r) parts.push(`${timeField}:[${r.from * 1000} TO ${r.to * 1000}]`);
     for (const f of filters) parts.push(clauseOf(f));
+    return parts;
+  }
+  /** The query actually sent (lexical): the typed query ANDed with each active filter (score-neutral). */
+  function effectiveQuery(): string {
+    const parts: string[] = [];
+    if (query.trim()) parts.push(`(${query.trim()})`);
+    parts.push(...filterClauses());
     return parts.join(' AND ');
+  }
+  /** The refinement filter expression for semantic/hybrid's `filter` param (no typed query). */
+  function filterExpr(): string {
+    return filterClauses().join(' AND ');
   }
   function isActive(field: string, value: string): boolean {
     return filters.some((f) => f.field === field && f.value === value);
   }
 
-  /** Run a fresh search (page 1). Resets the keyset cursor; sorted runs scroll via {@link loadMore}. */
+  /** Run a fresh search (page 1). Dispatches by retrieval mode: lexical → BM25 `/v1/search`
+   *  (offset/keyset paging); semantic/hybrid → the vector endpoints (a single KNN/fused page). */
   async function run(from = 0) {
+    if (mode !== 'lexical') return runVector();
+    return runLexical(from);
+  }
+
+  /** Semantic (KNN) or hybrid (RRF-fused) retrieval over the selected VECTOR field. The typed text
+   *  is `query_text`; the time/facet refinement goes in `filter`. One page of `k` results — no
+   *  offset/keyset paging, no facet rail (a lexical-refinement concept). */
+  async function runVector() {
+    if (!vectorField || !query.trim()) return;
+    const seq = ++searchSeq;
+    loading = true;
+    error = '';
+    selected = null;
+    partialDismissed = false;
+    try {
+      const t0 = performance.now();
+      const common = { vectorField, filter: filterExpr(), syntax, index: scopeIndex || undefined };
+      const res =
+        mode === 'hybrid'
+          ? await searchHybrid(query.trim(), { ...common, rrfK })
+          : await searchSemantic(query.trim(), common);
+      if (seq !== searchSeq) return;
+      elapsedMs = Math.round(performance.now() - t0);
+      hits = res.hits ?? [];
+      total = res.total ?? hits.length;
+      partial = res.partial ?? false;
+      shardsScanned = res.shards_scanned ?? 0;
+      shardsTotal = res.shards_total ?? 0;
+      cursor = undefined;
+      offset = 0;
+      lastQuery = query.trim(); // the drawer's Explain re-parses this as a lexical query
+      scoped = queryTermsByField(query.trim());
+      searched = true;
+      facetGroups = []; // facets are a lexical refinement; not shown for vector modes
+    } catch (err) {
+      if (seq === searchSeq) error = String(err);
+    } finally {
+      if (seq === searchSeq) loading = false;
+    }
+  }
+
+  /** "More like this": switch to semantic mode and retrieve neighbors of `hit`, seeded by its own
+   *  source text (hydrated by key when the source field isn't cached on the hit). */
+  async function runMoreLike(hit: SearchHit) {
+    const vec = selectedVec ?? vectorFields[0];
+    if (!vec) return;
+    mode = 'semantic';
+    prevMode = 'semantic'; // adopt the mode without letting the change-effect double-run
+    vectorField = vec.name;
+    selected = null;
+    const seq = ++searchSeq;
+    loading = true;
+    error = '';
+    partialDismissed = false;
+    searched = true;
+    try {
+      const res = await moreLikeThis(hit, {
+        vectorField: vec.name,
+        sourceField: vec.source_field,
+        index: scopeIndex || undefined,
+        k: PAGE_SIZE,
+      });
+      if (seq !== searchSeq) return;
+      hits = res.hits ?? [];
+      total = res.total ?? hits.length;
+      partial = res.partial ?? false;
+      shardsScanned = res.shards_scanned ?? 0;
+      shardsTotal = res.shards_total ?? 0;
+      cursor = undefined;
+      offset = 0;
+      elapsedMs = null;
+      facetGroups = [];
+    } catch (err) {
+      if (seq === searchSeq) error = String(err);
+    } finally {
+      if (seq === searchSeq) loading = false;
+    }
+  }
+
+  /** Lexical BM25 search (page 1). Resets the keyset cursor; sorted runs scroll via {@link loadMore}. */
+  async function runLexical(from = 0) {
     const eq = effectiveQuery();
     if (!eq) return;
     const seq = ++searchSeq; // this run's generation
@@ -558,7 +704,35 @@
           <!-- Active-syntax pill inside the field. -->
           <span class="syntax-pill mono">{syntaxLabel}</span>
         </div>
+        {#if hasVector}
+          <Segmented options={modeOptions} bind:value={mode} label={t('search.mode')} />
+        {/if}
         <Segmented options={syntaxOptions} bind:value={syntax} label={t('search.syntax')} />
+        {#if mode !== 'lexical'}
+          <Dropdown
+            bind:value={vectorField}
+            options={vectorFieldOptions}
+            label={t('search.vectorField')}
+            ariaLabel={t('search.vectorField')}
+            mono
+            onchange={() => {
+              if (searched) run(0);
+            }}
+          />
+        {/if}
+        {#if mode === 'hybrid'}
+          <Dropdown
+            value={String(rrfK)}
+            options={rrfOptions}
+            label={t('search.rrfK')}
+            ariaLabel={t('search.rrfK')}
+            width={140}
+            onchange={(v) => {
+              rrfK = Number(v);
+              if (searched) run(0);
+            }}
+          />
+        {/if}
         <button class="primary" type="submit" disabled={loading}>
           {t('search.run')}
         </button>
@@ -596,16 +770,18 @@
     {/if}
     <div class="spacer"></div>
     {#if searched && !error}
-      <label class="sort">
-        <span class="sr-only">{t('search.sort')}</span>
-        <Dropdown
-          bind:value={sortField}
-          options={sortOptions}
-          label={t('search.sort')}
-          ariaLabel={t('search.sort')}
-          onchange={rerun}
-        />
-      </label>
+      {#if mode === 'lexical'}
+        <label class="sort">
+          <span class="sr-only">{t('search.sort')}</span>
+          <Dropdown
+            bind:value={sortField}
+            options={sortOptions}
+            label={t('search.sort')}
+            ariaLabel={t('search.sort')}
+            onchange={rerun}
+          />
+        </label>
+      {/if}
       <div class="actions">
         <button type="button" onclick={exportJson} disabled={hits.length === 0}>
           {t('search.exportJson')}
@@ -887,6 +1063,8 @@
       query={lastQuery}
       {syntax}
       index={scopeIndex}
+      moreLikeThis={hasVector ? t('search.moreLikeThis') : undefined}
+      onMoreLikeThis={hasVector ? () => selected && runMoreLike(selected) : undefined}
       onClose={() => (selected = null)}
     />
   {/key}

@@ -2140,6 +2140,36 @@ struct IndexStatsDto {
     /// Mapped sortable fields (numeric/date/keyword, `fast`) — the console's sort menu.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     sort_fields: Vec<String>,
+    /// The index's VECTOR fields — the console's semantic/hybrid vector-field picker. Each carries
+    /// the field path plus its embedding config (source text field, model, dims). Empty (and
+    /// omitted) for a non-vector index.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    vector_fields: Vec<VectorFieldDto>,
+}
+
+/// One VECTOR field on the describe response: its path plus the embedding config a console needs
+/// to offer semantic/hybrid search over it.
+#[derive(Serialize)]
+struct VectorFieldDto {
+    /// The VECTOR field path — what a semantic/hybrid request targets.
+    name: String,
+    /// The text field whose value is embedded to produce this vector.
+    source_field: String,
+    /// Embedding model id.
+    model: String,
+    /// Embedding dimensionality (vector length).
+    dims: u32,
+}
+
+impl From<v1::VectorFieldStat> for VectorFieldDto {
+    fn from(v: v1::VectorFieldStat) -> Self {
+        VectorFieldDto {
+            name: v.name,
+            source_field: v.source_field,
+            model: v.model,
+            dims: v.dims,
+        }
+    }
 }
 
 impl From<v1::IndexStats> for IndexStatsDto {
@@ -2152,6 +2182,11 @@ impl From<v1::IndexStats> for IndexStatsDto {
             checkpoint: s.checkpoint,
             time_fields: s.time_fields,
             sort_fields: s.sort_fields,
+            vector_fields: s
+                .vector_fields
+                .into_iter()
+                .map(VectorFieldDto::from)
+                .collect(),
         }
     }
 }

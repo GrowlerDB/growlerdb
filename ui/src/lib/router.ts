@@ -2,7 +2,7 @@
 // client routes are real paths.
 import { writable } from 'svelte/store';
 
-export const routes = ['/', '/indexes', '/observability', '/settings'] as const;
+export const routes = ['/', '/rag', '/indexes', '/observability', '/settings'] as const;
 export type Route = (typeof routes)[number];
 
 function normalize(pathname: string): Route {

@@ -20,6 +20,7 @@ use growlerdb_proto::v1::{
     BackupIndexResponse, BackupStatusRequest, BackupStatusResponse, CompactIndexRequest,
     CompactIndexResponse, DescribeIndexRequest, DescribeIndexResponse, IndexStats,
     ReconcileIndexRequest, ReconcileIndexResponse, ReindexIndexRequest, ReindexIndexResponse,
+    VectorFieldStat,
 };
 use growlerdb_proto::{Admin, AdminServer};
 use growlerdb_source::{IcebergConfig, IcebergReader};
@@ -339,6 +340,17 @@ impl Admin for AdminService {
                 size_bytes: shard.size_bytes(), // per-shard on-disk size (skew signal)
                 time_fields: shard.date_fields(), // DATE columns for the console time filter
                 sort_fields: shard.sort_fields(), // sortable fast fields for the console sort menu
+                // VECTOR fields for the console's semantic/hybrid vector-field picker.
+                vector_fields: shard
+                    .vector_fields()
+                    .into_iter()
+                    .map(|v| VectorFieldStat {
+                        name: v.name,
+                        source_field: v.source_field,
+                        model: v.model,
+                        dims: v.dims as u32,
+                    })
+                    .collect(),
             })
         })
         .await?
@@ -1123,6 +1135,50 @@ mod tests {
             .unwrap();
         // Only the DATE column is a time field (not the KEYWORD `id`/`city`).
         assert_eq!(stats.time_fields, vec!["ts".to_string()]);
+        // A non-vector index reports no vector fields.
+        assert!(stats.vector_fields.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn describe_surfaces_vector_fields_for_semantic_search() {
+        // Describe reports the index's VECTOR fields (path + embedding config) so the console can
+        // offer a semantic/hybrid vector-field picker.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("body", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        let idx = IndexDefinition::from_yaml(
+            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD }, { path: body, type: TEXT }, { path: body_vec, type: VECTOR, vector: { dims: 8, model: test-model, source_field: body } } ] }\n",
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+        let shard = LocalIndexStore::open(tmp.path())
+            .unwrap()
+            .create_shard(&ShardId::single("docs"), &idx)
+            .unwrap();
+        let svc = AdminService::new(std::sync::Arc::new(shard), "docs");
+        let stats = svc
+            .describe_index(Request::new(DescribeIndexRequest {
+                window: 0,
+                index: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .stats
+            .unwrap();
+        assert_eq!(stats.vector_fields.len(), 1);
+        let vf = &stats.vector_fields[0];
+        assert_eq!(vf.name, "body_vec");
+        assert_eq!(vf.source_field, "body");
+        assert_eq!(vf.model, "test-model");
+        assert_eq!(vf.dims, 8);
     }
 
     #[tokio::test(flavor = "current_thread")]

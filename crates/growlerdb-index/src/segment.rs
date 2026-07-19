@@ -153,6 +153,22 @@ struct VectorFieldInfo {
     spec: growlerdb_core::VectorSpec,
 }
 
+/// A VECTOR field's describe-facing summary: its field path plus the embedding config a console
+/// needs to offer semantic/hybrid search (the embedded text `source_field`, the `model`, and the
+/// `dims`). The internal [`VectorFieldInfo`] is private (it carries a Tantivy field handle); this
+/// is the owned, public projection the describe/stats path returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorFieldSummary {
+    /// The VECTOR field path — what a semantic/hybrid request targets.
+    pub name: String,
+    /// The text field whose value is embedded to produce this vector.
+    pub source_field: String,
+    /// Embedding model id.
+    pub model: String,
+    /// Embedding dimensionality (vector length).
+    pub dims: usize,
+}
+
 impl IndexSchema {
     /// Derive a Tantivy schema from a resolved index definition.
     ///
@@ -295,6 +311,22 @@ impl IndexSchema {
     /// will accept — a non-fast keyword like `author` is excluded rather than 400ing at query time.
     pub fn sort_fields(&self) -> Vec<&str> {
         self.sortable_fields.iter().map(String::as_str).collect()
+    }
+
+    /// The index's VECTOR fields, in definition order — each a [`VectorFieldSummary`] of the field
+    /// path plus its embedding config (`source_field`/`model`/`dims`). The describe path surfaces
+    /// these so a console can offer a semantic/hybrid vector-field picker without re-deriving the
+    /// mapping. Empty for a non-vector index.
+    pub fn vector_fields(&self) -> Vec<VectorFieldSummary> {
+        self.vector_fields
+            .iter()
+            .map(|vf| VectorFieldSummary {
+                name: vf.path.clone(),
+                source_field: vf.spec.source_field.clone(),
+                model: vf.spec.model.clone(),
+                dims: vf.spec.dims,
+            })
+            .collect()
     }
 
     /// The bytes-indexed `enc(key)` field — used to **delete by key** (the Tantivy-native
@@ -2628,6 +2660,68 @@ mapping:
         // Included: fast keyword/long/double, in definition order. Excluded: non-fast keywords
         // (`id`, `author`), a fast BOOL (`archived`), and TEXT (`body`).
         assert_eq!(schema.sort_fields(), vec!["tag", "views", "rating"]);
+    }
+
+    #[test]
+    fn vector_fields_reports_a_vector_field_with_its_embedding_config() {
+        // A VECTOR index surfaces its vector field(s) with the embedding config the console needs
+        // to offer semantic/hybrid search (source text field, model, dims).
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("body", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        let idx = IndexDefinition::from_yaml(
+            r#"
+name: docs
+source: { iceberg: { catalog: growlerdb, table: growlerdb.docs } }
+mapping:
+  selection: EXPLICIT
+  fields:
+    - { path: id, type: KEYWORD }
+    - { path: body, type: TEXT }
+    - { path: body_vec, type: VECTOR, vector: { dims: 8, model: test-model, source_field: body } }
+"#,
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+        let schema = IndexSchema::from_resolved(&idx);
+        let vfs = schema.vector_fields();
+        assert_eq!(vfs.len(), 1);
+        assert_eq!(vfs[0].name, "body_vec");
+        assert_eq!(vfs[0].source_field, "body");
+        assert_eq!(vfs[0].model, "test-model");
+        assert_eq!(vfs[0].dims, 8);
+    }
+
+    #[test]
+    fn vector_fields_is_empty_for_a_non_vector_index() {
+        // A plain lexical index reports no vector fields (the console then hides semantic/hybrid).
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("body", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        let idx = IndexDefinition::from_yaml(
+            r#"
+name: docs
+source: { iceberg: { catalog: growlerdb, table: growlerdb.docs } }
+mapping: { selection: ALL }
+"#,
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+        let schema = IndexSchema::from_resolved(&idx);
+        assert!(schema.vector_fields().is_empty());
+        assert!(!schema.has_vector_fields());
     }
 
     #[test]

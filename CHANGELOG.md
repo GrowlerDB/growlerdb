@@ -44,6 +44,12 @@ All notable changes to GrowlerDB are documented here. The format is based on
   `describe_index`. It fronts the authenticated gateway over HTTP and forwards the caller's bearer
   token, so RBAC + the non-widenable tenant filter are reused verbatim — an agent cannot reach another
   tenant's data. Hand-rolled (no SDK dependency). (ADR D41/D42 · TASK-297)
+- **Console: vector / hybrid search + a grounded "Ask" screen.** The Search screen gains a Lexical /
+  Semantic / Hybrid mode toggle (with a vector-field selector and an RRF-`k` control), a "more like
+  this" action, and a "vectorize a field" step in create-index. A new **Ask** screen hybrid-retrieves a
+  question and shows the source passages **with their Iceberg coordinates as citations** — **no answer
+  generation**; GrowlerDB never calls an LLM ([D42](okf/system/decisions/d42-retrieval-first.md)).
+  `POST /v1/index:describe` now reports an index's `vector_fields`. (TASK-298)
 
 ## [0.3.0] - 2026-07-18
 

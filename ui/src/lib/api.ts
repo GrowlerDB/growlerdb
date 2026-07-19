@@ -3,6 +3,7 @@
 // token, which the Engine gateway validates. The base URL is empty by default — the SPA is served
 // *by* the Engine, so the API is same-origin.
 import { getToken, clearToken, isTokenExpired } from './auth';
+import { semanticBody, hybridBody, type SemanticOpts, type HybridOpts } from './vectorSearch';
 
 /** Fired when a request we authenticated is rejected 401 (expired/revoked token) — App re-gates. */
 export const UNAUTHORIZED_EVENT = 'growlerdb:unauthorized';
@@ -135,6 +136,46 @@ export async function search(query: string, opts: SearchOptions = {}): Promise<S
   const res = await apiFetch('/v1/search', body);
   if (!res.ok) throw new Error(`search failed (${res.status})`);
   return res.json();
+}
+
+/** Semantic (KNN) search over a VECTOR field via `/v1/search:semantic`. The Node embeds
+ *  `queryText` with the field's configured embedder and returns the `k` nearest documents.
+ *  Reuses {@link SearchResponse} (hits/total). */
+export async function searchSemantic(
+  queryText: string,
+  opts: SemanticOpts,
+): Promise<SearchResponse> {
+  const res = await apiFetch('/v1/search:semantic', semanticBody(queryText, opts));
+  if (!res.ok) throw new Error(`semantic search failed (${res.status})`);
+  return res.json();
+}
+
+/** Hybrid search via `/v1/search:hybrid`: runs a lexical (BM25) and a semantic (KNN) arm over
+ *  `queryText` and Reciprocal-Rank-Fuses them (`rrf_k` fusion constant). Reuses {@link SearchResponse}. */
+export async function searchHybrid(queryText: string, opts: HybridOpts): Promise<SearchResponse> {
+  const res = await apiFetch('/v1/search:hybrid', hybridBody(queryText, opts));
+  if (!res.ok) throw new Error(`hybrid search failed (${res.status})`);
+  return res.json();
+}
+
+/** "More like this": re-run a semantic search seeded by a hit's own source text. The seed is the
+ *  hit's `fields[sourceField]` (the text embedded to produce `vectorField`); when that field isn't
+ *  cached on the hit, the authoritative row is hydrated by key to read it. Returns the semantic
+ *  neighbors of the seed document. */
+export async function moreLikeThis(
+  hit: SearchHit,
+  opts: { vectorField: string; sourceField: string; index?: string; k?: number },
+): Promise<SearchResponse> {
+  let seed = hit.fields?.[opts.sourceField];
+  if (seed == null || seed === '') {
+    // The source text isn't on the hit (index caches no display fields, or not this one) — hydrate
+    // the authoritative Iceberg row by key to read it (governed, like the document drawer).
+    const rows = await getByKey([hit.coordinates ?? {}], [opts.sourceField], opts.index);
+    seed = rows[0]?.fields?.[opts.sourceField];
+  }
+  const text = seed == null ? '' : String(seed);
+  if (!text.trim()) throw new Error('No source text to seed "more like this".');
+  return searchSemantic(text, { vectorField: opts.vectorField, index: opts.index, k: opts.k });
 }
 
 /** One facet value and how many matching docs carry it. */
@@ -544,6 +585,23 @@ export interface IndexStats {
   time_fields?: string[];
   /** Mapped sortable fields (numeric/date/keyword, `fast`) — the sort menu's options. Absent when none. */
   sort_fields?: string[];
+  /** The index's VECTOR fields — the semantic/hybrid vector-field picker's options. Each carries
+   *  its field path plus the embedding config (source text field, model, dims). Absent/empty for a
+   *  non-vector index, so the console then hides the semantic/hybrid modes. */
+  vector_fields?: VectorFieldInfo[];
+}
+
+/** One VECTOR field on the describe response: its path plus the embedding config a console needs to
+ *  offer semantic/hybrid search over it. */
+export interface VectorFieldInfo {
+  /** The VECTOR field path — what a semantic/hybrid request targets. */
+  name: string;
+  /** The text field whose value is embedded to produce this vector. */
+  source_field: string;
+  /** Embedding model id. */
+  model?: string;
+  /** Embedding dimensionality (vector length). */
+  dims?: number;
 }
 
 export interface SourceField {

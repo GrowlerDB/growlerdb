@@ -16,7 +16,14 @@ The **GrowlerDB console** — a Svelte single-page app (in `ui/`) served by the
 
 ## Screens
 
-- **Search / Explore** — query, facets, sort/paging, highlighted results, hydrate a hit, export.
+- **Search / Explore** — query, facets, sort/paging, highlighted results, hydrate a hit, export. A
+  **Lexical / Semantic / Hybrid** mode toggle (shown when the index has a
+  [vector field](/product/functional/search/vector.md); hybrid exposes the RRF `k`), a **"more like
+  this"** action on a hit, and a **"vectorize a field"** step in create-index.
+- **Ask** — a grounded-retrieval screen: a question is hybrid-retrieved and answered with the source
+  **passages plus their exact Iceberg coordinates as citations**. There is intentionally **no answer
+  generation** — GrowlerDB never sends text to an LLM ([D42](/system/decisions/d42-retrieval-first.md));
+  the value is grounded retrieval an agent can build on.
 - **Indexes** — list/create/alter/drop/reindex/compact/backup, aliases, per-index detail.
 - **Ingestion** — per-index sync status, lag, streaming charts.
 - **Observability** — SLI dashboards (latency, ingest lag, shards, cold-cache), alerts.
