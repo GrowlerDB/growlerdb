@@ -7,6 +7,7 @@
 pub mod api;
 pub mod doc;
 pub mod durable;
+pub mod embed;
 pub mod index_def;
 pub mod query;
 pub mod routing;
@@ -21,11 +22,15 @@ pub use api::{
     SCORE_SORT_KEY,
 };
 pub use doc::{CompositeKey, DocBatch, Document, KeyDecodeError, SourceCheckpoint, Value};
+pub use embed::{
+    default_embedder, embed_located_docs, embed_vector_fields, EmbedError, Embedder, HashEmbedder,
+};
 pub use index_def::{
-    AlterPlan, DefError, EqualityDeleteHandling, FieldMapping, FieldType, IcebergSource,
-    IndexDefinition, KeySpec, LocationStrategy, Mapping, ResolvedField, ResolvedIndex, ResolvedKey,
-    ScanMode, Selection, Source, SourceField, SourceSchema, SourceType, TextRecord,
-    MAX_CACHED_FIELD_BYTES,
+    AlterPlan, DefError, EmbedProvider, EqualityDeleteHandling, FieldMapping, FieldType,
+    IcebergSource, IndexDefinition, KeySpec, LocationStrategy, Mapping, ResolvedField,
+    ResolvedIndex, ResolvedKey, ScanMode, Selection, Source, SourceField, SourceSchema, SourceType,
+    TextRecord, VectorMappingOpts, VectorMetric, VectorSpec, DEFAULT_EMBED_DIMS,
+    DEFAULT_EMBED_MODEL, MAX_CACHED_FIELD_BYTES,
 };
 pub use query::{MatchOp, ParseError, Query, Syntax};
 pub use routing::{BucketMap, Reassignment, RoutingStrategy, ShardRouter};

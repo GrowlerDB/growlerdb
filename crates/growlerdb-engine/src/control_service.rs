@@ -295,7 +295,7 @@ fn subject_of(ctx: &AuthContext) -> String {
 /// Build per-field [`FieldMapping`]s for the console's Mapping tab from the resolved definition:
 /// type / analyzer / fast / cached, key role, and the reason a field can't be cached.
 fn field_mappings(def: &ResolvedIndex) -> Vec<FieldMapping> {
-    use growlerdb_core::FieldType::{Bool, Date, Double, Ip, Keyword, Long, Text};
+    use growlerdb_core::FieldType::{Bool, Date, Double, Ip, Keyword, Long, Text, Vector};
     let is_pk = |path: &str| {
         def.key.identifier_fields.iter().any(|p| p == path)
             || def.key.partition_fields.iter().any(|p| p == path)
@@ -311,6 +311,7 @@ fn field_mappings(def: &ResolvedIndex) -> Vec<FieldMapping> {
                 Bool => "BOOL",
                 Date => "DATE",
                 Ip => "IP",
+                Vector => "VECTOR",
             };
             // A field that can't be cached — sensitive (never) or big text (over the cap).
             let blocked = if f.sensitive {
