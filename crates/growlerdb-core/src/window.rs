@@ -171,6 +171,20 @@ impl TimeWindowing {
     ///
     /// Each window's sub-batch keeps the same `checkpoint` and gets a window-unique `batch_id`
     /// (`{batch_id}#w{window}`) so idempotent retries stay per-window.
+    ///
+    /// **Checkpoint carrying is deliberately asymmetric** (the JVM `WindowedWriteClient`
+    /// mirrors this):
+    ///
+    /// * `from_checkpoint` is **not** carried. Unlike ordinal shards (lockstep — every shard
+    ///   gets a possibly-empty sub-batch each commit, so `from` always continues from `current`),
+    ///   windows advance independently: a window receives a sub-batch only when rows route to it,
+    ///   so its checkpoint legitimately skips batches. Carrying the stream's `from` would trip
+    ///   that window's continuity guard with a false `CheckpointGap`. Windowed resume safety
+    ///   comes from the connector instead: it resumes from the **server-derived min committed
+    ///   checkpoint** across windows and replays idempotently (`batch_id` dedup).
+    /// * `safe_checkpoint` **is** carried: the connector's resume floor is global (it never
+    ///   resumes below it for any window), so each window can prune its idempotency records —
+    ///   without it, a windowed shard's batch tables would grow without bound.
     pub fn partition_batch(
         &self,
         batch: &CommitBatch,
@@ -208,7 +222,8 @@ impl TimeWindowing {
                     acc.ops,
                     batch.checkpoint.clone(),
                     format!("{}#w{window}", batch.batch_id),
-                ),
+                )
+                .with_safe_checkpoint(batch.safe_checkpoint.clone()),
                 event_min: acc.event_min,
                 event_max: acc.event_max,
             })
@@ -383,6 +398,31 @@ mod tests {
             1,
             "deletes are returned for broadcast, not windowed"
         );
+    }
+
+    #[test]
+    fn partition_batch_carries_the_safe_floor_but_never_from() {
+        use crate::doc::SourceCheckpoint;
+        let w = TimeWindowing::new("ingest", WindowGranularity::Daily);
+        let batch = CommitBatch::new(
+            vec![upsert("a", 10 * DAY, None), upsert("b", 11 * DAY, None)],
+            SourceCheckpoint::iceberg_ordered(9, 9),
+            "b1",
+        )
+        .with_from_checkpoint(Some(SourceCheckpoint::iceberg_ordered(8, 8)))
+        .with_safe_checkpoint(Some(SourceCheckpoint::iceberg_ordered(5, 5)));
+        let (windows, _) = w.partition_batch(&batch, None, None, None);
+        assert_eq!(windows.len(), 2);
+        for wb in &windows {
+            // The resume floor is global across windows → carried, so idempotency records prune.
+            assert_eq!(
+                wb.batch.safe_checkpoint,
+                Some(SourceCheckpoint::iceberg_ordered(5, 5))
+            );
+            // `from` continuity is lockstep-only (ordinal shards); a window that skips batches
+            // would false-Gap on it — deliberately absent here.
+            assert_eq!(wb.batch.from_checkpoint, None);
+        }
     }
 
     #[test]

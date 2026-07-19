@@ -254,19 +254,41 @@ impl WindowedWriteService {
         // Deletes carry only a key (no window value), so broadcast to every window — only the owner
         // holds the key. Rare for the append-mostly sources windowing targets.
         if !deletes.is_empty() {
+            // Carry the connector's resume floor so each window prunes its idempotency records
+            // (`from` stays absent by design — see `TimeWindowing::partition_batch`).
             let del_batch = CommitBatch::new(
                 deletes,
                 batch.checkpoint.clone(),
                 format!("{}#del", batch.batch_id),
-            );
-            let handles: Vec<ShardHandle> = self
+            )
+            .with_safe_checkpoint(batch.safe_checkpoint.clone());
+            let handles: Vec<(i64, ShardHandle)> = self
                 .read_windows()
-                .values()
-                .map(|s| s.handle.clone())
+                .iter()
+                .map(|(w, s)| (*w, s.handle.clone()))
                 .collect();
-            for handle in handles {
-                let snapshot = IndexWriter::write(&*handle.current(), &del_batch)?;
+            let mut skipped_parked = Vec::new();
+            for (window, handle) in handles {
+                let shard = handle.current();
+                // A parked (cold read-through) window is immutable: writing would fail, and
+                // failing the whole batch would wedge ingest behind an un-applicable delete. Skip
+                // it — if the key lives in a parked window, the doc outlives its delete until the
+                // window is dropped/revived (accepted for the append-mostly sources windowing
+                // targets; surfaced via the warning below).
+                if shard.is_read_only() {
+                    skipped_parked.push(window);
+                    continue;
+                }
+                let snapshot = IndexWriter::write(&*shard, &del_batch)?;
                 max_snapshot = max_snapshot.max(snapshot.0);
+            }
+            if !skipped_parked.is_empty() {
+                tracing::warn!(
+                    index = %self.index_name,
+                    windows = ?skipped_parked,
+                    "delete broadcast skipped parked (read-only cold) windows — a deleted key \
+                     residing in one stays visible there until the window is revived or dropped"
+                );
             }
         }
         // Ingestion throughput SLI: committed doc-ops this commit, labelled by index
@@ -388,14 +410,25 @@ impl Write for WindowedWriteService {
     }
 }
 
-/// Map a commit [`StoreError`] to a gRPC status — a checkpoint gap is a non-retryable
-/// `FAILED_PRECONDITION` (the connector must reconcile), everything else internal. Mirrors
+/// Map a commit [`StoreError`] to a gRPC status — a checkpoint gap and a write into a parked
+/// window are non-retryable `FAILED_PRECONDITION`s (retrying can never succeed; the operator
+/// must reconcile / revive), everything else internal. Mirrors
 /// [`write_service`](crate::write_service).
 fn store_error_to_status(e: StoreError) -> Status {
     match &e {
         StoreError::CheckpointGap { .. } => to_status(
             Code::FailedPrecondition,
             WireError::new("CHECKPOINT_GAP", e.to_string()),
+        ),
+        // Late data routed to a window already parked to the cold tier: an infinite-retry trap
+        // as INTERNAL (the write can never succeed while the window is cold). Loud + actionable
+        // instead: revive (pre-warm) the window or widen `hot_windows`.
+        StoreError::ReadOnlyShard(_) => to_status(
+            Code::FailedPrecondition,
+            WireError::new(
+                "WINDOW_PARKED",
+                format!("{e} (late data arrived for a cold-parked window — revive it or widen `hot_windows`)"),
+            ),
         ),
         _ => to_status(Code::Internal, WireError::new("INTERNAL", e.to_string())),
     }
@@ -447,7 +480,12 @@ mod tests {
         })
     }
 
-    fn service() -> (WindowedWriteService, SharedSearchWindows, tempfile::TempDir) {
+    fn service() -> (
+        WindowedWriteService,
+        SharedSearchWindows,
+        LocalIndexStore,
+        tempfile::TempDir,
+    ) {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalIndexStore::open(tmp.path()).unwrap();
         let resolved = windowed_index();
@@ -460,7 +498,7 @@ mod tests {
         // queries the mux directly, so this gateway is only exercised by the swap.
         let gw = Arc::new(Gateway::windowed(vec![], windowing, vec![]));
         let svc = WindowedWriteService::new(
-            store,
+            store.clone(),
             resolved,
             "g.logs",
             IcebergConfig::local(),
@@ -473,7 +511,70 @@ mod tests {
             Arc::new(|_w, _h| {}),
         )
         .unwrap();
-        (svc, search, tmp)
+        (svc, search, store, tmp)
+    }
+
+    /// Park `window` under the service's live handle, exactly like the CLI cold-park loop: copy
+    /// the window's tantivy bulk into a local-fs "object store", evict the local copy, open a
+    /// read-through cold shard **sharing the live `aux.redb` handle**, and hot-swap it in.
+    /// Returns the object-store tempdir (kept alive by the caller).
+    async fn park_window(
+        svc: &WindowedWriteService,
+        store: &LocalIndexStore,
+        window: i64,
+    ) -> tempfile::TempDir {
+        let resolved = windowed_index();
+        let window_dir = store.shard_path(&ShardId::window(&resolved.name, window));
+        let index_dir = window_dir.join("index");
+        let store_root = tempfile::tempdir().unwrap();
+        let cold = store_root.path().join("cold");
+        std::fs::create_dir_all(&cold).unwrap();
+        for entry in std::fs::read_dir(&index_dir).unwrap() {
+            let e = entry.unwrap();
+            if e.file_type().unwrap().is_file() {
+                std::fs::copy(e.path(), cold.join(e.file_name())).unwrap();
+            }
+        }
+        std::fs::remove_dir_all(&index_dir).unwrap();
+        let op = opendal::Operator::new(
+            opendal::services::Fs::default().root(&store_root.path().to_string_lossy()),
+        )
+        .unwrap()
+        .finish();
+        let handle = svc
+            .window_handles()
+            .into_iter()
+            .find(|(w, _)| *w == window)
+            .expect("window exists")
+            .1;
+        let reuse_db = handle.current().db_handle();
+        let cache = growlerdb_index::RangeCache::new(8 * 1024 * 1024);
+        let (store2, aux) = (store.clone(), window_dir.clone());
+        let shard = tokio::task::spawn_blocking(move || {
+            store2.open_cold_shard(
+                &resolved,
+                &aux,
+                op,
+                "cold",
+                cache,
+                None,
+                None,
+                Some(reuse_db),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(shard.is_read_only());
+        handle.swap(Arc::new(shard));
+        store_root
+    }
+
+    fn delete(id: &str) -> DocOp {
+        DocOp::Delete(CompositeKey::new(
+            vec![],
+            vec![("id".into(), Value::from(id))],
+        ))
     }
 
     async fn ids_in_window(search: &SharedSearchWindows, window: i64) -> Vec<String> {
@@ -504,7 +605,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn streaming_write_creates_windows_and_makes_them_queryable() {
-        let (svc, search, _tmp) = service();
+        let (svc, search, _store, _tmp) = service();
         let day = |n: i64| n * DAY;
 
         // A batch spanning two days → two windows created on first write.
@@ -550,7 +651,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn per_window_checkpoint_resumes_each_window_independently() {
         use growlerdb_proto::v1::source_checkpoint::Kind;
-        let (svc, _search, _tmp) = service();
+        let (svc, _search, _store, _tmp) = service();
         let day = |n: i64| n * DAY;
 
         svc.write(Request::new(WriteRequest {
@@ -586,5 +687,87 @@ mod tests {
             .into_inner();
         assert!(none.checkpoint.is_none());
         assert_eq!(none.snapshot, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_broadcast_skips_parked_windows_instead_of_wedging_ingest() {
+        let (svc, search, store, _tmp) = service();
+        let day = |n: i64| n * DAY;
+
+        // Two hot windows, then window 10 ages out and parks to the cold tier.
+        svc.write(Request::new(WriteRequest {
+            batch: Some(
+                growlerdb_core::CommitBatch::new(
+                    vec![upsert("a", day(10) + 5), upsert("b", day(11) + 7)],
+                    SourceCheckpoint::iceberg(1),
+                    "b1",
+                )
+                .into(),
+            ),
+        }))
+        .await
+        .unwrap();
+        let _cold_store = park_window(&svc, &store, day(10)).await;
+
+        // A batch with an upsert + deletes commits cleanly: the broadcast applies to the hot
+        // window and skips the parked one (previously this panicked the write path and the
+        // connector retried the poison batch forever).
+        svc.write(Request::new(WriteRequest {
+            batch: Some(
+                growlerdb_core::CommitBatch::new(
+                    vec![upsert("c", day(11) + 9), delete("a"), delete("b")],
+                    SourceCheckpoint::iceberg(2),
+                    "b2",
+                )
+                .into(),
+            ),
+        }))
+        .await
+        .expect("a delete broadcast must not fail on a parked window");
+
+        // Hot window 11: the delete applied ("b" gone, "c" landed).
+        assert_eq!(ids_in_window(&search, day(11)).await, vec!["c"]);
+        // Parked window 10 is immutable: "a" outlives its delete until revive/drop — the
+        // documented trade-off (and still served read-through).
+        assert_eq!(ids_in_window(&search, day(10)).await, vec!["a"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_upsert_into_a_parked_window_is_a_clean_window_parked_error() {
+        let (svc, _search, store, _tmp) = service();
+        let day = |n: i64| n * DAY;
+
+        svc.write(Request::new(WriteRequest {
+            batch: Some(
+                growlerdb_core::CommitBatch::new(
+                    vec![upsert("a", day(10) + 5)],
+                    SourceCheckpoint::iceberg(1),
+                    "b1",
+                )
+                .into(),
+            ),
+        }))
+        .await
+        .unwrap();
+        let _cold_store = park_window(&svc, &store, day(10)).await;
+
+        // Late data routed to the parked window: a loud, non-retryable FAILED_PRECONDITION
+        // (previously a panic surfaced as INTERNAL, which the connector retried forever).
+        let status = svc
+            .write(Request::new(WriteRequest {
+                batch: Some(
+                    growlerdb_core::CommitBatch::new(
+                        vec![upsert("late", day(10) + 9)],
+                        SourceCheckpoint::iceberg(2),
+                        "b2",
+                    )
+                    .into(),
+                ),
+            }))
+            .await
+            .expect_err("a write into a parked window must be refused");
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        let detail = growlerdb_proto::error_details(&status).expect("structured error");
+        assert_eq!(detail.code, "WINDOW_PARKED");
     }
 }
