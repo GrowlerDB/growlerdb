@@ -16,4 +16,6 @@ via the seam. It sits **outside** the index and never changes what is stored.
 top-K via the local **bge-reranker-base** (Candle, keyless, deterministic dev fallback when
 unprovisioned). Ships **open** ([D41](/system/decisions/d41-vector-open-core.md)) as the optional final
 stage of retrieval-first ([D42](/system/decisions/d42-retrieval-first.md)). The **external**-provider
-reranker path (server-side keys) is the outstanding piece — TASK-299.
+reranker path is also implemented: `GROWLERDB_RERANK_PROVIDER=external` calls a hosted reranker over
+HTTP with a **server-side-only** key (`GROWLERDB_RERANK_API_KEY`, redacted, rotatable, never
+browser-exposed), failing closed without one.

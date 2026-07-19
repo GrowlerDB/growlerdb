@@ -21,11 +21,19 @@ candle-transformers = { version = "0.9", optional = true }
 # `fancy-regex` backend instead (tokenizers requires exactly one) so the build stays
 # native-dependency-free.
 tokenizers = { version = "0.21", optional = true, default-features = false, features = ["fancy-regex"] }
-# Parse the model's config.json into candle's BERT `Config`.
+# Parse the model's config.json into candle's BERT `Config`. Also (de)serializes the external
+# provider request/response DTOs when the `external` feature is on.
 serde_json = { workspace = true, optional = true }
+# The opt-in EXTERNAL embedding/rerank path calls a hosted provider over HTTP with a
+# server-side-only API key. Behind a default-on `external` feature so a `--no-default-features`
+# build carries no HTTP/TLS stack; the factories then fail closed for an EXTERNAL field.
+# `blocking` because the embed/rerank seams are synchronous (run on a dedicated thread — see
+# external.rs). rustls-tls keeps the build native-dependency-free.
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls", "blocking"] }
+serde = { workspace = true, optional = true }
 
 [features]
-default = ["bge", "rerank"]
+default = ["bge", "rerank", "external"]
 bge = [
     "dep:candle-core",
     "dep:candle-nn",
@@ -44,6 +52,12 @@ rerank = [
     "dep:tokenizers",
     "dep:serde_json",
 ]
+# The external HTTP embedding/rerank provider path.
+external = ["dep:reqwest", "dep:serde", "dep:serde_json"]
 
 [dev-dependencies]
 tempfile.workspace = true
+# A tiny in-process axum mock provider so the external HTTP path is tested offline (no network,
+# no real provider): assert the `Authorization: Bearer` header is sent and a mock response parses.
+axum = "0.8"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }

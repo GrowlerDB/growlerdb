@@ -15,6 +15,8 @@ self-hosted server) attach via the `Embedder` seam and are strictly **opt-in**. 
 (model id, dimensions, provider) is recorded in the index metadata so vector search is reproducible and
 a model change is a tracked re-embedding reindex.
 
-**Status.** Accepted; in active build (M5). Local-default embedding is what lets the vector capability
-be **open** with zero required keys ([D41](/system/decisions/d41-vector-open-core.md)); provider keys
-are server-side only.
+**Status.** Accepted; **shipped**. Local-default (Candle BGE) embedding is what lets the vector
+capability be **open** with zero required keys ([D41](/system/decisions/d41-vector-open-core.md)). The
+opt-in **external** path is implemented: a `provider: EXTERNAL` field calls a hosted service over HTTP
+with a **server-side-only** key (`GROWLERDB_EMBEDDING_API_KEY`, redacted, rotatable, never
+browser-exposed), failing closed without one — provider keys are never client-side.

@@ -25,6 +25,18 @@ use std::sync::Arc;
 use growlerdb_core::index_def::{EmbedProvider, ResolvedIndex, VectorSpec};
 use growlerdb_core::{Document, Embedder, HashEmbedder, HashReranker, Reranker, Value};
 
+/// Serialize every test that mutates a process-global env var this crate reads
+/// (`GROWLERDB_MODEL_DIR`, `GROWLERDB_*_API_KEY`, `GROWLERDB_*_ENDPOINT`,
+/// `GROWLERDB_RERANK_PROVIDER`). `set_var`/`remove_var` are process-wide, so tests across modules
+/// race under `cargo test`'s parallelism unless they share ONE lock. Every such test takes this guard.
+#[cfg(test)]
+pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
 #[cfg(feature = "bge")]
 mod bge;
 #[cfg(feature = "bge")]
@@ -34,6 +46,14 @@ pub use bge::BgeEmbedder;
 mod bge_rerank;
 #[cfg(feature = "rerank")]
 pub use bge_rerank::BgeReranker;
+
+#[cfg(feature = "external")]
+mod external;
+#[cfg(feature = "external")]
+pub use external::{ExternalEmbedder, ExternalReranker};
+
+mod secrets;
+pub use secrets::{redact, ProviderSecrets};
 
 /// Default cross-encoder reranker model id ([D21]'s suggested local model). The reranker is
 /// opt-in per query and configured with no per-index model today, so the factory targets this
@@ -47,6 +67,14 @@ pub const DEFAULT_RERANK_MODEL: &str = "bge-reranker-base";
 /// back to core's dependency-free [`HashReranker`] (token overlap), logging a one-time warning.
 /// This is the single factory the search path calls when a query opts into reranking.
 pub fn reranker_for(model_id: &str) -> Arc<dyn Reranker> {
+    // Opt-in external provider (GROWLERDB_RERANK_PROVIDER=external): call a hosted reranker over
+    // HTTP with a server-side-only key. Fail closed (no key ⇒ error at `rerank()`), never a silent
+    // fall back to the dev reranker.
+    #[cfg(feature = "external")]
+    if external::rerank_provider_is_external() {
+        return Arc::new(external::ExternalReranker::from_env(model_id));
+    }
+
     #[cfg(feature = "rerank")]
     match BgeReranker::load(model_id) {
         Ok(r) => return Arc::new(r),
@@ -76,25 +104,81 @@ fn warn_rerank_fallback(msg: &str) {
 /// resolved model directory; otherwise falls back to core's [`HashEmbedder`] (logging a
 /// one-time warning with the model-dir hint). This is the single factory ingest calls.
 pub fn embedder_for(spec: &VectorSpec) -> Arc<dyn Embedder> {
+    match spec.provider {
+        EmbedProvider::Local => local_embedder(spec),
+        EmbedProvider::External => external_embedder(spec),
+    }
+}
+
+/// The LOCAL, keyless embedder: a real [`BgeEmbedder`] when provisioned, else the dev
+/// [`HashEmbedder`]. Never reads a provider secret.
+fn local_embedder(spec: &VectorSpec) -> Arc<dyn Embedder> {
     #[cfg(feature = "bge")]
-    if spec.provider == EmbedProvider::Local {
-        match BgeEmbedder::load(spec) {
-            Ok(e) => return Arc::new(e),
-            Err(err) => warn_fallback(&format!(
-                "BGE model unavailable ({err}); using the dev hash embedder. \
-                 Provision the model under {} (or set GROWLERDB_MODEL_DIR).",
-                bge::model_dir(&spec.model).display()
-            )),
-        }
+    match BgeEmbedder::load(spec) {
+        Ok(e) => return Arc::new(e),
+        Err(err) => warn_fallback(&format!(
+            "BGE model unavailable ({err}); using the dev hash embedder. \
+             Provision the model under {} (or set GROWLERDB_MODEL_DIR).",
+            bge::model_dir(&spec.model).display()
+        )),
     }
 
-    // Feature off, external provider, or load failure → the deterministic dev embedder.
-    #[cfg(not(feature = "bge"))]
-    let _ = EmbedProvider::Local; // silence unused import without the feature
     #[cfg(not(feature = "bge"))]
     warn_fallback("the `bge` feature is disabled; using the dev hash embedder");
 
     Arc::new(HashEmbedder::new(spec.model.clone(), spec.dims))
+}
+
+/// The EXTERNAL embedder: call a hosted provider over HTTP with a server-side-only key. Fails
+/// **closed** — a misconfiguration (no key, no endpoint, or the `external` feature compiled out)
+/// surfaces as an [`EmbedError`] at [`Embedder::embed`], never a silent fall back to the dev
+/// embedder (which would hide it).
+fn external_embedder(spec: &VectorSpec) -> Arc<dyn Embedder> {
+    #[cfg(feature = "external")]
+    {
+        Arc::new(external::ExternalEmbedder::from_env(spec))
+    }
+    #[cfg(not(feature = "external"))]
+    {
+        Arc::new(FailClosedEmbedder::new(
+            spec,
+            "external embedding provider selected but the `external` feature is disabled",
+        ))
+    }
+}
+
+/// A fail-closed [`Embedder`] used when an EXTERNAL field is selected but the `external` feature
+/// is compiled out: every [`embed`](Embedder::embed) errors with a clear reason rather than
+/// silently producing dev-hash vectors that would hide the misconfiguration.
+#[cfg(not(feature = "external"))]
+struct FailClosedEmbedder {
+    model_id: String,
+    dims: usize,
+    reason: String,
+}
+
+#[cfg(not(feature = "external"))]
+impl FailClosedEmbedder {
+    fn new(spec: &VectorSpec, reason: &str) -> Self {
+        Self {
+            model_id: spec.model.clone(),
+            dims: spec.dims,
+            reason: reason.to_string(),
+        }
+    }
+}
+
+#[cfg(not(feature = "external"))]
+impl Embedder for FailClosedEmbedder {
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+    fn dims(&self) -> usize {
+        self.dims
+    }
+    fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, growlerdb_core::EmbedError> {
+        Err(growlerdb_core::EmbedError::Backend(self.reason.clone()))
+    }
 }
 
 /// Log the fallback-to-hash-embedder reason exactly once per process (repeated per-field
@@ -105,9 +189,10 @@ fn warn_fallback(msg: &str) {
     ONCE.call_once(|| tracing::warn!("{msg}"));
 }
 
-/// Populate every LOCAL vector field's embedding on `docs` in place, resolving the embedder
-/// via [`embedder_for`] (BGE-or-fallback). Mirrors `growlerdb_core::embed_vector_fields` but
-/// keyed on this crate's factory rather than core's built-in one.
+/// Populate every vector field's embedding on `docs` in place, resolving the embedder via
+/// [`embedder_for`] (LOCAL BGE-or-fallback, or the EXTERNAL provider). Mirrors
+/// `growlerdb_core::embed_vector_fields` but keyed on this crate's factory rather than core's
+/// built-in one.
 pub fn embed_vector_fields(idx: &ResolvedIndex, docs: &mut [Document]) {
     let mut refs: Vec<&mut Document> = docs.iter_mut().collect();
     embed_docs(idx, &mut refs);
@@ -120,29 +205,46 @@ pub fn embed_located_docs(idx: &ResolvedIndex, docs: &mut [growlerdb_core::Locat
     embed_docs(idx, &mut refs);
 }
 
-/// Shared core: fill in each LOCAL vector field's embedding across `docs`, batching the embed
-/// call per field. Best-effort (a missing source text embeds `""`; a backend error skips the
-/// field) — identical semantics to core's orchestration, only the factory differs.
+/// Shared core: fill in each vector field's embedding across `docs`, batching the embed call per
+/// field. Best-effort (a missing source text embeds `""`; a backend error skips the field) —
+/// identical semantics to core's orchestration, only the factory differs. An EXTERNAL field that
+/// fails closed (no key/endpoint) errors here rather than writing dev-hash vectors, so the field
+/// is skipped (a warning is logged) instead of silently indexing wrong vectors.
 fn embed_docs(idx: &ResolvedIndex, docs: &mut [&mut Document]) {
     for f in &idx.fields {
         let Some(spec) = f.vector.as_ref() else {
             continue;
         };
-        if spec.provider != EmbedProvider::Local {
-            continue;
-        }
         let embedder = embedder_for(spec);
         let texts: Vec<String> = docs
             .iter()
             .map(|d| source_text(d, &spec.source_field))
             .collect();
-        let Ok(vectors) = embedder.embed(&texts) else {
-            continue;
+        let vectors = match embedder.embed(&texts) {
+            Ok(v) => v,
+            Err(err) => {
+                if spec.provider == EmbedProvider::External {
+                    // Fail closed + observable: don't write vectors, but surface why.
+                    warn_external_embed(&format!(
+                        "external embedding of field `{}` failed: {err}; field left un-embedded",
+                        f.path
+                    ));
+                }
+                continue;
+            }
         };
         for (d, v) in docs.iter_mut().zip(vectors) {
             d.fields.insert(f.path.clone(), Value::Vector(v));
         }
     }
+}
+
+/// Log an external-embedding failure at most once per process (per-field/per-batch ingest calls
+/// would otherwise spam it).
+fn warn_external_embed(msg: &str) {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| tracing::warn!("{msg}"));
 }
 
 /// The text to embed for `source_field`: its indexed-string form, or `""` when absent.
@@ -174,6 +276,7 @@ mod tests {
         // for both `bge`-on (load fails, falls back) and `bge`-off (feature gate) builds.
         // Point the model dir at an empty temp dir so a developer's real ~/.cache model can't
         // make this test flake.
+        let _g = crate::env_guard();
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("GROWLERDB_MODEL_DIR", tmp.path());
 
@@ -188,9 +291,30 @@ mod tests {
     }
 
     #[test]
+    fn external_provider_fails_closed_without_a_key() {
+        // provider: External + no GROWLERDB_EMBEDDING_API_KEY ⇒ embed() errors (fail closed),
+        // never a silent hash-embedder fallback that would hide the misconfiguration.
+        let _g = crate::env_guard();
+        std::env::remove_var("GROWLERDB_EMBEDDING_API_KEY");
+        std::env::set_var("GROWLERDB_EMBEDDING_ENDPOINT", "http://127.0.0.1:1/embed");
+
+        let mut s = spec(384);
+        s.provider = EmbedProvider::External;
+        let e = embedder_for(&s);
+        let err = e.embed(&["hello".into()]).unwrap_err();
+        assert!(
+            matches!(&err, growlerdb_core::EmbedError::Backend(m) if m.contains("GROWLERDB_EMBEDDING_API_KEY")),
+            "expected a fail-closed key error, got {err:?}"
+        );
+
+        std::env::remove_var("GROWLERDB_EMBEDDING_ENDPOINT");
+    }
+
+    #[test]
     fn reranker_for_falls_back_to_hash_when_no_model() {
         // No provisioned model dir → the deterministic token-overlap reranker, for both the
         // `rerank`-on (load fails → fallback) and `rerank`-off (feature gate) builds.
+        let _g = crate::env_guard();
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("GROWLERDB_MODEL_DIR", tmp.path());
 
