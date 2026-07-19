@@ -26,6 +26,8 @@
     query = '',
     syntax = 'lucene',
     index = '',
+    moreLikeThis,
+    onMoreLikeThis,
     onClose,
   }: {
     hit: SearchHit;
@@ -33,6 +35,10 @@
     query?: string;
     syntax?: QuerySyntax;
     index?: string;
+    /** Label for the "more like this" action; omit to hide it (index has no vector field). */
+    moreLikeThis?: string;
+    /** Run a semantic "more like this" seeded by this document; omit to hide the action. */
+    onMoreLikeThis?: () => void;
     onClose: () => void;
   } = $props();
 
@@ -84,6 +90,19 @@
 
 <Drawer title={hitId(hit)} eyebrow={t('search.docEyebrow')} width="392px" {onClose}>
   <Tabs {tabs} bind:active={tab} />
+
+  {#if moreLikeThis && onMoreLikeThis}
+    <div class="mlt-row">
+      <button
+        type="button"
+        class="mlt-btn"
+        onclick={onMoreLikeThis}
+        title={t('search.moreLikeThisHint')}
+      >
+        {moreLikeThis}
+      </button>
+    </div>
+  {/if}
 
   {#if tab === 'fields'}
     <p class="gov"><span class="gov-dot"></span>{t('search.governed')}</p>
@@ -197,6 +216,13 @@
 </Drawer>
 
 <style>
+  .mlt-row {
+    display: flex;
+    margin: 0.7rem 0 0;
+  }
+  .mlt-btn {
+    font-size: 0.9em;
+  }
   .gov {
     display: flex;
     align-items: center;

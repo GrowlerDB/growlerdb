@@ -155,6 +155,50 @@ describe('buildDefinition', () => {
     expect(yaml).toContain('mapping: { selection: ALL }');
   });
 
+  it('emits a vectorized field as a VECTOR mapping entry under ALL', () => {
+    const yaml = buildDefinition({
+      name: 'docs',
+      table: 'ns.docs',
+      selection: 'ALL',
+      fields: [],
+      vectorField: { path: 'body_vec', sourceField: 'body', model: 'bge-small-en-v1.5', dims: 384 },
+    });
+    expect(yaml).toBe(
+      'name: docs\n' +
+        'source: { iceberg: { catalog: ns, table: ns.docs } }\n' +
+        'mapping: { selection: ALL, fields: [ { path: body_vec, type: VECTOR, ' +
+        'vector: { source_field: body, model: bge-small-en-v1.5, dims: 384 } } ] }\n',
+    );
+  });
+
+  it('appends the vectorized field after the mapped + time entries under EXPLICIT', () => {
+    const yaml = buildDefinition({
+      name: 'docs',
+      table: 'ns.docs',
+      selection: 'EXPLICIT',
+      fields: [{ path: 'body', type: 'string' }],
+      timeField: { path: 'ts', format: 'epoch_ms' },
+      vectorField: { path: 'body_vec', sourceField: 'body', model: 'custom-model', dims: 768 },
+    });
+    expect(yaml).toContain(
+      'mapping: { selection: EXPLICIT, fields: [ { path: body, type: TEXT }, ' +
+        '{ path: ts, format: epoch_ms, fast: true }, ' +
+        '{ path: body_vec, type: VECTOR, vector: { source_field: body, model: custom-model, dims: 768 } } ] }',
+    );
+  });
+
+  it('ignores a vectorized field with no source column selected', () => {
+    const yaml = buildDefinition({
+      name: 'docs',
+      table: 'ns.docs',
+      selection: 'ALL',
+      fields: [],
+      vectorField: { path: 'body_vec', sourceField: '', model: 'bge-small-en-v1.5', dims: 384 },
+    });
+    expect(yaml).not.toContain('VECTOR');
+    expect(yaml).toContain('mapping: { selection: ALL }');
+  });
+
   it('does not duplicate an override when the event field reuses the ingest column', () => {
     const yaml = buildDefinition({
       name: 'events',

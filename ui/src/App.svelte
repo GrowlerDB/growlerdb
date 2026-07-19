@@ -12,6 +12,7 @@
   import { clusterHealth, startHealthPolling } from './lib/health';
   import type { Health } from './lib/cluster';
   import Search from './routes/Search.svelte';
+  import Rag from './routes/Rag.svelte';
   import Indexes from './routes/Indexes.svelte';
   import Settings from './routes/Settings.svelte';
   import Popover from './lib/components/Popover.svelte';
@@ -40,6 +41,7 @@
 
   const navItems: { route: Route; key: string }[] = [
     { route: '/', key: 'nav.search' },
+    { route: '/rag', key: 'nav.rag' },
     { route: '/indexes', key: 'nav.indexes' },
     { route: '/observability', key: 'nav.observability' },
     { route: '/settings', key: 'nav.settings' },
@@ -167,6 +169,25 @@
         y2="14"
         stroke-linecap="round"
       ></line></svg
+    >
+  {:else if route === '/rag'}
+    <!-- Ask glyph: a speech bubble with two dots — grounded retrieval / question. -->
+    <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true"
+      ><rect
+        x="2"
+        y="2.6"
+        width="12"
+        height="9"
+        rx="2.2"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.4"
+      ></rect><circle cx="6" cy="7.1" r="0.95" fill="currentColor"></circle><circle
+        cx="9.4"
+        cy="7.1"
+        r="0.95"
+        fill="currentColor"
+      ></circle></svg
     >
   {:else if route === '/indexes'}
     <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"
@@ -325,6 +346,8 @@
     <main id="main" tabindex="-1">
       {#if $path === '/'}
         <Search />
+      {:else if $path === '/rag'}
+        <Rag />
       {:else if $path === '/indexes'}
         <Indexes />
       {:else if $path === '/observability'}

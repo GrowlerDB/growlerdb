@@ -23,6 +23,8 @@
     defaultFieldType,
     TIME_FORMATS,
     WINDOW_GRANULARITIES,
+    DEFAULT_EMBED_MODEL,
+    DEFAULT_EMBED_DIMS,
   } from '../lib/indexDef';
   import Badge from '../lib/components/Badge.svelte';
   import StatusDot from '../lib/components/StatusDot.svelte';
@@ -57,6 +59,16 @@
   let cEventField = $state(''); // optional event-time column for zone-map pruning; '' = none
   let cEventFormat = $state(TIME_FORMATS[1].value);
   let cHotWindows = $state<number | null>(null); // optional: keep N most-recent windows hot; null = all hot
+  // Vectorize-a-field — embed a TEXT column into a VECTOR field for semantic/hybrid search.
+  let cVectorize = $state(false);
+  let cVectorSource = $state(''); // the TEXT source column to embed; '' = none
+  let cVectorName = $state(''); // the VECTOR field name; '' ⇒ defaults to `${source}_vec`
+  let cVectorModel = $state(DEFAULT_EMBED_MODEL);
+  let cVectorDims = $state<number>(DEFAULT_EMBED_DIMS);
+  // The TEXT columns available to vectorize (string sources map to TEXT).
+  const textColumns = $derived(
+    (schema?.fields ?? []).filter((f) => defaultFieldType(f.type) === 'TEXT'),
+  );
   let introspecting = $state(false);
   let createError = $state('');
   let creating = $state(false);
@@ -196,6 +208,15 @@
               hotWindows: cHotWindows && cHotWindows > 0 ? cHotWindows : null,
             }
           : null;
+      const vectorField =
+        cVectorize && cVectorSource
+          ? {
+              path: cVectorName.trim() || `${cVectorSource}_vec`,
+              sourceField: cVectorSource,
+              model: cVectorModel.trim() || DEFAULT_EMBED_MODEL,
+              dims: cVectorDims && cVectorDims > 0 ? cVectorDims : DEFAULT_EMBED_DIMS,
+            }
+          : null;
       const definition = buildDefinition({
         name: cName,
         table: cTable,
@@ -203,6 +224,7 @@
         fields,
         timeField,
         windowing,
+        vectorField,
       });
       await createIndex(definition);
       showCreate = false;
@@ -213,6 +235,9 @@
       cWindowing = false;
       cEventField = '';
       cHotWindows = null;
+      cVectorize = false;
+      cVectorSource = '';
+      cVectorName = '';
       await load();
     } catch (err) {
       createError = String(err);
@@ -451,6 +476,47 @@
                   bind:value={cHotWindows}
                   placeholder={t('indexes.windowingHotAll')}
                 />
+              </div>
+            {/if}
+          {/if}
+        </fieldset>
+
+        <fieldset>
+          <legend>{t('indexes.vectorize')}</legend>
+          <p class="hint muted">{t('indexes.vectorizeHint')}</p>
+          {#if textColumns.length === 0}
+            <p class="hint muted">{t('indexes.vectorizeNeedsText')}</p>
+          {:else}
+            <label>
+              <input type="checkbox" bind:checked={cVectorize} />
+              {t('indexes.vectorizeEnable')}
+            </label>
+            {#if cVectorize}
+              <div class="row">
+                <label for="c-vec-source">{t('indexes.vectorSource')}</label>
+                <select id="c-vec-source" bind:value={cVectorSource}>
+                  <option value="">{t('indexes.vectorSourceNone')}</option>
+                  {#each textColumns as f (f.path)}
+                    <option value={f.path}>{f.path}</option>
+                  {/each}
+                </select>
+              </div>
+              <div class="row">
+                <label for="c-vec-name">{t('indexes.vectorName')}</label>
+                <input
+                  id="c-vec-name"
+                  bind:value={cVectorName}
+                  placeholder={cVectorSource ? `${cVectorSource}_vec` : 'body_vec'}
+                  autocomplete="off"
+                />
+              </div>
+              <div class="row">
+                <label for="c-vec-model">{t('indexes.vectorModel')}</label>
+                <input id="c-vec-model" bind:value={cVectorModel} autocomplete="off" />
+              </div>
+              <div class="row">
+                <label for="c-vec-dims">{t('indexes.vectorDims')}</label>
+                <input id="c-vec-dims" type="number" min="1" bind:value={cVectorDims} />
               </div>
             {/if}
           {/if}

@@ -33,6 +33,20 @@ message IndexStats {
   // console offers exactly these as sort options, so it never sends an unsortable field (which the
   // engine rejects). Same for every shard of an index.
   repeated string sort_fields = 8;
+  // The index's VECTOR fields, in definition order — the semantic/hybrid-search inputs. Each
+  // carries the field path plus its embedding config, so a console can offer a vector-field picker
+  // and label it (model/dims) without re-deriving the mapping. Empty for a non-vector index. Same
+  // for every shard of an index.
+  repeated VectorFieldStat vector_fields = 9;
+}
+
+// One VECTOR field's describe-facing summary: the field path plus the embedding config a console
+// needs to offer semantic/hybrid search over it.
+message VectorFieldStat {
+  string name = 1;         // the VECTOR field path (what a semantic/hybrid request targets)
+  string source_field = 2; // the text field whose value is embedded to produce this vector
+  string model = 3;        // embedding model id
+  uint32 dims = 4;         // embedding dimensionality (vector length)
 }
 
 message DescribeIndexResponse {

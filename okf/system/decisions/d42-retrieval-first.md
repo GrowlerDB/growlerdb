@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: 'D42. Retrieval-first, not a RAG framework'
-description: GrowlerDB is the governed retrieval layer; generation belongs to the app/agent. Chunking is supported at ingest (simple, configurable); LLM generation exists only as a demo/playground convenience.
+description: GrowlerDB is the governed retrieval layer; generation belongs to the app/agent. Chunking is supported at ingest (simple, configurable); GrowlerDB never calls out to an LLM.
 tags: [decision, adr]
 timestamp: 2026-07-18T00:00:00
 ---
@@ -20,9 +20,12 @@ The product surface is a great **retrieval API + an MCP server**. Two deliberate
   *indexing*, not *generation*: the connector / build can split a text field into chunk-documents that
   share a parent key, with a simple, configurable policy. Sophisticated / semantic chunking stays in
   the caller's pipeline.
-- **Generation is a demo-only convenience.** A thin RAG *playground* (retrieve → optionally call a
-  configured LLM → show a cited answer) is worth shipping as a showcase in the console/demo, but it is
-  explicitly **not** the product surface. GrowlerDB configures no LLM by default and ships none.
+- **GrowlerDB never calls out to an LLM.** Generation — the LLM answer — is entirely the app / agent's
+  concern; it is **out of scope for the product**, not merely off by default. GrowlerDB configures,
+  ships, and calls **no** LLM. The console's grounded-retrieval playground answers a question by
+  returning the retrieved chunks **with their Iceberg coordinates as citations** and stops there; the
+  agent (e.g. via the [MCP server](/product/interfaces/mcp-server.md)) does its own generation with its
+  own model. This keeps GrowlerDB free of outbound-LLM egress, keys, and prompt-orchestration surface.
 
 **Why.** The one thing only a lakehouse-native engine can do is *governed, fresh retrieval keyed to
 authoritative data with no second copy of the truth*. Competing with RAG frameworks on orchestration

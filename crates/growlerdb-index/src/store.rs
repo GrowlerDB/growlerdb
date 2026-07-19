@@ -2366,6 +2366,13 @@ impl Shard {
             .collect()
     }
 
+    /// The index's VECTOR fields — each a [`VectorFieldSummary`](crate::VectorFieldSummary) of the
+    /// field path plus its embedding config. The describe path surfaces these so a console can
+    /// offer a semantic/hybrid vector-field picker. Empty for a non-vector index.
+    pub fn vector_fields(&self) -> Vec<crate::VectorFieldSummary> {
+        self.schema.vector_fields()
+    }
+
     pub fn index_dir(&self) -> &Path {
         &self.index_dir
     }
