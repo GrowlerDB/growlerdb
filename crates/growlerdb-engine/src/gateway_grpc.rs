@@ -18,7 +18,7 @@ use growlerdb_proto::v1::{
     DescribeIndexResponse, ExplainRequest, ExplainResponse, ExportRequest, GetByKeyRequest,
     GetByKeyResponse, OpenPitRequest, OpenPitResponse, ReconcileIndexRequest,
     ReconcileIndexResponse, ReindexIndexRequest, ReindexIndexResponse, SearchRequest,
-    SearchResponse, SuggestRequest, SuggestResponse,
+    SearchResponse, SemanticSearchRequest, SuggestRequest, SuggestResponse,
 };
 use growlerdb_proto::{
     Admin, AdminServer, Lookup, LookupServer, Search, SearchServer, Suggest, SuggestServer,
@@ -65,6 +65,13 @@ impl Search for GatewaySearch {
         req: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         self.0.search(req).await
+    }
+
+    async fn semantic_search(
+        &self,
+        req: Request<SemanticSearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        self.0.semantic_search(req).await
     }
 
     async fn open_pit(

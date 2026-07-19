@@ -145,12 +145,12 @@ pub struct IndexSchema {
 }
 
 /// One VECTOR field's ANN-build inputs: its path, the stored-bytes Tantivy field handle, and the
-/// embedding `dims` + distance `metric` from its [`VectorSpec`](growlerdb_core::VectorSpec).
+/// full [`VectorSpec`](growlerdb_core::VectorSpec). The ANN build reads `spec.dims`/`spec.metric`;
+/// the query path reads the whole spec (to embed a query with the field's configured embedder).
 struct VectorFieldInfo {
     path: String,
     field: Field,
-    dims: usize,
-    metric: growlerdb_core::VectorMetric,
+    spec: growlerdb_core::VectorSpec,
 }
 
 impl IndexSchema {
@@ -219,8 +219,7 @@ impl IndexSchema {
                     vector_fields.push(VectorFieldInfo {
                         path: f.path.clone(),
                         field: handle,
-                        dims: spec.dims,
-                        metric: spec.metric,
+                        spec: spec.clone(),
                     });
                 }
             }
@@ -264,6 +263,17 @@ impl IndexSchema {
     /// a mandatory `= <verified claim>` filter on.
     pub fn tenant_field(&self) -> Option<&str> {
         self.tenant_field.as_deref()
+    }
+
+    /// The [`VectorSpec`](growlerdb_core::VectorSpec) of the VECTOR field named `path`, or `None`
+    /// if `path` is not a VECTOR field on this index. The semantic-search path reads this to
+    /// embed a query with the field's configured embedder (matching the space its documents were
+    /// embedded in at ingest).
+    pub fn vector_spec(&self, path: &str) -> Option<&growlerdb_core::VectorSpec> {
+        self.vector_fields
+            .iter()
+            .find(|vf| vf.path == path)
+            .map(|vf| &vf.spec)
     }
 
     /// The mapped **DATE** fields, in definition order. These are the columns a console
@@ -901,7 +911,7 @@ impl SegmentReader {
                 if !items.is_empty() {
                     sidecar.insert(
                         vf.path.clone(),
-                        &BruteForceIndex::build(vf.dims, vf.metric, &items),
+                        &BruteForceIndex::build(vf.spec.dims, vf.spec.metric, &items),
                     );
                 }
             }
