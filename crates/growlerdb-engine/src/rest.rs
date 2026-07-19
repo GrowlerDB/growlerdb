@@ -2923,6 +2923,48 @@ mod tests {
         assert_eq!(body["code"], "NotFound");
     }
 
+    /// The maintenance routes: `index:compact` runs a REAL compaction on the served shard
+    /// (200 with segment counts — the happy path, not just wiring), while `index:backup` on a
+    /// node with no backup target is a clean 501 and `index:backup-status` honestly reports
+    /// `configured: false` (200). `GET /v1/cold` on a non-windowed index is a clean 404.
+    #[tokio::test(flavor = "current_thread")]
+    async fn compact_backup_and_cold_over_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app(shard(tmp.path()), crate::auth::default_auth());
+
+        // Compact: a real merge on the served shard.
+        let (status, body) = post(&app, "/v1/index:compact", json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["segments_after"].is_number(), "{body}");
+
+        // Backup without a configured target → 501 (mounted + dispatched, refused cleanly)...
+        let (status, body) = post(&app, "/v1/index:backup", json!({})).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(body["code"], "Unimplemented");
+        // ...and status reports the unconfigured state rather than erroring.
+        let (status, body) = post(&app, "/v1/index:backup-status", json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["configured"], false);
+        // Naming an index this node doesn't serve → 404, on both.
+        let (status, _) = post(&app, "/v1/index:compact", json!({ "index": "nope" })).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = post(&app, "/v1/index:backup", json!({ "index": "nope" })).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Cold-tier status on a non-windowed index: nothing to tier → 404.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/cold")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn alter_over_rest_is_wired_to_the_node() {
         let tmp = tempfile::tempdir().unwrap();

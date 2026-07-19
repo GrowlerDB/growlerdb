@@ -34,6 +34,25 @@ use a matching GrowlerDB version — old binaries fail loudly instead of mis-res
 - **Replica segment shipping** — a [replica](/product/functional/replicas.md) advances by pulling
   shipped segments from the same store and hot-swapping on a snapshot advance.
 
+## Consistency invariants
+
+- **The manifest is the commit point** — written last on every backup, and every mutation keeps
+  the durable manifest consistent with the object set at every crash point. In particular, cold
+  [bundling](/system/storage/cold-bundles.md) commits the `bundled` manifest **before** deleting
+  the per-file objects it supersedes, so a crash never leaves a manifest naming deleted objects
+  (a `restore` gets the clean `Bundled` refusal, never a mid-download 404).
+- **Replica refresh is torn-proof against concurrent backups.** A refresh pass fetches the
+  mutable objects (`index/meta.json`, `aux.redb`, `location.arr`) live while segment files come
+  from the manifest's list, so a primary backup landing mid-pass could pair a newer meta with an
+  older segment set. After each pass the replica re-reads the manifest and retries (bounded)
+  whenever the snapshot advanced during the pass; persistent contention surfaces as a transient
+  `RefreshContention` the poll loop simply retries.
+- **Cold-park verifies its snapshot post-swap.** A write committing between a window's backup
+  and its cold swap would advance the kept `aux.redb` checkpoint past the served cold copy —
+  silent loss. The park pass compares the live snapshot to the backed-up one *after* the swap
+  (when the window is read-only, so the check can't itself race); on a mismatch it swaps the
+  intact hot shard back and re-parks next tick.
+
 ## Notes
 
 Because the manifest carries snapshot + checkpoint, a restored index resumes ingestion exactly-once.

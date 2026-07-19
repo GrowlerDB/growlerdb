@@ -417,3 +417,27 @@ async fn client_login_returns_token() {
     let token = client.login("demo", "demo").await.unwrap();
     assert_eq!(token, TOKEN);
 }
+
+/// The `aggregate` tool end to end: a tools/call reaches the gateway's `/v1/facets` and the
+/// bucket payload flows back as the tool result (previously only name-asserted in tools/list).
+#[tokio::test]
+async fn aggregate_tool_returns_facet_buckets() {
+    let base = spawn_mock_gateway().await;
+    let responses = drive(
+        config(&base),
+        vec![json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "aggregate",
+                        "arguments": { "query": "*", "index": "docs",
+                                       "fields": ["category"], "size": 5 } }
+        })],
+    )
+    .await;
+
+    let result = &responses[0]["result"];
+    assert_eq!(result["isError"], false);
+    let text = result["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["facets"][0]["field"], "category");
+    assert_eq!(payload["facets"][0]["buckets"][0]["count"], 3);
+}
