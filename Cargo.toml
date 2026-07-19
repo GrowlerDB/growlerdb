@@ -46,6 +46,7 @@ growlerdb-telemetry = { path = "crates/growlerdb-telemetry" }
 growlerdb-source = { path = "crates/growlerdb-source" }
 growlerdb-proto = { path = "crates/growlerdb-proto" }
 growlerdb-client = { path = "crates/growlerdb-client" }
+growlerdb-mcp = { path = "crates/growlerdb-mcp" }
 
 # Local dev/test builds: keep line tables (so panics/backtraces still show file:line) but drop the
 # heavy variable/type debuginfo that dominates `target/debug` size for this dep set

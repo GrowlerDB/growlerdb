@@ -38,6 +38,12 @@ All notable changes to GrowlerDB are documented here. The format is based on
   the gateway scatters, merges by score, and RRF-fuses the lexical + vector arms for hybrid. The
   mandatory tenant filter is enforced at the node on the vector path (fail-closed without a claim), so
   tenant isolation holds on semantic/hybrid exactly as on lexical. (TASK-302)
+- **MCP retrieval server (`growlerdb mcp`).** A read-only Model Context Protocol server (JSON-RPC over
+  stdio) that exposes GrowlerDB to AI agents (Claude, any MCP client) as a governed retrieval tool —
+  tools: `search` (lexical / semantic / hybrid), `hydrate`, `aggregate`, `list_indexes`,
+  `describe_index`. It fronts the authenticated gateway over HTTP and forwards the caller's bearer
+  token, so RBAC + the non-widenable tenant filter are reused verbatim — an agent cannot reach another
+  tenant's data. Hand-rolled (no SDK dependency). (ADR D41/D42 · TASK-297)
 
 ## [0.3.0] - 2026-07-18
 

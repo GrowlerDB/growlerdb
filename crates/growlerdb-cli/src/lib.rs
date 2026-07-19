@@ -495,6 +495,33 @@ enum Command {
         #[command(flatten)]
         tls: ServerTlsArgs,
     },
+    /// Run a read-only Model Context Protocol (MCP) server on stdio for AI agents (Claude and any
+    /// MCP client). It fronts the GrowlerDB **gateway** over HTTP — forwarding the caller's bearer
+    /// token so the gateway's RBAC + tenant isolation govern every read — and exposes
+    /// search/hydrate/aggregate/list/describe as MCP tools. HTTP-only: it needs no local data dir.
+    Mcp {
+        /// Gateway origin the MCP server fronts. Env: `GROWLERDB_GATEWAY_URL`.
+        #[arg(
+            long,
+            default_value = "http://127.0.0.1:8081",
+            env = "GROWLERDB_GATEWAY_URL"
+        )]
+        gateway_url: String,
+        /// Bearer token forwarded to the gateway (carries tenant + RBAC). If absent, pass
+        /// `--username`/`--password` to log in for one. Env: `GROWLERDB_TOKEN`.
+        #[arg(long, env = "GROWLERDB_TOKEN")]
+        token: Option<String>,
+        /// Default index for a tool call that omits `index`.
+        #[arg(long)]
+        index: Option<String>,
+        /// Username to log in with (via `POST /v1/login`) when `--token` is absent. Env:
+        /// `GROWLERDB_USERNAME`.
+        #[arg(long, env = "GROWLERDB_USERNAME")]
+        username: Option<String>,
+        /// Password paired with `--username`. Env: `GROWLERDB_PASSWORD`.
+        #[arg(long, env = "GROWLERDB_PASSWORD")]
+        password: Option<String>,
+    },
 }
 
 /// Cluster reconcile backstop: fetch the index's shard map + bucket owners from the
@@ -630,6 +657,14 @@ async fn reconcile_cluster(control_plane: &str, index: &str, full: bool) -> anyh
 /// wrapper over this; exposing it (and [`gateway`]) lets an out-of-tree build reuse the CLI.
 pub async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // The `mcp` subcommand speaks JSON-RPC on stdout, so it must NOT initialize the telemetry
+    // stdout log layer (that would corrupt the protocol stream) and it opens no embedded engine
+    // (it fronts the gateway over HTTP). Handle it before both.
+    if matches!(cli.command, Command::Mcp { .. }) {
+        return run_mcp(cli.command).await;
+    }
+
     // Structured JSON logging + the Prometheus metrics recorder.
     growlerdb_telemetry::init("growlerdb");
     // Startup splash to stderr (clap handles --help/--version before this, so it
@@ -874,10 +909,49 @@ pub async fn run() -> anyhow::Result<()> {
             )
             .await?;
         }
+        // Handled before the engine opens (see the top of `run`), so it never reaches this match.
+        Command::Mcp { .. } => {
+            unreachable!("Command::Mcp is dispatched by run_mcp before Engine::open")
+        }
     }
     // Flush any buffered OTLP spans before exit (no-op when export is off).
     growlerdb_telemetry::shutdown();
     Ok(())
+}
+
+/// Run the `mcp` subcommand: a read-only MCP stdio server fronting the gateway. Kept off the
+/// telemetry/engine path in [`run`] because it owns stdout for JSON-RPC. When no `--token` is given
+/// but `--username`/`--password` are, it logs in first (`POST /v1/login`) to obtain one.
+async fn run_mcp(command: Command) -> anyhow::Result<()> {
+    let Command::Mcp {
+        gateway_url,
+        token,
+        index,
+        username,
+        password,
+    } = command
+    else {
+        unreachable!("run_mcp is only called for Command::Mcp");
+    };
+
+    let token = match (token, username, password) {
+        (Some(token), _, _) => Some(token),
+        (None, Some(username), Some(password)) => {
+            let client = growlerdb_mcp::GatewayClient::new(gateway_url.clone(), None);
+            Some(client.login(&username, &password).await?)
+        }
+        (None, Some(_), None) | (None, None, Some(_)) => {
+            anyhow::bail!("--username and --password must be provided together");
+        }
+        (None, None, None) => None,
+    };
+
+    let cfg = growlerdb_mcp::McpConfig {
+        gateway_url,
+        token,
+        default_index: index,
+    };
+    growlerdb_mcp::serve(cfg).await
 }
 
 /// Spawn the health-driven **auto-compaction** loop for one shard `handle`: on a timer it

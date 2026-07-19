@@ -8,6 +8,7 @@ The touchpoints through which users reach GrowlerDB — all over one Engine API.
 * [REST API](/product/interfaces/rest.md) - the /v1/* HTTP+JSON facade over the same operations
 * [Client SDKs](/product/interfaces/client-sdks.md) - Python and Rust clients
 * [OpenSearch _search adapter](/product/interfaces/opensearch-adapter.md) - optional OpenSearch-compatible read endpoint
+* [MCP retrieval server](/product/interfaces/mcp-server.md) - read-only Model Context Protocol server exposing governed retrieval to AI agents, token-scoped
 * [SQL UDFs (Trino / Spark)](/product/interfaces/sql-udfs.md) - search-then-join from SQL engines
 
 # Operational
