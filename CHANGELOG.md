@@ -25,6 +25,13 @@ All notable changes to GrowlerDB are documented here. The format is based on
   returns the nearest documents as coordinates that hydrate. KNN is not yet tenant-filtered, so it is
   refused **fail-closed** on tenant-scoped indexes and exposed only on the native engine API (RRF
   fusion + filtered KNN follow). (ADR D19 · TASK-42)
+- **Hybrid search (RRF) + filtered / tenant-scoped KNN.** A KNN query takes an optional filter
+  (lexical / fast-field sub-query) whose matching docs constrain the neighbors, and `hybrid_search`
+  fuses lexical BM25 + vector KNN via Reciprocal Rank Fusion into one ranking. The mandatory
+  `tenant = <claim>` filter is now enforced on the vector path (the tenant Term rides inside the KNN),
+  so tenant-scoped semantic/hybrid search is filtered rather than refused — still fail-closed when a
+  scoped index has no verified claim. On a real-model paraphrase eval, hybrid strictly beats
+  lexical-only. Engine-facade for now (gateway exposure is a later surface). (TASK-43)
 
 ## [0.3.0] - 2026-07-18
 

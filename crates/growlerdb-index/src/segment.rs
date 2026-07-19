@@ -852,8 +852,14 @@ impl SegmentReader {
     /// Validates fields like [`search`](Self::search), so a bad query errors clearly.
     pub fn count(&self, query: &Query) -> Result<u64> {
         // A top-level KNN query has no Tantivy representation — count its resolved neighbors.
-        if let Query::Knn { field, vector, k } = query {
-            return Ok(self.knn_search(field, vector, *k)?.len() as u64);
+        if let Query::Knn {
+            field,
+            vector,
+            k,
+            filter,
+        } = query
+        {
+            return Ok(self.knn_search(field, vector, *k, filter.as_deref())?.len() as u64);
         }
         let tantivy_query = self.build(query)?;
         let searcher = self.reader.searcher();
@@ -913,7 +919,19 @@ impl SegmentReader {
     /// (`DocAddress` → stored `_key`), then merges across segments and keeps the global top-`k`.
     /// `field` must be a VECTOR (stored-bytes) field; a missing sidecar (e.g. a cold read-through
     /// reader, or a segment with no vectors) contributes no hits rather than erroring.
-    pub fn knn_search(&self, field: &str, vector: &[f32], k: usize) -> Result<Vec<Hit>> {
+    ///
+    /// When `filter` is `Some`, it is a lexical/fast-field sub-query whose matching docs constrain
+    /// the candidates: it is compiled once and collected into an allowed-address set, and a neighbor
+    /// is admitted only if it is both **live** and in that set. With a filter present the search
+    /// requests **all** of each segment's candidates (not just `k`) so the constraint can't starve
+    /// the result below `k` when matches exist. `None` keeps the unfiltered fast path.
+    pub fn knn_search(
+        &self,
+        field: &str,
+        vector: &[f32],
+        k: usize,
+        filter: Option<&Query>,
+    ) -> Result<Vec<Hit>> {
         let schema = self.index.schema();
         let tv_field = schema
             .get_field(field)
@@ -936,6 +954,16 @@ impl SegmentReader {
         };
         let key_field = schema.get_field(KEY_FIELD)?;
         let searcher = self.reader.searcher();
+        // Filtered KNN: compile the lexical/fast-field sub-query **once** and collect the full set of
+        // matching `(seg_ord, doc_id)` addresses. A neighbor is admitted only if it is also in this
+        // set — so tenant and fast-field constraints intersect the candidate pool.
+        let allowed: Option<std::collections::HashSet<DocAddress>> = match filter {
+            Some(f) => {
+                let tantivy_query = self.build(f)?;
+                Some(searcher.search(tantivy_query.as_ref(), &DocSetCollector)?)
+            }
+            None => None,
+        };
         let mut hits: Vec<Hit> = Vec::new();
         for (seg_ord, seg) in searcher.segment_readers().iter().enumerate() {
             let path = dir.join(ann_sidecar_name(&seg.segment_id().uuid_string()));
@@ -946,12 +974,21 @@ impl SegmentReader {
                 continue; // this segment's sidecar holds no index for the field
             };
             let alive = seg.alive_bitset();
-            // Ask for enough neighbors that, after dropping deleted/superseded docs, at least `k`
-            // live ones remain if the segment has them.
-            let want = k.saturating_add(seg.num_deleted_docs() as usize);
+            // With a filter, brute-force still ranks candidates but an arbitrary fraction may be
+            // filtered out, so request **all** of the segment's candidates and let the alive+allowed
+            // gate plus the global top-`k` decide — filtering can't starve the result below `k` when
+            // matches exist. Without a filter, keep the fast path: enough that dropping
+            // deleted/superseded docs still leaves `k` live ones.
+            let want = if allowed.is_some() {
+                index.len()
+            } else {
+                k.saturating_add(seg.num_deleted_docs() as usize)
+            };
             for (doc_id, score) in index.knn(vector, want) {
-                if alive.is_none_or(|b| b.is_alive(doc_id)) {
-                    let address = DocAddress::new(seg_ord as u32, doc_id);
+                let address = DocAddress::new(seg_ord as u32, doc_id);
+                if alive.is_none_or(|b| b.is_alive(doc_id))
+                    && allowed.as_ref().is_none_or(|a| a.contains(&address))
+                {
                     let doc: TantivyDocument = searcher.doc(address)?;
                     hits.push(Hit {
                         key: stored_key(&doc, key_field)?,
@@ -1004,13 +1041,19 @@ impl SegmentReader {
         // Tantivy query. It ranks by KNN score (no field sort, no keyset cursor — fusion with a
         // lexical query is a later task), so hand back score-ranked hits with empty sort values;
         // the store's paging then slices the window like any score-ranked result.
-        if let Query::Knn { field, vector, k } = query {
+        if let Query::Knn {
+            field,
+            vector,
+            k,
+            filter,
+        } = query
+        {
             if !sort.is_empty() || after.is_some() {
                 return Err(IndexError::QueryType(
                     "KNN search cannot be combined with a field sort or keyset cursor".into(),
                 ));
             }
-            let mut khits = self.knn_search(field, vector, *k)?;
+            let mut khits = self.knn_search(field, vector, *k, filter.as_deref())?;
             khits.truncate(limit);
             return Ok(khits.into_iter().map(|h| (h, Vec::new())).collect());
         }
@@ -2381,7 +2424,9 @@ mapping:
         let reader = TantivySegmentCore.open(dir.path()).unwrap();
 
         // Nearest to +x → doc 1 (exact) then doc 3 (mostly +x), best-first.
-        let hits = reader.knn_search("body_vec", &[1.0, 0.0, 0.0], 2).unwrap();
+        let hits = reader
+            .knn_search("body_vec", &[1.0, 0.0, 0.0], 2, None)
+            .unwrap();
         assert_eq!(hits.iter().map(hit_id).collect::<Vec<_>>(), vec![1, 3]);
         assert!(hits[0].score >= hits[1].score);
 
@@ -2392,6 +2437,7 @@ mapping:
                     field: "body_vec".into(),
                     vector: vec![0.0, 0.0, 1.0],
                     k: 1,
+                    filter: None,
                 },
                 1,
             )
@@ -2406,13 +2452,16 @@ mapping:
                     field: "body_vec".into(),
                     vector: vec![1.0, 0.0, 0.0],
                     k: 3,
+                    filter: None,
                 })
                 .unwrap(),
             3
         );
 
         // A non-vector field is a clear type error, not an empty result.
-        assert!(reader.knn_search("body", &[1.0, 0.0, 0.0], 1).is_err());
+        assert!(reader
+            .knn_search("body", &[1.0, 0.0, 0.0], 1, None)
+            .is_err());
     }
 
     fn batch() -> DocBatch {
