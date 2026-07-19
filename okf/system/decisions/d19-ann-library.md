@@ -28,7 +28,7 @@ implementation: at the current per-segment N it is exact (no recall loss), stabl
 adds **no new dependency** (so no `deny.toml` change). An HNSW crate can replace it behind the same
 trait later with no change to callers — the sidecar stores each field's index as opaque bytes and each
 index self-describes its `dims`/`metric`. The artifact is a **versioned per-segment sidecar**
-(`<segment-uuid>.ann`, magic `GDBa` + `u16` version, like the cold-tier `sidecar.rs`) holding one
+(`<segment-uuid>.ann`, magic `GDBv` + `u16` version, like the cold-tier `sidecar.rs`) holding one
 `VectorIndex` per vector field. It is built after commit (and rebuilt after each compaction merge over
 the newly-sealed segment), registered in `sealed_segments()` so backup/restore carries it, and read at
 query time by a top-level `Query::Knn { field, vector, k }`: each Tantivy segment's sidecar is loaded,

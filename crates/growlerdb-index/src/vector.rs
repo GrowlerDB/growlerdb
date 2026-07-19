@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 /// The ANN sidecar's magic tag — mirrors the cold-tier [`sidecar`](crate::sidecar) framing so a
 /// wrong-format or pre-versioning file is **detected**, never mis-parsed.
-pub const ANN_MAGIC: [u8; 4] = *b"GDBa";
+pub const ANN_MAGIC: [u8; 4] = *b"GDBv";
 /// Current ANN sidecar format version. Bump on any incompatible payload-layout change.
 const ANN_VERSION: u16 = 1;
 /// File-name suffix of a segment's ANN sidecar: `<segment-uuid>.ann`, beside the lexical segment.
