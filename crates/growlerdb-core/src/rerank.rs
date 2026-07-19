@@ -5,8 +5,8 @@
 //! `bge-reranker-base`, or an external provider) plugs into; the built-in
 //! [`HashReranker`] is the deterministic dependency-free default/fallback for tests + CI.
 //!
-//! [D21]: ../../okf/system/decisions/d21-reranker.md
-//! [D42]: ../../okf/system/decisions/d42-retrieval-first.md
+//! [D21]: ../../../okf/system/decisions/d21-reranker.md
+//! [D42]: ../../../okf/system/decisions/d42-retrieval-first.md
 
 use std::collections::HashSet;
 

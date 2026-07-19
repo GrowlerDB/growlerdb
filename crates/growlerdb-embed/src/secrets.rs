@@ -26,8 +26,8 @@
 //! to render key-derived text. The `/v1/config` DTO (and every other REST response) carries no key
 //! field — see the engine's `config_dto_has_no_secret_field` test.
 //!
-//! [D41]: ../../okf/system/decisions/d41-open-core.md
-//! [D42]: ../../okf/system/decisions/d42-retrieval-first.md
+//! [D41]: ../../../okf/system/decisions/d41-vector-open-core.md
+//! [D42]: ../../../okf/system/decisions/d42-retrieval-first.md
 
 use std::collections::HashMap;
 use std::fmt;

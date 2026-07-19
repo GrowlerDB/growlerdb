@@ -7,7 +7,7 @@
 //! validated at **execution** (against the index schema), where the field types are
 //! known — see `growlerdb-index`.
 //!
-//! [Design 03]: ../../../design/03-query-schema.md
+//! [Design 03]: ../../../okf/product/functional/search/syntax.md
 
 use std::fmt;
 
@@ -24,7 +24,7 @@ pub enum MatchOp {
 /// validated at **execution** (against the index schema), where the field types
 /// are known — see `growlerdb-index`.
 ///
-/// [Design 03]: ../../../design/03-query-schema.md
+/// [Design 03]: ../../../okf/product/functional/search/syntax.md
 #[derive(Debug, Clone, PartialEq)]
 pub enum Query {
     /// Match every document.

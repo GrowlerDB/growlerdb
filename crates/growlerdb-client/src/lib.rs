@@ -17,7 +17,7 @@
 //! # Ok(()) }
 //! ```
 //!
-//! [Design 01]: ../../../design/01-engine-api.md
+//! [Design 01]: ../../../okf/product/interfaces/grpc.md
 
 use growlerdb_proto::v1::admin_client::AdminClient;
 use growlerdb_proto::v1::lookup_client::LookupClient;
@@ -293,7 +293,7 @@ impl From<SearchQuery> for SearchRequest {
             collapse: q.collapse,
             pit_id: q.pit_id,
             search_after: q.search_after,
-            // Default scoring (per-shard BM25); SCORE_GLOBAL is reserved (design/09).
+            // Default scoring (per-shard BM25); SCORE_GLOBAL is reserved.
             score_mode: growlerdb_proto::v1::ScoreMode::ScoreLocal as i32,
             // The window selector is gateway-internal; a client request never sets it.
             window: 0,

@@ -798,7 +798,7 @@ mod tests {
         assert_eq!(s, "status:(active OR pending)");
     }
 
-    /// TASK-209: the http_logs `cidr_clientip` workload query — a `term` whose value is a CIDR
+    /// The http_logs benchmark `cidr_clientip` workload query — a `term` whose value is a CIDR
     /// block on an IP field. `/` is not a query metacharacter, so it passes through the token
     /// filter and the parser recognizes the `addr/prefix` shape as a native `IpCidr` (routed to
     /// the field's IP range). On a correctly-mapped IP field this returns matches; the failure
@@ -816,7 +816,7 @@ mod tests {
         );
     }
 
-    /// TASK-209: the http_logs `topk_hydrated` workload sort — top-k by a numeric field, desc.
+    /// The http_logs benchmark `topk_hydrated` workload sort — top-k by a numeric field, desc.
     /// Translates to a single descending `WireSort`; the server orders on the field's `fast`
     /// column (a non-`fast` field is the rejected-query case the gateway now reports as a 4xx).
     #[test]

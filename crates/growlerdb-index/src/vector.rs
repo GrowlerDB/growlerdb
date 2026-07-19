@@ -588,7 +588,7 @@ mod tests {
         ));
     }
 
-    // --- HNSW approximate index (TASK-301) ---
+    // --- HNSW approximate index ---
 
     /// Deterministic synthetic vectors from a xorshift64 PRNG (no `rand` dependency), so the
     /// recall/latency benchmark is reproducible.

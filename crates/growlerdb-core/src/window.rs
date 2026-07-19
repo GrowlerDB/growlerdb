@@ -9,8 +9,8 @@
 //! — the same canonical scale the index, range queries, and the console time filter use,
 //! so a `format`-declared timestamp can be the window field and pruning stays correct.
 //!
-//! [Service architecture]: ../../../design/06-service-architecture.md
-//! [Deployment ops]: ../../../design/14-deployment-ops.md
+//! [Service architecture]: ../../../okf/system/architecture.md
+//! [Deployment ops]: ../../../okf/system/deployment/index.md
 
 use serde::{Deserialize, Serialize};
 

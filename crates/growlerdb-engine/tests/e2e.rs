@@ -168,7 +168,7 @@ async fn sharded_build_partitions_the_table_disjointly() {
     assert!(ids1.iter().all(|id| router.route(&doc_key(id)) == 1));
 }
 
-/// **Empty-shard health (TASK-121)** — a shard that owns **zero** of the source rows (a sparse
+/// **Empty-shard health** — a shard that owns **zero** of the source rows (a sparse
 /// multi-shard build: more shards than the 3-row table can fill) must still record the source
 /// snapshot it caught up to. Otherwise it never commits a checkpoint and reports `uninitialized`
 /// forever — a grey "unknown" health pill for the whole index — even though it is genuinely in sync.
@@ -211,7 +211,7 @@ async fn a_sparse_shard_with_no_rows_records_the_source_snapshot() {
             .current_checkpoint()
             .expect("read checkpoint")
             .is_some(),
-        "an empty shard must record the source snapshot it caught up to (TASK-121)"
+        "an empty shard must record the source snapshot it caught up to"
     );
 }
 

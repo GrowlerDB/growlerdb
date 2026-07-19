@@ -3,7 +3,7 @@
 //! `DocOp`) to the wire `Write` service, so the Spark
 //! changelog connector can apply batches to a shard over gRPC.
 //!
-//! [Design 06]: ../../../design/06-service-architecture.md
+//! [Design 06]: ../../../okf/system/architecture.md
 
 use std::sync::Arc;
 

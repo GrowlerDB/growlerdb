@@ -4,7 +4,7 @@
 //! / `suggest_fuzzy`. Suggestion frequencies are approximate (not liveness-filtered),
 //! the suggester contract.
 //!
-//! [Design 01]: ../../../design/01-engine-api.md
+//! [Design 01]: ../../../okf/product/interfaces/grpc.md
 
 use growlerdb_index::{IndexError, StoreError};
 use growlerdb_proto::v1::{

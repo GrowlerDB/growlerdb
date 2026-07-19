@@ -30,7 +30,7 @@
 //! "relevance_score":s}]}` (Cohere/Voyage rerank). Providers that diverge from these shapes need a
 //! small per-provider adapter (deferred).
 //!
-//! [D42]: ../../okf/system/decisions/d42-retrieval-first.md
+//! [D42]: ../../../okf/system/decisions/d42-retrieval-first.md
 
 use std::time::Duration;
 

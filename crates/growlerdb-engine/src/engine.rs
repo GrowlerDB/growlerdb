@@ -336,7 +336,7 @@ impl Engine {
             // shard in a multi-shard build that owns none of the keys, or a currently-empty source —
             // must still record the snapshot it reflects. Otherwise it never commits a checkpoint and
             // reports `uninitialized` forever (a grey "unknown" health pill for the whole index),
-            // even though it is genuinely in sync (TASK-121). If nothing above advanced the
+            // even though it is genuinely in sync. If nothing above advanced the
             // checkpoint, anchor it with a checkpoint-only commit. Guarded on a real snapshot
             // (`snapshot_id != 0`) so a source with no snapshot stays honestly uninitialized.
             if snapshot_id != 0 && shard.current_checkpoint()?.is_none() {
@@ -555,16 +555,14 @@ impl Engine {
             k: fetch,
             filter: None,
         };
-        // Tenant enforcement (filtered KNN, TASK-43): on a tenant-scoped index the caller MUST
+        // Tenant enforcement (filtered KNN): on a tenant-scoped index the caller MUST
         // present a claim; the `tenant = <claim>` Term rides inside the KNN as its filter, so the
         // neighbor set is intersected with that tenant's docs. Still fail **closed** when the claim
         // is missing — a tenant-scoped index with no claim must refuse, never return nearest
         // neighbors across tenants. A non-tenant-scoped index ignores `tenant`.
         if let Some(tenant_field) = resolved.tenant_field() {
             let Some(claim) = tenant else {
-                return Err(EngineError::SemanticTenantScopedUnsupported(
-                    index.to_string(),
-                ));
+                return Err(EngineError::SemanticTenantClaimRequired(index.to_string()));
             };
             query = query.with_knn_filter(Query::Term {
                 field: Some(tenant_field.to_string()),
@@ -632,9 +630,7 @@ impl Engine {
         let tenant_claim = match resolved.tenant_field() {
             Some(tf) => {
                 let Some(claim) = tenant else {
-                    return Err(EngineError::SemanticTenantScopedUnsupported(
-                        index.to_string(),
-                    ));
+                    return Err(EngineError::SemanticTenantClaimRequired(index.to_string()));
                 };
                 Some((tf.to_string(), claim.to_string()))
             }
@@ -1127,7 +1123,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            EngineError::SemanticTenantScopedUnsupported(i) if i == "docs"
+            EngineError::SemanticTenantClaimRequired(i) if i == "docs"
         ));
     }
 
@@ -1388,7 +1384,7 @@ mod tests {
     fn reindex_on_schema_change_wipes_a_stale_index_but_leaves_an_unchanged_one() {
         // A previously-built `docs` index (schema A: id, body). A `growlerdb index` re-run with a
         // *widened* definition (adds a mapped `title` field) must reindex from scratch rather than
-        // reopen the stale narrower index and panic Tantivy's fast-field writer (TASK-303). A re-run
+        // reopen the stale narrower index and panic Tantivy's fast-field writer. A re-run
         // with the SAME schema must be a no-op (the built data is preserved).
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();

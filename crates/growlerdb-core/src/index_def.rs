@@ -6,7 +6,7 @@
 //! leaf fields + key hints) into a [`ResolvedIndex`] — concrete key fields and a
 //! concrete typed field list — validating that every referenced path exists.
 //!
-//! Per [Design 04](../../../design/04-index-definition.md):
+//! Per [Design 04](../../../okf/product/functional/index-management/create.md):
 //!
 //! * Field types: **TEXT**, **KEYWORD**, **LONG**, **DOUBLE**, **BOOL**, **DATE**,
 //!   **IP**, with the `fast` (columnar) and `cached` (returned-with-hit) flags
@@ -417,7 +417,7 @@ impl IndexDefinition {
 }
 
 /// Decide how a source's **equality deletes** apply to the index, and warn when
-/// they need the costlier fallback ([equality deletes](../../../wiki/06-ingestion.md)):
+/// they need the costlier fallback ([equality deletes](../../../okf/product/functional/ingestion/index.md)):
 ///
 /// * columns ⊆ the composite key → [`DeleteByKey`](EqualityDeleteHandling::DeleteByKey)
 ///   (an equality delete `c = K` *is* `delete_by_key(K)` — no pre-image needed);
@@ -805,7 +805,7 @@ fn resolve_vector_field(f: &FieldMapping) -> Result<ResolvedField, DefError> {
         analyzer: None,
         format: None,
         fast: false,
-        // Vectors get no inverted index — the KNN/ANN path (TASK-42) reads the stored bytes.
+        // Vectors get no inverted index — the KNN/ANN path reads the stored bytes.
         indexed: false,
         record: TextRecord::Position,
         fieldnorms: true,
@@ -1352,7 +1352,7 @@ fn diff_field(path: &str, old: &ResolvedField, new: &ResolvedField, plan: &mut A
 }
 
 /// How a source's **equality deletes** are applied to the index ([equality
-/// deletes](../../../wiki/06-ingestion.md)). GrowlerDB is keyed by the
+/// deletes](../../../okf/product/functional/ingestion/index.md)). GrowlerDB is keyed by the
 /// composite document key, so an equality delete on the key columns is just a
 /// `delete_by_key`; anything else needs a partition re-scan.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
