@@ -7,10 +7,13 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use growlerdb_core::{
-    embed_located_docs, CommitBatch, CompositeKey, Hit, HydratedRow, IcebergSource,
-    IndexDefinition, IndexReader, IndexWriter, KeySpec, LocatedDoc, Mapping, Projection,
-    ResolvedIndex, ScanMode, SearchParams, ShardRouter, Snapshot, Source, SourceCheckpoint, Value,
+    CommitBatch, CompositeKey, Hit, HydratedRow, IcebergSource, IndexDefinition, IndexReader,
+    IndexWriter, KeySpec, LocatedDoc, Mapping, Projection, ResolvedIndex, ScanMode, SearchParams,
+    ShardRouter, Snapshot, Source, SourceCheckpoint, Value,
 };
+// Ingest embeds via the BGE-capable factory (real local model, or the hash-embedder fallback),
+// not core's built-in `default_embedder`.
+use growlerdb_embed::embed_located_docs;
 use growlerdb_index::{LocalIndexStore, Shard, ShardId};
 use growlerdb_source::{IcebergConfig, IcebergReader};
 

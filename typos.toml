@@ -13,6 +13,8 @@ Ded = "Ded"
 mis = "mis"
 # "MoR" — Iceberg merge-on-read
 mor = "mor"
+# "mmaped" — candle's `VarBuilder::from_mmaped_safetensors` API name (memory-mapped)
+mmaped = "mmaped"
 # "unparseable" — accepted variant of unparsable (also a Rust enum/error variant)
 unparseable = "unparseable"
 Unparseable = "Unparseable"

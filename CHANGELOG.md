@@ -14,6 +14,11 @@ All notable changes to GrowlerDB are documented here. The format is based on
   recorded in the index metadata for reproducibility. Embeddings are produced through a pluggable
   `Embedder` seam (external providers attach here). Query-time KNN / fusion / reranking follow.
   (ADR D19/D20/D21/D41/D42 · TASK-41)
+- **Local BGE embedding runtime.** The default embedder is **bge-small-en-v1.5** run in-process on
+  [Candle](https://github.com/huggingface/candle) — pure Rust, no native/C dependency, no network. The
+  model is provisioned out of band into `${GROWLERDB_MODEL_DIR:-~/.cache/growlerdb/models}/<model-id>/`;
+  when absent, embedding falls back to a deterministic dev embedder so ingest and offline CI keep
+  working. Behind a default-on `bge` build feature (a slim build can drop the ML dependency). (TASK-41)
 
 ## [0.3.0] - 2026-07-18
 

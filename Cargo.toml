@@ -37,6 +37,7 @@ prost = "0.14"
 tonic-prost-build = "0.14"
 # internal crates
 growlerdb-core = { path = "crates/growlerdb-core" }
+growlerdb-embed = { path = "crates/growlerdb-embed" }
 growlerdb-controlplane = { path = "crates/growlerdb-controlplane" }
 growlerdb-index = { path = "crates/growlerdb-index" }
 growlerdb-backup = { path = "crates/growlerdb-backup" }
