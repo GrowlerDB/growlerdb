@@ -6,6 +6,15 @@ All notable changes to GrowlerDB are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Vector fields (foundation).** A `VECTOR` field type embeds a text column (local model by default,
+  no egress) and stores the per-document embedding in the segment, backed up with the lexical segment —
+  the base for semantic / hybrid retrieval. Opt-in per field; `model` / `dims` / `metric` / `provider`
+  recorded in the index metadata for reproducibility. Embeddings are produced through a pluggable
+  `Embedder` seam (external providers attach here). Query-time KNN / fusion / reranking follow.
+  (ADR D19/D20/D21/D41/D42 · TASK-41)
+
 ## [0.3.0] - 2026-07-18
 
 The **Brand v1.0 + launch-readiness** release: a unified brand across the console, website, and docs;

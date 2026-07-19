@@ -7,9 +7,9 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use growlerdb_core::{
-    CommitBatch, CompositeKey, Hit, HydratedRow, IcebergSource, IndexDefinition, IndexReader,
-    IndexWriter, KeySpec, LocatedDoc, Mapping, Projection, ResolvedIndex, ScanMode, SearchParams,
-    ShardRouter, Snapshot, Source, SourceCheckpoint, Value,
+    embed_located_docs, CommitBatch, CompositeKey, Hit, HydratedRow, IcebergSource,
+    IndexDefinition, IndexReader, IndexWriter, KeySpec, LocatedDoc, Mapping, Projection,
+    ResolvedIndex, ScanMode, SearchParams, ShardRouter, Snapshot, Source, SourceCheckpoint, Value,
 };
 use growlerdb_index::{LocalIndexStore, Shard, ShardId};
 use growlerdb_source::{IcebergConfig, IcebergReader};
@@ -278,7 +278,9 @@ impl Engine {
         shard_filter: Option<&(ShardRouter, u32)>,
     ) -> Result<(Snapshot, usize), EngineError> {
         let (snapshot, doc_count) = if resolved.windowing.is_some() {
-            let batch = reader.read_documents(table, resolved).await?;
+            let mut batch = reader.read_documents(table, resolved).await?;
+            // Fill in each LOCAL vector field's embedding before the docs are written.
+            embed_located_docs(resolved, &mut batch.docs);
             let doc_count = batch.docs.len();
             let snapshot = self.write_build(
                 resolved,
@@ -306,6 +308,8 @@ impl Engine {
                     if let Some((router, ordinal)) = shard_filter {
                         docs.retain(|d| router.owns(&d.doc.key, *ordinal));
                     }
+                    // Fill in each LOCAL vector field's embedding before the chunk is written.
+                    embed_located_docs(resolved, &mut docs);
                     written += docs.len();
                     chunk += 1;
                     let batch = CommitBatch::from_upserts(

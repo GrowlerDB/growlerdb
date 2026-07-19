@@ -183,6 +183,9 @@ impl IndexSchema {
                 FieldType::Bool => builder.add_bool_field(&f.path, num_opts(f)),
                 FieldType::Date => builder.add_date_field(&f.path, date_opts(f)),
                 FieldType::Ip => builder.add_ip_addr_field(&f.path, ip_opts(f)),
+                // A vector is stored as raw LE-`f32` bytes: STORED so it round-trips per-doc,
+                // FAST so the ANN build (TASK-42) can read it columnar. Not sortable.
+                FieldType::Vector => builder.add_bytes_field(&f.path, STORED | FAST),
             };
             fields.push((f.path.clone(), handle, f.ty, f.format));
         }
@@ -388,7 +391,33 @@ fn add_typed_value(
                 }
             }
         }
+        // Vectors are stored as raw LE-`f32` bytes (see [`vec_f32_to_le_bytes`]).
+        FieldType::Vector => {
+            if let V::Vector(v) = value {
+                td.add_bytes(field, &vec_f32_to_le_bytes(v));
+            }
+        }
     }
+}
+
+/// Encode a dense vector as its raw little-endian `f32` bytes (4 bytes/element) — the
+/// stored form of a VECTOR field. Inverse of [`le_bytes_to_vec_f32`].
+fn vec_f32_to_le_bytes(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
+/// Decode raw little-endian `f32` bytes back into a vector — inverse of
+/// [`vec_f32_to_le_bytes`]. A trailing partial element (input length not a multiple of 4)
+/// is dropped. Test-only until the ANN read path (TASK-42) consumes stored vectors.
+#[cfg(test)]
+fn le_bytes_to_vec_f32(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 /// Normalize an `IpAddr` to the IPv6 form Tantivy stores (IPv4 → v4-mapped v6).
@@ -2867,5 +2896,69 @@ mapping:
             ),
             Err(IndexError::QueryType(_))
         ));
+    }
+
+    #[test]
+    fn vec_f32_le_bytes_round_trips() {
+        let v = vec![0.0f32, 1.5, -2.25, 3.125, f32::MIN_POSITIVE, f32::MAX];
+        assert_eq!(le_bytes_to_vec_f32(&vec_f32_to_le_bytes(&v)), v);
+        // Empty vector → empty bytes → empty vector.
+        assert!(le_bytes_to_vec_f32(&vec_f32_to_le_bytes(&[])).is_empty());
+    }
+
+    #[test]
+    fn vector_field_stores_and_reads_back() {
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("body", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        let idx = IndexDefinition::from_yaml(
+            r#"
+name: docs
+source: { iceberg: { catalog: growlerdb, table: growlerdb.docs } }
+mapping:
+  selection: EXPLICIT
+  fields:
+    - { path: id, type: KEYWORD }
+    - { path: body, type: TEXT }
+    - { path: body_vec, type: VECTOR, vector: { dims: 4, source_field: body } }
+"#,
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+
+        let vector = vec![0.1f32, 0.2, 0.3, 0.4];
+        let key = CompositeKey::new(vec![], vec![("id".into(), Value::from("a"))]);
+        let mut f = BTreeMap::new();
+        f.insert("id".to_string(), Value::from("a"));
+        f.insert("body".to_string(), Value::from("hello"));
+        f.insert("body_vec".to_string(), Value::Vector(vector.clone()));
+        let batch = DocBatch::new(vec![Document::new(key, f)]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let schema = IndexSchema::from_resolved(&idx);
+        let core = TantivySegmentCore;
+        assert_eq!(core.build(&schema, &batch, dir.path()).unwrap(), 1);
+
+        // Read the stored vector bytes back and decode — they must equal the input.
+        let reader = core.open(dir.path()).unwrap();
+        let searcher = reader.reader.searcher();
+        let field = reader.index.schema().get_field("body_vec").unwrap();
+        let addr = *searcher
+            .search(&AllQuery, &DocSetCollector)
+            .unwrap()
+            .iter()
+            .next()
+            .unwrap();
+        let doc: TantivyDocument = searcher.doc(addr).unwrap();
+        // The tantivy `Value` trait (for `as_bytes`) — `_` avoids clashing with `growlerdb_core::Value`.
+        use tantivy::schema::Value as _;
+        let bytes = doc.get_first(field).and_then(|v| v.as_bytes()).unwrap();
+        assert_eq!(le_bytes_to_vec_f32(bytes), vector);
     }
 }

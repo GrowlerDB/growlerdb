@@ -38,13 +38,22 @@ impl From<growlerdb_core::Value> for v1::Value {
     fn from(value: growlerdb_core::Value) -> Self {
         use v1::value::Kind;
         let kind = match value {
-            growlerdb_core::Value::Str(s) => Kind::Str(s),
-            growlerdb_core::Value::Int(i) => Kind::Int(i),
-            growlerdb_core::Value::Float(f) => Kind::Float(f),
-            growlerdb_core::Value::Bool(b) => Kind::Bool(b),
-            growlerdb_core::Value::Ts(t) => Kind::TsMicros(t),
+            growlerdb_core::Value::Str(s) => Some(Kind::Str(s)),
+            growlerdb_core::Value::Int(i) => Some(Kind::Int(i)),
+            growlerdb_core::Value::Float(f) => Some(Kind::Float(f)),
+            growlerdb_core::Value::Bool(b) => Some(Kind::Bool(b)),
+            growlerdb_core::Value::Ts(t) => Some(Kind::TsMicros(t)),
+            // A vector is a local-store artifact — embedded node-locally at ingest and kept in
+            // the segment; it never crosses the document wire (the `Document` bridge below drops
+            // vector fields). There is no scalar wire kind for it, so this arm is unreachable by
+            // construction; stay total and inert (never panic in a `From`) if the invariant is
+            // ever bypassed directly.
+            growlerdb_core::Value::Vector(_) => {
+                debug_assert!(false, "vector values do not cross the document wire");
+                None
+            }
         };
-        v1::Value { kind: Some(kind) }
+        v1::Value { kind }
     }
 }
 
@@ -159,9 +168,12 @@ impl From<growlerdb_core::Document> for v1::Document {
     fn from(doc: growlerdb_core::Document) -> Self {
         v1::Document {
             key: Some((&doc.key).into()),
+            // A VECTOR field's embedding is a node-local segment artifact, not document-wire
+            // state — drop it here so the write bridge stays total without a vector wire kind.
             fields: doc
                 .fields
                 .into_iter()
+                .filter(|(_, value)| !matches!(value, growlerdb_core::Value::Vector(_)))
                 .map(|(name, value)| (name, value.into()))
                 .collect(),
         }

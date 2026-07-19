@@ -23,6 +23,8 @@ pub enum Value {
     /// the index stores dates in). One variant covers both source dates
     /// and timestamps — the source schema disambiguates at the boundary.
     Ts(i64),
+    /// A dense embedding vector (never a key field).
+    Vector(Vec<f32>),
 }
 
 impl Value {
@@ -37,6 +39,8 @@ impl Value {
             // Canonical micros, rendered like an Int — matches how a pre-parsed epoch
             // column is stringified for TEXT/KEYWORD indexing.
             Value::Ts(t) => t.to_string(),
+            // Vectors are not text-indexed — they carry no meaningful string form.
+            Value::Vector(_) => String::new(),
         }
     }
 }
@@ -56,6 +60,12 @@ impl From<String> for Value {
 impl From<i64> for Value {
     fn from(i: i64) -> Self {
         Value::Int(i)
+    }
+}
+
+impl From<Vec<f32>> for Value {
+    fn from(v: Vec<f32>) -> Self {
+        Value::Vector(v)
     }
 }
 
@@ -93,9 +103,9 @@ impl CompositeKey {
     /// as `role · len(name) · name · type-tag · len(value) · value`, so lookups
     /// are **exact** and deterministic. It is **not** order-preserving across
     /// types — hash routing doesn't need it. Type tags: `1` Str, `2` Int,
-    /// `3` Float, `4` Bool, `5` Ts — the encoding of existing tags is frozen (it
-    /// is the routing-hash input and the Tantivy delete term), so new types only
-    /// ever **append** tags.
+    /// `3` Float, `4` Bool, `5` Ts, `6` Vector — the encoding of existing tags is
+    /// frozen (it is the routing-hash input and the Tantivy delete term), so new types
+    /// only ever **append** tags.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         for (role, fields) in [(0u8, &self.partition), (1u8, &self.identifier)] {
@@ -151,6 +161,17 @@ fn push_value(out: &mut Vec<u8>, value: &Value) {
             // so a timestamp key never collides with an integer key of the same value.
             out.push(5);
             push_bytes(out, &t.to_le_bytes());
+        }
+        Value::Vector(v) => {
+            // A vector is never a key field, but `push_value` stays **total** (no panic):
+            // tag `6`, the `f32` count, then each element as 4 LE bytes.
+            out.push(6);
+            let mut bytes = Vec::with_capacity(4 + v.len() * 4);
+            bytes.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            for x in v {
+                bytes.extend_from_slice(&x.to_le_bytes());
+            }
+            push_bytes(out, &bytes);
         }
     }
 }

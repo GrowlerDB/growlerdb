@@ -140,6 +140,46 @@ pub enum DefError {
     /// something for analyzed multi-token TEXT.
     #[error("field `{0}` is not TEXT — `fieldnorms:` only applies to analyzed TEXT fields")]
     FieldnormsOnNonText(String),
+
+    /// A `type: VECTOR` field carried no `vector` config — dims/model/source_field
+    /// have no defaults for the source field to embed, so the config is required.
+    #[error("VECTOR field `{0}` requires a `vector` config")]
+    VectorMissingConfig(String),
+
+    /// A `vector` config was declared on a field whose type isn't `VECTOR` — the
+    /// embedding config only means something for a vector field.
+    #[error("field `{0}` has a `vector` config but is not a VECTOR field")]
+    VectorConfigOnNonVector(String),
+
+    /// A VECTOR field's `dims` was 0 — a zero-length embedding is meaningless.
+    #[error("VECTOR field `{0}` has `dims: 0` — embedding dimensionality must be > 0")]
+    VectorZeroDims(String),
+
+    /// A VECTOR field set a knob that doesn't apply to a vector (`fast`, `cached`,
+    /// `sensitive`, `analyzer`, `record`, `fieldnorms`, or `format`) — vectors get
+    /// no inverted index and no columnar/text representation.
+    #[error("VECTOR field `{path}` cannot set `{option}` — it does not apply to a vector field")]
+    VectorInvalidOption {
+        /// The offending field path.
+        path: String,
+        /// The knob that isn't allowed on a vector field.
+        option: &'static str,
+    },
+
+    /// A VECTOR field asked for the `EXTERNAL` embedding provider — only the
+    /// in-process `LOCAL` provider is wired today.
+    #[error("VECTOR field `{0}`: external embedding provider not yet supported (local only)")]
+    VectorExternalProvider(String),
+
+    /// A VECTOR field's `source_field` was empty or didn't name a mapped field —
+    /// there is nothing to embed.
+    #[error("VECTOR field `{path}` source_field `{source_field}` does not name a mapped field")]
+    VectorSourceUnknown {
+        /// The vector field's path.
+        path: String,
+        /// The unresolved `source_field` reference.
+        source_field: String,
+    },
 }
 
 /// Cache cap: a field whose declared `max_bytes` exceeds this is **big text** and
@@ -246,7 +286,9 @@ impl IndexDefinition {
         // Plus the `indexed` guardrails: a non-indexed field must have a columnar
         // query path (fast), and string types can't opt out at all.
         for f in &fields {
-            if !f.indexed {
+            // A VECTOR field is intentionally non-indexed and non-fast (it carries no
+            // inverted index or columnar scalar) — the guardrail below doesn't apply.
+            if !f.indexed && f.ty != FieldType::Vector {
                 if matches!(f.ty, FieldType::Text | FieldType::Keyword) {
                     return Err(DefError::IndexedFalseText(f.path.clone()));
                 }
@@ -266,6 +308,18 @@ impl IndexDefinition {
                             cap: MAX_CACHED_FIELD_BYTES,
                         });
                     }
+                }
+            }
+        }
+        // A VECTOR field's `source_field` must name another mapped field — that's the text
+        // whose value is embedded at ingest. Checked here, where the whole field set exists.
+        for f in &fields {
+            if let Some(spec) = &f.vector {
+                if !fields.iter().any(|o| o.path == spec.source_field) {
+                    return Err(DefError::VectorSourceUnknown {
+                        path: f.path.clone(),
+                        source_field: spec.source_field.clone(),
+                    });
                 }
             }
         }
@@ -524,9 +578,10 @@ pub struct Mapping {
 
 impl Mapping {
     fn resolve(&self, source: &SourceSchema) -> Result<Vec<ResolvedField>, DefError> {
-        // Every override / allowlist path must exist in the source.
         for f in &self.fields {
-            if !source.has_field(&f.path) {
+            // A VECTOR field is a **derived** field (the embedding of `source_field`), not a
+            // source column, so its `path` need not name a source leaf; every other field's must.
+            if f.ty != Some(FieldType::Vector) && !source.has_field(&f.path) {
                 return Err(DefError::UnknownPath {
                     path: f.path.clone(),
                     referenced_by: "mapping.fields",
@@ -534,7 +589,11 @@ impl Mapping {
             }
             // A timestamp `format` declares the field a DATE; an explicit non-DATE `type`
             // alongside it is a contradiction — reject it loudly rather than silently pick one.
-            if f.format.is_some() && matches!(f.ty, Some(t) if t != FieldType::Date) {
+            // (Skipped for VECTOR, whose `resolve_vector_field` rejects `format` with its own error.)
+            if f.ty != Some(FieldType::Vector)
+                && f.format.is_some()
+                && matches!(f.ty, Some(t) if t != FieldType::Date)
+            {
                 return Err(DefError::TimestampFormatType {
                     path: f.path.clone(),
                     ty: f.ty.unwrap(),
@@ -557,7 +616,7 @@ impl Mapping {
                 } else {
                     HashSet::new()
                 };
-                source
+                let mut fields = source
                     .fields
                     .iter()
                     .filter(|sf| !exclude.contains(sf.path.as_str()))
@@ -565,7 +624,17 @@ impl Mapping {
                         let ovr = self.fields.iter().find(|f| f.path == sf.path);
                         resolve_field(&sf.path, sf.ty, ovr)
                     })
-                    .collect()
+                    .collect::<Result<Vec<_>, _>>()?;
+                // Append the derived VECTOR fields — they aren't source leaves, so the
+                // source-driven pass above never emits them.
+                for f in self
+                    .fields
+                    .iter()
+                    .filter(|f| f.ty == Some(FieldType::Vector))
+                {
+                    fields.push(resolve_vector_field(f)?);
+                }
+                Ok(fields)
             }
             Selection::Explicit => {
                 if self.fields.is_empty() {
@@ -574,6 +643,9 @@ impl Mapping {
                 self.fields
                     .iter()
                     .map(|f| {
+                        if f.ty == Some(FieldType::Vector) {
+                            return resolve_vector_field(f);
+                        }
                         // Safe: presence validated above.
                         let sf = source.field(&f.path).expect("validated present");
                         resolve_field(&f.path, sf.ty, Some(f))
@@ -593,6 +665,11 @@ fn resolve_field(
     source_ty: SourceType,
     ovr: Option<&FieldMapping>,
 ) -> Result<ResolvedField, DefError> {
+    // A `vector` config only means something for a VECTOR field (which resolves through
+    // `resolve_vector_field`, never here) — reject it on any other type.
+    if ovr.is_some_and(|o| o.vector.is_some()) {
+        return Err(DefError::VectorConfigOnNonVector(path.to_string()));
+    }
     let format = ovr.and_then(|o| o.format);
     // A declared timestamp `format` makes the field a DATE regardless of its source
     // Arrow type — that's the whole point (an int64/string epoch column becomes a timestamp).
@@ -635,6 +712,78 @@ fn resolve_field(
         cached: ovr.is_some_and(|o| o.cached),
         sensitive: ovr.is_some_and(|o| o.sensitive),
         max_bytes: ovr.and_then(|o| o.max_bytes),
+        vector: None,
+    })
+}
+
+/// Resolve a `type: VECTOR` field mapping into its [`ResolvedField`]. Unlike a normal
+/// field, a vector field is **derived** (its value is the embedding of `source_field`, not a
+/// source column), so its `path` need not name a source leaf. The `vector` config is required;
+/// the knobs that shape an inverted/columnar/text representation (`fast`, `cached`, `sensitive`,
+/// `analyzer`, `record`, `fieldnorms`, `format`) don't apply and are rejected. The field is
+/// forced non-`indexed` (vectors get no inverted index); `record`/`fieldnorms` stay at their
+/// defaults. Cross-field validation (that `source_field` names a mapped field) happens in
+/// [`resolve`](IndexDefinition::resolve) once the whole field set exists.
+fn resolve_vector_field(f: &FieldMapping) -> Result<ResolvedField, DefError> {
+    let opts = f
+        .vector
+        .as_ref()
+        .ok_or_else(|| DefError::VectorMissingConfig(f.path.clone()))?;
+    let reject = |set: bool, option: &'static str| -> Result<(), DefError> {
+        if set {
+            return Err(DefError::VectorInvalidOption {
+                path: f.path.clone(),
+                option,
+            });
+        }
+        Ok(())
+    };
+    reject(f.fast, "fast")?;
+    reject(f.cached, "cached")?;
+    reject(f.sensitive, "sensitive")?;
+    reject(f.analyzer.is_some(), "analyzer")?;
+    reject(f.record.is_some(), "record")?;
+    reject(f.fieldnorms.is_some(), "fieldnorms")?;
+    reject(f.format.is_some(), "format")?;
+
+    let dims = opts.dims.unwrap_or(DEFAULT_EMBED_DIMS);
+    if dims == 0 {
+        return Err(DefError::VectorZeroDims(f.path.clone()));
+    }
+    let provider = opts.provider.unwrap_or_default();
+    if provider == EmbedProvider::External {
+        return Err(DefError::VectorExternalProvider(f.path.clone()));
+    }
+    if opts.source_field.is_empty() {
+        return Err(DefError::VectorSourceUnknown {
+            path: f.path.clone(),
+            source_field: opts.source_field.clone(),
+        });
+    }
+    let spec = VectorSpec {
+        dims,
+        model: opts
+            .model
+            .clone()
+            .unwrap_or_else(|| DEFAULT_EMBED_MODEL.to_string()),
+        metric: opts.metric.unwrap_or_default(),
+        provider,
+        source_field: opts.source_field.clone(),
+    };
+    Ok(ResolvedField {
+        path: f.path.clone(),
+        ty: FieldType::Vector,
+        analyzer: None,
+        format: None,
+        fast: false,
+        // Vectors get no inverted index — the KNN/ANN path (TASK-42) reads the stored bytes.
+        indexed: false,
+        record: TextRecord::Position,
+        fieldnorms: true,
+        cached: false,
+        sensitive: false,
+        max_bytes: None,
+        vector: Some(spec),
     })
 }
 
@@ -693,6 +842,9 @@ pub struct FieldMapping {
     /// the field is hydrate-only and cannot be `cached`. Default unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<u64>,
+    /// VECTOR-only: embedding config (dims, model, metric, provider, source_field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector: Option<VectorMappingOpts>,
 }
 
 /// GrowlerDB field type.
@@ -714,6 +866,10 @@ pub enum FieldType {
     /// IP address — CIDR / range match (e.g. device/gateway IPs). Declared explicitly; never auto-derived
     /// (Iceberg/Arrow has no IP type — it arrives as a string the user types as `IP`).
     Ip,
+    /// Dense embedding vector — KNN / semantic retrieval. Declared explicitly with a
+    /// [`vector`](FieldMapping::vector) config; never auto-derived (the source has no vector
+    /// column — the embedding is produced from a text `source_field` at ingest).
+    Vector,
 }
 
 impl FieldType {
@@ -721,6 +877,77 @@ impl FieldType {
     pub fn is_text(self) -> bool {
         matches!(self, FieldType::Text)
     }
+}
+
+/// Default embedding model id for a VECTOR field ([`VectorSpec::model`]) when the
+/// author declares none — the small English BGE model the local runtime targets.
+pub const DEFAULT_EMBED_MODEL: &str = "bge-small-en-v1.5";
+/// Default embedding dimensionality ([`VectorSpec::dims`]) — the width of
+/// [`DEFAULT_EMBED_MODEL`]'s output.
+pub const DEFAULT_EMBED_DIMS: usize = 384;
+
+/// Vector distance metric for KNN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum VectorMetric {
+    /// Cosine similarity (the default) — angle between vectors, scale-invariant.
+    #[default]
+    Cosine,
+    /// Dot product — raw inner product (assumes normalized inputs for cosine parity).
+    Dot,
+    /// Euclidean (L2) distance.
+    L2,
+}
+
+/// Where a vector field's embeddings are produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum EmbedProvider {
+    /// In-process, no egress (the default) — the built-in embedder.
+    #[default]
+    Local,
+    /// An external embedding service — not yet supported.
+    External,
+}
+
+/// Configuration for a VECTOR field: the embedding model, its dimensionality,
+/// the distance metric, the provider, and the text field embedded to produce it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorSpec {
+    /// Embedding dimensionality (vector length). Must be > 0.
+    pub dims: usize,
+    /// Embedding model id, recorded for reproducibility (a change ⇒ re-embedding reindex).
+    pub model: String,
+    /// Distance metric. Default COSINE.
+    #[serde(default)]
+    pub metric: VectorMetric,
+    /// Embedding provider. Default LOCAL (in-process, no egress).
+    #[serde(default)]
+    pub provider: EmbedProvider,
+    /// The text field path whose value is embedded to produce this vector.
+    pub source_field: String,
+}
+
+/// Authoring DTO for a VECTOR field's [`vector`](FieldMapping::vector) config: every
+/// tuning knob is optional so an author can write `vector: { source_field: body }` and
+/// get the defaults; only [`source_field`](Self::source_field) is required. Resolved into
+/// a concrete [`VectorSpec`] at [`resolve`](IndexDefinition::resolve).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorMappingOpts {
+    /// Embedding dimensionality — defaults to [`DEFAULT_EMBED_DIMS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dims: Option<usize>,
+    /// Embedding model id — defaults to [`DEFAULT_EMBED_MODEL`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Distance metric — defaults to [`VectorMetric::Cosine`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric: Option<VectorMetric>,
+    /// Embedding provider — defaults to [`EmbedProvider::Local`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<EmbedProvider>,
+    /// Required: the text field to embed.
+    pub source_field: String,
 }
 
 /// How much the inverted index records per TEXT-field posting — the
@@ -748,7 +975,8 @@ impl TextRecord {
 /// Auto-derive a GrowlerDB field type from a source type: textual sources become
 /// full-text [`Text`](FieldType::Text), scalars map to their typed counterpart, and
 /// anything else becomes an exact-match [`Keyword`](FieldType::Keyword) so every
-/// field stays indexable. (`Ip` is never auto-derived — it needs an explicit `IP`.)
+/// field stays indexable. (`Ip` and `Vector` are never auto-derived — each needs an
+/// explicit type.)
 fn auto_type(ty: SourceType) -> FieldType {
     match ty {
         SourceType::String => FieldType::Text,
@@ -1086,6 +1314,12 @@ fn diff_field(path: &str, old: &ResolvedField, new: &ResolvedField, plan: &mut A
         plan.in_place
             .push(format!("field `{path}` max_bytes redeclared"));
     }
+    if old.vector != new.vector {
+        // The stored embeddings are produced from this exact config (model/dims/metric/
+        // source_field) — any change means every vector must be regenerated → reindex.
+        plan.reindex_reasons
+            .push(format!("field `{path}` vector config changed (re-embed)"));
+    }
 }
 
 /// How a source's **equality deletes** are applied to the index ([equality
@@ -1154,6 +1388,9 @@ pub struct ResolvedField {
     /// Declared max byte length, if known — drives the big-text caching rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<u64>,
+    /// Present iff `ty == Vector`: the resolved embedding config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector: Option<VectorSpec>,
 }
 
 #[cfg(test)]
@@ -2028,5 +2265,143 @@ mapping:
         .unwrap();
         assert_eq!(hashed.routing_strategy(), RoutingStrategy::Hash);
         assert_eq!(hashed.shard_router(2), ShardRouter::hashed(2));
+    }
+
+    // ---- VECTOR fields -----------------------------------------------------
+
+    /// Resolve an EXPLICIT mapping with `body` + a `body_vec` VECTOR field over it.
+    fn resolve_vector(vector_field_yaml: &str) -> Result<ResolvedIndex, DefError> {
+        let yaml = format!(
+            "name: docs\nsource: {{ iceberg: {{ catalog: g, table: g.docs }} }}\n\
+             key: {{ identifier_fields: [id] }}\n\
+             mapping:\n  selection: EXPLICIT\n  fields:\n\
+             \x20   - {{ path: body, type: TEXT }}\n{vector_field_yaml}"
+        );
+        IndexDefinition::from_yaml(&yaml)
+            .unwrap()
+            .resolve(&docs_schema())
+    }
+
+    #[test]
+    fn vector_field_resolves_with_explicit_config() {
+        let r = resolve_vector(
+            "    - { path: body_vec, type: VECTOR, \
+             vector: { dims: 8, model: test-model, source_field: body } }\n",
+        )
+        .expect("resolve");
+        let vf = r.fields.iter().find(|f| f.path == "body_vec").unwrap();
+        assert_eq!(vf.ty, FieldType::Vector);
+        assert!(!vf.indexed, "vectors get no inverted index");
+        assert!(!vf.fast);
+        let spec = vf.vector.as_ref().expect("vector spec");
+        assert_eq!(spec.dims, 8);
+        assert_eq!(spec.model, "test-model");
+        assert_eq!(spec.source_field, "body");
+        assert_eq!(spec.metric, VectorMetric::Cosine);
+        assert_eq!(spec.provider, EmbedProvider::Local);
+    }
+
+    #[test]
+    fn vector_field_applies_defaults() {
+        let r = resolve_vector(
+            "    - { path: body_vec, type: VECTOR, vector: { source_field: body } }\n",
+        )
+        .expect("resolve");
+        let spec = r
+            .fields
+            .iter()
+            .find(|f| f.path == "body_vec")
+            .unwrap()
+            .vector
+            .as_ref()
+            .unwrap();
+        assert_eq!(spec.dims, DEFAULT_EMBED_DIMS);
+        assert_eq!(spec.model, DEFAULT_EMBED_MODEL);
+    }
+
+    #[test]
+    fn vector_field_without_config_is_rejected() {
+        let err = resolve_vector("    - { path: body_vec, type: VECTOR }\n").unwrap_err();
+        assert!(matches!(err, DefError::VectorMissingConfig(p) if p == "body_vec"));
+    }
+
+    #[test]
+    fn vector_field_zero_dims_is_rejected() {
+        let err = resolve_vector(
+            "    - { path: body_vec, type: VECTOR, vector: { dims: 0, source_field: body } }\n",
+        )
+        .unwrap_err();
+        assert!(matches!(err, DefError::VectorZeroDims(p) if p == "body_vec"));
+    }
+
+    #[test]
+    fn vector_config_on_non_vector_field_is_rejected() {
+        let err =
+            resolve_vector("    - { path: count, vector: { source_field: body } }\n").unwrap_err();
+        assert!(matches!(err, DefError::VectorConfigOnNonVector(p) if p == "count"));
+    }
+
+    #[test]
+    fn vector_external_provider_is_rejected() {
+        let err = resolve_vector(
+            "    - { path: body_vec, type: VECTOR, \
+             vector: { provider: EXTERNAL, source_field: body } }\n",
+        )
+        .unwrap_err();
+        assert!(matches!(err, DefError::VectorExternalProvider(p) if p == "body_vec"));
+    }
+
+    #[test]
+    fn vector_field_rejects_fast_and_cached() {
+        let fast = resolve_vector(
+            "    - { path: body_vec, type: VECTOR, fast: true, \
+             vector: { source_field: body } }\n",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            fast,
+            DefError::VectorInvalidOption { option: "fast", .. }
+        ));
+        let cached = resolve_vector(
+            "    - { path: body_vec, type: VECTOR, cached: true, \
+             vector: { source_field: body } }\n",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            cached,
+            DefError::VectorInvalidOption {
+                option: "cached",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn vector_unknown_source_field_is_rejected() {
+        let err = resolve_vector(
+            "    - { path: body_vec, type: VECTOR, vector: { source_field: nope } }\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, DefError::VectorSourceUnknown { source_field, .. } if source_field == "nope")
+        );
+    }
+
+    #[test]
+    fn adding_a_vector_field_requires_reindex() {
+        // The helper with no extra field resolves to just the `body` TEXT field.
+        let without = resolve_vector("").unwrap();
+        let with = resolve_vector(
+            "    - { path: body_vec, type: VECTOR, vector: { source_field: body } }\n",
+        )
+        .unwrap();
+        assert!(without.alter_to(&with).requires_reindex());
+
+        // Changing the spec (dims) also forces a reindex (re-embed).
+        let with_16 = resolve_vector(
+            "    - { path: body_vec, type: VECTOR, vector: { dims: 16, source_field: body } }\n",
+        )
+        .unwrap();
+        assert!(with.alter_to(&with_16).requires_reindex());
     }
 }
