@@ -28,8 +28,8 @@ pub use embed::{
     default_embedder, embed_located_docs, embed_vector_fields, EmbedError, Embedder, HashEmbedder,
 };
 pub use index_def::{
-    AlterPlan, DefError, EmbedProvider, EqualityDeleteHandling, FieldMapping, FieldType,
-    IcebergSource, IndexDefinition, KeySpec, LocationStrategy, Mapping, ResolvedField,
+    validate_index_name, AlterPlan, DefError, EmbedProvider, EqualityDeleteHandling, FieldMapping,
+    FieldType, IcebergSource, IndexDefinition, KeySpec, LocationStrategy, Mapping, ResolvedField,
     ResolvedIndex, ResolvedKey, ScanMode, Selection, Source, SourceField, SourceSchema, SourceType,
     TextRecord, VectorMappingOpts, VectorMetric, VectorSpec, DEFAULT_EMBED_DIMS,
     DEFAULT_EMBED_MODEL, MAX_CACHED_FIELD_BYTES,

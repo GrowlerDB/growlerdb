@@ -97,6 +97,16 @@ app.kubernetes.io/instance: {{ .Release.Name }}
      the shared read-through cache size. Emitted only when cold-tiering is enabled; the bucket is
      required then (parking has nowhere to write without it). Reuses the same GROWLERDB_S3_* endpoint
      /region/credentials as the Iceberg source (from `growlerdb.icebergEnv`). */}}
+{{/* The shared cluster service token: closes the control plane's internal RPCs and every
+     node's data-plane gRPC. Emitted only when configured (or when reusing an existing secret,
+     which must then carry the `serviceToken` key). */}}
+{{- define "growlerdb.serviceTokenEnv" -}}
+{{- if or .Values.credentials.serviceToken .Values.credentials.existingSecret }}
+- name: GROWLERDB_SERVICE_TOKEN
+  valueFrom: { secretKeyRef: { name: {{ include "growlerdb.secretName" . }}, key: serviceToken, optional: true } }
+{{- end }}
+{{- end -}}
+
 {{- define "growlerdb.coldTierEnv" -}}
 {{- if .Values.coldTier.enabled }}
 - name: GROWLERDB_BACKUP_BUCKET

@@ -481,6 +481,10 @@ fn registry_status(e: RegistryError) -> Status {
             Code::AlreadyExists,
             WireError::new("ALREADY_EXISTS", format!("index `{name}` already exists")),
         ),
+        RegistryError::InvalidDefinition(detail) => to_status(
+            Code::InvalidArgument,
+            WireError::new("INVALID_ARGUMENT", detail),
+        ),
         RegistryError::NotFound(name) => to_status(
             Code::NotFound,
             WireError::new("NOT_FOUND", format!("index `{name}` not found")),
@@ -595,9 +599,11 @@ async fn reindex_shard_on_node(
     owners: &[u32],
     ordinal: u32,
 ) -> Result<(), Status> {
-    let mut client = AdminClient::connect(endpoint.to_string())
+    // Mesh dial: stamp the shared service token (env) — the node's data plane enforces it.
+    let (channel, stamp) = growlerdb_proto::service_token::node_channel(endpoint.to_string())
         .await
         .map_err(|e| Status::unavailable(format!("connecting to node `{endpoint}`: {e}")))?;
+    let mut client = AdminClient::with_interceptor(channel, stamp);
     client
         .reindex_index(ReindexIndexRequest {
             index: index.to_string(),
@@ -1624,9 +1630,10 @@ fn ingestion_state(
 /// from the shard primary's `Write.GetCheckpoint`. A fresh connect per call — the Ingestion view
 /// polls at human cadence, so a pooled client isn't worth the bookkeeping.
 async fn shard_checkpoint(endpoint: &str, window: i64) -> Result<(i64, u64), &'static str> {
-    let mut client = WriteClient::connect(endpoint.to_string())
+    let (channel, stamp) = growlerdb_proto::service_token::node_channel(endpoint.to_string())
         .await
         .map_err(|_| "unreachable")?;
+    let mut client = WriteClient::with_interceptor(channel, stamp);
     let resp = client
         // `window` selects the time-window shard on a windowed node; 0 on an ordinal node,
         // which ignores it.

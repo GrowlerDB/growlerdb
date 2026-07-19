@@ -369,6 +369,14 @@ enum Command {
         /// pulls the primary's already-healed locators). Default 45.
         #[arg(long, default_value_t = 45)]
         remap_interval_secs: u64,
+        /// Shared service token closing this Node's **data-plane gRPC**
+        /// (Write/Search/Lookup/Suggest/Admin/System) to callers that don't present it. In
+        /// distributed mode a Node carries no per-user auth of its own (authn/RBAC/tenant live at
+        /// the Gateway), so set this everywhere in the cluster (gateway, control plane, connector
+        /// read the same env) for defense-in-depth beyond network isolation. Unset ⇒ open
+        /// (single-node dev). Env: `GROWLERDB_SERVICE_TOKEN`.
+        #[arg(long, env = "GROWLERDB_SERVICE_TOKEN")]
+        service_token: Option<String>,
         #[command(flatten)]
         tls: ServerTlsArgs,
     },
@@ -558,7 +566,9 @@ async fn reconcile_cluster(control_plane: &str, index: &str, full: bool) -> anyh
 
     // One shard-scoped ReconcileIndex call (or a counts-only probe when `count_only`).
     let call = |primary: String, ordinal: u32, owners: Vec<u32>, count_only: bool| async move {
-        let mut client = AdminClient::connect(primary).await?;
+        // Mesh dial: stamp the shared service token (env) — the node's data plane enforces it.
+        let (channel, stamp) = growlerdb_proto::service_token::node_channel(primary).await?;
+        let mut client = AdminClient::with_interceptor(channel, stamp);
         let resp = client
             .reconcile_index(ReconcileIndexRequest {
                 index: index.to_string(),
@@ -807,6 +817,7 @@ pub async fn run() -> anyhow::Result<()> {
             replica_refresh_secs,
             compact_interval_secs,
             remap_interval_secs,
+            service_token,
             tls,
         } => {
             if replica {
@@ -820,6 +831,7 @@ pub async fn run() -> anyhow::Result<()> {
                     ui_dir.as_deref(),
                     replica_prefix.as_deref(),
                     replica_refresh_secs,
+                    service_token.clone(),
                 )
                 .await?;
             } else {
@@ -838,6 +850,7 @@ pub async fn run() -> anyhow::Result<()> {
                     shard_ordinal,
                     compact_interval_secs,
                     remap_interval_secs,
+                    service_token,
                 })
                 .await?;
             }
@@ -1447,6 +1460,7 @@ struct ServeConfig<'a> {
     shard_ordinal: u32,
     compact_interval_secs: u64,
     remap_interval_secs: u64,
+    service_token: Option<String>,
 }
 
 /// Host the gRPC services for the index over its address (and, if `rest_addr` is set, the
@@ -1511,6 +1525,7 @@ async fn serve(cfg: ServeConfig<'_>) -> anyhow::Result<()> {
         shard_ordinal,
         compact_interval_secs,
         remap_interval_secs,
+        service_token,
         data_dir: _,
     } = cfg;
     let shard_id = ShardId::single(index);
@@ -1715,7 +1730,17 @@ async fn serve(cfg: ServeConfig<'_>) -> anyhow::Result<()> {
         readiness.mark_ready();
     }
 
+    // Service-token gate over the WHOLE data plane (Write/Search/Lookup/Suggest/Admin/System):
+    // a Node carries no per-user auth in distributed mode, so the shared token is the
+    // defense-in-depth boundary for a directly-reachable Node port. Unset ⇒ no-op (open dev).
+    if service_token.is_none() {
+        eprintln!(
+            "serve: WARNING data-plane gRPC is open — any caller that can reach {socket} can \
+             write/search/reindex (set GROWLERDB_SERVICE_TOKEN to close it)"
+        );
+    }
     builder
+        .layer(growlerdb_engine::service_token_layer(service_token.clone()))
         .add_service(write.into_server())
         .add_service(search.into_server())
         .add_service(lookup.into_server())
@@ -1747,6 +1772,7 @@ async fn serve_replica(
     ui_dir: Option<&str>,
     prefix: Option<&str>,
     refresh_secs: u64,
+    service_token: Option<String>,
 ) -> anyhow::Result<()> {
     use growlerdb_index::{LocalIndexStore, ShardId};
     use growlerdb_proto::{SystemServer, SystemService};
@@ -1910,7 +1936,14 @@ async fn serve_replica(
     let readiness = spawn_health(metrics_addr).await?;
     readiness.mark_ready();
 
+    // Same data-plane service-token gate as `serve` (a replica's read surface is mesh-internal).
+    if service_token.is_none() {
+        eprintln!(
+            "serve --replica: WARNING data-plane gRPC is open (set GROWLERDB_SERVICE_TOKEN to close it)"
+        );
+    }
     builder
+        .layer(growlerdb_engine::service_token_layer(service_token.clone()))
         .add_service(search.into_server())
         .add_service(lookup.into_server())
         .add_service(suggest.into_server())
@@ -1957,6 +1990,7 @@ async fn serve_windowed(
         advertise_addr,
         compact_interval_secs,
         remap_interval_secs,
+        service_token,
         ..
     } = cfg;
 
@@ -2313,7 +2347,15 @@ async fn serve_windowed(
     if let Some(tls) = tls {
         builder = builder.tls_config(tls)?;
     }
+    // Same data-plane service-token gate as `serve` — the windowed Write service in particular
+    // must not be writable by anything that merely reaches the pod port.
+    if service_token.is_none() {
+        eprintln!(
+            "serve (windowed): WARNING data-plane gRPC is open (set GROWLERDB_SERVICE_TOKEN to close it)"
+        );
+    }
     builder
+        .layer(growlerdb_engine::service_token_layer(service_token.clone()))
         .add_service(
             growlerdb_engine::WindowedSearchService::new(search_windows.clone()).into_server(),
         )
@@ -3618,16 +3660,23 @@ fn resolve_targets(
 }
 
 /// Connect a [`RemoteNode`] to `endpoint`, over mutual TLS when `tls` is set or
-/// plaintext otherwise.
+/// plaintext otherwise. Stamps the cluster service token (`GROWLERDB_SERVICE_TOKEN`) on every
+/// request when configured — required once the Node closes its data plane with the same token.
 async fn connect_node(
     endpoint: &str,
     tls: Option<tonic::transport::ClientTlsConfig>,
 ) -> anyhow::Result<growlerdb_engine::RemoteNode> {
+    let token = growlerdb_proto::service_token::service_token_from_env();
     let node = match tls {
         Some(tls) => {
-            growlerdb_engine::RemoteNode::connect_with_tls(endpoint.to_string(), tls).await
+            growlerdb_engine::RemoteNode::connect_with_tls(
+                endpoint.to_string(),
+                tls,
+                token.as_deref(),
+            )
+            .await
         }
-        None => growlerdb_engine::RemoteNode::connect(endpoint.to_string()).await,
+        None => growlerdb_engine::RemoteNode::connect(endpoint.to_string(), token.as_deref()).await,
     };
     node.map_err(|e| anyhow::anyhow!("connecting to Node `{endpoint}`: {e}"))
 }
@@ -3641,9 +3690,14 @@ fn connect_node_lazy(
     endpoint: &str,
     tls: Option<tonic::transport::ClientTlsConfig>,
 ) -> anyhow::Result<growlerdb_engine::RemoteNode> {
+    let token = growlerdb_proto::service_token::service_token_from_env();
     let node = match tls {
-        Some(tls) => growlerdb_engine::RemoteNode::connect_lazy_with_tls(endpoint.to_string(), tls),
-        None => growlerdb_engine::RemoteNode::connect_lazy(endpoint.to_string()),
+        Some(tls) => growlerdb_engine::RemoteNode::connect_lazy_with_tls(
+            endpoint.to_string(),
+            tls,
+            token.as_deref(),
+        ),
+        None => growlerdb_engine::RemoteNode::connect_lazy(endpoint.to_string(), token.as_deref()),
     };
     node.map_err(|e| anyhow::anyhow!("preparing Node `{endpoint}`: {e}"))
 }

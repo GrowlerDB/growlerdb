@@ -4,10 +4,13 @@ import io.growlerdb.proto.v1.SearchGrpc;
 import io.growlerdb.proto.v1.SearchHit;
 import io.growlerdb.proto.v1.SearchRequest;
 import io.growlerdb.proto.v1.SearchResponse;
+import io.grpc.ClientInterceptor;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
+import io.grpc.Metadata;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
+import io.grpc.stub.MetadataUtils;
 
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -97,7 +100,18 @@ public final class SearchClient implements AutoCloseable {
             .keepAliveTimeout(5, TimeUnit.SECONDS)
             .keepAliveWithoutCalls(true)
             .build();
-    this.stub = SearchGrpc.newBlockingStub(channel);
+    // Stamp the shared service token when set (a directly-dialed Node's data plane enforces
+    // it; a Gateway ignores it — user auth governs there). Mirrors WriteClient.
+    SearchGrpc.SearchBlockingStub s = SearchGrpc.newBlockingStub(channel);
+    String token = System.getenv("GROWLERDB_SERVICE_TOKEN");
+    if (token != null && !token.isEmpty()) {
+      Metadata md = new Metadata();
+      md.put(
+          Metadata.Key.of("x-growlerdb-service-token", Metadata.ASCII_STRING_MARSHALLER), token);
+      ClientInterceptor interceptor = MetadataUtils.newAttachHeadersInterceptor(md);
+      s = s.withInterceptors(interceptor);
+    }
+    this.stub = s;
     this.deadlineSeconds = deadlineSeconds;
     this.maxAttempts = maxAttempts;
     this.initialBackoffMs = initialBackoffMs;
