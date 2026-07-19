@@ -77,8 +77,13 @@ still respects metadata.
 **Hybrid search (RRF).** A hybrid query runs both modalities — lexical **BM25** and vector **KNN** — and
 fuses their rankings with **Reciprocal Rank Fusion** (`RRF_K = 60`) into one ranked list of coordinates.
 This is where semantic recall complements exact-term precision: on a real-model eval over paraphrase
-queries (zero lexical term overlap), hybrid strictly beats lexical-only. The optional
-[reranker](/system/decisions/d21-reranker.md) is the remaining refinement.
+queries (zero lexical term overlap), hybrid strictly beats lexical-only.
+
+**Reranking (opt-in).** A semantic/hybrid query may set `rerank` to reorder its retrieved top-K by a
+cross-encoder relevance pass over `(query, passage)` ([D21](/system/decisions/d21-reranker.md), local
+**bge-reranker-base** on Candle). It **sits outside the index** — a post-retrieval reorder — and is
+**off by default** (retrieval-first); the local model is keyless, falling back to a deterministic dev
+reranker when unprovisioned.
 
 **On the authenticated gateway.** Semantic and hybrid search are exposed on the multi-shard gateway
 (gRPC `SemanticSearch` + REST `/v1/search:semantic` and `/v1/search:hybrid`), not just the embedded
@@ -99,7 +104,8 @@ a no-op; see [RBAC & tenancy](/product/functional/rbac-and-tenancy.md).)
 
 > **Status.** In active build (M5). Shipped: the **field type, local BGE embedding at ingest (Candle),
 > the `Embedder` seam, per-document vector storage, the per-segment ANN sidecar (backed up), top-level
-> KNN, filtered / tenant-scoped KNN, RRF hybrid fusion, and the authenticated multi-shard gateway
-> surface** (gRPC + REST, node-local embedding). The optional **reranker**, the **console** search-mode
-> UX, and **distributed windowed** semantic search follow — see
+> KNN, filtered / tenant-scoped KNN, RRF hybrid fusion, the authenticated multi-shard gateway
+> surface** (gRPC + REST, node-local embedding), the **console** search-mode UX + grounded Ask screen,
+> and the **opt-in reranker**. **Distributed windowed** semantic search and the approximate (HNSW) index
+> (a scale optimization) follow — see
 > [known limitations](/quality/known-limitations/index.md). The interface and stored format are stable.

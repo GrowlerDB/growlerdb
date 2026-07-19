@@ -57,6 +57,20 @@ All notable changes to GrowlerDB are documented here. The format is based on
   (idempotent, reused across runs and local `cargo`/eval); the published image is not bloated.
   Getting-started documents semantic/hybrid, the Ask screen, and connecting an agent via `growlerdb mcp`.
   (TASK-300)
+- **Reranker (opt-in, off by default).** A pluggable `Reranker` reorders a semantic/hybrid query's
+  retrieved top-K by a cross-encoder relevance pass over `(query, passage)` — set `rerank: true` (+ an
+  optional `rerank_top_k` candidate pool) on a semantic/hybrid request. It **sits outside the index**
+  (a post-retrieval reorder), is **off by default** (retrieval-first), and runs the local
+  **bge-reranker-base** on Candle (default-on `rerank` feature; falls back to a deterministic dev
+  reranker when the model isn't provisioned — offline/keyless). (ADR D21 · TASK-44)
+
+### Fixed
+
+- **Schema change on a built index no longer panics.** Rebuilding an index whose definition gained,
+  dropped, or retyped a mapped field previously crashed the Tantivy fast-field writer (a field-count
+  mismatch against the stale on-disk schema). Now the engine detects the derived-schema change and
+  **reindexes from scratch** (logged), backed by a store-level `SchemaChanged` error that guarantees the
+  mismatch can never reach a writer — never a panic. (TASK-303)
 
 ## [0.3.0] - 2026-07-18
 
