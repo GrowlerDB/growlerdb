@@ -99,7 +99,7 @@ impl CompositeKey {
 
     /// Canonical, type-tagged byte encoding of the key — `partition[] ++
     /// identifier[]` — used as the `locator` / `key_to_doc` map key in the index
-    /// store ([Design 08](../../../design/08-schemas.md)). Each field is encoded
+    /// store ([Design 08](../../../okf/system/storage/data-model.md)). Each field is encoded
     /// as `role · len(name) · name · type-tag · len(value) · value`, so lookups
     /// are **exact** and deterministic. It is **not** order-preserving across
     /// types — hash routing doesn't need it. Type tags: `1` Str, `2` Int,

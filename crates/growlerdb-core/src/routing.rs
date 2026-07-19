@@ -17,7 +17,7 @@
 //!   every key. A [balanced](BucketMap::balanced) map over a shard count that divides
 //!   `NUM_BUCKETS` reproduces legacy placement exactly, so the two agree on power-of-two counts.
 //!
-//! [Service architecture]: ../../../design/06-service-architecture.md
+//! [Service architecture]: ../../../okf/system/architecture.md
 
 use std::sync::Arc;
 

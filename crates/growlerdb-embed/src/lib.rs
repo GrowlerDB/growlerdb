@@ -64,7 +64,7 @@ pub use secrets::{redact, ProviderSecrets};
 /// opt-in per query and configured with no per-index model today, so the factory targets this
 /// one model directory; the [`HashReranker`] fallback carries the same id.
 ///
-/// [D21]: ../../okf/system/decisions/d21-reranker.md
+/// [D21]: ../../../okf/system/decisions/d21-reranker.md
 pub const DEFAULT_RERANK_MODEL: &str = "bge-reranker-base";
 
 /// The reranker to use for `model_id`. Returns a real [`BgeReranker`] when the `rerank` feature is

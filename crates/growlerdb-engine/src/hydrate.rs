@@ -6,7 +6,7 @@
 //! the [`IndexReader`] (locator) and the [`IcebergReader`] (rows) together; the
 //! engine façade and CLI drive it.
 //!
-//! [Flow 2]: ../../../design/07-data-flows.md
+//! [Flow 2]: ../../../okf/system/architecture.md
 
 use growlerdb_core::{
     CompositeKey, HydratedRow, IndexReader, LocationStrategy, Projection, RowLocator,
