@@ -38,6 +38,7 @@ local-dev defaults):
 | `GROWLERDB_S3_SECRET_KEY` | `minioadmin` | Object-store secret key. |
 | `GROWLERDB_S3_REGION` | `us-east-1` | Object-store region. |
 | `GROWLERDB_BACKUP_BUCKET` | — | Bucket for `backup`/`restore` (reuses the `GROWLERDB_S3_*` credentials/endpoint). |
+| `GROWLERDB_MODEL_DIR` | `~/.cache/growlerdb/models` | Where the local embedder loads models from (`<dir>/<model-id>/`). Only the **index nodes** — which embed `VECTOR` fields at ingest — read it. |
 | `GROWLERDB_LICENSE` | — | Enterprise scale-limit license token (set on the **control plane**). Unset ⇒ the free tier. |
 
 In Kubernetes these are wired from a ConfigMap (non-secret) + a Secret (credentials) by the
@@ -92,6 +93,35 @@ mapping:
 | `BOOL` | Boolean. |
 | `DATE` | Date / timestamp — range, date-histogram, time pruning. |
 | `IP` | IP address — CIDR/range match. **Never auto-derived** (declare it explicitly; it arrives as a string). |
+| `VECTOR` | Dense embedding for **semantic / hybrid** search. **Never auto-derived** — declare it with a `vector:` config; the embedding is produced from a text `source_field` at ingest (see below). |
+
+### Vector fields (semantic search) {#vector-fields}
+
+A `VECTOR` field is **opt-in** and **derived**: rather than mapping a source column, it declares a
+`vector:` config naming a text `source_field`, and GrowlerDB embeds that field's value into a dense
+vector **at ingest** — powering `POST /v1/search:semantic` and `/v1/search:hybrid` (and the console's
+Search modes + **Ask** screen). Embedding runs **locally by default** — in-process, no egress, no API
+key — so a vector field adds semantic retrieval without an external service.
+
+```yaml
+    - { path: body_vec, type: VECTOR,
+        vector: { source_field: body, model: bge-small-en-v1.5, dims: 384, metric: COSINE, provider: LOCAL } }
+```
+
+| `vector:` key | Default | Notes |
+|---|---|---|
+| `source_field` | — (**required**) | The mapped **text** field whose value is embedded. |
+| `model` | `bge-small-en-v1.5` | Embedding model id; changing it is a re-embedding reindex. |
+| `dims` | `384` | Vector dimensionality — must match the model's output width. |
+| `metric` | `COSINE` | Distance metric: `COSINE`, `DOT`, or `L2`. |
+| `provider` | `LOCAL` | Where embeddings run. `LOCAL` = the in-process embedder (the only provider today). |
+
+The local provider loads the model from `${GROWLERDB_MODEL_DIR:-~/.cache/growlerdb/models}/<model>/`
+(three files: `config.json`, `tokenizer.json`, `model.safetensors`). If the model isn't present the
+field still builds, falling back to a deterministic dev embedder — provision the model (the demo's
+`just stack` does this for you) for real semantic quality. A vector field carries no inverted index or
+columnar store, so the scalar knobs (`fast`, `cached`, `analyzer`, `record`, …) don't apply and are
+rejected on it.
 
 ### Declaring timestamps {#declaring-timestamps}
 

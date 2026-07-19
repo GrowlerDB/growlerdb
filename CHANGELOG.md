@@ -50,6 +50,13 @@ All notable changes to GrowlerDB are documented here. The format is based on
   question and shows the source passages **with their Iceberg coordinates as citations** — **no answer
   generation**; GrowlerDB never calls an LLM ([D42](okf/system/decisions/d42-retrieval-first.md)).
   `POST /v1/index:describe` now reports an index's `vector_fields`. (TASK-298)
+- **Demo: a local-embeddings vector index.** The demo `catalog` index gains a `body_vec` VECTOR field
+  embedded with the local **bge-small-en-v1.5** model, so `just stack` exercises **semantic + hybrid
+  search**, the console **Ask** screen, and the **MCP server** against real data — keyless, no egress.
+  The model is fetched **once per machine** into a host-mounted `${GROWLERDB_MODEL_DIR:-~/.cache/growlerdb/models}`
+  (idempotent, reused across runs and local `cargo`/eval); the published image is not bloated.
+  Getting-started documents semantic/hybrid, the Ask screen, and connecting an agent via `growlerdb mcp`.
+  (TASK-300)
 
 ## [0.3.0] - 2026-07-18
 

@@ -41,3 +41,8 @@ mapping:
     # `indexed: true` so the BOOL *term* filter `archived:true` has postings to
     # match — a `fast`-only BOOL is range/sortable but not term-queryable, so the filter would be empty.
     - { path: archived, type: BOOL, indexed: true }
+    # A derived VECTOR field: the local BGE embedder embeds each row's `body` text at ingest, so the
+    # `catalog` index backs semantic + hybrid search and the console's Ask screen. Fully local (Candle
+    # loads bge-small-en-v1.5 from GROWLERDB_MODEL_DIR) — no API key. Opt-in; embedding only happens
+    # when the model is present (the model-fetch one-shot provisions it before the node builds).
+    - { path: body_vec, type: VECTOR, vector: { source_field: body, dims: 384, model: bge-small-en-v1.5 } }

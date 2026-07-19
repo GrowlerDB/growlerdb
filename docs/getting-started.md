@@ -13,10 +13,10 @@ observability stack). Time: ~10 minutes, mostly the first image build.
 ## Prerequisites
 
 You need **Docker with the Compose v2 plugin**, **[`just`](https://github.com/casey/just)**, and
-**`jq`** (the REST examples pipe JSON through it). The **core walkthrough (§1–§8) runs entirely in
-containers** — no language toolchains required. The **streaming demo (§9)** is the one exception: it
+**`jq`** (the REST examples pipe JSON through it). The **core walkthrough (§1–§10) runs entirely in
+containers** — no language toolchains required. The **streaming demo (§11)** is the one exception: it
 builds the Spark connector jar on the host, which needs **[`mise`](https://mise.jdx.dev)** (it
-provisions JDK 21 + Maven on demand) — installed in §9, not needed before then. Run it on a **Linux
+provisions JDK 21 + Maven on demand) — installed in §11, not needed before then. Run it on a **Linux
 host or a VM, or macOS with Docker Desktop** — *not* inside a container (Docker bind mounts won't
 resolve there). **~4 GB RAM** is enough.
 
@@ -62,6 +62,12 @@ This builds the GrowlerDB image, brings up MinIO + Polaris, **seeds two sample I
 plane, **two nodes**, the gateway, and Grafana/LGTM. One node builds the `docs` index, the other the
 `catalog` index; both serve and register with the control plane, and the single `--all-indexes`
 gateway routes each request to its named index (multi-index routing).
+
+> **First run also fetches the local embedding model.** `just stack` provisions **bge-small-en-v1.5**
+> (~130 MB) once into `${GROWLERDB_MODEL_DIR:-~/.cache/growlerdb/models}` on the host and reuses it on
+> every later run (and from host `cargo test`/eval). It's what powers the semantic + hybrid search and
+> the **Ask** screen (§6–§7): embedding runs **in-process** (Candle), **fully local, no API key**.
+> Point `GROWLERDB_MODEL_DIR` elsewhere to relocate the cache.
 
 When it settles, the **console** is at <http://localhost:8081> and Grafana at <http://localhost:3000>.
 
@@ -263,7 +269,88 @@ In the **console**, each result row shows the index's `cached` fields (here titl
 rating, views) inline to the right of the primary key — lighter font, with your query terms
 highlighted — so the valuable data is visible without opening the detail drawer.
 
-## 6. Use the OpenSearch adapter (optional)
+## 6. Semantic & hybrid search
+
+The `catalog` index carries one field the playground above didn't use: **`body_vec`**, a `VECTOR`
+field. At ingest, GrowlerDB embeds each row's `body` text with the local **bge-small-en-v1.5** model
+(via Candle, in-process) and stores the 384-dim vector — so `catalog` also supports **semantic**
+(nearest-neighbour) and **hybrid** (lexical + semantic, fused) retrieval alongside the Lucene/KQL
+queries above. It's **fully local**: the model is the one `just stack` fetched in §1 — no embedding
+service, no API key.
+
+**Semantic search** embeds your `query_text` the same way and returns the `k` nearest rows, matching
+on *meaning* — so a paraphrase with no shared keywords still hits. The two hydration rows (`cat-02`,
+`cat-07`) say "hydrate", never "fetch the original record":
+
+```sh
+curl -s localhost:8081/v1/search:semantic \
+  -H 'content-type: application/json' \
+  -H "authorization: Bearer $TOKEN" \
+  -d '{"index":"catalog","vector_field":"body_vec","query_text":"how do I fetch the original record after a query","k":5}'
+```
+
+Like `/v1/search`, it returns ranked **coordinates** (with any `cached` fields) — hydrate them with
+`keys:get` exactly as in section 3. A lexical `body:"fetch the original record"` matches nothing,
+while the semantic arm ranks the hydration rows at the top.
+
+**Hybrid search** runs a lexical (BM25) *and* a semantic arm over the same `query_text` and
+Reciprocal-Rank-Fuses them, so exact keyword hits and semantic near-matches both surface (tune the
+fusion constant with `rrf_k`):
+
+```sh
+curl -s localhost:8081/v1/search:hybrid \
+  -H 'content-type: application/json' \
+  -H "authorization: Bearer $TOKEN" \
+  -d '{"index":"catalog","vector_field":"body_vec","query_text":"restoring authoritative rows from the lakehouse","k":5}'
+```
+
+In the **console**, open the **Search** screen over the `catalog` index: a **Lexical / Semantic /
+Hybrid** mode selector appears (it shows only for an index with a `VECTOR` field) — pick a mode and
+query from the same box. The **Ask** screen goes further: pose a natural-language question over
+`catalog` and it hybrid-retrieves the matching source passages, each shown with a **citation** back to
+its exact Iceberg coordinates. GrowlerDB does the *retrieval* and returns governed coordinates +
+citations — **it never calls an LLM**; generating a prose answer is the caller's job (see §7).
+
+## 7. Connect an AI agent (MCP)
+
+GrowlerDB ships a read-only **MCP server** (Model Context Protocol), so an AI agent can use the demo
+as a **retrieval tool** — grounded, governed search over your Iceberg data with no bespoke glue. It
+fronts the same gateway and **forwards the demo bearer token**, so the token's **tenant + per-index
+RBAC scoping still applies**: the agent only ever sees what `demo` may see.
+
+Run it against the running stack, scoped to `catalog`:
+
+```sh
+growlerdb mcp --gateway-url http://localhost:8081 --username demo --password demo --index catalog
+```
+
+It speaks MCP over stdio, exposing `search` / `keys:get` (hydrate) / `aggregate` / `list` / `describe`
+as tools. To wire it into **Claude Desktop**, add it to `mcpServers` in the app's config (point
+`command` at the `growlerdb` binary on your `PATH`):
+
+```json
+{
+  "mcpServers": {
+    "growlerdb": {
+      "command": "growlerdb",
+      "args": [
+        "mcp",
+        "--gateway-url", "http://localhost:8081",
+        "--username", "demo",
+        "--password", "demo",
+        "--index", "catalog"
+      ]
+    }
+  }
+}
+```
+
+Now the agent retrieves from `catalog` — semantic, hybrid, and lexical — and GrowlerDB hands back
+**governed coordinates + citations** scoped by the demo token's RBAC. As everywhere else, **GrowlerDB
+never calls an LLM**: it returns the retrieved, access-controlled source rows and *the agent* composes
+the answer from them. Retrieval with citations is the product; the model stays yours.
+
+## 8. Use the OpenSearch adapter (optional)
 
 The stack enables the [OpenSearch-compatible adapter](opensearch-adapter), so OpenSearch clients
 work against the same data:
@@ -291,7 +378,7 @@ You get OpenSearch-shaped documents — `_id` from the key, `_source` hydrated f
 
 So an existing OpenSearch/Elasticsearch client can point at GrowlerDB unchanged.
 
-## 7. See the source in Iceberg with Trino (optional)
+## 9. See the source in Iceberg with Trino (optional)
 
 GrowlerDB keeps **Iceberg as the system of record** and indexes it. To see that source data directly
 — and compare it with what GrowlerDB returns — bring up **Trino** (SQL over the *same* Polaris
@@ -319,7 +406,7 @@ Those are exactly the rows a GrowlerDB search hydrates — `body:iceberg` return
 here you can see the full row in Iceberg. The next section uses this Trino connection to run the full
 **insert → reindex → search** loop.
 
-## 8. The full cycle: add a document, then find it
+## 10. The full cycle: add a document, then find it
 
 Iceberg is the source of truth, so a new row **starts in the lake** and GrowlerDB catches up by
 **reindexing from source**. This section walks the whole loop against the richer `catalog` index
@@ -327,7 +414,7 @@ Iceberg is the source of truth, so a new row **starts in the lake** and GrowlerD
 
 ### Insert a row via Trino
 
-With Trino up (section 7), insert one row into `iceberg.growlerdb.catalog` — a value for every
+With Trino up (section 9), insert one row into `iceberg.growlerdb.catalog` — a value for every
 column, matching the table's types (`views` BIGINT, `rating` DOUBLE, `published` epoch-**ms** BIGINT,
 `archived` BOOLEAN, the rest VARCHAR):
 
@@ -391,9 +478,9 @@ curl -s localhost:8081/v1/search \
 `cat-11` now appears — the full **insert (Trino) → reindex (from source) → search** loop, with Trino
 and GrowlerDB reading one source of truth. Hydrate it with `keys:get` (section 3) to see every column.
 
-## 9. The other sync path: continuous streaming (no reindex)
+## 11. The other sync path: continuous streaming (no reindex)
 
-Section 8 showed the **batch** path — you insert into the lake, then trigger a full **reindex** by
+Section 10 showed the **batch** path — you insert into the lake, then trigger a full **reindex** by
 hand. That's right for a table that changes occasionally. For a table that changes **continuously**,
 you don't want to reindex on every write: GrowlerDB reads the Iceberg **changelog** and ingests each
 new snapshot **incrementally**, so rows become searchable on their own. The shipped **Spark
@@ -449,7 +536,7 @@ the `telemetry_stream` doc count on the **Indexes** screen keeps climbing. Raise
 
 So the two paths, side by side:
 
-| | **Batch** (section 8) | **Streaming** (this section) |
+| | **Batch** (section 10) | **Streaming** (this section) |
 |---|---|---|
 | Trigger | manual `POST /v1/index:reindex` | automatic — connector reads the Iceberg changelog |
 | Rebuilds | the whole index from source | incremental, only the new snapshots |
@@ -459,7 +546,7 @@ So the two paths, side by side:
 Full details + tuning knobs are in [`deploy/compose/pipeline/README.md`](https://github.com/GrowlerDB/growlerdb/blob/main/deploy/compose/pipeline/README.md).
 Tear the streaming demo down with `just pipeline-down`.
 
-## 10. Tear down
+## 12. Tear down
 
 ```sh
 just stack-down
@@ -487,6 +574,9 @@ just stack-down
 
 - **[Connect your own Iceberg table](external-iceberg)** — run Compose against your own external table
   on S3 (real AWS S3 or an in-house lakehouse), including the connector setup.
+- **Add semantic search to your own index** — declare a `VECTOR` field over a text column (see the
+  [index definition reference](configuration#field-types)); embeddings are produced locally at ingest.
+  Then point an AI agent at it over MCP (§7) for grounded, RBAC-scoped retrieval.
 - Index your own table: define an index over its columns + key, drop the [index definition](reference)
   in via the console's **Indexes → Create** (it introspects your source schema).
 - [Migrate from Elasticsearch/OpenSearch](migration-from-elasticsearch).

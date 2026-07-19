@@ -23,3 +23,6 @@ __pycache__/
 /bench/scale/runs/
 # Packaged tarballs (Helm charts, npm packs) — build artifacts, never committed
 *.tgz
+
+# Local embedding-model cache for the demo stack (fallback when GROWLERDB_MODEL_DIR is unset)
+deploy/compose/model-cache/
