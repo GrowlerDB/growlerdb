@@ -146,9 +146,10 @@ pub enum Query {
     /// *text* → embedding happens at the search-service layer via the index's
     /// [`Embedder`](crate::embed::Embedder), so the core AST carries the raw vector, not text.
     /// Executed against the per-segment ANN sidecar and ranked by KNN score. This is a
-    /// **top-level** retrieval clause: fusing it with a lexical query (RRF) is a later task, so it
-    /// is not representable inside a `Bool`/`Boost`, nor in the query-string / OpenSearch / gRPC
-    /// surfaces (those carry a query string, which never parses to `Knn`).
+    /// **top-level** retrieval clause: it is not representable inside a `Bool`/`Boost`, nor in the
+    /// query-string / OpenSearch / gRPC surfaces (those carry a query string, which never parses to
+    /// `Knn`). Fusing it with a lexical query (RRF) happens at the engine layer, over the two hit
+    /// lists, not by nesting `Knn` in a `Bool`.
     Knn {
         /// Target VECTOR field.
         field: String,
@@ -156,6 +157,14 @@ pub enum Query {
         vector: Vec<f32>,
         /// Number of nearest neighbors to return.
         k: usize,
+        /// An optional **lexical / fast-field** sub-query (terms, ranges, bool) whose matching docs
+        /// constrain the KNN candidates: only neighbors that also match `filter` are returned. This
+        /// is how a tenant constraint (`Term { tenant_field, claim }`) and fast-field predicates
+        /// (`lang = en`, a numeric range) are enforced on KNN — the analogue of [`and_filter`] for a
+        /// lexical query. `None` = unfiltered (the fast path).
+        ///
+        /// [`and_filter`]: Query::and_filter
+        filter: Option<Box<Query>>,
     },
 }
 
@@ -215,6 +224,44 @@ impl Query {
                 field: Some(field.into()),
                 value: value.into(),
             }],
+        }
+    }
+
+    /// AND an extra constraint onto a [`Knn`](Query::Knn)'s `filter` — the KNN analogue of
+    /// [`and_filter`](Query::and_filter). A `Bool` forbids `Knn`, so a KNN clause can't be wrapped in
+    /// an outer filter; instead the constraint rides *inside* the `Knn` as (part of) its `filter`,
+    /// where [`knn_search`] intersects it with the neighbor set. If `self` is `Knn`, `extra` is ANDed
+    /// into the existing `filter` (both become non-scoring `filter` clauses of a `Bool`; an absent
+    /// filter becomes just `extra`). If `self` is **not** `Knn` it is returned unchanged — the caller
+    /// is expected to guard the tenant path, so this never silently drops a constraint on a lexical
+    /// query (use [`and_filter`](Query::and_filter) for those).
+    ///
+    /// [`knn_search`]: ../../growlerdb_index/index.html
+    pub fn with_knn_filter(self, extra: Query) -> Query {
+        match self {
+            Query::Knn {
+                field,
+                vector,
+                k,
+                filter,
+            } => {
+                let combined = match filter {
+                    None => extra,
+                    Some(existing) => Query::Bool {
+                        must: Vec::new(),
+                        should: Vec::new(),
+                        must_not: Vec::new(),
+                        filter: vec![*existing, extra],
+                    },
+                };
+                Query::Knn {
+                    field,
+                    vector,
+                    k,
+                    filter: Some(Box::new(combined)),
+                }
+            }
+            other => other,
         }
     }
 
@@ -857,6 +904,46 @@ mod tests {
                 must_not: vec![],
                 filter: vec![term(Some("tenant"), "acme")],
             }
+        );
+    }
+
+    #[test]
+    fn with_knn_filter_sets_then_combines_constraints() {
+        let knn = Query::Knn {
+            field: "body_vec".into(),
+            vector: vec![1.0, 0.0],
+            k: 5,
+            filter: None,
+        };
+        // First constraint becomes the filter directly.
+        let scoped = knn.with_knn_filter(term(Some("tenant"), "acme"));
+        let Query::Knn { filter, .. } = &scoped else {
+            panic!("expected Knn, got {scoped:?}");
+        };
+        assert_eq!(filter.as_deref(), Some(&term(Some("tenant"), "acme")));
+
+        // A second constraint ANDs into a filter-only Bool alongside the first.
+        let scoped2 = scoped.with_knn_filter(term(Some("lang"), "en"));
+        let Query::Knn { filter, .. } = &scoped2 else {
+            panic!("expected Knn, got {scoped2:?}");
+        };
+        assert_eq!(
+            filter.as_deref(),
+            Some(&Query::Bool {
+                must: vec![],
+                should: vec![],
+                must_not: vec![],
+                filter: vec![term(Some("tenant"), "acme"), term(Some("lang"), "en")],
+            })
+        );
+
+        // A non-Knn query is returned unchanged (guarded by the caller).
+        let lexical = Query::parse("a OR b").unwrap();
+        assert_eq!(
+            lexical
+                .clone()
+                .with_knn_filter(term(Some("tenant"), "acme")),
+            lexical
         );
     }
 

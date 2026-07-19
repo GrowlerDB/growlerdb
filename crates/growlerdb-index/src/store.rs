@@ -7680,6 +7680,7 @@ mod ann_tests {
                     field: "body_vec".into(),
                     vector: vec![1.0, 0.0, 0.0],
                     k: 2,
+                    filter: None,
                 },
                 2,
             )
@@ -7714,7 +7715,7 @@ mod ann_tests {
             .open(&staging.path().join("index"))
             .unwrap();
         let restored_hits = restored
-            .knn_search("body_vec", &[0.0, 0.0, 1.0], 1)
+            .knn_search("body_vec", &[0.0, 0.0, 1.0], 1, None)
             .unwrap();
         assert_eq!(knn_ids(&restored_hits), vec!["z"]);
     }
@@ -7733,6 +7734,7 @@ mod ann_tests {
                     field: "body_vec".into(),
                     vector: vec![1.0, 0.0, 0.0],
                     k: 5,
+                    filter: None,
                 },
                 5,
             )
@@ -7741,5 +7743,78 @@ mod ann_tests {
         // is the sole live doc, so it's the only hit (the superseded +x version is filtered out).
         assert_eq!(knn_ids(&hits), vec!["a"]);
         assert_eq!(hits.len(), 1);
+    }
+
+    /// A vector shard that also carries a `lang` KEYWORD fast field, for filtered-KNN tests.
+    fn vector_shard_with_lang(tmp: &std::path::Path) -> Shard {
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("body", SourceType::String),
+                SourceField::new("lang", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        let idx = IndexDefinition::from_yaml(
+            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD }, { path: body, type: TEXT }, { path: lang, type: KEYWORD, fast: true }, { path: body_vec, type: VECTOR, vector: { dims: 3, metric: COSINE, source_field: body } } ] }\n",
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+        LocalIndexStore::open(tmp)
+            .unwrap()
+            .create_shard(&ShardId::single("docs"), &idx)
+            .unwrap()
+    }
+
+    fn put_vec_lang(shard: &Shard, id: &str, v: Vec<f32>, lang: &str, snap: i64) {
+        let key = CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]);
+        let mut f = BTreeMap::new();
+        f.insert("id".to_string(), Value::from(id));
+        f.insert("body".to_string(), Value::from(id));
+        f.insert("lang".to_string(), Value::from(lang));
+        f.insert("body_vec".to_string(), Value::Vector(v));
+        let doc = LocatedDoc {
+            doc: Document::new(key, f),
+            iceberg_file: "f".into(),
+            row_position: 0,
+        };
+        IndexWriter::write(
+            shard,
+            &CommitBatch::from_upserts(
+                vec![doc],
+                SourceCheckpoint::iceberg(snap),
+                format!("b{snap}"),
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn filtered_knn_returns_only_docs_matching_the_filter() {
+        // The nearest doc to +x is `en_near` (lang=en); the very nearest overall is `de_near`
+        // (lang=de). A KNN filtered to `lang:en` must skip `de_near` and return the `en` docs even
+        // though a `de` doc is closer — the filter intersects the candidate set.
+        let tmp = tempfile::tempdir().unwrap();
+        let shard = vector_shard_with_lang(tmp.path());
+        put_vec_lang(&shard, "de_near", vec![1.0, 0.0, 0.0], "de", 1);
+        put_vec_lang(&shard, "en_near", vec![0.95, 0.05, 0.0], "en", 2);
+        put_vec_lang(&shard, "en_mid", vec![0.5, 0.5, 0.0], "en", 3);
+        put_vec_lang(&shard, "de_far", vec![0.0, 1.0, 0.0], "de", 4);
+
+        let knn = Query::Knn {
+            field: "body_vec".into(),
+            vector: vec![1.0, 0.0, 0.0],
+            k: 2,
+            filter: Some(Box::new(Query::Term {
+                field: Some("lang".into()),
+                value: "en".into(),
+            })),
+        };
+        let hits = shard.search_all(&knn, 2).unwrap();
+        assert_eq!(knn_ids(&hits), vec!["en_near", "en_mid"]);
+        // The closer `de` doc was excluded by the filter.
+        assert!(!knn_ids(&hits).contains(&"de_near".to_string()));
     }
 }

@@ -67,16 +67,28 @@ Each segment's vectors are indexed into a GrowlerDB-owned **ANN sidecar**
 after commit and each compaction, and backed up / restored with the lexical segment. A **top-level KNN**
 query embeds the query text through the same `Embedder` used at ingest, finds the nearest vectors per
 segment, keeps only live docs, and resolves each to its composite **coordinate** — exactly like a lexical
-hit, so [hydration](/product/functional/hydration.md) is unchanged. **RRF fusion with BM25**, **filtered
-KNN**, and the optional [reranker](/system/decisions/d21-reranker.md) are the remaining retrieval half.
+hit, so [hydration](/product/functional/hydration.md) is unchanged.
 
-**Tenant safety.** KNN does not yet enforce the mandatory, non-widenable
-[`tenant = <claim>` filter](/product/functional/rbac-and-tenancy.md) (that is filtered KNN). Until it
-does, semantic search is refused **fail-closed** on a tenant-scoped index rather than risk returning
-cross-tenant rows, and it is not exposed on any authenticated (gateway / REST / gRPC / OpenSearch)
-surface — only the native engine API.
+**Filtered KNN.** A KNN query carries an optional **filter** — a lexical / fast-field sub-query whose
+matching documents constrain the candidate set (the nearest vectors *where* `lang = en`, a numeric
+range, etc.). The filter's per-segment doc set is intersected with the neighbors, so semantic retrieval
+still respects metadata.
+
+**Hybrid search (RRF).** A hybrid query runs both modalities — lexical **BM25** and vector **KNN** — and
+fuses their rankings with **Reciprocal Rank Fusion** (`RRF_K = 60`) into one ranked list of coordinates.
+This is where semantic recall complements exact-term precision: on a real-model eval over paraphrase
+queries (zero lexical term overlap), hybrid strictly beats lexical-only. The optional
+[reranker](/system/decisions/d21-reranker.md) is the remaining refinement.
+
+**Tenant safety.** The mandatory, non-widenable [`tenant = <claim>` filter](/product/functional/rbac-and-tenancy.md)
+is now enforced on the vector path too: the tenant `Term` rides **inside** the KNN as a filter (the
+lexical arm gets the usual `and_filter`), so neighbors are intersected with the caller's tenant docs and
+cannot cross tenants. A tenant-scoped index with **no** verified claim still **fails closed** (refuses)
+rather than returning nearest neighbors unscoped. Semantic / hybrid search remain on the native engine
+API for now — exposing them on the authenticated gateway is a later surface, but the tenant enforcement
+that makes that safe is in place.
 
 > **Status.** In active build (M5). Shipped: the **field type, local BGE embedding at ingest (Candle),
-> the `Embedder` seam, per-document vector storage, the per-segment ANN sidecar (backed up), and
-> top-level KNN** retrieval. **RRF fusion, filtered / tenant-scoped KNN, and reranking** follow — see
+> the `Embedder` seam, per-document vector storage, the per-segment ANN sidecar (backed up), top-level
+> KNN, filtered / tenant-scoped KNN, and RRF hybrid fusion**. The optional **reranker** follows — see
 > [known limitations](/quality/known-limitations/index.md). The interface and stored format are stable.
