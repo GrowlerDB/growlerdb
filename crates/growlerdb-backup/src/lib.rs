@@ -39,6 +39,13 @@ pub enum BackupError {
     /// not per-file objects, so it can't be `restore`d — un-bundle it (`promote_cold`) instead.
     #[error("prefix `{0}` is a bundled cold window; un-bundle (promote) it rather than restore")]
     Bundled(String),
+    /// A replica [`refresh`] kept racing concurrent primary backups: every bounded retry found
+    /// the manifest advanced again mid-pass. Transient by nature — the caller's poll loop simply
+    /// retries next tick while the previously-served shard keeps serving.
+    #[error(
+        "replica refresh at `{0}` kept racing concurrent primary backups — retrying next poll"
+    )]
+    RefreshContention(String),
     /// The manifest declares a [format](Manifest::format) newer than this binary supports: the
     /// backup was written by a newer GrowlerDB whose layout this version can't interpret, so
     /// refuse loudly rather than mis-restore.
@@ -407,15 +414,24 @@ async fn cold_park_to_store(
         .await
         {
             Ok(_) => {
-                delete_prefix_best_effort(store, &format!("{object_prefix}/")).await;
-                // Keep the committed manifest consistent with the store: the
-                // individual `index/*` objects are gone, so mark it `bundled` and drop those entries
-                // (keep `aux.redb`) — a plain `restore` of this prefix now refuses cleanly instead of
-                // 404-ing mid-download. Best-effort: the cold window serves from the bundle regardless.
+                // Commit the `bundled` manifest BEFORE deleting the per-file objects. The old
+                // order (delete, then best-effort rewrite) left a crash window where the durable
+                // manifest still listed the deleted `index/*` objects as restorable — a later
+                // `restore` 404'd mid-download instead of getting the clean `Bundled` refusal.
+                // With manifest-first, every crash point is consistent: rewrite fails ⇒ objects
+                // are kept and the old manifest still restores; rewrite lands ⇒ the objects are
+                // unreferenced and their deletion is pure (best-effort) reclamation.
                 manifest.bundled = true;
                 manifest.files.retain(|f| !f.path.starts_with("index/"));
-                if let Ok(bytes) = serde_json::to_vec(&manifest) {
-                    let _ = store.write(&format!("{base}/manifest.json"), bytes).await;
+                let manifest_committed = match serde_json::to_vec(&manifest) {
+                    Ok(bytes) => store
+                        .write(&format!("{base}/manifest.json"), bytes)
+                        .await
+                        .is_ok(),
+                    Err(_) => false,
+                };
+                if manifest_committed {
+                    delete_prefix_best_effort(store, &format!("{object_prefix}/")).await;
                 }
                 (Some(bkey), Some(mkey))
             }
@@ -626,17 +642,43 @@ pub struct RefreshStats {
 /// **byte-for-byte**, a replica scores identically to the primary. The caller (re)opens the shard
 /// afterward; the first refresh of an empty `dest` downloads everything.
 pub async fn refresh(store: &Operator, prefix: &str, dest: &Path) -> Result<RefreshStats> {
-    let manifest = read_manifest(store, prefix).await?;
-    match refresh_once(store, prefix, dest, manifest).await {
-        // A listed segment 404'd mid-download: a concurrent backup's GC (prune_superseded) pruned a
-        // file this now-stale manifest still names. Re-read the manifest and retry once against the
-        // current file set; a second NotFound is a real error.
-        Err(BackupError::Store(e)) if e.kind() == opendal::ErrorKind::NotFound => {
-            let manifest = read_manifest(store, prefix).await?;
-            refresh_once(store, prefix, dest, manifest).await
+    // Bounded retries over the two ways a concurrent primary backup can race this pass:
+    //
+    // * A listed segment **404s** mid-download — the backup's GC (`prune_superseded`) pruned a
+    //   file this now-stale manifest still names. Re-read and go again.
+    // * The pass **tears**: the mutable objects (`index/meta.json`, `aux.redb`, `location.arr`)
+    //   are fetched live while segment files come from the manifest's list, so a backup landing
+    //   mid-pass can pair a NEWER meta with the OLDER segment set — a meta referencing segments
+    //   never downloaded (and the prune step even removes files the new meta needs). The
+    //   manifest is the backup's commit point (written last), so re-reading it after the pass
+    //   and comparing snapshots detects any backup that completed during the pass; a retry is
+    //   cheap (the immutable segments already downloaded are reused). A sub-object-read race
+    //   narrower than the manifest commit remains theoretically possible but is bounded by one
+    //   GET, not the whole multi-second pass.
+    const MAX_REFRESH_RETRIES: usize = 3;
+    let mut manifest = read_manifest(store, prefix).await?;
+    // One re-read covers the GC race; a SECOND NotFound is a genuinely missing object and
+    // surfaces as the store error (unbounded 404 retries would mask real corruption).
+    let mut retried_404 = false;
+    for _ in 0..=MAX_REFRESH_RETRIES {
+        match refresh_once(store, prefix, dest, manifest).await {
+            Ok(stats) => {
+                let current = read_manifest(store, prefix).await?;
+                if current.snapshot == stats.manifest.snapshot {
+                    return Ok(stats);
+                }
+                manifest = current; // torn: a backup completed mid-pass — refresh against it
+            }
+            Err(BackupError::Store(e))
+                if e.kind() == opendal::ErrorKind::NotFound && !retried_404 =>
+            {
+                retried_404 = true;
+                manifest = read_manifest(store, prefix).await?;
+            }
+            Err(e) => return Err(e),
         }
-        result => result,
     }
+    Err(BackupError::RefreshContention(prefix.to_string()))
 }
 
 async fn refresh_once(
@@ -737,4 +779,116 @@ pub async fn refresh_and_reopen(
     }
     let shard = out_store.open_shard(shard_id, resolved)?;
     Ok((Some(shard), stats))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use growlerdb_core::{
+        CommitBatch, CompositeKey, Document, IndexDefinition, IndexWriter, LocatedDoc, Query,
+        SourceCheckpoint, SourceField, SourceSchema, SourceType, Value,
+    };
+    use growlerdb_index::LocalIndexStore;
+    use std::collections::BTreeMap;
+
+    fn docs_index() -> growlerdb_core::ResolvedIndex {
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("body", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        IndexDefinition::from_yaml(
+            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD }, { path: body, type: TEXT } ] }\n",
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap()
+    }
+
+    fn doc(id: &str) -> LocatedDoc {
+        let key = CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]);
+        let mut f = BTreeMap::new();
+        f.insert("id".to_string(), Value::from(id));
+        f.insert("body".to_string(), Value::from("text"));
+        LocatedDoc {
+            doc: Document::new(key, f),
+            iceberg_file: "f".into(),
+            row_position: 0,
+        }
+    }
+
+    /// The torn-refresh hazard and its guard. A refresh pass fetches the mutable objects
+    /// (`index/meta.json`, `aux.redb`, `location.arr`) live while segment files come from the
+    /// manifest's list — so a pass running against a **stale** manifest while the store already
+    /// holds a newer backup assembles a shard whose meta references segments it never
+    /// downloaded (and prunes ones it shouldn't). `refresh_once` (the raw pass) reproduces
+    /// exactly that; the public [`refresh`] re-reads the manifest after the pass and retries,
+    /// converging on a consistent, openable shard.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stale_manifest_pass_tears_and_refresh_converges() {
+        let primary_tmp = tempfile::tempdir().unwrap();
+        let store_tmp = tempfile::tempdir().unwrap();
+        let replica_tmp = tempfile::tempdir().unwrap();
+        let staging = primary_tmp.path().join(".staging");
+        let op = fs_store(store_tmp.path()).unwrap();
+        let idx = docs_index();
+        let primary_store = LocalIndexStore::open(primary_tmp.path()).unwrap();
+        let shard = primary_store
+            .create_shard(&growlerdb_index::ShardId::single("docs"), &idx)
+            .unwrap();
+
+        // Backup v1 (doc a), keep its manifest — the stale one.
+        IndexWriter::write(
+            &shard,
+            &CommitBatch::from_upserts(vec![doc("a")], SourceCheckpoint::iceberg(1), "b1"),
+        )
+        .unwrap();
+        backup(&shard, "docs", "docs", &staging, &op, "backups/docs", None)
+            .await
+            .unwrap();
+        let stale = read_manifest(&op, "backups/docs").await.unwrap();
+
+        // Backup v2 (doc b) — the store's mutable objects now belong to v2.
+        IndexWriter::write(
+            &shard,
+            &CommitBatch::from_upserts(vec![doc("b")], SourceCheckpoint::iceberg(2), "b2"),
+        )
+        .unwrap();
+        backup(&shard, "docs", "docs", &staging, &op, "backups/docs", None)
+            .await
+            .unwrap();
+
+        // The raw pass against the stale manifest = a backup landing mid-pass: v2 meta/aux paired
+        // with v1's segment list. The assembled dir must not open as a working shard.
+        let replica = LocalIndexStore::open(replica_tmp.path()).unwrap();
+        let dest = replica.shard_path(&growlerdb_index::ShardId::single("docs"));
+        refresh_once(&op, "backups/docs", &dest, stale)
+            .await
+            .unwrap();
+        let torn = replica.open_shard(&growlerdb_index::ShardId::single("docs"), &idx);
+        assert!(
+            torn.is_err(),
+            "a torn refresh (new meta, old segment set) must not open cleanly"
+        );
+
+        // The guarded public refresh converges: consistent manifest, shard opens, both docs.
+        let stats = refresh(&op, "backups/docs", &dest).await.unwrap();
+        assert_eq!(stats.manifest.snapshot, 2);
+        let healed = replica
+            .open_shard(&growlerdb_index::ShardId::single("docs"), &idx)
+            .expect("guarded refresh assembles a consistent shard");
+        for id in ["a", "b"] {
+            assert_eq!(
+                healed
+                    .search_all(&Query::parse(&format!("id:{id}")).unwrap(), 10)
+                    .unwrap()
+                    .len(),
+                1,
+                "doc {id} present after the guarded refresh"
+            );
+        }
+    }
 }

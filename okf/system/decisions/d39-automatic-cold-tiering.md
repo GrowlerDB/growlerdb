@@ -24,7 +24,10 @@ pod. A separate job pod cannot mount that volume (and generally won't even land 
 the orchestrator pattern does not transfer. In-process parking is the only option that touches the data
 where it lives, and it also makes operation automatic for free by mirroring pre-warm.
 
-**Safety.** Victims are aged windows outside the hot horizon — immutable, not receiving row writes.
+**Safety.** Victims are aged windows outside the hot horizon — immutable, not receiving row writes;
+and because the write paths below can still race the park, the pass **verifies the shard's
+snapshot after the cold swap** (the window is read-only by then, so the check is stable) and swaps
+the intact hot shard back on a mismatch rather than evicting a write that exists only locally.
 Only one node owns the current (actively written) window and it is that node's most-recent window, so a
 per-node "keep the most recent N hot" policy never parks a window still being written. The backup +
 durable marker land **before** any local eviction, so a crash mid-park always leaves a fully-serving
