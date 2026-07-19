@@ -66,8 +66,9 @@ All notable changes to GrowlerDB are documented here. The format is based on
 - **External embedding / rerank providers (opt-in, server-side keys).** A vector field with
   `provider: EXTERNAL` (or `GROWLERDB_RERANK_PROVIDER=external`) calls a hosted provider over HTTP using
   a **server-side-only** API key (`GROWLERDB_EMBEDDING_API_KEY` / `GROWLERDB_RERANK_API_KEY`, +
-  `..._ENDPOINT`) — read from the engine's env (k8s Secret / Vault mount), **re-read per call so keys
-  rotate without a restart**, **redacted** in all output, and **never** exposed to the browser or
+  `..._ENDPOINT`) — read from the engine's env (k8s Secret / Vault mount), **cached with a 5-min TTL**
+  (a rotated key is picked up within the window; no per-call env read on the hot path), **redacted** in
+  all output, and **never** exposed to the browser or
   `/v1/config`. Selecting `EXTERNAL` without a key **fails closed** (a clear error, no silent fallback).
   The **local** BGE/reranker default needs zero keys. No LLM keys — GrowlerDB never calls an LLM (D42).
   (ADR D20/D21 · TASK-299)

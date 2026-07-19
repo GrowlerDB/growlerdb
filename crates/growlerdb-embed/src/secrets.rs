@@ -29,7 +29,17 @@
 //! [D41]: ../../okf/system/decisions/d41-open-core.md
 //! [D42]: ../../okf/system/decisions/d42-retrieval-first.md
 
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+/// How long a provider key is cached before the env is re-read. Reading the key on **every**
+/// embed/rerank call means a `std::env::var` (a process-global lock + an allocation) on a hot path;
+/// caching for a short window removes that per-call cost while still picking up a rotated
+/// Secret/Vault-mounted env **within the TTL** (no restart needed). 5 min is a deliberate balance:
+/// negligible read cost vs. how promptly a rotation must take effect.
+const KEY_TTL: Duration = Duration::from_secs(300);
 
 /// Env var carrying the outbound **embedding** provider API key (server-side only).
 pub const EMBEDDING_API_KEY_ENV: &str = "GROWLERDB_EMBEDDING_API_KEY";
@@ -38,9 +48,10 @@ pub const RERANK_API_KEY_ENV: &str = "GROWLERDB_RERANK_API_KEY";
 
 /// The server-side source of outbound embedding/rerank provider API keys.
 ///
-/// This is a zero-sized handle: it holds no key material itself. Each accessor re-reads the
-/// process environment on call, so a rotated secret (see the module docs) takes effect
-/// immediately and no long-lived copy of a key sits in memory beyond the call that uses it.
+/// This is a zero-sized handle: it holds no key material itself. Each accessor reads the process
+/// environment behind a short [`KEY_TTL`] cache, so a rotated secret (see the module docs) takes
+/// effect **within the TTL** without a restart, and no long-lived copy of a key sits in memory
+/// beyond the cache window.
 #[derive(Clone, Copy, Default)]
 pub struct ProviderSecrets;
 
@@ -51,24 +62,57 @@ impl ProviderSecrets {
     }
 
     /// The outbound **embedding** provider key from [`EMBEDDING_API_KEY_ENV`], or `None` when
-    /// unset/blank. Re-read on every call (rotation-safe).
+    /// unset/blank. Cached for [`KEY_TTL`]; a rotation is picked up within that window.
     pub fn embedding_key(&self) -> Option<String> {
         read_key(EMBEDDING_API_KEY_ENV)
     }
 
     /// The outbound **rerank** provider key from [`RERANK_API_KEY_ENV`], or `None` when
-    /// unset/blank. Re-read on every call (rotation-safe).
+    /// unset/blank. Cached for [`KEY_TTL`]; a rotation is picked up within that window.
     pub fn rerank_key(&self) -> Option<String> {
         read_key(RERANK_API_KEY_ENV)
     }
 }
 
-/// Read a key from `env_var`, trimming surrounding whitespace and treating blank as unset.
-fn read_key(env_var: &str) -> Option<String> {
+/// The last-read key per env var + when it was read. Two entries (embedding, rerank).
+type KeyCache = HashMap<&'static str, (Option<String>, Instant)>;
+
+/// Process-global cache behind [`read_key`]'s [`KEY_TTL`] window.
+fn key_cache() -> &'static Mutex<KeyCache> {
+    static CACHE: OnceLock<Mutex<KeyCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(KeyCache::new()))
+}
+
+/// Read a key from `env_var` (trimmed, blank ⇒ unset), served from a [`KEY_TTL`] cache — the env is
+/// re-read only when the cached value is older than the TTL, so a rotation lands within the window.
+fn read_key(env_var: &'static str) -> Option<String> {
+    let mut cache = key_cache().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((val, read_at)) = cache.get(env_var) {
+        if read_at.elapsed() < KEY_TTL {
+            return val.clone();
+        }
+    }
+    let fresh = read_key_uncached(env_var);
+    cache.insert(env_var, (fresh.clone(), Instant::now()));
+    fresh
+}
+
+/// The uncached env read (trim, blank ⇒ `None`).
+fn read_key_uncached(env_var: &str) -> Option<String> {
     std::env::var(env_var)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Test-only: drop the key cache so a test can observe a just-changed env var without waiting out
+/// [`KEY_TTL`]. (Production picks up a rotation on the next post-TTL read.)
+#[cfg(test)]
+pub(crate) fn clear_key_cache() {
+    key_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
 }
 
 /// Render `key` for safe display: never the full secret. Shows a `***…last4` tail for a key long
@@ -137,28 +181,37 @@ mod tests {
     }
 
     #[test]
-    fn keys_read_from_env_and_reflect_rotation() {
-        let _g = env_guard();
+    fn keys_are_cached_and_rotate_after_the_ttl() {
+        let _g = env_guard(); // clears the key cache
         std::env::remove_var(EMBEDDING_API_KEY_ENV);
         std::env::remove_var(RERANK_API_KEY_ENV);
         let s = ProviderSecrets::from_env();
 
-        // Unset → None (fail closed at the call site).
+        // Unset → None (fail closed at the call site); this caches `None`.
         assert_eq!(s.embedding_key(), None);
         assert_eq!(s.rerank_key(), None);
 
+        // A rotation is NOT visible while the prior read is still cached (within KEY_TTL) …
         std::env::set_var(EMBEDDING_API_KEY_ENV, "  embed-key-v1  ");
-        std::env::set_var(RERANK_API_KEY_ENV, "rerank-key-v1");
-        // Trimmed on read.
-        assert_eq!(s.embedding_key().as_deref(), Some("embed-key-v1"));
-        assert_eq!(s.rerank_key().as_deref(), Some("rerank-key-v1"));
+        assert_eq!(
+            s.embedding_key(),
+            None,
+            "still-cached read (within TTL) — the rotation isn't visible yet"
+        );
 
-        // Rotate: the same handle re-reads env and sees the new value.
+        // … and IS picked up once the cache refreshes (TTL expiry, simulated by a clear). Trimmed.
+        clear_key_cache();
+        assert_eq!(s.embedding_key().as_deref(), Some("embed-key-v1"));
+        assert_eq!(s.rerank_key(), None); // rerank untouched
+
+        // Rotate again → new value after the cache refreshes.
         std::env::set_var(EMBEDDING_API_KEY_ENV, "embed-key-v2");
+        clear_key_cache();
         assert_eq!(s.embedding_key().as_deref(), Some("embed-key-v2"));
 
         // Blank is treated as unset.
         std::env::set_var(EMBEDDING_API_KEY_ENV, "   ");
+        clear_key_cache();
         assert_eq!(s.embedding_key(), None);
 
         std::env::remove_var(EMBEDDING_API_KEY_ENV);
