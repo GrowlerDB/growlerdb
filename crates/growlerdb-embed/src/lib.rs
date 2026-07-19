@@ -32,9 +32,14 @@ use growlerdb_core::{Document, Embedder, HashEmbedder, HashReranker, Reranker, V
 #[cfg(test)]
 pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    let guard = LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(|p| p.into_inner());
+    // Drop the provider-key TTL cache so this test sees the env it's about to set, not a value a
+    // prior serialized test cached.
+    crate::secrets::clear_key_cache();
+    guard
 }
 
 #[cfg(feature = "bge")]

@@ -22,6 +22,10 @@ postcard = { version = "1", features = ["use-std"] }
 # Lightweight metrics facade for the cold-cache hit/miss counters — emitted at the
 # source; a no-op unless the process installs a recorder (growlerdb-telemetry does).
 metrics = "0.24"
+# Pure-Rust HNSW for the approximate ANN index (D19) — picked over `hnsw_rs` for its small,
+# permissive (MIT/Apache-2.0) tree and `serde` serialization. `with-serde` pulls in
+# `serde-big-array` so the fixed 64-wide zero-layer node array (de)serializes.
+instant-distance = { version = "0.6.1", features = ["with-serde"] }
 
 [dev-dependencies]
 tempfile.workspace = true

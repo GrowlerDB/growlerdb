@@ -63,7 +63,8 @@ runtime — provisioning stays explicit, keeping the default deployment offline.
 **External providers (opt-in).** A field declared `provider: EXTERNAL` (and, for reranking,
 `GROWLERDB_RERANK_PROVIDER=external`) instead calls a hosted embedding / rerank service over HTTP. The
 API key is **server-side only** (`GROWLERDB_EMBEDDING_API_KEY` / `GROWLERDB_RERANK_API_KEY`, from the
-engine's env — a k8s Secret / Vault mount), **re-read per call so it rotates without a restart**,
+engine's env — a k8s Secret / Vault mount), **cached with a 5-min TTL so a rotated key is picked up
+within the window** (no per-call env read on the hot path, no restart),
 **redacted** in all output, and **never** sent to the browser or surfaced on `/v1/config`. Selecting
 `EXTERNAL` with no key **fails closed** (a clear error, never a silent local fallback). The local default
 needs **zero** keys. There are **no LLM keys** — GrowlerDB never calls an LLM
@@ -115,6 +116,6 @@ a no-op; see [RBAC & tenancy](/product/functional/rbac-and-tenancy.md).)
 > the `Embedder` seam, per-document vector storage, the per-segment ANN sidecar (backed up), top-level
 > KNN, filtered / tenant-scoped KNN, RRF hybrid fusion, the authenticated multi-shard gateway
 > surface** (gRPC + REST, node-local embedding), the **console** search-mode UX + grounded Ask screen,
-> and the **opt-in reranker**. **Distributed windowed** semantic search and the approximate (HNSW) index
-> (a scale optimization) follow — see
+> the **opt-in reranker** (local + external providers), and the **approximate HNSW index** (auto-selected
+> at scale, filtered KNN stays exact). Only **distributed windowed** semantic search remains — see
 > [known limitations](/quality/known-limitations/index.md). The interface and stored format are stable.
