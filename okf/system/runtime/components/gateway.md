@@ -37,3 +37,14 @@ without forking — the [extension seam](/system/decisions/d37-extension-seams.m
 ## Notes
 
 Stateless → horizontally scalable; routing is derived, so a gateway is disposable. In `growlerdb-engine`.
+
+## Admission control
+
+The gateway load-sheds rather than queues: at `GROWLERDB_MAX_CONCURRENT_QUERIES` (default 256,
+`0` = unbounded; Helm `gateway.maxConcurrentQueries`) concurrent in-flight queries, the next
+query — search, semantic, hybrid, suggest, aggregate, lookup, explain, over REST and gRPC alike —
+is rejected immediately with `RESOURCE_EXHAUSTED` (HTTP 429), an honest retry-with-backoff signal
+instead of a timeout. A hybrid query charges one admission slot (its internal arms are exempt).
+This composes with the existing per-query 30s deadline, the 10k page-fetch ceiling, and the
+fan-out cap; per-principal (per-client) rate limiting is future work — admission is currently a
+global budget.

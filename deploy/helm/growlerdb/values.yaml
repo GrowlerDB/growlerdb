@@ -161,6 +161,9 @@ controlPlane:
 # ---- Node: stateful searcher/index on a local PV ---------------------------------------------
 # The StatefulSet runs one pod per shard: replicas = `index.shards`, and pod-K serves ordinal K.
 node:
+  # Max concurrent HEAVY read ops (exports/aggregations — full scans on the blocking pool)
+  # per node, across all its shards/windows. Saturation load-sheds with RESOURCE_EXHAUSTED.
+  maxHeavyReads: 8
   grpcPort: 50051
   restPort: 8080
   metricsPort: 9102
@@ -194,6 +197,10 @@ node:
 
 # ---- Gateway: public Engine API + console UI -------------------------------------------------
 gateway:
+  # Max concurrent queries admitted at the gateway (search/semantic/hybrid/suggest/aggregate/
+  # lookup/explain, REST + gRPC). At the cap requests are load-shed with HTTP 429 /
+  # RESOURCE_EXHAUSTED rather than queued into timeouts. 0 = unbounded.
+  maxConcurrentQueries: 256
   replicas: 2
   grpcPort: 50061
   restPort: 8080 # REST Engine API + the console UI, behind the Service

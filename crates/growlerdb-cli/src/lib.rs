@@ -1691,8 +1691,11 @@ async fn serve(cfg: ServeConfig<'_>) -> anyhow::Result<()> {
             lookup.clone(),
             admin.clone(),
         );
-        let gateway =
-            Arc::new(growlerdb_engine::Gateway::new(node.shared()).serving(resolved.name.clone()));
+        let gateway = Arc::new(
+            growlerdb_engine::Gateway::new(node.shared())
+                .with_limits(growlerdb_engine::GatewayLimits::from_env())
+                .serving(resolved.name.clone()),
+        );
         let router = rest_router(gateway, ui_dir);
         let listener = tokio::net::TcpListener::bind(rest_socket).await?;
         println!("serving REST/JSON gateway on http://{rest_socket}/v1/...");
@@ -1932,8 +1935,11 @@ async fn serve_replica(
             lookup.clone(),
             admin.clone(),
         );
-        let gateway =
-            Arc::new(growlerdb_engine::Gateway::new(node.shared()).serving(resolved.name.clone()));
+        let gateway = Arc::new(
+            growlerdb_engine::Gateway::new(node.shared())
+                .with_limits(growlerdb_engine::GatewayLimits::from_env())
+                .serving(resolved.name.clone()),
+        );
         let router = rest_router(gateway, ui_dir);
         let listener = tokio::net::TcpListener::bind(rest_socket).await?;
         println!("replica REST/JSON gateway on http://{rest_socket}/v1/...");
@@ -2523,7 +2529,8 @@ pub async fn gateway(cfg: GatewayConfig<'_>) -> anyhow::Result<()> {
             node_tls: node_tls.clone(),
             reload_secs,
         });
-        let gw = growlerdb_engine::Gateway::multi_index(resolver, None);
+        let gw = growlerdb_engine::Gateway::multi_index(resolver, None)
+            .with_limits(growlerdb_engine::GatewayLimits::from_env());
         (gw, format!("all indexes via control-plane {cp}"))
     } else {
         match (registry, index, node_addr) {
@@ -2572,7 +2579,8 @@ pub async fn gateway(cfg: GatewayConfig<'_>) -> anyhow::Result<()> {
             (_, _, Some(node_addr)) => {
                 let node = connect_node(node_addr, node_tls).await?;
                 (
-                    growlerdb_engine::Gateway::new(Arc::new(node)),
+                    growlerdb_engine::Gateway::new(Arc::new(node))
+                        .with_limits(growlerdb_engine::GatewayLimits::from_env()),
                     format!("Node {node_addr}"),
                 )
             }
@@ -2803,6 +2811,7 @@ async fn gateway_from_registry(
         .map(|e| keyword_partition_fields(&e.definition))
         .unwrap_or_default();
     Ok(growlerdb_engine::Gateway::sharded_with(nodes, router)
+        .with_limits(growlerdb_engine::GatewayLimits::from_env())
         .with_partition_fields(partition_fields))
 }
 
@@ -3234,7 +3243,8 @@ async fn gateway_from_control_plane(
             } else {
                 let (nodes, router, fp) = connect_sharded_from_get_index(index, &resp, node_tls)?;
                 Ok((
-                    growlerdb_engine::Gateway::sharded_with(nodes, router),
+                    growlerdb_engine::Gateway::sharded_with(nodes, router)
+                        .with_limits(growlerdb_engine::GatewayLimits::from_env()),
                     CpReload::Ordinal(fp),
                 ))
             }

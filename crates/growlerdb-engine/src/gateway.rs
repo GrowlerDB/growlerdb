@@ -65,6 +65,14 @@ pub struct GatewayLimits {
     /// queries and exhaust the Gateway's socket/fd budget; a semaphore caps it (excess tasks queue
     /// under the deadline). `0` = unbounded.
     pub max_concurrent_fanout: usize,
+    /// Max concurrent **queries** admitted at the Gateway (search/semantic/hybrid/suggest/
+    /// aggregate/lookup/explain, over REST and gRPC alike — both fronts route through these
+    /// methods). At the cap, a query is REJECTED immediately with `RESOURCE_EXHAUSTED`
+    /// (HTTP 429) rather than queued — load-shedding keeps admitted queries fast and gives the
+    /// client an honest retry signal instead of a timeout. Distinct from
+    /// [`max_concurrent_fanout`], which bounds per-shard RPCs *within* admitted queries.
+    /// `0` = unbounded. Env knob: `GROWLERDB_MAX_CONCURRENT_QUERIES` (via the CLI).
+    pub max_concurrent_queries: usize,
 }
 
 impl Default for GatewayLimits {
@@ -75,7 +83,27 @@ impl Default for GatewayLimits {
             deadline: Some(Duration::from_secs(30)),
             max_fetch: 10_000,
             max_concurrent_fanout: 256,
+            // 256 concurrent admitted queries: far above a healthy interactive load, a firm
+            // wall against an unbounded flood (each admitted query can hold shard RPCs, PITs,
+            // and blocking-pool time).
+            max_concurrent_queries: 256,
         }
+    }
+}
+
+impl GatewayLimits {
+    /// [`Default`], with the deploy-facing env overrides applied — what the CLI binaries use so
+    /// operators can tune admission without a rebuild. Currently: `GROWLERDB_MAX_CONCURRENT_QUERIES`
+    /// (`0` = unbounded).
+    pub fn from_env() -> Self {
+        let mut limits = Self::default();
+        if let Some(n) = std::env::var("GROWLERDB_MAX_CONCURRENT_QUERIES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            limits.max_concurrent_queries = n;
+        }
+        limits
     }
 }
 
@@ -123,6 +151,9 @@ pub struct Gateway {
     /// [`resolve_route`](Self::resolve_route)). In single-index mode this is the served index name.
     default_index: Option<String>,
     limits: GatewayLimits,
+    /// Query-admission semaphore over [`GatewayLimits::max_concurrent_queries`] — `try_acquire`
+    /// at the top of every query method; saturation load-sheds with `RESOURCE_EXHAUSTED`.
+    admission: Arc<tokio::sync::Semaphore>,
     authn: Option<SharedAuthn>,
     /// Built-in (no-IdP) password login is available — advertised on `/v1/config` so the
     /// console shows a username/password form rather than an OIDC redirect.
@@ -365,6 +396,7 @@ impl Gateway {
             date_formats: crate::opensearch::FieldFormats::default(),
             served_index: None,
             fanout: fanout_semaphore(GatewayLimits::default().max_concurrent_fanout),
+            admission: fanout_semaphore(GatewayLimits::default().max_concurrent_queries),
         }
     }
 
@@ -388,6 +420,7 @@ impl Gateway {
             date_formats: crate::opensearch::FieldFormats::default(),
             served_index: None,
             fanout: fanout_semaphore(GatewayLimits::default().max_concurrent_fanout),
+            admission: fanout_semaphore(GatewayLimits::default().max_concurrent_queries),
         }
     }
 
@@ -653,8 +686,22 @@ impl Gateway {
     /// Override the [resiliency limits](GatewayLimits) (deadline + max page fetch + fan-out cap).
     pub fn with_limits(mut self, limits: GatewayLimits) -> Self {
         self.fanout = fanout_semaphore(limits.max_concurrent_fanout);
+        self.admission = fanout_semaphore(limits.max_concurrent_queries);
         self.limits = limits;
         self
+    }
+
+    /// Admit one query, or load-shed: at [`GatewayLimits::max_concurrent_queries`] concurrent
+    /// admitted queries the call is rejected immediately with `RESOURCE_EXHAUSTED` (HTTP 429 over
+    /// REST) — an honest "retry with backoff" instead of queueing into a timeout. The permit is
+    /// held for the query's whole lifetime (RAII).
+    fn admit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Status> {
+        self.admission.clone().try_acquire_owned().map_err(|_| {
+            Status::resource_exhausted(format!(
+                "gateway at its concurrent-query limit ({}) — retry with backoff                  (GROWLERDB_MAX_CONCURRENT_QUERIES tunes this)",
+                self.limits.max_concurrent_queries
+            ))
+        })
     }
 
     /// Run a single-shard forward under the same per-query deadline the scatter-gather uses. The
@@ -837,6 +884,17 @@ impl Gateway {
     /// SLI (rate/errors/duration) around the whole call, so both the gRPC and REST
     /// fronts are covered through this one chokepoint.
     pub async fn search(
+        &self,
+        req: Request<SearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        let _permit = self.admit()?;
+        self.search_unadmitted(req).await
+    }
+
+    /// [`search`](Self::search) minus the admission permit — the internal form composite
+    /// queries call, so one admitted query never charges multiple permits (or sheds its own
+    /// sub-queries at the cap).
+    async fn search_unadmitted(
         &self,
         req: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
@@ -1130,6 +1188,17 @@ impl Gateway {
     /// uses). Single-shard forwards verbatim. Tenant scoping is enforced Node-side, fail-closed.
     pub async fn semantic_search(
         &self,
+        req: Request<SemanticSearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        let _permit = self.admit()?;
+        self.semantic_search_unadmitted(req).await
+    }
+
+    /// [`semantic_search`](Self::semantic_search) minus the admission permit — the internal form composite
+    /// queries call, so one admitted query never charges multiple permits (or sheds its own
+    /// sub-queries at the cap).
+    async fn semantic_search_unadmitted(
+        &self,
         mut req: Request<SemanticSearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         let index = req.get_ref().index.clone();
@@ -1205,6 +1274,7 @@ impl Gateway {
         &self,
         req: Request<HybridSearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
+        let _permit = self.admit()?;
         let (meta, _ext, body) = req.into_parts();
         let k = body.k as usize;
         let rrf_k = if body.rrf_k == 0 {
@@ -1276,8 +1346,14 @@ impl Gateway {
         // surface its error verbatim. The lexical arm tolerates an unparseable/empty query — the
         // fusion then just reflects the semantic ranking (mirroring the engine's MatchAll-fallback
         // intent), rather than failing the whole hybrid on a query the vector arm handled fine.
-        let semantic = self.semantic_search(semantic_req).await?.into_inner();
-        let lexical = self.search(lexical_req).await.map(Response::into_inner);
+        let semantic = self
+            .semantic_search_unadmitted(semantic_req)
+            .await?
+            .into_inner();
+        let lexical = self
+            .search_unadmitted(lexical_req)
+            .await
+            .map(Response::into_inner);
 
         let empty: &[SearchHit] = &[];
         let lex_hits = lexical.as_ref().map(|r| r.hits.as_slice()).unwrap_or(empty);
@@ -1307,6 +1383,7 @@ impl Gateway {
         &self,
         mut req: Request<SuggestRequest>,
     ) -> Result<Response<SuggestResponse>, Status> {
+        let _permit = self.admit()?;
         // Resolve the target index: suggest honors `SuggestRequest.index`, so a
         // multi-index endpoint suggests over the named index (and per-index RBAC applies).
         let index = req.get_ref().index.clone();
@@ -1361,6 +1438,17 @@ impl Gateway {
     /// Hydrate keys. Multi-shard: **route** each key to its owning shard, send each shard only
     /// the keys it owns (not a broadcast), and concatenate the rows.
     pub async fn get_by_key(
+        &self,
+        req: Request<GetByKeyRequest>,
+    ) -> Result<Response<GetByKeyResponse>, Status> {
+        let _permit = self.admit()?;
+        self.get_by_key_unadmitted(req).await
+    }
+
+    /// [`get_by_key`](Self::get_by_key) minus the admission permit — the internal form composite
+    /// queries call, so one admitted query never charges multiple permits (or sheds its own
+    /// sub-queries at the cap).
+    async fn get_by_key_unadmitted(
         &self,
         mut req: Request<GetByKeyRequest>,
     ) -> Result<Response<GetByKeyResponse>, Status> {
@@ -1501,6 +1589,7 @@ impl Gateway {
         &self,
         mut req: Request<ExplainRequest>,
     ) -> Result<Response<ExplainResponse>, Status> {
+        let _permit = self.admit()?;
         // Resolve the target index (scoping + routing/RBAC), authorized as a read.
         let index = req.get_ref().index.clone();
         let route = self.guard_and_resolve("Search", &index, &mut req).await?;
@@ -1536,7 +1625,7 @@ impl Gateway {
             },
         );
         let h0 = std::time::Instant::now();
-        let hydrated = self.get_by_key(gk).await.is_ok();
+        let hydrated = self.get_by_key_unadmitted(gk).await.is_ok();
         let timings = resp.timings.get_or_insert_with(Default::default);
         timings.hydration_ms = if hydrated {
             h0.elapsed().as_secs_f64() * 1000.0
@@ -1557,6 +1646,7 @@ impl Gateway {
         &self,
         mut req: Request<AggregateRequest>,
     ) -> Result<Response<AggregateResponse>, Status> {
+        let _permit = self.admit()?;
         // Resolve the target index: aggregate honors `AggregateRequest.index`.
         let index = req.get_ref().index.clone();
         let route = self
@@ -4779,6 +4869,92 @@ mod tests {
                 "{want} missing from {ids:?}"
             );
         }
+    }
+
+    /// Admission load-shedding: at `max_concurrent_queries` in-flight queries, the next one is
+    /// rejected immediately with `RESOURCE_EXHAUSTED` (→ HTTP 429), and capacity frees the moment
+    /// an admitted query finishes. A hybrid query charges exactly ONE permit (its internal arms
+    /// use the unadmitted forms), so composite queries complete even at cap 1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_sheds_the_flood_and_recovers() {
+        use tokio::sync::Notify;
+
+        /// A node whose search parks until released — holds its gateway permit in flight.
+        struct ParkedNode {
+            entered: Arc<Notify>,
+            release: Arc<Notify>,
+        }
+        #[tonic::async_trait]
+        impl Node for ParkedNode {
+            async fn search(
+                &self,
+                _: Request<SearchRequest>,
+            ) -> Result<Response<SearchResponse>, Status> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(Response::new(SearchResponse::default()))
+            }
+            async fn suggest(
+                &self,
+                _: Request<SuggestRequest>,
+            ) -> Result<Response<SuggestResponse>, Status> {
+                Ok(Response::new(SuggestResponse::default()))
+            }
+            async fn get_by_key(
+                &self,
+                _: Request<GetByKeyRequest>,
+            ) -> Result<Response<GetByKeyResponse>, Status> {
+                Ok(Response::new(GetByKeyResponse::default()))
+            }
+            async fn describe_index(
+                &self,
+                _: Request<DescribeIndexRequest>,
+            ) -> Result<Response<DescribeIndexResponse>, Status> {
+                Err(Status::unimplemented("stub"))
+            }
+        }
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let gw = Arc::new(
+            Gateway::new(Arc::new(ParkedNode {
+                entered: entered.clone(),
+                release: release.clone(),
+            }))
+            .with_limits(GatewayLimits {
+                max_concurrent_queries: 1,
+                ..GatewayLimits::default()
+            }),
+        );
+
+        // Occupy the single admission slot.
+        let held = {
+            let gw = gw.clone();
+            tokio::spawn(async move { gw.search(Request::new(SearchRequest::default())).await })
+        };
+        entered.notified().await;
+
+        // The flood is shed with the honest signal, on search AND suggest (all query methods
+        // share the budget).
+        let err = gw
+            .search(Request::new(SearchRequest::default()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        let err = gw
+            .suggest(Request::new(SuggestRequest::default()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+
+        // Capacity frees as soon as the admitted query completes.
+        release.notify_one();
+        held.await.unwrap().unwrap();
+        // Pre-store the release permit so the re-admitted query passes straight through the stub.
+        release.notify_one();
+        gw.search(Request::new(SearchRequest::default()))
+            .await
+            .expect("admitted once the slot freed");
     }
 
     /// Hybrid `filter` constrains BOTH arms: the semantic arm carries it as the KNN filter, and

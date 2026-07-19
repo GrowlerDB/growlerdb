@@ -66,6 +66,8 @@ spec:
           env:
             {{- include "growlerdb.icebergEnv" . | nindent 12 }}
             {{- include "growlerdb.serviceTokenEnv" . | nindent 12 }}
+            - name: GROWLERDB_MAX_CONCURRENT_QUERIES
+              value: {{ .Values.gateway.maxConcurrentQueries | int64 | quote }}
             {{- include "growlerdb.observabilityEnv" . | nindent 12 }}
             {{- with .Values.observability.grafanaUrl }}
             # Only the gateway serves /v1/config, so the console's Grafana link lives here; keeping it
