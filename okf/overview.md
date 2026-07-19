@@ -1,17 +1,17 @@
 ---
 type: Concept
 title: GrowlerDB — Overview
-description: What GrowlerDB is — a fast, derived, open-source full-text index over Apache Iceberg data.
+description: What GrowlerDB is — a fast, derived, open-source retrieval engine (full-text, vector & hybrid) over your data, keyed back to an authoritative source (Apache Iceberg today).
 tags: [overview, thesis, product]
 timestamp: 2026-07-04T14:22:00
 ---
 
 # GrowlerDB — Overview
 
-GrowlerDB is an **open-source full-text search engine over Apache Iceberg**. It keeps Iceberg as the
-system of record and maintains a fast, **derived, rebuildable** index of the Iceberg data, fed by
-streaming ingestion — then serves search that returns **primary keys**, which resolve straight back to
-the authoritative Iceberg rows.
+GrowlerDB is an **open-source retrieval engine — full-text, vector, and hybrid search over your
+data**. It keeps your source (Apache Iceberg today) as the system of record and maintains a fast,
+**derived, rebuildable** index of it, fed by streaming ingestion — then serves search that returns
+**primary keys**, which resolve straight back to the authoritative rows.
 
 ## The problem
 
@@ -24,9 +24,9 @@ to babysit, governance reinvented, and a key/identity mismatch between the index
 
 ## The thesis
 
-> Keep Iceberg as the system of record. Build a fast, derived, open-source full-text index *of* the
-> Iceberg data, fed by streaming ingestion, and serve search that returns primary keys — which
-> resolve straight back to the Iceberg rows.
+> Keep your source as the system of record. Build a fast, derived, open-source retrieval index
+> (full-text, vector & hybrid) *of* the data, fed by streaming ingestion, and serve search that
+> returns primary keys — which resolve straight back to the authoritative rows.
 
 Three commitments make it work:
 
@@ -45,8 +45,8 @@ Three commitments make it work:
 
 | Value | How |
 |---|---|
-| One source of truth | Iceberg owns the data; the index is a disposable derived view |
-| Always in sync | Continuous streaming ingestion from Iceberg / Kafka / CDC, with checkpoints |
+| One source of truth | Your source owns the data; the index is a derived view |
+| Always in sync | Continuous streaming ingestion from your source, with checkpoints (Apache Iceberg today; Delta, CDC & Kafka on the roadmap) |
 | Fast search | Local Tantivy index on NVMe; milliseconds, not object-storage round trips |
 | Governed retrieval | Search returns keys; the authoritative, access-controlled row is fetched from Iceberg |
 | Rebuildable & cheap to operate | Lose the index? Replay from Iceberg. Durability tier on object storage |
@@ -54,8 +54,8 @@ Three commitments make it work:
 
 ## What GrowlerDB is *not*
 
-- **A pure text search engine — nothing more.** No detection/alerting/percolator (that is the app
-  layer above GrowlerDB); not an analytics/OLAP engine; not a datastore.
+- **A retrieval engine, not the app layer above it.** No detection/alerting/percolator (that is the
+  app layer above GrowlerDB); not an analytics/OLAP engine; not a datastore.
 - **Not a system of record.** The index holds only what it needs to search and to point back to
   Iceberg; Iceberg holds the truth.
 - **Not "search inside Iceberg files."** GrowlerDB maintains a dedicated index store next to Iceberg

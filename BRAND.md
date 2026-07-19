@@ -56,15 +56,16 @@ Self-hosted on every surface (console, website, docs) — no font CDN.
 
 ## Voice & terminology
 
-**Tagline: "Search your lake. Keep one truth."** Plain, confident, falsifiable claims; no superlatives;
-no iceberg puns in product UI (the *growler* story is for the name only). Use the canonical words:
+**Positioning line: "Full-text, vector, and hybrid search over your data."** Plain, confident,
+falsifiable claims; no superlatives; no iceberg puns in product UI (the *growler* story is for the name
+only). Use the canonical words:
 
 | Use | Not |
 |---|---|
 | **coordinates** (what a search hit returns) | doc ID, pointer, "document keys" |
 | **hydrate / hydration** (resolve to the authoritative row) | fetch, lookup, resolve |
 | **derived index** (secondary, rebuildable) | copy, replica, cache |
-| **system of record** (Apache Iceberg, always) | backend, upstream database |
+| **system of record** (your source; Apache Iceberg today, the flagship) | backend, upstream database |
 | **connector / gateway / console** | ingester, proxy, dashboard |
 
 **Maturity:** the product is **Beta / pre-1.0** — never claim "GA" or "v1.0 / generally available"

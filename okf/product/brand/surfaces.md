@@ -19,8 +19,8 @@ The [apex landing page](/product/interfaces/website.md) becomes a branded homepa
 Docs/Performance/GitHub links and a glacier-light "Get started" button; a centred hero (maturity pill,
 Archivo-800 H1, `#B9BCC2` sub, two CTAs, a `$ just stack` mono card); a 3-column "How it works" grid
 with melt mono kickers (`1 — INDEX`); a "Why not Elasticsearch" stack; a footer with the small lockup and
-`AGPL-3.0` in mono. Copy: **"document keys" → coordinates**, hero tagline "Full-text search over Apache
-Iceberg."
+`AGPL-3.0` in mono. Copy: **"document keys" → coordinates**, hero line "Full-text, vector, and hybrid
+search over your data" ([D44](/system/decisions/d44-product-scope-retrieval.md)).
 
 ## Console — `ui/`
 

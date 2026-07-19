@@ -1,7 +1,7 @@
 # GitHub Pages (just-the-docs) — built natively from this docs/ folder.
 # Settings → Pages → Source: "Deploy from a branch" → main / docs.
 title: GrowlerDB
-description: Open-source text search engine over Apache Iceberg.
+description: Open-source retrieval engine — full-text, vector, and hybrid search over your data.
 remote_theme: just-the-docs/just-the-docs
 
 # Custom domain: docs served at the root of the docs subdomain (see docs/CNAME).

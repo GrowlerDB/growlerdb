@@ -3,20 +3,20 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GrowlerDB — full-text search over Apache Iceberg</title>
-<meta name="description" content="GrowlerDB is an open-source full-text search engine over Apache Iceberg. Iceberg stays the system of record; search returns coordinates that hydrate back to the authoritative rows in your lake.">
+<title>GrowlerDB — full-text, vector, and hybrid search over your data</title>
+<meta name="description" content="GrowlerDB is an open-source retrieval engine — full-text, vector, and hybrid search over your data. Your source stays the system of record; a fast derived index resolves matches back to the authoritative row. No second copy.">
 <link rel="canonical" href="https://growlerdb.com/">
 <link rel="icon" href="/favicon.svg">
 <!-- Social unfurl -->
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="GrowlerDB">
-<meta property="og:title" content="GrowlerDB — full-text search over Apache Iceberg">
-<meta property="og:description" content="Open-source text search over your Iceberg lakehouse. Search returns coordinates that hydrate to authoritative rows — no second copy of your data.">
+<meta property="og:title" content="GrowlerDB — full-text, vector, and hybrid search over your data">
+<meta property="og:description" content="Open-source retrieval engine — full-text, vector, and hybrid search over your data. Matches resolve back to authoritative rows in your source — no second copy of your data.">
 <meta property="og:url" content="https://growlerdb.com/">
 <meta property="og:image" content="https://docs.growlerdb.com/img/social-preview.png">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="GrowlerDB — full-text search over Apache Iceberg">
-<meta name="twitter:description" content="Open-source text search over your Iceberg lakehouse. Search returns coordinates that hydrate to authoritative rows.">
+<meta name="twitter:title" content="GrowlerDB — full-text, vector, and hybrid search over your data">
+<meta name="twitter:description" content="Open-source retrieval — full-text, vector, and hybrid search over your data. Matches resolve back to authoritative rows in your source.">
 <meta name="twitter:image" content="https://docs.growlerdb.com/img/social-preview.png">
 <style>
   /* Self-hosted brand typography (no font CDN) — see /fonts. */
@@ -133,9 +133,9 @@
 
 <header class="hero wrap">
   <span class="pill"><span class="dot"></span> beta · pre-1.0 — production-tested</span>
-  <h1>Full-text search over Apache Iceberg</h1>
-  <p class="sub">Iceberg stays the system of record. GrowlerDB maintains a fast, derived index —
-    search returns <b>coordinates</b> that hydrate back to the authoritative rows in your lake.</p>
+  <h1>Full-text, vector, and hybrid search over your data</h1>
+  <p class="sub">GrowlerDB keeps a fast, derived index over your lakehouse and resolves matching
+    <b>coordinates</b> back to the authoritative row — your source stays the system of record.</p>
   <div class="ctas">
     <a class="cta primary" href="https://docs.growlerdb.com/getting-started">Get started</a>
     <a class="cta ghost" href="https://docs.growlerdb.com/">Documentation</a>
@@ -153,7 +153,7 @@
     <div class="card">
       <div class="kicker">2 — SEARCH</div>
       <h3>Query returns coordinates</h3>
-      <p>Full-text, filters, ranges, aggregations. A search returns ranked coordinates — not a stale copy of your data.</p>
+      <p>Full-text, vector, and hybrid retrieval — plus filters, ranges, and optional reranking. A search returns ranked coordinates — not a stale copy of your data.</p>
     </div>
     <div class="card">
       <div class="kicker">3 — HYDRATE</div>

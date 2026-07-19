@@ -16,10 +16,10 @@ mechanics of moving over, see [Migrating from Elasticsearch/OpenSearch](migratio
 
 ## The one-line frame
 
-GrowlerDB is a **derived full-text index over your Apache Iceberg lakehouse**. Iceberg stays the
-system of record; a search returns document **keys** that hydrate back to the authoritative rows. That
-single design choice — *don't own a second copy of the data* — is what separates it from both search
-engines and query engines.
+GrowlerDB is a **derived retrieval index — full-text, vector & hybrid — over your data** (Apache
+Iceberg today). Your source stays the system of record; a search returns document **keys** that hydrate
+back to the authoritative rows. That single design choice — *don't own a second copy of the data* — is
+what separates it from both search engines and query engines.
 
 ## vs. Elasticsearch / OpenSearch
 
@@ -38,10 +38,9 @@ event/time-series data where the lake is already the archive of record.
 
 **Elasticsearch/OpenSearch is the better fit when** you need capabilities GrowlerDB doesn't ship yet:
 sub-10 ms **authoritative** single-document retrieval (ES serves `_source` from its own store; GrowlerDB
-pays an Iceberg hydration round-trip — cache display fields to close the gap for the display case),
-**vector / hybrid search and reranking** (designed but [not shipped](roadmap)), a **write API**
-(GrowlerDB ingests from the changelog, not `_bulk`), or the full breadth of the aggregation/scripting/
-ingest-pipeline surface. GrowlerDB's [OpenSearch `_search` adapter](opensearch-adapter) covers a
+pays an Iceberg hydration round-trip — cache display fields to close the gap for the display case), a
+**write API** (GrowlerDB ingests from the changelog, not `_bulk`), or the full breadth of the
+aggregation/scripting/ingest-pipeline surface. GrowlerDB's [OpenSearch `_search` adapter](opensearch-adapter) covers a
 documented **read-path subset** and returns `501` on anything unsupported — no silent wrong answers.
 
 ## vs. Trino / Spark full-text on Iceberg
@@ -77,14 +76,12 @@ matching rows rather than scanning.)
 
 ## When to reach for something else (today)
 
-- You need **vector / hybrid retrieval or reranking** (the RAG path) — designed but not shipped; see
-  the [roadmap](roadmap).
 - You need **sub-10 ms authoritative single-document** retrieval and can't cache display fields — ES
   `_source` wins on raw latency there.
 - You need a **write/ingest API** into the search engine itself — GrowlerDB ingests from the Iceberg
   changelog, not a `_bulk` endpoint.
-- Your data **isn't and won't be in a lakehouse table format** — GrowlerDB's whole model is the
-  derived-index-over-Iceberg one.
+- Your data **isn't in a supported source** — Apache Iceberg today (Delta, CDC/Debezium and Kafka are
+  on the [roadmap](roadmap)); GrowlerDB's whole model is a derived index over an authoritative source.
 
 See [Migrating from Elasticsearch/OpenSearch](migration-from-elasticsearch) for the two integration
 paths (native API or the `_search` adapter) and a cutover checklist.

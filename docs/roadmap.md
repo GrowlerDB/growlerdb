@@ -11,8 +11,9 @@ internal [GA criteria](ga-criteria) — what's shipped, what's known-limited, an
 
 ## What GA delivers
 
-- **Text search over Apache Iceberg** — index → search → hydrate the authoritative rows, with a native
-  query language and an [OpenSearch-compatible `_search` adapter](opensearch-adapter).
+- **Full-text, vector & hybrid search over your data** — index → search → hydrate the authoritative
+  rows, with a native query language, semantic + hybrid (RRF) retrieval, an optional reranker, a
+  read-only MCP server, and an [OpenSearch-compatible `_search` adapter](opensearch-adapter).
 - **Distributed**: control plane + sharded/windowed nodes + gateway, with scatter-gather + top-K merge.
 - **Time-windowed indexes** with event-time query pruning and [cold-tiering](storage-tiering) (aged
   windows served read-through from object storage).
@@ -53,8 +54,6 @@ copyleft).
 - **Data-plane authz is catalog-delegated.** Hydration is governed by the Iceberg catalog and tenant
   isolation is enforced at the gateway; full Apache Polaris policy enforcement on the data plane is
   post-GA.
-- **Vector / hybrid retrieval is not shipped.** Embeddings, ANN/KNN, reranking (the RAG path) are
-  designed but deferred.
 - **Non-windowed indexes have no cold tier** (disk-capacity bound); cold-tiering applies to windowed
   indexes. See the scale-ceiling notes for the honest map toward very large (100 TB) deployments.
 
@@ -66,9 +65,10 @@ Near-term, in rough priority:
    vs an Iceberg/Trino table-scan baseline.
 2. **Cold-tier validation at scale** + per-key hydration routing (drop the current broadcast fan-out).
 3. **Ingest throughput** — parallel windowed connectors toward higher sustained rates.
-4. **Vector + hybrid search** — embeddings, ANN, filtered KNN, reranking.
-5. **More sources** — a second table format (Delta read) and a near-real-time hot tier.
-6. **Full Polaris data-plane authz.**
+4. **More sources & federated retrieval** — a second table format (Delta read), then CDC/Debezium and
+   Kafka, toward **federated retrieval across lakehouse and operational data**; plus a near-real-time
+   hot tier.
+5. **Full Polaris data-plane authz.**
 
 Dates aren't promised; this is direction, not commitment. The [GA criteria](ga-criteria) page tracks
 the go/no-go gate for the initial release.

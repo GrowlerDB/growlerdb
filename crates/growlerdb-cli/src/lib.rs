@@ -149,7 +149,7 @@ async fn connect_cp(
 #[command(
     name = "growlerdb",
     version = VERSION,
-    about = "Open-source text search over Apache Iceberg"
+    about = "Full-text, vector & hybrid search over your data"
 )]
 struct Cli {
     /// Local index store directory (env: `GROWLERDB_DATA_DIR`).
