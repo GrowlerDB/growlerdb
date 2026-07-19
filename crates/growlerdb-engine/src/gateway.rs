@@ -686,7 +686,7 @@ impl Gateway {
     }
 
     /// Install an [authenticator](crate::authn) — the Gateway is where authentication
-    /// terminates (wiki/22-security). Once set, every query-surface call must carry a valid
+    /// terminates (see okf/system/decisions/d06-authn-authz.md). Once set, every query-surface call must carry a valid
     /// credential: the Gateway authenticates it, stamps the *verified* principal/tenant into
     /// the request (dropping any caller-asserted identity), then routes. Without this the
     /// Gateway stays open and forwards caller-supplied identity verbatim.
@@ -913,11 +913,13 @@ impl Gateway {
                 .await;
         }
 
-        // Offset-merge (design/09 §9): a shard can't apply the *global* offset, so ask each for
+        // Offset-merge: a shard can't apply the *global* offset, so ask each for
         // the page from rank 0 deep enough to cover it — `offset + limit` hits — and apply the
         // global `offset`/`limit` once, at the merge. A `search_after` cursor encodes the global
         // position directly, so `offset` is ignored on the keyset path (each shard resumes
-        // strictly after the cursor and returns up to `limit`). `limit == 0` means unbounded.
+        // strictly after the cursor and returns up to `limit`). `limit == 0` propagates as a
+        // zero per-shard limit, which each shard answers with an empty page — a de-facto
+        // hits-metadata-only query, not an unbounded one.
         let effective_offset = if body.search_after.is_empty() {
             offset
         } else {
@@ -1121,7 +1123,7 @@ impl Gateway {
         }))
     }
 
-    /// Run a **semantic (KNN) search** ([TASK-302]). The Gateway is pure orchestration: it
+    /// Run a **semantic (KNN) search**. The Gateway is pure orchestration: it
     /// resolves + authorizes the index, then scatters the `SemanticSearchRequest` to each shard —
     /// **each Node embeds the query text itself** (the Gateway carries no ML model) — and merges the
     /// KNN hits into one global top-`k` by score (the same score-merge + dedupe the lexical path
@@ -1193,7 +1195,7 @@ impl Gateway {
         }))
     }
 
-    /// Run a **hybrid search** ([TASK-302]): fan out BOTH a lexical (BM25) [`search`](Self::search)
+    /// Run a **hybrid search**: fan out BOTH a lexical (BM25) [`search`](Self::search)
     /// over `query_text` AND a [`semantic_search`](Self::semantic_search) over `vector_field`, each
     /// already merged into a ranked list across shards, then **Reciprocal-Rank-Fuse** the two lists
     /// at the Gateway. The Gateway embeds nothing — each Node embeds its own semantic arm. A doc
@@ -2408,7 +2410,7 @@ mod tests {
         }
     }
 
-    /// TASK-209 regression: on a multi-shard index a genuinely-unsupported query makes *every*
+    /// Regression (from the http_logs benchmark): on a multi-shard index a genuinely-unsupported query makes *every*
     /// shard reject it with the same client error (a bad query shape is uniform — same schema on
     /// each shard). The fan-out must surface that **4xx verbatim**, not collapse it into an
     /// opaque, retryable `unavailable` (which the OpenSearch adapter renders as a 500). Both the

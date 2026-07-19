@@ -2944,9 +2944,10 @@ fn spawn_registry_reloader(
     });
 }
 
-/// Backoff between gateway startup attempts to reach the control-plane + resolve the index's shards
-/// The gateway retries **unboundedly** (up but /readyz not-ready) rather than
-/// exiting, so a gateway rolled alongside the control-plane waits instead of crash-looping.
+/// Backoff between gateway startup attempts to reach the control-plane + resolve the index's
+/// shards. The gateway retries **unboundedly** — staying up with `/readyz` reporting not-ready —
+/// rather than exiting, so a gateway rolled alongside the control-plane waits instead of
+/// crash-looping.
 const GW_CP_STARTUP_INTERVAL_SECS: u64 = 5;
 
 /// The pure routing plan from a control-plane `GetIndex` response: each shard's primary endpoint

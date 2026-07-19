@@ -7,7 +7,7 @@
 //! vocabulary types ([`Snapshot`], [`RowLocator`], [`CommitBatch`], [`Hit`], …)
 //! live here for the same reason.
 //!
-//! [Design 02]: ../../../design/02-index-api.md
+//! [Design 02]: ../../../okf/system/storage/index-store.md
 //! [`LocalIndexStore`]: ../../growlerdb_index/store/struct.LocalIndexStore.html
 
 use serde::{Deserialize, Serialize};
@@ -36,7 +36,7 @@ pub struct LocatedDoc {
 /// A **changelog** reduces to these: `INSERT`/`UPDATE_AFTER` → [`Upsert`](DocOp::Upsert),
 /// `DELETE`/`UPDATE_BEFORE` → [`Delete`](DocOp::Delete).
 ///
-/// [Design 02]: ../../../design/02-index-api.md
+/// [Design 02]: ../../../okf/system/storage/index-store.md
 #[derive(Debug, Clone)]
 pub enum DocOp {
     /// Index (or replace) the document; carries its source location for the locator.
@@ -60,7 +60,7 @@ impl DocOp {
 /// index to. The realization of [Design 02]'s `DocBatch` (the per-doc source
 /// location is passed explicitly rather than derived during indexing).
 ///
-/// [Design 02]: ../../../design/02-index-api.md
+/// [Design 02]: ../../../okf/system/storage/index-store.md
 #[derive(Debug, Clone)]
 pub struct CommitBatch {
     /// The ordered changes to apply.
@@ -484,7 +484,7 @@ pub enum SortValue {
 /// Compare two [`SortValue`]s for a sorted ranking: present values by `order`
 /// (numerically or lexicographically by kind), and [`Missing`](SortValue::Missing)
 /// always sorts **last** regardless of direction. The single comparator shared by the
-/// store's cross-generation merge and the Gateway's cross-shard merge (design/09), so
+/// store's cross-generation merge and the Gateway's cross-shard merge, so
 /// the two orderings can't drift.
 pub fn cmp_sort_value(a: &SortValue, b: &SortValue, order: SortOrder) -> std::cmp::Ordering {
     use std::cmp::Ordering;
@@ -534,7 +534,7 @@ pub struct CollapsedHit {
     /// Number of docs in this group (over the matched, live result set).
     pub count: usize,
     /// The top hit's [`SortValue`] for each sort key, aligned to the search sort. Carried so
-    /// a Gateway can fold and order collapse groups **across shards** (design/09) —
+    /// a Gateway can fold and order collapse groups **across shards** —
     /// the same role `sort_values` plays for ordinary field-sorted hits.
     pub sort_values: Vec<SortValue>,
 }
@@ -634,7 +634,7 @@ pub struct ShardHits {
 /// then **commit** staged work atomically (publish + advance checkpoint). Called
 /// by ingest.
 ///
-/// [Design 02]: ../../../design/02-index-api.md
+/// [Design 02]: ../../../okf/system/storage/index-store.md
 pub trait IndexWriter {
     /// Implementation error type.
     type Error;

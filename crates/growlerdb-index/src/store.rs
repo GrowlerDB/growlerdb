@@ -19,8 +19,8 @@
 //! on the key (delete-then-add) — so exactly-once holds. Commits are idempotent on
 //! `batch_id`.
 //!
-//! [redb]: ../../../wiki/21-decisions.md
-//! [Design 08]: ../../../design/08-schemas.md
+//! [redb]: ../../../okf/system/decisions/d11-kv-store.md
+//! [Design 08]: ../../../okf/system/storage/data-model.md
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -53,7 +53,7 @@ use crate::segment::{
 
 /// A page of hits, each paired with its per-key sort values, plus the next-page keyset
 /// cursor — the value-carrying counterpart of `(Vec<Hit>, Option<SearchAfter>)`. Lets the
-/// Engine API put `sort_values` on every wire hit for cross-shard merge (design/09).
+/// Engine API put `sort_values` on every wire hit for cross-shard merge.
 type ValuedPage = (Vec<(Hit, Vec<SortValue>)>, Option<SearchAfter>);
 
 // `aux.redb` holds META + BATCH_KEYS (+ its BATCH_CKPT prune index) + FILES. Locators
@@ -1731,7 +1731,7 @@ impl Shard {
         // harmless no-op fsync.
         flush_chunk!();
 
-        // Build the per-segment ANN sidecars over the vectors just committed (TASK-42). Idempotent
+        // Build the per-segment ANN sidecars over the vectors just committed. Idempotent
         // + skipped for a non-vector index; runs after the final flush so the reloaded searcher sees
         // every new segment. The sidecars are content-stable and registered in `sealed_segments`, so
         // backup/restore carries them with the lexical segments.
@@ -2075,7 +2075,7 @@ impl Shard {
     }
 
     /// **Partition-scoped reconciliation** — the equality-delete fallback
-    /// for a non-key predicate ([equality deletes](../../../wiki/06-ingestion.md)).
+    /// for a non-key predicate ([equality deletes](../../../okf/product/functional/ingestion/index.md)).
     /// Given the keys a fresh source scan found **live** in `partition`, drop every
     /// indexed doc in that partition whose key is absent. Bounded to the partition
     /// and robust regardless of delete encoding (it never needs a pre-image).
@@ -2331,7 +2331,7 @@ impl Shard {
                 .map_err(|e| StoreError::Segment(e.into()))?;
             drop(writer); // release the lock so ingest can commit before the next bounded pass
             self.core.reload().map_err(StoreError::Segment)?;
-            // A merge produced a new segment id → build its ANN sidecar (TASK-42). The merged-away
+            // A merge produced a new segment id → build its ANN sidecar. The merged-away
             // segments' sidecars are now orphaned; `garbage_collect_files` only reclaims Tantivy's
             // own managed files, so a stale `.ann` may linger on disk (harmless — `sealed_segments`
             // lists only current segments' files, so backup never carries an orphan).
@@ -2480,7 +2480,7 @@ impl Shard {
     ///
     /// [`index_dir`]: Self::index_dir
     ///
-    /// Build the per-segment **ANN sidecars** (TASK-42, [D19]) for the newly-sealed segments — one
+    /// Build the per-segment **ANN sidecars** ([D19]) for the newly-sealed segments — one
     /// `<segment-uuid>.ann` beside each Tantivy segment, over its stored vectors. Idempotent (a
     /// segment with an existing sidecar is skipped) and a no-op for a non-vector index, so it can
     /// run after every commit and after each compaction pass. Must be called with the live reader
@@ -2511,7 +2511,7 @@ impl Shard {
                     .into_iter()
                     .filter(|f| self.index_dir.join(f).exists())
                     .collect();
-                // The per-segment ANN sidecar (`<segment-uuid>.ann`, TASK-42) is a GrowlerDB-owned
+                // The per-segment ANN sidecar (`<segment-uuid>.ann`) is a GrowlerDB-owned
                 // artifact not listed by `list_files`, but it belongs to this segment and must ship
                 // with it — register it so backup/restore carries it (content-stable per segment id,
                 // so it hard-links/dedupes like the lexical files).
@@ -2672,7 +2672,7 @@ impl Shard {
     /// Like [`search_page`](Self::search_page) but keeps **each hit's sort values**
     /// (not just the cursor's): returns `(Vec<(Hit, Vec<SortValue>)>, next_cursor)`. The
     /// Engine API uses this to put `sort_values` on every wire hit so the Gateway can
-    /// merge field-sorted pages across shards (design/09). Values are empty per hit when
+    /// merge field-sorted pages across shards. Values are empty per hit when
     /// `sort` is empty (score ranking).
     pub fn search_page_values(
         &self,
@@ -5041,7 +5041,7 @@ mapping:
     /// A widened schema for `docs`: the same fields as [`index`] plus a new mapped `title` TEXT
     /// field. Its derived Tantivy schema has one more field than [`index`]'s, so opening an index
     /// built with [`index`] against this definition is exactly the schema-change the guardrail
-    /// catches (TASK-303).
+    /// catches.
     fn index_widened() -> ResolvedIndex {
         let src = SourceSchema::new(
             vec![
@@ -5603,7 +5603,7 @@ mapping:
 
     /// A shard whose FIRST commit is an empty batch (0 rows routed here, e.g. a sparse
     /// multi-shard build) must still record the source checkpoint — else it reports
-    /// `uninitialized` forever (TASK-121). Advances from `None`, not just N -> M.
+    /// `uninitialized` forever. Advances from `None`, not just N -> M.
     #[test]
     fn first_empty_batch_records_the_source_checkpoint() {
         let tmp = tempfile::tempdir().unwrap();

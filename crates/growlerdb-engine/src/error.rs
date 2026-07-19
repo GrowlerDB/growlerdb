@@ -34,15 +34,15 @@ pub enum EngineError {
     /// Producing the query embedding for a semantic search failed.
     #[error(transparent)]
     Embed(#[from] EmbedError),
-    /// Semantic (KNN) search was attempted on a **tenant-scoped** index. KNN does not yet
-    /// enforce the mandatory, non-widenable `tenant = <claim>` filter (that is filtered KNN,
-    /// TASK-43), so it is refused **fail-closed** on tenant-scoped indexes rather than risk
-    /// returning cross-tenant rows.
+    /// Semantic (KNN) search on a **tenant-scoped** index without a verified tenant claim.
+    /// Filtered KNN enforces the mandatory `tenant = <claim>` filter inside the vector search;
+    /// with no claim there is nothing to filter by, so the request is refused **fail-closed**
+    /// rather than risk returning nearest neighbors across tenants.
     #[error(
-        "index `{0}` is tenant-scoped — semantic (KNN) search is not yet tenant-filtered and is \
-         refused here to prevent cross-tenant results (filtered KNN is pending)"
+        "index `{0}` is tenant-scoped — semantic (KNN) search requires a verified tenant claim \
+         (authenticate with a tenant-bearing identity); refused to prevent cross-tenant results"
     )]
-    SemanticTenantScopedUnsupported(String),
+    SemanticTenantClaimRequired(String),
     /// The aux store / index operation failed.
     #[error(transparent)]
     Store(#[from] StoreError),

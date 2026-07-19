@@ -401,8 +401,8 @@ impl IcebergReader {
     /// point read entirely and goes straight to the fallback (whose
     /// result refreshes the slot).
     ///
-    /// [Flow 2]: ../../../design/07-data-flows.md
-    /// [keeping the locator valid]: ../../../wiki/07-query-execution.md#keeping-the-locator-valid-as-iceberg-changes
+    /// [Flow 2]: ../../../okf/system/architecture.md
+    /// [keeping the locator valid]: ../../../okf/system/storage/locators-segments.md
     pub async fn hydrate(
         &self,
         table: &str,

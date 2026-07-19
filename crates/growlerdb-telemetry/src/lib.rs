@@ -1,6 +1,6 @@
 //! `growlerdb-telemetry` — the **observability foundation**: structured JSON
 //! logging, a Prometheus metrics recorder for the core SLIs, and Kubernetes health/readiness
-//! probes. Per [observability](../../../wiki/23-observability.md), telemetry is open and
+//! probes. Per [observability](../../../okf/system/observability.md), telemetry is open and
 //! standards-based: metrics are scrapeable in Prometheus exposition format (the wiki's
 //! "scrape or OTLP" metrics path), logs are machine-parseable JSON carrying span context.
 //!
@@ -180,7 +180,7 @@ async fn metrics_handler() -> (StatusCode, String) {
     (StatusCode::OK, metrics_text())
 }
 
-/// The first-class **SLIs** ([observability](../../../wiki/23-observability.md)) the engine
+/// The first-class **SLIs** ([observability](../../../okf/system/observability.md)) the engine
 /// records through, so metric names stay consistent across call sites. RED for requests
 /// (rate/errors/duration), throughput/lag for ingestion.
 pub mod sli {

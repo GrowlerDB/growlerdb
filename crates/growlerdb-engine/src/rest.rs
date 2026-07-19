@@ -10,7 +10,7 @@
 //! `x-growlerdb-*` identity headers are never propagated (they would be forgeable on a
 //! control-plane path without an authenticator).
 //!
-//! [Engine API]: ../../../design/01-engine-api.md
+//! [Engine API]: ../../../okf/product/interfaces/rest.md
 
 use std::sync::Arc;
 
@@ -111,7 +111,7 @@ pub async fn track_http_metrics(
 /// As [`router`], but also serves the built **UI SPA** from `ui_dir`: static assets
 /// directly, with `index.html` as the SPA fallback for client-side routes (e.g. `/indexes`).
 /// The `/v1/...` API routes take precedence, so the SPA only handles paths the API doesn't —
-/// this is what "served by the Engine binary" means (wiki/20-ui). `ui_dir` is the Vite `dist/`.
+/// this is what "served by the Engine binary" means (see okf/product/interfaces/ui.md). `ui_dir` is the Vite `dist/`.
 pub fn router_with_ui(gateway: Arc<Gateway>, ui_dir: &std::path::Path) -> Router {
     use tower_http::services::{ServeDir, ServeFile};
     let spa_fallback = ServeFile::new(ui_dir.join("index.html"));
@@ -1823,7 +1823,7 @@ impl SearchDto {
                 .search_after
                 .map(String::into_bytes)
                 .unwrap_or_default(),
-            // REST doesn't expose scoring mode yet; default per-shard BM25 (design/09).
+            // REST doesn't expose scoring mode yet; default per-shard BM25.
             score_mode: growlerdb_proto::v1::ScoreMode::ScoreLocal as i32,
             // The window selector is gateway-internal; a client request never sets it.
             window: 0,
@@ -2722,7 +2722,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn config_dto_has_no_secret_field() {
         // The unauthenticated /v1/config the browser fetches must NEVER carry an outbound
-        // provider API key (external embedding/rerank secrets are server-side only, TASK-299).
+        // provider API key (external embedding/rerank secrets are server-side only — see okf/system/decisions/d43-node-local-query-embedding.md).
         // Even with keys present in the server's env, the response exposes no key/secret field.
         std::env::set_var("GROWLERDB_EMBEDDING_API_KEY", "sk-must-not-leak-embed");
         std::env::set_var("GROWLERDB_RERANK_API_KEY", "sk-must-not-leak-rerank");

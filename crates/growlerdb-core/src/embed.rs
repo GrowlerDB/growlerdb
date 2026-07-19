@@ -93,8 +93,9 @@ impl Embedder for HashEmbedder {
     }
 }
 
-/// The embedder to use for `spec`. Returns the built-in [`HashEmbedder`] today; the
-/// local BGE runtime replaces this body in a follow-on (keyed on `spec.model`/`provider`).
+/// The embedder to use for `spec` in tests and examples: the built-in, dependency-free
+/// [`HashEmbedder`]. Production embedding (the local BGE runtime + external providers, keyed on
+/// `spec.model`/`provider`) lives in the `growlerdb-embed` crate.
 pub fn default_embedder(spec: &VectorSpec) -> Arc<dyn Embedder> {
     Arc::new(HashEmbedder::new(spec.model.clone(), spec.dims))
 }

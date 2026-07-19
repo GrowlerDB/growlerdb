@@ -11,7 +11,7 @@
 //! coordinates the engine hydrates from Iceberg.
 //!
 //! [Tantivy]: https://github.com/quickwit-oss/tantivy
-//! [wiki 05]: ../../../wiki/05-search-core.md
+//! [wiki 05]: ../../../okf/system/decisions/d22-search-core.md
 
 use std::net::{IpAddr, Ipv6Addr};
 use std::ops::Bound;
@@ -137,7 +137,7 @@ pub struct IndexSchema {
     /// populates [`LOC_ID_FIELD`] and writes no location slots — the schema **keeps**
     /// the field either way (see [`from_resolved`](Self::from_resolved)).
     location_strategy: LocationStrategy,
-    /// The VECTOR fields, in definition order — the ANN-build inputs (TASK-42). Each carries the
+    /// The VECTOR fields, in definition order — the ANN-build inputs. Each carries the
     /// stored-bytes field handle plus the [`VectorSpec`](growlerdb_core::VectorSpec)'s `dims`/`metric`
     /// the per-segment ANN index is built with. Empty for a non-vector index (the ANN build is then
     /// skipped entirely).
@@ -227,7 +227,7 @@ impl IndexSchema {
                 FieldType::Date => builder.add_date_field(&f.path, date_opts(f)),
                 FieldType::Ip => builder.add_ip_addr_field(&f.path, ip_opts(f)),
                 // A vector is stored as raw LE-`f32` bytes: STORED so it round-trips per-doc,
-                // FAST so the ANN build (TASK-42) can read it columnar. Not sortable.
+                // FAST so the ANN build can read it columnar. Not sortable.
                 FieldType::Vector => builder.add_bytes_field(&f.path, STORED | FAST),
             };
             if f.ty == FieldType::Vector {
@@ -499,7 +499,7 @@ fn vec_f32_to_le_bytes(v: &[f32]) -> Vec<u8> {
 
 /// Decode raw little-endian `f32` bytes back into a vector — inverse of
 /// [`vec_f32_to_le_bytes`]. A trailing partial element (input length not a multiple of 4)
-/// is dropped. Read by the per-segment ANN build (TASK-42), which reconstitutes each doc's
+/// is dropped. Read by the per-segment ANN build, which reconstitutes each doc's
 /// stored embedding from these bytes.
 fn le_bytes_to_vec_f32(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4)
@@ -606,7 +606,7 @@ impl TantivySegmentCore {
         }
 
         writer.commit()?;
-        // Build the per-segment ANN sidecar(s) over the just-committed vectors (TASK-42), so a
+        // Build the per-segment ANN sidecar(s) over the just-committed vectors, so a
         // freshly built segment set carries its KNN index like the store's commit path does.
         if schema.has_vector_fields() {
             let reader = self.open(dir)?;
@@ -908,7 +908,7 @@ impl SegmentReader {
         Ok(searcher.search(tantivy_query.as_ref(), &Count)? as u64)
     }
 
-    /// Build the **per-segment ANN sidecar(s)** (TASK-42, [D19]) for every VECTOR field in
+    /// Build the **per-segment ANN sidecar(s)** ([D19]) for every VECTOR field in
     /// `schema`, writing `<segment-uuid>.ann` beside each Tantivy segment in `dir`. Idempotent: a
     /// segment whose sidecar already exists is skipped, so this can run after every commit and only
     /// the newly-sealed segments are indexed. A sidecar is built over **all** docs in a segment
@@ -2534,7 +2534,7 @@ mapping:
             .is_err());
     }
 
-    /// TASK-301 regression: **filtered KNN is exact on an HNSW-tier segment.** The approximate HNSW
+    /// Regression: **filtered KNN is exact on an HNSW-tier segment.** The approximate HNSW
     /// index returns only ~`ef_search` top-similarity candidates, so relying on it for the filtered
     /// path would silently drop filter-allowed matches that rank far down by similarity (the
     /// tenant-isolation hazard). We build one segment with > `HNSW_MIN_VECTORS` vectors (forcing the

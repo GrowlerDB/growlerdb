@@ -3,7 +3,7 @@
 //! to the wire `Search` service, returning ranked document
 //! **coordinates** + scores. Hydration of the authoritative rows is a follow-up.
 //!
-//! [Design 01]: ../../../design/01-engine-api.md
+//! [Design 01]: ../../../okf/product/interfaces/grpc.md
 
 use growlerdb_core::{Agg, CompositeKey, Highlight, Query, SearchAfter, Sort, SortOrder};
 use growlerdb_index::{IndexError, Shard, StoreError};
@@ -195,7 +195,7 @@ impl Search for SearchService {
         Ok(Response::new(resp))
     }
 
-    /// **Semantic (KNN) search** over a VECTOR field ([TASK-302]) — the node-side arm of the
+    /// **Semantic (KNN) search** over a VECTOR field — the node-side arm of the
     /// authenticated gateway's semantic/hybrid search. The query arrives as *text*: this Node
     /// embeds it with the vector field's configured embedder (the same [`embedder_for`] factory
     /// ingest uses, so the query shares the documents' embedding space — no ML model at the
@@ -698,7 +698,7 @@ fn page_response(
                 group: None,
                 group_count: 0,
                 // Field-sorted hits carry their sort values so the Gateway can merge
-                // across shards (design/09); score-ranked hits leave this empty.
+                // across shards; score-ranked hits leave this empty.
                 sort_values: sort_values.iter().map(Into::into).collect(),
                 // Cached display fields render the page without hydration.
                 fields: hit_fields(&h.fields),

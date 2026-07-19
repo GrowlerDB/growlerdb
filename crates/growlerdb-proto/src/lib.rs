@@ -6,7 +6,7 @@
 //! The proto is canonical; breaking changes bump the package to `growlerdb.v2`.
 //! Real services (Write, Engine API) add their own protos and grow this surface per service.
 //!
-//! [Design 08]: ../../../design/08-schemas.md
+//! [Design 08]: ../../../okf/system/storage/data-model.md
 
 use tonic::{Request, Response, Status};
 
