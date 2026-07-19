@@ -39,65 +39,6 @@ on filtered search and ~50–170× faster than a Trino scan. See the full
 [**comparison & positioning**](https://docs.growlerdb.com/comparison) page for when GrowlerDB is (and
 isn't) the right fit.
 
-## Architecture
-
-![GrowlerDB architecture — your data lands in Apache Iceberg (the system of record); the Spark Structured Streaming connector reads the Iceberg changelog and streams batches to index nodes that build Tantivy segments; a client query hits the gateway, which scatter-gathers across shard nodes and hydrates the ranked keys back to authoritative Iceberg rows](docs/img/architecture.png)
-
-GrowlerDB sits between your **Apache Iceberg** tables and your users. Iceberg stays the **system of
-record**; GrowlerDB maintains a fast, derived full-text index and resolves matches back to the
-authoritative rows.
-
-**Ingest / write path** — ① your pipelines (Spark, Flink, streaming, batch ETL) land data in Iceberg
-· ② the **Connector** (Spark Structured Streaming) reads the Iceberg changelog · ③ it streams
-document batches over gRPC to **index nodes**, which build local **Tantivy** segments with a **redb**
-locator (key → `(file, row position)`).
-
-**Query / read path** — ④ a client (Console, SDK, or the OpenSearch `_search` adapter) calls the
-**Gateway** · ⑤ the Gateway scatter-gathers across shard **nodes** and merges the top-K into ranked
-**document coordinates** (primary keys) · ⑥ `keys:get` **hydrates** those coordinates to authoritative
-rows via targeted point-reads back from Iceberg · ⑦ merged, hydrated results return to the client.
-
-The **Control Plane** is the routing source of truth (nodes register; the Gateway resolves shards),
-and every service emits **OpenTelemetry** to the bundled **LGTM** stack (Grafana · Prometheus · Loki ·
-Tempo). Editable diagram source: [`docs/img/architecture.excalidraw`](docs/img/architecture.excalidraw).
-
-## Features
-
-- **Search over your data** — index a source table; search returns coordinates that **hydrate to
-  authoritative rows from your source** (`/v1/search` → `/v1/keys:get`).
-- **Full-text, vector & hybrid retrieval** — lexical (Lucene/KQL), semantic (local-default
-  embeddings), and hybrid (RRF) search, with an optional reranker and a read-only **MCP server** for
-  AI agents.
-- **Query language** — native structured AST + a Lucene/KQL string parser.
-- **Distributed** — control plane (registry), stateful searcher/index nodes, and a scatter-gather
-  Gateway; hash/partition sharding.
-- **Secure & multi-tenant** — OIDC/JWT + API keys + mTLS; control-plane RBAC; non-widenable tenant
-  scoping verified end-to-end.
-- **Observable** — OpenTelemetry traces/metrics/logs, Prometheus, and bundled Grafana SLI dashboards.
-- **Console UI** — Search, Indexes, Ingestion, and Observability, served by the Gateway.
-- **Ecosystem** — an optional [OpenSearch `_search` adapter](docs/opensearch-adapter.md).
-
-## Repository layout
-
-```
-crates/
-  growlerdb-core         shared types, traits, errors, the query AST + parser
-  growlerdb-index        index store (Tantivy segments + redb locator) + Index API
-  growlerdb-engine       search execution, hydration, auth, gateway, REST/OpenSearch surfaces
-  growlerdb-controlplane the cluster index registry
-  growlerdb-source       Iceberg source reader (Polaris/REST catalog)
-  growlerdb-telemetry    OpenTelemetry + Prometheus + health probes
-  growlerdb-proto        gRPC wire schema (growlerdb.v1) + the growlerdb-core bridge
-  growlerdb-cli          the `growlerdb` CLI (embedded · serve · gateway · control-plane)
-  growlerdb-client       Rust client library
-ui/             the Svelte console (served by the Gateway)
-connector/      JVM Spark ingestion connector (separate Maven build; not a cargo member)
-connector-trino/  Trino plugin — a `search` table function (query→keys+score) to JOIN in SQL (experimental)
-deploy/compose  local dev/test stack (MinIO + Polaris + LGTM)
-deploy/helm     Helm chart (Kubernetes sharded-cluster topology)
-docs/           user documentation (GitHub Pages site, built from this folder)
-```
-
 ## Try it (one command)
 
 Bring up the **whole stack** (GrowlerDB + MinIO + Polaris + LGTM), which seeds a sample
@@ -128,6 +69,75 @@ Tear it all down with `just stack-down`.
 👉 Full walkthrough (first search → hydrate → console → OpenSearch adapter):
 **[getting-started tutorial](https://docs.growlerdb.com/getting-started)**.
 
+## Features
+
+- **Search over your data** — index a source table; search returns coordinates that **hydrate to
+  authoritative rows from your source** (`/v1/search` → `/v1/keys:get`).
+- **Full-text, vector & hybrid retrieval** — lexical (Lucene/KQL), semantic (local-default
+  embeddings), and hybrid (RRF) search, with an optional reranker and a read-only **MCP server** for
+  AI agents.
+- **Query language** — native structured AST + a Lucene/KQL string parser.
+- **Distributed** — control plane (registry), stateful searcher/index nodes, and a scatter-gather
+  Gateway; hash/partition sharding.
+- **Secure & multi-tenant** — OIDC/JWT + API keys + mTLS; control-plane RBAC; non-widenable tenant
+  scoping verified end-to-end.
+- **Observable** — OpenTelemetry traces/metrics/logs, Prometheus, and bundled Grafana SLI dashboards.
+- **Console UI** — Search, Indexes, Ingestion, and Observability, served by the Gateway.
+- **Ecosystem** — an optional [OpenSearch `_search` adapter](docs/opensearch-adapter.md).
+
+## How it works
+
+![GrowlerDB architecture — your data lands in Apache Iceberg (the system of record); the Spark Structured Streaming connector reads the Iceberg changelog and streams batches to index nodes that build Tantivy segments; a client query hits the gateway, which scatter-gathers across shard nodes and hydrates the ranked keys back to authoritative Iceberg rows](docs/img/architecture.png)
+
+GrowlerDB sits between your **Apache Iceberg** tables and your users. Iceberg stays the **system of
+record**; GrowlerDB maintains a fast, derived index and resolves matches back to the authoritative
+rows over two paths:
+
+- **Ingest** — the **Connector** (Spark Structured Streaming) reads the Iceberg changelog and streams
+  document batches over gRPC to **index nodes**, which build local **Tantivy** segments with a **redb**
+  locator (key → file + row position).
+- **Query** — a client (Console, SDK, or the OpenSearch `_search` adapter) calls the **Gateway**,
+  which scatter-gathers across shard nodes, merges the top-K into ranked **coordinates** (primary
+  keys), and **hydrates** them back to authoritative rows from Iceberg.
+
+A **Control Plane** is the routing source of truth (nodes register; the Gateway resolves shards), and
+every service emits **OpenTelemetry** to the bundled **LGTM** stack (Grafana · Prometheus · Loki ·
+Tempo).
+
+Full walkthrough: **[system architecture](okf/system/architecture.md)** · [deployment topologies](https://docs.growlerdb.com/deployment) · [editable diagram source](docs/img/architecture.excalidraw).
+
+## Documentation
+
+Full docs are the **GitHub Pages site at <https://docs.growlerdb.com/>** (built from
+[`docs/`](docs/)):
+
+- [Getting started](https://docs.growlerdb.com/getting-started) — zero to first search.
+- [Install & run modes](https://docs.growlerdb.com/install) · [Configuration](https://docs.growlerdb.com/configuration) · [API & query reference](https://docs.growlerdb.com/reference)
+- [Why GrowlerDB — comparison & positioning](https://docs.growlerdb.com/comparison) · [Performance (directional)](https://docs.growlerdb.com/performance) — vs Elasticsearch & Trino.
+- [Migrating from Elasticsearch/OpenSearch](https://docs.growlerdb.com/migration-from-elasticsearch) · [Deployment](https://docs.growlerdb.com/deployment) · [Roadmap & known limitations](https://docs.growlerdb.com/roadmap) · [GA criteria](https://docs.growlerdb.com/ga-criteria)
+- [Security policy](SECURITY.md) · [Releasing](RELEASING.md) · [Changelog](CHANGELOG.md) · [Brand guidelines](BRAND.md)
+
+## Repository layout
+
+```
+crates/
+  growlerdb-core         shared types, traits, errors, the query AST + parser
+  growlerdb-index        index store (Tantivy segments + redb locator) + Index API
+  growlerdb-engine       search execution, hydration, auth, gateway, REST/OpenSearch surfaces
+  growlerdb-controlplane the cluster index registry
+  growlerdb-source       Iceberg source reader (Polaris/REST catalog)
+  growlerdb-telemetry    OpenTelemetry + Prometheus + health probes
+  growlerdb-proto        gRPC wire schema (growlerdb.v1) + the growlerdb-core bridge
+  growlerdb-cli          the `growlerdb` CLI (embedded · serve · gateway · control-plane)
+  growlerdb-client       Rust client library
+ui/             the Svelte console (served by the Gateway)
+connector/      JVM Spark ingestion connector (separate Maven build; not a cargo member)
+connector-trino/  Trino plugin — a `search` table function (query→keys+score) to JOIN in SQL (experimental)
+deploy/compose  local dev/test stack (MinIO + Polaris + LGTM)
+deploy/helm     Helm chart (Kubernetes sharded-cluster topology)
+docs/           user documentation (GitHub Pages site, built from this folder)
+```
+
 ## Develop
 
 The Rust toolchain is managed by [mise](https://mise.jdx.dev). With mise installed:
@@ -141,38 +151,23 @@ just up                 # start local dev deps (MinIO + Polaris) only
 just run -- --help      # run the growlerdb CLI
 ```
 
-## Documentation
-
-Full docs are the **GitHub Pages site at <https://docs.growlerdb.com/>** (built from
-[`docs/`](docs/)):
-
-- [Getting started](https://docs.growlerdb.com/getting-started) — zero to first search.
-- [Install & run modes](https://docs.growlerdb.com/install) · [Configuration](https://docs.growlerdb.com/configuration) · [API & query reference](https://docs.growlerdb.com/reference)
-- [Why GrowlerDB — comparison & positioning](https://docs.growlerdb.com/comparison) · [Performance (directional)](https://docs.growlerdb.com/performance) — vs Elasticsearch & Trino.
-- [Migrating from Elasticsearch/OpenSearch](https://docs.growlerdb.com/migration-from-elasticsearch) · [Deployment](https://docs.growlerdb.com/deployment) · [Roadmap & known limitations](https://docs.growlerdb.com/roadmap) · [GA criteria](https://docs.growlerdb.com/ga-criteria)
-- [Security policy](SECURITY.md) · [Releasing](RELEASING.md) · [Changelog](CHANGELOG.md) · [Brand guidelines](BRAND.md)
-
 ## Open source & commercial
 
 GrowlerDB is **open core**. The full engine — distributed search/hydration, AuthN/RBAC, the console,
 and everything in this repo — is **open source under AGPL-3.0**, free for internal and self-hosted
 production use up to the **open-source scale limit** (currently **3 nodes**). No sign-up, no
-phone-home: entitlements are verified offline.
+phone-home; entitlements are verified offline, and beyond the limit existing nodes keep running —
+only *new* capacity is gated.
 
-A **[commercial license](COMM-LICENSE.md)** from **GrowlerDB LLC** covers the cases the AGPL doesn't:
-
-- **Scale** — operating **beyond the open-source node limit**.
-- **Embedding / OEM** — shipping GrowlerDB inside a proprietary product or SaaS without AGPL copyleft.
-- **AGPL-incompatible use** — when your organization's policy can't take AGPL.
-- **Enterprise add-ons** — SSO/SAML/SCIM, audit logging, advanced HA (cross-region DR), and managed
-  multi-tenancy, distributed separately from this AGPL core.
-
-Beyond the limit, the cluster keeps running — existing nodes re-register normally; only *new*
-capacity is gated. See the console's **Settings → Enterprise license** for current usage.
+A **[commercial license](COMM-LICENSE.md)** from **GrowlerDB LLC** covers what the AGPL doesn't:
+operating **beyond the node limit**, **embedding / OEM** without copyleft, **AGPL-incompatible use**,
+and **enterprise add-ons** (SSO/SAML/SCIM, audit logging, cross-region DR, managed multi-tenancy),
+distributed separately from this AGPL core. Usage is shown in the console's **Settings → Enterprise
+license**.
 
 **📬 Talk to us** — for commercial/OEM licensing, enterprise features, or operating at scale, email
-**[support@growlerdb.com](mailto:support@growlerdb.com)** with your use case and we'll scope the right
-agreement. (Pricing isn't public yet — reach out and we'll work it out with you.)
+**[support@growlerdb.com](mailto:support@growlerdb.com)** with your use case. (Pricing isn't public
+yet — reach out and we'll scope the right agreement with you.)
 
 ## License & contributing
 
