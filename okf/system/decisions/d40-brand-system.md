@@ -21,7 +21,9 @@ card, unthemed docs). The system — captured in [Brand](/product/brand/index.md
   glacier-light `#7FA9D4` for interactive accents on dark.
 - **A three-family type trio:** Archivo (display), Instrument Sans (body), Geist Mono (keys/queries/code).
 - **Voice:** tagline "Search your lake. Keep one truth."; plain, falsifiable claims; canonical
-  terminology (coordinates / hydrate / derived index / system of record).
+  terminology (coordinates / hydrate / derived index / system of record). *(The positioning line was
+  later broadened by [D44](/system/decisions/d44-product-scope-retrieval.md) to "Full-text, vector, and
+  hybrid search over your data.")*
 
 **Why.** Pre-GA, each surface had drifted to its own palette and type, which reads as unfinished at a
 public launch. One system makes the surfaces legibly one product and encodes the "derived index over

@@ -1,7 +1,8 @@
 //! `growlerdb-core` — shared types, traits, and errors for GrowlerDB.
 //!
-//! GrowlerDB is an open-source **text search engine over Apache Iceberg** (and other
-//! datastores). This crate holds the vocabulary the other crates build on; types
+//! GrowlerDB is an open-source **retrieval engine** — full-text, vector & hybrid search over your
+//! data (Apache Iceberg today; more sources on the roadmap). This crate holds the vocabulary the
+//! other crates build on; types
 //! are fleshed out as the M0 walking-skeleton tasks land (see the project backlog).
 
 pub mod api;
@@ -51,7 +52,7 @@ pub fn version() -> &'static str {
 /// printed by binaries (CLI now, server later) when they start.
 pub fn startup_banner() -> String {
     format!(
-        "{BANNER}\n    GrowlerDB v{}  ·  open-source text search over Apache Iceberg\n",
+        "{BANNER}\n    GrowlerDB v{}  ·  full-text, vector & hybrid search over your data\n",
         version()
     )
 }

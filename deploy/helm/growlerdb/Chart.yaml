@@ -1,9 +1,9 @@
 apiVersion: v2
 name: growlerdb
 description: |
-  GrowlerDB — text search over Apache Iceberg. Deploys the production sharded-cluster
-  topology (Design 14): a control-plane registry, stateful searcher/index nodes on local
-  PVs, and a gateway that fronts the cluster and serves the console UI.
+  GrowlerDB — full-text, vector & hybrid search over your data. Deploys the production
+  sharded-cluster topology (Design 14): a control-plane registry, stateful searcher/index nodes on
+  local PVs, and a gateway that fronts the cluster and serves the console UI.
 type: application
 # Chart version — bump on chart changes (SemVer). appVersion tracks the GrowlerDB image.
 version: 0.3.0
@@ -13,6 +13,10 @@ keywords:
   - iceberg
   - lakehouse
   - full-text
+  - vector-search
+  - hybrid-search
+  - retrieval
+  - embeddings
 home: https://github.com/GrowlerDB/growlerdb
 sources:
   - https://github.com/GrowlerDB/growlerdb

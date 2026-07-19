@@ -7,9 +7,9 @@ nav_order: 1
 # GrowlerDB
 {: .fs-9 }
 
-Open-source **text search engine over Apache Iceberg**. Iceberg stays the system of record;
-GrowlerDB keeps a fast derived full-text index and returns the matching **primary keys**, which
-hydrate back to authoritative rows in the lake.
+Open-source **retrieval engine — full-text, vector, and hybrid search over your data**. Your source
+(Apache Iceberg today) stays the system of record; GrowlerDB keeps a fast derived index and returns
+the matching **primary keys**, which hydrate back to the authoritative rows.
 {: .fs-6 .fw-300 }
 
 [Get started](getting-started){: .btn .btn-primary .fs-5 .mb-4 .mb-md-0 .mr-2 }
@@ -45,7 +45,8 @@ onto a lakehouse instead of duplicating it.
 
 ## Feature overview
 
-- **Search over Iceberg** with PK hydration (`/v1/search` → `/v1/keys:get`).
+- **Search over your data** with PK hydration (`/v1/search` → `/v1/keys:get`).
+- **Full-text, vector & hybrid retrieval** — semantic + hybrid (RRF) search, an optional reranker, and a read-only MCP server for AI agents.
 - **Query language** — native structured AST + a Lucene/KQL string parser.
 - **Distributed** — control plane + stateful searcher nodes + a scatter-gather gateway.
 - **Secure & multi-tenant** — OIDC/JWT, API keys, mTLS; control-plane RBAC; non-widenable tenant

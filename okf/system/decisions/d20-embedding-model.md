@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: D20. Default embedding model
-description: Configurable, provider-agnostic BGE-family embedding models for the deferred vector capability.
+description: Configurable, provider-agnostic BGE-family embedding models (local-default, keyless) for the shipped vector capability.
 tags: [decision, adr]
 timestamp: 2026-07-04T14:22:00
 ---

@@ -1,8 +1,8 @@
 # GrowlerDB
 
-![GrowlerDB — full-text search over Apache Iceberg](docs/img/social-preview.png)
+![GrowlerDB — full-text, vector, and hybrid search over your data](docs/img/social-preview.png)
 
-**Search your lake. Keep one truth.** — open-source full-text search over Apache Iceberg (and other datastores).
+**Full-text, vector, and hybrid search over your data** — open-source retrieval over Apache Iceberg (with more sources on the roadmap).
 
 [![CI](https://github.com/GrowlerDB/growlerdb/actions/workflows/ci.yml/badge.svg)](https://github.com/GrowlerDB/growlerdb/actions/workflows/ci.yml)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
@@ -11,7 +11,7 @@
 📖 **Documentation: <https://docs.growlerdb.com/>** — [Getting started](https://docs.growlerdb.com/getting-started) · [Install & run modes](https://docs.growlerdb.com/install) · [Configuration](https://docs.growlerdb.com/configuration) · [API reference](https://docs.growlerdb.com/reference)
 
 GrowlerDB keeps Apache Iceberg as the system of record and maintains a fast, derived
-full-text index of your Iceberg data. Search returns the matching **primary keys
+index — **full-text, vector, and hybrid** — of your data. Search returns the matching **primary keys
 (document coordinates)**, which resolve back to the authoritative rows in Iceberg.
 
 ![The GrowlerDB console — full-text search over an Iceberg table, returning ranked coordinates](docs/img/console-search.png)
@@ -63,8 +63,11 @@ Tempo). Editable diagram source: [`docs/img/architecture.excalidraw`](docs/img/a
 
 ## Features
 
-- **Search over Iceberg** — index a source table; search returns coordinates that **hydrate to
-  authoritative rows from Iceberg** (`/v1/search` → `/v1/keys:get`).
+- **Search over your data** — index a source table; search returns coordinates that **hydrate to
+  authoritative rows from your source** (`/v1/search` → `/v1/keys:get`).
+- **Full-text, vector & hybrid retrieval** — lexical (Lucene/KQL), semantic (local-default
+  embeddings), and hybrid (RRF) search, with an optional reranker and a read-only **MCP server** for
+  AI agents.
 - **Query language** — native structured AST + a Lucene/KQL string parser.
 - **Distributed** — control plane (registry), stateful searcher/index nodes, and a scatter-gather
   Gateway; hash/partition sharding.

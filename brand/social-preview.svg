@@ -15,9 +15,9 @@
   </g>
   <text x="140" y="103" font-size="38" font-weight="800" letter-spacing="-1.1" fill="#FCFCFC">growler<tspan fill="#46B8C8">db</tspan></text>
   
-  <text x="72" y="298" font-size="64" font-weight="800" letter-spacing="-1.9" fill="#FCFCFC">Full-text search over</text>
-  <text x="72" y="366" font-size="64" font-weight="800" letter-spacing="-1.9" fill="#FCFCFC">Apache Iceberg</text>
-  <text x="72" y="428" font-size="22" fill="#B9BCC2" font-family="&#39;Instrument Sans&#39;, system-ui, sans-serif">Iceberg is the system of record · search returns coordinates → rows hydrate from the lake</text>
+  <text x="72" y="298" font-size="56" font-weight="800" letter-spacing="-1.6" fill="#FCFCFC">Full-text, vector &amp; hybrid</text>
+  <text x="72" y="360" font-size="56" font-weight="800" letter-spacing="-1.6" fill="#FCFCFC">search over your data</text>
+  <text x="72" y="424" font-size="22" fill="#B9BCC2" font-family="&#39;Instrument Sans&#39;, system-ui, sans-serif">Full-text · vector · hybrid — matches resolve to authoritative rows in your source</text>
   
   <g font-family="&#39;Geist Mono&#39;, ui-monospace, monospace">
     <rect x="72" y="512" width="186" height="38" rx="19" fill="#1C1D20" stroke="#3F4147"></rect>

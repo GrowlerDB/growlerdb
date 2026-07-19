@@ -1,6 +1,7 @@
 # Working on GrowlerDB
 
-GrowlerDB is open-source text search over Apache Iceberg. The compiled source of truth for what it
+GrowlerDB is an open-source retrieval engine — full-text, vector & hybrid search over your data
+(Apache Iceberg today; more sources on the roadmap). The compiled source of truth for what it
 is and how it works is the **OKF** in [`okf/`](okf/index.md) — start there.
 
 ## Session flow
