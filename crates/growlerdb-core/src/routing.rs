@@ -252,6 +252,15 @@ impl BucketMap {
                 owners.len()
             ));
         }
+        // Bound the owner range BEFORE sizing the density bitmap by it: `owners = [u32::MAX, …]`
+        // (reachable from the authenticated ReindexIndex request's `bucket_owners`) would
+        // otherwise attempt a ~4 GiB allocation here. A dense map over NUM_BUCKETS buckets can
+        // never name a shard ≥ NUM_BUCKETS, so anything larger is malformed on its face.
+        if let Some(&bad) = owners.iter().find(|&&o| o >= NUM_BUCKETS) {
+            return Err(format!(
+                "bucket map names shard {bad}, beyond the {NUM_BUCKETS}-bucket maximum — malformed"
+            ));
+        }
         let max = owners.iter().copied().max().unwrap_or(0);
         let mut seen = vec![false; max as usize + 1];
         for &o in &owners {
@@ -804,6 +813,17 @@ mod tests {
         }
         // A malformed map (wrong length) is still rejected.
         assert!(ShardRouter::from_registry(RoutingStrategy::Hash, &[0, 1, 2], 3).is_err());
+    }
+
+    #[test]
+    fn from_owners_rejects_out_of_range_shards_before_allocating() {
+        // An owners vector naming shard u32::MAX must be refused up front — sizing the density
+        // bitmap by it would attempt a ~4 GiB allocation (reachable from an authenticated
+        // ReindexIndex request).
+        let mut owners = BucketMap::balanced(2).owners().to_vec();
+        owners[7] = u32::MAX;
+        let err = BucketMap::from_owners(owners).unwrap_err();
+        assert!(err.contains("malformed"), "{err}");
     }
 
     #[test]

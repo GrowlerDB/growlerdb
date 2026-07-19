@@ -196,11 +196,22 @@ impl TimeWindowing {
         // window-start → accumulator. BTreeMap keeps windows in time order.
         let mut by_window: BTreeMap<i64, WindowAcc> = BTreeMap::new();
         let mut deletes = Vec::new();
+        let mut window_fallbacks = 0usize;
         for op in &batch.ops {
             match op {
                 DocOp::Upsert(located) => {
                     let window = self.window_of(
-                        field_micros(&located.doc, &self.field, window_format).unwrap_or(0),
+                        match field_micros(&located.doc, &self.field, window_format) {
+                            Some(us) => us,
+                            None => {
+                                // Missing/unparseable window value: the doc still lands (window 0)
+                                // rather than being dropped, but that is a silent MISPLACEMENT of
+                                // data — counted + warned below so a misconfigured connector (not
+                                // setting the ingest-time field) is loud, not invisible.
+                                window_fallbacks += 1;
+                                0
+                            }
+                        },
                     );
                     let acc = by_window.entry(window).or_default();
                     if let Some(ef) = event_time_field {
@@ -213,6 +224,15 @@ impl TimeWindowing {
                 }
                 DocOp::Delete(_) => deletes.push(op.clone()),
             }
+        }
+        if window_fallbacks > 0 {
+            tracing::warn!(
+                batch_id = %batch.batch_id,
+                field = %self.field,
+                count = window_fallbacks,
+                "windowed upserts with a missing/unparseable window value fell back to window 0 \
+                 — the connector should always set the ingest-time field"
+            );
         }
         let windows = by_window
             .into_iter()

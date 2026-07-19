@@ -11,6 +11,9 @@ thiserror.workspace = true
 serde.workspace = true
 serde_norway.workspace = true
 chrono.workspace = true
+# Facade-only (subscribers live in the binaries): lets core surface data-placement anomalies
+# (e.g. windowed upserts falling back to window 0) instead of silently misplacing rows.
+tracing.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

@@ -240,7 +240,10 @@ message HybridSearchRequest {
   string vector_field = 2;  // the VECTOR field the semantic arm embeds + searches
   string query_text = 3;    // drives BOTH arms: lexical query string + text the Nodes embed
   uint32 k = 4;             // number of fused results to return
-  string filter = 5;        // optional lexical/fast-field filter STRING for the semantic arm's KNN
+  // Optional filter STRING constraining BOTH arms: the semantic arm's KNN neighbor set is
+  // intersected with it, and the lexical arm gets it ANDed into its query — so the fused result
+  // never contains a doc the filter excludes.
+  string filter = 5;
   QuerySyntax syntax = 6;   // grammar for `query_text` (lexical arm) + `filter` (Lucene default)
   uint32 rrf_k = 7;         // RRF constant (0 ⇒ the standard default, 60)
   // Opt-in **reranking** (D21): when true the semantic arm's Node reorders its retrieved
