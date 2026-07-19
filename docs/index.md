@@ -31,22 +31,50 @@ onto a lakehouse instead of duplicating it.
 
 ## Documentation
 
+New here? Start with **[Getting started](getting-started)** (Compose → first search → hydrate →
+console). The rest of the site is grouped by what you're trying to do:
+
+### Start here
+
 | Page | What it covers |
 |---|---|
 | [Getting started](getting-started) | Compose stack → your first search → hydrate → console. |
 | [Install & run modes](install) | Build from source; embedded, `serve`, `gateway`, `control-plane`. |
+
+### Configure & connect
+
+| Page | What it covers |
+|---|---|
 | [Configuration](configuration) | CLI flags, env vars, and the index-definition YAML (fields, key, tenant). |
-| [Connecting your own Iceberg table](external-iceberg) | Compose against your own external table on S3, plus the connector. |
-| [Reference](reference) | Query language, the REST/gRPC API, and the OpenSearch `_search` adapter. |
-| [Migrating from Elasticsearch / OpenSearch](migration-from-elasticsearch) | Concepts + the two integration paths. |
-| [Deployment](deployment) | Local Compose and Kubernetes (Helm). |
+| [Connecting your own Iceberg table](external-iceberg) | Point GrowlerDB at your own external table on S3, plus the connector. |
 | [Storage & tiering](storage-tiering) | Hot vs cold object-storage tiering — when to use it (and when to keep hot). |
+
+### Reference
+
+| Page | What it covers |
+|---|---|
+| [Reference](reference) | Entry point to the [query language](query-language), the [REST & gRPC API](rest-api), and the [OpenSearch `_search` adapter](opensearch-adapter). |
+
+### Is it the right fit?
+
+| Page | What it covers |
+|---|---|
+| [Comparison & positioning](comparison) | When GrowlerDB fits (and when it doesn't) vs Elasticsearch & Trino. |
+| [Performance (directional)](performance) | Directional latency/throughput numbers vs Elasticsearch & Trino. |
+| [Migrating from Elasticsearch / OpenSearch](migration-from-elasticsearch) | Concepts + the two integration paths. |
+
+### Operate & what's next
+
+| Page | What it covers |
+|---|---|
+| [Deployment](deployment) | Local Compose and Kubernetes (Helm). |
 | [GA criteria](ga-criteria) | What's GA-ready vs. the road to 1.0. |
+| [Roadmap & known limitations](roadmap) | What's coming next, and the current limits to know about. |
 
 ## Feature overview
 
 - **Search over your data** with PK hydration (`/v1/search` → `/v1/keys:get`).
-- **Full-text, vector & hybrid retrieval** — semantic + hybrid (RRF) search, an optional reranker, and a read-only MCP server for AI agents.
+- **Full-text, vector & hybrid retrieval** — lexical, semantic, and hybrid (RRF) search, an optional reranker, and a read-only MCP server for AI agents.
 - **Query language** — native structured AST + a Lucene/KQL string parser.
 - **Distributed** — control plane + stateful searcher nodes + a scatter-gather gateway.
 - **Secure & multi-tenant** — OIDC/JWT, API keys, mTLS; control-plane RBAC; non-widenable tenant
