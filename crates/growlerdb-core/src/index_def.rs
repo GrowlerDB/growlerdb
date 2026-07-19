@@ -33,6 +33,16 @@ pub enum DefError {
     #[error("invalid index definition: {0}")]
     Parse(#[from] serde_norway::Error),
 
+    /// The index `name` is empty, too long, or contains characters outside
+    /// `[a-zA-Z0-9_-]`. The name becomes an on-disk directory component (the shard path) and an
+    /// object-storage prefix, so the charset is locked down — in particular `/` and `..` would
+    /// escape the store root.
+    #[error(
+        "invalid index name `{0}`: use 1-128 characters from a-z, A-Z, 0-9, `_` and `-` \
+         (the name becomes a filesystem path component)"
+    )]
+    InvalidName(String),
+
     /// `selection: EXPLICIT` was given without any `fields[]`.
     #[error("selection EXPLICIT requires a non-empty `fields` list")]
     EmptyExplicit,
@@ -268,10 +278,29 @@ fn default_shard_count() -> u32 {
     1
 }
 
+/// Validate an index name for use as a filesystem path component / object-storage prefix:
+/// non-empty, ≤128 chars, `[a-zA-Z0-9_-]` only. Rejecting `/`, `\` and `.` closes path
+/// traversal (`../../evil`) at the single chokepoint every definition passes through
+/// ([`IndexDefinition::from_yaml`]); the registry re-checks on create for defense-in-depth.
+pub fn validate_index_name(name: &str) -> Result<(), DefError> {
+    let ok = !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if ok {
+        Ok(())
+    } else {
+        Err(DefError::InvalidName(name.to_string()))
+    }
+}
+
 impl IndexDefinition {
     /// Parse an index definition from YAML.
     pub fn from_yaml(yaml: &str) -> Result<Self, DefError> {
-        Ok(serde_norway::from_str(yaml)?)
+        let def: Self = serde_norway::from_str(yaml)?;
+        validate_index_name(&def.name)?;
+        Ok(def)
     }
 
     /// Resolve this definition against a concrete `source` schema: derive the
@@ -1409,6 +1438,35 @@ mod tests {
             vec!["day".into()],
             vec!["id".into()],
         )
+    }
+
+    /// The name becomes a shard directory + object prefix, so traversal/odd charsets are
+    /// refused at parse time — the single chokepoint every definition passes through.
+    #[test]
+    fn index_names_unusable_as_path_components_are_rejected() {
+        let yaml_with = |name: &str| {
+            format!(
+                "name: \"{name}\"\nsource: {{ iceberg: {{ catalog: g, table: g.docs }} }}\nmapping: {{ selection: EXPLICIT, fields: [ {{ path: id, type: KEYWORD }} ] }}\n"
+            )
+        };
+        for bad in [
+            "../../evil",
+            "a/b",
+            "a\\b",
+            "with space",
+            "dot.dot",
+            "",
+            &"x".repeat(129),
+        ] {
+            let err = IndexDefinition::from_yaml(&yaml_with(bad)).unwrap_err();
+            assert!(
+                matches!(err, DefError::InvalidName(_)),
+                "`{bad}` must be rejected, got: {err}"
+            );
+        }
+        for good in ["docs", "http_logs-2026", "A1_b-C"] {
+            IndexDefinition::from_yaml(&yaml_with(good)).expect(good);
+        }
     }
 
     #[test]

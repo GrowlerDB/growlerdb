@@ -233,6 +233,10 @@ pub enum RegistryError {
     /// `create` of a name that is already registered.
     #[error("index `{0}` already exists")]
     AlreadyExists(String),
+    /// `create` with a definition the registry refuses (e.g. an index name unusable as a
+    /// filesystem path component).
+    #[error("invalid definition: {0}")]
+    InvalidDefinition(String),
     /// An operation named an index that is not registered.
     #[error("index `{0}` not found")]
     NotFound(String),
@@ -570,6 +574,11 @@ impl Registry {
     /// is already taken.
     pub fn create(&self, definition: ResolvedIndex) -> Result<()> {
         let name = definition.name.clone();
+        // Re-check the name even though `IndexDefinition::from_yaml` already validates it: the
+        // registry also accepts pre-resolved definitions (tests, future programmatic callers),
+        // and the name becomes a node-side shard directory + object prefix.
+        growlerdb_core::validate_index_name(&name)
+            .map_err(|e| RegistryError::InvalidDefinition(e.to_string()))?;
         let mut map = self.write_map();
         if map.contains_key(&name) {
             return Err(RegistryError::AlreadyExists(name));

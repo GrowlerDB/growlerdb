@@ -36,6 +36,7 @@ spec:
             - 0.0.0.0:{{ .Values.controlPlane.metricsPort }}
           env:
             {{- include "growlerdb.icebergEnv" . | nindent 12 }}
+            {{- include "growlerdb.serviceTokenEnv" . | nindent 12 }}
             {{- include "growlerdb.observabilityEnv" . | nindent 12 }}
           ports:
             - { name: grpc, containerPort: {{ .Values.controlPlane.grpcPort }} }

@@ -50,11 +50,24 @@ impl tonic::service::Interceptor for ServiceTokenAuth {
             .unwrap_or_default();
         if presented.is_empty() || !tokens_match(presented.as_bytes(), &self.expected) {
             return Err(Status::unauthenticated(
-                "control plane requires a valid service token",
+                "this service requires a valid service token",
             ));
         }
         Ok(request)
     }
+}
+
+/// A whole-server tower layer applying the same service-token requirement to **every** service a
+/// tonic server mounts — the data-plane (Node) counterpart of [`intercept`], which wraps one
+/// service. A Node's gRPC surface (Write/Search/Lookup/Suggest/Admin/System) carries no per-user
+/// auth of its own in distributed mode (authn/RBAC/tenant enforcement live at the Gateway), so
+/// without this the only boundary is network isolation; the token adds defense-in-depth for a
+/// directly-reachable Node port. `None`/empty ⇒ a no-op layer (open single-node dev).
+pub fn layer(
+    token: Option<String>,
+) -> tonic::service::interceptor::InterceptorLayer<ServiceTokenAuth> {
+    let expected = token.filter(|t| !t.is_empty()).map(|t| t.into_bytes());
+    tonic::service::interceptor::InterceptorLayer::new(ServiceTokenAuth::from_expected(expected))
 }
 
 /// Wrap `service` so every RPC must present the matching service token, when `token` is set.

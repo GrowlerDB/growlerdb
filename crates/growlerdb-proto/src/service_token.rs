@@ -66,6 +66,22 @@ pub fn service_token_from_env() -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
+/// Dial a **Node** endpoint (plaintext, connect now) and return the channel plus the env-token
+/// stamp — for cluster-internal Node dials outside the engine's `RemoteNode` seam
+/// (control plane → node reindex/write probes, ops CLI → node admin). Callers build the concrete
+/// client with `XClient::with_interceptor(channel, stamp)`. The Node side enforces the same token
+/// when configured; with the env unset the stamp is a no-op (open dev).
+pub async fn node_channel(
+    endpoint: impl Into<String>,
+) -> Result<(Channel, ServiceTokenInterceptor), tonic::transport::Error> {
+    let channel = Endpoint::from_shared(endpoint.into())?
+        .connect_timeout(CONNECT_TIMEOUT)
+        .connect()
+        .await?;
+    let stamp = ServiceTokenInterceptor::new(service_token_from_env().as_deref());
+    Ok((channel, stamp))
+}
+
 /// Build the control-plane [`Endpoint`] for `endpoint`, applying `tls` when set. Shared by the
 /// eager and lazy connect paths.
 fn cp_endpoint(

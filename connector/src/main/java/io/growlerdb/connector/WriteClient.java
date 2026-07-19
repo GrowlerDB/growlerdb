@@ -7,10 +7,13 @@ import io.growlerdb.proto.v1.SourceCheckpoint;
 import io.growlerdb.proto.v1.WriteGrpc;
 import io.growlerdb.proto.v1.WriteRequest;
 import io.growlerdb.proto.v1.WriteResponse;
+import io.grpc.ClientInterceptor;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
+import io.grpc.Metadata;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
+import io.grpc.stub.MetadataUtils;
 
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
@@ -132,7 +135,19 @@ public final class WriteClient implements BatchWriter {
             .keepAliveTimeout(5, TimeUnit.SECONDS)
             .keepAliveWithoutCalls(true)
             .build();
-    this.stub = WriteGrpc.newBlockingStub(channel);
+    // When GROWLERDB_SERVICE_TOKEN is set, every call carries it as the shared
+    // x-growlerdb-service-token header — the Node's data plane enforces the same token when
+    // configured (unset => no header, open dev). Mirrors ControlPlaneClient.
+    WriteGrpc.WriteBlockingStub s = WriteGrpc.newBlockingStub(channel);
+    String token = System.getenv("GROWLERDB_SERVICE_TOKEN");
+    if (token != null && !token.isEmpty()) {
+      Metadata md = new Metadata();
+      md.put(
+          Metadata.Key.of("x-growlerdb-service-token", Metadata.ASCII_STRING_MARSHALLER), token);
+      ClientInterceptor interceptor = MetadataUtils.newAttachHeadersInterceptor(md);
+      s = s.withInterceptors(interceptor);
+    }
+    this.stub = s;
     this.deadlineSeconds = deadlineSeconds;
     this.maxAttempts = maxAttempts;
     this.initialBackoffMs = initialBackoffMs;

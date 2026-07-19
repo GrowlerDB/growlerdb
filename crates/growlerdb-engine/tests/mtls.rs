@@ -91,7 +91,7 @@ async fn spawn_mtls_node(shard: Arc<Shard>) -> String {
 async fn try_describe(endpoint: &str, tls: ClientTlsConfig) -> Result<(), String> {
     let mut last = String::new();
     for _ in 0..50 {
-        match RemoteNode::connect_with_tls(endpoint.to_string(), tls.clone()).await {
+        match RemoteNode::connect_with_tls(endpoint.to_string(), tls.clone(), None).await {
             Ok(node) => {
                 let gw = growlerdb_engine::Gateway::new(Arc::new(node));
                 return gw

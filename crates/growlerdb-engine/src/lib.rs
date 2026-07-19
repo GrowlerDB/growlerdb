@@ -54,7 +54,9 @@ pub use opensearch::opensearch_router;
 pub use rbac::{scope_for_method, RbacPolicy, Scope};
 pub use remap::{remap_shard, remap_tick, RemapOutcome, RemapState};
 pub use search_service::SearchService;
-pub use service_auth::{intercept as intercept_service_token, ServiceTokenAuth};
+pub use service_auth::{
+    intercept as intercept_service_token, layer as service_token_layer, ServiceTokenAuth,
+};
 pub use shard_handle::ShardHandle;
 pub use suggest_service::SuggestService;
 pub use topology::{shard_primaries, ShardTopologyError};

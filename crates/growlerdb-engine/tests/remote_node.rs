@@ -92,7 +92,7 @@ async fn distributed_gateway(shard: Arc<Shard>) -> Gateway {
     let endpoint = format!("http://{addr}");
     let mut last = None;
     for _ in 0..50 {
-        match RemoteNode::connect(endpoint.clone()).await {
+        match RemoteNode::connect(endpoint.clone(), None).await {
             Ok(node) => return Gateway::new(Arc::new(node)),
             Err(e) => {
                 last = Some(e);

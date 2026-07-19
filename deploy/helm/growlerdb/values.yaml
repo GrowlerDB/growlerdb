@@ -48,6 +48,11 @@ credentials:
   catalogCredential: "" # Polaris client-id:secret, e.g. "client:secret"
   s3AccessKey: ""
   s3SecretKey: ""
+  # Shared cluster service token (GROWLERDB_SERVICE_TOKEN). Closes the control plane's internal
+  # RPCs AND every node's data-plane gRPC (write/search/reindex/backup) to callers that don't
+  # present it — the defense-in-depth boundary behind network policy. Empty = open (the node and
+  # control-plane pods log a warning). Set it for any multi-pod deployment.
+  serviceToken: ""
 
 # ---- The index the nodes build + serve -------------------------------------------------------
 # The index is partitioned into `shards` ordinals (virtual-bucket sharding). The node StatefulSet

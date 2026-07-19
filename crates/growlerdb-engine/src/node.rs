@@ -266,12 +266,20 @@ impl Node for LocalNode {
 /// metadata set by the Engine API travels over the wire to the Node's [auth seam](crate::auth).
 /// This is the half of the seam that makes the [Gateway](crate::gateway::Gateway) work
 /// across a real network hop; embedded mode uses [`LocalNode`] instead.
+/// A Node channel with the cluster's shared service token stamped on every request (a no-op
+/// stamp when no token is configured, so the same type serves open single-node dev). The
+/// server-side counterpart is [`service_token_layer`](crate::service_token_layer) on the Node.
+type NodeChannel = tonic::service::interceptor::InterceptedService<
+    Channel,
+    growlerdb_proto::service_token::ServiceTokenInterceptor,
+>;
+
 #[derive(Clone)]
 pub struct RemoteNode {
-    search: SearchClient<Channel>,
-    suggest: SuggestClient<Channel>,
-    lookup: LookupClient<Channel>,
-    admin: AdminClient<Channel>,
+    search: SearchClient<NodeChannel>,
+    suggest: SuggestClient<NodeChannel>,
+    lookup: LookupClient<NodeChannel>,
+    admin: AdminClient<NodeChannel>,
 }
 
 impl RemoteNode {
@@ -279,13 +287,16 @@ impl RemoteNode {
     /// per-request timeout so a hung/slow shard surfaces as a call error (counted as a failed
     /// shard → `partial`) rather than blocking forever, complementing the Gateway's scatter
     /// deadline.
-    pub async fn connect(endpoint: impl Into<String>) -> Result<Self, tonic::transport::Error> {
+    pub async fn connect(
+        endpoint: impl Into<String>,
+        token: Option<&str>,
+    ) -> Result<Self, tonic::transport::Error> {
         let channel = Endpoint::from_shared(endpoint.into())?
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .connect()
             .await?;
-        Ok(Self::with_channel(channel))
+        Ok(Self::with_channel(channel, token))
     }
 
     /// Connect over **mutual TLS** ([`tls`](crate::tls)): like [`connect`](Self::connect), but
@@ -294,6 +305,7 @@ impl RemoteNode {
     pub async fn connect_with_tls(
         endpoint: impl Into<String>,
         tls: tonic::transport::ClientTlsConfig,
+        token: Option<&str>,
     ) -> Result<Self, tonic::transport::Error> {
         let channel = Endpoint::from_shared(endpoint.into())?
             .tls_config(tls)?
@@ -301,7 +313,7 @@ impl RemoteNode {
             .timeout(REQUEST_TIMEOUT)
             .connect()
             .await?;
-        Ok(Self::with_channel(channel))
+        Ok(Self::with_channel(channel, token))
     }
 
     /// Like [`connect`](Self::connect) but **lazy**: build the channel without establishing the
@@ -310,34 +322,40 @@ impl RemoteNode {
     /// at a *new* IP is reached again automatically, and a still-down shard fails fast at
     /// [`CONNECT_TIMEOUT`] (→ a `partial` query) instead of blocking on a stale connection. Building
     /// never fails on an unreachable node, so a Gateway can front a partially-down cluster.
-    pub fn connect_lazy(endpoint: impl Into<String>) -> Result<Self, tonic::transport::Error> {
+    pub fn connect_lazy(
+        endpoint: impl Into<String>,
+        token: Option<&str>,
+    ) -> Result<Self, tonic::transport::Error> {
         let channel = Endpoint::from_shared(endpoint.into())?
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .connect_lazy();
-        Ok(Self::with_channel(channel))
+        Ok(Self::with_channel(channel, token))
     }
 
     /// [`connect_lazy`](Self::connect_lazy) over mutual TLS (cf. [`connect_with_tls`](Self::connect_with_tls)).
     pub fn connect_lazy_with_tls(
         endpoint: impl Into<String>,
         tls: tonic::transport::ClientTlsConfig,
+        token: Option<&str>,
     ) -> Result<Self, tonic::transport::Error> {
         let channel = Endpoint::from_shared(endpoint.into())?
             .tls_config(tls)?
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .connect_lazy();
-        Ok(Self::with_channel(channel))
+        Ok(Self::with_channel(channel, token))
     }
 
-    /// Build over an existing channel — all four clients share the one connection.
-    pub fn with_channel(channel: Channel) -> Self {
+    /// Build over an existing channel — all four clients share the one connection, each
+    /// stamping the cluster service `token` on every request (`None` ⇒ no stamp, open dev).
+    pub fn with_channel(channel: Channel, token: Option<&str>) -> Self {
+        let stamp = growlerdb_proto::service_token::ServiceTokenInterceptor::new(token);
         Self {
-            search: SearchClient::new(channel.clone()),
-            suggest: SuggestClient::new(channel.clone()),
-            lookup: LookupClient::new(channel.clone()),
-            admin: AdminClient::new(channel),
+            search: SearchClient::with_interceptor(channel.clone(), stamp.clone()),
+            suggest: SuggestClient::with_interceptor(channel.clone(), stamp.clone()),
+            lookup: LookupClient::with_interceptor(channel.clone(), stamp.clone()),
+            admin: AdminClient::with_interceptor(channel, stamp),
         }
     }
 }
@@ -439,12 +457,12 @@ mod tests {
     #[tokio::test]
     async fn connect_lazy_builds_for_an_unreachable_endpoint() {
         // 198.51.100.0/24 (TEST-NET-2) is non-routable; an eager connect would fail, lazy must not.
-        assert!(RemoteNode::connect_lazy("http://198.51.100.1:50051").is_ok());
+        assert!(RemoteNode::connect_lazy("http://198.51.100.1:50051", None).is_ok());
     }
 
     /// A malformed endpoint is still a build error (not silently accepted).
     #[test]
     fn connect_lazy_rejects_a_bad_endpoint() {
-        assert!(RemoteNode::connect_lazy("not a url").is_err());
+        assert!(RemoteNode::connect_lazy("not a url", None).is_err());
     }
 }

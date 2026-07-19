@@ -24,6 +24,22 @@ Write endpoint for ingestion. **Stateful but rebuildable**: its local
 - Health-driven [auto-compaction](/product/functional/index-management/compact.md); the source-lineage
   guard serves degraded on a recreated source.
 
+## Trust boundary
+
+A Node's gRPC surface carries **no per-user auth of its own** in distributed mode — authn, RBAC,
+and tenant enforcement all live at the [gateway](/system/runtime/components/gateway.md) (tenant
+scoping on reads additionally fails closed node-side). The Node's boundary is the **shared
+service token** (`GROWLERDB_SERVICE_TOKEN` / `--service-token`): when configured, every
+data-plane RPC (Write/Search/Lookup/Suggest/Admin/System, all serve modes) must present it, the
+same token the control plane already enforces. All mesh callers — gateway, control plane,
+connector, the ops CLI — stamp it from the same env var; the Helm chart wires it from
+`credentials.serviceToken`. Unset ⇒ the data plane is **open** and the Node logs a loud warning:
+acceptable only single-node or behind strict network isolation. **Deployment requirement: never
+expose a Node port beyond the cluster network; the token is defense-in-depth behind that, not a
+substitute for it.**
+
 ## Notes
 
 One StatefulSet pod per shard in the sharded chart (ordinal = pod index). In `growlerdb-engine`.
+Index names are validated at definition parse (`[a-zA-Z0-9_-]`, ≤128 chars) because they become
+shard directory paths and object-storage prefixes.

@@ -423,10 +423,13 @@ impl Search for SearchService {
                 },
             })
             .collect();
+        // Cap like every other paged endpoint (`MAX_NODE_FETCH`): an unclamped `u32::MAX`
+        // page would build a ~4-billion-entry top-k in one page — an OOM, not a big export.
+        // Export still streams the FULL result set; the cap only bounds one page's memory.
         let page_size = if req.page_size == 0 {
             DEFAULT_EXPORT_PAGE_SIZE
         } else {
-            req.page_size as usize
+            (req.page_size as usize).min(MAX_NODE_FETCH)
         };
         let given_pit = req.pit_id;
 
@@ -1315,6 +1318,32 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    /// `page_size` is clamped to [`MAX_NODE_FETCH`] like every other paged endpoint: a
+    /// `u32::MAX` request must stream the full result set in bounded pages, not build a
+    /// ~4-billion-entry top-k in one page (OOM).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn export_clamps_an_absurd_page_size() {
+        use tokio_stream::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (svc, _shard) = service_and_shard(tmp.path());
+
+        let mut stream = svc
+            .export(Request::new(ExportRequest {
+                query: "rank:[0 TO 1000]".into(),
+                page_size: u32::MAX,
+                sort: rank_asc(),
+                pit_id: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut got = Vec::new();
+        while let Some(page) = stream.next().await {
+            got.extend(page.unwrap().hits.iter().map(id_of));
+        }
+        assert_eq!(got, vec!["b", "c", "a"], "full set, bounded page memory");
     }
 
     /// The auth hook gates every RPC: a denying hook rejects a Search before it runs.

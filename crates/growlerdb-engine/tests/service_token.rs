@@ -74,3 +74,122 @@ async fn unconfigured_control_plane_is_open() {
         .await
         .expect("open control plane accepts a tokenless call");
 }
+
+// ---- Node data plane -------------------------------------------------------------------------
+//
+// The Node's whole gRPC surface (here: Search + Admin, representative of the layered server the
+// CLI serves) is gated by `service_token_layer`, and `RemoteNode` stamps the token per request —
+// the two halves the distributed mesh relies on. Without the layer a directly-reachable Node port
+// bypassed the Gateway's authn/RBAC entirely.
+
+fn data_plane_shard(root: &std::path::Path) -> Arc<growlerdb_index::Shard> {
+    use growlerdb_core::{
+        CommitBatch, CompositeKey, Document, IndexDefinition, IndexWriter, LocatedDoc,
+        SourceCheckpoint, SourceField, SourceSchema, SourceType, Value,
+    };
+    use growlerdb_index::{LocalIndexStore, ShardId};
+    let src = SourceSchema::new(
+        vec![SourceField::new("id", SourceType::String)],
+        vec![],
+        vec!["id".into()],
+    );
+    let idx = IndexDefinition::from_yaml(
+        "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD } ] }\n",
+    )
+    .unwrap()
+    .resolve(&src)
+    .unwrap();
+    let shard = LocalIndexStore::open(root)
+        .unwrap()
+        .create_shard(&ShardId::single("docs"), &idx)
+        .unwrap();
+    let key = CompositeKey::new(vec![], vec![("id".into(), Value::from("1"))]);
+    let mut f = std::collections::BTreeMap::new();
+    f.insert("id".to_string(), Value::from("1"));
+    IndexWriter::write(
+        &shard,
+        &CommitBatch::from_upserts(
+            vec![LocatedDoc {
+                doc: Document::new(key, f),
+                iceberg_file: "f".into(),
+                row_position: 0,
+            }],
+            SourceCheckpoint::iceberg(1),
+            "b1",
+        ),
+    )
+    .unwrap();
+    Arc::new(shard)
+}
+
+/// Spawn a Node data plane (Search + Admin over a real shard) behind
+/// [`service_token_layer`](growlerdb_engine::service_token_layer); return its endpoint.
+async fn spawn_node(token: Option<&str>) -> String {
+    use growlerdb_engine::{AdminService, SearchService};
+    let tmp = tempfile::tempdir().unwrap();
+    let shard = data_plane_shard(tmp.path());
+    std::mem::forget(tmp);
+    let search = SearchService::new(shard.clone());
+    let admin = AdminService::new(shard, "docs");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(
+        Server::builder()
+            .layer(growlerdb_engine::service_token_layer(
+                token.map(str::to_string),
+            ))
+            .add_service(search.into_server())
+            .add_service(admin.into_server())
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
+    format!("http://{addr}")
+}
+
+async fn describe(
+    endpoint: &str,
+    token: Option<&str>,
+) -> Result<growlerdb_proto::v1::DescribeIndexResponse, tonic::Status> {
+    // Retry the initial connect so the test isn't racing the server's bind.
+    let mut node = None;
+    for _ in 0..50 {
+        if let Ok(n) = growlerdb_engine::RemoteNode::connect(endpoint.to_string(), token).await {
+            node = Some(n);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    use growlerdb_engine::Node;
+    node.expect("node never came up")
+        .describe_index(tonic::Request::new(
+            growlerdb_proto::v1::DescribeIndexRequest {
+                index: "docs".into(),
+                window: 0,
+            },
+        ))
+        .await
+        .map(tonic::Response::into_inner)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn node_data_plane_enforces_the_token_and_remote_node_stamps_it() {
+    let ep = spawn_node(Some("mesh")).await;
+
+    // Missing / wrong token ⇒ unauthenticated, on every service behind the layer.
+    let err = describe(&ep, None).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    let err = describe(&ep, Some("nope")).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // Matching token ⇒ the same RPC succeeds (RemoteNode stamped it on the request).
+    let resp = describe(&ep, Some("mesh")).await.expect("token accepted");
+    assert_eq!(resp.stats.expect("stats present").num_docs, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unconfigured_node_data_plane_is_open() {
+    let ep = spawn_node(None).await;
+    // No token configured ⇒ single-node dev stays open.
+    describe(&ep, None)
+        .await
+        .expect("open node accepts a tokenless call");
+}
