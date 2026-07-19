@@ -2441,6 +2441,9 @@ impl From<Status> for ApiError {
             Code::Unauthenticated => StatusCode::UNAUTHORIZED,
             Code::FailedPrecondition => StatusCode::PRECONDITION_FAILED,
             Code::Unimplemented => StatusCode::NOT_IMPLEMENTED,
+            // Admission load-shed (gateway concurrent-query cap, node heavy-read cap): the
+            // client's honest signal to back off and retry.
+            Code::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         ApiError {

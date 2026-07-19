@@ -5,6 +5,8 @@
 //!
 //! [Design 01]: ../../../okf/product/interfaces/grpc.md
 
+use std::sync::Arc;
+
 use growlerdb_core::{Agg, CompositeKey, Highlight, Query, SearchAfter, Sort, SortOrder};
 use growlerdb_index::{IndexError, Shard, StoreError};
 use growlerdb_proto::v1::{
@@ -39,6 +41,29 @@ pub(crate) const MAX_NODE_FETCH: usize = 10_000;
 pub struct SearchService {
     shard: ShardHandle,
     auth: SharedAuth,
+    /// Admission for the HEAVY read ops (`export`, `aggregate` — full scans on the blocking
+    /// pool). Defaults to the process-wide semaphore ([`heavy_reads`]) so every service on this
+    /// node shares ONE budget; saturation load-sheds with `RESOURCE_EXHAUSTED` rather than
+    /// queueing unbounded blocking work.
+    heavy: Arc<tokio::sync::Semaphore>,
+}
+
+/// The node-wide heavy-read budget: at most `GROWLERDB_MAX_HEAVY_READS` (default 8, `0` treated
+/// as 1) concurrent exports/aggregations across ALL served shards/windows — these run full scans
+/// on the blocking pool, so an unbounded flood starves every other query's blocking work. Sized
+/// once at first use from the env.
+fn heavy_reads() -> Arc<tokio::sync::Semaphore> {
+    static GLOBAL: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    GLOBAL
+        .get_or_init(|| {
+            let n = std::env::var("GROWLERDB_MAX_HEAVY_READS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(8)
+                .max(1);
+            Arc::new(tokio::sync::Semaphore::new(n))
+        })
+        .clone()
 }
 
 impl SearchService {
@@ -49,11 +74,19 @@ impl SearchService {
         Self::with_auth(shard, default_auth())
     }
 
+    /// Override the heavy-read admission budget (tests / bespoke embedders); production uses the
+    /// process-wide [`heavy_reads`] default so all services share one budget.
+    pub fn with_heavy_limit(mut self, n: usize) -> Self {
+        self.heavy = Arc::new(tokio::sync::Semaphore::new(n.max(1)));
+        self
+    }
+
     /// A Search service over `shard` with a specific [auth hook](SharedAuth).
     pub fn with_auth(shard: impl Into<ShardHandle>, auth: SharedAuth) -> Self {
         Self {
             shard: shard.into(),
             auth,
+            heavy: heavy_reads(),
         }
     }
 
@@ -433,6 +466,18 @@ impl Search for SearchService {
         };
         let given_pit = req.pit_id;
 
+        // Admission: an export is a full scan holding a PIT + blocking-pool time for its whole
+        // stream — take a node-wide heavy-read permit (held until the stream finishes) or
+        // load-shed now with an honest retry signal.
+        let permit = self.heavy.clone().try_acquire_owned().map_err(|_| {
+            to_status(
+                Code::ResourceExhausted,
+                WireError::new(
+                    "RESOURCE_EXHAUSTED",
+                    "node at its concurrent heavy-read limit (exports/aggregations) — retry                      with backoff (GROWLERDB_MAX_HEAVY_READS tunes this)",
+                ),
+            )
+        })?;
         // Stream pages from a blocking task over a bounded channel (backpressure: the
         // producer parks on `blocking_send` until the client drains).
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<SearchResponse, Status>>(4);
@@ -440,6 +485,8 @@ impl Search for SearchService {
         // Tenant scoping: export is a full scan, so the tenant filter matters most here.
         let query = tenant_scope(&shard, query, tenant.as_deref())?;
         tokio::task::spawn_blocking(move || {
+            // Hold the heavy-read permit for the producer's whole lifetime.
+            let _permit = permit;
             // Use the caller's PIT, or open one for the export's duration (then close).
             let (pit, owned) = if given_pit != 0 {
                 (given_pit, false)
@@ -523,6 +570,17 @@ impl Search for SearchService {
         // Tantivy, so bad input is a clear InvalidArgument, not an opaque Internal.
         growlerdb_core::validate_aggs(&aggs).map_err(invalid)?;
 
+        // Admission: an aggregation scans every matching doc's fast fields on the blocking
+        // pool — same node-wide heavy-read budget as export (permit held through the run).
+        let _permit = self.heavy.clone().try_acquire_owned().map_err(|_| {
+            to_status(
+                Code::ResourceExhausted,
+                WireError::new(
+                    "RESOURCE_EXHAUSTED",
+                    "node at its concurrent heavy-read limit (exports/aggregations) — retry                      with backoff (GROWLERDB_MAX_HEAVY_READS tunes this)",
+                ),
+            )
+        })?;
         let shard = self.shard.current();
         // Tenant scoping: aggregations over another tenant's rows would leak counts/
         // sums, so the same mandatory filter applies before the agg runs.
@@ -1318,6 +1376,64 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    /// The node-wide heavy-read budget: with a limit of 1, an in-flight (undrained) export
+    /// holds the only permit, so an aggregate load-sheds with `RESOURCE_EXHAUSTED`; draining
+    /// the export frees the budget and the same aggregate runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn heavy_reads_share_one_budget_and_shed_the_flood() {
+        use tokio_stream::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (svc, _shard) = service_and_shard(tmp.path());
+        let svc = svc.with_heavy_limit(1);
+
+        // Start an export but do NOT drain it: page_size 1 parks the producer on the bounded
+        // channel with the heavy permit held.
+        let mut stream = svc
+            .export(Request::new(ExportRequest {
+                query: "rank:[0 TO 1000]".into(),
+                page_size: 1,
+                sort: rank_asc(),
+                pit_id: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // The budget is exhausted → an aggregate is shed with the honest signal.
+        let err = svc
+            .aggregate(Request::new(AggregateRequest {
+                query: "rank:[0 TO 1000]".into(),
+                aggs: r#"{"r": {"Stats": {"field": "rank"}}}"#.into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::ResourceExhausted);
+
+        // Drain the export to completion → the permit frees → the same aggregate runs.
+        while let Some(page) = stream.next().await {
+            page.unwrap();
+        }
+        // The producer's permit drops with its task; poll briefly for the release.
+        let mut ok = false;
+        for _ in 0..50 {
+            if svc
+                .aggregate(Request::new(AggregateRequest {
+                    query: "rank:[0 TO 1000]".into(),
+                    aggs: r#"{"r": {"Stats": {"field": "rank"}}}"#.into(),
+                    ..Default::default()
+                }))
+                .await
+                .is_ok()
+            {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ok, "the heavy budget frees once the export finishes");
     }
 
     /// `page_size` is clamped to [`MAX_NODE_FETCH`] like every other paged endpoint: a

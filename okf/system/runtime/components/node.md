@@ -38,6 +38,14 @@ acceptable only single-node or behind strict network isolation. **Deployment req
 expose a Node port beyond the cluster network; the token is defense-in-depth behind that, not a
 substitute for it.**
 
+## Admission control
+
+Heavy read ops — `Export` and `Aggregate`, full scans on the blocking pool — share one
+node-wide budget: `GROWLERDB_MAX_HEAVY_READS` concurrent (default 8; Helm `node.maxHeavyReads`),
+across all served shards and windows. Saturation load-sheds with `RESOURCE_EXHAUSTED` so a flood
+of exports can't starve every other query's blocking work; the permit is held for an export's
+whole stream. Writes have their own in-flight cap (`--max-inflight`).
+
 ## Notes
 
 One StatefulSet pod per shard in the sharded chart (ordinal = pod index). In `growlerdb-engine`.
