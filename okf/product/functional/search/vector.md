@@ -60,6 +60,15 @@ offline CI keep working) with a one-time warning. The BGE runtime is behind a de
 a slim build can drop the ML dependency entirely. Automatic model download is intentionally not part of the
 runtime — provisioning stays explicit, keeping the default deployment offline.
 
+**External providers (opt-in).** A field declared `provider: EXTERNAL` (and, for reranking,
+`GROWLERDB_RERANK_PROVIDER=external`) instead calls a hosted embedding / rerank service over HTTP. The
+API key is **server-side only** (`GROWLERDB_EMBEDDING_API_KEY` / `GROWLERDB_RERANK_API_KEY`, from the
+engine's env — a k8s Secret / Vault mount), **re-read per call so it rotates without a restart**,
+**redacted** in all output, and **never** sent to the browser or surfaced on `/v1/config`. Selecting
+`EXTERNAL` with no key **fails closed** (a clear error, never a silent local fallback). The local default
+needs **zero** keys. There are **no LLM keys** — GrowlerDB never calls an LLM
+([D42](/system/decisions/d42-retrieval-first.md)); the external path is embedding + reranking only.
+
 ## Semantic (KNN) retrieval
 
 Each segment's vectors are indexed into a GrowlerDB-owned **ANN sidecar**
