@@ -517,6 +517,11 @@ impl Engine {
         tenant: Option<&str>,
         hydrate: bool,
         projection: Projection,
+        // Opt-in reranking (D21): reorder the retrieved top-K by a cross-encoder over
+        // `query_text` and each hit's cached source-field text. `rerank_top_k` is the candidate
+        // pool to fetch + rerank (0 ⇒ exactly `k`). Off by default.
+        rerank: bool,
+        rerank_top_k: usize,
     ) -> Result<SearchOutcome, EngineError> {
         let resolved = self.load_definition(index)?;
         // The named field must be a VECTOR field — its `VectorSpec` drives the query embedder.
@@ -526,6 +531,9 @@ impl Engine {
             .find(|f| f.path == field)
             .and_then(|f| f.vector.as_ref())
             .ok_or_else(|| EngineError::NotVectorField(field.to_string()))?;
+
+        // The KNN fetch depth: the rerank candidate pool when reranking, else just `k`.
+        let fetch = if rerank { rerank_top_k.max(k) } else { k };
 
         // Embed the query text with the SAME factory ingest uses (real BGE when a model is
         // provisioned, else the deterministic hash fallback) — the query and the stored document
@@ -537,7 +545,7 @@ impl Engine {
         let mut query = Query::Knn {
             field: field.to_string(),
             vector,
-            k,
+            k: fetch,
             filter: None,
         };
         // Tenant enforcement (filtered KNN, TASK-43): on a tenant-scoped index the caller MUST
@@ -558,7 +566,14 @@ impl Engine {
         }
 
         let shard = self.store.open_shard(&ShardId::single(index), &resolved)?;
-        let hits = shard.search_all(&query, k)?;
+        let hits = shard.search_all(&query, fetch)?;
+        // Reranking reorders the retrieved pool by (query, cached source-field text) relevance and
+        // returns the top `k`; off by default it's a plain KNN top-`k`.
+        let hits = if rerank {
+            crate::search_service::rerank_hits(hits, query_text, &spec.source_field, k)
+        } else {
+            hits
+        };
 
         let rows = if hydrate {
             let keys: Vec<CompositeKey> = hits.iter().map(|h| h.key.clone()).collect();
@@ -593,6 +608,10 @@ impl Engine {
         tenant: Option<&str>,
         hydrate: bool,
         projection: Projection,
+        // Opt-in reranking (D21): the semantic arm reorders its candidates by a cross-encoder
+        // before RRF, so cross-encoder relevance carries into the fused ranks. Off by default.
+        rerank: bool,
+        rerank_top_k: usize,
     ) -> Result<SearchOutcome, EngineError> {
         let resolved = self.load_definition(index)?;
         let spec = resolved
@@ -618,6 +637,13 @@ impl Engine {
         // Over-fetch each arm so the fusion has depth to work with (a doc ranked past `k` in one
         // arm can still win once the other arm's rank is added in).
         let k_each = k.max(10) * 2;
+        // When reranking, fetch the larger of the fusion depth and the requested rerank pool for
+        // the semantic arm, so a caller can rerank a deeper candidate set than the fusion depth.
+        let knn_k = if rerank {
+            k_each.max(rerank_top_k)
+        } else {
+            k_each
+        };
 
         // Lexical arm: parse the query text (an empty/unparseable query falls back to match-all so
         // hybrid still returns the semantic arm). Tenant-scope with the non-widenable filter.
@@ -634,7 +660,7 @@ impl Engine {
         let mut knn = Query::Knn {
             field: field.to_string(),
             vector,
-            k: k_each,
+            k: knn_k,
             filter: None,
         };
         if let Some((tf, claim)) = &tenant_claim {
@@ -646,7 +672,14 @@ impl Engine {
 
         let shard = self.store.open_shard(&ShardId::single(index), &resolved)?;
         let lexical_hits = shard.search_all(&lexical, k_each)?;
-        let vector_hits = shard.search_all(&knn, k_each)?;
+        let vector_hits = shard.search_all(&knn, knn_k)?;
+        // Reranking reorders the semantic arm's candidates by (query, cached source-field text)
+        // relevance before fusion, so the cross-encoder signal carries into the fused RRF ranks.
+        let vector_hits = if rerank {
+            crate::search_service::rerank_hits(vector_hits, query_text, &spec.source_field, k_each)
+        } else {
+            vector_hits
+        };
 
         let hits = rrf_fuse(&[&lexical_hits, &vector_hits], RRF_K, k);
 
@@ -975,6 +1008,8 @@ mod tests {
                 None,
                 false,
                 Projection::All,
+                false,
+                0,
             )
             .await
             .unwrap();
@@ -984,7 +1019,17 @@ mod tests {
 
         // Naming a non-vector field is a clear error.
         let err = engine
-            .semantic_search("docs", "body", "x", 1, None, false, Projection::All)
+            .semantic_search(
+                "docs",
+                "body",
+                "x",
+                1,
+                None,
+                false,
+                Projection::All,
+                false,
+                0,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, EngineError::NotVectorField(f) if f == "body"));
@@ -1024,7 +1069,17 @@ mod tests {
         let engine = Engine::open(root, IcebergConfig::local()).unwrap();
         // A tenant-scoped index with NO claim still fails closed — never returns cross-tenant rows.
         let err = engine
-            .semantic_search("docs", "body_vec", "x", 1, None, false, Projection::All)
+            .semantic_search(
+                "docs",
+                "body_vec",
+                "x",
+                1,
+                None,
+                false,
+                Projection::All,
+                false,
+                0,
+            )
             .await
             .unwrap_err();
         assert!(matches!(
@@ -1108,6 +1163,8 @@ mod tests {
                 Some("t1"),
                 false,
                 Projection::All,
+                false,
+                0,
             )
             .await
             .unwrap();
@@ -1188,6 +1245,8 @@ mod tests {
                 None,
                 false,
                 Projection::All,
+                false,
+                0,
             )
             .await
             .unwrap();
@@ -1678,7 +1737,17 @@ mod tests {
                 .await
                 .unwrap();
             let hyb = engine
-                .hybrid_search("docs", "body_vec", q, 10, None, false, Projection::All)
+                .hybrid_search(
+                    "docs",
+                    "body_vec",
+                    q,
+                    10,
+                    None,
+                    false,
+                    Projection::All,
+                    false,
+                    0,
+                )
                 .await
                 .unwrap();
             lex_mrr += rr(&lex.hits, rel);
