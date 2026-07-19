@@ -10,6 +10,7 @@ pub mod durable;
 pub mod embed;
 pub mod index_def;
 pub mod query;
+pub mod rerank;
 pub mod routing;
 pub mod timestamp;
 pub mod window;
@@ -33,6 +34,7 @@ pub use index_def::{
     DEFAULT_EMBED_MODEL, MAX_CACHED_FIELD_BYTES,
 };
 pub use query::{MatchOp, ParseError, Query, Syntax};
+pub use rerank::{HashReranker, Reranker};
 pub use routing::{BucketMap, Reassignment, RoutingStrategy, ShardRouter};
 pub use timestamp::{TimeFormat, TimeParseError};
 pub use window::{TimeWindowing, WindowGranularity};

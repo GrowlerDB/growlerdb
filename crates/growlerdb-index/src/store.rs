@@ -222,6 +222,16 @@ pub enum StoreError {
     /// (typically a reindex/reconcile). Carries `(from, current)` for the operator.
     #[error("checkpoint gap: batch resumes from {from} but this shard is at {current}")]
     CheckpointGap { from: String, current: String },
+    /// The on-disk index for this name was built with a **different schema** than the definition
+    /// now being opened against it: a mapped field was added/removed/renamed, or a field's type or
+    /// fast-ness changed, so the derived Tantivy schema (its field set/types) no longer matches the
+    /// one persisted in the segment's `meta.json`. Writing new-schema documents into the stale index
+    /// would corrupt the fast-field writer (the doc references a field ordinal the writer's schema
+    /// doesn't have — the historical `index out of bounds` panic), so refuse up front instead. A
+    /// schema change invalidates the old data: reindex from scratch (drop the index / use a fresh
+    /// data dir, or run `growlerdb index`, which reindexes automatically on a schema change).
+    #[error("index `{index}` was built with a different schema; drop it (or use a fresh data dir / reindex) before rebuilding")]
+    SchemaChanged { index: String },
 }
 
 /// Convenience result alias for the store.
@@ -644,6 +654,18 @@ impl LocalIndexStore {
         let tantivy = TantivySegmentCore
             .open_or_create_index(&schema, &index_dir)
             .map_err(StoreError::Segment)?;
+        // Guardrail: if an index already exists on disk, its persisted (`meta.json`) Tantivy schema
+        // must match the one we just derived from `index`. A definition that changed the mapped-field
+        // set or a field's type/fast-ness derives a different Tantivy schema; opening the stale index
+        // and adding new-schema documents through its writer corrupts the fast-field writer (a doc
+        // references a field ordinal the writer's schema lacks — the `index out of bounds` panic).
+        // Refuse before any document is written. The engine's `index`/reindex path wipes the stale
+        // dir first, so a clean rebuild never reaches this; this is the safety net for any other path.
+        if tantivy.schema() != *schema.tantivy_schema() {
+            return Err(StoreError::SchemaChanged {
+                index: index.name.clone(),
+            });
+        }
         let core = SegmentReader::live(&tantivy, index_dir.clone()).map_err(StoreError::Segment)?;
         let db = match reuse_db {
             Some(db) => db, // already open + migrated (shared across a tier swap)
@@ -5005,6 +5027,94 @@ mapping:
 
     fn key(id: i64) -> CompositeKey {
         CompositeKey::new(vec![], vec![("id".into(), id.into())])
+    }
+
+    /// A widened schema for `docs`: the same fields as [`index`] plus a new mapped `title` TEXT
+    /// field. Its derived Tantivy schema has one more field than [`index`]'s, so opening an index
+    /// built with [`index`] against this definition is exactly the schema-change the guardrail
+    /// catches (TASK-303).
+    fn index_widened() -> ResolvedIndex {
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("body", SourceType::String),
+                SourceField::new("title", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        IndexDefinition::from_yaml(
+            r#"
+name: docs
+source: { iceberg: { catalog: growlerdb, table: growlerdb.docs } }
+mapping:
+  selection: EXPLICIT
+  fields:
+    - { path: id, type: KEYWORD }
+    - { path: body, type: TEXT }
+    - { path: title, type: TEXT }
+"#,
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap()
+    }
+
+    #[test]
+    fn reopening_with_a_changed_schema_errors_instead_of_panicking() {
+        // Build an index with schema A (id, body), then reopen the SAME data dir with schema B that
+        // adds a mapped `title` field (a wider derived Tantivy schema). Reopening the stale narrower
+        // index and writing wider-schema docs into it corrupts Tantivy's fast-field writer (the
+        // historical `index out of bounds: the len is N but the index is N` panic). The store must
+        // DETECT the change and refuse — never open the stale index — so the panic is unreachable.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalIndexStore::open(tmp.path()).unwrap();
+
+        // Schema A: build + commit real docs, so a built index (with meta.json) persists on disk.
+        let shard_a = store
+            .create_shard(&ShardId::single("docs"), &index())
+            .unwrap();
+        IndexWriter::write(&shard_a, &batch()).unwrap();
+        drop(shard_a);
+
+        // Schema B on the same dir: detected as a schema change, refused with the typed error —
+        // BEFORE any writer touches the stale index. Not a panic, not a silent stale-open.
+        let err = store
+            .create_shard(&ShardId::single("docs"), &index_widened())
+            .err()
+            .expect("reopening with a changed schema must error, not open the stale index");
+        assert!(
+            matches!(&err, StoreError::SchemaChanged { index } if index == "docs"),
+            "expected SchemaChanged, got {err:?}"
+        );
+
+        // The engine's reindex-from-scratch remedy (wipe the stale dir) lets schema B build cleanly:
+        // a fresh index with the wider schema accepts a doc carrying the new `title` field.
+        std::fs::remove_dir_all(tmp.path().join("docs")).unwrap();
+        let shard_b = store
+            .create_shard(&ShardId::single("docs"), &index_widened())
+            .unwrap();
+        let mut fields = BTreeMap::new();
+        fields.insert("id".to_string(), 1i64.into());
+        fields.insert("body".to_string(), "hello".into());
+        fields.insert("title".to_string(), "greeting".into());
+        let doc = LocatedDoc {
+            doc: Document::new(key(1), fields),
+            iceberg_file: "data/f0.parquet".into(),
+            row_position: 0,
+        };
+        IndexWriter::write(
+            &shard_b,
+            &CommitBatch::from_upserts(vec![doc], SourceCheckpoint::iceberg(1), "b1"),
+        )
+        .unwrap();
+        assert_eq!(
+            shard_b
+                .search_all(&Query::parse("title:greeting").unwrap(), 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     fn open_committed(tmp: &std::path::Path) -> Shard {

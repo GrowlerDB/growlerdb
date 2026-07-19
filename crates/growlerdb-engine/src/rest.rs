@@ -1875,6 +1875,14 @@ struct SemanticSearchDto {
     /// Target index name. Empty = the endpoint's default index.
     #[serde(default)]
     index: String,
+    /// Opt-in reranking: reorder the retrieved top-K by a cross-encoder over `query_text` and
+    /// each hit's cached source-field text. Off by default (retrieval-first).
+    #[serde(default)]
+    rerank: bool,
+    /// Candidate pool to rerank (retrieve this many, rerank, return the top `k`). 0 ⇒ rerank the
+    /// `k` retrieved. Ignored when `rerank` is false.
+    #[serde(default)]
+    rerank_top_k: u32,
 }
 
 impl SemanticSearchDto {
@@ -1892,6 +1900,8 @@ impl SemanticSearchDto {
             syntax: syntax_to_proto(&self.syntax),
             // The window selector is gateway-internal; a client request never sets it.
             window: 0,
+            rerank: self.rerank,
+            rerank_top_k: self.rerank_top_k,
         }
     }
 }
@@ -1919,6 +1929,14 @@ struct HybridSearchDto {
     /// Target index name. Empty = the endpoint's default index.
     #[serde(default)]
     index: String,
+    /// Opt-in reranking: the semantic arm reorders its candidates by a cross-encoder before the
+    /// arms are Reciprocal-Rank-Fused. Off by default.
+    #[serde(default)]
+    rerank: bool,
+    /// Candidate pool the semantic arm reranks. 0 ⇒ the arm's over-fetched set. Ignored when
+    /// `rerank` is false.
+    #[serde(default)]
+    rerank_top_k: u32,
 }
 
 impl HybridSearchDto {
@@ -1935,6 +1953,8 @@ impl HybridSearchDto {
             filter: self.filter,
             syntax: syntax_to_proto(&self.syntax),
             rrf_k: self.rrf_k,
+            rerank: self.rerank,
+            rerank_top_k: self.rerank_top_k,
         }
     }
 }

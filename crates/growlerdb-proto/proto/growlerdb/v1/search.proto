@@ -222,6 +222,13 @@ message SemanticSearchRequest {
   // Time-window selector for distributed windowed routing, mirroring SearchRequest.window:
   // gateway-set per scattered window; 0 = not windowed, ignored by a single-shard node.
   int64 window = 7;
+  // Opt-in **reranking** (D21): when true the Node reorders the retrieved top-K by a
+  // cross-encoder over (query_text, each hit's cached source-field text) before returning.
+  // Off by default (retrieval-first) — reranking is an extra per-hit model pass.
+  bool rerank = 8;
+  // Candidate pool to rerank when `rerank` is set: retrieve this many neighbors, rerank them,
+  // then return the top `k`. 0 ⇒ rerank exactly the `k` retrieved. Ignored when `rerank` is false.
+  uint32 rerank_top_k = 9;
 }
 
 // **Hybrid search** — a Gateway-only orchestration surface (no node RPC): the Gateway runs BOTH a
@@ -236,6 +243,13 @@ message HybridSearchRequest {
   string filter = 5;        // optional lexical/fast-field filter STRING for the semantic arm's KNN
   QuerySyntax syntax = 6;   // grammar for `query_text` (lexical arm) + `filter` (Lucene default)
   uint32 rrf_k = 7;         // RRF constant (0 ⇒ the standard default, 60)
+  // Opt-in **reranking** (D21): when true the semantic arm's Node reorders its retrieved
+  // candidates by a cross-encoder over (query_text, doc text) before the arms are fused, so the
+  // vector candidates carry cross-encoder relevance into the RRF. Off by default.
+  bool rerank = 8;
+  // Candidate pool the semantic arm reranks (see SemanticSearchRequest.rerank_top_k). 0 ⇒ the
+  // arm's over-fetched candidate set. Ignored when `rerank` is false.
+  uint32 rerank_top_k = 9;
 }
 
 // Read-side query service over a shard (adapts the in-process IndexReader).

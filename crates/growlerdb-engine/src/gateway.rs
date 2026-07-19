@@ -1244,6 +1244,11 @@ impl Gateway {
                 filter: body.filter.clone(),
                 syntax: body.syntax,
                 window: 0,
+                // Hybrid reranking reorders the semantic candidates node-side (where the vector
+                // spec + cached text live) before RRF, so the cross-encoder relevance carries into
+                // the fused ranks. `rerank_top_k` bounds the candidate pool the Node reranks.
+                rerank: body.rerank,
+                rerank_top_k: body.rerank_top_k,
             },
         );
 

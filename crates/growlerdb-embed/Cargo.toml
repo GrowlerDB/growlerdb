@@ -25,8 +25,19 @@ tokenizers = { version = "0.21", optional = true, default-features = false, feat
 serde_json = { workspace = true, optional = true }
 
 [features]
-default = ["bge"]
+default = ["bge", "rerank"]
 bge = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+    "dep:serde_json",
+]
+# The local cross-encoder reranker (bge-reranker-base, a BERT model on Candle). Behind a
+# default-on `rerank` feature that reuses the same pure-Rust ML deps as `bge`, so a
+# `--no-default-features` build carries ZERO ML deps and `reranker_for` falls back to the
+# dependency-free `HashReranker`.
+rerank = [
     "dep:candle-core",
     "dep:candle-nn",
     "dep:candle-transformers",

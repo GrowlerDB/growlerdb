@@ -220,12 +220,19 @@ impl Search for SearchService {
             |e: String| to_status(Code::InvalidArgument, WireError::new("INVALID_ARGUMENT", e));
 
         let k = req.k as usize;
-        // Self-defend against an unbounded `k` the same way the lexical path guards `offset+limit`:
-        // a direct Node RPC bypasses the Gateway ceiling, so a giant `k` would build an enormous
-        // top-k and OOM the process.
-        if k > MAX_NODE_FETCH {
+        // Opt-in reranking (D21): reorder the retrieved top-K by a cross-encoder before returning.
+        // When set, over-fetch a `rerank_top_k` candidate pool (default: exactly `k`), rerank it,
+        // and return the top `k`. Off by default (retrieval-first).
+        let rerank = req.rerank;
+        let rerank_top_k = req.rerank_top_k as usize;
+        // The KNN fetch depth: the rerank candidate pool when reranking, else just `k`.
+        let fetch = if rerank { rerank_top_k.max(k) } else { k };
+        // Self-defend against an unbounded fetch the same way the lexical path guards `offset+limit`:
+        // a direct Node RPC bypasses the Gateway ceiling, so a giant `k` (or rerank pool) would
+        // build an enormous top-k and OOM the process.
+        if fetch > MAX_NODE_FETCH {
             return Err(invalid(format!(
-                "k ({k}) exceeds the maximum page fetch ({MAX_NODE_FETCH})"
+                "fetch ({fetch}) exceeds the maximum page fetch ({MAX_NODE_FETCH})"
             )));
         }
         let field = req.vector_field;
@@ -236,6 +243,8 @@ impl Search for SearchService {
             .vector_spec(&field)
             .ok_or_else(|| invalid(format!("`{field}` is not a VECTOR field on this index")))?
             .clone();
+        // Keep the raw query text for reranking (the embed step below consumes a copy).
+        let query_text = req.query_text.clone();
 
         // Embed the query text with the SAME factory ingest uses (real BGE when provisioned, else
         // the deterministic hash fallback) — the query and the stored document vectors must come
@@ -262,17 +271,27 @@ impl Search for SearchService {
         let query = Query::Knn {
             field,
             vector,
-            k,
+            k: fetch,
             filter,
         };
         // Tenant scoping (fail-closed): a tenant-scoped index injects the mandatory tenant Term
         // *inside* the KNN filter; a scoped index with no claim is refused.
         let query = tenant_scope_knn(&shard, query, tenant.as_deref())?;
 
-        let hits = tokio::task::spawn_blocking(move || shard.search_all(&query, k))
-            .await
-            .map_err(internal)?
-            .map_err(store_status)?;
+        let source_field = spec.source_field.clone();
+        let hits = tokio::task::spawn_blocking(move || {
+            let hits = shard.search_all(&query, fetch)?;
+            // Reranking is CPU-bound (a per-hit model pass) — keep it on the blocking pool with the
+            // retrieval. It reorders using each hit's cached `source_field` text and truncates to `k`.
+            Ok::<_, StoreError>(if rerank {
+                rerank_hits(hits, &query_text, &source_field, k)
+            } else {
+                hits
+            })
+        })
+        .await
+        .map_err(internal)?
+        .map_err(store_status)?;
         Ok(Response::new(knn_response(hits)))
     }
 
@@ -576,6 +595,44 @@ fn tenant_scope_knn(shard: &Shard, query: Query, tenant: Option<&str>) -> Result
         field: Some(field.to_string()),
         value: tenant.to_string(),
     }))
+}
+
+/// Reorder retrieved `hits` by a cross-encoder reranker (D21), returning the top `top_k`. The
+/// reranker scores each hit against `query_text` using the hit's cached `source_field` text (a hit
+/// that doesn't carry that cached field reranks on empty text). The hit's `score` becomes the
+/// rerank relevance score. If the reranker errors, fall back to the retrieval order (truncated).
+/// Shared by the node's [`SearchService::semantic_search`] and the embedded engine's search path.
+pub(crate) fn rerank_hits(
+    hits: Vec<growlerdb_core::Hit>,
+    query_text: &str,
+    source_field: &str,
+    top_k: usize,
+) -> Vec<growlerdb_core::Hit> {
+    let docs: Vec<String> = hits
+        .iter()
+        .map(|h| {
+            h.fields
+                .get(source_field)
+                .map(growlerdb_core::Value::to_index_string)
+                .unwrap_or_default()
+        })
+        .collect();
+    let reranker = growlerdb_embed::reranker_for(growlerdb_embed::DEFAULT_RERANK_MODEL);
+    match reranker.rerank(query_text, &docs, top_k) {
+        Ok(order) => order
+            .into_iter()
+            .map(|(i, score)| {
+                let mut h = hits[i].clone();
+                h.score = score;
+                h
+            })
+            .collect(),
+        Err(_) => {
+            let mut hits = hits;
+            hits.truncate(top_k);
+            hits
+        }
+    }
 }
 
 /// Build a [`SearchResponse`] from KNN hits: coordinates + KNN score (in `SearchHit.score`), plus
@@ -1593,6 +1650,108 @@ mod tests {
             .into_inner();
         assert_eq!(resp.hits.len(), 1);
         assert_eq!(id_of(&resp.hits[0]), "doc-3");
+    }
+
+    /// A vector service whose `body` **source field is cached**, so each KNN hit carries its body
+    /// text — the input a reranker reorders on. Two docs are tuned so KNN order (cosine, which
+    /// favors a short dense doc) and token-overlap rerank order (which favors more shared terms)
+    /// **diverge**: `dense` shares 2 of the 4 query terms in a 2-token body (high cosine); `broad`
+    /// shares all 4 in a 10-token body (lower cosine, but the higher overlap the reranker rewards).
+    fn rerank_service(root: &std::path::Path) -> SearchService {
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("body", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        let idx = IndexDefinition::from_yaml(
+            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD }, { path: body, type: TEXT, cached: true }, { path: body_vec, type: VECTOR, vector: { dims: 64, source_field: body } } ] }\n",
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+        let shard = LocalIndexStore::open(root)
+            .unwrap()
+            .create_shard(&ShardId::single("docs"), &idx)
+            .unwrap();
+        let vdoc = |id: &str, body: &str| {
+            let key = CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]);
+            let mut f = BTreeMap::new();
+            f.insert("id".to_string(), Value::from(id));
+            f.insert("body".to_string(), Value::from(body));
+            LocatedDoc {
+                doc: Document::new(key, f),
+                iceberg_file: "f".into(),
+                row_position: 0,
+            }
+        };
+        let mut docs = vec![
+            vdoc("dense", "cat dog"),
+            vdoc(
+                "broad",
+                "cat dog bird fish whale shark octopus squid nine ten",
+            ),
+        ];
+        growlerdb_embed::embed_located_docs(&idx, &mut docs);
+        IndexWriter::write(
+            &shard,
+            &CommitBatch::from_upserts(docs, SourceCheckpoint::iceberg(1), "b1"),
+        )
+        .unwrap();
+        SearchService::new(Arc::new(shard))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rerank_is_off_by_default_and_reorders_when_requested() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = rerank_service(tmp.path());
+        let query = "cat dog bird fish";
+
+        // Off by default: KNN order stands. Cosine favors the short dense body (2 shared terms of 2
+        // tokens) over the diluted broad body (4 shared of 10) → `dense` first, KNN scores intact.
+        let plain = svc
+            .semantic_search(Request::new(SemanticSearchRequest {
+                vector_field: "body_vec".into(),
+                query_text: query.into(),
+                k: 2,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let plain_ids: Vec<String> = plain.hits.iter().map(id_of).collect();
+        assert_eq!(
+            plain_ids,
+            vec!["dense", "broad"],
+            "KNN order without rerank"
+        );
+
+        // Rerank on: the cross-encoder fallback (token overlap of the cached body) rewards the
+        // broad body's 4 shared terms over the dense body's 2 → the order flips, and the hit score
+        // becomes the rerank relevance score (overlap count), not the KNN score.
+        let reranked = svc
+            .semantic_search(Request::new(SemanticSearchRequest {
+                vector_field: "body_vec".into(),
+                query_text: query.into(),
+                k: 2,
+                rerank: true,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let reranked_ids: Vec<String> = reranked.hits.iter().map(id_of).collect();
+        assert_eq!(
+            reranked_ids,
+            vec!["broad", "dense"],
+            "rerank reorders by (query, doc-text) relevance"
+        );
+        assert_eq!(
+            reranked.hits[0].score, 4.0,
+            "top hit carries the rerank score"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

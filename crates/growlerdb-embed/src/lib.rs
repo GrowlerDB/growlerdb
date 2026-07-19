@@ -23,12 +23,53 @@
 use std::sync::Arc;
 
 use growlerdb_core::index_def::{EmbedProvider, ResolvedIndex, VectorSpec};
-use growlerdb_core::{Document, Embedder, HashEmbedder, Value};
+use growlerdb_core::{Document, Embedder, HashEmbedder, HashReranker, Reranker, Value};
 
 #[cfg(feature = "bge")]
 mod bge;
 #[cfg(feature = "bge")]
 pub use bge::BgeEmbedder;
+
+#[cfg(feature = "rerank")]
+mod bge_rerank;
+#[cfg(feature = "rerank")]
+pub use bge_rerank::BgeReranker;
+
+/// Default cross-encoder reranker model id ([D21]'s suggested local model). The reranker is
+/// opt-in per query and configured with no per-index model today, so the factory targets this
+/// one model directory; the [`HashReranker`] fallback carries the same id.
+///
+/// [D21]: ../../okf/system/decisions/d21-reranker.md
+pub const DEFAULT_RERANK_MODEL: &str = "bge-reranker-base";
+
+/// The reranker to use for `model_id`. Returns a real [`BgeReranker`] when the `rerank` feature is
+/// enabled and the cross-encoder model loads from the resolved model directory; otherwise falls
+/// back to core's dependency-free [`HashReranker`] (token overlap), logging a one-time warning.
+/// This is the single factory the search path calls when a query opts into reranking.
+pub fn reranker_for(model_id: &str) -> Arc<dyn Reranker> {
+    #[cfg(feature = "rerank")]
+    match BgeReranker::load(model_id) {
+        Ok(r) => return Arc::new(r),
+        Err(err) => warn_rerank_fallback(&format!(
+            "reranker model unavailable ({err}); using the dev token-overlap reranker. \
+             Provision the model under {} (or set GROWLERDB_MODEL_DIR).",
+            bge_rerank::model_dir(model_id).display()
+        )),
+    }
+
+    #[cfg(not(feature = "rerank"))]
+    warn_rerank_fallback("the `rerank` feature is disabled; using the dev token-overlap reranker");
+
+    Arc::new(HashReranker::new(model_id))
+}
+
+/// Log the reranker fallback reason exactly once per process (repeated per-query rerank calls
+/// would otherwise spam it).
+fn warn_rerank_fallback(msg: &str) {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| tracing::warn!("{msg}"));
+}
 
 /// The embedder to use for `spec`. Returns a real [`BgeEmbedder`] when the `bge` feature is
 /// enabled, the provider is [`Local`](EmbedProvider::Local), and the model loads from the
@@ -142,6 +183,26 @@ mod tests {
         let out = e.embed(&["hello world".into(), "".into()]).unwrap();
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|v| v.len() == 384));
+
+        std::env::remove_var("GROWLERDB_MODEL_DIR");
+    }
+
+    #[test]
+    fn reranker_for_falls_back_to_hash_when_no_model() {
+        // No provisioned model dir → the deterministic token-overlap reranker, for both the
+        // `rerank`-on (load fails → fallback) and `rerank`-off (feature gate) builds.
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("GROWLERDB_MODEL_DIR", tmp.path());
+
+        let r = reranker_for(DEFAULT_RERANK_MODEL);
+        assert_eq!(r.model_id(), DEFAULT_RERANK_MODEL);
+        // It reorders a known set by token overlap (the fallback's signal), best-first.
+        let docs = vec![
+            "unrelated words here".to_string(),
+            "vector semantic embeddings retrieval".to_string(),
+        ];
+        let order = r.rerank("semantic vector embeddings", &docs, 2).unwrap();
+        assert_eq!(order[0].0, 1, "the overlapping doc reranks first");
 
         std::env::remove_var("GROWLERDB_MODEL_DIR");
     }

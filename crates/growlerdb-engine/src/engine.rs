@@ -14,7 +14,7 @@ use growlerdb_core::{
 // Ingest embeds via the BGE-capable factory (real local model, or the hash-embedder fallback),
 // not core's built-in `default_embedder`.
 use growlerdb_embed::{embed_located_docs, embedder_for};
-use growlerdb_index::{LocalIndexStore, Shard, ShardId};
+use growlerdb_index::{IndexSchema, LocalIndexStore, Shard, ShardId};
 use growlerdb_source::{IcebergConfig, IcebergReader};
 
 use crate::{hydrate, EngineError};
@@ -224,6 +224,13 @@ impl Engine {
         // The per-shard build filter: keep only docs this ordinal owns. None for a single-shard
         // (full) build. Windowed indexes shard by time window, so ordinal sharding doesn't apply.
         let filter = shard_build_filter(&resolved, shards, shard_ordinal)?;
+
+        // A `growlerdb index` run is a full build. If a previously-built index for this name persists
+        // on disk with a *different* schema (a mapped field added/removed/renamed, or a type/fast-ness
+        // change), reopening it and writing new-schema documents would corrupt Tantivy's fast-field
+        // writer (a field-count mismatch panic). Detect that up front and reindex from scratch — wipe
+        // the stale dir so the build below creates a fresh index with the new schema.
+        self.reindex_on_schema_change(&index_name, &resolved)?;
 
         self.persist_definition(&index_name, &resolved)?;
 
@@ -517,6 +524,11 @@ impl Engine {
         tenant: Option<&str>,
         hydrate: bool,
         projection: Projection,
+        // Opt-in reranking (D21): reorder the retrieved top-K by a cross-encoder over
+        // `query_text` and each hit's cached source-field text. `rerank_top_k` is the candidate
+        // pool to fetch + rerank (0 ⇒ exactly `k`). Off by default.
+        rerank: bool,
+        rerank_top_k: usize,
     ) -> Result<SearchOutcome, EngineError> {
         let resolved = self.load_definition(index)?;
         // The named field must be a VECTOR field — its `VectorSpec` drives the query embedder.
@@ -526,6 +538,9 @@ impl Engine {
             .find(|f| f.path == field)
             .and_then(|f| f.vector.as_ref())
             .ok_or_else(|| EngineError::NotVectorField(field.to_string()))?;
+
+        // The KNN fetch depth: the rerank candidate pool when reranking, else just `k`.
+        let fetch = if rerank { rerank_top_k.max(k) } else { k };
 
         // Embed the query text with the SAME factory ingest uses (real BGE when a model is
         // provisioned, else the deterministic hash fallback) — the query and the stored document
@@ -537,7 +552,7 @@ impl Engine {
         let mut query = Query::Knn {
             field: field.to_string(),
             vector,
-            k,
+            k: fetch,
             filter: None,
         };
         // Tenant enforcement (filtered KNN, TASK-43): on a tenant-scoped index the caller MUST
@@ -558,7 +573,14 @@ impl Engine {
         }
 
         let shard = self.store.open_shard(&ShardId::single(index), &resolved)?;
-        let hits = shard.search_all(&query, k)?;
+        let hits = shard.search_all(&query, fetch)?;
+        // Reranking reorders the retrieved pool by (query, cached source-field text) relevance and
+        // returns the top `k`; off by default it's a plain KNN top-`k`.
+        let hits = if rerank {
+            crate::search_service::rerank_hits(hits, query_text, &spec.source_field, k)
+        } else {
+            hits
+        };
 
         let rows = if hydrate {
             let keys: Vec<CompositeKey> = hits.iter().map(|h| h.key.clone()).collect();
@@ -593,6 +615,10 @@ impl Engine {
         tenant: Option<&str>,
         hydrate: bool,
         projection: Projection,
+        // Opt-in reranking (D21): the semantic arm reorders its candidates by a cross-encoder
+        // before RRF, so cross-encoder relevance carries into the fused ranks. Off by default.
+        rerank: bool,
+        rerank_top_k: usize,
     ) -> Result<SearchOutcome, EngineError> {
         let resolved = self.load_definition(index)?;
         let spec = resolved
@@ -618,6 +644,13 @@ impl Engine {
         // Over-fetch each arm so the fusion has depth to work with (a doc ranked past `k` in one
         // arm can still win once the other arm's rank is added in).
         let k_each = k.max(10) * 2;
+        // When reranking, fetch the larger of the fusion depth and the requested rerank pool for
+        // the semantic arm, so a caller can rerank a deeper candidate set than the fusion depth.
+        let knn_k = if rerank {
+            k_each.max(rerank_top_k)
+        } else {
+            k_each
+        };
 
         // Lexical arm: parse the query text (an empty/unparseable query falls back to match-all so
         // hybrid still returns the semantic arm). Tenant-scope with the non-widenable filter.
@@ -634,7 +667,7 @@ impl Engine {
         let mut knn = Query::Knn {
             field: field.to_string(),
             vector,
-            k: k_each,
+            k: knn_k,
             filter: None,
         };
         if let Some((tf, claim)) = &tenant_claim {
@@ -646,7 +679,14 @@ impl Engine {
 
         let shard = self.store.open_shard(&ShardId::single(index), &resolved)?;
         let lexical_hits = shard.search_all(&lexical, k_each)?;
-        let vector_hits = shard.search_all(&knn, k_each)?;
+        let vector_hits = shard.search_all(&knn, knn_k)?;
+        // Reranking reorders the semantic arm's candidates by (query, cached source-field text)
+        // relevance before fusion, so the cross-encoder signal carries into the fused RRF ranks.
+        let vector_hits = if rerank {
+            crate::search_service::rerank_hits(vector_hits, query_text, &spec.source_field, k_each)
+        } else {
+            vector_hits
+        };
 
         let hits = rrf_fuse(&[&lexical_hits, &vector_hits], RRF_K, k);
 
@@ -706,6 +746,42 @@ impl Engine {
     /// Path to the persisted definition for `index`.
     fn definition_path(&self, index: &str) -> PathBuf {
         self.root.join(index).join("index.json")
+    }
+
+    /// If an index for `index` was already built and its persisted definition derives a **different**
+    /// Tantivy schema than `resolved` (a mapped-field add/remove/rename or a field type/fast-ness
+    /// change — anything that changes the field set the segment writer expects), wipe its on-disk
+    /// state so the build reindexes from scratch against the new schema. A schema change invalidates
+    /// the old segments+locator+checkpoint, so a fresh build is the correct behavior (same hard-reset
+    /// as [`rebuild`](Self::rebuild)). Without this, reopening the stale narrower index and adding
+    /// wider-schema documents panics Tantivy's fast-field writer (a field-count mismatch). No prior
+    /// definition (a fresh volume), or a schema-compatible re-run, is a no-op.
+    fn reindex_on_schema_change(
+        &self,
+        index: &str,
+        resolved: &ResolvedIndex,
+    ) -> Result<(), EngineError> {
+        let path = self.definition_path(index);
+        if !path.exists() {
+            return Ok(()); // nothing built yet — a fresh index
+        }
+        let old: ResolvedIndex = serde_json::from_slice(&std::fs::read(&path)?)?;
+        // Compare the *derived Tantivy schemas*, not the definitions: that is exactly the field set
+        // (count/types/fast-ness) the segment writer is built against, so it flags precisely the
+        // changes that would corrupt the writer while ignoring cosmetic definition edits.
+        let old_schema = IndexSchema::from_resolved(&old);
+        let new_schema = IndexSchema::from_resolved(resolved);
+        if old_schema.tantivy_schema() != new_schema.tantivy_schema() {
+            tracing::info!(
+                index,
+                "index schema changed since the last build — reindexing from scratch"
+            );
+            let dir = self.root.join(index);
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir)?;
+            }
+        }
+        Ok(())
     }
 
     /// Persist a resolved definition so `search` can reopen the shard later.
@@ -975,6 +1051,8 @@ mod tests {
                 None,
                 false,
                 Projection::All,
+                false,
+                0,
             )
             .await
             .unwrap();
@@ -984,7 +1062,17 @@ mod tests {
 
         // Naming a non-vector field is a clear error.
         let err = engine
-            .semantic_search("docs", "body", "x", 1, None, false, Projection::All)
+            .semantic_search(
+                "docs",
+                "body",
+                "x",
+                1,
+                None,
+                false,
+                Projection::All,
+                false,
+                0,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, EngineError::NotVectorField(f) if f == "body"));
@@ -1024,7 +1112,17 @@ mod tests {
         let engine = Engine::open(root, IcebergConfig::local()).unwrap();
         // A tenant-scoped index with NO claim still fails closed — never returns cross-tenant rows.
         let err = engine
-            .semantic_search("docs", "body_vec", "x", 1, None, false, Projection::All)
+            .semantic_search(
+                "docs",
+                "body_vec",
+                "x",
+                1,
+                None,
+                false,
+                Projection::All,
+                false,
+                0,
+            )
             .await
             .unwrap_err();
         assert!(matches!(
@@ -1108,6 +1206,8 @@ mod tests {
                 Some("t1"),
                 false,
                 Projection::All,
+                false,
+                0,
             )
             .await
             .unwrap();
@@ -1188,6 +1288,8 @@ mod tests {
                 None,
                 false,
                 Projection::All,
+                false,
+                0,
             )
             .await
             .unwrap();
@@ -1280,6 +1382,79 @@ mod tests {
         assert_eq!(out.hits.len(), 1);
         assert_eq!(out.hits[0].key.get("id"), Some(&Value::from("doc-2")));
         assert!(out.rows.is_none());
+    }
+
+    #[test]
+    fn reindex_on_schema_change_wipes_a_stale_index_but_leaves_an_unchanged_one() {
+        // A previously-built `docs` index (schema A: id, body). A `growlerdb index` re-run with a
+        // *widened* definition (adds a mapped `title` field) must reindex from scratch rather than
+        // reopen the stale narrower index and panic Tantivy's fast-field writer (TASK-303). A re-run
+        // with the SAME schema must be a no-op (the built data is preserved).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        seed_index(root); // builds `docs` (schema A) + persists its index.json
+        let engine = Engine::open(root, IcebergConfig::local()).unwrap();
+        let docs_dir = root.join("docs");
+        assert!(docs_dir.join("index.json").exists());
+
+        // Same schema ⇒ no-op: the built index (and its data) survive.
+        engine
+            .reindex_on_schema_change("docs", &resolved())
+            .unwrap();
+        assert!(
+            docs_dir.exists(),
+            "an unchanged schema must not wipe the index"
+        );
+
+        // Widened schema ⇒ the stale on-disk index is wiped so the build reindexes from scratch.
+        let widened = {
+            let src = SourceSchema::new(
+                vec![
+                    SourceField::new("id", SourceType::String),
+                    SourceField::new("body", SourceType::String),
+                    SourceField::new("title", SourceType::String),
+                ],
+                vec![],
+                vec!["id".into()],
+            );
+            IndexDefinition::from_yaml(
+                "name: docs\nsource: { iceberg: { catalog: growlerdb, table: growlerdb.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD }, { path: body, type: TEXT }, { path: title, type: TEXT } ] }\n",
+            )
+            .unwrap()
+            .resolve(&src)
+            .unwrap()
+        };
+        engine.reindex_on_schema_change("docs", &widened).unwrap();
+        assert!(
+            !docs_dir.exists(),
+            "a changed schema reindexes from scratch (wipes the stale dir)"
+        );
+
+        // The wiped dir now builds cleanly against the widened schema — a fresh index whose writer
+        // schema matches the wider docs, so the historical field-count panic is unreachable.
+        let shard = engine
+            .store
+            .create_shard(&ShardId::single("docs"), &widened)
+            .unwrap();
+        let mut fields = BTreeMap::new();
+        fields.insert("id".to_string(), Value::from("doc-1"));
+        fields.insert("body".to_string(), Value::from("hello world"));
+        fields.insert("title".to_string(), Value::from("greeting"));
+        let key = CompositeKey::new(vec![], vec![("id".into(), Value::from("doc-1"))]);
+        IndexWriter::write(
+            &shard,
+            &CommitBatch::from_upserts(
+                vec![LocatedDoc {
+                    doc: Document::new(key, fields),
+                    iceberg_file: "data/f0.parquet".into(),
+                    row_position: 0,
+                }],
+                SourceCheckpoint::iceberg(1),
+                "b1",
+            ),
+        )
+        .unwrap();
+        assert_eq!(shard.num_docs().unwrap(), 1);
     }
 
     fn doc(id: &str, body: &str, pos: u64) -> LocatedDoc {
@@ -1678,7 +1853,17 @@ mod tests {
                 .await
                 .unwrap();
             let hyb = engine
-                .hybrid_search("docs", "body_vec", q, 10, None, false, Projection::All)
+                .hybrid_search(
+                    "docs",
+                    "body_vec",
+                    q,
+                    10,
+                    None,
+                    false,
+                    Projection::All,
+                    false,
+                    0,
+                )
                 .await
                 .unwrap();
             lex_mrr += rr(&lex.hits, rel);
