@@ -2,6 +2,7 @@
 title: Getting started
 layout: default
 nav_order: 2
+has_children: true
 ---
 
 # Getting started
@@ -310,6 +311,11 @@ query from the same box. The **Ask** screen goes further: pose a natural-languag
 `catalog` and it hybrid-retrieves the matching source passages, each shown with a **citation** back to
 its exact Iceberg coordinates. GrowlerDB does the *retrieval* and returns governed coordinates +
 citations — **it never calls an LLM**; generating a prose answer is the caller's job (see §7).
+
+> **Want retrieval quality you can feel?** Ten rows can't show ranking. `just demo-data` loads the
+> opt-in **arXiv corpus** — ~20k CS abstracts, embedded locally — where semantic vs lexical vs
+> hybrid visibly differ and agent Q&A (§7) has real substance. See
+> [Demo corpus (arXiv)](demo-corpus).
 
 ## 7. Connect an AI agent (MCP)
 

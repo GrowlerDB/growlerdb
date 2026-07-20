@@ -26,3 +26,5 @@ __pycache__/
 
 # Local embedding-model cache for the demo stack (fallback when GROWLERDB_MODEL_DIR is unset)
 deploy/compose/model-cache/
+deploy/compose/demo-data/local/*
+!deploy/compose/demo-data/local/.gitkeep
