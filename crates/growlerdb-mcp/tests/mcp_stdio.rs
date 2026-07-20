@@ -13,7 +13,7 @@ use axum::{
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use growlerdb_mcp::{serve_io, GatewayClient, McpConfig, McpError};
+use growlerdb_mcp::{serve_io, GatewayClient, McpConfig, McpError, QueryBackend};
 
 const TOKEN: &str = "test-token";
 
@@ -241,7 +241,12 @@ async fn default_protocol_version_when_client_omits_one() {
         vec![json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} })],
     )
     .await;
-    assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
+    // The Streamable-HTTP-era default: a client that omits the version gets 2025-03-26,
+    // per the spec's missing-version guidance.
+    assert_eq!(
+        responses[0]["result"]["protocolVersion"],
+        growlerdb_mcp::DEFAULT_PROTOCOL_VERSION
+    );
 }
 
 #[tokio::test]

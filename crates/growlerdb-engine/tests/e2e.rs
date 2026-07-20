@@ -486,3 +486,124 @@ async fn reconcile_backstop_detects_and_repairs_drift_both_ways() {
     let again = engine.reconcile("docs").await.expect("re-reconcile");
     assert!(again.is_clean(), "second reconcile is a no-op: {again:?}");
 }
+
+/// **MCP Streamable HTTP transport e2e** — an HTTP MCP client's flow against the real stack:
+/// build the index from the seeded `growlerdb.docs` Iceberg table, mount the composed REST
+/// surface + `/mcp` exactly as the CLI fronts do, then drive `initialize` → `tools/list` →
+/// `tools/call search` (with inline hydration) over the transport and assert the authoritative
+/// row comes back from the real lakehouse — tool calls riding the same admitted, governed
+/// `/v1` surface as any other query.
+#[tokio::test]
+#[ignore = "requires the local dev stack (just up) + `127.0.0.1 minio` in /etc/hosts"]
+async fn mcp_http_transport_searches_and_hydrates_the_real_stack() {
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request as HttpRequest;
+    use growlerdb_engine::{
+        mcp_router, rest, AdminService, Gateway, LocalNode, LookupService, SearchService,
+        SuggestService,
+    };
+    use growlerdb_index::Shard;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    // Author the same shape the walking skeleton indexes, so the shard can be reopened
+    // outside the Engine (open_shard needs the resolved definition).
+    let def = "name: docs\n\
+               source: { iceberg: { catalog: growlerdb, table: growlerdb.docs } }\n\
+               key: { identifier_fields: [id] }\n\
+               mapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD }, \
+               { path: title, type: TEXT }, { path: body, type: TEXT } ] }\n";
+
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = Engine::open(tmp.path(), IcebergConfig::local()).unwrap();
+    let indexed = engine
+        .index("growlerdb.docs", Some(def), None)
+        .await
+        .expect("index growlerdb.docs");
+    assert_eq!(indexed.doc_count, 3);
+
+    // Reopen the built shard and front it with the real services + Gateway + REST + /mcp.
+    let reader = IcebergReader::connect(&IcebergConfig::local())
+        .await
+        .unwrap();
+    let schema = reader.read_source_schema("growlerdb.docs").await.unwrap();
+    let resolved = growlerdb_core::IndexDefinition::from_yaml(def)
+        .unwrap()
+        .resolve(&schema)
+        .unwrap();
+    let shard: Arc<Shard> = Arc::new(
+        LocalIndexStore::open(tmp.path())
+            .unwrap()
+            .open_shard(&ShardId::single("docs"), &resolved)
+            .unwrap(),
+    );
+    let auth = growlerdb_engine::auth::default_auth();
+    let node = LocalNode::new(
+        SearchService::with_auth(shard.clone(), auth.clone()),
+        SuggestService::with_auth(shard.clone(), auth.clone()),
+        LookupService::with_auth(
+            shard.clone(),
+            IcebergConfig::local(),
+            "growlerdb.docs",
+            auth.clone(),
+        ),
+        AdminService::with_auth(shard, "docs", auth),
+    );
+    let gw = Arc::new(Gateway::new(node.shared()));
+    let v1 = rest::router(gw.clone());
+    let app = v1.clone().merge(mcp_router(v1, gw));
+
+    let post = |body: serde_json::Value| {
+        let app = app.clone();
+        async move {
+            let req = HttpRequest::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            let status = resp.status();
+            let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            )
+        }
+    };
+
+    // initialize → tools/list → search(hydrate) — the client flow, over the HTTP transport.
+    let (status, init) = post(serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": "2025-06-18" }
+    }))
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(init["result"]["serverInfo"]["name"], "growlerdb");
+
+    let (status, list) = post(serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list"
+    }))
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 5);
+
+    let (status, resp) = post(serde_json::json!({
+        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": { "name": "search",
+                    "arguments": { "query": "body:iceberg", "hydrate": true } }
+    }))
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(resp["result"]["isError"], false);
+    let payload: serde_json::Value =
+        serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let hit = &payload["hits"][0];
+    assert_eq!(hit["coordinates"]["identifier"][0]["value"], "doc-2");
+    // The authoritative row, hydrated from the real Iceberg table through the one tool call.
+    assert_eq!(hit["row"]["title"], "iceberg search");
+    assert_eq!(
+        hit["row"]["body"],
+        "fast full text search over apache iceberg"
+    );
+}

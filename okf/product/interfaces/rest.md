@@ -4,7 +4,7 @@ title: REST API
 description: The /v1/* HTTP+JSON Engine API served by the gateway (and a bare node).
 tags: [interface, rest, api]
 resource: /docs/rest-api.md
-timestamp: 2026-07-04T14:22:00
+timestamp: 2026-07-20T00:00:00
 ---
 
 # REST API
@@ -28,4 +28,6 @@ the gateway validates.
 
 The full endpoint reference is in [docs/rest-api.md](/docs/rest-api.md). Behavior of each capability
 is described under [product/functional](/product/functional/index.md); the wire types mirror the
-[gRPC API](/product/interfaces/grpc.md).
+[gRPC API](/product/interfaces/grpc.md). The same listener also serves the
+[MCP Streamable HTTP transport](/product/interfaces/mcp-server.md) at `POST /mcp` — the agent face
+of this query surface.

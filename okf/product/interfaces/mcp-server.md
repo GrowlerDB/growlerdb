@@ -17,13 +17,22 @@ agent-native face of [retrieval-first](/system/decisions/d42-retrieval-first.md)
 
 - **Read-only.** It exposes retrieval, not ingest or admin — those stay on the native
   [REST](/product/interfaces/rest.md) / [gRPC](/product/interfaces/grpc.md) API.
-- **Transport: stdio** (JSON-RPC 2.0), the common local-agent path (e.g. Claude Desktop). An HTTP/SSE
-  transport is a later addition.
-- **Fronts the gateway.** The server is a thin adapter that calls the authenticated gateway over HTTP,
-  forwarding the caller's `Authorization: Bearer <token>`. It **synthesizes no identity** — RBAC,
-  per-index scope, and the non-widenable [tenant filter](/product/functional/rbac-and-tenancy.md) all
-  ride the verified token and are enforced by the gateway, so **an agent physically cannot retrieve
-  another tenant's data**. (Tenancy stays opt-in; a single-tenant deployment scopes by RBAC only.)
+- **Two transports, one protocol core** (the same JSON-RPC 2.0 dispatch and tool set):
+  - **Streamable HTTP at `POST /mcp`**, served by every REST front (gateway, bare node, replica,
+    windowed) same-origin with the console — the remote-agent path: a URL + bearer token connects
+    Claude web/desktop connectors, hosted agent platforms, or CI with no local binary.
+    **Sessionless** (no `Mcp-Session-Id`; scales horizontally), **POST-only** (no server-initiated
+    messages, so `GET /mcp` is 405 and responses are plain JSON, not SSE), no JSON-RPC batching
+    (spec 2025-06-18), `Origin` validation against DNS rebinding, and on a closed deployment a
+    missing/invalid bearer answers `401` + `WWW-Authenticate: Bearer` before any protocol work.
+  - **stdio** (`growlerdb mcp`, newline-delimited), the local-agent path (e.g. Claude Desktop
+    against a remote gateway) — a thin adapter calling the gateway's REST surface over HTTP.
+- **Fronts the one query surface.** Both transports **synthesize no identity** — they forward the
+  caller's `Authorization: Bearer <token>` verbatim (the HTTP transport re-enters the gateway's own
+  `/v1` router in-process), so authn, RBAC, per-index scope, the non-widenable
+  [tenant filter](/product/functional/rbac-and-tenancy.md), and admission control are enforced by
+  the same path as every other query — **an agent physically cannot retrieve another tenant's
+  data**. (Tenancy stays opt-in; a single-tenant deployment scopes by RBAC only.)
 
 ## Tools
 

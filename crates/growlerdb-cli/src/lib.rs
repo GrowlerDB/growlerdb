@@ -1696,9 +1696,9 @@ async fn serve(cfg: ServeConfig<'_>) -> anyhow::Result<()> {
                 .with_limits(growlerdb_engine::GatewayLimits::from_env())
                 .serving(resolved.name.clone()),
         );
-        let router = rest_router(gateway, ui_dir);
+        let router = with_mcp(rest_router(gateway.clone(), ui_dir), gateway);
         let listener = tokio::net::TcpListener::bind(rest_socket).await?;
-        println!("serving REST/JSON gateway on http://{rest_socket}/v1/...");
+        println!("serving REST/JSON gateway on http://{rest_socket}/v1/... (+ MCP on /mcp)");
         tokio::spawn(async move {
             let shutdown = async {
                 let _ = tokio::signal::ctrl_c().await;
@@ -1940,9 +1940,9 @@ async fn serve_replica(
                 .with_limits(growlerdb_engine::GatewayLimits::from_env())
                 .serving(resolved.name.clone()),
         );
-        let router = rest_router(gateway, ui_dir);
+        let router = with_mcp(rest_router(gateway.clone(), ui_dir), gateway);
         let listener = tokio::net::TcpListener::bind(rest_socket).await?;
-        println!("replica REST/JSON gateway on http://{rest_socket}/v1/...");
+        println!("replica REST/JSON gateway on http://{rest_socket}/v1/... (+ MCP on /mcp)");
         tokio::spawn(async move {
             let shutdown = async {
                 let _ = tokio::signal::ctrl_c().await;
@@ -2336,7 +2336,7 @@ async fn serve_windowed(
     let rest_socket: std::net::SocketAddr = rest_addr
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid --rest-addr `{rest_addr}`: {e}"))?;
-    let router = rest_router(gateway.clone(), ui_dir);
+    let router = with_mcp(rest_router(gateway.clone(), ui_dir), gateway.clone());
     let listener = tokio::net::TcpListener::bind(rest_socket).await?;
     println!(
         "serving windowed index `{index}` ({} windows: {hot_count} hot, {cold_count} cold read-through) REST/JSON on http://{rest_socket}/v1/...",
@@ -2678,6 +2678,10 @@ pub async fn gateway(cfg: GatewayConfig<'_>) -> anyhow::Result<()> {
         router = router.merge(growlerdb_engine::opensearch_router(gw.clone()));
         println!("gateway: OpenSearch-compatible adapter on http://{rest_socket}/<index>/_search");
     }
+    // MCP Streamable HTTP transport, mounted over the fully-merged /v1 surface (so agent tool
+    // calls can reach the control-plane proxy's /v1/indexes too, when wired).
+    router = with_mcp(router, gw.clone());
+    println!("gateway: MCP Streamable HTTP transport on http://{rest_socket}/mcp");
     // RED metrics for every REST endpoint: one layer over the fully-merged router, so
     // `MatchedPath` resolves the route template for all `/v1/*` routes.
     router = router.layer(axum::middleware::from_fn(
@@ -2728,6 +2732,14 @@ fn rest_router(
         }
         None => growlerdb_engine::rest::router(gateway),
     }
+}
+
+/// Mount the MCP **Streamable HTTP transport** (`POST /mcp`) over a composed REST router.
+/// Tool calls re-enter `v1` in-process, so call this LAST — after every `/v1` merge — so
+/// everything mounted there (search, keys:get, facets, `/v1/indexes` when the control-plane
+/// proxy is wired) is reachable through MCP under the same enforcement.
+fn with_mcp(v1: axum::Router, gateway: std::sync::Arc<growlerdb_engine::Gateway>) -> axum::Router {
+    v1.clone().merge(growlerdb_engine::mcp_router(v1, gateway))
 }
 
 /// Spawn the health/readiness + Prometheus `/metrics` server on `addr`, returning a

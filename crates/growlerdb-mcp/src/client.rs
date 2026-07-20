@@ -1,4 +1,5 @@
-//! HTTP client that fronts the GrowlerDB **gateway** REST surface (`<gateway-url>/v1/...`).
+//! HTTP client that fronts the GrowlerDB **gateway** REST surface (`<gateway-url>/v1/...`) —
+//! the remote [`QueryBackend`] the stdio server uses.
 //!
 //! The MCP server embeds no engine: it forwards the caller's bearer token to the gateway and lets
 //! the gateway's existing RBAC + tenant isolation govern every read. We only ever *forward* the
@@ -7,6 +8,7 @@
 
 use serde_json::Value;
 
+use crate::backend::{interpret_response, QueryBackend};
 use crate::error::McpError;
 
 /// A thin reqwest wrapper over the gateway's read endpoints. Cheap to clone (`reqwest::Client` is
@@ -52,66 +54,12 @@ impl GatewayClient {
         Self::read(req.send().await?).await
     }
 
-    /// Map a response into either its JSON body (2xx) or a typed [`McpError::Gateway`]
-    /// (from the gateway's `{code, message}` error body) so a tool call surfaces it as `isError`.
+    /// Map a response into either its JSON body (2xx) or a typed [`McpError::Gateway`] so a
+    /// tool call surfaces it as `isError` — via the backend-shared [`interpret_response`].
     async fn read(resp: reqwest::Response) -> Result<Value, McpError> {
-        let status = resp.status();
-        if status.is_success() {
-            Ok(resp.json().await?)
-        } else {
-            let body: Value = resp.json().await.unwrap_or(Value::Null);
-            let code = body
-                .get("code")
-                .and_then(Value::as_str)
-                .unwrap_or("UNKNOWN")
-                .to_string();
-            let message = body
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("gateway request failed")
-                .to_string();
-            Err(McpError::Gateway {
-                status: status.as_u16(),
-                code,
-                message,
-            })
-        }
-    }
-
-    /// `POST /v1/search` — lexical (BM25) search.
-    pub async fn search(&self, body: Value) -> Result<Value, McpError> {
-        self.post("/search", body).await
-    }
-
-    /// `POST /v1/search:semantic` — semantic (vector KNN) search.
-    pub async fn semantic_search(&self, body: Value) -> Result<Value, McpError> {
-        self.post("/search:semantic", body).await
-    }
-
-    /// `POST /v1/search:hybrid` — hybrid (lexical + vector, RRF-fused) search.
-    pub async fn hybrid_search(&self, body: Value) -> Result<Value, McpError> {
-        self.post("/search:hybrid", body).await
-    }
-
-    /// `POST /v1/keys:get` — hydrate coordinates into authoritative rows.
-    pub async fn hydrate(&self, body: Value) -> Result<Value, McpError> {
-        self.post("/keys:get", body).await
-    }
-
-    /// `POST /v1/facets` — term-facet aggregation.
-    pub async fn facets(&self, body: Value) -> Result<Value, McpError> {
-        self.post("/facets", body).await
-    }
-
-    /// `POST /v1/index:describe` — index stats.
-    pub async fn describe(&self, index: &str) -> Result<Value, McpError> {
-        self.post("/index:describe", serde_json::json!({ "index": index }))
-            .await
-    }
-
-    /// `GET /v1/indexes` — list available indexes (served by the control-plane REST surface).
-    pub async fn list_indexes(&self) -> Result<Value, McpError> {
-        self.get("/indexes").await
+        let status = resp.status().as_u16();
+        let body = resp.bytes().await?;
+        interpret_response(status, &body)
     }
 
     /// `POST /v1/login` — exchange credentials for a session token. Returns the token string.
@@ -126,5 +74,36 @@ impl GatewayClient {
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| McpError::Config("login response contained no token".to_string()))
+    }
+}
+
+impl QueryBackend for GatewayClient {
+    async fn search(&self, body: Value) -> Result<Value, McpError> {
+        self.post("/search", body).await
+    }
+
+    async fn semantic_search(&self, body: Value) -> Result<Value, McpError> {
+        self.post("/search:semantic", body).await
+    }
+
+    async fn hybrid_search(&self, body: Value) -> Result<Value, McpError> {
+        self.post("/search:hybrid", body).await
+    }
+
+    async fn hydrate(&self, body: Value) -> Result<Value, McpError> {
+        self.post("/keys:get", body).await
+    }
+
+    async fn facets(&self, body: Value) -> Result<Value, McpError> {
+        self.post("/facets", body).await
+    }
+
+    async fn describe(&self, index: &str) -> Result<Value, McpError> {
+        self.post("/index:describe", serde_json::json!({ "index": index }))
+            .await
+    }
+
+    async fn list_indexes(&self) -> Result<Value, McpError> {
+        self.get("/indexes").await
     }
 }
