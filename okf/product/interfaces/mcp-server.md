@@ -60,7 +60,10 @@ agent-native face of [retrieval-first](/system/decisions/d42-retrieval-first.md)
 
 The tool descriptions are written for an agent to read: retrieve coordinates, then hydrate them for
 the authoritative answer — and index authors should mark the fields agents read as `cached`, so
-`search` alone answers. **Failed tool calls teach the recovery move**: a 400 points at
+`search` alone answers. The server also sets the MCP **`instructions`** field on `initialize` —
+field-tested steering: an agent inside a code checkout otherwise greps *files* when asked what "the
+catalog" says, and defaults to lexical mode (no stemming: `hydration` ≠ `hydrate`) when hybrid over
+the index's vector field is the right call. The instructions push describe-first + hybrid-when-vectors. **Failed tool calls teach the recovery move**: a 400 points at
 `describe_index` + the syntax resource, a 404 at `list_indexes`, a 401/403 at the token's
 index/tenant scope.
 

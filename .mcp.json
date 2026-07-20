@@ -1,11 +1,3 @@
 {
-  "mcpServers": {
-    "growlerdb-demo": {
-      "type": "http",
-      "url": "http://localhost:8081/mcp",
-      "headers": {
-        "Authorization": "Bearer ${GROWLERDB_DEMO_TOKEN}"
-      }
-    }
-  }
+  "mcpServers": {}
 }

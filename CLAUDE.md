@@ -18,3 +18,10 @@ is and how it works is the **OKF** in [`okf/`](okf/index.md) — start there.
   the conformance check (`just okf-check`). See [`okf/workflow.md`](okf/workflow.md).
 
 No commit trailer. Keep PRs small and honestly scoped.
+
+## Querying GrowlerDB data
+
+When asked what a GrowlerDB **index** (`docs`, `catalog`, `arxiv`, …) says or contains, use the
+**growlerdb MCP tools** (`search`, `describe_index`, …) against the running demo stack — not file
+search over this repo. `describe_index` first; prefer `mode: hybrid` when the index has vector
+fields (lexical does no stemming).
