@@ -131,7 +131,10 @@ query matches it (`detail`/score are present only when it matches).
 
 ### `POST /v1/index:describe`
 Per-index stats merged across shards (`num_docs`, `snapshot`, `checkpoint`, …) when the gateway
-fronts the index.
+fronts the index — plus the **full mapping**: `fields` lists every mapped field with its `type`
+and what a query can do with it (`indexed` = term-queryable, `fast` = range/sort/aggregate,
+`cached` = returned with hits), alongside `time_fields` / `sort_fields` / `vector_fields`. This is
+the schema clients compose valid queries from (console pickers, the MCP `describe_index` tool).
 
 ### `POST /v1/index:reindex`
 Rebuild an index from its source and **atomically swap it live** (`{ "index": "<name>" }`; empty ⇒

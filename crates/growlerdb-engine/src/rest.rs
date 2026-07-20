@@ -2211,6 +2211,25 @@ struct IndexStatsDto {
     /// omitted) for a non-vector index.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     vector_fields: Vec<VectorFieldDto>,
+    /// Every mapped field with its type + capability flags, in definition order — the full
+    /// schema a client needs to compose valid queries (term-queryable? range/sortable?
+    /// returned with hits?). Empty ⇒ omitted (a pre-upgrade peer that sent no field list).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    fields: Vec<MappedFieldDto>,
+}
+
+/// One mapped field on the describe response: name, type, and what a query can do with it.
+#[derive(Serialize)]
+struct MappedFieldDto {
+    name: String,
+    /// `TEXT | KEYWORD | LONG | DOUBLE | BOOL | DATE | IP | VECTOR`.
+    r#type: String,
+    /// Columnar: range-filter / sort / aggregate.
+    fast: bool,
+    /// Inverted index: term-queryable.
+    indexed: bool,
+    /// Value returns with the hit (no hydration round trip).
+    cached: bool,
 }
 
 /// One VECTOR field on the describe response: its path plus the embedding config a console needs
@@ -2252,6 +2271,17 @@ impl From<v1::IndexStats> for IndexStatsDto {
                 .vector_fields
                 .into_iter()
                 .map(VectorFieldDto::from)
+                .collect(),
+            fields: s
+                .fields
+                .into_iter()
+                .map(|f| MappedFieldDto {
+                    name: f.name,
+                    r#type: f.r#type,
+                    fast: f.fast,
+                    indexed: f.indexed,
+                    cached: f.cached,
+                })
                 .collect(),
         }
     }
@@ -2927,6 +2957,12 @@ mod tests {
         assert_eq!(body["name"], "docs");
         assert_eq!(body["num_docs"], 2);
         assert_eq!(body["checkpoint"], "iceberg_snapshot:4");
+        // The full mapping is on the REST wire too (the MCP describe tool reads this shape).
+        let fields = body["fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 3, "{fields:?}");
+        assert!(fields
+            .iter()
+            .any(|f| f["name"] == "rank" && f["type"] == "LONG" && f["fast"] == true));
     }
 
     #[tokio::test(flavor = "current_thread")]

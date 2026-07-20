@@ -9,7 +9,8 @@ parent: Getting started
 
 The seeded demo tables are deliberately tiny (3 + 10 rows) — enough to learn the API, too small to
 *feel* retrieval quality. The **opt-in arXiv corpus** loads **~20,000 computer-science
-titles+abstracts** (arXiv metadata, CC0) into the lakehouse and stands up a vector-enabled `arxiv`
+titles+abstracts** (arXiv metadata, CC0; harvested with a 2022+ datestamp floor, so it skews to
+modern ML — cs.LG / cs.CV / cs.CL) into the lakehouse and stands up a vector-enabled `arxiv`
 index over them — the scale where semantic vs lexical vs hybrid visibly differ, facets mean
 something, and an MCP-connected agent has real substance to answer from.
 
@@ -19,7 +20,7 @@ With the stack up (`just stack`):
 just demo-data
 ```
 
-This downloads the pre-sliced parquet (~30 MB, a GitHub release asset), writes it into Iceberg
+This downloads the pre-sliced parquet (~10 MB, a GitHub release asset), writes it into Iceberg
 **first** (`growlerdb.arxiv` — the system of record, same lakehouse-first shape as everything
 else), then starts `node-arxiv`, which builds the index and **embeds every abstract locally**
 (bge-small-en-v1.5, no API key, no egress) before registering with the control plane — the gateway

@@ -130,6 +130,10 @@ pub struct IndexSchema {
     /// The mapped fields a query can sort by — numeric/date/keyword fields declared `fast`,
     /// precomputed here (the tuple above drops the `fast` flag). See [`sort_fields`](Self::sort_fields).
     sortable_fields: Vec<String>,
+    /// Every mapped field's describe-facing summary (type + capability flags), in definition
+    /// order — precomputed at build (the tuple above drops `fast`/`cached`). See
+    /// [`mapped_fields`](Self::mapped_fields).
+    mapped_field_summaries: Vec<MappedFieldSummary>,
     /// The tenant-scoping field, if the index is tenant-scoped.
     tenant_field: Option<String>,
     /// The index's **location strategy** (D30). Under
@@ -151,6 +155,21 @@ struct VectorFieldInfo {
     path: String,
     field: Field,
     spec: growlerdb_core::VectorSpec,
+}
+
+/// One mapped field's describe-facing summary — name, type, and what a query can do with it
+/// (`fast` = range/sort/aggregate, `indexed` = term-queryable, `cached` = returned with hits).
+/// The describe/stats path surfaces the full list so clients (console pickers, MCP agents)
+/// compose valid queries from the schema instead of discovering it by trial 400s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MappedFieldSummary {
+    /// Dotted field path.
+    pub name: String,
+    /// The GrowlerDB type name: `TEXT | KEYWORD | LONG | DOUBLE | BOOL | DATE | IP | VECTOR`.
+    pub ty: String,
+    pub fast: bool,
+    pub indexed: bool,
+    pub cached: bool,
 }
 
 /// A VECTOR field's describe-facing summary: its field path plus the embedding config a console
@@ -185,6 +204,8 @@ impl IndexSchema {
         // Sortable fields: `fast` + a sortable type (numeric/date/keyword) — the exact set the
         // sort path's `ensure_sortable` accepts. Collected here where the `fast` flag is still in scope.
         let mut sortable_fields = Vec::new();
+        // Every field's describe summary, captured here where the capability flags are in scope.
+        let mut mapped_field_summaries = Vec::with_capacity(idx.fields.len());
         // VECTOR fields, captured with their `dims`/`metric` for the per-segment ANN build.
         let mut vector_fields = Vec::new();
         for f in &idx.fields {
@@ -240,6 +261,13 @@ impl IndexSchema {
                 }
             }
             fields.push((f.path.clone(), handle, f.ty, f.format));
+            mapped_field_summaries.push(MappedFieldSummary {
+                name: f.path.clone(),
+                ty: format!("{:?}", f.ty).to_uppercase(),
+                fast: f.fast,
+                indexed: f.indexed,
+                cached: f.cached,
+            });
         }
         // The D30 locator-ID fast field, added after the mapped fields so the internal
         // handles never shift a user field's ordinal. It is declared for **every**
@@ -256,6 +284,7 @@ impl IndexSchema {
             loc_id_field,
             fields,
             sortable_fields,
+            mapped_field_summaries,
             tenant_field: idx.tenant_field().map(str::to_string),
             location_strategy: idx.location_strategy,
             vector_fields,
@@ -311,6 +340,13 @@ impl IndexSchema {
     /// will accept — a non-fast keyword like `author` is excluded rather than 400ing at query time.
     pub fn sort_fields(&self) -> Vec<&str> {
         self.sortable_fields.iter().map(String::as_str).collect()
+    }
+
+    /// Every mapped field's describe-facing summary (name, type, capability flags), in
+    /// definition order — the full schema the describe path surfaces so clients compose valid
+    /// queries instead of discovering the mapping by trial 400s.
+    pub fn mapped_fields(&self) -> Vec<MappedFieldSummary> {
+        self.mapped_field_summaries.clone()
     }
 
     /// The index's VECTOR fields, in definition order — each a [`VectorFieldSummary`] of the field

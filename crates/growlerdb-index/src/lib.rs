@@ -17,8 +17,8 @@ pub use location::{LocationStore, ENTRY_BYTES, LOCATION_FILE};
 pub use object_directory::ObjectDirectory;
 pub use range_cache::{CacheStats, RangeCache};
 pub use segment::{
-    ExplainHit, IndexError, IndexSchema, Result, SegmentReader, TantivySegmentCore,
-    VectorFieldSummary, KEY_FIELD,
+    ExplainHit, IndexError, IndexSchema, MappedFieldSummary, Result, SegmentReader,
+    TantivySegmentCore, VectorFieldSummary, KEY_FIELD,
 };
 pub use store::{
     merge_aggregations, BackupSnapshot, ColdMarker, CompactionHealth, CompactionPolicy,

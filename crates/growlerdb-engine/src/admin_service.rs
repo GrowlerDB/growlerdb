@@ -351,6 +351,19 @@ impl Admin for AdminService {
                         dims: v.dims as u32,
                     })
                     .collect(),
+                // The full mapping (type + capability flags) so clients compose valid
+                // queries from the schema — console pickers, MCP agents self-teaching.
+                fields: shard
+                    .mapped_fields()
+                    .into_iter()
+                    .map(|f| growlerdb_proto::v1::MappedFieldStat {
+                        name: f.name,
+                        r#type: f.ty,
+                        fast: f.fast,
+                        indexed: f.indexed,
+                        cached: f.cached,
+                    })
+                    .collect(),
             })
         })
         .await?
@@ -1088,6 +1101,15 @@ mod tests {
         assert!(stats.generation_count >= 1); // ≥1 Tantivy segment (merge policy varies)
         assert_eq!(stats.checkpoint, "iceberg_snapshot:7");
         assert!(stats.snapshot >= 2);
+
+        // The full mapping rides describe: name, type, and capability flags per field — the
+        // schema clients (console pickers, MCP agents) compose queries from.
+        assert_eq!(stats.fields.len(), 1);
+        let f = &stats.fields[0];
+        assert_eq!((f.name.as_str(), f.r#type.as_str()), ("id", "KEYWORD"));
+        assert!(f.indexed, "KEYWORD is term-queryable by default");
+        assert!(!f.fast);
+        assert!(!f.cached);
 
         // Naming the served index explicitly also works.
         assert!(svc

@@ -201,7 +201,8 @@ async fn tools_flow_through_the_real_v1_surface() {
             "hydrate",
             "aggregate",
             "list_indexes",
-            "describe_index"
+            "describe_index",
+            "more_like_this"
         ]
     );
 

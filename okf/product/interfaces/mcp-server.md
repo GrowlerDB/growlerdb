@@ -40,13 +40,29 @@ agent-native face of [retrieval-first](/system/decisions/d42-retrieval-first.md)
   returns ranked **coordinates** + scores + cached fields. With `hydrate: true` it also returns each
   hit's **authoritative row** in the same call (the engine's
   [inline hydration](/product/functional/hydration.md) — one tool call instead of search-then-hydrate).
+  **Context shaping:** `highlight` returns matched snippets instead of whole fields (lexical), and
+  `max_chars` is a response budget — lowest-ranked hits are dropped until the payload fits, flagged
+  via `truncated_hits` (never a silent cut).
 - **`hydrate`** — resolves coordinates to authoritative, governed rows from Iceberg
   ([hydration](/product/functional/hydration.md)).
+- **`more_like_this`** — nearest neighbors of one document: hydrates the seed's text (governed),
+  embeds it over a `vector_field`, excludes the seed — "find more rows like this one".
 - **`aggregate`** — value counts / facets to narrow a search.
-- **`list_indexes`** / **`describe_index`** — what's available and its shape.
+- **`list_indexes`** / **`describe_index`** — what's available and its shape. `describe_index` is
+  the **self-teaching** entry point: it returns every mapped field with its type + capability flags
+  (`indexed`/`fast`/`cached` — the engine's describe now carries the full mapping), the vector
+  fields, ready-made `example_queries` composed from that actual schema, and usage guidance.
 
-The tool descriptions are written for an agent to read: retrieve coordinates, then hydrate them for the
-authoritative answer.
+## Resources
+
+- **`growlerdb://query-syntax`** — a condensed Lucene/KQL grammar + field-capability reference
+  (markdown), so an agent writes valid queries without discovering the grammar through 400s.
+
+The tool descriptions are written for an agent to read: retrieve coordinates, then hydrate them for
+the authoritative answer — and index authors should mark the fields agents read as `cached`, so
+`search` alone answers. **Failed tool calls teach the recovery move**: a 400 points at
+`describe_index` + the syntax resource, a 404 at `list_indexes`, a 401/403 at the token's
+index/tenant scope.
 
 ## Notes
 
