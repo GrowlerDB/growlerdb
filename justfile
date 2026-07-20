@@ -168,6 +168,15 @@ stack:
     # store. Build the shared image ONCE, then start without --build.
     docker compose -f deploy/compose/docker-compose.yml build node
     docker compose -f deploy/compose/docker-compose.yml --profile stack --profile catalog up -d
+    @echo ""
+    @echo "Console:           http://localhost:8081  (demo/demo)"
+    @echo "Grafana:           http://localhost:3000"
+    @echo "Connect an agent:  just mcp-connect   (MCP over HTTP — Claude or any MCP client)"
+
+# Mint a demo bearer and print paste-ready MCP connect snippets (Claude Code one-liner, the
+# checked-in .mcp.json export, generic HTTP config, Claude Desktop bridge). Re-run to re-mint.
+mcp-connect:
+    deploy/compose/mcp-connect.sh
 
 # bring up Trino to explore the Iceberg source with SQL and compare with GrowlerDB
 # Then: `docker compose -f deploy/compose/docker-compose.yml exec trino trino`

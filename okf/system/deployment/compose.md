@@ -4,7 +4,7 @@ title: Docker Compose
 description: The single-host stack for dev and CI — dependencies + GrowlerDB + observability.
 tags: [deployment, compose, dev]
 resource: /deploy/compose
-timestamp: 2026-07-04T14:22:00
+timestamp: 2026-07-20T00:00:00
 ---
 
 # Docker Compose
@@ -51,3 +51,10 @@ present, and shared with local `cargo`/eval runs), mounted on `node` + `node-cat
 ingest and query time; the gateway does not — [D43](/system/decisions/d43-node-local-query-embedding.md)).
 The published image stays lean — the model is **not** baked in. Per [D42](/system/decisions/d42-retrieval-first.md)
 the demo is retrieval-only: it returns governed coordinates + citations and never calls an LLM.
+
+**Agent quick-connect:** `just mcp-connect` (→ `deploy/compose/mcp-connect.sh`) mints a demo bearer
+via `/v1/login` and prints paste-ready snippets for connecting any HTTP-capable MCP client to the
+gateway's [`/mcp` transport](/product/interfaces/mcp-server.md) — a Claude Code one-liner, a generic
+HTTP config block, and a Claude Desktop bridge. The repo's checked-in `.mcp.json` points Claude Code
+at the demo server automatically (auth via the `GROWLERDB_DEMO_TOKEN` env var the script prints), and
+`just stack` ends by advertising the hookup. Tokens are session-scoped; re-run to re-mint.

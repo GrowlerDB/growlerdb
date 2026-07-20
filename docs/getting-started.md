@@ -313,53 +313,43 @@ citations — **it never calls an LLM**; generating a prose answer is the caller
 
 ## 7. Connect an AI agent (MCP)
 
-GrowlerDB ships a read-only **MCP server** (Model Context Protocol), so an AI agent can use the demo
-as a **retrieval tool** — grounded, governed search over your Iceberg data with no bespoke glue. It
-fronts the same gateway and **forwards the demo bearer token**, so the token's **tenant + per-index
+GrowlerDB is an **MCP server** (Model Context Protocol), so an AI agent can use the demo as a
+**retrieval tool** — grounded, governed search over your Iceberg data with no bespoke glue. The
+gateway serves the MCP **Streamable HTTP transport** at `POST /mcp` on the same port as the console
+and **verifies the caller's bearer token** on every tool call, so the token's **tenant + per-index
 RBAC scoping still applies**: the agent only ever sees what `demo` may see.
 
-**The simplest hookup is HTTP — no binary, no subprocess.** The gateway serves the MCP
-**Streamable HTTP transport** at `POST /mcp` on the same port as the console. Mint a token
-(`POST /v1/login` with `demo`/`demo`, §2) and point any HTTP-capable MCP client at it — e.g. for
-Claude Code:
+With the stack up, one command prints everything you need:
 
 ```sh
-claude mcp add --transport http growlerdb http://localhost:8081/mcp \
-  --header "Authorization: Bearer $TOKEN"
+just mcp-connect
 ```
 
-Alternatively, run the **stdio** server against the running stack, scoped to `catalog` (this needs
-the `growlerdb` binary on your machine):
+It mints a demo token and prints paste-ready snippets: the **Claude Code** one-liner
+(`claude mcp add --transport http growlerdb http://localhost:8081/mcp --header "Authorization: Bearer <token>"`),
+a generic HTTP-MCP config block for any client, and a **Claude Desktop** bridge. No binary to
+install, no subprocess to manage — it's a URL and a token. (Tokens expire; re-run to re-mint.)
+
+**Claude Code auto-discovers the demo server** via the repo's checked-in `.mcp.json`: export the
+token the script prints —
 
 ```sh
-growlerdb mcp --gateway-url http://localhost:8081 --username demo --password demo --index catalog
+export GROWLERDB_DEMO_TOKEN=<token>   # printed by `just mcp-connect`
 ```
 
-It speaks MCP over stdio, exposing `search` / `keys:get` (hydrate) / `aggregate` / `list` / `describe`
-as tools. To wire it into **Claude Desktop**, add it to `mcpServers` in the app's config (point
-`command` at the `growlerdb` binary on your `PATH`):
+— then start `claude` anywhere in this repo and approve the `growlerdb-demo` server when prompted.
 
-```json
-{
-  "mcpServers": {
-    "growlerdb": {
-      "command": "growlerdb",
-      "args": [
-        "mcp",
-        "--gateway-url", "http://localhost:8081",
-        "--username", "demo",
-        "--password", "demo",
-        "--index", "catalog"
-      ]
-    }
-  }
-}
-```
+Now ask the agent something the demo data answers — *"what does the catalog say about hydration?"* —
+and it retrieves from `catalog` (semantic, hybrid, and lexical; `search` even hydrates authoritative
+rows in the same call with `hydrate: true`), grounded by **governed coordinates + citations** scoped
+by the demo token's RBAC. As everywhere else, **GrowlerDB never calls an LLM**: it returns the
+retrieved, access-controlled source rows and *the agent* composes the answer from them. Retrieval
+with citations is the product; the model stays yours.
 
-Now the agent retrieves from `catalog` — semantic, hybrid, and lexical — and GrowlerDB hands back
-**governed coordinates + citations** scoped by the demo token's RBAC. As everywhere else, **GrowlerDB
-never calls an LLM**: it returns the retrieved, access-controlled source rows and *the agent* composes
-the answer from them. Retrieval with citations is the product; the model stays yours.
+> A **stdio** transport (`growlerdb mcp`) also exists for environments where the agent can't reach
+> the gateway over HTTP — see the
+> [MCP interface reference](https://github.com/GrowlerDB/growlerdb/blob/main/okf/product/interfaces/mcp-server.md)
+> and `growlerdb mcp --help`.
 
 ## 8. Use the OpenSearch adapter (optional)
 
