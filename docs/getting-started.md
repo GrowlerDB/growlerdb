@@ -377,15 +377,23 @@ You get OpenSearch-shaped documents — `_id` from the key, `_source` hydrated f
 
 ```json
 {
-  "hits": { "hits": [
-    { "_index": "docs", "_id": "doc-2", "_score": 0.451,
-      "_source": { "id": "doc-2", "title": "iceberg search",
-                   "body": "fast full text search over apache iceberg" } },
-    { "_index": "docs", "_id": "doc-3", "_score": 0.451, "_source": { "id": "doc-3", "...": "..." } }
-  ] },
+  "hits": {
+    "total": { "value": 2, "relation": "eq" },
+    "max_score": 0.451,
+    "hits": [
+      { "_index": "docs", "_id": "doc-2", "_score": 0.451,
+        "_source": { "id": "doc-2", "title": "iceberg search",
+                     "body": "fast full text search over apache iceberg" } },
+      { "_index": "docs", "_id": "doc-3", "_score": 0.451, "_source": { "id": "doc-3", "...": "..." } }
+    ]
+  },
   "_shards": { "total": 1, "successful": 1, "failed": 0, "skipped": 0 }
 }
 ```
+
+(The doubled `hits.hits` is OpenSearch's **own** response envelope — the outer `hits` object carries
+result metadata, the inner array the documents — reproduced verbatim so existing clients parse it
+unchanged. GrowlerDB's native `/v1/search` in §3 has no such nesting.)
 
 So an existing OpenSearch/Elasticsearch client can point at GrowlerDB unchanged.
 
