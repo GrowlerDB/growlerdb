@@ -344,6 +344,10 @@ export GROWLERDB_DEMO_TOKEN=<token>   # printed by `just mcp-connect`
 ```
 
 — then start `claude` anywhere in this repo and approve the `growlerdb-demo` server when prompted.
+Without the export the server fails **silently** (no growlerdb tools in the session — the agent will
+fall back to grepping files); verify with `/mcp` inside the session. And when a token expires, note
+`claude mcp add` won't overwrite an existing server — `claude mcp remove growlerdb` first (the
+`just mcp-connect` snippet does this for you).
 
 Now ask the agent something the demo data answers — *"what does the catalog say about hydration?"* —
 and it retrieves from `catalog` (semantic, hybrid, and lexical; `search` even hydrates authoritative
