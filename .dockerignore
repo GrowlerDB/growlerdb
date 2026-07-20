@@ -4,6 +4,9 @@ connector/target/
 clients/**/target/
 .git/
 **/*.md
+# EXCEPT markdown that is COMPILED IN via include_str! — excluding it breaks `cargo build`
+# inside the image (the host toolchain never notices; only the docker context is filtered).
+!crates/growlerdb-mcp/src/query_syntax.md
 deploy/compose/seed/
 # UI is built inside the image (node stage); don't ship the local deps/output.
 **/node_modules
