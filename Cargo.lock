@@ -1863,6 +1863,7 @@ dependencies = [
  "growlerdb-core",
  "growlerdb-embed",
  "growlerdb-index",
+ "growlerdb-mcp",
  "growlerdb-proto",
  "growlerdb-source",
  "growlerdb-telemetry",

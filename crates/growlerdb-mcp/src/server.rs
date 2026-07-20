@@ -1,20 +1,27 @@
-//! The MCP stdio server: a newline-delimited JSON-RPC 2.0 loop that exposes GrowlerDB's read-only
-//! retrieval surface as MCP **tools**.
+//! The MCP protocol core + the **stdio transport**.
 //!
-//! Transport contract: one JSON object per line on stdin/stdout, no embedded newlines. **stdout
-//! carries ONLY JSON-RPC messages** — all diagnostics go to stderr (via `tracing`, which is a no-op
-//! unless a stderr subscriber is installed by the host process).
+//! [`handle_message`] is the transport-agnostic JSON-RPC 2.0 dispatch: one parsed message in, an
+//! optional response out, tools executed against any [`QueryBackend`]. [`serve_io`] wraps it in
+//! the newline-delimited **stdio** loop (the local-agent path); the engine's gateway wraps it in
+//! the **Streamable HTTP** transport at `POST /mcp`.
+//!
+//! Stdio transport contract: one JSON object per line on stdin/stdout, no embedded newlines.
+//! **stdout carries ONLY JSON-RPC messages** — all diagnostics go to stderr (via `tracing`, which
+//! is a no-op unless a stderr subscriber is installed by the host process).
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
+use crate::backend::QueryBackend;
 use crate::client::GatewayClient;
 use crate::error::McpError;
 
-/// The MCP protocol version we default to when a client's `initialize` omits one.
-const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
+/// The MCP protocol version we default to when a client's `initialize` omits one. The Streamable
+/// HTTP transport exists since 2025-03-26, and the spec's guidance for a missing version header is
+/// to assume this revision.
+pub const DEFAULT_PROTOCOL_VERSION: &str = "2025-03-26";
 
-/// Runtime configuration for [`serve`].
+/// Runtime configuration for [`serve`] (the stdio transport).
 #[derive(Clone, Debug)]
 pub struct McpConfig {
     /// Gateway origin, e.g. `http://127.0.0.1:8081`.
@@ -47,7 +54,7 @@ where
         if line.is_empty() {
             continue;
         }
-        if let Some(response) = handle_line(line, &client, &config).await {
+        if let Some(response) = handle_line(line, &client, config.default_index.as_deref()).await {
             let mut bytes = serde_json::to_vec(&response)?;
             bytes.push(b'\n');
             writer.write_all(&bytes).await?;
@@ -59,7 +66,11 @@ where
 
 /// Parse and dispatch a single JSON-RPC line. Returns `Some(response)` for a request and `None` for
 /// a notification (no `id`) or an unparseable-but-idless message.
-async fn handle_line(line: &str, client: &GatewayClient, config: &McpConfig) -> Option<Value> {
+async fn handle_line<B: QueryBackend>(
+    line: &str,
+    backend: &B,
+    default_index: Option<&str>,
+) -> Option<Value> {
     let msg: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => {
@@ -71,7 +82,17 @@ async fn handle_line(line: &str, client: &GatewayClient, config: &McpConfig) -> 
             ));
         }
     };
+    handle_message(msg, backend, default_index).await
+}
 
+/// Dispatch one parsed JSON-RPC message against `backend` — the transport-agnostic protocol
+/// core shared by stdio and the gateway's Streamable HTTP route. Returns `Some(response)` for a
+/// request, `None` for a notification (no `id`).
+pub async fn handle_message<B: QueryBackend>(
+    msg: Value,
+    backend: &B,
+    default_index: Option<&str>,
+) -> Option<Value> {
     let method = msg
         .get("method")
         .and_then(Value::as_str)
@@ -89,7 +110,7 @@ async fn handle_line(line: &str, client: &GatewayClient, config: &McpConfig) -> 
         "initialize" => initialize_result(&params),
         "ping" => json!({}),
         "tools/list" => json!({ "tools": tool_defs() }),
-        "tools/call" => return Some(handle_tools_call(id, &params, client, config).await),
+        "tools/call" => return Some(handle_tools_call(id, &params, backend, default_index).await),
         _ => {
             return Some(error_response(
                 id,
@@ -119,11 +140,11 @@ fn initialize_result(params: &Value) -> Value {
 
 /// Dispatch a `tools/call`. Protocol-shape problems (missing name) return a JSON-RPC `-32602`;
 /// tool/gateway failures return an MCP tool error (`isError: true`) so the agent can read them.
-async fn handle_tools_call(
+async fn handle_tools_call<B: QueryBackend>(
     id: Value,
     params: &Value,
-    client: &GatewayClient,
-    config: &McpConfig,
+    backend: &B,
+    default_index: Option<&str>,
 ) -> Value {
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return error_response(id, -32602, "tools/call requires a `name`");
@@ -134,11 +155,11 @@ async fn handle_tools_call(
         .unwrap_or_else(|| json!({}));
 
     let outcome = match name {
-        "search" => tool_search(&args, client, config).await,
-        "hydrate" => tool_hydrate(&args, client, config).await,
-        "aggregate" => tool_aggregate(&args, client, config).await,
-        "list_indexes" => client.list_indexes().await,
-        "describe_index" => tool_describe(&args, client, config).await,
+        "search" => tool_search(&args, backend, default_index).await,
+        "hydrate" => tool_hydrate(&args, backend, default_index).await,
+        "aggregate" => tool_aggregate(&args, backend, default_index).await,
+        "list_indexes" => backend.list_indexes().await,
+        "describe_index" => tool_describe(&args, backend, default_index).await,
         other => Err(McpError::Config(format!("unknown tool: {other}"))),
     };
 
@@ -155,14 +176,15 @@ async fn handle_tools_call(
     )
 }
 
-/// Resolve the target index for a tool call: the argument's `index`, else the configured default.
-fn resolve_index(args: &Value, config: &McpConfig) -> Result<String, McpError> {
+/// Resolve the target index for a tool call: the argument's `index`, else the configured default
+/// (the gateway's own transport passes `Some("")` — empty routes to the endpoint's served index).
+fn resolve_index(args: &Value, default_index: Option<&str>) -> Result<String, McpError> {
     if let Some(index) = args.get("index").and_then(Value::as_str) {
         if !index.is_empty() {
             return Ok(index.to_string());
         }
     }
-    config.default_index.clone().ok_or_else(|| {
+    default_index.map(str::to_string).ok_or_else(|| {
         McpError::Config(
             "no index specified and no default index configured (pass `index`, or start the \
              server with --index)"
@@ -171,22 +193,17 @@ fn resolve_index(args: &Value, config: &McpConfig) -> Result<String, McpError> {
     })
 }
 
-fn tool_search(
+async fn tool_search<B: QueryBackend>(
     args: &Value,
-    client: &GatewayClient,
-    config: &McpConfig,
-) -> impl std::future::Future<Output = Result<Value, McpError>> + Send {
-    // Resolve everything up front so the returned future borrows nothing from `args`.
-    let index = resolve_index(args, config);
+    backend: &B,
+    default_index: Option<&str>,
+) -> Result<Value, McpError> {
+    let index = resolve_index(args, default_index)?;
     let query = args
         .get("query")
         .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let vector_field = args
-        .get("vector_field")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+        .unwrap_or_default();
+    let vector_field = args.get("vector_field").and_then(Value::as_str);
     // `k` and `limit` are aliases for the page size.
     let k = args
         .get("k")
@@ -196,13 +213,11 @@ fn tool_search(
     let filter = args
         .get("filter")
         .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
+        .unwrap_or_default();
     let syntax = args
         .get("syntax")
         .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
+        .unwrap_or_default();
     // Inline hydration: forwarded to the engine, which attaches each hit's authoritative
     // row via the governed keys:get path — the one-call form of search→hydrate.
     let hydrate = args
@@ -217,121 +232,100 @@ fn tool_search(
     let mode = args
         .get("mode")
         .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            if vector_field.is_some() {
-                "hybrid".to_string()
-            } else {
-                "lexical".to_string()
-            }
+        .unwrap_or(if vector_field.is_some() {
+            "hybrid"
+        } else {
+            "lexical"
         });
-    let client = client.clone();
 
-    async move {
-        let index = index?;
-        match mode.as_str() {
-            "lexical" => {
-                let body = json!({
-                    "query": query,
-                    "limit": k,
-                    "syntax": syntax,
-                    "index": index,
-                    "hydrate": hydrate,
-                    "hydrate_columns": hydrate_columns,
-                });
-                client.search(body).await
-            }
-            "semantic" | "hybrid" => {
-                let vector_field = vector_field.ok_or_else(|| {
-                    McpError::Config(format!(
-                        "mode `{mode}` requires `vector_field` (the VECTOR field to search)"
-                    ))
-                })?;
-                let body = json!({
-                    "vector_field": vector_field,
-                    "query_text": query,
-                    "k": k,
-                    "filter": filter,
-                    "syntax": syntax,
-                    "index": index,
-                    "hydrate": hydrate,
-                    "hydrate_columns": hydrate_columns,
-                });
-                if mode == "semantic" {
-                    client.semantic_search(body).await
-                } else {
-                    client.hybrid_search(body).await
-                }
-            }
-            other => Err(McpError::Config(format!(
-                "unknown search mode `{other}` (use lexical|semantic|hybrid)"
-            ))),
+    match mode {
+        "lexical" => {
+            let body = json!({
+                "query": query,
+                "limit": k,
+                "syntax": syntax,
+                "index": index,
+                "hydrate": hydrate,
+                "hydrate_columns": hydrate_columns,
+            });
+            backend.search(body).await
         }
+        "semantic" | "hybrid" => {
+            let vector_field = vector_field.ok_or_else(|| {
+                McpError::Config(format!(
+                    "mode `{mode}` requires `vector_field` (the VECTOR field to search)"
+                ))
+            })?;
+            let body = json!({
+                "vector_field": vector_field,
+                "query_text": query,
+                "k": k,
+                "filter": filter,
+                "syntax": syntax,
+                "index": index,
+                "hydrate": hydrate,
+                "hydrate_columns": hydrate_columns,
+            });
+            if mode == "semantic" {
+                backend.semantic_search(body).await
+            } else {
+                backend.hybrid_search(body).await
+            }
+        }
+        other => Err(McpError::Config(format!(
+            "unknown search mode `{other}` (use lexical|semantic|hybrid)"
+        ))),
     }
 }
 
-fn tool_hydrate(
+async fn tool_hydrate<B: QueryBackend>(
     args: &Value,
-    client: &GatewayClient,
-    config: &McpConfig,
-) -> impl std::future::Future<Output = Result<Value, McpError>> + Send {
-    let index = resolve_index(args, config);
+    backend: &B,
+    default_index: Option<&str>,
+) -> Result<Value, McpError> {
+    let index = resolve_index(args, default_index)?;
     let coordinates = args
         .get("coordinates")
         .cloned()
         .unwrap_or_else(|| json!([]));
     let columns = args.get("columns").cloned().unwrap_or_else(|| json!([]));
-    let client = client.clone();
-    async move {
-        let index = index?;
-        let body = json!({
-            "keys": coordinates,
-            "columns": columns,
-            "index": index,
-        });
-        client.hydrate(body).await
-    }
+    let body = json!({
+        "keys": coordinates,
+        "columns": columns,
+        "index": index,
+    });
+    backend.hydrate(body).await
 }
 
-fn tool_aggregate(
+async fn tool_aggregate<B: QueryBackend>(
     args: &Value,
-    client: &GatewayClient,
-    config: &McpConfig,
-) -> impl std::future::Future<Output = Result<Value, McpError>> + Send {
-    let index = resolve_index(args, config);
+    backend: &B,
+    default_index: Option<&str>,
+) -> Result<Value, McpError> {
+    let index = resolve_index(args, default_index)?;
     let query = args
         .get("query")
         .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
+        .unwrap_or_default();
     let fields = args.get("fields").cloned().unwrap_or_else(|| json!([]));
     let size = args.get("size").and_then(Value::as_u64).unwrap_or(0);
-    let client = client.clone();
-    async move {
-        let index = index?;
-        let body = json!({
-            "query": query,
-            "fields": fields,
-            "size": size,
-            "index": index,
-        });
-        client.facets(body).await
-    }
+    let body = json!({
+        "query": query,
+        "fields": fields,
+        "size": size,
+        "index": index,
+    });
+    backend.facets(body).await
 }
 
-fn tool_describe(
+async fn tool_describe<B: QueryBackend>(
     args: &Value,
-    client: &GatewayClient,
-    config: &McpConfig,
-) -> impl std::future::Future<Output = Result<Value, McpError>> + Send {
-    let index = resolve_index(args, config);
-    let client = client.clone();
-    async move {
-        let index = index?;
-        client.describe(&index).await
-    }
+    backend: &B,
+    default_index: Option<&str>,
+) -> Result<Value, McpError> {
+    let index = resolve_index(args, default_index)?;
+    backend.describe(&index).await
 }
-
 /// The tool catalog returned by `tools/list`, each with an agent-facing description + JSON schema.
 fn tool_defs() -> Value {
     let coordinates_schema = json!({

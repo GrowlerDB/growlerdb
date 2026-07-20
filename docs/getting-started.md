@@ -318,7 +318,18 @@ as a **retrieval tool** — grounded, governed search over your Iceberg data wit
 fronts the same gateway and **forwards the demo bearer token**, so the token's **tenant + per-index
 RBAC scoping still applies**: the agent only ever sees what `demo` may see.
 
-Run it against the running stack, scoped to `catalog`:
+**The simplest hookup is HTTP — no binary, no subprocess.** The gateway serves the MCP
+**Streamable HTTP transport** at `POST /mcp` on the same port as the console. Mint a token
+(`POST /v1/login` with `demo`/`demo`, §2) and point any HTTP-capable MCP client at it — e.g. for
+Claude Code:
+
+```sh
+claude mcp add --transport http growlerdb http://localhost:8081/mcp \
+  --header "Authorization: Bearer $TOKEN"
+```
+
+Alternatively, run the **stdio** server against the running stack, scoped to `catalog` (this needs
+the `growlerdb` binary on your machine):
 
 ```sh
 growlerdb mcp --gateway-url http://localhost:8081 --username demo --password demo --index catalog

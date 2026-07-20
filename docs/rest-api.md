@@ -294,6 +294,17 @@ cache's hit/miss/byte stats. **`404`** on a non-windowed index (nothing to tier)
 `GET /v1/stats/query`, `/v1/stats/query_range`, `/v1/stats/alerts` proxy to the configured
 Prometheus (same-origin, for the console's SLI panels).
 
+## MCP transport (`POST /mcp`)
+
+The **Model Context Protocol** [Streamable HTTP transport](https://modelcontextprotocol.io) — the
+read-only agent face of the same query surface, served on the same listener. JSON-RPC 2.0 over
+POST; sessionless; `GET` answers 405 (no server-initiated stream); a browser-sent `Origin` must be
+loopback or match the request's `Host`. Auth is the same bearer as `/v1/*` (a closed deployment
+401s a missing/invalid token with `WWW-Authenticate: Bearer`); tool calls (`search` with optional
+inline hydration, `hydrate`, `aggregate`, `list_indexes`, `describe_index`) re-enter the `/v1`
+surface under the caller's own token — see the
+[getting-started MCP section](getting-started#7-connect-an-ai-agent-mcp).
+
 ## OpenSearch adapter (gateway `--opensearch`)
 
 `POST /{index}/_search` (and `POST /_search`) — a documented DSL subset → native query, results as

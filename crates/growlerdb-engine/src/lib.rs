@@ -17,6 +17,7 @@ pub mod gateway_grpc;
 pub mod hydrate;
 pub mod license;
 pub mod lookup_service;
+pub mod mcp_http;
 pub mod node;
 pub mod opensearch;
 pub mod rbac;
@@ -49,6 +50,7 @@ pub use gateway::{Gateway, GatewayLimits, IndexRoute, RouteResolver, WindowRouti
 pub use hydrate::{apply_live_file_bitmap, get_by_key, resolve_locators};
 pub use license::{License, LicenseError, FREE_NODE_LIMIT};
 pub use lookup_service::LookupService;
+pub use mcp_http::mcp_router;
 pub use node::{LocalNode, Node, RemoteNode};
 pub use opensearch::opensearch_router;
 pub use rbac::{scope_for_method, RbacPolicy, Scope};

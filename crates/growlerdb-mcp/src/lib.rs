@@ -8,10 +8,12 @@
 //! It exposes five tools — `search`, `hydrate`, `aggregate`, `list_indexes`, `describe_index` — and
 //! embeds no engine (no ingest/write/admin surface). See [`serve`] for the entry point.
 
+mod backend;
 mod client;
 mod error;
 mod server;
 
+pub use backend::{interpret_response, QueryBackend};
 pub use client::GatewayClient;
 pub use error::McpError;
-pub use server::{serve, serve_io, McpConfig};
+pub use server::{handle_message, serve, serve_io, McpConfig, DEFAULT_PROTOCOL_VERSION};
