@@ -64,6 +64,20 @@ curl -s localhost:8081/v1/search -H "authorization: Bearer $token" \
   -d '{"index":"docs","query":"title:iceberg","limit":5}'
 ```
 
+**Connect an AI agent** — the gateway serves MCP (Streamable HTTP) on the same port; one command
+prints paste-ready snippets for Claude Code / Desktop or any MCP client:
+
+```sh
+just mcp-connect
+```
+
+**Want retrieval quality you can feel?** Load the opt-in ~20k-paper arXiv corpus (abstracts embedded
+locally, no API key) and ask the agent real questions:
+
+```sh
+just demo-data
+```
+
 Tear it all down with `just stack-down`.
 
 👉 Full walkthrough (first search → hydrate → console → OpenSearch adapter):
