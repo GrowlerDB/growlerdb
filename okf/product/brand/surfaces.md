@@ -3,7 +3,7 @@ type: Concept
 title: Brand surfaces & assets
 description: How Brand v1.0 applies to the console, website, docs, and social card, plus the canonical asset inventory.
 tags: [brand, design, website, console, docs, assets]
-timestamp: 2026-07-18T00:00:00
+timestamp: 2026-07-20T00:00:00
 ---
 
 # Brand surfaces & assets
@@ -34,9 +34,13 @@ unchanged.
 
 ## Docs — `docs/`
 
-Not mocked; applied by token. Override the just-the-docs dark scheme (`docs/_sass/custom/custom.scss`):
-surfaces/text from the neutral scale, links **glacier-light**, inline code on `#232529` in **Geist
-Mono**, plus the favicon and header lockup.
+Not mocked; applied by token. The `growlerdb` color scheme
+(`docs/_sass/color_schemes/growlerdb.scss`) **builds on the theme's `dark` scheme** — the
+`@import "./color_schemes/dark"` is load-bearing: it carries the dark Rouge syntax palette, and
+without it code-block tokens (e.g. JSON punctuation) fall back to the light palette and render
+dark-on-dark. Brand variables override on top: surfaces/text from the neutral scale, links
+**glacier-light**, inline code on `#232529` in **Geist Mono** (typography + tweaks in
+`docs/_sass/custom/custom.scss`), plus the favicon and header lockup.
 
 ## Social card — `docs/img/social-preview.png`
 

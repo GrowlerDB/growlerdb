@@ -2,6 +2,13 @@
 // A color scheme only sets the theme's SCSS colour variables; the theme wires them into the
 // rendered CSS. Neutral dark surfaces, glacier-light links/buttons, melt reserved for identity.
 
+// Build ON the theme's dark scheme (the brand intent — okf/product/brand/surfaces.md): it is
+// what carries the dark Rouge/OneDark **syntax-highlighting palette**. Without this import the
+// token colors fall through to the theme's LIGHT defaults, and e.g. JSON punctuation (Rouge `.p`)
+// renders near-black on our dark `$code-background-color` — illegible code blocks. Every brand
+// variable below still wins (SCSS: later assignment overrides dark's).
+@import "./color_schemes/dark";
+
 $body-background-color: #141517; // page background
 $sidebar-color: #1c1d20; // left nav rail
 $search-background-color: #1c1d20; // search box + results panel
