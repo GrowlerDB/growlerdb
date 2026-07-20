@@ -3,7 +3,7 @@ type: Feature
 title: Vector fields & embeddings
 description: Declare a VECTOR field over a text column; GrowlerDB embeds it (local by default) and stores the vector per document for semantic / hybrid retrieval.
 tags: [feature, search, vector, embedding, rag]
-timestamp: 2026-07-18T00:00:00
+timestamp: 2026-07-20T00:00:00
 ---
 
 # Vector fields & embeddings
@@ -50,7 +50,10 @@ At **ingest**, for each `LOCAL` vector field GrowlerDB embeds the `source_field`
 through the [`Embedder`](/system/decisions/d20-embedding-model.md) seam and stores the resulting vector
 in the document's segment (backed up and restored with the lexical segment). The `Embedder` trait is the
 integration point ([D41](/system/decisions/d41-vector-open-core.md) keeps it open; external providers
-attach here).
+attach here). Forward passes are **bounded** (sub-batches of 32 inputs): attention memory scales with
+`batch × seq²`, so an unbounded whole-table pass OOMs a node on real corpora (the ~20k-abstract arXiv
+demo killed a 4 GB node at batch 400) — sub-batching caps peak memory regardless of build size, with
+identical vectors (no cross-sequence attention).
 
 The default local embedder is **bge-small-en-v1.5** run **in-process on [Candle](https://github.com/huggingface/candle)**
 — pure Rust, no native/C dependency, no network. The model (`config.json`, `tokenizer.json`,

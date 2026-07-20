@@ -15,6 +15,12 @@ const CONFIG_JSON: &str = "config.json";
 const TOKENIZER_JSON: &str = "tokenizer.json";
 const WEIGHTS: &str = "model.safetensors";
 
+/// Upper bound on one BERT forward pass. Attention memory is `batch × heads × seq²` per layer —
+/// unbounded, a whole-table build's texts in one pass allocate gigabytes (the arXiv demo corpus
+/// OOM-killed a 4 GB node at batch 400 × seq 512). 32 keeps the worst-case pass in the
+/// hundreds-of-MB range with no measurable CPU throughput cost.
+const MAX_FORWARD_BATCH: usize = 32;
+
 /// Resolve the model directory for `model_id`:
 /// `${GROWLERDB_MODEL_DIR:-~/.cache/growlerdb/models}/<model_id>/`.
 pub(crate) fn model_dir(model_id: &str) -> PathBuf {
@@ -101,9 +107,22 @@ impl BgeEmbedder {
     }
 
     /// Tokenize + forward + mean-pool + L2-normalize a batch, returning one vector per input.
+    /// Inputs beyond [`MAX_FORWARD_BATCH`] are processed in bounded sub-batches: attention
+    /// memory scales with `batch × seq²`, so a single forward over a whole table build (e.g.
+    /// thousands of 512-token abstracts) OOM-kills the node — sub-batching caps the peak at a
+    /// few hundred MB regardless of input size, and per-sub-batch padding only pads to that
+    /// sub-batch's longest sequence. Each text still embeds independently (BERT applies no
+    /// cross-sequence attention), so results are identical to one big pass.
     fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
         if texts.is_empty() {
             return Ok(vec![]);
+        }
+        if texts.len() > MAX_FORWARD_BATCH {
+            let mut out = Vec::with_capacity(texts.len());
+            for chunk in texts.chunks(MAX_FORWARD_BATCH) {
+                out.extend(self.embed_batch(chunk)?);
+            }
+            return Ok(out);
         }
         let inputs: Vec<String> = texts.to_vec();
         let encodings = self
@@ -274,6 +293,24 @@ mod tests {
         assert!(
             similar > dissimilar,
             "semantically-similar pair ({similar}) should score above the dissimilar pair ({dissimilar})"
+        );
+
+        // Sub-batching (the MAX_FORWARD_BATCH bound) changes memory, never results: a batch
+        // crossing the boundary returns one vector per input, and each equals the vector the
+        // same text gets alone (padding differs per sub-batch; the attention mask makes that
+        // irrelevant). Guards the whole-table build path that used to OOM.
+        let texts: Vec<String> = (0..(MAX_FORWARD_BATCH * 2 + 5))
+            .map(|i| format!("document number {i} about search engines and lakehouse tables"))
+            .collect();
+        let batched = e.embed(&texts).unwrap();
+        assert_eq!(batched.len(), texts.len());
+        let solo = e
+            .embed(&texts[MAX_FORWARD_BATCH..MAX_FORWARD_BATCH + 1])
+            .unwrap();
+        let drift = 1.0 - cos(&batched[MAX_FORWARD_BATCH], &solo[0]);
+        assert!(
+            drift.abs() < 1e-4,
+            "chunked embedding must equal the solo embedding (cos drift {drift})"
         );
     }
 }
