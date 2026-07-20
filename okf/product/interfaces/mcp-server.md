@@ -52,4 +52,6 @@ authoritative answer.
 
 Open-core ([D41](/system/decisions/d41-vector-open-core.md)): the basic MCP server ships in the AGPL
 engine; enterprise identity/audit around it is a commercial concern. The semantic/hybrid tools need a
-VECTOR-indexed table; connecting an agent to a seeded vector demo is covered by the AI/RAG demo.
+VECTOR-indexed table; the [compose demo](/system/deployment/compose.md) seeds one and its
+**`just mcp-connect`** prints paste-ready HTTP connect snippets (plus the repo's checked-in
+`.mcp.json` for Claude Code auto-discovery) — the zero-install agent hookup.
