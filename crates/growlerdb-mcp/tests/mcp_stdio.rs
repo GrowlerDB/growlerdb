@@ -235,6 +235,11 @@ async fn initialize_handshake_and_tools_list() {
     assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
     assert_eq!(init["result"]["serverInfo"]["name"], "growlerdb");
     assert!(init["result"]["capabilities"]["tools"].is_object());
+    // The steering text hosts inject into agent context: live indexes, not files.
+    assert!(init["result"]["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("NOT files"));
 
     let list = &responses[1];
     let tools = list["result"]["tools"].as_array().unwrap();

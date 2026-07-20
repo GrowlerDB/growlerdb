@@ -173,6 +173,17 @@ fn initialize_result(params: &Value) -> Value {
             "name": "growlerdb",
             "version": env!("CARGO_PKG_VERSION"),
         },
+        // The MCP-official steering text a host injects into the agent's context. Field-tested:
+        // an agent working inside a code checkout hears "what does the growlerdb catalog say…"
+        // and greps FILES unless told these tools query the live, indexed data.
+        "instructions": "GrowlerDB serves LIVE, indexed data — these tools query running search \
+            indexes (in the demo: `docs`, `catalog`, `arxiv`), NOT files on disk. When asked what \
+            GrowlerDB / an index / 'the catalog' says or contains, use `search` here instead of \
+            file or grep tools. ALWAYS start an unfamiliar index with `describe_index`: it returns \
+            the schema, example queries, and any `vector_fields` — and when vector fields exist, \
+            search with `mode: hybrid` (lexical does NO stemming: a lexical `hydration` will not \
+            match `hydrate`; hybrid catches both meaning and exact terms). Answers come back as \
+            governed rows with coordinates you can cite.",
     })
 }
 

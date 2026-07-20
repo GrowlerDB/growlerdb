@@ -41,13 +41,17 @@ The gateway serves MCP at  $GATEWAY/mcp  — governed retrieval over the demo's
 Iceberg data, scoped to what '$MCP_USER' may see. Tokens expire; re-run this to
 re-mint.
 
-▸ Claude Code — one line:
+▸ Claude Code — one line (the remove first makes re-runs rotate the token:
+  \`claude mcp add\` will NOT overwrite an existing server):
 
+    claude mcp remove growlerdb 2>/dev/null; \\
     claude mcp add --transport http growlerdb $GATEWAY/mcp \\
       --header "Authorization: Bearer $TOKEN"
 
 ▸ Claude Code, via the repo's checked-in .mcp.json — export the token and start
-  claude in this repo (the server is auto-discovered):
+  claude in this repo (the server is auto-discovered). Without the export the
+  server fails SILENTLY (no growlerdb tools in the session — agents then fall
+  back to grepping files); check with /mcp inside the session:
 
     export GROWLERDB_DEMO_TOKEN=$TOKEN
 

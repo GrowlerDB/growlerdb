@@ -8,7 +8,7 @@ Call `describe_index` first — it returns every field with its type + capabilit
 
 | Form | Example | Notes |
 |---|---|---|
-| Term | `status:active` | field must be `indexed`; bare `iceberg` hits the default TEXT field |
+| Term | `status:active` | field must be `indexed`; bare `iceberg` hits the default TEXT field. **No stemming**: `hydration` ≠ `hydrate` — use hybrid mode for meaning-level matches |
 | Phrase | `"iceberg search"~2` | optional slop |
 | Boolean | `a AND b`, `NOT c`, `(x OR y)` | KQL: lowercase `and`/`or`/`not` |
 | Field group | `category:(guide OR reference)` | distributes the field over the group |
