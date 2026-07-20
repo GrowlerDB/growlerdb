@@ -885,10 +885,22 @@ impl Gateway {
     /// fronts are covered through this one chokepoint.
     pub async fn search(
         &self,
-        req: Request<SearchRequest>,
+        mut req: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         let _permit = self.admit()?;
-        self.search_unadmitted(req).await
+        // Inline hydration is Gateway orchestration (like hybrid): take the opt-in out of the
+        // request so shards never see it, run the search, then attach rows via the governed
+        // GetByKey path under this same admission permit.
+        let hydrate = std::mem::take(&mut req.get_mut().hydrate);
+        let hydrate_columns = std::mem::take(&mut req.get_mut().hydrate_columns);
+        self.check_hydrate_page(hydrate, req.get_ref().limit)?;
+        let hydration = hydrate.then(|| (req.metadata().clone(), req.get_ref().index.clone()));
+        let mut resp = self.search_unadmitted(req).await?;
+        if let Some((meta, index)) = hydration {
+            self.hydrate_hits(resp.get_mut(), meta, index, hydrate_columns)
+                .await;
+        }
+        Ok(resp)
     }
 
     /// [`search`](Self::search) minus the admission permit — the internal form composite
@@ -1188,10 +1200,21 @@ impl Gateway {
     /// uses). Single-shard forwards verbatim. Tenant scoping is enforced Node-side, fail-closed.
     pub async fn semantic_search(
         &self,
-        req: Request<SemanticSearchRequest>,
+        mut req: Request<SemanticSearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         let _permit = self.admit()?;
-        self.semantic_search_unadmitted(req).await
+        // Inline hydration, mirroring `search`: Gateway-only, stripped before the scatter,
+        // attached after the merge under this same admission permit.
+        let hydrate = std::mem::take(&mut req.get_mut().hydrate);
+        let hydrate_columns = std::mem::take(&mut req.get_mut().hydrate_columns);
+        self.check_hydrate_page(hydrate, req.get_ref().k)?;
+        let hydration = hydrate.then(|| (req.metadata().clone(), req.get_ref().index.clone()));
+        let mut resp = self.semantic_search_unadmitted(req).await?;
+        if let Some((meta, index)) = hydration {
+            self.hydrate_hits(resp.get_mut(), meta, index, hydrate_columns)
+                .await;
+        }
+        Ok(resp)
     }
 
     /// [`semantic_search`](Self::semantic_search) minus the admission permit — the internal form composite
@@ -1275,7 +1298,12 @@ impl Gateway {
         req: Request<HybridSearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         let _permit = self.admit()?;
-        let (meta, _ext, body) = req.into_parts();
+        let (meta, _ext, mut body) = req.into_parts();
+        // Inline hydration: consumed here, after the fusion; the arm requests below are
+        // built field-by-field, so neither arm re-hydrates.
+        let hydrate = body.hydrate;
+        let hydrate_columns = std::mem::take(&mut body.hydrate_columns);
+        self.check_hydrate_page(hydrate, body.k)?;
         let k = body.k as usize;
         let rrf_k = if body.rrf_k == 0 {
             HYBRID_RRF_K
@@ -1339,6 +1367,9 @@ impl Gateway {
                 // the fused ranks. `rerank_top_k` bounds the candidate pool the Node reranks.
                 rerank: body.rerank,
                 rerank_top_k: body.rerank_top_k,
+                // Hydration happens once, after the fusion — never per arm.
+                hydrate: false,
+                hydrate_columns: Vec::new(),
             },
         );
 
@@ -1367,14 +1398,97 @@ impl Gateway {
 
         let fused = rrf_fuse_hits(&[lex_hits, semantic.hits.as_slice()], rrf_k, k);
         let total = fused.len() as u64;
-        Ok(Response::new(SearchResponse {
+        let mut resp = SearchResponse {
             hits: fused,
             total,
             next_cursor: Vec::new(),
             partial,
             shards_scanned,
             shards_total,
-        }))
+        };
+        if hydrate {
+            self.hydrate_hits(&mut resp, meta, body.index, hydrate_columns)
+                .await;
+        }
+        Ok(Response::new(resp))
+    }
+
+    /// Reject an inline-hydration request whose page could exceed the GetByKey batch ceiling
+    /// ([`MAX_KEYS`](crate::lookup_service::MAX_KEYS)) — the same bound a standalone hydration
+    /// enforces, checked up front so the search isn't executed just to fail at the attach.
+    fn check_hydrate_page(&self, hydrate: bool, page: u32) -> Result<(), Status> {
+        let max = crate::lookup_service::MAX_KEYS;
+        if hydrate && page as usize > max {
+            return Err(Status::invalid_argument(format!(
+                "hydrate: page size ({page}) exceeds the hydration batch maximum ({max}); \
+                 request a smaller page"
+            )));
+        }
+        Ok(())
+    }
+
+    /// **Inline hydration**: resolve the page's hit coordinates through
+    /// [`get_by_key_unadmitted`](Self::get_by_key_unadmitted) — the same governed, key-verified
+    /// path as a standalone GetByKey, under the caller's own request metadata — and attach each
+    /// row to its hit. Failure degrades **per-hit** (`hydrate_error`), never the search: the hits
+    /// keep their coordinates + cached fields whether a shard dropped, a row was tenant-filtered
+    /// or source-missing, or the whole hydration errored.
+    async fn hydrate_hits(
+        &self,
+        resp: &mut SearchResponse,
+        meta: tonic::metadata::MetadataMap,
+        index: String,
+        columns: Vec<String>,
+    ) {
+        use crate::opensearch::compose_id;
+        if resp.hits.is_empty() {
+            return;
+        }
+        let keys: Vec<Coordinates> = resp
+            .hits
+            .iter()
+            .filter_map(|h| h.coordinates.clone())
+            .collect();
+        let req = Request::from_parts(
+            meta,
+            Extensions::default(),
+            GetByKeyRequest {
+                keys,
+                columns,
+                window: 0,
+                index,
+            },
+        );
+        // Key rows by their own coordinates: rows come back in completion order and may drop
+        // tenant-filtered or missing keys, so pairing by position would mis-attribute rows
+        // (same rationale as the OpenSearch adapter's `_source` attribution).
+        let (mut rows, error) = match self.get_by_key_unadmitted(req).await {
+            Ok(r) => {
+                let r = r.into_inner();
+                let error = if r.failed_shards > 0 {
+                    "row not returned (a hydration shard failed to respond)".to_string()
+                } else {
+                    "row not returned (tenant-filtered or missing in the source)".to_string()
+                };
+                let rows: HashMap<String, growlerdb_proto::v1::HydratedRow> = r
+                    .rows
+                    .into_iter()
+                    .filter_map(|row| Some((compose_id(row.key.as_ref()?), row)))
+                    .collect();
+                (rows, error)
+            }
+            Err(status) => (
+                HashMap::new(),
+                format!("hydration failed: {}", status.message()),
+            ),
+        };
+        for hit in &mut resp.hits {
+            let id = hit.coordinates.as_ref().map(compose_id).unwrap_or_default();
+            match rows.remove(&id) {
+                Some(row) => hit.row = Some(row),
+                None => hit.hydrate_error = error.clone(),
+            }
+        }
     }
 
     /// Run a suggest. Multi-shard: merge suggestions by text (summing counts), best (highest
@@ -2244,6 +2358,8 @@ mod tests {
                     sort_values: Vec::new(),
                     fields: vec![],
                     highlight: Default::default(),
+                    row: None,
+                    hydrate_error: String::new(),
                 })
                 .collect::<Vec<_>>();
             let total = hits.len() as u64;
@@ -2650,6 +2766,8 @@ mod tests {
                         })
                         .collect(),
                     highlight: Default::default(),
+                    row: None,
+                    hydrate_error: String::new(),
                 })
                 .collect::<Vec<_>>();
             Ok(Response::new(SearchResponse {
@@ -3288,6 +3406,8 @@ mod tests {
                     sort_values: Vec::new(),
                     fields: vec![],
                     highlight: Default::default(),
+                    row: None,
+                    hydrate_error: String::new(),
                 })
                 .collect::<Vec<_>>();
             Ok(Response::new(SearchResponse {
@@ -3463,6 +3583,8 @@ mod tests {
                         kind: Some(sort_value::Kind::Num(*rank)),
                     }],
                     highlight: Default::default(),
+                    row: None,
+                    hydrate_error: String::new(),
                 })
                 .collect::<Vec<_>>();
             Ok(Response::new(SearchResponse {
@@ -3582,6 +3704,8 @@ mod tests {
                         kind: Some(sort_value::Kind::Num(*rank)),
                     }],
                     highlight: Default::default(),
+                    row: None,
+                    hydrate_error: String::new(),
                 })
                 .collect::<Vec<_>>();
             Ok(Response::new(SearchResponse {
@@ -4498,6 +4622,8 @@ mod tests {
                     sort_values: Vec::new(),
                     fields: vec![],
                     highlight: Default::default(),
+                    row: None,
+                    hydrate_error: String::new(),
                 }],
                 total: 1,
                 ..Default::default()
@@ -4745,6 +4871,8 @@ mod tests {
             sort_values: Vec::new(),
             fields: vec![],
             highlight: Default::default(),
+            row: None,
+            hydrate_error: String::new(),
         }
     }
 

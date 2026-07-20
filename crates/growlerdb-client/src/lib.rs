@@ -209,6 +209,8 @@ pub struct SearchQuery {
     search_after: Vec<u8>,
     index: String,
     highlight: Option<growlerdb_proto::v1::HighlightRequest>,
+    hydrate: bool,
+    hydrate_columns: Vec<String>,
 }
 
 impl SearchQuery {
@@ -281,6 +283,16 @@ impl SearchQuery {
         self.search_after = cursor;
         self
     }
+
+    /// **Inline hydration**: attach each hit's authoritative source row (`SearchHit.row`)
+    /// to the response — the search → `GetByKey` round trip in one call. `columns` projects
+    /// the hydrated row; empty = all. A row that fails to resolve carries a per-hit
+    /// `hydrate_error` instead; the search itself never fails on hydration.
+    pub fn hydrate(mut self, columns: Vec<String>) -> Self {
+        self.hydrate = true;
+        self.hydrate_columns = columns;
+        self
+    }
 }
 
 impl From<SearchQuery> for SearchRequest {
@@ -302,6 +314,8 @@ impl From<SearchQuery> for SearchRequest {
             index: q.index,
             // Server-side highlighting opt-in; None ⇒ off.
             highlight: q.highlight,
+            hydrate: q.hydrate,
+            hydrate_columns: q.hydrate_columns,
         }
     }
 }

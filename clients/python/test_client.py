@@ -37,6 +37,25 @@ def capture_request():
         yield seen
 
 
+class SearchBodyTests(unittest.TestCase):
+    def test_hydrate_opt_in_rides_the_search_body(self):
+        import json
+
+        with capture_request() as seen:
+            Client("http://x").search("q", hydrate=True, hydrate_columns=["body"])
+        body = json.loads(seen[0].data)
+        self.assertTrue(body["hydrate"])
+        self.assertEqual(body["hydrate_columns"], ["body"])
+
+    def test_hydrate_absent_by_default(self):
+        import json
+
+        with capture_request() as seen:
+            Client("http://x").search("q")
+        body = json.loads(seen[0].data)
+        self.assertNotIn("hydrate", body)
+
+
 class AuthHeaderTests(unittest.TestCase):
     def test_token_sends_bearer_and_no_identity_headers(self):
         with capture_request() as seen:

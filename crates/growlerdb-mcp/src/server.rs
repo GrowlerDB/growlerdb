@@ -203,6 +203,16 @@ fn tool_search(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    // Inline hydration: forwarded to the engine, which attaches each hit's authoritative
+    // row via the governed keys:get path — the one-call form of search→hydrate.
+    let hydrate = args
+        .get("hydrate")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let hydrate_columns = args
+        .get("hydrate_columns")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
     // Default mode: hybrid when a vector field is given, else lexical.
     let mode = args
         .get("mode")
@@ -226,6 +236,8 @@ fn tool_search(
                     "limit": k,
                     "syntax": syntax,
                     "index": index,
+                    "hydrate": hydrate,
+                    "hydrate_columns": hydrate_columns,
                 });
                 client.search(body).await
             }
@@ -242,6 +254,8 @@ fn tool_search(
                     "filter": filter,
                     "syntax": syntax,
                     "index": index,
+                    "hydrate": hydrate,
+                    "hydrate_columns": hydrate_columns,
                 });
                 if mode == "semantic" {
                     client.semantic_search(body).await
@@ -343,11 +357,13 @@ fn tool_defs() -> Value {
             "name": "search",
             "description": "Governed, tenant-scoped retrieval over a GrowlerDB index. Returns ranked hits as \
                 document COORDINATES (partition + identifier) with relevance scores and any cached display \
-                fields — NOT authoritative rows. To read full/authoritative field values, pass a hit's \
-                `coordinates` to `hydrate`. Modes: `lexical` (BM25 keyword, the default), `semantic` (vector \
-                KNN — needs `vector_field`), `hybrid` (lexical+vector RRF fusion — needs `vector_field`, the \
-                default when `vector_field` is given). Results are limited to what the caller's bearer token \
-                is entitled to; you never see another tenant's data.",
+                fields. Set `hydrate: true` to ALSO get each hit's authoritative source `row` in the same \
+                call (the one-call form of search→hydrate; a row that fails to resolve carries a per-hit \
+                `hydrate_error` instead). Without `hydrate`, pass a hit's `coordinates` to the `hydrate` \
+                tool for the authoritative values. Modes: `lexical` (BM25 keyword, the default), `semantic` \
+                (vector KNN — needs `vector_field`), `hybrid` (lexical+vector RRF fusion — needs \
+                `vector_field`, the default when `vector_field` is given). Results are limited to what the \
+                caller's bearer token is entitled to; you never see another tenant's data.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -358,7 +374,9 @@ fn tool_defs() -> Value {
                     "k": { "type": "integer", "description": "Max results (alias: limit)." },
                     "limit": { "type": "integer", "description": "Max results (alias: k)." },
                     "filter": { "type": "string", "description": "Optional lexical/fast-field filter for the vector arm (semantic/hybrid)." },
-                    "syntax": { "type": "string", "enum": ["lucene", "kql"], "description": "Query grammar. Defaults to lucene." }
+                    "syntax": { "type": "string", "enum": ["lucene", "kql"], "description": "Query grammar. Defaults to lucene." },
+                    "hydrate": { "type": "boolean", "description": "Also return each hit's authoritative source row inline (governed, same as the `hydrate` tool). Default false." },
+                    "hydrate_columns": { "type": "array", "items": { "type": "string" }, "description": "Columns to hydrate when `hydrate` is set. Empty/omitted = all." }
                 },
                 "required": ["query"]
             }

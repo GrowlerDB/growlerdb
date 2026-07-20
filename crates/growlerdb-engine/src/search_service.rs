@@ -190,6 +190,9 @@ impl Search for SearchService {
                             sort_values: g.sort_values.iter().map(Into::into).collect(),
                             fields: hit_fields(&g.hit.fields),
                             highlight: hit_highlight(&g.hit.highlight),
+                            // Inline hydration is Gateway-set; a Node never fills these.
+                            row: None,
+                            hydrate_error: String::new(),
                         })
                         .collect(),
                     next_cursor: Vec::new(),
@@ -712,6 +715,8 @@ fn knn_response(hits: Vec<growlerdb_core::Hit>) -> SearchResponse {
                 sort_values: Vec::new(),
                 fields: hit_fields(&h.fields),
                 highlight: hit_highlight(&h.highlight),
+                row: None,
+                hydrate_error: String::new(),
             })
             .collect(),
         next_cursor: Vec::new(),
@@ -762,6 +767,9 @@ fn page_response(
                 fields: hit_fields(&h.fields),
                 // Server-side highlights; empty unless the request opted in.
                 highlight: hit_highlight(&h.highlight),
+                // Inline hydration is Gateway-set; a Node never fills these.
+                row: None,
+                hydrate_error: String::new(),
             })
             .collect(),
         next_cursor: next.map(encode_cursor).unwrap_or_default(),

@@ -2,15 +2,13 @@
 //! subset* of the OpenSearch Query DSL into GrowlerDB's native query string (which parses to the
 //! canonical [`Query`](growlerdb_core::Query) AST), runs it through the [`Gateway`], and shapes the
 //! results as OpenSearch documents: `_id` synthesized from the **composite key**, `_source` filled
-//! by **PK hydration** ([`GetByKey`]). Read-path first — the native PK API stays primary; this is a
-//! thin migration/ecosystem convenience, mounted only when the gateway is started with
-//! `--opensearch`.
+//! by the Gateway's **inline hydration** (`SearchRequest.hydrate` — the governed PK-lookup path).
+//! Read-path first — the native PK API stays primary; this is a thin migration/ecosystem
+//! convenience, mounted only when the gateway is started with `--opensearch`.
 //!
 //! The supported subset and its caveats are documented in `docs/opensearch-adapter.md`; anything
 //! outside it returns a clear error (`501` unsupported / `400` malformed) rather than silently
 //! mis-translating.
-//!
-//! [`GetByKey`]: crate::gateway::Gateway::get_by_key
 
 use std::sync::Arc;
 
@@ -23,8 +21,8 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value as JsonValue};
 
 use growlerdb_proto::v1::{
-    self, value::Kind, Coordinates, GetByKeyRequest, HighlightField, HighlightRequest,
-    SearchRequest, Sort as WireSort,
+    self, value::Kind, Coordinates, HighlightField, HighlightRequest, SearchRequest,
+    Sort as WireSort,
 };
 
 use crate::gateway::Gateway;
@@ -578,6 +576,13 @@ async fn run_search(
             // Scope to the path's `{index}`; empty for `/_search` (the served index).
             index: index.clone(),
             highlight,
+            // `_source` comes from the engine's **inline hydration**: rows attach to their
+            // hits by coordinates at the Gateway (one admitted query), replacing the adapter's
+            // old search-then-GetByKey pair. A hit whose row doesn't resolve (failed shard /
+            // tenant-filtered / missing) carries `hydrate_error` and gets an empty `_source` —
+            // hydration failure stays non-fatal, as before.
+            hydrate: true,
+            hydrate_columns: Vec::new(),
         },
         &headers,
     );
@@ -587,55 +592,22 @@ async fn run_search(
         Err(status) => return status_error(status),
     };
 
-    // Hydrate `_source` for the page in one batch (PK lookup; columns empty = all fields).
-    let keys: Vec<Coordinates> = resp
-        .hits
-        .iter()
-        .filter_map(|h| h.coordinates.clone())
-        .collect();
-    let rows = if keys.is_empty() {
-        Vec::new()
-    } else {
-        let hreq = grpc_request(
-            GetByKeyRequest {
-                keys,
-                columns: Vec::new(),
-                window: 0,
-                // Hydrate against the same index the search resolved.
-                index: index.clone(),
-            },
-            &headers,
-        );
-        match gw.get_by_key(hreq).await {
-            Ok(r) => r.into_inner().rows,
-            // Hydration failure is non-fatal: return hits without `_source` rather than 500.
-            Err(_) => Vec::new(),
-        }
-    };
-
-    // Key hydrated rows by their own coordinates: `get_by_key` returns rows in completion order and
-    // may drop tenant-filtered or missing keys, so pairing by position would mis-attribute `_source`
-    // to the wrong `_id` on a sharded/windowed index. Look each hit's source up by its coordinates.
-    let sources: std::collections::HashMap<String, Map<String, JsonValue>> = rows
-        .into_iter()
-        .filter_map(|row| {
-            let id = compose_id(row.key.as_ref()?);
-            let fields = row
-                .fields
-                .into_iter()
-                .filter_map(|f| f.value.map(|v| (f.name, value_to_json(v))))
-                .collect::<Map<String, JsonValue>>();
-            Some((id, fields))
-        })
-        .collect();
-
     let mut hits = Vec::with_capacity(resp.hits.len());
     let mut max_score = f64::MIN;
     for hit in resp.hits.iter() {
         let coords = hit.coordinates.clone().unwrap_or_default();
         let id = compose_id(&coords);
-        // Missing key → omit `_source` rather than shift another hit's row onto this `_id`.
-        let source = sources.get(&id).cloned().unwrap_or_default();
+        // Missing row → omit `_source` rather than shift another hit's row onto this `_id`.
+        let source: Map<String, JsonValue> = hit
+            .row
+            .as_ref()
+            .map(|row| {
+                row.fields
+                    .iter()
+                    .filter_map(|f| f.value.clone().map(|v| (f.name.clone(), value_to_json(v))))
+                    .collect()
+            })
+            .unwrap_or_default();
         max_score = max_score.max(hit.score);
         let mut doc = json!({
             "_index": index,

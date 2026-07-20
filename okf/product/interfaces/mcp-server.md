@@ -3,7 +3,7 @@ type: Interface
 title: MCP retrieval server
 description: A read-only Model Context Protocol server that exposes GrowlerDB's governed retrieval to AI agents, scoped by the caller's token (RBAC + tenant).
 tags: [interface, mcp, agents, retrieval, rag]
-timestamp: 2026-07-19T00:00:00
+timestamp: 2026-07-20T00:00:00
 ---
 
 # MCP retrieval server
@@ -28,7 +28,9 @@ agent-native face of [retrieval-first](/system/decisions/d42-retrieval-first.md)
 ## Tools
 
 - **`search`** — lexical, semantic, or **hybrid** ([RRF](/product/functional/search/vector.md)) retrieval;
-  returns ranked **coordinates** + scores + cached fields.
+  returns ranked **coordinates** + scores + cached fields. With `hydrate: true` it also returns each
+  hit's **authoritative row** in the same call (the engine's
+  [inline hydration](/product/functional/hydration.md) — one tool call instead of search-then-hydrate).
 - **`hydrate`** — resolves coordinates to authoritative, governed rows from Iceberg
   ([hydration](/product/functional/hydration.md)).
 - **`aggregate`** — value counts / facets to narrow a search.

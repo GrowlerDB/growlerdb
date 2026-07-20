@@ -85,6 +85,8 @@ impl Node for CaptureNode {
                 sort_values: vec![],
                 fields: vec![],
                 highlight,
+                row: None,
+                hydrate_error: String::new(),
             }],
             total: 1,
             next_cursor: vec![],

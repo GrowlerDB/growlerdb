@@ -82,6 +82,17 @@ message SearchRequest {
   // (highlighting reads stored text + runs a snippet generator, a per-hit cost). Unset ⇒ no
   // highlights (the console falls back to its client-side term marker).
   HighlightRequest highlight = 12;
+  // Opt-in **inline hydration**: when true the Gateway resolves the returned page's
+  // coordinates to authoritative source rows through the same governed GetByKey path (catalog
+  // access control, key-verified rows) and attaches each row to its hit (`SearchHit.row`) — the
+  // search → GetByKey round-trip in one call. Gateway-only orchestration (like HybridSearch):
+  // the Gateway consumes it and never forwards it to shards. A hydration failure degrades
+  // per-hit (`SearchHit.hydrate_error`), never the search itself. Off by default — cached
+  // display fields (`SearchHit.fields`) remain the no-round-trip default.
+  bool hydrate = 13;
+  // Column projection for inline hydration (mirrors `GetByKeyRequest.columns`).
+  // Empty = all source columns. Ignored unless `hydrate` is set.
+  repeated string hydrate_columns = 14;
 }
 
 // Server-side highlight options. Only analyzed **TEXT** fields whose text is available
@@ -136,6 +147,14 @@ message SearchHit {
   // unlike the console's client-side literal-term marker. Empty when highlighting wasn't requested
   // or the hit had no matching fragment in any highlightable field.
   map<string, HighlightField> highlight = 7;
+  // The hit's **authoritative source row**, present only when the request opted in via
+  // `hydrate` and the row resolved. Same governance + key verification as GetByKey; the cached
+  // `fields` above are index copies, this is the source of truth. Gateway-set; never set by a Node.
+  HydratedRow row = 8;
+  // Why this hit carries no `row` under `hydrate`: the per-hit failure surface (a failed
+  // shard, a tenant-filtered or source-missing row, or a hydration error). Empty when the row is
+  // present or hydration wasn't requested — hydration failure degrades per-hit, never the search.
+  string hydrate_error = 9;
 }
 
 message SearchResponse {
@@ -229,6 +248,11 @@ message SemanticSearchRequest {
   // Candidate pool to rerank when `rerank` is set: retrieve this many neighbors, rerank them,
   // then return the top `k`. 0 ⇒ rerank exactly the `k` retrieved. Ignored when `rerank` is false.
   uint32 rerank_top_k = 9;
+  // Opt-in **inline hydration** (see `SearchRequest.hydrate`): attach each returned hit's
+  // authoritative row via the governed GetByKey path. Gateway-consumed; never forwarded to shards.
+  bool hydrate = 10;
+  // Column projection for inline hydration; empty = all. Ignored unless `hydrate` is set.
+  repeated string hydrate_columns = 11;
 }
 
 // **Hybrid search** — a Gateway-only orchestration surface (no node RPC): the Gateway runs BOTH a
@@ -253,6 +277,11 @@ message HybridSearchRequest {
   // Candidate pool the semantic arm reranks (see SemanticSearchRequest.rerank_top_k). 0 ⇒ the
   // arm's over-fetched candidate set. Ignored when `rerank` is false.
   uint32 rerank_top_k = 9;
+  // Opt-in **inline hydration** (see `SearchRequest.hydrate`): attach each fused hit's
+  // authoritative row via the governed GetByKey path, after the arms are fused.
+  bool hydrate = 10;
+  // Column projection for inline hydration; empty = all. Ignored unless `hydrate` is set.
+  repeated string hydrate_columns = 11;
 }
 
 // Read-side query service over a shard (adapts the in-process IndexReader).

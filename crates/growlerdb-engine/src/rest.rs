@@ -1771,6 +1771,15 @@ struct SearchDto {
     /// object of matched fragments per field. Absent (the default) ⇒ no highlights (a per-hit cost).
     #[serde(default)]
     highlight: Option<HighlightDto>,
+    /// Opt into **inline hydration**: each hit also carries `row`, its authoritative source
+    /// row resolved through the same governed path as `/v1/keys:get` — the search → hydrate
+    /// round-trip in one call. A row that doesn't resolve degrades per-hit (`hydrate_error`),
+    /// never the search.
+    #[serde(default)]
+    hydrate: bool,
+    /// Column projection for inline hydration; empty = all source columns.
+    #[serde(default)]
+    hydrate_columns: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -1842,6 +1851,8 @@ impl SearchDto {
                 max_fragments: h.max_fragments,
                 fragment_size: h.fragment_size,
             }),
+            hydrate: self.hydrate,
+            hydrate_columns: self.hydrate_columns,
         }
     }
 }
@@ -1883,6 +1894,13 @@ struct SemanticSearchDto {
     /// `k` retrieved. Ignored when `rerank` is false.
     #[serde(default)]
     rerank_top_k: u32,
+    /// Opt into **inline hydration** (see `/v1/search`): each hit also carries its
+    /// authoritative `row`, resolved via the governed `/v1/keys:get` path.
+    #[serde(default)]
+    hydrate: bool,
+    /// Column projection for inline hydration; empty = all source columns.
+    #[serde(default)]
+    hydrate_columns: Vec<String>,
 }
 
 impl SemanticSearchDto {
@@ -1902,6 +1920,8 @@ impl SemanticSearchDto {
             window: 0,
             rerank: self.rerank,
             rerank_top_k: self.rerank_top_k,
+            hydrate: self.hydrate,
+            hydrate_columns: self.hydrate_columns,
         }
     }
 }
@@ -1937,6 +1957,13 @@ struct HybridSearchDto {
     /// `rerank` is false.
     #[serde(default)]
     rerank_top_k: u32,
+    /// Opt into **inline hydration** (see `/v1/search`): each fused hit also carries its
+    /// authoritative `row`, resolved via the governed `/v1/keys:get` path after fusion.
+    #[serde(default)]
+    hydrate: bool,
+    /// Column projection for inline hydration; empty = all source columns.
+    #[serde(default)]
+    hydrate_columns: Vec<String>,
 }
 
 impl HybridSearchDto {
@@ -1955,6 +1982,8 @@ impl HybridSearchDto {
             rrf_k: self.rrf_k,
             rerank: self.rerank,
             rerank_top_k: self.rerank_top_k,
+            hydrate: self.hydrate,
+            hydrate_columns: self.hydrate_columns,
         }
     }
 }
@@ -1995,6 +2024,16 @@ struct HitDto {
     /// the console renders `marked` segments in `<mark>`. Omitted otherwise.
     #[serde(skip_serializing_if = "Map::is_empty")]
     highlight: Map<String, JsonValue>,
+    /// The hit's **authoritative source row** (inline hydration): present only when the
+    /// request set `hydrate` and the row resolved through the governed `/v1/keys:get` path.
+    /// Unlike `fields` (index-cached copies), these are the source-of-truth values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    row: Option<Map<String, JsonValue>>,
+    /// Why this hit carries no `row` under `hydrate` — the per-hit failure surface (failed
+    /// shard, tenant-filtered/missing row, or a hydration error). Omitted when `row` is present
+    /// or hydration wasn't requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hydrate_error: Option<String>,
 }
 
 /// One XSS-safe highlight segment over REST: a run of text and whether it is a matched
@@ -2028,6 +2067,13 @@ impl From<v1::SearchResponse> for SearchRespDto {
                     group: h.group.map(value_to_json),
                     group_count: h.group_count,
                     highlight: highlight_to_json(h.highlight),
+                    row: h.row.map(|row| {
+                        row.fields
+                            .into_iter()
+                            .filter_map(|f| f.value.map(|v| (f.name, value_to_json(v))))
+                            .collect()
+                    }),
+                    hydrate_error: (!h.hydrate_error.is_empty()).then_some(h.hydrate_error),
                 })
                 .collect(),
         }
@@ -3148,6 +3194,8 @@ mod tests {
             sort_values: vec![],
             fields,
             highlight: Default::default(),
+            row: None,
+            hydrate_error: String::new(),
         };
         let resp = |hits| {
             serde_json::to_value(SearchRespDto::from(v1::SearchResponse {
