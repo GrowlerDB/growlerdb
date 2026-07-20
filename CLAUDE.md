@@ -6,7 +6,6 @@ is and how it works is the **OKF** in [`okf/`](okf/index.md) — start there.
 
 ## Session flow
 
-- **Backlog** lives in a sibling `backlog/` directory outside this repo. Work items are its tasks.
 - **Every implementation change goes on a branch and into a PR** — never commit to `main`. A single
   PR may cover several tasks.
 - **The user reviews and merges the PR** before we continue. Don't start dependent follow-on work on
