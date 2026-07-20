@@ -2404,6 +2404,12 @@ impl Shard {
         self.schema.vector_fields()
     }
 
+    /// Every mapped field's describe-facing summary (name, type, `fast`/`indexed`/`cached`),
+    /// in definition order — see [`IndexSchema::mapped_fields`](crate::MappedFieldSummary).
+    pub fn mapped_fields(&self) -> Vec<crate::MappedFieldSummary> {
+        self.schema.mapped_fields()
+    }
+
     pub fn index_dir(&self) -> &Path {
         &self.index_dir
     }

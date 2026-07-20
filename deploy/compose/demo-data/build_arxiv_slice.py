@@ -54,9 +54,13 @@ def epoch_ms(date: str) -> int:
         return 0
 
 
-def harvest(max_records: int):
+def harvest(max_records: int, from_date: str):
     rows = []
     params = {"verb": "ListRecords", "metadataPrefix": "arXiv", "set": "cs"}
+    # OAI harvests oldest-first; without a floor the slice is all 1990s/2000s papers — the
+    # demo wants a corpus that can answer questions about current techniques.
+    if from_date:
+        params["from"] = from_date
     while len(rows) < max_records:
         root = fetch(params)
         for rec in root.iterfind(".//oai:record", NS):
@@ -100,9 +104,15 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--max", type=int, default=20_000, help="max papers to harvest")
     ap.add_argument("--out", default="arxiv-cs-20k.parquet", help="output parquet path")
+    ap.add_argument(
+        "--from",
+        dest="from_date",
+        default="2022-01-01",
+        help="OAI datestamp floor (YYYY-MM-DD; empty = from the beginning of arXiv)",
+    )
     args = ap.parse_args()
 
-    rows = harvest(args.max)
+    rows = harvest(args.max, args.from_date)
     schema = pa.schema(
         [
             ("id", pa.string()),

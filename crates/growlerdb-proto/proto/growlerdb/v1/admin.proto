@@ -38,6 +38,21 @@ message IndexStats {
   // and label it (model/dims) without re-deriving the mapping. Empty for a non-vector index. Same
   // for every shard of an index.
   repeated VectorFieldStat vector_fields = 9;
+  // Every mapped field with its type + capability flags, in definition order — the full
+  // schema a client needs to COMPOSE valid queries (which fields are term-queryable,
+  // range/sortable, returned with hits) instead of discovering the mapping by trial 400s.
+  // Consumers: console field pickers, the MCP `describe_index` tool (agents self-teach the
+  // schema). Same for every shard of an index.
+  repeated MappedFieldStat fields = 10;
+}
+
+// One mapped field's describe-facing summary: name, type, and what a query can do with it.
+message MappedFieldStat {
+  string name = 1;
+  string type = 2;   // TEXT | KEYWORD | LONG | DOUBLE | BOOL | DATE | IP | VECTOR
+  bool fast = 3;     // columnar: range-filter / sort / aggregate
+  bool indexed = 4;  // inverted index: term-queryable
+  bool cached = 5;   // value returns with the hit (no hydration round trip)
 }
 
 // One VECTOR field's describe-facing summary: the field path plus the embedding config a console

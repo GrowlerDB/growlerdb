@@ -56,16 +56,26 @@ async fn search_handler(headers: HeaderMap, Json(body): Json<Value>) -> impl Int
         "shards_total": 1,
         "_echo_index": index,
         "_echo_hydrate": hydrate,
-        "_echo_hydrate_columns": hydrate_columns
+        "_echo_hydrate_columns": hydrate_columns,
+        "_echo_highlight": body.get("highlight").cloned().unwrap_or(Value::Null)
     }))
     .into_response()
 }
 
-async fn semantic_handler(headers: HeaderMap, Json(_): Json<Value>) -> impl IntoResponse {
+async fn semantic_handler(headers: HeaderMap, Json(body): Json<Value>) -> impl IntoResponse {
     if let Err(e) = require_bearer(&headers) {
         return e.into_response();
     }
-    Json(json!({ "hits": [], "total": 0, "_endpoint": "semantic" })).into_response()
+    // Echo the embedded text; return the canonical seed (doc-1) plus one neighbor (doc-2), so
+    // the more_like_this test can assert the seed is excluded and the neighbor survives.
+    let hit = |id: &str| json!({ "coordinates": { "identifier": [{ "name": "id", "value": id }] }, "score": 0.9 });
+    Json(json!({
+        "hits": [hit("doc-1"), hit("doc-2")],
+        "total": 2,
+        "_endpoint": "semantic",
+        "_echo_query_text": body.get("query_text").cloned().unwrap_or(Value::Null)
+    }))
+    .into_response()
 }
 
 async fn keys_get_handler(headers: HeaderMap, Json(body): Json<Value>) -> impl IntoResponse {
@@ -101,7 +111,19 @@ async fn describe_handler(headers: HeaderMap, Json(body): Json<Value>) -> impl I
         )
             .into_response();
     }
-    Json(json!({ "name": "docs", "num_docs": 42, "snapshot": 7 })).into_response()
+    Json(json!({
+        "name": "docs", "num_docs": 42, "snapshot": 7,
+        // The full-mapping shape the engine's describe now returns; drives example_queries.
+        "fields": [
+            { "name": "id", "type": "KEYWORD", "fast": false, "indexed": true, "cached": false },
+            { "name": "title", "type": "TEXT", "fast": false, "indexed": true, "cached": true },
+            { "name": "published", "type": "DATE", "fast": true, "indexed": false, "cached": false }
+        ],
+        "vector_fields": [
+            { "name": "body_vec", "source_field": "body", "model": "bge-small-en-v1.5", "dims": 384 }
+        ]
+    }))
+    .into_response()
 }
 
 async fn indexes_handler(headers: HeaderMap) -> impl IntoResponse {
@@ -224,7 +246,8 @@ async fn initialize_handshake_and_tools_list() {
             "hydrate",
             "aggregate",
             "list_indexes",
-            "describe_index"
+            "describe_index",
+            "more_like_this"
         ]
     );
     // Every tool advertises an inputSchema.
@@ -484,4 +507,165 @@ async fn aggregate_tool_returns_facet_buckets() {
     let payload: Value = serde_json::from_str(text).unwrap();
     assert_eq!(payload["facets"][0]["field"], "category");
     assert_eq!(payload["facets"][0]["buckets"][0]["count"], 3);
+}
+
+/// The query-syntax reference is a first-class MCP **resource**: advertised in capabilities,
+/// listed, and readable — so an agent learns the grammar without a round trip to the gateway.
+#[tokio::test]
+async fn query_syntax_resource_lists_and_reads() {
+    let base = spawn_mock_gateway().await;
+    let responses = drive(
+        config(&base),
+        vec![
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "resources/list" }),
+            json!({ "jsonrpc": "2.0", "id": 3, "method": "resources/read",
+                    "params": { "uri": "growlerdb://query-syntax" } }),
+            json!({ "jsonrpc": "2.0", "id": 4, "method": "resources/read",
+                    "params": { "uri": "growlerdb://nope" } }),
+        ],
+    )
+    .await;
+
+    assert!(responses[0]["result"]["capabilities"]["resources"].is_object());
+    let listed = responses[1]["result"]["resources"].as_array().unwrap();
+    assert_eq!(listed[0]["uri"], "growlerdb://query-syntax");
+    let text = responses[2]["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(text.contains("Lucene"), "the grammar doc reads back");
+    assert!(text.contains("hydrate"), "capabilities guidance included");
+    // Unknown URI → a JSON-RPC resource error, not a crash or an empty read.
+    assert!(responses[3]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("unknown resource"));
+}
+
+/// `highlight` + `max_chars` shape the search response for an agent's context window:
+/// the opt-in rides to the gateway, and an over-budget payload drops tail hits with an
+/// explicit `truncated_hits` marker.
+#[tokio::test]
+async fn search_highlight_and_response_budget() {
+    let base = spawn_mock_gateway().await;
+    let responses = drive(
+        config(&base),
+        vec![
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": { "name": "search",
+                                "arguments": { "query": "x", "highlight": true } } }),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": { "name": "search",
+                                "arguments": { "query": "x", "max_chars": 40 } } }),
+        ],
+    )
+    .await;
+
+    let with_highlight: Value = serde_json::from_str(
+        responses[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(with_highlight["_echo_highlight"], json!({}));
+
+    let budgeted: Value = serde_json::from_str(
+        responses[1]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        budgeted["hits"].as_array().unwrap().len(),
+        0,
+        "over-budget hits dropped"
+    );
+    assert_eq!(
+        budgeted["truncated_hits"], 1,
+        "the cut is flagged, never silent"
+    );
+    assert_eq!(
+        budgeted["total"], 1,
+        "total survives so the agent knows matches exist"
+    );
+}
+
+/// `more_like_this` composes hydrate → semantic search: the seed's text is what gets embedded,
+/// and the seed itself is excluded from the neighbors.
+#[tokio::test]
+async fn more_like_this_embeds_the_seed_and_excludes_it() {
+    let base = spawn_mock_gateway().await;
+    let responses = drive(
+        config(&base),
+        vec![json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "more_like_this", "arguments": {
+                    "coordinates": { "identifier": [{ "name": "id", "value": "doc-1" }] },
+                    "vector_field": "body_vec",
+                    "text_field": "body"
+                } } })],
+    )
+    .await;
+
+    let result = &responses[0]["result"];
+    assert_eq!(result["isError"], false, "{result}");
+    let payload: Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    // The mock hydrates doc-1's body to "authoritative" — that text is what was embedded.
+    assert_eq!(payload["_echo_query_text"], "authoritative");
+    // The mock returned [doc-1 (seed), doc-2]; the seed is excluded.
+    let ids: Vec<&str> = payload["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["coordinates"]["identifier"][0]["value"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["doc-2"]);
+}
+
+/// A failed tool call teaches the recovery move: a gateway 404 points at `list_indexes`.
+#[tokio::test]
+async fn tool_errors_carry_actionable_hints() {
+    let base = spawn_mock_gateway().await;
+    let responses = drive(
+        config(&base),
+        vec![json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "describe_index", "arguments": { "index": "missing" } } })],
+    )
+    .await;
+    let result = &responses[0]["result"];
+    assert_eq!(result["isError"], true);
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("hint:"), "{text}");
+    assert!(text.contains("list_indexes"), "{text}");
+}
+
+/// `describe_index` self-teaches: the mock's schema comes back with ready-made
+/// `example_queries` composed from the actual fields, plus usage guidance.
+#[tokio::test]
+async fn describe_returns_example_queries_from_the_schema() {
+    let base = spawn_mock_gateway().await;
+    let responses = drive(
+        config(&base),
+        vec![json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "describe_index", "arguments": {} } })],
+    )
+    .await;
+    let payload: Value = serde_json::from_str(
+        responses[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let examples = payload["example_queries"].as_array().unwrap();
+    assert!(
+        examples.iter().any(|e| e["query"]
+            .as_str()
+            .map(|q| q.starts_with("title:"))
+            .unwrap_or(false)),
+        "a term example on the indexed TEXT field: {examples:?}"
+    );
+    assert!(payload["guidance"]
+        .as_str()
+        .unwrap()
+        .contains("query-syntax"));
 }
