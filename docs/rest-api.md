@@ -72,6 +72,29 @@ full scan use the keyset `search_after` scroll, not an unbounded page. When a sh
 the response carries `"partial": true` (and `/v1/suggest`, `/v1/keys:get` carry `"failed_shards": N`)
 so the result's incompleteness is never silent; the flag is omitted on a complete result.
 
+**Inline hydration** (opt-in) — set `"hydrate": true` to get the search → `/v1/keys:get` round trip
+in **one call**: each hit also carries `row`, its **authoritative source row**, resolved through the
+same governed, key-verified path as `/v1/keys:get` (`hydrate_columns` projects it; empty = all).
+Unlike `fields` (index-cached copies), `row` holds the source-of-truth values. Only the returned page
+is hydrated, and a page above the hydration batch maximum (1000) is rejected up front. A row that
+fails to resolve — a failed shard, a tenant-filtered or source-missing key, or a source outage —
+degrades **per hit**: the hit keeps its coordinates + `fields` and carries `hydrate_error` instead of
+`row`; the search itself never fails on hydration. Also accepted by `search:semantic` and
+`search:hybrid` (rows attach to the fused page).
+
+```sh
+curl -s localhost:8081/v1/search -H 'content-type: application/json' -d '{
+  "query": "title:iceberg", "limit": 10, "hydrate": true, "hydrate_columns": ["title", "body"]
+}'
+```
+```json
+{ "hits": [ { "coordinates": { "identifier": [ { "name": "id", "value": "doc-2" } ] },
+             "score": 1.0,
+             "fields": { "title": "Iceberg internals" },
+             "row": { "title": "Iceberg internals", "body": "…the full source text…" } } ],
+  "total": 1 }
+```
+
 ### `POST /v1/keys:get`
 Hydrate authoritative rows from Iceberg by coordinate (catalog-governed). `columns` empty = all.
 

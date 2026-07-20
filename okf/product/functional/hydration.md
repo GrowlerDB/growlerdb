@@ -1,9 +1,9 @@
 ---
 type: Feature
 title: Hydration
-description: Resolve search coordinates to the full authoritative Iceberg rows, governed — via a per-index location strategy (coordinates or predicate).
+description: Resolve search coordinates to the full authoritative Iceberg rows, governed — via a per-index location strategy (coordinates or predicate); standalone (keys:get) or inline with the search.
 tags: [feature, hydration, keys, retrieval]
-timestamp: 2026-07-04T14:22:00
+timestamp: 2026-07-20T00:00:00
 ---
 
 # Hydration
@@ -12,13 +12,22 @@ Search returns [coordinates](/glossary.md) (the composite key), not documents. *
 those coordinates to the **full authoritative rows** via `POST /v1/keys:get` (gRPC `Lookup`) — a fast
 point lookup against Iceberg, governed by the catalog so a user only retrieves what they may read.
 
-## Two retrieval paths
+## Three retrieval paths
 
 - **Cached display fields (no hydration).** If the result columns are marked
   [`cached`](/system/storage/data-model.md), their values return **with the hit**, so a results page
   renders without any Iceberg round trip.
 - **Full hydration.** For the authoritative record (including large/uncached fields), fetch by key —
   typically on row-open.
+- **Inline hydration (one call).** A search (lexical, semantic, or hybrid) with `hydrate: true`
+  returns each hit's authoritative row **with the search response** (`hit.row`, projected by
+  `hydrate_columns`) — the search → keys:get round trip collapsed for callers that want documents,
+  not coordinates (SDK/agent retrieval, the [OpenSearch adapter](/product/interfaces/opensearch-adapter.md)'s
+  `_source`, the [MCP `search` tool](/product/interfaces/mcp-server.md)). The gateway orchestrates it
+  through the **same governed GetByKey path** (never a new one) under the query's single admission
+  permit; only the returned page hydrates (a page above the hydration batch maximum is rejected up
+  front), and a row that fails to resolve degrades **per hit** (`hit.hydrate_error`) — never the
+  search. Cached fields stay the no-round-trip default; inline hydration is the explicit opt-in.
 
 ## How a key finds its row: the location strategy
 

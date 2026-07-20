@@ -4,7 +4,7 @@ title: Query
 description: Full-text query via a canonical AST, with Lucene- and KQL-style string forms.
 tags: [feature, search, query]
 resource: /docs/query-language.md
-timestamp: 2026-07-04T14:22:00
+timestamp: 2026-07-20T00:00:00
 ---
 
 # Query
@@ -34,5 +34,7 @@ and type rules are validated **at execution** against the index schema.
 ## Returns
 
 Ranked **coordinates** (the composite key) + a BM25 score — not documents; a true cross-shard `total`
-and a `partial` flag if a shard was down. Fetch rows via [hydration](/product/functional/hydration.md).
+and a `partial` flag if a shard was down. Fetch rows via [hydration](/product/functional/hydration.md) —
+either the standalone `keys:get`, or **inline** (`hydrate: true` attaches each hit's authoritative
+row to the same response, per-hit-degrading on failure).
 Execution details: [system/query-execution](/system/query-execution.md).

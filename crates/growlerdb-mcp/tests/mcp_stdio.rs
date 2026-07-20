@@ -38,8 +38,10 @@ async fn search_handler(headers: HeaderMap, Json(body): Json<Value>) -> impl Int
     if let Err(e) = require_bearer(&headers) {
         return e.into_response();
     }
-    // Echo the index back so the test can assert routing.
+    // Echo the index + hydrate opt-in back so tests can assert routing/forwarding.
     let index = body.get("index").cloned().unwrap_or(Value::Null);
+    let hydrate = body.get("hydrate").cloned().unwrap_or(Value::Null);
+    let hydrate_columns = body.get("hydrate_columns").cloned().unwrap_or(Value::Null);
     Json(json!({
         "hits": [{
             "coordinates": {
@@ -52,7 +54,9 @@ async fn search_handler(headers: HeaderMap, Json(body): Json<Value>) -> impl Int
         "total": 1,
         "shards_scanned": 1,
         "shards_total": 1,
-        "_echo_index": index
+        "_echo_index": index,
+        "_echo_hydrate": hydrate,
+        "_echo_hydrate_columns": hydrate_columns
     }))
     .into_response()
 }
@@ -262,6 +266,41 @@ async fn search_tool_hits_gateway_and_returns_coordinates() {
         "doc-1"
     );
     assert_eq!(payload["_echo_index"], "docs");
+}
+
+/// The search tool's `hydrate` opt-in rides through to the engine (which does the governed
+/// one-call search→hydrate); by default it is forwarded as false.
+#[tokio::test]
+async fn search_tool_forwards_the_hydrate_opt_in() {
+    let base = spawn_mock_gateway().await;
+    let responses = drive(
+        config(&base),
+        vec![
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": { "name": "search", "arguments": {
+                        "query": "hello", "hydrate": true, "hydrate_columns": ["body"] } } }),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": { "name": "search", "arguments": { "query": "hello" } } }),
+        ],
+    )
+    .await;
+
+    let opted_in: Value = serde_json::from_str(
+        responses[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(opted_in["_echo_hydrate"], true);
+    assert_eq!(opted_in["_echo_hydrate_columns"], json!(["body"]));
+
+    let default: Value = serde_json::from_str(
+        responses[1]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(default["_echo_hydrate"], false);
 }
 
 #[tokio::test]

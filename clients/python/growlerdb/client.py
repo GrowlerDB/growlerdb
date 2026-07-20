@@ -70,8 +70,16 @@ class Client:
         collapse: Optional[str] = None,
         pit_id: int = 0,
         search_after: Optional[str] = None,
+        hydrate: bool = False,
+        hydrate_columns: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Run a search. `sort` is a list of `(field, descending)` pairs."""
+        """Run a search. `sort` is a list of `(field, descending)` pairs.
+
+        ``hydrate=True`` also returns each hit's authoritative source ``row`` in the
+        same call (the one-call form of search + ``get_by_key``); a row that fails to
+        resolve carries a per-hit ``hydrate_error`` instead. ``hydrate_columns``
+        projects the hydrated columns (empty = all).
+        """
         body: Dict[str, Any] = {"query": query, "limit": limit, "offset": offset}
         if sort:
             body["sort"] = [{"field": f, "desc": bool(d)} for f, d in sort]
@@ -81,6 +89,9 @@ class Client:
             body["pit_id"] = pit_id
         if search_after:
             body["search_after"] = search_after
+        if hydrate:
+            body["hydrate"] = True
+            body["hydrate_columns"] = hydrate_columns or []
         return self._post("/v1/search", body)
 
     def get_by_key(
