@@ -10,9 +10,13 @@ repository.workspace = true
 growlerdb-core.workspace = true
 tracing.workspace = true
 
-# The local BGE runtime (BERT on Candle, pure Rust, no native/C deps). Behind a default-on
-# `bge` feature so a `--no-default-features` build carries ZERO ML deps and the factory
-# transparently falls back to the dev HashEmbedder.
+# The local BGE embedder runtime: bge-small-en-v1.5 on ONNX Runtime (`ort`), behind a default-on
+# `bge` feature. ONNX links a native libonnxruntime (fetched at build via `download-binaries`),
+# a deliberate trade of the old pure-Rust Candle path for ~2-4x CPU throughput (D20/D46). A
+# `--no-default-features` build carries no ML deps and the factory falls back to the dev HashEmbedder.
+ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = ["std", "download-binaries", "tls-rustls"] }
+# The local cross-encoder reranker still runs on Candle (bge-reranker-base) — moving it to ONNX is a
+# follow-up; until then the `rerank` feature keeps these pure-Rust deps.
 candle-core = { version = "0.9", optional = true }
 candle-nn = { version = "0.9", optional = true }
 candle-transformers = { version = "0.9", optional = true }
@@ -35,9 +39,7 @@ serde = { workspace = true, optional = true }
 [features]
 default = ["bge", "rerank", "external"]
 bge = [
-    "dep:candle-core",
-    "dep:candle-nn",
-    "dep:candle-transformers",
+    "dep:ort",
     "dep:tokenizers",
     "dep:serde_json",
 ]

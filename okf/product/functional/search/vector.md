@@ -80,13 +80,17 @@ runs on every semantic query, and per-call loading made each query re-read 133 M
 semantic search — a gap lexical search and `num_docs` both mask. Agents and the console read this
 before trusting semantic/hybrid results ([D45](/system/decisions/d45-degraded-vs-error.md)).
 
-The default local embedder is **bge-small-en-v1.5** run **in-process on [Candle](https://github.com/huggingface/candle)**
-— pure Rust, no native/C dependency, no network. The model (`config.json`, `tokenizer.json`,
-`model.safetensors`) is provisioned out of band into `${GROWLERDB_MODEL_DIR:-~/.cache/growlerdb/models}/<model-id>/`;
-when it isn't present, embedding transparently falls back to a deterministic dev embedder (so ingest and
-offline CI keep working) with a one-time warning. The BGE runtime is behind a default-on build feature, so
-a slim build can drop the ML dependency entirely. Automatic model download is intentionally not part of the
-runtime — provisioning stays explicit, keeping the default deployment offline.
+The default local embedder is **bge-small-en-v1.5** run **in-process on [ONNX Runtime](https://onnxruntime.ai/)**
+(via the `ort` crate, int8-quantized), CPU, no network at runtime ([D20](/system/decisions/d20-embedding-model.md)).
+This links a **native `libonnxruntime`** (fetched at build time) — a deliberate trade of the former pure-Rust
+Candle path for **~an order of magnitude** more CPU throughput, which is what makes local embed-at-ingest
+viable on a laptop (the cross-encoder reranker still runs on Candle pending its own ONNX move). The model
+(`config.json`, `tokenizer.json`, `model.onnx`) is provisioned out of band into
+`${GROWLERDB_MODEL_DIR:-~/.cache/growlerdb/models}/<model-id>/`; when it isn't present, embedding transparently
+falls back to a deterministic dev embedder (so ingest and offline CI keep working) with a one-time warning. The
+BGE runtime is behind a default-on build feature, so a slim build can drop the ML dependency entirely. Automatic
+model download is intentionally not part of the runtime — provisioning stays explicit, keeping the default
+deployment offline.
 
 **External providers (opt-in).** A field declared `provider: EXTERNAL` (and, for reranking,
 `GROWLERDB_RERANK_PROVIDER=external`) instead calls a hosted embedding / rerank service over HTTP. The
