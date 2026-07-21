@@ -586,7 +586,25 @@ async fn mcp_http_transport_searches_and_hydrates_the_real_stack() {
     }))
     .await;
     assert_eq!(status, 200);
-    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 5);
+    // Assert the tool NAMES, not just the count: a bare count silently missed `more_like_this`
+    // when TASK-319 added it (this real-stack test runs only in nightly, so the PR CI stayed green).
+    let tools: std::collections::BTreeSet<&str> = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        tools,
+        std::collections::BTreeSet::from([
+            "aggregate",
+            "describe_index",
+            "hydrate",
+            "list_indexes",
+            "more_like_this",
+            "search",
+        ])
+    );
 
     let (status, resp) = post(serde_json::json!({
         "jsonrpc": "2.0", "id": 3, "method": "tools/call",

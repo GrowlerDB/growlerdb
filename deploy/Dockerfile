@@ -1,7 +1,9 @@
 # Multi-stage build of the `growlerdb` binary (control-plane / node / gateway — one binary,
 # selected by subcommand). Build context is the repo root; see .dockerignore.
 # Bases pinned by digest so the released, signed image is byte-reproducible; tag comments track version.
-FROM rust:1-bookworm@sha256:7d0723df719e7f213b69dc7c8c595985c3f4b060cfbee4f7bc0e347a86fe3b6a AS build
+# trixie (glibc 2.41), not bookworm (2.36): pyke's prebuilt ONNX Runtime 1.24 references glibc-2.38+
+# symbols (e.g. __isoc23_strtoull), so bookworm can't link/run it. The runtime base is bumped to match.
+FROM rust:1-trixie@sha256:9a2cd304a852f05d3352f75bc2775242371c0169a72dbb40d5d881379d571989 AS build
 # protoc is required by tonic-build/prost-build (the gRPC wire layer).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends protobuf-compiler \
@@ -21,6 +23,7 @@ ARG GROWLERDB_VERSION
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
+    RUSTFLAGS="-C link-arg=-lstdc++" \
     GROWLERDB_VERSION="${GROWLERDB_VERSION}" cargo build --profile dist -p growlerdb-cli \
     && cp target/dist/growlerdb /usr/local/bin/growlerdb
 
@@ -32,10 +35,11 @@ RUN npm ci
 COPY ui/ ./
 RUN npm run build
 
-FROM debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df AS runtime
-# ca-certificates for TLS to the catalog/object store; curl for the container healthcheck.
+FROM debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd AS runtime
+# ca-certificates for TLS to the catalog/object store; curl for the container healthcheck;
+# libstdc++6 for the statically-linked ONNX Runtime (its C++ stdlib refs are linked dynamically).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl libstdc++6 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -u 10001 -m growlerdb
 COPY --from=build /usr/local/bin/growlerdb /usr/local/bin/growlerdb
