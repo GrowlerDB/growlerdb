@@ -47,6 +47,18 @@ mod bge;
 #[cfg(feature = "bge")]
 pub use bge::BgeEmbedder;
 
+/// pyke's prebuilt ONNX Runtime static lib (built with an older GCC) references
+/// `__cxa_call_terminate`, a libstdc++ internal exception-handling symbol that GCC 12
+/// (Debian bookworm's toolchain, our release-image builder) **removed** — so the static link can't
+/// resolve it. It is only ever reached when a C++ exception escapes a `noexcept` boundary, an
+/// already-fatal path, so `abort()` is a sound stand-in. Linux-only: macOS (libc++) resolves
+/// exception handling natively and needs no shim. Gated on `bge` (the only feature that links ort).
+#[cfg(all(feature = "bge", target_os = "linux"))]
+#[no_mangle]
+pub extern "C" fn __cxa_call_terminate(_exception: *mut core::ffi::c_void) {
+    std::process::abort();
+}
+
 #[cfg(feature = "rerank")]
 mod bge_rerank;
 #[cfg(feature = "rerank")]
