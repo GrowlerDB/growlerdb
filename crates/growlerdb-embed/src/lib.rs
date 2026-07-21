@@ -23,7 +23,7 @@
 use std::sync::Arc;
 
 use growlerdb_core::index_def::{EmbedProvider, ResolvedIndex, VectorSpec};
-use growlerdb_core::{Document, Embedder, HashEmbedder, HashReranker, Reranker, Value};
+use growlerdb_core::{Document, EmbedError, Embedder, HashEmbedder, HashReranker, Reranker, Value};
 
 /// Serialize every test that mutates a process-global env var this crate reads
 /// (`GROWLERDB_MODEL_DIR`, `GROWLERDB_*_API_KEY`, `GROWLERDB_*_ENDPOINT`,
@@ -117,15 +117,44 @@ pub fn embedder_for(spec: &VectorSpec) -> Arc<dyn Embedder> {
 
 /// The LOCAL, keyless embedder: a real [`BgeEmbedder`] when provisioned, else the dev
 /// [`HashEmbedder`]. Never reads a provider secret.
+///
+/// Loaded models are **cached per resolved model directory** for the life of the process:
+/// the factory is called on every semantic query (and every ingest batch), and a BGE load is a
+/// 133 MB safetensors read + graph build — per-call loading made every query pay seconds and
+/// turned memory pressure into silent hash-fallback queries against real-model document vectors.
+/// Only successful loads are cached; a missing model keeps probing (cheap) so provisioning the
+/// model directory doesn't require a restart.
 fn local_embedder(spec: &VectorSpec) -> Arc<dyn Embedder> {
     #[cfg(feature = "bge")]
-    match BgeEmbedder::load(spec) {
-        Ok(e) => return Arc::new(e),
-        Err(err) => warn_fallback(&format!(
-            "BGE model unavailable ({err}); using the dev hash embedder. \
-             Provision the model under {} (or set GROWLERDB_MODEL_DIR).",
-            bge::model_dir(&spec.model).display()
-        )),
+    {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        use std::sync::{Mutex, OnceLock};
+        /// Cache key: (resolved model dir, dims) — the inputs that change which model loads.
+        type BgeCache = Mutex<HashMap<(PathBuf, usize), Arc<dyn Embedder>>>;
+        static BGE_CACHE: OnceLock<BgeCache> = OnceLock::new();
+        let key = (bge::model_dir(&spec.model), spec.dims);
+        // Hold the lock across the load: a second concurrent caller waits instead of
+        // double-loading 133 MB. First-load-only cost; every later call is a map hit.
+        let mut cache = BGE_CACHE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(e) = cache.get(&key) {
+            return e.clone();
+        }
+        match BgeEmbedder::load(spec) {
+            Ok(e) => {
+                let e: Arc<dyn Embedder> = Arc::new(e);
+                cache.insert(key, e.clone());
+                return e;
+            }
+            Err(err) => warn_fallback(&format!(
+                "BGE model unavailable ({err}); using the dev hash embedder. \
+                 Provision the model under {} (or set GROWLERDB_MODEL_DIR).",
+                bge::model_dir(&spec.model).display()
+            )),
+        }
     }
 
     #[cfg(not(feature = "bge"))]
@@ -211,10 +240,11 @@ pub fn embed_located_docs(idx: &ResolvedIndex, docs: &mut [growlerdb_core::Locat
 }
 
 /// Shared core: fill in each vector field's embedding across `docs`, batching the embed call per
-/// field. Best-effort (a missing source text embeds `""`; a backend error skips the field) —
-/// identical semantics to core's orchestration, only the factory differs. An EXTERNAL field that
-/// fails closed (no key/endpoint) errors here rather than writing dev-hash vectors, so the field
-/// is skipped (a warning is logged) instead of silently indexing wrong vectors.
+/// field. Best-effort (a missing source text embeds `""`), but never silently: an EXTERNAL field
+/// that fails closed (no key/endpoint) skips the field with a warning rather than writing
+/// dev-hash vectors; a LOCAL batch failure retries **per text** so one poison doc can't void the
+/// whole batch's vectors, and whatever is still skipped is counted in a per-call warning — a
+/// 20k-doc build losing its vectors must be loud, not a log-free `continue`.
 fn embed_docs(idx: &ResolvedIndex, docs: &mut [&mut Document]) {
     for f in &idx.fields {
         let Some(spec) = f.vector.as_ref() else {
@@ -225,21 +255,56 @@ fn embed_docs(idx: &ResolvedIndex, docs: &mut [&mut Document]) {
             .iter()
             .map(|d| source_text(d, &spec.source_field))
             .collect();
-        let vectors = match embedder.embed(&texts) {
-            Ok(v) => v,
-            Err(err) => {
-                if spec.provider == EmbedProvider::External {
-                    // Fail closed + observable: don't write vectors, but surface why.
-                    warn_external_embed(&format!(
-                        "external embedding of field `{}` failed: {err}; field left un-embedded",
-                        f.path
-                    ));
-                }
-                continue;
+        embed_field(embedder.as_ref(), &f.path, spec.provider, docs, &texts);
+    }
+}
+
+/// Embed one vector field across `docs` (`texts[i]` is `docs[i]`'s source text). Split from
+/// [`embed_docs`] so the failure semantics are testable without a real failing model.
+fn embed_field(
+    embedder: &dyn Embedder,
+    path: &str,
+    provider: EmbedProvider,
+    docs: &mut [&mut Document],
+    texts: &[String],
+) {
+    match embedder.embed(texts) {
+        Ok(vectors) => {
+            for (d, v) in docs.iter_mut().zip(vectors) {
+                d.fields.insert(path.to_string(), Value::Vector(v));
             }
-        };
-        for (d, v) in docs.iter_mut().zip(vectors) {
-            d.fields.insert(f.path.clone(), Value::Vector(v));
+        }
+        Err(err) if provider == EmbedProvider::External => {
+            // Fail closed + observable: don't write vectors, but surface why.
+            warn_external_embed(&format!(
+                "external embedding of field `{path}` failed: {err}; field left un-embedded"
+            ));
+        }
+        Err(batch_err) => {
+            let mut skipped = 0usize;
+            let mut first_doc_err: Option<EmbedError> = None;
+            for (d, text) in docs.iter_mut().zip(texts) {
+                match embedder.embed(std::slice::from_ref(text)) {
+                    Ok(mut v) if !v.is_empty() => {
+                        d.fields
+                            .insert(path.to_string(), Value::Vector(v.swap_remove(0)));
+                    }
+                    Ok(_) => skipped += 1,
+                    Err(e) => {
+                        skipped += 1;
+                        first_doc_err.get_or_insert(e);
+                    }
+                }
+            }
+            tracing::warn!(
+                field = %path,
+                batch = docs.len(),
+                skipped,
+                batch_error = %batch_err,
+                first_doc_error = first_doc_err.map(|e| e.to_string()).unwrap_or_default(),
+                "batch embed failed; retried per text — {skipped} of {} doc(s) left un-embedded",
+                docs.len(),
+            );
         }
     }
 }
@@ -334,5 +399,85 @@ mod tests {
         assert_eq!(order[0].0, 1, "the overlapping doc reranks first");
 
         std::env::remove_var("GROWLERDB_MODEL_DIR");
+    }
+
+    /// A batch-call embedder that fails whenever the batch contains the poison text, and
+    /// per-text fails only on the poison itself — the "one bad doc" ingest scenario (the arXiv
+    /// demo lost all 20k of a chunk's vectors to a single over-long abstract pre-truncation).
+    struct PoisonEmbedder;
+
+    impl Embedder for PoisonEmbedder {
+        fn model_id(&self) -> &str {
+            "poison-test"
+        }
+        fn dims(&self) -> usize {
+            2
+        }
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+            if texts.iter().any(|t| t == "POISON") {
+                return Err(EmbedError::Backend("poison text".into()));
+            }
+            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+        }
+    }
+
+    fn plain_doc(id: i64, body: &str) -> Document {
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert("body".to_string(), Value::Str(body.to_string()));
+        Document::new(
+            growlerdb_core::CompositeKey::new(vec![], vec![("id".into(), Value::Int(id))]),
+            fields,
+        )
+    }
+
+    /// Regression (TASK-323): a batch embed failure used to void the ENTIRE batch's vectors with
+    /// a bare `continue` — one poison doc silently left every other doc un-embedded (and thus
+    /// invisible to KNN). The per-text fallback must skip only the true failures.
+    #[test]
+    fn one_poison_text_no_longer_voids_the_batch() {
+        let mut docs = [
+            plain_doc(1, "fine"),
+            plain_doc(2, "POISON"),
+            plain_doc(3, "also fine"),
+        ];
+        let mut refs: Vec<&mut Document> = docs.iter_mut().collect();
+        let texts: Vec<String> = refs.iter().map(|d| source_text(d, "body")).collect();
+        embed_field(
+            &PoisonEmbedder,
+            "body_vec",
+            EmbedProvider::Local,
+            &mut refs,
+            &texts,
+        );
+        assert!(
+            matches!(docs[0].fields.get("body_vec"), Some(Value::Vector(_))),
+            "healthy doc 1 must keep its vector"
+        );
+        assert!(
+            !docs[1].fields.contains_key("body_vec"),
+            "only the poison doc is skipped"
+        );
+        assert!(
+            matches!(docs[2].fields.get("body_vec"), Some(Value::Vector(_))),
+            "healthy doc 3 must keep its vector"
+        );
+    }
+
+    /// An EXTERNAL provider keeps fail-closed semantics: a batch failure skips the whole field
+    /// (no per-text retry against a broken/misconfigured remote), never writes partial vectors.
+    #[test]
+    fn external_batch_failure_stays_fail_closed() {
+        let mut docs = [plain_doc(1, "fine"), plain_doc(2, "POISON")];
+        let mut refs: Vec<&mut Document> = docs.iter_mut().collect();
+        let texts: Vec<String> = refs.iter().map(|d| source_text(d, "body")).collect();
+        embed_field(
+            &PoisonEmbedder,
+            "body_vec",
+            EmbedProvider::External,
+            &mut refs,
+            &texts,
+        );
+        assert!(!docs[0].fields.contains_key("body_vec"));
+        assert!(!docs[1].fields.contains_key("body_vec"));
     }
 }

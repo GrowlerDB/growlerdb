@@ -33,8 +33,12 @@ and type rules are validated **at execution** against the index schema.
 
 ## Returns
 
-Ranked **coordinates** (the composite key) + a BM25 score — not documents; a true cross-shard `total`
-and a `partial` flag if a shard was down. Fetch rows via [hydration](/product/functional/hydration.md) —
-either the standalone `keys:get`, or **inline** (`hydrate: true` attaches each hit's authoritative
-row to the same response, per-hit-degrading on failure).
-Execution details: [system/query-execution](/system/query-execution.md).
+Ranked **coordinates** (the composite key) + a BM25 score — not documents; a true cross-shard `total`,
+a `partial` flag if a shard was down, and `warnings` naming any in-band degradation (a failed hybrid
+arm, a dev-fallback query embed) — a degraded response is always flagged, never silent
+([D45](/system/decisions/d45-degraded-vs-error.md)). A request may set `require_complete` to refuse
+the partial state entirely: any coverage degradation then errors (UNAVAILABLE) instead of returning a
+flagged subset; total scatter failure is always an error. Fetch rows via
+[hydration](/product/functional/hydration.md) — either the standalone `keys:get`, or **inline**
+(`hydrate: true` attaches each hit's authoritative row to the same response, per-hit-degrading on
+failure). Execution details: [system/query-execution](/system/query-execution.md).

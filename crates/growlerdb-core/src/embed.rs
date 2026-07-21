@@ -35,6 +35,12 @@ pub trait Embedder: Send + Sync {
     fn dims(&self) -> usize;
     /// Embed a batch of texts; returns one `dims()`-length vector per input, in order.
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError>;
+    /// True for the dependency-free dev fallback ([`HashEmbedder`]): its vectors only
+    /// match other hash vectors, so a query embedded by it against real-model document
+    /// vectors is meaningless — callers surface that as a response warning.
+    fn is_dev_fallback(&self) -> bool {
+        false
+    }
 }
 
 /// Deterministic, dependency-free embedder for tests and as the default until the
@@ -62,6 +68,10 @@ impl Embedder for HashEmbedder {
 
     fn dims(&self) -> usize {
         self.dims
+    }
+
+    fn is_dev_fallback(&self) -> bool {
+        true
     }
 
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {

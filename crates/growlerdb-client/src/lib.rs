@@ -211,6 +211,7 @@ pub struct SearchQuery {
     highlight: Option<growlerdb_proto::v1::HighlightRequest>,
     hydrate: bool,
     hydrate_columns: Vec<String>,
+    require_complete: bool,
 }
 
 impl SearchQuery {
@@ -293,6 +294,14 @@ impl SearchQuery {
         self.hydrate_columns = columns;
         self
     }
+
+    /// Opt out of the third (partial) state: any coverage degradation (a failed shard, a
+    /// dropped hybrid arm) fails the request with UNAVAILABLE instead of returning a flagged
+    /// partial page. Off by default (flagged partial results).
+    pub fn require_complete(mut self) -> Self {
+        self.require_complete = true;
+        self
+    }
 }
 
 impl From<SearchQuery> for SearchRequest {
@@ -316,6 +325,7 @@ impl From<SearchQuery> for SearchRequest {
             highlight: q.highlight,
             hydrate: q.hydrate,
             hydrate_columns: q.hydrate_columns,
+            require_complete: q.require_complete,
         }
     }
 }

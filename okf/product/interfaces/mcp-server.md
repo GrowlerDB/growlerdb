@@ -42,7 +42,11 @@ agent-native face of [retrieval-first](/system/decisions/d42-retrieval-first.md)
   [inline hydration](/product/functional/hydration.md) — one tool call instead of search-then-hydrate).
   **Context shaping:** `highlight` returns matched snippets instead of whole fields (lexical), and
   `max_chars` is a response budget — lowest-ranked hits are dropped until the payload fits, flagged
-  via `truncated_hits` (never a silent cut).
+  via `truncated_hits` (never a silent cut). **Degradation is in-band** ([D45](/system/decisions/d45-degraded-vs-error.md)):
+  responses pass through `partial` and `warnings` (a failed hybrid arm, a dev-fallback query embed) and
+  the tool description tells the agent to read them; `require_complete: true` refuses partial coverage
+  with an error instead. `total` is a corpus-wide count for lexical only — semantic is top-k, hybrid
+  reports the lexical arm's count.
 - **`hydrate`** — resolves coordinates to authoritative, governed rows from Iceberg
   ([hydration](/product/functional/hydration.md)).
 - **`more_like_this`** — nearest neighbors of one document: hydrates the seed's text (governed),
@@ -51,7 +55,9 @@ agent-native face of [retrieval-first](/system/decisions/d42-retrieval-first.md)
 - **`list_indexes`** / **`describe_index`** — what's available and its shape. `describe_index` is
   the **self-teaching** entry point: it returns every mapped field with its type + capability flags
   (`indexed`/`fast`/`cached` — the engine's describe now carries the full mapping), the vector
-  fields, ready-made `example_queries` composed from that actual schema, and usage guidance.
+  fields **with per-field `docs_with_vector` coverage** (a shortfall against `num_docs` = docs
+  invisible to KNN — check before trusting semantic/hybrid), ready-made `example_queries` composed
+  from that actual schema, and usage guidance.
 
 ## Resources
 

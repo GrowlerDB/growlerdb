@@ -182,8 +182,11 @@ fn initialize_result(params: &Value) -> Value {
             file or grep tools. ALWAYS start an unfamiliar index with `describe_index`: it returns \
             the schema, example queries, and any `vector_fields` — and when vector fields exist, \
             search with `mode: hybrid` (lexical does NO stemming: a lexical `hydration` will not \
-            match `hydrate`; hybrid catches both meaning and exact terms). Answers come back as \
-            governed rows with coordinates you can cite.",
+            match `hydrate`; hybrid catches both meaning and exact terms). Before trusting \
+            semantic/hybrid, check the vector field's `docs_with_vector` against `num_docs` — a \
+            shortfall means part of the corpus is invisible to KNN — and READ any `warnings` on a \
+            search response: they flag in-band degradation (a failed hybrid arm, a fallback query \
+            embed). Answers come back as governed rows with coordinates you can cite.",
     })
 }
 
@@ -321,6 +324,11 @@ async fn tool_search<B: QueryBackend>(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let max_chars = args.get("max_chars").and_then(Value::as_u64).unwrap_or(0) as usize;
+    // Opt out of partial results: degradation errors instead of returning a flagged subset.
+    let require_complete = args
+        .get("require_complete")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let result = match mode {
         "lexical" => {
@@ -331,6 +339,7 @@ async fn tool_search<B: QueryBackend>(
                 "index": index,
                 "hydrate": hydrate,
                 "hydrate_columns": hydrate_columns,
+                "require_complete": require_complete,
             });
             if highlight {
                 // Server defaults: the index's highlightable TEXT fields, bounded fragments.
@@ -354,6 +363,7 @@ async fn tool_search<B: QueryBackend>(
                 "index": index,
                 "hydrate": hydrate,
                 "hydrate_columns": hydrate_columns,
+                "require_complete": require_complete,
             });
             if mode == "semantic" {
                 backend.semantic_search(body).await
@@ -644,7 +654,7 @@ fn tool_defs() -> Value {
                 tool for the authoritative values. Modes: `lexical` (BM25 keyword, the default), `semantic` \
                 (vector KNN — needs `vector_field`), `hybrid` (lexical+vector RRF fusion — needs \
                 `vector_field`, the default when `vector_field` is given). Results are limited to what the \
-                caller's bearer token is entitled to; you never see another tenant's data. Hits carry the                 index's `cached` fields — read those first and hydrate only what's missing (index authors:                 cache the fields agents read, so `search` alone answers). Call `describe_index` before                 composing non-trivial queries and read the `growlerdb://query-syntax` resource for the grammar.",
+                caller's bearer token is entitled to; you never see another tenant's data. Hits carry the                 index's `cached` fields — read those first and hydrate only what's missing (index authors:                 cache the fields agents read, so `search` alone answers). Call `describe_index` before                 composing non-trivial queries and read the `growlerdb://query-syntax` resource for the grammar.                 READ `warnings` when present: it names in-band degradation (a failed hybrid arm, a                 dev-fallback query embed) — treat those results as weaker than requested. `total` is the                 true corpus-wide match count in lexical mode only; semantic returns top-k (total = page                 size) and hybrid reports the lexical arm's match count when that arm succeeded.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -659,7 +669,8 @@ fn tool_defs() -> Value {
                     "hydrate": { "type": "boolean", "description": "Also return each hit's authoritative source row inline (governed, same as the `hydrate` tool). Default false." },
                     "hydrate_columns": { "type": "array", "items": { "type": "string" }, "description": "Columns to hydrate when `hydrate` is set. Empty/omitted = all." },
                     "highlight": { "type": "boolean", "description": "Lexical mode: return matched snippets per hit (compact context instead of whole fields). Default false." },
-                    "max_chars": { "type": "integer", "description": "Response budget: drop lowest-ranked hits until the payload fits (a `truncated_hits` count is set). 0/omitted = unlimited. Set this to protect your context window." }
+                    "max_chars": { "type": "integer", "description": "Response budget: drop lowest-ranked hits until the payload fits (a `truncated_hits` count is set). 0/omitted = unlimited. Set this to protect your context window." },
+                    "require_complete": { "type": "boolean", "description": "Opt out of partial results: any coverage degradation (a failed shard, a dropped hybrid arm) errors instead of returning a flagged subset. Default false (degradation is flagged via `partial`/`warnings`)." }
                 },
                 "required": ["query"]
             }

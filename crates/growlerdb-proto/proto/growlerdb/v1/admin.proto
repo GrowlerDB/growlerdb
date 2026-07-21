@@ -62,6 +62,10 @@ message VectorFieldStat {
   string source_field = 2; // the text field whose value is embedded to produce this vector
   string model = 3;        // embedding model id
   uint32 dims = 4;         // embedding dimensionality (vector length)
+  // KNN **coverage**: how many documents hold a vector for this field (ANN sidecar entries,
+  // summed across live segments). Pair with `num_docs`: a shortfall means documents were
+  // indexed without an embedding — invisible to semantic search, a gap nothing else surfaces.
+  uint64 docs_with_vector = 5;
 }
 
 message DescribeIndexResponse {

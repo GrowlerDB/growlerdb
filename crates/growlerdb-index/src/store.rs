@@ -2404,6 +2404,16 @@ impl Shard {
         self.schema.vector_fields()
     }
 
+    /// Per-VECTOR-field **KNN coverage**: how many vectors the live segments' ANN sidecars hold
+    /// for `field` (see [`SegmentReader::vector_coverage`]). The describe path pairs this with
+    /// `num_docs` so a partially-embedded index — documents ingested without an embedding — is
+    /// observable instead of silently unsearchable.
+    pub fn vector_coverage(&self, field: &str) -> Result<u64> {
+        self.core
+            .vector_coverage(field)
+            .map_err(StoreError::Segment)
+    }
+
     /// Every mapped field's describe-facing summary (name, type, `fast`/`indexed`/`cached`),
     /// in definition order — see [`IndexSchema::mapped_fields`](crate::MappedFieldSummary).
     pub fn mapped_fields(&self) -> Vec<crate::MappedFieldSummary> {
@@ -7895,6 +7905,20 @@ mod ann_tests {
             )
             .unwrap();
         assert_eq!(knn_ids(&hits), vec!["x", "xy"]);
+
+        // Coverage pairs with `num_docs`: every doc here embedded, so the ANN sidecars hold a
+        // vector for each — the describe path surfaces a shortfall (docs ingested without an
+        // embedding, invisible to KNN) instead of leaving it silent (TASK-323).
+        assert_eq!(
+            shard.vector_coverage("body_vec").unwrap(),
+            shard.num_docs().unwrap(),
+            "every embedded doc counts toward KNN coverage"
+        );
+        assert_eq!(
+            shard.vector_coverage("no_such_field").unwrap(),
+            0,
+            "an unknown/never-embedded field has zero coverage"
+        );
 
         // Every current segment lists its `.ann` sidecar among its backup files.
         let segs = shard.sealed_segments().unwrap();

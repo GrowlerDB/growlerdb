@@ -573,6 +573,10 @@ async fn run_search(
             window: 0,
             // The adapter translates the DSL to a Lucene query string.
             syntax: v1::QuerySyntax::Lucene as i32,
+            // OpenSearch semantics allow partial results by default (its
+            // `allow_partial_search_results` is a query param, not a body clause); the adapter
+            // keeps the native default and flags gaps via `_shards.failed`.
+            require_complete: false,
             // Scope to the path's `{index}`; empty for `/_search` (the served index).
             index: index.clone(),
             highlight,

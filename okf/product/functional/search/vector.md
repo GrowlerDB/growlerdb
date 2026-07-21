@@ -53,7 +53,18 @@ integration point ([D41](/system/decisions/d41-vector-open-core.md) keeps it ope
 attach here). Forward passes are **bounded** (sub-batches of 32 inputs): attention memory scales with
 `batch × seq²`, so an unbounded whole-table pass OOMs a node on real corpora (the ~20k-abstract arXiv
 demo killed a 4 GB node at batch 400) — sub-batching caps peak memory regardless of build size, with
-identical vectors (no cross-sequence attention).
+identical vectors (no cross-sequence attention). Inputs are **truncated to the model's sequence
+window** (512 positions for BGE): an over-long text embeds its head rather than failing the forward
+pass. A batch whose embed still fails is retried **per text**, skipping only true failures — and the
+skip count is logged loudly per call. Both are load-bearing: pre-fix, one over-long abstract voided an
+entire build chunk's vectors with a log-free skip, leaving 20k demo docs silently invisible to KNN
+(TASK-323). Loaded models are **cached per model directory** for the process lifetime — the factory
+runs on every semantic query, and per-call loading made each query re-read 133 MB of weights.
+
+**Coverage is observable.** `describe_index` reports each vector field's `docs_with_vector` next to
+`num_docs`: a shortfall means documents were ingested **without** an embedding and are invisible to
+semantic search — a gap lexical search and `num_docs` both mask. Agents and the console read this
+before trusting semantic/hybrid results ([D45](/system/decisions/d45-degraded-vs-error.md)).
 
 The default local embedder is **bge-small-en-v1.5** run **in-process on [Candle](https://github.com/huggingface/candle)**
 — pure Rust, no native/C dependency, no network. The model (`config.json`, `tokenizer.json`,
@@ -87,10 +98,15 @@ matching documents constrain the candidate set (the nearest vectors *where* `lan
 range, etc.). The filter's per-segment doc set is intersected with the neighbors, so semantic retrieval
 still respects metadata.
 
-**Hybrid search (RRF).** A hybrid query runs both modalities — lexical **BM25** and vector **KNN** — and
-fuses their rankings with **Reciprocal Rank Fusion** (`RRF_K = 60`) into one ranked list of coordinates.
-This is where semantic recall complements exact-term precision: on a real-model eval over paraphrase
-queries (zero lexical term overlap), hybrid strictly beats lexical-only.
+**Hybrid search (RRF).** A hybrid query runs both modalities **concurrently** — lexical **BM25** and
+vector **KNN** — and fuses their rankings with **Reciprocal Rank Fusion** (`RRF_K = 60`) into one
+ranked list of coordinates. This is where semantic recall complements exact-term precision: on a
+real-model eval over paraphrase queries (zero lexical term overlap), hybrid strictly beats
+lexical-only. The semantic arm **defines** the request (its vector field drives resolution and
+authz), so its failure fails the query; a failed **lexical** arm degrades to the semantic ranking —
+**flagged** via `partial` + a `warnings` entry, never silently ([D45](/system/decisions/d45-degraded-vs-error.md)),
+and refused outright when the request set `require_complete`. Hybrid `total` is the lexical arm's
+true match count when that arm succeeded (KNN has no match count), else the fused page size.
 
 **Reranking (opt-in).** A semantic/hybrid query may set `rerank` to reorder its retrieved top-K by a
 cross-encoder relevance pass over `(query, passage)` ([D21](/system/decisions/d21-reranker.md), local
