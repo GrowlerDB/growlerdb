@@ -1005,6 +1005,31 @@ impl SegmentReader {
     /// is admitted only if it is both **live** and in that set. With a filter present the search
     /// requests **all** of each segment's candidates (not just `k`) so the constraint can't starve
     /// the result below `k` when matches exist. `None` keeps the unfiltered fast path.
+    /// Per-field count of vectors present in the live segments' ANN sidecars — the KNN
+    /// coverage numerator the describe path pairs with `num_docs`. A shortfall means documents
+    /// were indexed **without** an embedding (e.g. an ingest-time embed failure) and are
+    /// invisible to semantic search — a gap nothing else surfaces, since lexical search and
+    /// `num_docs` both see the full corpus. Counts sidecar entries, so recently deleted docs may
+    /// still be included until compaction rewrites their segment; a segment with no sidecar
+    /// contributes 0 (mirroring `knn_search`, which skips it).
+    pub fn vector_coverage(&self, field: &str) -> Result<u64> {
+        let Some(dir) = self.index_dir.as_ref() else {
+            return Ok(0); // no local sidecar directory (e.g. cold read-through)
+        };
+        let searcher = self.reader.searcher();
+        let mut vectors = 0u64;
+        for seg in searcher.segment_readers() {
+            let path = dir.join(ann_sidecar_name(&seg.segment_id().uuid_string()));
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue; // no sidecar for this segment
+            };
+            if let Some(index) = SegmentAnn::from_frame(&bytes)?.field(field) {
+                vectors += index.len() as u64;
+            }
+        }
+        Ok(vectors)
+    }
+
     pub fn knn_search(
         &self,
         field: &str,

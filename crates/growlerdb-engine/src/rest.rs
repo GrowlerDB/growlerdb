@@ -1780,6 +1780,11 @@ struct SearchDto {
     /// Column projection for inline hydration; empty = all source columns.
     #[serde(default)]
     hydrate_columns: Vec<String>,
+    /// Opt out of the third (partial) state: when true, any coverage degradation that would
+    /// otherwise return a flagged 200 (`partial` / a degraded hybrid arm) fails the request
+    /// with 503 instead — a complete answer or an error, never a flagged subset.
+    #[serde(default)]
+    require_complete: bool,
 }
 
 #[derive(Deserialize)]
@@ -1853,6 +1858,7 @@ impl SearchDto {
             }),
             hydrate: self.hydrate,
             hydrate_columns: self.hydrate_columns,
+            require_complete: self.require_complete,
         }
     }
 }
@@ -1901,6 +1907,11 @@ struct SemanticSearchDto {
     /// Column projection for inline hydration; empty = all source columns.
     #[serde(default)]
     hydrate_columns: Vec<String>,
+    /// Opt out of the third (partial) state: when true, any coverage degradation that would
+    /// otherwise return a flagged 200 (`partial` / a degraded hybrid arm) fails the request
+    /// with 503 instead — a complete answer or an error, never a flagged subset.
+    #[serde(default)]
+    require_complete: bool,
 }
 
 impl SemanticSearchDto {
@@ -1922,6 +1933,7 @@ impl SemanticSearchDto {
             rerank_top_k: self.rerank_top_k,
             hydrate: self.hydrate,
             hydrate_columns: self.hydrate_columns,
+            require_complete: self.require_complete,
         }
     }
 }
@@ -1964,6 +1976,11 @@ struct HybridSearchDto {
     /// Column projection for inline hydration; empty = all source columns.
     #[serde(default)]
     hydrate_columns: Vec<String>,
+    /// Opt out of the third (partial) state: when true, any coverage degradation that would
+    /// otherwise return a flagged 200 (`partial` / a degraded hybrid arm) fails the request
+    /// with 503 instead — a complete answer or an error, never a flagged subset.
+    #[serde(default)]
+    require_complete: bool,
 }
 
 impl HybridSearchDto {
@@ -1984,6 +2001,7 @@ impl HybridSearchDto {
             rerank_top_k: self.rerank_top_k,
             hydrate: self.hydrate,
             hydrate_columns: self.hydrate_columns,
+            require_complete: self.require_complete,
         }
     }
 }
@@ -2005,6 +2023,11 @@ struct SearchRespDto {
     shards_scanned: u32,
     #[serde(skip_serializing_if = "is_zero_u32")]
     shards_total: u32,
+    /// Degradation notices: the response is valid but weaker than requested (e.g. a hybrid
+    /// search whose lexical arm failed, or a query embedded by the dev hash fallback). Omitted
+    /// when nothing degraded — a present `warnings` always means "read me".
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -2051,6 +2074,7 @@ impl From<v1::SearchResponse> for SearchRespDto {
             partial: r.partial,
             shards_scanned: r.shards_scanned,
             shards_total: r.shards_total,
+            warnings: r.warnings,
             next_cursor: (!r.next_cursor.is_empty())
                 .then(|| String::from_utf8_lossy(&r.next_cursor).into_owned()),
             hits: r
@@ -2244,6 +2268,10 @@ struct VectorFieldDto {
     model: String,
     /// Embedding dimensionality (vector length).
     dims: u32,
+    /// KNN **coverage**: how many documents hold a vector for this field. Pair with
+    /// `num_docs` — a shortfall means documents were indexed without an embedding and are
+    /// invisible to semantic search.
+    docs_with_vector: u64,
 }
 
 impl From<v1::VectorFieldStat> for VectorFieldDto {
@@ -2253,6 +2281,7 @@ impl From<v1::VectorFieldStat> for VectorFieldDto {
             source_field: v.source_field,
             model: v.model,
             dims: v.dims,
+            docs_with_vector: v.docs_with_vector,
         }
     }
 }

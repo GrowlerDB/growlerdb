@@ -284,8 +284,18 @@ impl Search for SearchService {
 
         // Embed the query text with the SAME factory ingest uses (real BGE when provisioned, else
         // the deterministic hash fallback) — the query and the stored document vectors must come
-        // from one model or KNN compares across incompatible spaces.
+        // from one model or KNN compares across incompatible spaces. The fallback is flagged in
+        // the response: hash-vs-hash (dev/CI) is legitimate, but a hash query against real-model
+        // document vectors returns meaningless neighbors, and the caller can't tell without a flag.
         let embedder = growlerdb_embed::embedder_for(&spec);
+        let mut warnings = Vec::new();
+        if embedder.is_dev_fallback() {
+            warnings.push(format!(
+                "query embedded by the dev hash fallback (model `{}` unavailable); results are \
+                 only meaningful if the documents were embedded by the same fallback",
+                spec.model
+            ));
+        }
         let mut vectors = embedder
             .embed(&[req.query_text])
             .map_err(|e| to_status(Code::Internal, WireError::new("INTERNAL", e.to_string())))?;
@@ -328,7 +338,7 @@ impl Search for SearchService {
         .await
         .map_err(internal)?
         .map_err(store_status)?;
-        Ok(Response::new(knn_response(hits)))
+        Ok(Response::new(knn_response(hits, warnings)))
     }
 
     /// Explain how `query` scores one document. Locates the doc by coordinate, asks the
@@ -702,9 +712,11 @@ pub(crate) fn rerank_hits(
 /// Build a [`SearchResponse`] from KNN hits: coordinates + KNN score (in `SearchHit.score`), plus
 /// any cached display fields. KNN is a top-`k` retrieval with no separate match count, so `total`
 /// is the number of hits returned; the Gateway re-merges these across shards to a global top-`k`.
-fn knn_response(hits: Vec<growlerdb_core::Hit>) -> SearchResponse {
+/// `warnings` carries degradation notices (e.g. the dev hash-fallback query embed) verbatim.
+fn knn_response(hits: Vec<growlerdb_core::Hit>, warnings: Vec<String>) -> SearchResponse {
     SearchResponse {
         total: hits.len() as u64,
+        warnings,
         hits: hits
             .iter()
             .map(|h| SearchHit {
@@ -1803,6 +1815,72 @@ mod tests {
             .into_inner();
         assert_eq!(resp.hits.len(), 1);
         assert_eq!(id_of(&resp.hits[0]), "doc-3");
+    }
+
+    /// A dev-fallback query embed must be FLAGGED in the response (TASK-324): a hash query
+    /// against real-model doc vectors returns meaningless neighbors, and without the warning the
+    /// caller can't tell. The index names a model that can never load, so the fallback engages
+    /// deterministically — on a dev machine with a provisioned real model just as in CI — without
+    /// mutating `GROWLERDB_MODEL_DIR` (process-global; racing it flips embedders under
+    /// concurrently-running tests).
+    #[tokio::test(flavor = "current_thread")]
+    async fn semantic_search_flags_a_dev_fallback_query_embed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("body", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        let idx = IndexDefinition::from_yaml(
+            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD }, { path: body, type: TEXT }, { path: body_vec, type: VECTOR, vector: { dims: 64, source_field: body, model: model-that-never-loads } } ] }\n",
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+        let shard = LocalIndexStore::open(tmp.path())
+            .unwrap()
+            .create_shard(&ShardId::single("docs"), &idx)
+            .unwrap();
+        let key = CompositeKey::new(vec![], vec![("id".into(), Value::from("doc-1"))]);
+        let mut f = BTreeMap::new();
+        f.insert("id".to_string(), Value::from("doc-1"));
+        f.insert(
+            "body".to_string(),
+            Value::from("vector embeddings semantic retrieval"),
+        );
+        let mut docs = vec![LocatedDoc {
+            doc: Document::new(key, f),
+            iceberg_file: "f".into(),
+            row_position: 0,
+        }];
+        growlerdb_embed::embed_located_docs(&idx, &mut docs);
+        IndexWriter::write(
+            &shard,
+            &CommitBatch::from_upserts(docs, SourceCheckpoint::iceberg(1), "b1"),
+        )
+        .unwrap();
+        let svc = SearchService::new(Arc::new(shard));
+
+        let resp = svc
+            .semantic_search(Request::new(SemanticSearchRequest {
+                vector_field: "body_vec".into(),
+                query_text: "semantic retrieval".into(),
+                k: 1,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            resp.warnings
+                .iter()
+                .any(|w| w.contains("hash fallback") && w.contains("model-that-never-loads")),
+            "the dev-fallback embed must be flagged: {:?}",
+            resp.warnings
+        );
     }
 
     /// A vector service whose `body` **source field is cached**, so each KNN hit carries its body

@@ -951,6 +951,7 @@ impl Gateway {
                 partial: false,
                 shards_scanned: 0,
                 shards_total,
+                warnings: Vec::new(),
             }));
         }
         if shards.len() == 1 {
@@ -1039,10 +1040,15 @@ impl Gateway {
         // normally disjoint, but during a **reshard** a moved bucket briefly lives on both
         // its old and new shard, so the merged hits are deduped by key below. `total` still
         // sums per-shard counts — it can over-count during that window, like the `partial` flag.
+        if body.require_complete && failed > 0 {
+            return Err(refuse_partial(failed, total_shards, &errors));
+        }
         let mut hits = Vec::new();
         let mut total_matches = 0u64;
-        for r in bodies {
+        let mut warnings = Vec::new();
+        for mut r in bodies {
             total_matches += r.total;
+            merge_warnings(&mut warnings, std::mem::take(&mut r.warnings));
             hits.extend(r.hits);
         }
 
@@ -1102,6 +1108,7 @@ impl Gateway {
             partial: failed > 0,
             shards_scanned: total_shards as u32,
             shards_total,
+            warnings,
         }))
     }
 
@@ -1156,8 +1163,17 @@ impl Gateway {
                 errors,
             ));
         }
-        let reps: Vec<growlerdb_proto::v1::SearchHit> =
-            bodies.into_iter().flat_map(|r| r.hits).collect();
+        if body.require_complete && failed > 0 {
+            return Err(refuse_partial(failed, total_shards, &errors));
+        }
+        let mut warnings = Vec::new();
+        let reps: Vec<growlerdb_proto::v1::SearchHit> = bodies
+            .into_iter()
+            .flat_map(|mut r| {
+                merge_warnings(&mut warnings, std::mem::take(&mut r.warnings));
+                r.hits
+            })
+            .collect();
 
         // Sum each group's count across shards (every rep carries its shard's local count).
         let mut counts: BTreeMap<String, u64> = BTreeMap::new();
@@ -1190,6 +1206,7 @@ impl Gateway {
             partial: failed > 0,
             shards_scanned: total_shards as u32,
             shards_total,
+            warnings,
         }))
     }
 
@@ -1267,10 +1284,15 @@ impl Gateway {
                 errors,
             ));
         }
+        if body.require_complete && failed > 0 {
+            return Err(refuse_partial(failed, total_shards, &errors));
+        }
         let mut hits = Vec::new();
         let mut total_matches = 0u64;
-        for r in bodies {
+        let mut warnings = Vec::new();
+        for mut r in bodies {
             total_matches += r.total;
+            merge_warnings(&mut warnings, std::mem::take(&mut r.warnings));
             hits.extend(r.hits);
         }
         // KNN hits are score-ranked (no field sort) — merge by score desc + key tiebreak, dedupe
@@ -1284,6 +1306,7 @@ impl Gateway {
             partial: failed > 0,
             shards_scanned: total_shards as u32,
             shards_total,
+            warnings,
         }))
     }
 
@@ -1347,6 +1370,7 @@ impl Gateway {
                 limit: k_each as u32,
                 index: body.index.clone(),
                 syntax: body.syntax,
+                require_complete: body.require_complete,
                 ..Default::default()
             },
         );
@@ -1370,6 +1394,7 @@ impl Gateway {
                 // Hydration happens once, after the fusion — never per arm.
                 hydrate: false,
                 hydrate_columns: Vec::new(),
+                require_complete: body.require_complete,
             },
         );
 
@@ -1377,18 +1402,49 @@ impl Gateway {
         // surface its error verbatim. The lexical arm tolerates an unparseable/empty query — the
         // fusion then just reflects the semantic ranking (mirroring the engine's MatchAll-fallback
         // intent), rather than failing the whole hybrid on a query the vector arm handled fine.
-        let semantic = self
-            .semantic_search_unadmitted(semantic_req)
-            .await?
-            .into_inner();
-        let lexical = self
-            .search_unadmitted(lexical_req)
-            .await
-            .map(Response::into_inner);
+        // A dropped lexical arm is a **flagged** degradation (`warn!` + `partial` + `warnings`),
+        // never a silent one: without the flag a hybrid response is indistinguishable from
+        // semantic-only, which is exactly how a broken arm hid in the demo stack. The arms run
+        // concurrently — hybrid latency is max(arms), not sum.
+        let (semantic, lexical) = tokio::join!(
+            self.semantic_search_unadmitted(semantic_req),
+            self.search_unadmitted(lexical_req),
+        );
+        let semantic = semantic?.into_inner();
+        let lexical = lexical.map(Response::into_inner);
+
+        // `require_complete` opts out of the third (partial) state: a dropped arm is a refusal,
+        // not a flagged fusion. (Shard-level gaps inside each arm already errored arm-side —
+        // the flag rides the arm requests — so this is the last degradation point.)
+        if body.require_complete {
+            if let Err(status) = &lexical {
+                return Err(Status::unavailable(format!(
+                    "hybrid lexical arm failed and the request requires complete results: {}",
+                    status.message()
+                )));
+            }
+        }
+
+        let mut warnings = semantic.warnings.clone();
+        if let Ok(lex) = &lexical {
+            warnings.extend(lex.warnings.iter().cloned());
+        }
+        if let Err(status) = &lexical {
+            tracing::warn!(
+                index = %body.index,
+                error = %status,
+                "hybrid lexical arm failed; fusion reflects the semantic ranking only"
+            );
+            warnings.push(format!(
+                "hybrid degraded: the lexical arm failed ({}); results reflect the semantic \
+                 ranking only",
+                status.message()
+            ));
+        }
 
         let empty: &[SearchHit] = &[];
         let lex_hits = lexical.as_ref().map(|r| r.hits.as_slice()).unwrap_or(empty);
-        let partial = semantic.partial || lexical.as_ref().map(|r| r.partial).unwrap_or(false);
+        let partial = semantic.partial || lexical.as_ref().map(|r| r.partial).unwrap_or(true);
         let shards_scanned = semantic
             .shards_scanned
             .max(lexical.as_ref().map(|r| r.shards_scanned).unwrap_or(0));
@@ -1397,7 +1453,12 @@ impl Gateway {
             .max(lexical.as_ref().map(|r| r.shards_total).unwrap_or(0));
 
         let fused = rrf_fuse_hits(&[lex_hits, semantic.hits.as_slice()], rrf_k, k);
-        let total = fused.len() as u64;
+        // `total`: the lexical arm's true corpus-wide match count when that arm succeeded (KNN
+        // has no match count — it is a top-k retrieval), else honestly just the fused page size.
+        let total = lexical
+            .as_ref()
+            .map(|r| r.total.max(fused.len() as u64))
+            .unwrap_or(fused.len() as u64);
         let mut resp = SearchResponse {
             hits: fused,
             total,
@@ -1405,6 +1466,7 @@ impl Gateway {
             partial,
             shards_scanned,
             shards_total,
+            warnings,
         };
         if hydrate {
             self.hydrate_hits(&mut resp, meta, body.index, hydrate_columns)
@@ -2097,6 +2159,30 @@ fn all_shards_failed(fallback: String, errors: Vec<Status>) -> Status {
         return errors.into_iter().next().unwrap();
     }
     Status::unavailable(fallback)
+}
+
+/// The error a merge point returns when shards dropped out of an otherwise-mergeable response
+/// but the request set `require_complete`: the caller opted out of the third (partial) state,
+/// so a flagged gap becomes a retryable UNAVAILABLE, with the first shard error inline so the
+/// refusal says *why* coverage was lost.
+fn refuse_partial(failed: usize, total_shards: usize, errors: &[Status]) -> Status {
+    let first = errors
+        .first()
+        .map(|s| format!("; first shard error: {}", s.message()))
+        .unwrap_or_default();
+    Status::unavailable(format!(
+        "{failed} of {total_shards} shards failed and the request requires complete results{first}"
+    ))
+}
+
+/// Union shard-level `warnings` into a merged response's list, deduplicating repeats — every
+/// shard embeds with the same fallback, so N shards would otherwise say the same thing N times.
+fn merge_warnings(into: &mut Vec<String>, from: Vec<String>) {
+    for w in from {
+        if !into.contains(&w) {
+            into.push(w);
+        }
+    }
 }
 
 /// A collapse group's stable key — the canonical index string of the hit's `group` value (the
@@ -4886,6 +4972,8 @@ mod tests {
         semantic: Vec<(&'static str, f64)>,
         /// When set, records the lexical arm's query string (for hybrid-filter assertions).
         seen_lexical: Option<Arc<std::sync::Mutex<String>>>,
+        /// When true, the lexical `search` RPC errors — the degraded-hybrid-arm scenario.
+        fail_lexical: bool,
     }
 
     #[tonic::async_trait]
@@ -4894,6 +4982,9 @@ mod tests {
             &self,
             req: Request<SearchRequest>,
         ) -> Result<Response<SearchResponse>, Status> {
+            if self.fail_lexical {
+                return Err(Status::internal("lexical arm down"));
+            }
             if let Some(seen) = &self.seen_lexical {
                 *seen.lock().unwrap() = req.get_ref().query.clone();
             }
@@ -5096,6 +5187,7 @@ mod tests {
             lexical: vec![("lex", 4.0)],
             semantic: vec![("vec", 0.8)],
             seen_lexical: Some(seen.clone()),
+            ..Default::default()
         });
         let gw = Gateway::new(node.clone());
         gw.hybrid_search(Request::new(HybridSearchRequest {
@@ -5132,5 +5224,138 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(*seen.lock().unwrap(), "tenant:acme");
+    }
+
+    /// Regression (demo stack, 2026-07-20): a failed lexical arm degraded hybrid to the semantic
+    /// ranking with **nothing** flagging it — no log, no `partial`, no warning — so hybrid was
+    /// indistinguishable from semantic-only (every score exactly `1/(rrf_k + rank)`). A dropped
+    /// arm must be a flagged gap, never a silent one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_lexical_arm_failure_is_flagged_not_silent() {
+        let node = Arc::new(VectorNode {
+            semantic: vec![("vec", 0.9), ("vec2", 0.8)],
+            fail_lexical: true,
+            ..Default::default()
+        });
+        let gw = Gateway::new(node);
+        let resp = gw
+            .hybrid_search(Request::new(HybridSearchRequest {
+                vector_field: "body_vec".into(),
+                query_text: "q".into(),
+                k: 4,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        // The fusion still answers (semantic ranking)…
+        let ids: Vec<String> = resp.hits.iter().map(id_of).collect();
+        assert_eq!(ids, vec!["vec", "vec2"]);
+        // …but the degradation is flagged in-band, both coarse (`partial`) and named (`warnings`).
+        assert!(resp.partial, "a dropped arm must set partial");
+        assert!(
+            resp.warnings.iter().any(|w| w.contains("lexical arm")),
+            "the warning must name the degraded arm: {:?}",
+            resp.warnings
+        );
+    }
+
+    /// `require_complete` opts out of the third (partial) state: the same dropped lexical arm
+    /// becomes a retryable UNAVAILABLE instead of a flagged fusion.
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_require_complete_refuses_a_dropped_arm() {
+        let node = Arc::new(VectorNode {
+            semantic: vec![("vec", 0.9)],
+            fail_lexical: true,
+            ..Default::default()
+        });
+        let gw = Gateway::new(node);
+        let err = gw
+            .hybrid_search(Request::new(HybridSearchRequest {
+                vector_field: "body_vec".into(),
+                query_text: "q".into(),
+                k: 4,
+                require_complete: true,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a dropped arm must refuse under require_complete");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(err.message().contains("requires complete results"));
+    }
+
+    /// Hybrid `total` is the lexical arm's true corpus-wide match count when that arm succeeded
+    /// (KNN has no match count) — previously it echoed the fused page size, which read as a
+    /// corpus-wide count.
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_total_reports_the_lexical_arms_match_count() {
+        let node = Arc::new(VectorNode {
+            lexical: vec![("both", 5.0), ("lex", 4.0)],
+            semantic: vec![("both", 0.9)],
+            ..Default::default()
+        });
+        let gw = Gateway::new(node);
+        let resp = gw
+            .hybrid_search(Request::new(HybridSearchRequest {
+                vector_field: "body_vec".into(),
+                query_text: "q".into(),
+                k: 5,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            resp.total, 2,
+            "the lexical arm's match count, not page size"
+        );
+    }
+
+    /// One shard down out of two: the default keeps the flagged partial page; `require_complete`
+    /// turns exactly the same situation into a retryable UNAVAILABLE naming the coverage loss.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn require_complete_turns_partial_shards_into_unavailable() {
+        let mk = || {
+            Gateway::sharded(vec![
+                Arc::new(VectorNode {
+                    lexical: vec![("a1", 0.9)],
+                    ..Default::default()
+                }) as Arc<dyn Node>,
+                Arc::new(RejectNode {
+                    code: tonic::Code::Internal,
+                    message: "shard down",
+                }),
+            ])
+        };
+        // Default: flagged partial results.
+        let resp = mk()
+            .search(Request::new(SearchRequest {
+                query: "x".into(),
+                limit: 10,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.partial);
+        assert_eq!(resp.hits.len(), 1);
+
+        // require_complete: the same gap is a refusal, with the shard error inline.
+        let err = mk()
+            .search(Request::new(SearchRequest {
+                query: "x".into(),
+                limit: 10,
+                require_complete: true,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("partial coverage must refuse under require_complete");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(
+            err.message().contains("1 of 2 shards failed"),
+            "{}",
+            err.message()
+        );
+        assert!(err.message().contains("shard down"), "{}", err.message());
     }
 }

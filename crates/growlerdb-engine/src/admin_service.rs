@@ -340,17 +340,23 @@ impl Admin for AdminService {
                 size_bytes: shard.size_bytes(), // per-shard on-disk size (skew signal)
                 time_fields: shard.date_fields(), // DATE columns for the console time filter
                 sort_fields: shard.sort_fields(), // sortable fast fields for the console sort menu
-                // VECTOR fields for the console's semantic/hybrid vector-field picker.
-                vector_fields: shard
-                    .vector_fields()
-                    .into_iter()
-                    .map(|v| VectorFieldStat {
-                        name: v.name,
-                        source_field: v.source_field,
-                        model: v.model,
-                        dims: v.dims as u32,
-                    })
-                    .collect(),
+                // VECTOR fields for the console's semantic/hybrid vector-field picker, each
+                // with its KNN coverage so a partially-embedded index is visible next to
+                // `num_docs` instead of silently unsearchable.
+                vector_fields: {
+                    let mut vfs = Vec::new();
+                    for v in shard.vector_fields() {
+                        let docs_with_vector = shard.vector_coverage(&v.name)?;
+                        vfs.push(VectorFieldStat {
+                            name: v.name,
+                            source_field: v.source_field,
+                            model: v.model,
+                            dims: v.dims as u32,
+                            docs_with_vector,
+                        });
+                    }
+                    vfs
+                },
                 // The full mapping (type + capability flags) so clients compose valid
                 // queries from the schema — console pickers, MCP agents self-teaching.
                 fields: shard

@@ -93,6 +93,12 @@ message SearchRequest {
   // Column projection for inline hydration (mirrors `GetByKeyRequest.columns`).
   // Empty = all source columns. Ignored unless `hydrate` is set.
   repeated string hydrate_columns = 14;
+  // Opt out of the third (partial) state: when true, any coverage degradation that would
+  // otherwise return a flagged 200 (`partial` / a degraded-arm warning) fails the request
+  // instead (UNAVAILABLE) — the caller gets a complete answer or an error, never a flagged
+  // subset. False (the wire default) keeps flagged partial results. Advisory warnings that
+  // don't reduce coverage (e.g. the dev-embedder notice) never trip this.
+  bool require_complete = 15;
 }
 
 // Server-side highlight options. Only analyzed **TEXT** fields whose text is available
@@ -174,6 +180,11 @@ message SearchResponse {
   // shows a "scanned/total" ratio. Both 0 from a bare Node (no shard scope).
   uint32 shards_scanned = 5;
   uint32 shards_total = 6;
+  // Human-readable degradation notices: the response is valid but weaker than requested —
+  // e.g. a hybrid search whose lexical arm failed (the fusion then reflects only the semantic
+  // ranking), or a query embedded by the dev hash fallback. A degraded arm is a flagged gap,
+  // never a silent one: agents and the console surface these verbatim. Empty when nothing degraded.
+  repeated string warnings = 7;
 }
 
 // Open a point-in-time snapshot: subsequent reads carrying the returned
@@ -253,6 +264,12 @@ message SemanticSearchRequest {
   bool hydrate = 10;
   // Column projection for inline hydration; empty = all. Ignored unless `hydrate` is set.
   repeated string hydrate_columns = 11;
+  // Opt out of the third (partial) state: when true, any coverage degradation that would
+  // otherwise return a flagged 200 (`partial` / a degraded-arm warning) fails the request
+  // instead (UNAVAILABLE) — the caller gets a complete answer or an error, never a flagged
+  // subset. False (the wire default) keeps flagged partial results. Advisory warnings that
+  // don't reduce coverage (e.g. the dev-embedder notice) never trip this.
+  bool require_complete = 12;
 }
 
 // **Hybrid search** — a Gateway-only orchestration surface (no node RPC): the Gateway runs BOTH a
@@ -282,6 +299,12 @@ message HybridSearchRequest {
   bool hydrate = 10;
   // Column projection for inline hydration; empty = all. Ignored unless `hydrate` is set.
   repeated string hydrate_columns = 11;
+  // Opt out of the third (partial) state: when true, any coverage degradation that would
+  // otherwise return a flagged 200 (`partial` / a degraded-arm warning) fails the request
+  // instead (UNAVAILABLE) — the caller gets a complete answer or an error, never a flagged
+  // subset. False (the wire default) keeps flagged partial results. Advisory warnings that
+  // don't reduce coverage (e.g. the dev-embedder notice) never trip this.
+  bool require_complete = 12;
 }
 
 // Read-side query service over a shard (adapts the in-process IndexReader).

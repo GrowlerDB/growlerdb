@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use candle_core::{Device, Tensor, D};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config, DTYPE};
-use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
+use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 use growlerdb_core::index_def::VectorSpec;
 use growlerdb_core::{EmbedError, Embedder};
@@ -85,6 +85,16 @@ impl BgeEmbedder {
             strategy: PaddingStrategy::BatchLongest,
             ..Default::default()
         }));
+        // BERT position embeddings stop at `max_position_embeddings` (512 for BGE): an
+        // over-long text otherwise fails the whole forward pass — and, per-batch, would void
+        // every other text batched with it. Embedding the head of a long text is the designed
+        // degradation, so truncate to the model's window.
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: config.max_position_embeddings,
+                ..Default::default()
+            }))
+            .map_err(|e| backend(&tokenizer_path, &e))?;
 
         let device = Device::Cpu;
         // SAFETY: mmap of a trusted, operator-provisioned weights file. `from_mmaped_safetensors`
@@ -312,5 +322,20 @@ mod tests {
             drift.abs() < 1e-4,
             "chunked embedding must equal the solo embedding (cos drift {drift})"
         );
+
+        // Regression (TASK-323): a text beyond BERT's 512-position window used to fail the
+        // forward pass — and, batched, void every other text's embedding with it (the arXiv demo
+        // silently lost all 20k of a chunk's vectors to over-long abstracts). Truncation must
+        // make it embed (the head of the text), and its batch-mates must be unaffected.
+        let long = "retrieval engine lakehouse search ".repeat(400); // ~1600 words ≫ 512 tokens
+        let out = e
+            .embed(&["short doc about search".into(), long])
+            .expect("an over-long text must embed (truncated), not fail the batch");
+        assert_eq!(out.len(), 2);
+        for v in &out {
+            assert_eq!(v.len(), 384);
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-3, "expected unit norm, got {norm}");
+        }
     }
 }
