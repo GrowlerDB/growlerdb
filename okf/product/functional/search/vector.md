@@ -65,13 +65,13 @@ so a rebuilt or appended-to LOCAL vector index loses coverage until the shared s
 provenance and the pooled pipeline are the same work.)* The `Embedder` trait is the
 integration point ([D41](/system/decisions/d41-vector-open-core.md) keeps it open; external providers
 attach here). Forward passes are **bounded** (sub-batches of 32 inputs): attention memory scales with
-`batch × seq²`, so an unbounded whole-table pass OOMs a node on real corpora (the ~20k-abstract arXiv
-demo killed a 4 GB node at batch 400) — sub-batching caps peak memory regardless of build size, with
+`batch × seq²`, so an unbounded whole-table pass OOMs a node on real corpora (a 20k-abstract arXiv
+build killed a 4 GB node at batch 400) — sub-batching caps peak memory regardless of build size, with
 identical vectors (no cross-sequence attention). Inputs are **truncated to the model's sequence
 window** (512 positions for BGE): an over-long text embeds its head rather than failing the forward
 pass. A batch whose embed still fails is retried **per text**, skipping only true failures — and the
 skip count is logged loudly per call. Both are load-bearing: pre-fix, one over-long abstract voided an
-entire build chunk's vectors with a log-free skip, leaving 20k demo docs silently invisible to KNN
+entire build chunk's vectors with a log-free skip, leaving 20k docs silently invisible to KNN
 (TASK-323). Loaded models are **cached per model directory** for the process lifetime — the factory
 runs on every semantic query, and per-call loading made each query re-read 133 MB of weights.
 
