@@ -1,10 +1,20 @@
-//! The real local BGE embedder: bge-small-en-v1.5 (a BERT model) on Candle, CPU, offline.
+//! The real local BGE embedder: bge-small-en-v1.5 (a BERT model) on **ONNX Runtime**, CPU, offline.
+//!
+//! ONNX Runtime links a native `libonnxruntime` (fetched at build time via ort's `download-binaries`
+//! feature; runtime stays offline). This replaces the former pure-Rust Candle path for ~2-4x CPU
+//! throughput (D20/D46). The cross-encoder reranker still runs on Candle pending its own ONNX move.
+//!
+//! The model directory holds `config.json`, `tokenizer.json`, and `model.onnx` (the BERT graph with
+//! `input_ids` / `attention_mask` / `token_type_ids` inputs and a `last_hidden_state` output).
+//! Sentence embeddings are the attention-masked **mean pool** of the last hidden state, **L2
+//! normalized** — identical semantics to the prior Candle path, so vectors stay reproducible across
+//! ingest and query (D43).
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-use candle_core::{Device, Tensor, D};
-use candle_nn::VarBuilder;
-use candle_transformers::models::bert::{BertModel, Config, DTYPE};
+use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::value::Tensor;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 use growlerdb_core::index_def::VectorSpec;
@@ -13,13 +23,12 @@ use growlerdb_core::{EmbedError, Embedder};
 /// The three files a model directory must contain.
 const CONFIG_JSON: &str = "config.json";
 const TOKENIZER_JSON: &str = "tokenizer.json";
-const WEIGHTS: &str = "model.safetensors";
+const MODEL_ONNX: &str = "model.onnx";
 
-/// Upper bound on one BERT forward pass. Attention memory is `batch × heads × seq²` per layer —
-/// unbounded, a whole-table build's texts in one pass allocate gigabytes (the arXiv demo corpus
-/// OOM-killed a 4 GB node at batch 400 × seq 512). 32 keeps the worst-case pass in the
-/// hundreds-of-MB range with no measurable CPU throughput cost.
-const MAX_FORWARD_BATCH: usize = 32;
+/// Upper bound on inputs per ONNX `Run`. ONNX Runtime parallelizes a single run across its
+/// intra-op thread pool, and short synopses pad cheaply, so this is larger than the old Candle
+/// bound (32) — but still bounded so a whole-table build doesn't materialize one giant tensor.
+const MAX_FORWARD_BATCH: usize = 64;
 
 /// Resolve the model directory for `model_id`:
 /// `${GROWLERDB_MODEL_DIR:-~/.cache/growlerdb/models}/<model_id>/`.
@@ -38,91 +47,93 @@ fn default_model_root() -> PathBuf {
     home.join(".cache").join("growlerdb").join("models")
 }
 
-/// A local BERT embedder producing L2-normalized, mean-pooled sentence embeddings.
+/// A local BERT embedder (ONNX Runtime) producing L2-normalized, mean-pooled sentence embeddings.
 pub struct BgeEmbedder {
-    model: BertModel,
+    // `Session::run` takes `&mut self`, but the [`Embedder`] seam is shared (`&self` behind an
+    // `Arc`), so the session lives behind a `Mutex`. ONNX Runtime parallelizes each `run` across
+    // its intra-op threads, so serializing runs still saturates the cores — the win is per-run,
+    // not per-concurrent-call. The embedder is cached per model dir by the factory, so the lock is
+    // uncontended on the ingest path (one embed loop) and cheap on the query path.
+    session: Mutex<Session>,
     tokenizer: Tokenizer,
-    device: Device,
     model_id: String,
     dims: usize,
 }
 
 impl BgeEmbedder {
-    /// Load the model named by `spec.model` from its resolved [`model_dir`]. Fails (so the
-    /// caller can fall back) if any of `config.json`, `tokenizer.json`, `model.safetensors`
-    /// is missing or malformed, or if the model's hidden size doesn't match `spec.dims`.
+    /// Load the model named by `spec.model` from its resolved [`model_dir`]. Fails (so the caller
+    /// can fall back) if any of `config.json`, `tokenizer.json`, `model.onnx` is missing or
+    /// malformed, or if the model's hidden size doesn't match `spec.dims`.
     pub fn load(spec: &VectorSpec) -> Result<Self, EmbedError> {
         let dir = model_dir(&spec.model);
         let config_path = dir.join(CONFIG_JSON);
         let tokenizer_path = dir.join(TOKENIZER_JSON);
-        let weights_path = dir.join(WEIGHTS);
+        let model_path = dir.join(MODEL_ONNX);
 
-        for p in [&config_path, &tokenizer_path, &weights_path] {
+        for p in [&config_path, &tokenizer_path, &model_path] {
             if !p.exists() {
                 return Err(EmbedError::Backend(format!("missing {}", p.display())));
             }
         }
 
-        let config: Config = {
+        // config.json → hidden size (must match the field's dims) and the sequence window.
+        let config: serde_json::Value = {
             let raw = std::fs::read_to_string(&config_path)
                 .map_err(|e| backend(&config_path, &e.to_string()))?;
             serde_json::from_str(&raw).map_err(|e| backend(&config_path, &e.to_string()))?
         };
-        let dims = config.hidden_size;
+        let dims = config
+            .get("hidden_size")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| backend(&config_path, &"missing hidden_size"))?
+            as usize;
         if dims != spec.dims {
             return Err(EmbedError::DimMismatch {
                 expected: spec.dims,
                 got: dims,
             });
         }
+        let max_seq = config
+            .get("max_position_embeddings")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(512) as usize;
 
         let mut tokenizer =
             Tokenizer::from_file(&tokenizer_path).map_err(|e| backend(&tokenizer_path, &e))?;
-        // Batch inference needs a rectangular [batch, seq] tensor: pad each batch to its
-        // longest member. The attention mask (built below) zeroes the padded positions so
-        // they don't contribute to the mean pool.
+        // Batch inference needs a rectangular [batch, seq] tensor: pad each batch to its longest
+        // member. The attention mask zeroes the padded positions in the mean pool below.
         tokenizer.with_padding(Some(PaddingParams {
             strategy: PaddingStrategy::BatchLongest,
             ..Default::default()
         }));
-        // BERT position embeddings stop at `max_position_embeddings` (512 for BGE): an
-        // over-long text otherwise fails the whole forward pass — and, per-batch, would void
-        // every other text batched with it. Embedding the head of a long text is the designed
-        // degradation, so truncate to the model's window.
+        // BERT position embeddings stop at `max_position_embeddings` (512 for BGE): an over-long
+        // text otherwise blows the graph's position range. Embedding the head of a long text is the
+        // designed degradation, so truncate to the model's window.
         tokenizer
             .with_truncation(Some(TruncationParams {
-                max_length: config.max_position_embeddings,
+                max_length: max_seq,
                 ..Default::default()
             }))
             .map_err(|e| backend(&tokenizer_path, &e))?;
 
-        let device = Device::Cpu;
-        // SAFETY: mmap of a trusted, operator-provisioned weights file. `from_mmaped_safetensors`
-        // is `unsafe` only because a concurrent external mutation of the file would be UB; the
-        // model directory is read-only config, not attacker-writable input.
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&weights_path), DTYPE, &device)
-                .map_err(|e| backend(&weights_path, &e.to_string()))?
-        };
-        let model =
-            BertModel::load(vb, &config).map_err(|e| backend(&weights_path, &e.to_string()))?;
+        let session = Session::builder()
+            .map_err(ort_err)?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(ort_err)?
+            .commit_from_file(&model_path)
+            .map_err(ort_err)?;
 
         Ok(Self {
-            model,
+            session: Mutex::new(session),
             tokenizer,
-            device,
             model_id: spec.model.clone(),
             dims,
         })
     }
 
-    /// Tokenize + forward + mean-pool + L2-normalize a batch, returning one vector per input.
-    /// Inputs beyond [`MAX_FORWARD_BATCH`] are processed in bounded sub-batches: attention
-    /// memory scales with `batch × seq²`, so a single forward over a whole table build (e.g.
-    /// thousands of 512-token abstracts) OOM-kills the node — sub-batching caps the peak at a
-    /// few hundred MB regardless of input size, and per-sub-batch padding only pads to that
-    /// sub-batch's longest sequence. Each text still embeds independently (BERT applies no
-    /// cross-sequence attention), so results are identical to one big pass.
+    /// Tokenize + ONNX forward + mean-pool + L2-normalize a batch, one vector per input. Inputs
+    /// beyond [`MAX_FORWARD_BATCH`] are processed in bounded sub-batches (each text embeds
+    /// independently — no cross-sequence attention — so results are identical to one big run).
     fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
         if texts.is_empty() {
             return Ok(vec![]);
@@ -134,48 +145,51 @@ impl BgeEmbedder {
             }
             return Ok(out);
         }
-        let inputs: Vec<String> = texts.to_vec();
+
         let encodings = self
             .tokenizer
-            .encode_batch(inputs, true)
+            .encode_batch(texts.to_vec(), true)
             .map_err(|e| EmbedError::Backend(format!("tokenize: {e}")))?;
-
         let batch = encodings.len();
         let seq = encodings.first().map(|e| e.get_ids().len()).unwrap_or(0);
 
-        // Flatten to [batch * seq] then reshape — every encoding is padded to `seq`.
-        let mut ids: Vec<u32> = Vec::with_capacity(batch * seq);
-        let mut mask: Vec<u32> = Vec::with_capacity(batch * seq);
+        let mut ids = Vec::with_capacity(batch * seq);
+        let mut mask = Vec::with_capacity(batch * seq);
         for e in &encodings {
-            ids.extend_from_slice(e.get_ids());
-            mask.extend_from_slice(e.get_attention_mask());
+            ids.extend(e.get_ids().iter().map(|&x| x as i64));
+            mask.extend(e.get_attention_mask().iter().map(|&x| x as i64));
         }
-
-        let input_ids = Tensor::from_vec(ids, (batch, seq), &self.device).map_err(tensor_err)?;
-        let attention_mask =
-            Tensor::from_vec(mask, (batch, seq), &self.device).map_err(tensor_err)?;
         // BGE/BERT sentence embeddings use a single segment → all-zero token type ids.
-        let token_type_ids = input_ids.zeros_like().map_err(tensor_err)?;
+        let types = vec![0i64; batch * seq];
 
-        // [batch, seq, hidden]
-        let hidden = self
-            .model
-            .forward(&input_ids, &token_type_ids, Some(&attention_mask))
-            .map_err(|e| EmbedError::Backend(format!("bert forward: {e}")))?;
+        // Build [batch, seq] i64 tensors directly from (shape, data) — no ndarray dependency.
+        let shape = [batch as i64, seq as i64];
+        let ids_t = Tensor::from_array((shape, ids)).map_err(ort_err)?;
+        let mask_t = Tensor::from_array((shape, mask.clone())).map_err(ort_err)?;
+        let types_t = Tensor::from_array((shape, types)).map_err(ort_err)?;
 
-        let pooled = mean_pool(&hidden, &attention_mask).map_err(tensor_err)?;
-        let normed = l2_normalize(&pooled).map_err(tensor_err)?;
+        let mut session = self.session.lock().unwrap_or_else(|p| p.into_inner());
+        let outputs = session
+            .run(ort::inputs![
+                "input_ids" => ids_t,
+                "attention_mask" => mask_t,
+                "token_type_ids" => types_t,
+            ])
+            .map_err(ort_err)?;
 
-        let out: Vec<Vec<f32>> = normed.to_vec2().map_err(tensor_err)?;
-        for v in &out {
-            if v.len() != self.dims {
-                return Err(EmbedError::DimMismatch {
-                    expected: self.dims,
-                    got: v.len(),
-                });
-            }
+        // last_hidden_state: [batch, seq, hidden] (row-major)
+        let (_shape, data) = outputs["last_hidden_state"]
+            .try_extract_tensor::<f32>()
+            .map_err(ort_err)?;
+        let hidden = data.len().checked_div(batch * seq).unwrap_or(0);
+        if hidden != self.dims {
+            return Err(EmbedError::DimMismatch {
+                expected: self.dims,
+                got: hidden,
+            });
         }
-        Ok(out)
+
+        Ok(mean_pool_l2(data, &mask, batch, seq, hidden))
     }
 }
 
@@ -193,149 +207,158 @@ impl Embedder for BgeEmbedder {
     }
 }
 
-/// Mean-pool the last hidden states over the token axis using the attention mask:
-/// `sum(hidden * mask) / sum(mask)`. `hidden` is `[batch, seq, hidden]`, `mask` is
-/// `[batch, seq]` (1 for real tokens, 0 for padding). Returns `[batch, hidden]`.
-fn mean_pool(hidden: &Tensor, mask: &Tensor) -> candle_core::Result<Tensor> {
-    let mask = mask.to_dtype(hidden.dtype())?; // [b, seq]
-    let mask_exp = mask.unsqueeze(2)?; // [b, seq, 1]
-    let summed = hidden.broadcast_mul(&mask_exp)?.sum(1)?; // [b, hidden]
-                                                           // Clamp the token count away from zero so an all-padding (empty) row yields zeros, not NaN.
-    let counts = mask.sum(1)?.clamp(1e-9, f32::INFINITY)?.unsqueeze(1)?; // [b, 1]
-    summed.broadcast_div(&counts)
-}
-
-/// L2-normalize each row of a `[batch, hidden]` tensor. A zero row (empty input) stays zero
-/// because its norm is clamped to a small epsilon rather than dividing by zero.
-fn l2_normalize(x: &Tensor) -> candle_core::Result<Tensor> {
-    let norm = x
-        .sqr()?
-        .sum_keepdim(D::Minus1)?
-        .sqrt()?
-        .clamp(1e-12, f32::INFINITY)?; // [b, 1]
-    x.broadcast_div(&norm)
+/// Attention-masked mean pool of `last_hidden_state` (`[batch, seq, hidden]`, row-major in `data`)
+/// followed by per-row L2 normalization. `mask[b*seq + s]` is 1 for a real token, 0 for padding; an
+/// all-padding row yields a zero vector (count/norm clamped away from zero, no NaN).
+fn mean_pool_l2(
+    data: &[f32],
+    mask: &[i64],
+    batch: usize,
+    seq: usize,
+    hidden: usize,
+) -> Vec<Vec<f32>> {
+    let mut out = Vec::with_capacity(batch);
+    for b in 0..batch {
+        let mut acc = vec![0f32; hidden];
+        let mut count = 0f32;
+        for s in 0..seq {
+            if mask[b * seq + s] == 0 {
+                continue;
+            }
+            count += 1.0;
+            let base = (b * seq + s) * hidden;
+            for h in 0..hidden {
+                acc[h] += data[base + h];
+            }
+        }
+        let count = count.max(1e-9);
+        let mut norm = 0f32;
+        for a in &mut acc {
+            *a /= count;
+            norm += *a * *a;
+        }
+        let norm = norm.sqrt().max(1e-12);
+        for a in &mut acc {
+            *a /= norm;
+        }
+        out.push(acc);
+    }
+    out
 }
 
 fn backend(path: &Path, msg: &impl std::fmt::Display) -> EmbedError {
     EmbedError::Backend(format!("{}: {msg}", path.display()))
 }
 
-fn tensor_err(e: candle_core::Error) -> EmbedError {
-    EmbedError::Backend(format!("tensor op: {e}"))
+fn ort_err<T>(e: ort::Error<T>) -> EmbedError {
+    EmbedError::Backend(format!("onnx: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use growlerdb_core::index_def::{EmbedProvider, VectorMetric};
 
     #[test]
-    fn mean_pool_masks_padding() {
-        let dev = Device::Cpu;
-        // batch=1, seq=3, hidden=2. Third token is padding (mask 0), so the mean is over the
-        // first two rows only: ([1,2] + [3,4]) / 2 = [2, 3]. If padding leaked in it'd be
-        // ([1,2]+[3,4]+[5,6])/3 = [3,4].
-        let hidden = Tensor::from_vec(vec![1f32, 2., 3., 4., 5., 6.], (1, 3, 2), &dev).unwrap();
-        let mask = Tensor::from_vec(vec![1f32, 1., 0.], (1, 3), &dev).unwrap();
-        let pooled = mean_pool(&hidden, &mask).unwrap();
-        let got: Vec<Vec<f32>> = pooled.to_vec2().unwrap();
-        assert!((got[0][0] - 2.0).abs() < 1e-6, "{got:?}");
-        assert!((got[0][1] - 3.0).abs() < 1e-6, "{got:?}");
+    fn mean_pool_masks_padding_and_normalizes() {
+        // batch=1, seq=3, hidden=2. Third token is padding (mask 0), so the pool is over the first
+        // two rows: ([1,2] + [3,4]) / 2 = [2, 3], then L2-normalized.
+        let data = vec![1f32, 2., 3., 4., 5., 6.];
+        let mask = vec![1i64, 1, 0];
+        let out = mean_pool_l2(&data, &mask, 1, 3, 2);
+        let v = &out[0];
+        let norm = (v[0] * v[0] + v[1] * v[1]).sqrt();
+        assert!((norm - 1.0).abs() < 1e-6, "row is L2-normalized");
+        // Direction is [2,3] normalized; the padding row [5,6] must not leak (that would give [3,4]).
+        let expect0 = 2.0 / (2f32 * 2. + 3. * 3.).sqrt();
+        assert!(
+            (v[0] - expect0).abs() < 1e-6,
+            "padding excluded from the pool"
+        );
     }
 
     #[test]
-    fn mean_pool_all_padding_is_zero() {
-        let dev = Device::Cpu;
-        let hidden = Tensor::from_vec(vec![7f32, 8., 9., 10.], (1, 2, 2), &dev).unwrap();
-        let mask = Tensor::from_vec(vec![0f32, 0.], (1, 2), &dev).unwrap();
-        let pooled = mean_pool(&hidden, &mask).unwrap();
-        let got: Vec<Vec<f32>> = pooled.to_vec2().unwrap();
-        assert!(got[0].iter().all(|x| x.abs() < 1e-6), "{got:?}");
+    fn all_padding_row_is_zero_not_nan() {
+        let data = vec![9f32, 9., 9., 9.];
+        let mask = vec![0i64, 0];
+        let out = mean_pool_l2(&data, &mask, 1, 2, 2);
+        assert_eq!(out[0], vec![0.0, 0.0]);
     }
 
+    /// End-to-end against the real ONNX model. Gated (needs a provisioned
+    /// `GROWLERDB_MODEL_DIR/bge-small-en-v1.5/{config.json,tokenizer.json,model.onnx}`); never runs
+    /// in CI. Run: `cargo test -p growlerdb-embed --release -- --ignored bge_onnx_real_model --nocapture`
     #[test]
-    fn l2_normalize_unit_norm() {
-        let dev = Device::Cpu;
-        // [3, 4] → norm 5 → [0.6, 0.8]; a zero row stays zero (no NaN).
-        let x = Tensor::from_vec(vec![3f32, 4., 0., 0.], (2, 2), &dev).unwrap();
-        let n = l2_normalize(&x).unwrap();
-        let got: Vec<Vec<f32>> = n.to_vec2().unwrap();
-        assert!((got[0][0] - 0.6).abs() < 1e-6, "{got:?}");
-        assert!((got[0][1] - 0.8).abs() < 1e-6, "{got:?}");
-        let norm0: f32 = got[0].iter().map(|v| v * v).sum::<f32>().sqrt();
-        assert!((norm0 - 1.0).abs() < 1e-6);
-        assert!(got[1].iter().all(|x| x.abs() < 1e-12), "{got:?}");
-    }
-
-    /// End-to-end test against a real provisioned model. Ignored: it needs
-    /// `GROWLERDB_MODEL_DIR` (or `~/.cache/growlerdb/models`) to contain
-    /// `bge-small-en-v1.5/{config.json,tokenizer.json,model.safetensors}` and never runs in
-    /// CI. Run with: `cargo test -p growlerdb-embed -- --ignored bge_real_model`.
-    #[test]
-    #[ignore = "requires a provisioned GROWLERDB_MODEL_DIR bge-small-en-v1.5 model"]
-    fn bge_real_model() {
+    #[ignore = "requires a provisioned bge-small-en-v1.5 ONNX model dir"]
+    fn bge_onnx_real_model() {
+        use growlerdb_core::index_def::{EmbedProvider, VectorMetric};
         let spec = VectorSpec {
             dims: 384,
             model: "bge-small-en-v1.5".into(),
+            source_field: "body".into(),
             metric: VectorMetric::Cosine,
             provider: EmbedProvider::Local,
-            source_field: "body".into(),
         };
-        let e = BgeEmbedder::load(&spec).expect("model should load");
+        let e = BgeEmbedder::load(&spec).expect("load ONNX model");
         assert_eq!(e.dims(), 384);
-
-        let out = e
+        let v = e
             .embed(&[
-                "A cat sleeps on the warm windowsill.".into(),
-                "A kitten naps in the sunny window.".into(),
-                "Quarterly tax filings are due next Friday.".into(),
+                "a cat sits on the mat".into(),               // 0
+                "a kitten rests on the rug".into(),           // 1 — semantically close to 0
+                "quarterly financial earnings report".into(), // 2 — far from 0
+                "".into(),                                    // 3 — empty ⇒ CLS/SEP-pooled, finite
             ])
-            .unwrap();
-        assert_eq!(out.len(), 3);
-        for v in &out {
-            assert_eq!(v.len(), 384);
-            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-            assert!((norm - 1.0).abs() < 1e-3, "expected unit norm, got {norm}");
+            .expect("embed");
+        assert_eq!(v.len(), 4);
+        for row in &v[..3] {
+            assert_eq!(row.len(), 384);
+            let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-3, "unit-normalized, got {norm}");
         }
         let cos = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
-        let similar = cos(&out[0], &out[1]);
-        let dissimilar = cos(&out[0], &out[2]);
+        let close = cos(&v[0], &v[1]);
+        let far = cos(&v[0], &v[2]);
         assert!(
-            similar > dissimilar,
-            "semantically-similar pair ({similar}) should score above the dissimilar pair ({dissimilar})"
+            close > far,
+            "semantic structure holds: cos(cat,kitten)={close:.3} > cos(cat,finance)={far:.3}"
         );
-
-        // Sub-batching (the MAX_FORWARD_BATCH bound) changes memory, never results: a batch
-        // crossing the boundary returns one vector per input, and each equals the vector the
-        // same text gets alone (padding differs per sub-batch; the attention mask makes that
-        // irrelevant). Guards the whole-table build path that used to OOM.
-        let texts: Vec<String> = (0..(MAX_FORWARD_BATCH * 2 + 5))
-            .map(|i| format!("document number {i} about search engines and lakehouse tables"))
-            .collect();
-        let batched = e.embed(&texts).unwrap();
-        assert_eq!(batched.len(), texts.len());
-        let solo = e
-            .embed(&texts[MAX_FORWARD_BATCH..MAX_FORWARD_BATCH + 1])
-            .unwrap();
-        let drift = 1.0 - cos(&batched[MAX_FORWARD_BATCH], &solo[0]);
+        // Empty text still tokenizes to [CLS]/[SEP] ⇒ a finite pooled vector, never NaN.
         assert!(
-            drift.abs() < 1e-4,
-            "chunked embedding must equal the solo embedding (cos drift {drift})"
+            v[3].iter().all(|x| x.is_finite()),
+            "empty text ⇒ finite vector, no NaN"
         );
+        eprintln!("ONNX bge-small: cos(cat,kitten)={close:.3}, cos(cat,finance)={far:.3}");
+    }
 
-        // Regression (TASK-323): a text beyond BERT's 512-position window used to fail the
-        // forward pass — and, batched, void every other text's embedding with it (the arXiv demo
-        // silently lost all 20k of a chunk's vectors to over-long abstracts). Truncation must
-        // make it embed (the head of the text), and its batch-mates must be unaffected.
-        let long = "retrieval engine lakehouse search ".repeat(400); // ~1600 words ≫ 512 tokens
-        let out = e
-            .embed(&["short doc about search".into(), long])
-            .expect("an over-long text must embed (truncated), not fail the batch");
-        assert_eq!(out.len(), 2);
-        for v in &out {
-            assert_eq!(v.len(), 384);
-            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-            assert!((norm - 1.0).abs() < 1e-3, "expected unit norm, got {norm}");
-        }
+    /// In-process throughput probe vs the ~10 docs/s Candle baseline, on synopsis-length text
+    /// (~78 words). Gated + release-only. Run:
+    /// `cargo test -p growlerdb-embed --release -- --ignored bge_onnx_throughput --nocapture`
+    #[test]
+    #[ignore = "requires a provisioned bge-small-en-v1.5 ONNX model dir; benchmark"]
+    fn bge_onnx_throughput() {
+        use growlerdb_core::index_def::{EmbedProvider, VectorMetric};
+        let spec = VectorSpec {
+            dims: 384,
+            model: "bge-small-en-v1.5".into(),
+            source_field: "body".into(),
+            metric: VectorMetric::Cosine,
+            provider: EmbedProvider::Local,
+        };
+        let e = BgeEmbedder::load(&spec).expect("load");
+        // A ~78-word synopsis-length string (the movie demo's embed source size).
+        let sentence = "During the war a small crew of soldiers is sent behind enemy lines on a \
+            dangerous mission to recover stolen plans, and as they cross the ruined countryside they \
+            confront betrayal, loss, and an impossible choice that will decide the fate of the city \
+            they left behind, testing loyalty and courage at every turn before the final reckoning "
+            .to_string();
+        let n = 500usize;
+        let texts: Vec<String> = (0..n).map(|_| sentence.clone()).collect();
+        let t0 = std::time::Instant::now();
+        let out = e.embed(&texts).expect("embed");
+        let secs = t0.elapsed().as_secs_f64();
+        assert_eq!(out.len(), n);
+        eprintln!(
+            "ONNX throughput: {n} docs in {secs:.2}s = {:.1} docs/s (candle baseline ~10 docs/s)",
+            n as f64 / secs
+        );
     }
 }

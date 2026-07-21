@@ -92,14 +92,15 @@ services:
       set -e;
       dir=/models/bge-small-en-v1.5;
       base=https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main;
-      if [ -f \"$$dir/config.json\" ] && [ -f \"$$dir/tokenizer.json\" ] && [ -f \"$$dir/model.safetensors\" ]; then
+      onnx=https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main/onnx/model_quantized.onnx;
+      if [ -f \"$$dir/config.json\" ] && [ -f \"$$dir/tokenizer.json\" ] && [ -f \"$$dir/model.onnx\" ]; then
         echo 'model present, skipping'; exit 0;
       fi;
       apk add --no-cache curl;
       mkdir -p \"$$dir\";
-      curl -fSL --retry 3 -o \"$$dir/config.json\"       \"$$base/config.json\";
-      curl -fSL --retry 3 -o \"$$dir/tokenizer.json\"    \"$$base/tokenizer.json\";
-      curl -fSL --retry 3 -o \"$$dir/model.safetensors\" \"$$base/model.safetensors\";
+      curl -fSL --retry 3 -o \"$$dir/config.json\"    \"$$base/config.json\";
+      curl -fSL --retry 3 -o \"$$dir/tokenizer.json\" \"$$base/tokenizer.json\";
+      curl -fSL --retry 3 -o \"$$dir/model.onnx\"     \"$$onnx\";
       echo 'model fetched'
       "
 
