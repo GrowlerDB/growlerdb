@@ -31,7 +31,7 @@ mapping:
         model: bge-small-en-v1.5  # default; recorded for reproducibility
         dims: 384                 # default for the model
         metric: COSINE            # COSINE (default) | DOT | L2
-        provider: LOCAL           # LOCAL (default, in-process) | EXTERNAL (opt-in, later)
+        provider: LOCAL           # provenance: LOCAL (default, in-process) | SOURCE (bring-your-own column) | EXTERNAL (opt-in)
 ```
 
 - **Opt-in, always** — a field is only a vector if the author declares it. The majority of indexes carry
@@ -39,6 +39,10 @@ mapping:
 - **Local by default** ([D20](/system/decisions/d20-embedding-model.md)) — embeddings are generated
   in-process from an open model; **no data leaves** the deployment and **no API key** is required. The
   `provider` seam allows an external embedding service as a conscious opt-in.
+- **Provenance-typed** ([D46](/system/decisions/d46-embed-write-path-stage.md)) — where the vector
+  comes from is a property of the field: **LOCAL** embeds in-process, **SOURCE** maps a vector column
+  the source table already carries straight through (bring-your-own — zero embed cost, the
+  high-throughput path), **EXTERNAL** calls a remote service. Same field, same query path.
 - **Reproducible** — `model`, `dims`, `metric`, and `provider` are recorded in the
   [index metadata](/system/storage/data-model.md); changing the model is a tracked re-embedding reindex.
 - A vector field takes no analyzer, and is never `fast`, `cached`, or inverted-indexed — it stores only
@@ -46,9 +50,19 @@ mapping:
 
 ## How the embedding is produced
 
-At **ingest**, for each `LOCAL` vector field GrowlerDB embeds the `source_field` text of every document
-through the [`Embedder`](/system/decisions/d20-embedding-model.md) seam and stores the resulting vector
-in the document's segment (backed up and restored with the lexical segment). The `Embedder` trait is the
+Embedding is a **write-path stage** ([D46](/system/decisions/d46-embed-write-path-stage.md)): for each
+`LOCAL` vector field GrowlerDB embeds the `source_field` text of every document through the
+[`Embedder`](/system/decisions/d20-embedding-model.md) seam and stores the resulting vector in the
+document's segment (backed up and restored with the lexical segment); a `SOURCE` field skips embedding
+and maps its vector column through. The stage is shared by every source→index path — build, reindex,
+sync, reconcile — so coverage is a property of the write pipeline rather than of one code path, and it
+runs **pipelined and pooled** (embed overlaps read/write and fans across cores) so a vector field's
+embedding is not a serial bottleneck on ingest throughput. Progress is a gauge emitted from the stage
+(embedded / total), **decoupled from commit granularity** — the build is observable without shrinking
+commit chunks. *(Direction: [D46](/system/decisions/d46-embed-write-path-stage.md). Today LOCAL
+embedding runs only on the **cold build**; reindex / sync / reconcile do not yet re-embed — TASK-326 —
+so a rebuilt or appended-to LOCAL vector index loses coverage until the shared stage lands. `SOURCE`
+provenance and the pooled pipeline are the same work.)* The `Embedder` trait is the
 integration point ([D41](/system/decisions/d41-vector-open-core.md) keeps it open; external providers
 attach here). Forward passes are **bounded** (sub-batches of 32 inputs): attention memory scales with
 `batch × seq²`, so an unbounded whole-table pass OOMs a node on real corpora (the ~20k-abstract arXiv
@@ -136,5 +150,8 @@ a no-op; see [RBAC & tenancy](/product/functional/rbac-and-tenancy.md).)
 > KNN, filtered / tenant-scoped KNN, RRF hybrid fusion, the authenticated multi-shard gateway
 > surface** (gRPC + REST, node-local embedding), the **console** search-mode UX + grounded Ask screen,
 > the **opt-in reranker** (local + external providers), and the **approximate HNSW index** (auto-selected
-> at scale, filtered KNN stays exact). Only **distributed windowed** semantic search remains — see
+> at scale, filtered KNN stays exact). Remaining: **distributed windowed** semantic search, the
+> **write-path embed stage** (LOCAL embedding on reindex/sync/reconcile, pooled/pipelined ingest, and
+> `SOURCE` bring-your-own vectors — [D46](/system/decisions/d46-embed-write-path-stage.md), TASK-326),
+> and the deferred **EXTERNAL pooling** / faster-runtime bake-off — see
 > [known limitations](/quality/known-limitations/index.md). The interface and stored format are stable.
