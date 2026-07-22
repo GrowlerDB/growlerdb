@@ -54,8 +54,9 @@
   .wordmark .db { color: var(--melt); }
 
   /* Nav */
-  nav { display: flex; align-items: center; gap: 28px; padding-top: 22px; padding-bottom: 22px; flex-wrap: wrap; }
-  nav .spacer { flex: 1; }
+  nav { display: flex; align-items: center; gap: 28px; padding-top: 22px; padding-bottom: 22px; }
+  .navlinks { display: flex; align-items: center; gap: 28px; margin-left: auto; }
+  .nav-toggle, .hamburger { display: none; }   /* mobile-only menu toggle (shown in the media query) */
   .navlink { font-size: 14px; font-weight: 500; color: var(--text-2); }
   .navlink:hover { color: var(--white); }
   .btn { display: inline-block; font-weight: 600; border-radius: 8px; }
@@ -105,8 +106,19 @@
     .wrap { padding-left: 20px; padding-right: 20px; }
     header.hero { padding-top: 56px; }
     .how { grid-template-columns: 1fr; }
-    nav .spacer { display: none; }
     .footrow .spacer { display: none; }
+
+    /* Collapse the nav to a hamburger instead of wrapping the links to a second line. */
+    nav { flex-wrap: wrap; column-gap: 18px; }
+    .hamburger { display: inline-flex; align-items: center; justify-content: center; margin-left: auto; margin-right: -8px; width: 44px; height: 44px; color: var(--text-2); cursor: pointer; -webkit-tap-highlight-color: transparent; }
+    .hamburger:hover { color: var(--white); }
+    /* The checkbox holds the open/closed state: visually hidden but focusable (keyboard-operable). */
+    .nav-toggle { display: block; position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); border: 0; }
+    .nav-toggle:focus-visible + .hamburger { outline: 2px solid var(--glacier); outline-offset: 2px; border-radius: 8px; }
+    .navlinks { display: none; order: 3; flex-basis: 100%; flex-direction: column; align-items: flex-start; gap: 2px; margin-top: 6px; padding-top: 8px; border-top: 1px solid var(--line); }
+    .nav-toggle:checked ~ .navlinks { display: flex; }
+    .navlinks .navlink { padding: 11px 2px; font-size: 15px; }
+    .navlinks .btn-primary { margin-top: 8px; }
   }
 </style>
 </head>
@@ -124,11 +136,18 @@
     </svg>
     <span class="wordmark" style="font-size:20px">growler<span class="db">db</span></span>
   </span>
-  <span class="spacer"></span>
-  <a class="navlink" href="https://docs.growlerdb.com/">Docs</a>
-  <a class="navlink" href="https://docs.growlerdb.com/performance">Performance</a>
-  <a class="navlink" href="https://github.com/GrowlerDB/growlerdb">GitHub</a>
-  <a class="btn btn-primary" href="https://docs.growlerdb.com/getting-started">Get started</a>
+  <input type="checkbox" id="nav-toggle" class="nav-toggle" aria-label="Toggle navigation menu">
+  <label for="nav-toggle" class="hamburger">
+    <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+      <line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/>
+    </svg>
+  </label>
+  <div class="navlinks">
+    <a class="navlink" href="https://docs.growlerdb.com/">Docs</a>
+    <a class="navlink" href="https://docs.growlerdb.com/performance">Performance</a>
+    <a class="navlink" href="https://github.com/GrowlerDB/growlerdb">GitHub</a>
+    <a class="btn btn-primary" href="https://docs.growlerdb.com/getting-started">Get started</a>
+  </div>
 </nav>
 
 <header class="hero wrap">

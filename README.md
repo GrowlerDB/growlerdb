@@ -8,8 +8,6 @@
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/GrowlerDB/growlerdb?sort=semver)](https://github.com/GrowlerDB/growlerdb/releases)
 
-📖 **Documentation: <https://docs.growlerdb.com/>** — [Getting started](https://docs.growlerdb.com/getting-started) · [Install & run modes](https://docs.growlerdb.com/install) · [Configuration](https://docs.growlerdb.com/configuration) · [API reference](https://docs.growlerdb.com/reference)
-
 GrowlerDB keeps Apache Iceberg as the system of record and maintains a fast, derived
 index — **full-text, vector, and hybrid** — of your data. Search returns the matching **primary keys
 (document coordinates)**, which resolve back to the authoritative rows in Iceberg.
