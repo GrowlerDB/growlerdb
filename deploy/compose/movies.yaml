@@ -1,0 +1,43 @@
+# The opt-in **movie demo corpus** index (`just demo-data`) over `growlerdb.movies` — a slice of
+# Wikipedia movie plots (CC-BY-SA-4.0), sized so semantic vs lexical vs hybrid visibly differ and
+# agent Q&A over MCP has real substance (the 10-row `catalog` can't show ranking quality). Build +
+# serve + register:
+#   growlerdb index growlerdb.movies --def movies.yaml --name movies
+#   growlerdb serve movies --addr 0.0.0.0:50053 --register http://controlplane:50071
+# The `--all-indexes` gateway routes `{"index":"movies", ...}` requests here automatically.
+#
+# We embed a short **synopsis** (the first few plot sentences), not the full `plot`: ~80 tokens/doc
+# keeps the local BGE embed fast at build, while `plot` (the full text) still powers lexical search
+# and reading. `title`/`plot`/`synopsis` are **cached** so agents read hits' text without a
+# hydration round trip (search alone answers; `hydrate`/inline hydration stays the escalation).
+name: movies
+source:
+  iceberg:
+    catalog: growlerdb
+    table: growlerdb.movies
+key:
+  identifier_fields: [id]
+mapping:
+  selection: EXPLICIT
+  fields:
+    - { path: id, type: KEYWORD }
+    - { path: title, type: TEXT, cached: true, default_field: true }
+    # Full plot: the lexical arm's rich exact-term surface, and readable in a hit.
+    - { path: plot, type: TEXT, cached: true }
+    # Short synopsis: the embed source (see plot_vec) — also cached so a hit shows the gist.
+    - { path: synopsis, type: TEXT, cached: true }
+    # The primary genre is the facet/filter axis (`genre:drama`), aggregatable for the console's
+    # left rail and the MCP `aggregate` tool.
+    - { path: genre, type: KEYWORD, cached: true, fast: true }
+    # All genres as analyzed text — `genres:thriller` term-matches any listed genre.
+    - { path: genres, type: TEXT }
+    # Production origin (`origin:Bollywood`) — a second facet axis.
+    - { path: origin, type: KEYWORD, cached: true, fast: true }
+    - { path: director, type: TEXT, cached: true }
+    - { path: cast, type: TEXT, cached: true }
+    # Release date for range filters/sort; decade + year for exact facets/aggregates.
+    - { path: released, type: DATE, format: epoch_ms, fast: true }
+    - { path: decade, type: KEYWORD, cached: true, fast: true }
+    - { path: year, type: KEYWORD, cached: true, fast: true }
+    # Local BGE embedding of the synopsis at ingest → semantic + hybrid search, keyless.
+    - { path: plot_vec, type: VECTOR, vector: { source_field: synopsis, dims: 384, model: bge-small-en-v1.5 } }

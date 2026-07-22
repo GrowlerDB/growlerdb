@@ -66,7 +66,7 @@ Then, in the same style as everything else:
 
 ```sh
 just mcp-connect    # connect an AI agent — prints MCP snippets for Claude Code/Desktop or any client
-just demo-data      # optional: ~20k-paper arXiv corpus for real retrieval quality (local embeddings, no key)
+just demo-data      # optional: Wikipedia movie-plots corpus for real retrieval quality (local embeddings, no key)
 just stack-down     # tear it all down
 ```
 

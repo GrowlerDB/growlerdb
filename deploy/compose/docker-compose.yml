@@ -273,12 +273,12 @@ services:
       # Demo login: a well-known baked-in credential, scoped to exactly the two demo indexes
       # so per-index RBAC is EXERCISED, not bypassed. Seeded on first boot only.
       #   user `demo` / password `demo`, roles [reader, operator], indexes [docs, catalog,
-      #   arxiv] — `arxiv` is the opt-in demo corpus (`just demo-data`); the claim is inert
+      #   movies] — `movies` is the opt-in demo corpus (`just demo-data`); the claim is inert
       #   until that profile stands the index up.
       # Change these for any non-demo use.
       GROWLERDB_DEMO_USER: demo
       GROWLERDB_DEMO_PASSWORD: demo
-      GROWLERDB_DEMO_INDEXES: docs,catalog,arxiv
+      GROWLERDB_DEMO_INDEXES: docs,catalog,movies
       # A well-known admin password for the walkthrough's Admin-scoped steps (reindex, §8) — so the
       # tutorial can log in as `admin`/`admin` deterministically instead of grepping a generated
       # password out of the logs. DEMO ONLY; set your own for any real deployment. (Without this the
@@ -380,8 +380,8 @@ services:
       retries: 60
 
   # ---- Opt-in demo corpus (profile `demo-data`, run via `just demo-data`) ----------
-  # ~20k arXiv CS titles+abstracts: the loader writes the parquet into Iceberg FIRST
-  # (`growlerdb.arxiv`, the system of record), then `node-arxiv` builds + serves the
+  # A slice of Wikipedia movie plots (CC-BY-SA-4.0): the loader writes the parquet into Iceberg
+  # FIRST (`growlerdb.movies`, the system of record), then `node-movies` builds + serves the
   # vector-enabled index from it — same lakehouse-first shape as everything else.
   demo-data:
     profiles: ["demo-data"]
@@ -396,27 +396,30 @@ services:
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_ENDPOINT_URL_S3: http://minio:9000
       AWS_REGION: us-east-1 # MinIO ignores it, but it silences pyiceberg's "unable to resolve region"
-      # The pre-sliced parquet (a GitHub release asset). Override the URL, cap rows for a
-      # slower machine (0 = all), or bind-drop a file into ./demo-data/local and set
-      # DEMO_DATA_FILE=/local/<name>.parquet to load without any download.
-      DEMO_DATA_URL: ${DEMO_DATA_URL:-https://github.com/GrowlerDB/growlerdb/releases/download/demo-data-v1/arxiv-cs-20k.parquet}
-      DEMO_DATA_SIZE: ${DEMO_DATA_SIZE:-0}
+      # The pre-sliced parquet (a GitHub release asset). Override the URL, change the row cap
+      # (0 = the full corpus), or bind-drop a file into ./demo-data/local and set
+      # DEMO_DATA_FILE=/local/<name>.parquet to load without a download.
+      # Default 5000 films: the local ONNX BGE embedder does ~500 docs/s in-container, so the
+      # index build + embed + serve is ~45s. The parquet is decade-interleaved, so the head slice
+      # still spans the decades. Raise it (or 0) for the full corpus.
+      DEMO_DATA_URL: ${DEMO_DATA_URL:-https://github.com/GrowlerDB/growlerdb/releases/download/demo-data-v1/movies-20k.parquet}
+      DEMO_DATA_SIZE: ${DEMO_DATA_SIZE:-5000}
       DEMO_DATA_FILE: ${DEMO_DATA_FILE:-}
     volumes:
       - ./demo-data/local:/local
 
-  # Builds + serves the `arxiv` index (VECTOR abstract_vec — embeds locally at build, so it
+  # Builds + serves the `movies` index (VECTOR plot_vec — embeds locally at build, so it
   # waits on model-fetch like node-catalog). Registers with the control plane; the
-  # `--all-indexes` gateway then routes `{"index":"arxiv"}` requests here automatically.
-  node-arxiv:
+  # `--all-indexes` gateway then routes `{"index":"movies"}` requests here automatically.
+  node-movies:
     profiles: ["demo-data"]
     <<: *growlerdb-image
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >
-        growlerdb index growlerdb.arxiv --def /arxiv.yaml --name arxiv &&
-        growlerdb serve arxiv --addr 0.0.0.0:50053 --rest-addr 0.0.0.0:8084 --metrics-addr 0.0.0.0:9106
-        --register http://controlplane:50071 --advertise-addr http://node-arxiv:50053
+        growlerdb index growlerdb.movies --def /movies.yaml --name movies &&
+        growlerdb serve movies --addr 0.0.0.0:50053 --rest-addr 0.0.0.0:8084 --metrics-addr 0.0.0.0:9106
+        --register http://controlplane:50071 --advertise-addr http://node-movies:50053
     environment:
       <<: *growlerdb-env
     depends_on:
@@ -430,8 +433,8 @@ services:
       - "50053:50053"
       - "9106:9106"
     volumes:
-      - node-arxiv-data:/data
-      - ./arxiv.yaml:/arxiv.yaml:ro
+      - node-movies-data:/data
+      - ./movies.yaml:/movies.yaml:ro
       # The local embedding model (bge-small-en-v1.5) at /models; GROWLERDB_MODEL_DIR points here.
       - ${MODEL_HOST_DIR:-./model-cache}:/models
     healthcheck:
@@ -658,6 +661,6 @@ volumes:
   cp-data:
   node-data:
   node-catalog-data:
-  node-arxiv-data:
+  node-movies-data:
   polaris-db:
   spark-ivy:

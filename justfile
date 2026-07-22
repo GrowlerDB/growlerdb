@@ -178,19 +178,20 @@ stack:
 mcp-connect:
     deploy/compose/mcp-connect.sh
 
-# Load the opt-in **arXiv demo corpus** (~20k CS titles+abstracts) into the lakehouse and stand
-# up its vector-enabled `arxiv` index. Stack must be up first (`just stack`); the index build
-# embeds abstracts locally (minutes on CPU — scale with `DEMO_DATA_SIZE=5000 just demo-data`).
+# Load the opt-in **movie demo corpus** (Wikipedia movie plots, CC-BY-SA) into the lakehouse and
+# stand up its vector-enabled `movies` index. Stack must be up first (`just stack`); the index
+# build embeds plot synopses locally with ONNX BGE (~500 docs/s in-container; default 5000 films
+# ≈ ~45s including build + serve — raise `DEMO_DATA_SIZE`, or `=0`, for the full corpus).
 demo-data:
-    # `--profile stack` rides along on every invocation: node-arxiv depends on control-plane +
+    # `--profile stack` rides along on every invocation: node-movies depends on control-plane +
     # model-fetch (stack profile), and compose validates depends_on across the ACTIVE profile set.
     docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data build demo-data
     docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data run --rm demo-data
-    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data up -d node-arxiv
+    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data up -d node-movies
     @echo ""
-    @echo "arxiv index building (local embedding; watch with:"
-    @echo "  docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data logs -f node-arxiv)"
-    @echo "Then search it — console index selector 'arxiv', or ask your MCP-connected agent."
+    @echo "movies index building (local embedding; watch with:"
+    @echo "  docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data logs -f node-movies)"
+    @echo "Then search it — console index selector 'movies', or ask your MCP-connected agent."
 
 # bring up Trino to explore the Iceberg source with SQL and compare with GrowlerDB
 # Then: `docker compose -f deploy/compose/docker-compose.yml exec trino trino`
