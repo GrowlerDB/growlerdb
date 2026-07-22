@@ -60,6 +60,17 @@ debug = "line-tables-only"
 [profile.test]
 debug = "line-tables-only"
 
+# Dependencies carry no debuginfo even in local dev/test builds: you never step into
+# ort/candle/tantivy/etc., and their debuginfo is a large slice of `target/`'s size. Your own
+# workspace crates keep `line-tables-only` (above) for readable backtraces — the `package."*"`
+# override applies to dependencies only, not workspace members. (CI already forces DEBUG=0 for
+# everything via env; this trims the local footprint the same way.)
+[profile.dev.package."*"]
+debug = false
+
+[profile.test.package."*"]
+debug = false
+
 [profile.release]
 lto = "thin"
 
