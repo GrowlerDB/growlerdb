@@ -20,6 +20,13 @@ Metrics defined as SLIs include: query latency; **ingest lag** (`growlerdb_inges
 **segments/compactions**. Gauges are kept fresh by a background sampler in the control plane so
 dashboards don't depend on console polling.
 
+**Topology sync:** a gateway hot-reload that rejects a malformed shard map keeps the old, servable
+routing and records it through the background-loop SLIs
+(`growlerdb_background_failures_total{loop="topology-swap"}` plus the
+`growlerdb_background_last_success_timestamp{loop="topology-swap"}` gauge). A node stuck on a stale
+routing table is then alertable ("topology hasn't synced in N minutes") rather than silently healthy
+behind a plain `/healthz` 200.
+
 **Write-path latency + backpressure:** alongside the ingest **throughput** counter
 (`growlerdb_ingested_docs_total{index}`) and the lag gauge, the node emits
 `growlerdb_write_duration_seconds{index}` — a true histogram of the per-commit

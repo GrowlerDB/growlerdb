@@ -2449,6 +2449,20 @@ pub struct GatewayConfig<'a> {
     pub authn: Option<growlerdb_engine::SharedAuthn>,
 }
 
+/// A truthy env value: `1` / `true` / `yes` / `on` (case-insensitive, trimmed).
+fn env_truthy(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Whether `GROWLERDB_REQUIRE_AUTH` demands the gateway refuse to start without an authenticator.
+/// A prod safety guard: opt-in so dev/CI stay open by default.
+fn require_auth_env() -> bool {
+    std::env::var("GROWLERDB_REQUIRE_AUTH").is_ok_and(|v| env_truthy(&v))
+}
+
 /// Run a standalone Gateway: terminate the Engine API over **gRPC** (on `addr`) and **REST**
 /// (on `rest_addr`), routing both to one or more remote Nodes. The same `Gateway` the embedded
 /// `serve` uses, but over [`RemoteNode`]s instead of a `LocalNode` — either a single Node
@@ -2633,9 +2647,21 @@ pub async fn gateway(cfg: GatewayConfig<'_>) -> anyhow::Result<()> {
         gw.with_authn(authn)
             .with_password_login(true)
             .with_authz(Arc::new(growlerdb_engine::RbacPolicy::with_default_roles()))
+    } else if require_auth_env() {
+        // Prod safety guard: refuse to start open when GROWLERDB_REQUIRE_AUTH is set, so a
+        // deployment that forgot to configure auth fails fast instead of silently serving
+        // unauthenticated traffic. Opt-in, so dev/CI stay open by default.
+        anyhow::bail!(
+            "gateway refused to start: GROWLERDB_REQUIRE_AUTH is set but no authentication is \
+             configured — pass --oidc-issuer or --builtin-auth (or unset GROWLERDB_REQUIRE_AUTH)"
+        );
     } else {
-        eprintln!(
-            "gateway: WARNING authentication disabled (no --oidc-issuer / --builtin-auth); the gateway is open"
+        // Open mode. Warn through tracing (not stderr) so the telemetry exporter captures it and
+        // an "open gateway in prod" alert is possible; set GROWLERDB_REQUIRE_AUTH=1 to make this a
+        // hard startup failure instead.
+        tracing::warn!(
+            "authentication is disabled (no --oidc-issuer / --builtin-auth); the gateway is OPEN. \
+             Set GROWLERDB_REQUIRE_AUTH=1 to refuse starting without authentication."
         );
         gw
     };
@@ -4557,6 +4583,18 @@ mod tests {
     use super::*;
     use growlerdb_controlplane::Registry;
     use growlerdb_core::{IndexDefinition, RoutingStrategy, SourceField, SourceSchema, SourceType};
+
+    #[test]
+    fn env_truthy_parses_common_forms() {
+        // The GROWLERDB_REQUIRE_AUTH guard treats these as "on".
+        for v in ["1", "true", "TRUE", " yes ", "On"] {
+            assert!(env_truthy(v), "{v:?} should be truthy");
+        }
+        // Everything else (including empty and "0") leaves the gateway able to run open.
+        for v in ["0", "false", "no", "", "off", "2"] {
+            assert!(!env_truthy(v), "{v:?} should not be truthy");
+        }
+    }
 
     #[test]
     fn jittered_stays_within_bounds() {
