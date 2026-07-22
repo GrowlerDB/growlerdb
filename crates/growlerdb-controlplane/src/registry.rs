@@ -1034,7 +1034,7 @@ impl Registry {
         flush.last_flush_ms = now;
         flush.dirty = false;
         if let Err(e) = persist_activity(&self.activity_path, &snapshot) {
-            eprintln!("registry: failed to persist activity log ({e})");
+            tracing::warn!(error = %e, "failed to persist activity log");
         }
     }
 
@@ -1060,7 +1060,7 @@ impl Registry {
             .unwrap_or_else(|e| e.into_inner());
         epochs.insert(subject.to_string(), now_ms());
         if let Err(e) = persist_sessions(&self.session_epochs_path, &epochs) {
-            eprintln!("registry: failed to persist session epochs ({e})");
+            tracing::warn!(error = %e, "failed to persist session epochs");
         }
     }
 
@@ -1522,7 +1522,7 @@ impl Drop for Registry {
         if dirty {
             let log = self.activity.get_mut().unwrap_or_else(|e| e.into_inner());
             if let Err(e) = persist_activity(&self.activity_path, log) {
-                eprintln!("registry: failed to flush activity log on shutdown ({e})");
+                tracing::warn!(error = %e, "failed to flush activity log on shutdown");
             }
         }
     }
@@ -1595,10 +1595,11 @@ fn load(path: &std::path::Path) -> Result<LoadedRegistry> {
         Err(primary) => {
             let prev = growlerdb_core::durable::prev_path(path);
             if prev.exists() {
-                eprintln!(
-                    "warning: registry `{}` failed to load ({primary}); falling back to `{}`",
-                    path.display(),
-                    prev.display()
+                tracing::warn!(
+                    path = %path.display(),
+                    fallback = %prev.display(),
+                    error = %primary,
+                    "registry failed to load; falling back to the previous snapshot"
                 );
                 parse(&std::fs::read(&prev)?)
             } else {

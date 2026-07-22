@@ -1328,8 +1328,8 @@ fn warn_duplicate_pk(key: &CompositeKey, winner: &RowLocator, loser: &RowLocator
             .collect::<Vec<_>>()
             .join(",")
     };
-    eprintln!(
-        "WARNING: duplicate primary key [{}|{}] in source scan: >1 distinct row matches — keeping \
+    tracing::warn!(
+        "duplicate primary key [{}|{}] in source scan: >1 distinct row matches — keeping \
          {}:{} over {}:{} (deterministic: highest (file, position) wins). The source table is not \
          unique on this key; further duplicates are counted (growlerdb_duplicate_pks_total) but \
          this warning is rate-limited.",
