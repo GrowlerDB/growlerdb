@@ -59,11 +59,12 @@ pub struct GatewayLimits {
     /// shard tasks, flags `partial`, and returns what arrived. `None` = wait indefinitely.
     pub deadline: Option<Duration>,
     /// Max `offset + limit` a search may request. Oversized → `InvalidArgument`. `0` = unbounded.
+    /// Env knob: `GROWLERDB_MAX_FETCH` (via the CLI).
     pub max_fetch: usize,
     /// Max concurrent per-shard RPCs in flight across all scatter-gathers. At hundreds of
     /// shards an unbounded fan-out would open hundreds of simultaneous connections per burst of
     /// queries and exhaust the Gateway's socket/fd budget; a semaphore caps it (excess tasks queue
-    /// under the deadline). `0` = unbounded.
+    /// under the deadline). `0` = unbounded. Env knob: `GROWLERDB_MAX_CONCURRENT_FANOUT` (via the CLI).
     pub max_concurrent_fanout: usize,
     /// Max concurrent **queries** admitted at the Gateway (search/semantic/hybrid/suggest/
     /// aggregate/lookup/explain, over REST and gRPC alike — both fronts route through these
@@ -92,20 +93,38 @@ impl Default for GatewayLimits {
 }
 
 impl GatewayLimits {
-    /// [`Default`], with the deploy-facing env overrides applied — what the CLI binaries use so
-    /// operators can tune admission without a rebuild. Currently: `GROWLERDB_MAX_CONCURRENT_QUERIES`
-    /// (`0` = unbounded).
+    /// [`Default`], with the deploy-facing env overrides applied. This is what the CLI binaries
+    /// use so operators can tune admission for their hardware without a rebuild (`0` = unbounded
+    /// on each):
+    /// - `GROWLERDB_MAX_CONCURRENT_QUERIES` (admission cap)
+    /// - `GROWLERDB_MAX_FETCH` (`offset + limit` ceiling per query)
+    /// - `GROWLERDB_MAX_CONCURRENT_FANOUT` (per-shard RPCs in flight)
     pub fn from_env() -> Self {
         let mut limits = Self::default();
-        if let Some(n) = std::env::var("GROWLERDB_MAX_CONCURRENT_QUERIES")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-        {
+        let env_usize = |key: &str| {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+        };
+        if let Some(n) = env_usize("GROWLERDB_MAX_CONCURRENT_QUERIES") {
             limits.max_concurrent_queries = n;
+        }
+        if let Some(n) = env_usize("GROWLERDB_MAX_FETCH") {
+            limits.max_fetch = n;
+        }
+        if let Some(n) = env_usize("GROWLERDB_MAX_CONCURRENT_FANOUT") {
+            limits.max_concurrent_fanout = n;
         }
         limits
     }
 }
+
+/// Loop label for the topology-swap SLI metrics. A rejected hot-reload bumps
+/// `growlerdb_background_failures_total{loop="topology-swap"}`; a successful one sets
+/// `growlerdb_background_last_success_timestamp{loop="topology-swap"}`. Together they let operators
+/// alert on a node stuck on a stale routing table ("topology hasn't synced in N minutes"), which a
+/// plain `/healthz` 200 wouldn't reveal.
+const TOPOLOGY_SWAP_LOOP: &str = "topology-swap";
 
 /// Build the fan-out semaphore for `max_concurrent_fanout`; `0` = effectively unbounded.
 fn fanout_semaphore(max: usize) -> Arc<tokio::sync::Semaphore> {
@@ -227,11 +246,15 @@ impl IndexRoute {
     /// method it backs.
     pub fn swap(&self, shards: Vec<Arc<dyn Node>>, router: ShardRouter) {
         if shards.is_empty() || router.shards() as usize != shards.len() {
-            eprintln!(
-                "gateway: ignoring an invalid routing swap ({} shards, router covers {}) — keeping current topology",
-                shards.len(),
-                router.shards()
+            // Keep the old (servable) topology, but make the rejection observable: a `warn!` that
+            // reaches the telemetry exporter and a failure metric operators can alert on, so a node
+            // stuck on a stale routing table isn't silently "healthy" (see the topology-swap SLI).
+            tracing::warn!(
+                shards = shards.len(),
+                router_covers = router.shards(),
+                "ignoring an invalid routing swap; keeping the current topology (routing is now stale)"
             );
+            growlerdb_telemetry::sli::background_failure(TOPOLOGY_SWAP_LOOP);
             return;
         }
         *self.routing.write().expect("routing lock not poisoned") = Arc::new(RoutingState {
@@ -239,6 +262,7 @@ impl IndexRoute {
             router,
             window_routing: None,
         });
+        growlerdb_telemetry::sli::background_success(TOPOLOGY_SWAP_LOOP);
     }
 
     /// **Hot-swap** this route's windowed window set. Skips an empty/mismatched swap.
@@ -249,11 +273,12 @@ impl IndexRoute {
         windows: Vec<WindowDescriptor>,
     ) {
         if shards.is_empty() || shards.len() != windows.len() {
-            eprintln!(
-                "gateway: ignoring an invalid windowed swap ({} shards, {} window descriptors) — keeping current topology",
-                shards.len(),
-                windows.len()
+            tracing::warn!(
+                shards = shards.len(),
+                window_descriptors = windows.len(),
+                "ignoring an invalid windowed swap; keeping the current topology (routing is now stale)"
             );
+            growlerdb_telemetry::sli::background_failure(TOPOLOGY_SWAP_LOOP);
             return;
         }
         let router = ShardRouter::hashed(shards.len() as u32);
@@ -262,6 +287,7 @@ impl IndexRoute {
             router,
             window_routing: Some(WindowRouting { windowing, windows }),
         });
+        growlerdb_telemetry::sli::background_success(TOPOLOGY_SWAP_LOOP);
     }
 }
 
@@ -3329,6 +3355,38 @@ mod tests {
             expected,
             "post-swap search lost/dup'd a doc"
         );
+    }
+
+    #[tokio::test]
+    async fn a_count_mismatched_swap_keeps_the_current_topology() {
+        use growlerdb_core::{BucketMap, RoutingStrategy, ShardRouter};
+        // A malformed hot-reload (empty, or shard count != router coverage) must not install a
+        // broken topology. The Gateway keeps the old, servable one and records a topology-swap
+        // failure (so a node stuck on a stale routing table is observable, not silently healthy).
+        let (t0, t1) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let ids: Vec<String> = (0..40).map(|i| format!("k{i}")).collect();
+        let mut expected = ids.clone();
+        expected.sort();
+        let gw = layout_gateway(
+            &[t0, t1],
+            &ids,
+            ShardRouter::bucketed(RoutingStrategy::Hash, BucketMap::balanced(2)),
+        );
+        assert_eq!(gw.shard_count(), 2);
+
+        // An empty (thus count-mismatched) swap: a router covering 2 shards, but zero nodes.
+        gw.swap_routing(
+            vec![],
+            ShardRouter::bucketed(RoutingStrategy::Hash, BucketMap::balanced(2)),
+        );
+
+        // Rejected: still 2 shards, still returning every doc exactly once.
+        assert_eq!(
+            gw.shard_count(),
+            2,
+            "an invalid swap must not drop the topology"
+        );
+        assert_eq!(all_ids(&gw, 1000).await, expected);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
