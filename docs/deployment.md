@@ -6,12 +6,12 @@ nav_order: 10
 
 # Deployment
 
-GrowlerDB ships two first-class deployment paths.
+GrowlerDB supports two deployment paths.
 
-## Local — Docker Compose
+## Local (Docker Compose)
 
-GrowlerDB + its dependencies (MinIO object storage, Apache Polaris catalog) and a bundled **LGTM**
-observability stack, on one host. This is also what the integration tests run against.
+GrowlerDB runs with its dependencies (MinIO object storage, Apache Polaris catalog) and a bundled
+LGTM observability stack, all on one host. The integration tests run against this setup too.
 
 ```sh
 just stack          # build + start everything; seeds a sample growlerdb.docs table
@@ -23,11 +23,11 @@ Endpoints once up: console + REST API at <http://localhost:8081>, gRPC `:50061`,
 [Compose README](https://github.com/GrowlerDB/growlerdb/blob/main/deploy/compose/README.md). See
 [Getting started](getting-started) for the guided walkthrough.
 
-## Kubernetes — Helm {#kubernetes-helm}
+## Kubernetes (Helm) {#kubernetes-helm}
 
 The production sharded-cluster topology: a control-plane StatefulSet (registry), node StatefulSets
-on local/NVMe PVs (the index store), and a gateway Deployment fronting the cluster + serving the
-console.
+on local/NVMe PVs (the index store), and a gateway Deployment that fronts the cluster and serves
+the console.
 
 ```sh
 helm install gdb deploy/helm/growlerdb \
@@ -46,6 +46,6 @@ single-shard/connector/compactor scope notes are in the
 
 ## Configuration
 
-Both paths take the same `GROWLERDB_*` connection environment and the same run-mode flags — see
+Both paths take the same `GROWLERDB_*` connection environment and the same run-mode flags; see
 [Configuration](configuration). For release artifacts (signed images, SBOM, the chart), see
 [RELEASING](https://github.com/GrowlerDB/growlerdb/blob/main/RELEASING.md).
