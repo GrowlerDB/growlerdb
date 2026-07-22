@@ -14,13 +14,6 @@ index — **full-text, vector, and hybrid** — of your data. Search returns the
 
 ![The GrowlerDB console — full-text search over an Iceberg table, returning ranked coordinates](docs/img/console-search.png)
 
-> Status: **Beta** (0.x) — pre-1.0, production-tested, on the road to 1.0. The full surface —
-> distributed search/hydration, AuthN/RBAC + tenant isolation, observability, the console UI, an
-> OpenSearch-compatible `_search` adapter, and Compose + Helm deployment — is in place and tested
-> (including backup/restore and single-shard replicas). Road to 1.0: a formal at-scale benchmark
-> suite (directional numbers are already published — see [Performance](https://docs.growlerdb.com/performance)),
-> full Polaris data-plane authz, and an external security review. See [docs/ga-criteria.md](docs/ga-criteria.md).
-
 ## Why GrowlerDB instead of Elasticsearch / OpenSearch?
 
 - **No second copy of your data.** Your lakehouse stays the system of record; the index is a derived,
@@ -43,15 +36,14 @@ Bring up the **whole stack** (GrowlerDB + MinIO + Polaris + LGTM), which seeds a
 `growlerdb.docs` table, builds + serves an index over it, and opens the console:
 
 ```sh
-just stack          # build + start everything (needs Docker + just); ~10 min on first build
+# build + start everything (needs Docker + just); ~10 min on first build
+just stack
 ```
 
 Open the console at **<http://localhost:8081>**, sign in with **`demo` / `demo`**, and search from
 the UI.
 
-Prefer the API? The demo runs with built-in auth, so log in for a session token, then search the
-seeded `docs` index (results are **coordinates**, which hydrate to the authoritative rows in
-Iceberg):
+Or hit the API directly.
 
 ```sh
 token=$(curl -s localhost:8081/v1/login -H 'content-type: application/json' \
@@ -65,9 +57,14 @@ curl -s localhost:8081/v1/search -H "authorization: Bearer $token" \
 Then, in the same style as everything else:
 
 ```sh
-just mcp-connect    # connect an AI agent — prints MCP snippets for Claude Code/Desktop or any client
-just demo-data      # optional: ~20k-paper arXiv corpus for real retrieval quality (local embeddings, no key)
-just stack-down     # tear it all down
+# connect an AI agent — prints MCP snippets for Claude Code/Desktop or any client
+just mcp-connect
+
+# optional: ~20k-paper arXiv corpus for real retrieval quality (local embeddings, no key)
+just demo-data
+
+# tear it all down
+just stack-down
 ```
 
 👉 Full walkthrough (first search → hydrate → console → OpenSearch adapter):
@@ -108,7 +105,7 @@ A **Control Plane** is the routing source of truth (nodes register; the Gateway 
 every service emits **OpenTelemetry** to the bundled **LGTM** stack (Grafana · Prometheus · Loki ·
 Tempo).
 
-Full walkthrough: **[system architecture](okf/system/architecture.md)** · [deployment topologies](https://docs.growlerdb.com/deployment) · [editable diagram source](docs/img/architecture.excalidraw).
+Full walkthrough: **[system architecture](okf/system/architecture.md)** · [deployment topologies](https://docs.growlerdb.com/deployment)
 
 ## Documentation
 
@@ -117,8 +114,8 @@ Full docs are the **GitHub Pages site at <https://docs.growlerdb.com/>** (built 
 
 - [Getting started](https://docs.growlerdb.com/getting-started) — zero to first search.
 - [Install & run modes](https://docs.growlerdb.com/install) · [Configuration](https://docs.growlerdb.com/configuration) · [API & query reference](https://docs.growlerdb.com/reference)
-- [Why GrowlerDB — comparison & positioning](https://docs.growlerdb.com/comparison) · [Performance (directional)](https://docs.growlerdb.com/performance) — vs Elasticsearch & Trino.
-- [Migrating from Elasticsearch/OpenSearch](https://docs.growlerdb.com/migration-from-elasticsearch) · [Deployment](https://docs.growlerdb.com/deployment) · [Roadmap & known limitations](https://docs.growlerdb.com/roadmap) · [GA criteria](https://docs.growlerdb.com/ga-criteria)
+- [Why GrowlerDB — comparison & positioning](https://docs.growlerdb.com/comparison) · [Performance (directional)](https://docs.growlerdb.com/performance)
+- [Migrating from Elasticsearch/OpenSearch](https://docs.growlerdb.com/migration-from-elasticsearch) · [Deployment](https://docs.growlerdb.com/deployment)
 - [Security policy](SECURITY.md) · [Releasing](RELEASING.md) · [Changelog](CHANGELOG.md) · [Brand guidelines](BRAND.md)
 
 ## Repository layout
