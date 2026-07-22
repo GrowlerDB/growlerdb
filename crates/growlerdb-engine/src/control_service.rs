@@ -659,7 +659,7 @@ impl ControlPlane for ControlPlaneService {
         // the source layout), or an equality-delete reconcile fallback.
         let warnings = resolved.warnings.clone();
         for w in &warnings {
-            eprintln!("create index `{name}`: warning: {w}");
+            tracing::warn!(index = %name, "create index warning: {w}");
         }
         self.registry.create(resolved).map_err(registry_status)?;
         self.registry
@@ -791,9 +791,11 @@ impl ControlPlane for ControlPlaneService {
         for (ord, endpoint) in &growth.trim {
             match reindex_shard_on_node(endpoint, &req.index, &owners, *ord).await {
                 Ok(()) => trimmed.push(*ord),
-                Err(e) => eprintln!(
-                    "apply-reshard `{}`: post-cutover trim of shard {ord} failed (non-fatal): {e}",
-                    req.index
+                Err(e) => tracing::warn!(
+                    index = %req.index,
+                    shard = ord,
+                    error = %e,
+                    "apply-reshard: post-cutover trim of shard failed (non-fatal)"
                 ),
             }
         }
@@ -880,9 +882,11 @@ impl ControlPlane for ControlPlaneService {
         // 3. Trim the source shard (best-effort) — it no longer owns the bucket.
         if let Err(e) = reindex_shard_on_node(&from_endpoint, &req.index, &owners, from_shard).await
         {
-            eprintln!(
-                "move-bucket `{}`: post-cutover trim of shard {from_shard} failed (non-fatal): {e}",
-                req.index
+            tracing::warn!(
+                index = %req.index,
+                shard = from_shard,
+                error = %e,
+                "move-bucket: post-cutover trim of shard failed (non-fatal)"
             );
         }
 

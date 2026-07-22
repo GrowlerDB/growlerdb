@@ -404,14 +404,12 @@ impl LocalIndexStore {
         // open on a stale hotcache.
         if let Some(key) = hotcache_key {
             match bop.read(key) {
-                Ok(buf) => {
-                    match crate::hotcache::preload(&buf.to_vec()) {
-                        Ok(hot) => dir = dir.with_hot(std::sync::Arc::new(hot)),
-                        Err(e) => {
-                            eprintln!("cold open: ignoring unusable hotcache `{key}` ({e}) — reading through")
-                        }
+                Ok(buf) => match crate::hotcache::preload(&buf.to_vec()) {
+                    Ok(hot) => dir = dir.with_hot(std::sync::Arc::new(hot)),
+                    Err(e) => {
+                        tracing::warn!(hotcache = %key, error = %e, "cold open: ignoring unusable hotcache; reading through")
                     }
-                }
+                },
                 Err(e) if e.kind() == opendal::ErrorKind::NotFound => {}
                 Err(e) => return Err(StoreError::Cold(e.to_string())),
             }
