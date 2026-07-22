@@ -14,12 +14,12 @@ nav_order: 3
 
 ## Prerequisites
 
-- **Rust** (stable) — the toolchain is pinned via [mise](https://mise.jdx.dev).
-- **Docker** + Compose — for the dependency stack (object storage + Iceberg catalog).
-- **A source of truth**: an Iceberg REST catalog (e.g. Apache Polaris) + S3-compatible object
-  storage. The [Compose stack](deployment) provides MinIO + Polaris locally.
+- Rust (stable). The toolchain is pinned via [mise](https://mise.jdx.dev).
+- Docker and Compose, for the dependency stack (object storage plus Iceberg catalog).
+- A source of truth: an Iceberg REST catalog (e.g. Apache Polaris) and S3-compatible object
+  storage. The [Compose stack](deployment) provides MinIO and Polaris locally.
 
-For the fastest path that needs none of the build steps below, jump to
+For the fastest path, one that skips all the build steps below, jump to
 [Getting started](getting-started) (`just stack`).
 
 ## Prebuilt images & binaries (no build)
@@ -27,17 +27,17 @@ For the fastest path that needs none of the build steps below, jump to
 Don't want to build from source? Every release publishes signed, ready-to-run artifacts:
 
 ```sh
-# Container image — multi-arch (amd64 + arm64), cosign-signed, with an SBOM.
+# Container image: multi-arch (amd64 + arm64), cosign-signed, with an SBOM.
 docker pull ghcr.io/growlerdb/growlerdb:latest      # or pin a version, e.g. :0.2.0
 docker run --rm ghcr.io/growlerdb/growlerdb:latest --help
 ```
 
-- **Release binaries** — the `growlerdb` binary + checksums for each platform are attached to every
+- Release binaries: the `growlerdb` binary and checksums for each platform are attached to every
   [GitHub Release](https://github.com/GrowlerDB/growlerdb/releases).
-- **Helm chart** — published to GHCR as an OCI artifact: `oci://ghcr.io/growlerdb/charts/growlerdb`
+- Helm chart: published to GHCR as an OCI artifact, `oci://ghcr.io/growlerdb/charts/growlerdb`
   (see [Deployment](deployment)).
 
-The image tags follow SemVer — `:X.Y.Z` (immutable) plus moving `:X.Y`, `:X`, and `:latest`, so you
+The image tags follow SemVer: `:X.Y.Z` (immutable) plus moving `:X.Y`, `:X`, and `:latest`, so you
 can pin exactly or float.
 
 ## Build from source
@@ -49,8 +49,8 @@ just build              # build the workspace (release: cargo build --release -p
 just check              # fmt + clippy + tests (the CI gate)
 ```
 
-The single binary is `growlerdb` (`target/release/growlerdb`). One binary, four long-running roles
-selected by subcommand, plus the offline index/maintenance commands.
+The single binary is `growlerdb` (`target/release/growlerdb`): one binary with four long-running
+roles selected by subcommand, plus the offline index and maintenance commands.
 
 ```sh
 growlerdb --help
@@ -74,7 +74,7 @@ export GROWLERDB_S3_SECRET_KEY=minioadmin
 
 ### 1. Embedded (single binary)
 
-Index a table, then search it — no servers. Best for laptops, CI, demos, small corpora.
+Index a table, then search it, no servers needed. Best for laptops, CI, demos, and small corpora.
 
 ```sh
 # Build the index from a source table (auto-maps the schema; --name defaults to the last segment).
@@ -99,7 +99,7 @@ Maintenance commands operate on a local index:
 `GROWLERDB_BACKUP_BUCKET` (see [Configuration](configuration#environment)). After a restore the
 connector resumes the tail from the backed-up checkpoint (exactly-once).
 
-### 2. `serve` — a Node
+### 2. `serve` (a Node)
 
 Host an already-built index over gRPC (Write + Search + Lookup + Suggest + Admin + System), and
 optionally the REST API + console. Register with a control plane so it's cluster-visible.
@@ -113,7 +113,7 @@ growlerdb serve docs \
   --advertise-addr http://node:50051
 ```
 
-### 3. `gateway` — the public Engine API
+### 3. `gateway` (the public Engine API)
 
 Terminate the Engine API (gRPC + REST) and route to one or more nodes. This is the address clients
 hit; it also serves the console UI and (optionally) the index-management, metrics, and OpenSearch
@@ -132,10 +132,10 @@ growlerdb gateway \
 ```
 
 Front a sharded cluster instead of a single node with `--registry <registry.json> --index <name>`.
-Enable authentication with `--oidc-issuer <url> --oidc-audience <aud>` (the gateway is **open**
-without it — see [Configuration → Auth](configuration#authentication--tenancy)).
+Enable authentication with `--oidc-issuer <url> --oidc-audience <aud>`. Without it the gateway is
+open (see [Configuration → Auth](configuration#authentication--tenancy)).
 
-### 4. `control-plane` — the registry
+### 4. `control-plane` (the registry)
 
 The cluster-wide index registry (create / drop / list / ingestion status) over gRPC.
 
@@ -154,6 +154,6 @@ curl -f localhost:9103/readyz
 
 ## Next
 
-- [Configuration](configuration) — flags, env, and the index-definition YAML.
-- [Reference](reference) — the query language and REST/gRPC API.
-- [Deployment](deployment) — Compose and Kubernetes (Helm).
+- [Configuration](configuration): flags, env, and the index-definition YAML.
+- [Reference](reference): the query language and REST/gRPC API.
+- [Deployment](deployment): Compose and Kubernetes (Helm).

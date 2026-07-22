@@ -6,7 +6,7 @@ nav_order: 7
 
 # Migrating from Elasticsearch / OpenSearch
 
-GrowlerDB can stand in for the **search** role of an Elasticsearch/OpenSearch cluster over data
+GrowlerDB can stand in for the search role of an Elasticsearch/OpenSearch cluster over data
 that lives in (or can land in) Apache Iceberg. This guide covers the conceptual differences and the
 two integration paths.
 
@@ -20,11 +20,11 @@ two integration paths.
 | Ingestion | `_bulk` / index API | a **changelog connector** keeps the index in sync with the source table |
 | Mappings | index mapping | an [index definition](reference) over a source table |
 
-So the mental shift is: **the lake is the source of truth; GrowlerDB is a derived index.** You
-don't migrate documents *into* GrowlerDB — you point GrowlerDB at the Iceberg table they already
+So the mental shift is that the lake is the source of truth and GrowlerDB is a derived index. You
+don't migrate documents *into* GrowlerDB; you point GrowlerDB at the Iceberg table they already
 live in (or replicate them there), and it indexes them.
 
-## Path 1 — adopt the native API (recommended)
+## Path 1: adopt the native API (recommended)
 
 1. **Land your data in Iceberg** if it isn't already (most lakehouse stacks already do this; or
    replicate from your current store).
@@ -37,7 +37,7 @@ live in (or replicate them there), and it indexes them.
 This gives you the full feature surface (collapsing, `search_after` paging, suggestions,
 aggregations, tenant scoping) and the cleanest semantics.
 
-## Path 2 — the OpenSearch `_search` adapter (drop-in, partial)
+## Path 2: the OpenSearch `_search` adapter (drop-in, partial)
 
 To reuse existing OpenSearch clients/tooling with minimal change, enable the optional adapter
 (`gateway --opensearch`) and point clients at the gateway:
@@ -52,21 +52,21 @@ curl -s GATEWAY/myindex/_search -H 'content-type: application/json' -d '{
 }'
 ```
 
-It translates a **documented subset** of the `_search` Query DSL to native queries and returns
+It translates a documented subset of the `_search` Query DSL to native queries and returns
 OpenSearch-shaped documents (`_id` from the key, `_source` via hydration). Supported: `match`,
 `match_phrase`, `multi_match`, `term`, `terms`, `range`, `bool`, `match_all`, plus `from`/`size`/
-`sort`. **Read-path only.** See the full support matrix + caveats in
+`sort`. Read-path only. See the full support matrix and caveats in
 [opensearch-adapter.md](opensearch-adapter).
 
 ### What won't carry over
 
-- **Writes** (`_bulk`, index/update/delete APIs) — ingestion is via the changelog connector, not a
+- **Writes** (`_bulk`, index/update/delete APIs). Ingestion is via the changelog connector, not a
   write API. Point your pipeline at the Iceberg table.
-- **Aggregations / scripting / mappings / ingest pipelines / percolators** — not served by the
+- **Aggregations, scripting, mappings, ingest pipelines, percolators.** Not served by the
   adapter. Use the [native aggregation API](rest-api#aggregations--facets) (terms, stats,
-  date-histogram, range — gRPC `Aggregate`, plus REST `/v1/facets`) and define mappings as index
+  date-histogram, and range via gRPC `Aggregate`, plus REST `/v1/facets`) and define mappings as index
   definitions.
-- **Exact scoring parity** — BM25 ranks results, but per-clause scoring nuances differ.
+- **Exact scoring parity.** BM25 ranks results, but per-clause scoring nuances differ.
 
 ## Multi-tenancy
 
@@ -78,6 +78,6 @@ the caller's token. See [SECURITY.md](https://github.com/GrowlerDB/growlerdb/blo
 
 - [ ] Source data is in Iceberg (or replicated there).
 - [ ] Index definition created (columns, key, `tenant_field`).
-- [ ] App reads moved to `/v1/search` + `/v1/keys:get` — or the `_search` adapter for a faster cutover.
+- [ ] App reads moved to `/v1/search` + `/v1/keys:get`, or the `_search` adapter for a faster cutover.
 - [ ] AuthN enabled at the gateway; tenant claims present in client tokens.
 - [ ] Ingestion connector running and caught up (check the **Ingestion** screen).
