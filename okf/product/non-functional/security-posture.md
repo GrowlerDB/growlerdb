@@ -18,6 +18,10 @@ timestamp: 2026-07-04T14:22:00
   `x-growlerdb-*` headers are never trusted on the public surface, and the control plane refuses to
   serve an authorizing policy without an authenticator (so roles can't be enforced against forgeable
   metadata).
+- **Fail-closed auth option** — the gateway runs open only when no authenticator is configured
+  (`--oidc-issuer` / `--builtin-auth`), and it warns at startup when it does. Setting
+  `GROWLERDB_REQUIRE_AUTH` makes it refuse to start open, so a production deployment that omits auth
+  fails fast instead of serving unauthenticated traffic.
 - **Bounded request cost** — the public data plane caps result pages and key-batch size, bounds
   aggregation cardinality, times out long requests, limits the request body, and clamps highlight
   fragments, so a single request can't exhaust node/gateway resources.

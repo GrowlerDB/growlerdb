@@ -44,6 +44,22 @@ override the local-dev defaults:
 In Kubernetes the [Helm chart](deployment#kubernetes-helm) wires these from a ConfigMap (non-secret)
 and a Secret (credentials); the credentials should come from a `Secret`, never inline.
 
+### Gateway limits & safety {#gateway-limits}
+
+The gateway reads a few admission and safety knobs from the environment, so you can tune them for
+your hardware without a rebuild. Set each on the gateway process.
+
+| Env var | Default | Effect |
+|---|---|---|
+| `GROWLERDB_MAX_CONCURRENT_QUERIES` | `256` | Queries admitted at once; over the cap, a query gets `429` (load-shed). `0` = unbounded. |
+| `GROWLERDB_MAX_FETCH` | `10000` | Ceiling on `offset + limit` per query; over it returns `InvalidArgument`. `0` = unbounded. |
+| `GROWLERDB_MAX_CONCURRENT_FANOUT` | `256` | Per-shard RPCs in flight across all scatter-gathers. `0` = unbounded. |
+| `GROWLERDB_REQUIRE_AUTH` | _unset_ | When truthy (`1`/`true`/`yes`/`on`), the gateway refuses to start unless authentication is configured (`--oidc-issuer` or `--builtin-auth`). Use it in production so a missing auth flag fails fast instead of serving open. |
+
+Running the gateway without `--oidc-issuer` or `--builtin-auth` leaves it open (no authentication).
+That is fine for local use and prints a warning at startup; set `GROWLERDB_REQUIRE_AUTH` to turn the
+warning into a hard startup failure.
+
 ### Scale limit & licensing {#scale-limit}
 
 The open-source tier runs up to 3 index nodes per deployment at no cost. Beyond that, the control
