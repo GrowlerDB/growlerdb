@@ -41,16 +41,17 @@ index through the gateway — every Lucene/KQL operator (term, phrase, keyword, 
 range, CIDR, wildcard, prefix, fuzzy, boost, bool, `NOT`, match-all, regex) against known rows. With
 two indexes served and no default configured, every search / `keys:get` request must name its index.
 
-**Opt-in demo corpus (`demo-data` profile, `just demo-data`):** ~20k arXiv CS titles+abstracts
-(CC0) at the scale where retrieval *quality* shows — semantic vs lexical vs hybrid visibly differ,
-facets are real, and MCP agent Q&A has substance the 10-row `catalog` can't give. A loader one-shot
-downloads the pre-sliced parquet (a GitHub release asset; `DEMO_DATA_URL`/`DEMO_DATA_FILE`
-overridable, `DEMO_DATA_SIZE` caps rows) and writes `growlerdb.arxiv` into Iceberg **first**; then
-`node-arxiv` builds + serves the vector-enabled index (`arxiv.yaml` — `abstract_vec` embedded
-locally; `abstract` deliberately **cached** so agents answer from `search` alone) and registers, so
-the `--all-indexes` gateway routes to it and the demo token (allowlist `docs,catalog,arxiv`) may
-query it. The slicer (`demo-data/build_arxiv_slice.py`, OAI-PMH) regenerates the asset. Default
-seed, `just stack`, and CI stay untouched — the corpus is strictly additive.
+**Opt-in demo corpus (`demo-data` profile, `just demo-data`):** a slice of Wikipedia movie plots
+(CC-BY-SA, decade-balanced) at the scale where retrieval *quality* shows — semantic vs lexical vs
+hybrid visibly differ, facets are real (genre / origin / decade), and MCP agent Q&A has substance
+the 10-row `catalog` can't give. A loader one-shot downloads the pre-sliced parquet (a GitHub release
+asset; `DEMO_DATA_URL`/`DEMO_DATA_FILE` overridable, `DEMO_DATA_SIZE` caps rows — default 5000) and
+writes `growlerdb.movies` into Iceberg **first**; then `node-movies` builds + serves the
+vector-enabled index (`movies.yaml` — `plot_vec` embedded locally from a short **synopsis** to keep
+embedding fast; full `plot`/`title` **cached** so agents answer from `search` alone) and registers,
+so the `--all-indexes` gateway routes to it and the demo token (allowlist `docs,catalog,movies`) may
+query it. The slicer (`demo-data/build_movies_slice.py`) regenerates the asset. Default seed,
+`just stack`, and CI stay untouched — the corpus is strictly additive.
 
 **Local-embeddings vector demo:** the `catalog` index carries a `body_vec`
 [VECTOR field](/product/functional/search/vector.md) over its `body`, embedded at ingest with the local

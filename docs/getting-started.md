@@ -313,9 +313,9 @@ its exact Iceberg coordinates. GrowlerDB does the *retrieval* and returns govern
 citations — **it never calls an LLM**; generating a prose answer is the caller's job (see §7).
 
 > **Want retrieval quality you can feel?** Ten rows can't show ranking. `just demo-data` loads the
-> opt-in **arXiv corpus** — ~20k CS abstracts, embedded locally — where semantic vs lexical vs
-> hybrid visibly differ and agent Q&A (§7) has real substance. See
-> [Demo corpus (arXiv)](demo-corpus).
+> opt-in **movie-plots corpus** — a slice of Wikipedia film plots, embedded locally — where semantic
+> vs lexical vs hybrid visibly differ and agent Q&A (§7) has real substance. See
+> [Demo corpus (movies)](demo-corpus).
 
 ## 7. Connect an AI agent (MCP)
 

@@ -40,14 +40,14 @@ run against.
 ```sh
 just stack        # deps + seed, then control-plane + node + node-catalog + gateway + LGTM
 just mcp-connect  # mint a demo token + print MCP connect snippets (Claude or any agent)
-just demo-data    # optional: load the ~20k-paper arXiv corpus + its vector index
+just demo-data    # optional: load the Wikipedia movie-plots corpus + its vector index
 just stack-down   # tear it all down (removes volumes)
 ```
 
 Once up, `just mcp-connect` makes the stack an **agent retrieval tool** over MCP (Streamable HTTP
 at `/mcp` on the gateway, same port as the console — no extra binary; see getting-started §7), and
-`just demo-data` adds the opt-in **arXiv demo corpus** (`demo-data` compose profile: a loader
-writes `growlerdb.arxiv` into Iceberg, then `node-arxiv` builds + serves its vector index — see
+`just demo-data` adds the opt-in **movie demo corpus** (`demo-data` compose profile: a loader
+writes `growlerdb.movies` into Iceberg, then `node-movies` builds + serves its vector index — see
 [docs: Demo corpus](https://docs.growlerdb.com/demo-corpus)).
 
 `just stack` activates two Compose profiles: `stack` (control-plane, node, gateway, LGTM) and

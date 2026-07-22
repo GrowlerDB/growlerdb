@@ -60,7 +60,7 @@ Then, in the same style as everything else:
 # connect an AI agent — prints MCP snippets for Claude Code/Desktop or any client
 just mcp-connect
 
-# optional: ~20k-paper arXiv corpus for real retrieval quality (local embeddings, no key)
+# optional: Wikipedia movie-plots corpus for real retrieval quality (local embeddings, no key)
 just demo-data
 
 # tear it all down
