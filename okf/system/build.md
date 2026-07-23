@@ -33,9 +33,12 @@ Runs on **self-hosted** runners.
 Triggered by a `workflow_dispatch` (with a `bump: patch|minor|major`) **or** a pushed `v*` tag. It
 runs the full gate, then publishes: a **signed multi-arch** (amd64+arm64) container image with an
 **SBOM** (cosign keyless via OIDC), the **Helm chart** (OCI), and release **binaries + checksums**,
-plus a GitHub Release. Runs on **GitHub-hosted** runners (PR/nightly CI stays self-hosted); the
-image is built on **native per-arch runners** (amd64 + arm64, no QEMU) with a buildx layer cache and
-merged into one manifest.
+plus a GitHub Release. Runs on **GitHub-hosted** runners; both the container image and the standalone
+binaries are built on **native per-arch runners** (amd64 + arm64, no QEMU, no `cross`) — the image
+with a buildx layer cache merged into one manifest, the binaries with a plain `cargo build`. Native is
+required so the local embedder links its native ONNX Runtime (`ort`) the same way the image does; a
+`cross` container's older glibc can't, so the **binaries require glibc 2.38+** at runtime (the ONNX
+prebuilt's floor, same as the image).
 
 **Versioning** is **tag-derived** ([D29](/system/decisions/d29-release-versioning.md)): the git tag
 is the source of truth, stamped into the image, the chart `appVersion`, the binaries, and the CLI

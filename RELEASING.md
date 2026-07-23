@@ -100,7 +100,9 @@ release workflow. One-time checklist:
 - **Helm chart** packaged with `--app-version X.Y.Z` (chart `version` from `Chart.yaml`) and pushed
   to `oci://ghcr.io/growlerdb/charts`.
 - **Release binaries** (`growlerdb`) for linux x86_64/arm64, each with a `.sha256`, attached to the
-  GitHub Release.
+  GitHub Release. Built on **native per-arch runners** (not `cross`) so the bundled local embedder
+  links its native ONNX Runtime — the binaries require **glibc 2.38+** at runtime (same floor as the
+  container image).
 
 Client libraries (PyPI / crates.io) publish from their own subtrees once their versions are bumped;
 add those jobs as the client packages stabilize.
