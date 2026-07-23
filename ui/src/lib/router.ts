@@ -2,7 +2,10 @@
 // client routes are real paths.
 import { writable } from 'svelte/store';
 
-export const routes = ['/', '/rag', '/indexes', '/observability', '/settings'] as const;
+// NB: '/rag' (the Ask / grounded-retrieval screen) is temporarily withheld from the console — the
+// component (routes/Rag.svelte) and its API stay in the tree, but the route is unregistered so the
+// URL falls back to '/'. See okf/product/interfaces/ui.md.
+export const routes = ['/', '/indexes', '/observability', '/settings'] as const;
 export type Route = (typeof routes)[number];
 
 function normalize(pathname: string): Route {
