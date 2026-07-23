@@ -20,10 +20,15 @@ The **GrowlerDB console** — a Svelte single-page app (in `ui/`) served by the
   **Lexical / Semantic / Hybrid** mode toggle (shown when the index has a
   [vector field](/product/functional/search/vector.md); hybrid exposes the RRF `k`), a **"more like
   this"** action on a hit, and a **"vectorize a field"** step in create-index.
-- **Ask** — a grounded-retrieval screen: a question is hybrid-retrieved and answered with the source
-  **passages plus their exact Iceberg coordinates as citations**. There is intentionally **no answer
-  generation** — GrowlerDB never sends text to an LLM ([D42](/system/decisions/d42-retrieval-first.md));
-  the value is grounded retrieval an agent can build on.
+- **Ask** _(temporarily withheld from the console)_ — a grounded-retrieval screen: a question is
+  hybrid-retrieved and answered with the source **passages plus their exact Iceberg coordinates as
+  citations**. There is intentionally **no answer generation** — GrowlerDB never sends text to an LLM
+  ([D42](/system/decisions/d42-retrieval-first.md)); the value is grounded retrieval an agent can build
+  on. The screen (`ui/src/routes/Rag.svelte`) and its API stay in the tree, but the `/rag` route is
+  **unregistered** for now: the default demo index (`docs`) has no vector field, so a fresh stack lands
+  on a dead-end that reads as "unavailable," and the "Ask" label over retrieval-only invites the wrong
+  expectation. Re-exposed once the demo ships a vectorized default (see
+  [vector search](/product/functional/search/vector.md)).
 - **Indexes** — list/create/alter/drop/reindex/compact/backup, aliases, per-index detail.
 - **Ingestion** — per-index sync status, lag, streaming charts.
 - **Observability** — SLI dashboards (latency, ingest lag, shards, cold-cache), alerts.
