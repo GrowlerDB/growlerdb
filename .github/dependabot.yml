@@ -1,7 +1,9 @@
-# Grouped, weekly dependency updates. Grouping minor/patch into one PR per ecosystem is the
-# anti-flood control: an ungrouped config opens a separate PR per dependency. Major bumps are
-# left ungrouped so each gets deliberate review. Security updates are enabled in repo settings,
-# not here.
+# Grouped, weekly dependency updates. Grouping is the anti-flood control: an ungrouped config opens a
+# separate PR per dependency, and pre-1.0 `0.x` crates make this worse because Dependabot counts a
+# `0.x` minor bump (e.g. 0.9 -> 0.11) as "major", so each got its own PR. Each ecosystem now bundles
+# minor/patch into one PR AND major/breaking bumps into a SECOND PR: routine updates stay trivially
+# mergeable, while breaking bumps land together for one careful review instead of N separate PRs.
+# Security updates are enabled in repo settings, not here.
 version: 2
 updates:
   - package-ecosystem: cargo
@@ -12,6 +14,13 @@ updates:
     groups:
       cargo-minor-patch:
         update-types: [minor, patch]
+      cargo-major:
+        update-types: [major]
+    ignore:
+      # Candle is on the way out (TASK-332 moves the reranker to ONNX; the embedder is already ONNX),
+      # and candle 0.11 breaks the current reranker build — don't churn on candle upgrades until it's
+      # removed. Security updates still come through (repo settings), just not version bumps.
+      - dependency-name: "candle-*"
 
   - package-ecosystem: npm
     directory: /ui
@@ -21,6 +30,8 @@ updates:
     groups:
       npm-minor-patch:
         update-types: [minor, patch]
+      npm-major:
+        update-types: [major]
 
   - package-ecosystem: maven
     directory: /connector
@@ -30,6 +41,8 @@ updates:
     groups:
       maven-minor-patch:
         update-types: [minor, patch]
+      maven-major:
+        update-types: [major]
     # Hold Spark at 4.1.x: Spark 4.2.0 turned `catalog.View` from an interface into a
     # class, so Iceberg 1.11.0's `SparkView` fails to load (IncompatibleClassChange) and
     # the connector integration tests all error out. Spark and Iceberg must move together;
@@ -46,6 +59,8 @@ updates:
     groups:
       maven-minor-patch:
         update-types: [minor, patch]
+      maven-major:
+        update-types: [major]
 
   - package-ecosystem: github-actions
     directory: /
