@@ -21,6 +21,15 @@ updates:
       # and candle 0.11 breaks the current reranker build — don't churn on candle upgrades until it's
       # removed. Security updates still come through (repo settings), just not version bumps.
       - dependency-name: "candle-*"
+      # Hold arrow/parquet at 58.x: iceberg 0.10 (the source read stack) pins arrow `^58`, so a bump
+      # to 59 pulls a second arrow tree and won't compile. Arrow and iceberg must move together —
+      # lift this once an iceberg release supports arrow 59 (bump both in one PR).
+      - dependency-name: "arrow-array"
+        versions: [">=59"]
+      - dependency-name: "arrow-schema"
+        versions: [">=59"]
+      - dependency-name: "parquet"
+        versions: [">=59"]
 
   - package-ecosystem: npm
     directory: /ui
