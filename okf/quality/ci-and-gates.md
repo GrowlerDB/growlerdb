@@ -20,7 +20,7 @@ The automated gates a change passes before merge — the quality process encoded
 - **UI** — eslint, prettier, svelte-check, unit tests (all four also in local `just check` via
   `ui-check`), plus build + mocked Playwright E2E (CI-only: they need the browser toolchain).
 - **E2E** — the walking-skeleton (index → search → hydrate) against the real Compose stack.
-- **Connector (JVM)** — on connector/proto changes: `mvn verify` for the Trino connector (JDK 23) and
+- **Connector (JVM)** — on connector/proto changes: `mvn verify` for the Trino connector (JDK 25) and
   the Spark connector (JDK 21) running **unit + Spark integration** (in-JVM Spark/Iceberg) — the
   integration group is what catches a binary-incompatible dependency bump, so it gates every connector
   PR, not just nightly. A guard fails the job if the integration suite silently selects zero tests.
