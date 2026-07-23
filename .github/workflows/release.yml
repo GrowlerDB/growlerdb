@@ -198,21 +198,31 @@ jobs:
           helm package deploy/helm/growlerdb --app-version "${{ needs.version.outputs.version }}" -d dist
           helm push dist/growlerdb-*.tgz oci://${{ env.REGISTRY }}/${{ needs.version.outputs.owner_lc }}/charts
 
+  # Build each release binary on its NATIVE per-arch runner (no `cross`). The local embedder links a
+  # native `libonnxruntime` (the `ort` crate's `download-binaries`), whose prebuilt needs glibc 2.38+
+  # that the `cross` containers don't have — so a `cross` build fails to link ONNX ("could not find
+  # native static library `onnxruntime`"). Native runners match the container image build's toolchain,
+  # so the binary links ONNX exactly like the published image. (Binaries therefore require glibc 2.38+
+  # at runtime, same floor as the image.)
   binaries:
     needs: version
-    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1
-      - name: Install cross
-        run: cargo install cross --locked || true
       - name: Build the release binary
         env:
           GROWLERDB_VERSION: ${{ needs.version.outputs.version }}
-        run: cross build --release --locked -p growlerdb-cli --target ${{ matrix.target }}
+        # Native build for the host's own target triple — no `--target` cross toolchain needed.
+        run: cargo build --release --locked -p growlerdb-cli --target ${{ matrix.target }}
       - name: Stage + checksum
         run: |
           mkdir -p dist
