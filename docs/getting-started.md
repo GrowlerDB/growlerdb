@@ -275,7 +275,7 @@ highlighted, so the data is visible without opening the detail drawer.
 
 The `catalog` index carries one field the playground above didn't use: `body_vec`, a `VECTOR` field.
 At ingest, GrowlerDB embeds each row's `body` text with the local bge-small-en-v1.5 model (via
-Candle, in-process) and stores the 384-dim vector, so `catalog` also supports semantic
+ONNX Runtime, in-process) and stores the 384-dim vector, so `catalog` also supports semantic
 (nearest-neighbour) and hybrid (lexical plus semantic, fused) retrieval alongside the Lucene/KQL
 queries above. It's fully local: the model is the one `just stack` fetched in §1, so there's no
 embedding service and no API key.

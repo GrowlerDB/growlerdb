@@ -65,11 +65,19 @@ corpus:** a loader one-shot downloads the pre-sliced parquet (a GitHub release a
 gateway routes to it and the demo token (allowlist `docs,catalog,movies`) may query it. The slicer
 (`demo-data/build_movies_slice.py`) regenerates the asset.
 
+**Vector indexes cold-rebuild on (re)load.** `node-catalog` and `node-movies` **wipe their index dir
+and rebuild from scratch** on start, and `just stack` / `just demo-data` **force-recreate** them after
+re-seeding their tables. Why: a running `serve` that background-syncs a reloaded source refreshes the
+**lexical** segments but **not** the vector sidecars (sync/reindex re-embed is TASK-326), so on a re-run
+the ANN sidecars would go stale and **semantic hits fail to hydrate** ("row not found") while lexical
+still works. The index dir is a derived, rebuildable store (the authoritative data is Iceberg), so
+wiping it is safe. This is a demo workaround for the engine gap; a durable fix is TASK-326.
+
 **Local-embeddings vector demo:** the `catalog` index carries a `body_vec`
 [VECTOR field](/product/functional/search/vector.md) over its `body`, embedded at ingest with the local
-**bge-small-en-v1.5** model — so the demo exercises **semantic + hybrid search**, the console **Ask**
-screen, and the [MCP server](/product/interfaces/mcp-server.md) against real data, **keyless** (no API
-key, no egress). The model is provisioned **once per machine** by a `model-fetch` one-shot into a
+**bge-small-en-v1.5** model — so the demo exercises **semantic + hybrid search** (inline in the console
+Search screen's Semantic/Hybrid modes) and the [MCP server](/product/interfaces/mcp-server.md) against
+real data, **keyless** (no API key, no egress). The model is provisioned **once per machine** by a `model-fetch` one-shot into a
 host-bind-mounted `${GROWLERDB_MODEL_DIR:-~/.cache/growlerdb/models}` (idempotent — skipped when already
 present, and shared with local `cargo`/eval runs), mounted on `node` + `node-catalog` (which embed at
 ingest and query time; the gateway does not — [D43](/system/decisions/d43-node-local-query-embedding.md)).

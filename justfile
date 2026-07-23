@@ -170,13 +170,20 @@ stack:
     # GROWLERDB_IMAGE=growlerdb-local:dev) — see docker-compose.yml's GROWLERDB_IMAGE note.
     docker compose -f deploy/compose/docker-compose.yml --profile stack pull node || docker compose -f deploy/compose/docker-compose.yml build node
     docker compose -f deploy/compose/docker-compose.yml --profile stack --profile catalog up -d
+    # Force-recreate the VECTOR index node so it does a clean COLD rebuild against the freshly re-seeded
+    # `catalog` table. On a re-run, `serve` background-syncs the new snapshot into the LEXICAL segments
+    # but not the vector sidecars (TASK-326), so without a rebuild semantic hits go stale ("row not
+    # found") — see the node-catalog command note.
+    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile catalog up -d --force-recreate node-catalog
     # Ship a SMALL movie-plots index (Wikipedia movie plots, CC-BY-SA) in the default stack so
     # semantic + hybrid search work out of the box and the console lands here
     # (GROWLERDB_DEFAULT_INDEX=movies on the gateway). Loads 300 rows from the COMMITTED local
     # parquet — no download, ~1s embed at build. `just demo-data` upgrades it to the full corpus.
     DEMO_DATA_FILE=/local/movies-300.parquet DEMO_DATA_SIZE=300 \
       docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data run --rm --build demo-data
-    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data up -d node-movies
+    # `--force-recreate`: the `run` above re-seeds `movies`, so cold-rebuild the node against the current
+    # table (same vector-staleness reason as node-catalog above).
+    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data up -d --force-recreate node-movies
     @echo ""
     @echo "Console:           http://localhost:8081  (demo/demo)  — opens on 'movies' (try Semantic/Hybrid)"
     @echo "Grafana:           http://localhost:3000"
@@ -205,7 +212,10 @@ demo-data:
     # model-fetch (stack profile), and compose validates depends_on across the ACTIVE profile set.
     docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data build demo-data
     docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data run --rm demo-data
-    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data up -d node-movies
+    # `--force-recreate`: this reloads `movies` to the full corpus, so cold-rebuild the node against the
+    # new table — a plain restart-less `serve` sync refreshes lexical but not the vector sidecars
+    # (TASK-326), leaving semantic hits stale. See the node-movies command note.
+    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data up -d --force-recreate node-movies
     @echo ""
     @echo "movies index building (local embedding; watch with:"
     @echo "  docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data logs -f node-movies)"

@@ -354,8 +354,15 @@ services:
     profiles: ["catalog"]
     <<: *growlerdb-image
     entrypoint: ["/bin/sh", "-c"]
+    # Wipe the index dir first so this is a clean COLD build — which re-embeds the `body_vec` VECTOR
+    # field. Why it matters: a running `serve` that background-syncs a re-seeded source refreshes the
+    # lexical segments but NOT the vector sidecars (embedding on sync/reindex is TASK-326), so the ANN
+    # sidecars go stale and semantic hits fail to hydrate ("row not found") while lexical still works.
+    # `just stack` force-recreates this service after re-seeding, so the rebuild runs against the
+    # current table. (The /data volume is rebuildable from Iceberg — the authoritative source.)
     command:
       - >
+        rm -rf /data/* 2>/dev/null;
         growlerdb index growlerdb.catalog --def /catalog.yaml --name catalog &&
         growlerdb serve catalog --addr 0.0.0.0:50052 --rest-addr 0.0.0.0:8083 --metrics-addr 0.0.0.0:9104
         --register http://controlplane:50071 --advertise-addr http://node-catalog:50052
@@ -420,8 +427,15 @@ services:
     profiles: ["demo-data"]
     <<: *growlerdb-image
     entrypoint: ["/bin/sh", "-c"]
+    # Wipe the index dir first so this is a clean COLD build — which re-embeds the `plot_vec` VECTOR
+    # field. A running `serve` that background-syncs a reloaded source refreshes the lexical segments
+    # but NOT the vector sidecars (sync/reindex re-embed is TASK-326), so without this the ANN sidecars
+    # go stale after a reload and semantic hits fail to hydrate ("row not found") while lexical works.
+    # `just stack` / `just demo-data` force-recreate this service after (re)loading `movies`, so the
+    # rebuild runs against the current table. (/data is rebuildable from Iceberg — the source of truth.)
     command:
       - >
+        rm -rf /data/* 2>/dev/null;
         growlerdb index growlerdb.movies --def /movies.yaml --name movies &&
         growlerdb serve movies --addr 0.0.0.0:50053 --rest-addr 0.0.0.0:8084 --metrics-addr 0.0.0.0:9106
         --register http://controlplane:50071 --advertise-addr http://node-movies:50053
