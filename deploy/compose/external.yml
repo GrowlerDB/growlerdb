@@ -12,10 +12,10 @@ name: growlerdb-external
 #   cp .env.external.example .env      # then edit it
 #   docker compose -f external.yml up
 #
-# Uses the published image by default (override with GROWLERDB_IMAGE).
+# Uses the latest published release image by default (pin a version with GROWLERDB_IMAGE).
 
 x-growlerdb-image: &growlerdb-image
-  image: ${GROWLERDB_IMAGE:-ghcr.io/growlerdb/growlerdb:0.2.0}
+  image: ${GROWLERDB_IMAGE:-ghcr.io/growlerdb/growlerdb:latest}
   restart: unless-stopped
 
 # Every GrowlerDB service reads the same catalog + object-store settings from the environment
@@ -40,10 +40,15 @@ services:
     command: ["control-plane", "--addr", "0.0.0.0:50071", "--metrics-addr", "0.0.0.0:9101", "--login-secret"]
     environment:
       <<: *growlerdb-env
-      # Seeds one login user on first boot (the gateway enforces it via --builtin-auth).
-      GROWLERDB_DEMO_USER: ${GROWLERDB_LOGIN_USER:-admin}
+      # Seeds one login user on first boot (the gateway enforces it via --builtin-auth), with roles
+      # reader + operator scoped to your index. Default `demo`, NOT `admin`: `admin` is the reserved
+      # built-in superuser, seeded separately with a random password unless GROWLERDB_ADMIN_PASSWORD
+      # is set — so naming the login `admin` would make GROWLERDB_LOGIN_PASSWORD have no effect.
+      GROWLERDB_DEMO_USER: ${GROWLERDB_LOGIN_USER:-demo}
       GROWLERDB_DEMO_PASSWORD: ${GROWLERDB_LOGIN_PASSWORD:?set a login password in .env}
       GROWLERDB_DEMO_INDEXES: ${GROWLERDB_INDEX_NAME:?set your index name in .env}
+      # Optional: give the built-in `admin` superuser a known password instead of a random one.
+      GROWLERDB_ADMIN_PASSWORD: ${GROWLERDB_ADMIN_PASSWORD:-}
     ports:
       - "50071:50071"
       - "9101:9101"
@@ -114,3 +119,15 @@ services:
 volumes:
   cp-data:
   node-data:
+
+# Networking. By default this stack creates its own bridge network and reaches your catalog and
+# object store by the URLs in .env (GROWLERDB_CATALOG_URI / GROWLERDB_S3_ENDPOINT) — which is the
+# common case (a remote/hosted catalog, or one on the host). If instead your catalog + storage run
+# in ANOTHER Compose stack (e.g. `growlerdb-dev`) and are only reachable by in-network hostnames like
+# `polaris` / `minio`, join that stack's network by uncommenting this and setting its name
+# (`docker network ls` shows it, usually `<stack>_default`):
+#
+# networks:
+#   default:
+#     name: growlerdb-dev_default
+#     external: true
