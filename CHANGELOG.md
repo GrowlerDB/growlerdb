@@ -6,6 +6,50 @@ All notable changes to GrowlerDB are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-23
+
+The **unified search experience** release — semantic and hybrid retrieval become one search box that
+gets smarter, the demo lands on a keyless movie-plots vector index out of the box, and a deployment can
+declare its front-door index.
+
+### Added
+
+- **Semantic & hybrid retrieval, inline in Search.** The console's **Lexical / Semantic / Hybrid** mode
+  toggle is the whole story: a natural-language placeholder in the vector modes, a one-time **"Try
+  semantic"** invitation on a vector-capable index, and **"more like this"** on a hit. One search box
+  that gets smarter — no separate retrieval screen.
+- **Deployment front-door index (`GROWLERDB_DEFAULT_INDEX`).** A new gateway env, surfaced via
+  `/v1/config`, lets a deployment declare the index the console opens on. The demo points it at `movies`
+  (a `VECTOR` index) so a fresh visitor lands where semantic/hybrid is one click away; unset ⇒ the first
+  index.
+- **Demo: a keyless movie-plots vector index out of the box.** `just stack` now ships a small (300-film)
+  **`movies`** index — Wikipedia movie plots (CC-BY-SA), embedded locally with bge-small-en-v1.5 — as the
+  console's default landing index, so semantic + hybrid search work on first run with no API key or
+  egress. `just demo-data` upgrades it to the full corpus.
+- **`just stack-dev`** — bring up the full stack from your working checkout (engine + console) instead of
+  the released image, for smoke-testing local changes end to end.
+
+### Changed
+
+- **Retired the standalone "Ask" (grounded-retrieval) screen.** Semantic/hybrid retrieval already lives
+  in Search, so a second door was redundant, and the "Ask" label over a retrieval-only feature (no answer
+  generation — GrowlerDB never calls an LLM, [D42](okf/system/decisions/d42-retrieval-first.md)) invited
+  the wrong expectation. Its value — source passages with governed Iceberg-coordinate provenance — is
+  delivered in Search results.
+- **Two-row search bar** so the query box gets full width; removed the redundant in-field syntax pill
+  (the Lucene/KQL toggle already shows the active syntax).
+
+### Fixed
+
+- **Semantic results now hydrate after a demo re-seed.** A running node synced a reloaded source table
+  into its **lexical** segments but not the **vector** ANN sidecars (sync/reindex re-embed is tracked
+  separately), so semantic hits pointed at dropped data files — "row not found" on click — while lexical
+  worked. The demo vector indexes (`movies`, `catalog`) now cold-rebuild on re-seed.
+- **Honest empty states in vector modes:** the facet rail no longer claims "no facetable fields" for a
+  top-`k` neighbour set (it points to Lexical mode instead), and term highlighting is gated to a lexical
+  match — Hybrid marks its BM25 query terms, pure Semantic marks nothing (highlighting natural-language
+  query words falsely implied a literal match).
+
 ## [0.4.1] - 2026-07-23
 
 Release-tooling fix — **no functional change from 0.4.0**. The 0.4.0 container image and Helm chart
@@ -313,7 +357,8 @@ The initial public (Beta) surface.
   into the image, chart `appVersion`, binaries, and CLI `--version` while the tree stays `0.0.0`;
   the image gets an immutable `X.Y.Z` plus moving `X.Y`/`X`/`latest`. See [RELEASING.md](RELEASING.md).
 
-[Unreleased]: https://github.com/GrowlerDB/growlerdb/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/GrowlerDB/growlerdb/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/GrowlerDB/growlerdb/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.2.0...v0.3.0
