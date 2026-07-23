@@ -19,7 +19,7 @@ ort = { version = "2.0.0-rc.12", optional = true, default-features = false, feat
 # follow-up; until then the `rerank` feature keeps these pure-Rust deps.
 candle-core = { version = "0.9", optional = true }
 candle-nn = { version = "0.9", optional = true }
-candle-transformers = { version = "0.9", optional = true }
+candle-transformers = { version = "0.11", optional = true }
 # WordPiece tokenizer loaded from a local tokenizer.json. default-features=false drops the
 # native `onig` regex (C lib) and the indicatif progress bar; we opt into the pure-Rust
 # `fancy-regex` backend instead (tokenizers requires exactly one) so the build stays
