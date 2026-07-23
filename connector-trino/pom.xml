@@ -12,8 +12,8 @@
   <description>Trino connector exposing a growlerdb_search table function: boolean retrieval over a GrowlerDB index, returning keys + score to JOIN against the Iceberg table.</description>
 
   <properties>
-    <!-- Trino 470's SPI targets JDK 23; the plugin runs inside Trino's JVM. -->
-    <maven.compiler.release>23</maven.compiler.release>
+    <!-- Trino 483's SPI targets JDK 25; the plugin runs inside Trino's JVM. -->
+    <maven.compiler.release>25</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
     <trino.version>483</trino.version>

@@ -51,9 +51,9 @@ jobs:
           # Spark integration suite to have actually produced a report.
           test -f target/surefire-reports/io.growlerdb.connector.ConnectorJobIntegrationTest.txt \
             || { echo "::error::Spark connector integration tests did not run — check the pom test groups"; exit 1; }
-      # The Trino connector is a separate module on JDK 23 (Trino 470's SPI bytecode) — its own
+      # The Trino connector is a separate module on JDK 25 (Trino 483's SPI bytecode) — its own
       # mise.toml provisions the newer JDK, so `mise install` here picks it up independently.
-      - name: Build + test (Trino connector, JDK 23)
+      - name: Build + test (Trino connector, JDK 25)
         working-directory: connector-trino
         run: |
           mise install

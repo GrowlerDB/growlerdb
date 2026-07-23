@@ -1,7 +1,7 @@
 # JVM toolchain for the Trino connector subproject.
-# Separate from ../connector (which is JDK 21 for Spark 4.1): Trino 470's SPI is compiled for
-# JDK 23, so this module needs its own newer toolchain. Maven via the asdf plugin (same as
+# Separate from ../connector (which is JDK 21 for Spark 4.1): Trino 483's SPI is compiled for
+# JDK 25, so this module needs its own newer toolchain. Maven via the asdf plugin (same as
 # ../connector — mise's default aqua registry 400s for apache/maven).
 [tools]
-java = "temurin-23"
+java = "temurin-25"
 "asdf:mise-plugins/mise-maven" = "3.9.9"
