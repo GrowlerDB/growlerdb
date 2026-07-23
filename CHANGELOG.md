@@ -6,6 +6,21 @@ All notable changes to GrowlerDB are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-23
+
+Release-tooling fix — **no functional change from 0.4.0**. The 0.4.0 container image and Helm chart
+published fine, but the standalone binaries failed to build, so 0.4.0 shipped without them; 0.4.1 is
+the first release of this line to include the downloadable binaries.
+
+### Fixed
+
+- **Release binaries now build and publish.** The local embedder links a native ONNX Runtime (the
+  `ort` crate) whose prebuilt requires glibc 2.38+, which the `cross` containers the binaries job used
+  don't provide — so the build failed with `could not find native static library onnxruntime` on both
+  x86_64 and aarch64. The binaries are now built on **native per-arch runners** (as the container image
+  already is), so they link ONNX the same way. **The release binaries require glibc 2.38+** at runtime,
+  the same floor as the container image.
+
 ## [0.4.0] - 2026-07-23
 
 The **vector, semantic & hybrid retrieval** release — GrowlerDB grows from full-text into full-text +
@@ -298,7 +313,8 @@ The initial public (Beta) surface.
   into the image, chart `appVersion`, binaries, and CLI `--version` while the tree stays `0.0.0`;
   the image gets an immutable `X.Y.Z` plus moving `X.Y`/`X`/`latest`. See [RELEASING.md](RELEASING.md).
 
-[Unreleased]: https://github.com/GrowlerDB/growlerdb/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/GrowlerDB/growlerdb/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/GrowlerDB/growlerdb/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/GrowlerDB/growlerdb/releases/tag/v0.2.0
