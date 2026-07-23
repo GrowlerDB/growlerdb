@@ -55,6 +55,7 @@ your hardware without a rebuild. Set each on the gateway process.
 | `GROWLERDB_MAX_FETCH` | `10000` | Ceiling on `offset + limit` per query; over it returns `InvalidArgument`. `0` = unbounded. |
 | `GROWLERDB_MAX_CONCURRENT_FANOUT` | `256` | Per-shard RPCs in flight across all scatter-gathers. `0` = unbounded. |
 | `GROWLERDB_REQUIRE_AUTH` | _unset_ | When truthy (`1`/`true`/`yes`/`on`), the gateway refuses to start unless authentication is configured (`--oidc-issuer` or `--builtin-auth`). Use it in production so a missing auth flag fails fast instead of serving open. |
+| `GROWLERDB_DEFAULT_INDEX` | _unset_ | The index the console selects by default — its front door — advertised via `/v1/config`. Point it at a `VECTOR` index (the demo uses `movies`) so a fresh visitor lands where semantic/hybrid search is one click away. Unset ⇒ the console uses the first index. |
 
 Running the gateway without `--oidc-issuer` or `--builtin-auth` leaves it open (no authentication).
 That is fine for local use and prints a warning at startup; set `GROWLERDB_REQUIRE_AUTH` to turn the
@@ -116,8 +117,8 @@ mapping:
 A `VECTOR` field is opt-in and derived. Rather than mapping a source column, it declares a
 `vector:` config naming a text `source_field`, and GrowlerDB embeds that field's value into a dense
 vector at ingest. That powers `POST /v1/search:semantic` and `/v1/search:hybrid` (and the console's
-Search modes and Ask screen). Embedding runs locally by default, in-process, with no egress and no API
-key, so a vector field adds semantic retrieval without an external service.
+Search Semantic / Hybrid modes). Embedding runs locally by default, in-process, with no egress and no
+API key, so a vector field adds semantic retrieval without an external service.
 
 ```yaml
     - { path: body_vec, type: VECTOR,

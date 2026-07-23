@@ -10,6 +10,7 @@
     facets,
     listIndexes,
     describeIndex,
+    serverConfig,
     hitId,
     type SearchHit,
     type Suggestion,
@@ -19,6 +20,7 @@
     type HighlightSegment,
     type VectorFieldInfo,
   } from '../lib/api';
+  import { pickDefaultIndex } from '../lib/defaultIndex';
   import { RRF_PRESETS, DEFAULT_RRF_K } from '../lib/vectorSearch';
   import { currentFieldToken, withCompletion } from '../lib/autocomplete';
   import { queryTermsByField, fieldTerms, type ScopedTerms } from '../lib/highlight';
@@ -108,8 +110,6 @@
     { value: '', label: t('search.sortScore') },
     ...sortableFields.map((f) => ({ value: f, label: f })),
   ]);
-  // The active query syntax, shown as a pill inside the query field.
-  const syntaxLabel = $derived(syntax === 'kql' ? t('search.kql') : t('search.lucene'));
 
   // Vector search wiring. Semantic/Hybrid modes appear only when the index has a VECTOR field.
   const hasVector = $derived(vectorFields.length > 0);
@@ -128,6 +128,12 @@
   const rrfOptions = RRF_PRESETS.map((n) => ({ value: String(n), label: String(n) }));
   // The VectorFieldInfo for the current selection — carries the `source_field` "more like this" seeds from.
   const selectedVec = $derived(vectorFields.find((v) => v.name === vectorField));
+
+  // Semantic/hybrid share the one query box, but the ask is different: lexical wants a
+  // Lucene/KQL expression, semantic wants a natural-language description. Nudge with the placeholder.
+  const queryPlaceholder = $derived(
+    mode === 'lexical' ? t('search.placeholder') : t('search.placeholderSemantic'),
+  );
 
   // Re-run when the retrieval mode changes (like the sort/scope dropdowns do). Guarded against
   // firing on unrelated state by tracking only `mode`; `searched` is read untracked.
@@ -225,13 +231,18 @@
     } catch {
       indexOptions = []; // no control plane fronted here → scope selector hidden; serve default
     }
-    // Restore the last chosen index, but only if it still exists. Otherwise default to the
-    // first served index: a multi-index endpoint rejects an index-less search, so the UI
-    // must never send one — pick a real index rather than show "index required". (Empty options = a
-    // single-index endpoint with no control plane fronted → leave '' to use the served default.)
-    const savedIndex = read(SEARCH_INDEX_KEY);
-    if (savedIndex && indexOptions.includes(savedIndex)) scopeIndex = savedIndex;
-    else if (indexOptions.length > 0) scopeIndex = indexOptions[0];
+    // Pick the opening index: the last chosen one if it still exists, else the deployment's
+    // configured front door (`GROWLERDB_DEFAULT_INDEX` → /v1/config — the demo points at `movies`,
+    // where semantic/hybrid is a click away), else the first served index. A multi-index endpoint
+    // rejects an index-less search, so the UI must never send one; empty options = a single-index
+    // endpoint with no control plane fronted → leave '' to use the served default.
+    let configuredDefault: string | undefined;
+    try {
+      configuredDefault = (await serverConfig()).default_index;
+    } catch {
+      configuredDefault = undefined; // best-effort; config is unauthenticated and cached
+    }
+    scopeIndex = pickDefaultIndex(indexOptions, read(SEARCH_INDEX_KEY), configuredDefault);
     await loadIndexMeta();
     try {
       saved = await loadSavedSearches();
@@ -373,7 +384,11 @@
       cursor = undefined;
       offset = 0;
       lastQuery = query.trim(); // the drawer's Explain re-parses this as a lexical query
-      scoped = queryTermsByField(query.trim());
+      // Term highlighting reflects a LEXICAL match. Hybrid has a BM25 arm, so mark its query terms.
+      // Pure Semantic (KNN) matches on meaning, not terms — highlighting the query words would
+      // falsely imply a literal match (and a natural-language query would mark stopwords), so mark
+      // nothing.
+      scoped = mode === 'hybrid' ? queryTermsByField(query.trim()) : { fields: {}, bare: [] };
       searched = true;
       facetGroups = []; // facets are a lexical refinement; not shown for vector modes
     } catch (err) {
@@ -675,7 +690,7 @@
               oninput={onInput}
               onkeydown={onQueryKeydown}
               onblur={() => setTimeout(closeAutocomplete, 120)}
-              placeholder={t('search.placeholder')}
+              placeholder={queryPlaceholder}
               autocomplete="off"
               role="combobox"
               aria-expanded={acOpen}
@@ -701,9 +716,13 @@
               </ul>
             {/if}
           </div>
-          <!-- Active-syntax pill inside the field. -->
-          <span class="syntax-pill mono">{syntaxLabel}</span>
         </div>
+        <button class="primary" type="submit" disabled={loading}>
+          {t('search.run')}
+        </button>
+      </div>
+      <!-- Row 2: retrieval controls — kept off the query line so the box gets full width. -->
+      <div class="qrow qrow-controls">
         {#if hasVector}
           <Segmented options={modeOptions} bind:value={mode} label={t('search.mode')} />
         {/if}
@@ -733,11 +752,18 @@
             }}
           />
         {/if}
-        <button class="primary" type="submit" disabled={loading}>
-          {t('search.run')}
-        </button>
       </div>
     </form>
+    {#if hasVector && mode === 'lexical' && !searched}
+      <!-- Gentle, one-time invitation: this index has a VECTOR field, so semantic search is a click
+           away. Disappears once the user runs anything, so it invites rather than nags. -->
+      <p class="semantic-hint">
+        <span>{t('search.semanticHint')}</span>
+        <button type="button" class="linklike" onclick={() => (mode = 'semantic')}>
+          {t('search.semanticHintCta')}
+        </button>
+      </p>
+    {/if}
   </div>
 
   <!-- BAND 2: stats band spanning rail + results. -->
@@ -1015,7 +1041,12 @@
             <div class="rail-section">
               <h2>{t('search.facets')}</h2>
               {#if facetGroups.length === 0}
-                <p class="muted small">{t('search.noFacets')}</p>
+                <!-- In Semantic/Hybrid the result is a top-k neighbour set, not a full matching set,
+                     so facet counts aren't computed — say so rather than the (false) "no facetable
+                     fields", which would imply the index has none. -->
+                <p class="muted small">
+                  {mode === 'lexical' ? t('search.noFacets') : t('search.facetsLexicalOnly')}
+                </p>
               {:else}
                 {#each facetGroups as g (g.field)}
                   {@const collapsed = collapsedFacets.has(g.field)}
@@ -1089,12 +1120,20 @@
   }
   .qbar {
     margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
   }
   .qrow {
     display: flex;
     align-items: center;
     gap: 0.6rem;
     flex-wrap: wrap;
+  }
+  /* Row 2 holds the retrieval-mode controls (scope / mode / syntax / vector / RRF) so the query box
+     on row 1 keeps full width. */
+  .qrow-controls {
+    gap: 0.5rem;
   }
   /* The query field: a bordered wrapper holding a search glyph, the input, and the syntax pill. */
   .qfield {
@@ -1129,15 +1168,6 @@
   }
   .ac input:focus {
     outline: none;
-  }
-  .syntax-pill {
-    flex: 0 0 auto;
-    font-size: 9.5px;
-    color: var(--text-3);
-    border: 1px solid var(--line);
-    border-radius: 4px;
-    padding: 2px 5px;
-    white-space: nowrap;
   }
 
   /* BAND 2 — stats band spanning the rail + results. */
@@ -1622,5 +1652,26 @@
   .save-btn {
     width: 100%;
     font-size: 0.85em;
+  }
+  /* Gentle invitation to semantic search on a vector-capable index (shown before the first query). */
+  .semantic-hint {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0.6rem 0 0;
+    font-size: 0.85rem;
+    color: var(--text-2);
+  }
+  .semantic-hint .linklike {
+    background: none;
+    border: 0;
+    padding: 0;
+    font: inherit;
+    color: var(--accent);
+    cursor: pointer;
+    text-decoration: underline;
+  }
+  .semantic-hint .linklike:hover {
+    text-decoration: none;
   }
 </style>
