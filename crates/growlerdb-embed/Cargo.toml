@@ -24,7 +24,7 @@ candle-transformers = { version = "0.9", optional = true }
 # native `onig` regex (C lib) and the indicatif progress bar; we opt into the pure-Rust
 # `fancy-regex` backend instead (tokenizers requires exactly one) so the build stays
 # native-dependency-free.
-tokenizers = { version = "0.21", optional = true, default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "0.23", optional = true, default-features = false, features = ["fancy-regex"] }
 # Parse the model's config.json into candle's BERT `Config`. Also (de)serializes the external
 # provider request/response DTOs when the `external` feature is on.
 serde_json = { workspace = true, optional = true }
