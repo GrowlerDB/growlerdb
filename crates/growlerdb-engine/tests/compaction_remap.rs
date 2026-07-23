@@ -76,7 +76,7 @@ fn write_parquet(path: &str, ids: &[i64], group_size: usize) {
     )
     .unwrap();
     let props = WriterProperties::builder()
-        .set_max_row_group_size(group_size)
+        .set_max_row_group_row_count(Some(group_size))
         .build();
     let mut writer =
         ArrowWriter::try_new(std::fs::File::create(path).unwrap(), schema, Some(props)).unwrap();
