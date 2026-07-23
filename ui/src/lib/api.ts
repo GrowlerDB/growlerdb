@@ -251,6 +251,9 @@ export interface ServerConfig {
   /** This deployment's Grafana base URL, served at runtime so the link points at the
    *  actual deployment. Absent when unset — the console then hides the "Open Grafana" link. */
   grafana_url?: string;
+  /** The index the console should select by default (the deployment's front door). Absent when
+   *  unset — the console then defaults to the first available index. */
+  default_index?: string;
 }
 
 /** A built-in login result: the session JWT to send as `Authorization: Bearer`. */

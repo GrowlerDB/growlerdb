@@ -58,16 +58,17 @@ From the repo root:
 just stack
 ```
 
-This builds the GrowlerDB image, brings up MinIO and Polaris, and seeds two sample Iceberg tables:
-`growlerdb.docs` (3 rows) and the richer `growlerdb.catalog` (10 rows). It then starts the control
-plane, two nodes, the gateway, and Grafana/LGTM. One node builds the `docs` index and the other
-builds the `catalog` index; both serve and register with the control plane, and the single
-`--all-indexes` gateway routes each request to its named index (multi-index routing).
+This builds the GrowlerDB image, brings up MinIO and Polaris, and seeds sample Iceberg tables:
+`growlerdb.docs` (3 rows), the richer `growlerdb.catalog` (10 rows), and a small `growlerdb.movies`
+slice (300 Wikipedia movie plots). It then starts the control plane, a node per index, the gateway,
+and Grafana/LGTM; each node builds and serves its index and registers with the control plane, and the
+single `--all-indexes` gateway routes each request to its named index (multi-index routing). **The
+console opens on `movies`** — a `VECTOR` index — so semantic and hybrid search are one click away.
 
 > **First run also fetches the local embedding model.** `just stack` provisions bge-small-en-v1.5
 > (~130 MB) once into `${GROWLERDB_MODEL_DIR:-~/.cache/growlerdb/models}` on the host and reuses it on
-> every later run (and from host `cargo test`/eval). It powers the semantic and hybrid search and the
-> Ask screen (§6–§7): embedding runs in-process (Candle), fully local, with no API key. Point
+> every later run (and from host `cargo test`/eval). It powers the semantic and hybrid search modes
+> (§6): embedding runs in-process on ONNX Runtime, fully local, with no API key. Point
 > `GROWLERDB_MODEL_DIR` elsewhere to relocate the cache.
 
 When it settles, the console is at <http://localhost:8081> and Grafana at <http://localhost:3000>.
@@ -305,17 +306,18 @@ curl -s localhost:8081/v1/search:hybrid \
   -d '{"index":"catalog","vector_field":"body_vec","query_text":"restoring authoritative rows from the lakehouse","k":5}'
 ```
 
-In the console, open the Search screen over the `catalog` index: a Lexical / Semantic / Hybrid mode
-selector appears (it shows only for an index with a `VECTOR` field), so pick a mode and query from the
-same box. The Ask screen goes further: pose a natural-language question over `catalog` and it
-hybrid-retrieves the matching source passages, each shown with a citation back to its exact Iceberg
-coordinates. GrowlerDB does the retrieval and returns governed coordinates plus citations. It never
-calls an LLM; generating a prose answer is the caller's job (see §7).
+In the console, the Search screen opens on the `movies` index (a `VECTOR` index): a Lexical /
+Semantic / Hybrid mode selector appears (it shows only for an index with a `VECTOR` field) and a **Try
+semantic** hint invites you in. Pick Semantic or Hybrid and describe what you want in plain language —
+e.g. *a heist that goes wrong* — from the same box; matching rows come back, each with a citation to
+its exact Iceberg coordinates. Retrieval lives in one search box that gets smarter — there is no
+separate "Ask" screen. GrowlerDB returns governed coordinates and **never calls an LLM**; generating a
+prose answer is the caller's job (see §7).
 
-> **Want retrieval quality you can feel?** Ten rows can't show ranking. `just demo-data` loads the
-> opt-in movie-plots corpus, a slice of Wikipedia film plots embedded locally, where semantic,
-> lexical, and hybrid visibly differ and agent Q&A (§7) has more to work with. See
-> [Demo corpus (movies)](demo-corpus).
+> **Want more to explore?** `just stack` already ships a small (300-film) `movies` index. `just
+> demo-data` upgrades it to the full Wikipedia movie-plots corpus (5000+ films), where the ranking
+> differences across semantic / lexical / hybrid are even clearer and agent Q&A (§7) has more to work
+> with. See [Demo corpus (movies)](demo-corpus).
 
 ## 7. Connect an AI agent (MCP)
 

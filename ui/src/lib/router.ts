@@ -2,9 +2,9 @@
 // client routes are real paths.
 import { writable } from 'svelte/store';
 
-// NB: '/rag' (the Ask / grounded-retrieval screen) is temporarily withheld from the console — the
-// component (routes/Rag.svelte) and its API stay in the tree, but the route is unregistered so the
-// URL falls back to '/'. See okf/product/interfaces/ui.md.
+// NB: the standalone "Ask" (grounded-retrieval) screen was retired — semantic/hybrid retrieval lives
+// inline in Search (the mode toggle), so a second door was redundant and confusing. A bookmarked
+// '/rag' URL falls back to '/'. See okf/product/interfaces/ui.md.
 export const routes = ['/', '/indexes', '/observability', '/settings'] as const;
 export type Route = (typeof routes)[number];
 

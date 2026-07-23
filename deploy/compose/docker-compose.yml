@@ -480,6 +480,11 @@ services:
       - "--opensearch"
     environment:
       <<: *growlerdb-env
+      # The console's front door: land a fresh visitor on `movies` (a VECTOR index) so semantic +
+      # hybrid search are one click away, not on the plain `docs` skeleton. Advertised via
+      # `/v1/config`; the console falls back to the first index if `movies` isn't present (e.g. the
+      # streaming demo, which never loads it), so this is safe to set unconditionally.
+      GROWLERDB_DEFAULT_INDEX: movies
     depends_on:
       node:
         condition: service_healthy

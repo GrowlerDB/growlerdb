@@ -10,6 +10,7 @@
     facets,
     listIndexes,
     describeIndex,
+    serverConfig,
     hitId,
     type SearchHit,
     type Suggestion,
@@ -19,6 +20,7 @@
     type HighlightSegment,
     type VectorFieldInfo,
   } from '../lib/api';
+  import { pickDefaultIndex } from '../lib/defaultIndex';
   import { RRF_PRESETS, DEFAULT_RRF_K } from '../lib/vectorSearch';
   import { currentFieldToken, withCompletion } from '../lib/autocomplete';
   import { queryTermsByField, fieldTerms, type ScopedTerms } from '../lib/highlight';
@@ -129,6 +131,12 @@
   // The VectorFieldInfo for the current selection — carries the `source_field` "more like this" seeds from.
   const selectedVec = $derived(vectorFields.find((v) => v.name === vectorField));
 
+  // Semantic/hybrid share the one query box, but the ask is different: lexical wants a
+  // Lucene/KQL expression, semantic wants a natural-language description. Nudge with the placeholder.
+  const queryPlaceholder = $derived(
+    mode === 'lexical' ? t('search.placeholder') : t('search.placeholderSemantic'),
+  );
+
   // Re-run when the retrieval mode changes (like the sort/scope dropdowns do). Guarded against
   // firing on unrelated state by tracking only `mode`; `searched` is read untracked.
   let prevMode: SearchMode = 'lexical';
@@ -225,13 +233,18 @@
     } catch {
       indexOptions = []; // no control plane fronted here → scope selector hidden; serve default
     }
-    // Restore the last chosen index, but only if it still exists. Otherwise default to the
-    // first served index: a multi-index endpoint rejects an index-less search, so the UI
-    // must never send one — pick a real index rather than show "index required". (Empty options = a
-    // single-index endpoint with no control plane fronted → leave '' to use the served default.)
-    const savedIndex = read(SEARCH_INDEX_KEY);
-    if (savedIndex && indexOptions.includes(savedIndex)) scopeIndex = savedIndex;
-    else if (indexOptions.length > 0) scopeIndex = indexOptions[0];
+    // Pick the opening index: the last chosen one if it still exists, else the deployment's
+    // configured front door (`GROWLERDB_DEFAULT_INDEX` → /v1/config — the demo points at `movies`,
+    // where semantic/hybrid is a click away), else the first served index. A multi-index endpoint
+    // rejects an index-less search, so the UI must never send one; empty options = a single-index
+    // endpoint with no control plane fronted → leave '' to use the served default.
+    let configuredDefault: string | undefined;
+    try {
+      configuredDefault = (await serverConfig()).default_index;
+    } catch {
+      configuredDefault = undefined; // best-effort; config is unauthenticated and cached
+    }
+    scopeIndex = pickDefaultIndex(indexOptions, read(SEARCH_INDEX_KEY), configuredDefault);
     await loadIndexMeta();
     try {
       saved = await loadSavedSearches();
@@ -675,7 +688,7 @@
               oninput={onInput}
               onkeydown={onQueryKeydown}
               onblur={() => setTimeout(closeAutocomplete, 120)}
-              placeholder={t('search.placeholder')}
+              placeholder={queryPlaceholder}
               autocomplete="off"
               role="combobox"
               aria-expanded={acOpen}
@@ -738,6 +751,16 @@
         </button>
       </div>
     </form>
+    {#if hasVector && mode === 'lexical' && !searched}
+      <!-- Gentle, one-time invitation: this index has a VECTOR field, so semantic search is a click
+           away. Disappears once the user runs anything, so it invites rather than nags. -->
+      <p class="semantic-hint">
+        <span>{t('search.semanticHint')}</span>
+        <button type="button" class="linklike" onclick={() => (mode = 'semantic')}>
+          {t('search.semanticHintCta')}
+        </button>
+      </p>
+    {/if}
   </div>
 
   <!-- BAND 2: stats band spanning rail + results. -->
@@ -1622,5 +1645,26 @@
   .save-btn {
     width: 100%;
     font-size: 0.85em;
+  }
+  /* Gentle invitation to semantic search on a vector-capable index (shown before the first query). */
+  .semantic-hint {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0.6rem 0 0;
+    font-size: 0.85rem;
+    color: var(--text-2);
+  }
+  .semantic-hint .linklike {
+    background: none;
+    border: 0;
+    padding: 0;
+    font: inherit;
+    color: var(--accent);
+    cursor: pointer;
+    text-decoration: underline;
+  }
+  .semantic-hint .linklike:hover {
+    text-decoration: none;
   }
 </style>

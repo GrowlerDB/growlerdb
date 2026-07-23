@@ -6,7 +6,6 @@ export default {
   'app.skipToContent': 'Skip to content',
   'nav.label': 'Primary',
   'nav.search': 'Search',
-  'nav.rag': 'Ask',
   'nav.indexes': 'Indexes',
   'nav.ingestion': 'Ingestion',
   'nav.observability': 'Observability',
@@ -87,6 +86,10 @@ export default {
   'help.close': 'Close dialogs and menus',
   'search.title': 'Search & Explore',
   'search.placeholder': 'Query (Lucene/KQL)…',
+  'search.placeholderSemantic': "Describe what you're looking for…",
+  'search.semanticHint':
+    'This index supports semantic search — find results by meaning, not just keywords.',
+  'search.semanticHintCta': 'Try semantic',
   'search.run': 'Search',
   'search.syntax': 'Query syntax',
   'search.lucene': 'Lucene',
@@ -378,24 +381,5 @@ export default {
   'cluster.storage.cacheHitRate': 'Cache hit rate',
   'cluster.storage.cached': 'cached',
   'cluster.storage.fetched': 'fetched from object storage',
-  'rag.title': 'Ask',
-  'rag.subtitle':
-    'Grounded retrieval — ask a question, get the source passages with their Iceberg coordinates as citations.',
-  'rag.question': 'Question',
-  'rag.questionPlaceholder': 'Ask a question of your documents…',
-  'rag.ask': 'Retrieve',
-  'rag.scope': 'Index',
-  'rag.vectorField': 'Vector field',
-  'rag.topK': 'Passages',
-  'rag.noVector':
-    'This index has no vector field, so grounded retrieval is unavailable. Vectorize a text column when creating the index to enable it.',
-  'rag.empty': 'Ask a question to retrieve grounded passages.',
-  'rag.noResults': 'No passages matched — try rephrasing the question.',
-  'rag.retrieved': 'Retrieved {count} passage(s)',
-  'rag.citation': 'Citation {n}',
-  'rag.coordinates': 'Iceberg coordinates',
-  'rag.retrievalOnly':
-    'Grounded retrieval — GrowlerDB returns the source passages with their exact Iceberg coordinates. Answer synthesis is intentionally out of scope: no text is sent to any external model.',
-  'rag.openDoc': 'Open document',
   'common.loading': 'Loading…',
 } as const;

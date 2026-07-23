@@ -43,19 +43,24 @@ there), and the gateway resolves indexes lazily rather than hard-depending on it
 The [getting-started](/product/interfaces/website.md) **query playground** exercises the `catalog`
 index through the gateway — every Lucene/KQL operator (term, phrase, keyword, set, numeric/float/date
 range, CIDR, wildcard, prefix, fuzzy, boost, bool, `NOT`, match-all, regex) against known rows. With
-two indexes served and no default configured, every search / `keys:get` request must name its index.
+`docs`, `catalog`, and `movies` served behind the `--all-indexes` gateway (no *served-default* index),
+every search / `keys:get` request names its index; the **console's** default selection is separate — a
+UI convenience set via `GROWLERDB_DEFAULT_INDEX` (→ `movies`, so a fresh visitor lands on a vector
+index with semantic/hybrid a click away).
 
-**Opt-in demo corpus (`demo-data` profile, `just demo-data`):** a slice of Wikipedia movie plots
-(CC-BY-SA, decade-balanced) at the scale where retrieval *quality* shows — semantic vs lexical vs
-hybrid visibly differ, facets are real (genre / origin / decade), and MCP agent Q&A has substance
-the 10-row `catalog` can't give. A loader one-shot downloads the pre-sliced parquet (a GitHub release
-asset; `DEMO_DATA_URL`/`DEMO_DATA_FILE` overridable, `DEMO_DATA_SIZE` caps rows — default 5000) and
-writes `growlerdb.movies` into Iceberg **first**; then `node-movies` builds + serves the
-vector-enabled index (`movies.yaml` — `plot_vec` embedded locally from a short **synopsis** to keep
-embedding fast; full `plot`/`title` **cached** so agents answer from `search` alone) and registers,
-so the `--all-indexes` gateway routes to it and the demo token (allowlist `docs,catalog,movies`) may
-query it. The slicer (`demo-data/build_movies_slice.py`) regenerates the asset. Default seed,
-`just stack`, and CI stay untouched — the corpus is strictly additive.
+**Movie corpus (`movies` — small by default, full via `just demo-data`):** a slice of Wikipedia movie
+plots (CC-BY-SA, decade-balanced) at the scale where retrieval *quality* shows — semantic vs lexical
+vs hybrid visibly differ, facets are real (genre / origin / decade), and MCP agent Q&A has substance
+the 10-row `catalog` can't give. **`just stack` ships a small 300-row slice** from a committed local
+parquet (`demo-data/local/movies-300.parquet` — no download, ~1s embed at build) as the console's
+default index, so all of that works out of the box. **`just demo-data` upgrades it to the full
+corpus:** a loader one-shot downloads the pre-sliced parquet (a GitHub release asset;
+`DEMO_DATA_URL`/`DEMO_DATA_FILE` overridable, `DEMO_DATA_SIZE` caps rows — default 5000) and writes
+`growlerdb.movies` into Iceberg **first**; then `node-movies` builds + serves the vector-enabled index
+(`movies.yaml` — `plot_vec` embedded locally from a short **synopsis** to keep embedding fast; full
+`plot`/`title` **cached** so agents answer from `search` alone) and registers, so the `--all-indexes`
+gateway routes to it and the demo token (allowlist `docs,catalog,movies`) may query it. The slicer
+(`demo-data/build_movies_slice.py`) regenerates the asset.
 
 **Local-embeddings vector demo:** the `catalog` index carries a `body_vec`
 [VECTOR field](/product/functional/search/vector.md) over its `body`, embedded at ingest with the local

@@ -1280,7 +1280,19 @@ async fn config_handler(State(gw): State<Arc<Gateway>>) -> Json<ConfigDto> {
         auth_required: gw.auth_required(),
         password_login: gw.password_login(),
         grafana_url: grafana_url_from_env(),
+        default_index: default_index_from_env(),
     })
+}
+
+/// The deployment's front-door index — the one the console selects by default so a fresh visitor
+/// lands somewhere useful (e.g. the demo points at `movies`, which has a VECTOR field, so
+/// semantic/hybrid search is one click away). Runtime env, like `grafana_url`: the same static SPA
+/// adapts to *this* deployment. Unset ⇒ omitted, and the console falls back to the first index.
+fn default_index_from_env() -> Option<String> {
+    std::env::var("GROWLERDB_DEFAULT_INDEX")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// The deployment's Grafana base URL, from the gateway process's `GROWLERDB_GRAFANA_URL` env.
@@ -1304,6 +1316,10 @@ struct ConfigDto {
     /// the "Open Grafana" link instead of defaulting to a deceptive localhost URL.
     #[serde(skip_serializing_if = "Option::is_none")]
     grafana_url: Option<String>,
+    /// The index the console should select by default (its front door), or omitted when unset —
+    /// then the console defaults to the first available index.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_index: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -2825,6 +2841,43 @@ mod tests {
         let body: JsonValue =
             serde_json::from_slice(&to_bytes(resp.into_body(), 1 << 20).await.unwrap()).unwrap();
         assert_eq!(body["auth_required"], false);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn config_advertises_the_default_index_from_env() {
+        // A deployment (e.g. the demo) sets GROWLERDB_DEFAULT_INDEX so the console lands on its
+        // front-door index; /v1/config surfaces it for the SPA. Env is process-global — hold the
+        // crate env lock and clean up via RAII so the var can't leak into other tests.
+        let _env = crate::env_guard();
+        struct Unset;
+        impl Drop for Unset {
+            fn drop(&mut self) {
+                std::env::remove_var("GROWLERDB_DEFAULT_INDEX");
+            }
+        }
+        let _unset = Unset;
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app(shard(tmp.path()), crate::auth::default_auth());
+        let get_config = || async {
+            let req = HttpRequest::builder()
+                .uri("/v1/config")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+            serde_json::from_slice::<JsonValue>(&bytes).unwrap()
+        };
+
+        // Set → advertised, trimmed to the bare index name.
+        std::env::set_var("GROWLERDB_DEFAULT_INDEX", "  movies  ");
+        assert_eq!(get_config().await["default_index"], "movies");
+
+        // Unset → omitted entirely (not null), so the console falls back to the first index. Both
+        // cases live under the one env guard so the assertion is deterministic (see env_guard).
+        std::env::remove_var("GROWLERDB_DEFAULT_INDEX");
+        assert!(get_config().await.get("default_index").is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]

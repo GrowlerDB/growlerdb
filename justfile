@@ -169,8 +169,15 @@ stack:
     # GROWLERDB_IMAGE=growlerdb-local:dev) — see docker-compose.yml's GROWLERDB_IMAGE note.
     docker compose -f deploy/compose/docker-compose.yml --profile stack pull node || docker compose -f deploy/compose/docker-compose.yml build node
     docker compose -f deploy/compose/docker-compose.yml --profile stack --profile catalog up -d
+    # Ship a SMALL movie-plots index (Wikipedia movie plots, CC-BY-SA) in the default stack so
+    # semantic + hybrid search work out of the box and the console lands here
+    # (GROWLERDB_DEFAULT_INDEX=movies on the gateway). Loads 300 rows from the COMMITTED local
+    # parquet — no download, ~1s embed at build. `just demo-data` upgrades it to the full corpus.
+    DEMO_DATA_FILE=/local/movies-300.parquet DEMO_DATA_SIZE=300 \
+      docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data run --rm --build demo-data
+    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data up -d node-movies
     @echo ""
-    @echo "Console:           http://localhost:8081  (demo/demo)"
+    @echo "Console:           http://localhost:8081  (demo/demo)  — opens on 'movies' (try Semantic/Hybrid)"
     @echo "Grafana:           http://localhost:3000"
     @echo "Connect an agent:  just mcp-connect   (MCP over HTTP — Claude or any MCP client)"
 
@@ -179,10 +186,11 @@ stack:
 mcp-connect:
     deploy/compose/mcp-connect.sh
 
-# Load the opt-in **movie demo corpus** (Wikipedia movie plots, CC-BY-SA) into the lakehouse and
-# stand up its vector-enabled `movies` index. Stack must be up first (`just stack`); the index
-# build embeds plot synopses locally with ONNX BGE (~500 docs/s in-container; default 5000 films
-# ≈ ~45s including build + serve — raise `DEMO_DATA_SIZE`, or `=0`, for the full corpus).
+# Upgrade the `movies` index to the FULL corpus (Wikipedia movie plots, CC-BY-SA). `just stack`
+# already ships a small 300-row `movies` for out-of-the-box semantic/hybrid; this downloads and
+# loads the full 5000-film slice (raise `DEMO_DATA_SIZE`, or `=0`, for the whole corpus). Stack must
+# be up first (`just stack`); the index build embeds plot synopses locally with ONNX BGE
+# (~500 docs/s in-container; 5000 films ≈ ~45s including build + serve).
 demo-data:
     # `--profile stack` rides along on every invocation: node-movies depends on control-plane +
     # model-fetch (stack profile), and compose validates depends_on across the ACTIVE profile set.
