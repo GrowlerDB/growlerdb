@@ -11,7 +11,7 @@ growlerdb-core.workspace = true
 growlerdb-embed.workspace = true
 growlerdb-controlplane.workspace = true
 growlerdb-backup.workspace = true
-opendal = { version = "0.55", features = ["services-s3", "services-fs"] }
+opendal = { version = "0.57", features = ["services-s3", "services-fs"] }
 growlerdb-index.workspace = true
 growlerdb-source.workspace = true
 growlerdb-proto.workspace = true
@@ -23,14 +23,14 @@ serde = { workspace = true }
 serde_json.workspace = true
 jsonwebtoken.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-sha2 = "0.10"
-getrandom = "0.2"
+sha2 = "0.11"
+getrandom = "0.4"
 base64 = "0.22"
 tonic.workspace = true
 tokio = { workspace = true, features = ["rt", "sync"] }
 tokio-stream = "0.1"
 axum = "0.8"
-tower-http = { version = "0.6", features = ["fs", "timeout"] }
+tower-http = { version = "0.7", features = ["fs", "timeout"] }
 # The MCP HTTP transport oneshots the /v1 router in-process.
 tower = { version = "0.5", features = ["util"] }
 libc = "0.2"
@@ -42,6 +42,6 @@ tokio-stream = { version = "0.1", features = ["net"] }
 http-body-util = "0.1"
 # The compaction-under-hydration regression test writes real parquet
 # fixture files — same major as growlerdb-source's pins.
-parquet = { version = "57", features = ["arrow"] }
-arrow-array = "57"
-arrow-schema = "57"
+parquet = { version = "59", features = ["arrow"] }
+arrow-array = "59"
+arrow-schema = "59"
