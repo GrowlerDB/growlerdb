@@ -22,6 +22,10 @@ Profiles: `seed` (sample tables), `stack` (GrowlerDB + LGTM), `catalog` (the sec
 `pipeline` (the streaming demo with Redpanda). Long-running services carry `restart:` policies
 (self-heal); chaos drills exercise recovery ([reliability](/quality/reliability.md)).
 
+The GrowlerDB services default to the **latest published release image** (`GROWLERDB_IMAGE`
+overrides, e.g. to pin a version or point at a locally-built tag), so a first `just stack` is a pull,
+not a ~10-minute source build. Building from the checkout is still one `docker compose build`.
+
 **External lakehouse (`external.yml`):** a companion file (`deploy/compose/external.yml` + `.env`) runs
 only GrowlerDB (control-plane + node + gateway, off the published image) against a user's **own**
 external Iceberg REST catalog + S3 store — no bundled MinIO/Polaris/seed. It's the "day 2" step after

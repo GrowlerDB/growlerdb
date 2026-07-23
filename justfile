@@ -163,10 +163,11 @@ stack:
     docker compose -f deploy/compose/docker-compose.yml up -d minio createbuckets polaris
     deploy/compose/setup-polaris.sh
     docker compose -f deploy/compose/docker-compose.yml --profile seed run --rm --build seed
-    # control-plane / node / gateway share one image (growlerdb-local:dev). `up --build` builds them
-    # in parallel and they race to name the same tag ("image already exists") on Docker's containerd
-    # store. Build the shared image ONCE, then start without --build.
-    docker compose -f deploy/compose/docker-compose.yml build node
+    # control-plane / node / gateway share one image: pull the latest official release once so the
+    # stack starts in a pull, not a ~10-minute source build. Falls back to building from your
+    # checkout when the image can't be pulled (developing GrowlerDB itself, or
+    # GROWLERDB_IMAGE=growlerdb-local:dev) — see docker-compose.yml's GROWLERDB_IMAGE note.
+    docker compose -f deploy/compose/docker-compose.yml --profile stack pull node || docker compose -f deploy/compose/docker-compose.yml build node
     docker compose -f deploy/compose/docker-compose.yml --profile stack --profile catalog up -d
     @echo ""
     @echo "Console:           http://localhost:8081  (demo/demo)"
