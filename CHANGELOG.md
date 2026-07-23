@@ -6,88 +6,134 @@ All notable changes to GrowlerDB are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-23
+
+The **vector, semantic & hybrid retrieval** release — GrowlerDB grows from full-text into full-text +
+vector + hybrid search over your Iceberg data, with a governed **MCP** server that makes it a
+first-class retrieval tool for AI agents. Embeddings are **local and keyless by default** — no egress,
+and GrowlerDB never calls an LLM.
+
 ### Added
 
-- **Vector fields (foundation).** A `VECTOR` field type embeds a text column (local model by default,
-  no egress) and stores the per-document embedding in the segment, backed up with the lexical segment —
-  the base for semantic / hybrid retrieval. Opt-in per field; `model` / `dims` / `metric` / `provider`
-  recorded in the index metadata for reproducibility. Embeddings are produced through a pluggable
-  `Embedder` seam (external providers attach here). Query-time KNN / fusion / reranking follow.
-  (ADR D19/D20/D21/D41/D42 · TASK-41)
-- **Local BGE embedding runtime.** The default embedder is **bge-small-en-v1.5** run in-process on
-  [Candle](https://github.com/huggingface/candle) — pure Rust, no native/C dependency, no network. The
-  model is provisioned out of band into `${GROWLERDB_MODEL_DIR:-~/.cache/growlerdb/models}/<model-id>/`;
-  when absent, embedding falls back to a deterministic dev embedder so ingest and offline CI keep
-  working. Behind a default-on `bge` build feature (a slim build can drop the ML dependency). (TASK-41)
+**Vector & semantic retrieval**
+
+- **`VECTOR` field type + embed-at-ingest.** A `VECTOR` field embeds a text column and stores the
+  per-document embedding in the segment (backed up / restored with the lexical segment) — the base for
+  semantic / hybrid retrieval. Opt-in per field; `model` / `dims` / `metric` / `provider` are recorded
+  in the index metadata for reproducibility, and embeddings flow through a pluggable `Embedder` seam
+  (external providers attach here). (ADR D19/D20/D21/D41/D42/D46 · TASK-41)
+- **Local embedding runtime (keyless, no egress).** The default embedder runs **bge-small-en-v1.5**
+  in-process on **ONNX Runtime** — no network, no API key, ~30× the CPU throughput of the initial
+  pure-Rust path. The model is provisioned out of band into
+  `${GROWLERDB_MODEL_DIR:-~/.cache/growlerdb/models}/<model-id>/`; when it is absent a deterministic dev
+  embedder keeps ingest and offline CI working. Behind a default-on build feature (a slim build can drop
+  the ML dependency). (TASK-41 · #175)
 - **Per-segment ANN index + semantic (KNN) retrieval.** Each segment's vectors are indexed into a
-  GrowlerDB-owned `<segment>.ann` sidecar (built after commit + compaction, backed up / restored with
-  the lexical segment). A top-level KNN query embeds the query text (same embedder as ingest) and
-  returns the nearest documents as coordinates that hydrate. KNN is not yet tenant-filtered, so it is
-  refused **fail-closed** on tenant-scoped indexes and exposed only on the native engine API (RRF
-  fusion + filtered KNN follow). (ADR D19 · TASK-42)
-- **Hybrid search (RRF) + filtered / tenant-scoped KNN.** A KNN query takes an optional filter
-  (lexical / fast-field sub-query) whose matching docs constrain the neighbors, and `hybrid_search`
-  fuses lexical BM25 + vector KNN via Reciprocal Rank Fusion into one ranking. The mandatory
-  `tenant = <claim>` filter is now enforced on the vector path (the tenant Term rides inside the KNN),
-  so tenant-scoped semantic/hybrid search is filtered rather than refused — still fail-closed when a
-  scoped index has no verified claim. On a real-model paraphrase eval, hybrid strictly beats
-  lexical-only. Engine-facade for now (gateway exposure is a later surface). (TASK-43)
+  GrowlerDB-owned `<segment>.ann` sidecar (built after commit + compaction, backed up / restored with the
+  lexical segment). A top-level KNN query embeds the query text (the same embedder as ingest) and returns
+  the nearest documents as coordinates that hydrate. (ADR D19 · TASK-42)
+- **Approximate ANN (HNSW) at scale.** The sidecar auto-selects a pure-Rust **HNSW** index
+  (`instant-distance`) once a field holds more than `HNSW_MIN_VECTORS` (4096) vectors, and stays exact
+  brute-force below that — transparent, same `knn` semantics, no config change. ~2.9× faster per query at
+  recall@10 ≈ 0.96 on a 10k × 128-d benchmark; **filtered / tenant-scoped KNN stays exact** on both
+  tiers, so a selective filter never under-fills. (ADR D19 · TASK-301)
+- **Hybrid search (RRF) + filtered, tenant-scoped KNN.** `hybrid_search` fuses lexical BM25 + vector KNN
+  via Reciprocal Rank Fusion; a KNN query takes an optional lexical / fast-field filter that constrains
+  its neighbors. The mandatory `tenant = <claim>` filter is enforced **inside** the vector path, so
+  tenant-scoped semantic / hybrid search is filtered rather than refused — still fail-closed without a
+  verified claim. On a real-model paraphrase eval, hybrid strictly beats lexical-only. (TASK-43)
 - **Semantic + hybrid search on the authenticated gateway.** Exposed multi-shard over gRPC
   (`SemanticSearch`) and REST (`/v1/search:semantic`, `/v1/search:hybrid`). The query is embedded on
-  each **node** (the gateway carries no embedding model — [D43](okf/system/decisions/d43-node-local-query-embedding.md));
-  the gateway scatters, merges by score, and RRF-fuses the lexical + vector arms for hybrid. The
-  mandatory tenant filter is enforced at the node on the vector path (fail-closed without a claim), so
-  tenant isolation holds on semantic/hybrid exactly as on lexical. (TASK-302)
-- **MCP retrieval server (`growlerdb mcp`).** A read-only Model Context Protocol server (JSON-RPC over
-  stdio) that exposes GrowlerDB to AI agents (Claude, any MCP client) as a governed retrieval tool —
-  tools: `search` (lexical / semantic / hybrid), `hydrate`, `aggregate`, `list_indexes`,
-  `describe_index`. It fronts the authenticated gateway over HTTP and forwards the caller's bearer
-  token, so RBAC + the non-widenable tenant filter are reused verbatim — an agent cannot reach another
-  tenant's data. Hand-rolled (no SDK dependency). (ADR D41/D42 · TASK-297)
-- **Console: vector / hybrid search + a grounded "Ask" screen.** The Search screen gains a Lexical /
-  Semantic / Hybrid mode toggle (with a vector-field selector and an RRF-`k` control), a "more like
-  this" action, and a "vectorize a field" step in create-index. A new **Ask** screen hybrid-retrieves a
-  question and shows the source passages **with their Iceberg coordinates as citations** — **no answer
-  generation**; GrowlerDB never calls an LLM ([D42](okf/system/decisions/d42-retrieval-first.md)).
-  `POST /v1/index:describe` now reports an index's `vector_fields`. (TASK-298)
-- **Demo: a local-embeddings vector index.** The demo `catalog` index gains a `body_vec` VECTOR field
-  embedded with the local **bge-small-en-v1.5** model, so `just stack` exercises **semantic + hybrid
-  search**, the console **Ask** screen, and the **MCP server** against real data — keyless, no egress.
-  The model is fetched **once per machine** into a host-mounted `${GROWLERDB_MODEL_DIR:-~/.cache/growlerdb/models}`
-  (idempotent, reused across runs and local `cargo`/eval); the published image is not bloated.
-  Getting-started documents semantic/hybrid, the Ask screen, and connecting an agent via `growlerdb mcp`.
-  (TASK-300)
-- **Reranker (opt-in, off by default).** A pluggable `Reranker` reorders a semantic/hybrid query's
-  retrieved top-K by a cross-encoder relevance pass over `(query, passage)` — set `rerank: true` (+ an
-  optional `rerank_top_k` candidate pool) on a semantic/hybrid request. It **sits outside the index**
-  (a post-retrieval reorder), is **off by default** (retrieval-first), and runs the local
-  **bge-reranker-base** on Candle (default-on `rerank` feature; falls back to a deterministic dev
-  reranker when the model isn't provisioned — offline/keyless). (ADR D21 · TASK-44)
+  each **node** (the gateway carries no embedding model —
+  [D43](okf/system/decisions/d43-node-local-query-embedding.md)); the gateway scatters, merges by score,
+  and RRF-fuses the lexical + vector arms. Tenant isolation holds on semantic / hybrid exactly as on
+  lexical. (TASK-302)
+- **Opt-in reranker.** A pluggable `Reranker` reorders a semantic / hybrid query's top-K by a
+  cross-encoder pass over `(query, passage)` — set `rerank: true` (+ an optional `rerank_top_k` candidate
+  pool). It sits **outside** the index (a post-retrieval reorder), is **off by default** (retrieval-first),
+  and runs the local **bge-reranker-base** on ONNX Runtime (falls back to a deterministic dev reranker
+  when the model isn't provisioned — offline / keyless). (ADR D21 · TASK-44)
 - **External embedding / rerank providers (opt-in, server-side keys).** A vector field with
-  `provider: EXTERNAL` (or `GROWLERDB_RERANK_PROVIDER=external`) calls a hosted provider over HTTP using
-  a **server-side-only** API key (`GROWLERDB_EMBEDDING_API_KEY` / `GROWLERDB_RERANK_API_KEY`, +
-  `..._ENDPOINT`) — read from the engine's env (k8s Secret / Vault mount), **cached with a 5-min TTL**
-  (a rotated key is picked up within the window; no per-call env read on the hot path), **redacted** in
-  all output, and **never** exposed to the browser or
-  `/v1/config`. Selecting `EXTERNAL` without a key **fails closed** (a clear error, no silent fallback).
-  The **local** BGE/reranker default needs zero keys. No LLM keys — GrowlerDB never calls an LLM (D42).
-  (ADR D20/D21 · TASK-299)
-- **Approximate ANN index (HNSW) at scale.** The per-segment ANN sidecar now auto-selects an
-  **HNSW** index (pure-Rust `instant-distance`) when a segment holds more than `HNSW_MIN_VECTORS` (4096)
-  vectors for a field, and stays exact **brute-force** below that — transparent (same sidecar, same
-  `knn` semantics, no config/API change). On a 10k × 128-d benchmark, HNSW is ~2.9× faster per query at
-  **recall@10 ≈ 0.96** vs. the exact scan. **Filtered / tenant-scoped KNN stays exact** on both tiers
-  (it scores the filter-allowed subset directly, so a selective filter never under-fills on an HNSW
-  segment). "Scale is the gate": approximation only engages where an exact scan gets expensive.
-  (ADR D19 · TASK-301)
+  `provider: EXTERNAL` (or `GROWLERDB_RERANK_PROVIDER=external`) calls a hosted provider over HTTP with a
+  **server-side-only** API key read from the engine env (k8s Secret / Vault mount), cached with a 5-min
+  TTL, **redacted** in all output, and **never** exposed to the browser or `/v1/config`. Selecting
+  `EXTERNAL` without a key **fails closed**. The local default needs zero keys; there are **no LLM keys** —
+  GrowlerDB never calls an LLM ([D42](okf/system/decisions/d42-retrieval-first.md)). (ADR D20/D21 · TASK-299)
+- **Inline hydration.** A search can return the authoritative Iceberg rows **in the same query** instead
+  of a follow-up `keys:get`, collapsing the search → hydrate round trip. (TASK-317)
+
+**MCP for AI agents**
+
+- **`growlerdb mcp` — governed retrieval server.** A read-only Model Context Protocol server that exposes
+  GrowlerDB to AI agents (Claude, any MCP client) as a governed tool set — `search`
+  (lexical / semantic / hybrid), `hydrate`, `aggregate`, `list_indexes`, `describe_index`, and
+  `more_like_this`. It fronts the authenticated gateway and forwards the caller's bearer token, so RBAC +
+  the non-widenable tenant filter are reused verbatim — an agent cannot reach another tenant's data.
+  (ADR D41/D42 · TASK-297)
+- **Streamable HTTP transport + one-command quick-connect.** Every REST front serves MCP over
+  **Streamable HTTP** (not only stdio), and `just mcp-connect` hooks a local agent to the demo stack over
+  HTTP in one step. A self-teaching schema, context budgets, and actionable errors steer agents to the
+  live indexes. (TASK-318/319/321)
+
+**Console & demo**
+
+- **Console: vector / hybrid search.** The Search screen gains a **Lexical / Semantic / Hybrid** mode
+  toggle (with a vector-field selector and an RRF-`k` control), a **"more like this"** action, and a
+  **"vectorize a field"** step in create-index. `POST /v1/index:describe` now reports an index's
+  `vector_fields`. (TASK-298)
+- **Demo: keyless semantic / hybrid out of the box.** `just stack`'s `catalog` index carries a `body_vec`
+  VECTOR field (local bge-small-en-v1.5), and `just demo-data` stands up a vector-enabled **movies** index
+  (Wikipedia movie plots), so semantic + hybrid search and the MCP server run against real data — keyless,
+  no egress. The model is fetched **once per machine** into a host-mounted cache (reused across runs and
+  local `cargo` / eval); the published image is not bloated. (TASK-300 · #180)
+- **Query-surface admission control.** The gateway sheds load on the query path under pressure (bounded
+  concurrency / queue) so a spike degrades gracefully instead of tipping the cluster. (TASK-314)
+
+### Changed
+
+- **Repositioned to "full-text, vector & hybrid retrieval over your data."** The README, docs landing,
+  and product messaging reflect the retrieval-first, open-core vector strategy — embedding is a
+  provenance-typed write-path stage, not a bolt-on. (ADR D44/D46)
+- **Console "Ask" (grounded-retrieval) screen withheld from this release.** The screen is built but its
+  `/rag` route is unregistered: the default demo index (`docs`) has no vector field, so it dead-ends, and
+  the "Ask" label over a retrieval-only feature (no answer generation — GrowlerDB never calls an LLM, D42)
+  invites the wrong expectation. Re-exposed once the demo ships a vectorized default. (#201)
+- **Online shard grow** reworked so a live `grow` actually rebalances — map adoption, map-wins routing,
+  and a CAS cutover replace the previous no-op path. (TASK-309)
 
 ### Fixed
 
-- **Schema change on a built index no longer panics.** Rebuilding an index whose definition gained,
-  dropped, or retyped a mapped field previously crashed the Tantivy fast-field writer (a field-count
-  mismatch against the stale on-disk schema). Now the engine detects the derived-schema change and
-  **reindexes from scratch** (logged), backed by a store-level `SchemaChanged` error that guarantees the
-  mismatch can never reach a writer — never a panic. (TASK-303)
+- **Schema change on a built index no longer panics.** A definition that gained, dropped, or retyped a
+  mapped field previously crashed the fast-field writer; the engine now detects the derived-schema change
+  and **reindexes from scratch** (logged), backed by a store-level `SchemaChanged` error that guarantees
+  the mismatch can never reach a writer. (TASK-303)
+- **Windowed:** a cold-window write no longer panics, and the safe resume floor is carried across
+  restarts. (TASK-308)
+- **Degraded results are flagged, not silently dropped.** A partial or failed arm — including missing
+  embed coverage on a hybrid query — now surfaces as a degraded-result flag instead of quietly returning
+  fewer hits. (#173)
+- **Backup / cold-tier hardening:** a cold-park write-race check, a torn-refresh guard, and manifest-first
+  bundle writes close data-loss windows in park / restore. (TASK-313)
+- **Robustness batch:** UTF-8 redaction, a `from_owners` guard, the hybrid filter applied to both arms, a
+  shared env-guard for embed configuration, and a window-0 warning. (TASK-315)
+- **Build / site:** the ONNX release image builds on a glibc-2.38+ base, `include_str!` markdown is kept
+  in the Docker context, the docs site's dark code palette is legible, and the website nav collapses to a
+  hamburger on mobile. (#176/#167/#168/#178)
+
+### Security
+
+- **Node data plane closed.** The Node's data-plane RPCs now require the mesh **service token**, with
+  trust-boundary hardening — the demo mesh is closed by default and a Node won't answer unauthenticated
+  peers. (TASK-310)
+- **Design-review hardening:** additional gateway limits, topology observability, and an auth guard on the
+  CLI / engine surface. (#183)
+- Grouped dependency security bumps across Rust, Maven, npm, GitHub Actions, and Trino.
+
+### Docs
+
+- An approachable README + docs landing, a scannable quickstart command block, the full OpenSearch
+  response envelope in the adapter example, tenant-isolation-is-opt-in clarified (single-tenant indexes
+  set no `tenant_field`), and dead design / wiki links repointed to the OKF. (D44/D46)
 
 ## [0.3.0] - 2026-07-18
 
@@ -252,6 +298,7 @@ The initial public (Beta) surface.
   into the image, chart `appVersion`, binaries, and CLI `--version` while the tree stays `0.0.0`;
   the image gets an immutable `X.Y.Z` plus moving `X.Y`/`X`/`latest`. See [RELEASING.md](RELEASING.md).
 
-[Unreleased]: https://github.com/GrowlerDB/growlerdb/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/GrowlerDB/growlerdb/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/GrowlerDB/growlerdb/releases/tag/v0.2.0
