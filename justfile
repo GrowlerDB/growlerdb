@@ -157,6 +157,7 @@ connector-e2e:
 # catalog setup → seed → the `stack` services (builds the growlerdb image on first run).
 # Endpoints: Gateway REST http://localhost:8081/v1 · gRPC :50061 · Grafana http://localhost:3000
 # NOTE: host clients/tests still need `127.0.0.1 minio` in /etc/hosts (see README).
+# Pulls the released image by default; to run YOUR checkout (engine + console), use `just stack-dev`.
 stack:
     @echo "Model dir: {{ MODEL_HOST_DIR }} (bge-small-en-v1.5 fetched once, reused)"
     mkdir -p "$MODEL_HOST_DIR"
@@ -180,6 +181,14 @@ stack:
     @echo "Console:           http://localhost:8081  (demo/demo)  — opens on 'movies' (try Semantic/Hybrid)"
     @echo "Grafana:           http://localhost:3000"
     @echo "Connect an agent:  just mcp-connect   (MCP over HTTP — Claude or any MCP client)"
+
+# Pins GROWLERDB_IMAGE to a local-only tag so the `pull` misses and compose builds the shared image
+# (engine binary + console) from deploy/Dockerfile. Every service (gateway, nodes) then runs your
+# code, so `/v1/config`, the console, and search all reflect the branch. First build is a full Rust
+# compile (cached after); re-run to pick up further changes.
+# Same as `just stack`, but runs YOUR checkout (engine + console) instead of the released image.
+stack-dev:
+    GROWLERDB_IMAGE=growlerdb-local:dev {{ just_executable() }} stack
 
 # Mint a demo bearer and print paste-ready MCP connect snippets (Claude Code one-liner, the
 # checked-in .mcp.json export, generic HTTP config, Claude Desktop bridge). Re-run to re-mint.

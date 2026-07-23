@@ -24,7 +24,10 @@ Profiles: `seed` (sample tables), `stack` (GrowlerDB + LGTM), `catalog` (the sec
 
 The GrowlerDB services default to the **latest published release image** (`GROWLERDB_IMAGE`
 overrides, e.g. to pin a version or point at a locally-built tag), so a first `just stack` is a pull,
-not a ~10-minute source build. Building from the checkout is still one `docker compose build`.
+not a ~10-minute source build. To run the **working checkout** end to end instead — engine binary +
+console, so `/v1/config`, the UI, and search all reflect local changes — **`just stack-dev`** pins
+`GROWLERDB_IMAGE` to a local-only tag, which makes the pull miss and builds the shared image from
+`deploy/Dockerfile`.
 
 **External lakehouse (`external.yml`):** a companion file (`deploy/compose/external.yml` + `.env`) runs
 only GrowlerDB (control-plane + node + gateway, off the published image) against a user's **own**
