@@ -10,7 +10,7 @@ name: growlerdb-dev
 # --- shared bits for the GrowlerDB services (one image, one env block) -----
 # By default the stack PULLS the latest official release image (`ghcr.io/growlerdb/growlerdb:latest`)
 # so `just stack` comes up in a pull, no ~10-minute source build. To run a specific release, set
-# `GROWLERDB_IMAGE=ghcr.io/growlerdb/growlerdb:v0.3.0` (immutable) for a reproducible stack. To build
+# `GROWLERDB_IMAGE=ghcr.io/growlerdb/growlerdb:v0.4.1` (immutable) for a reproducible stack. To build
 # from your checkout instead (developing GrowlerDB itself), set `GROWLERDB_IMAGE=growlerdb-local:dev`
 # and `docker compose build` — that tag then drives both build and run.
 x-growlerdb-image: &growlerdb-image
