@@ -159,6 +159,7 @@ export default {
   'search.savedShared': 'Shared with the workspace',
   'search.facets': 'Facets',
   'search.noFacets': 'No facetable fields in these results.',
+  'search.facetsLexicalOnly': 'Facets refine lexical results — switch to Lexical mode to use them.',
   'search.activeFilters': 'Active filters',
   'search.filters': 'Filters',
   'search.collapseFilters': 'Collapse filters',

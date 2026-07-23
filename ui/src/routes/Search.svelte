@@ -110,8 +110,6 @@
     { value: '', label: t('search.sortScore') },
     ...sortableFields.map((f) => ({ value: f, label: f })),
   ]);
-  // The active query syntax, shown as a pill inside the query field.
-  const syntaxLabel = $derived(syntax === 'kql' ? t('search.kql') : t('search.lucene'));
 
   // Vector search wiring. Semantic/Hybrid modes appear only when the index has a VECTOR field.
   const hasVector = $derived(vectorFields.length > 0);
@@ -386,7 +384,11 @@
       cursor = undefined;
       offset = 0;
       lastQuery = query.trim(); // the drawer's Explain re-parses this as a lexical query
-      scoped = queryTermsByField(query.trim());
+      // Term highlighting reflects a LEXICAL match. Hybrid has a BM25 arm, so mark its query terms.
+      // Pure Semantic (KNN) matches on meaning, not terms — highlighting the query words would
+      // falsely imply a literal match (and a natural-language query would mark stopwords), so mark
+      // nothing.
+      scoped = mode === 'hybrid' ? queryTermsByField(query.trim()) : { fields: {}, bare: [] };
       searched = true;
       facetGroups = []; // facets are a lexical refinement; not shown for vector modes
     } catch (err) {
@@ -714,9 +716,13 @@
               </ul>
             {/if}
           </div>
-          <!-- Active-syntax pill inside the field. -->
-          <span class="syntax-pill mono">{syntaxLabel}</span>
         </div>
+        <button class="primary" type="submit" disabled={loading}>
+          {t('search.run')}
+        </button>
+      </div>
+      <!-- Row 2: retrieval controls — kept off the query line so the box gets full width. -->
+      <div class="qrow qrow-controls">
         {#if hasVector}
           <Segmented options={modeOptions} bind:value={mode} label={t('search.mode')} />
         {/if}
@@ -746,9 +752,6 @@
             }}
           />
         {/if}
-        <button class="primary" type="submit" disabled={loading}>
-          {t('search.run')}
-        </button>
       </div>
     </form>
     {#if hasVector && mode === 'lexical' && !searched}
@@ -1038,7 +1041,12 @@
             <div class="rail-section">
               <h2>{t('search.facets')}</h2>
               {#if facetGroups.length === 0}
-                <p class="muted small">{t('search.noFacets')}</p>
+                <!-- In Semantic/Hybrid the result is a top-k neighbour set, not a full matching set,
+                     so facet counts aren't computed — say so rather than the (false) "no facetable
+                     fields", which would imply the index has none. -->
+                <p class="muted small">
+                  {mode === 'lexical' ? t('search.noFacets') : t('search.facetsLexicalOnly')}
+                </p>
               {:else}
                 {#each facetGroups as g (g.field)}
                   {@const collapsed = collapsedFacets.has(g.field)}
@@ -1112,12 +1120,20 @@
   }
   .qbar {
     margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
   }
   .qrow {
     display: flex;
     align-items: center;
     gap: 0.6rem;
     flex-wrap: wrap;
+  }
+  /* Row 2 holds the retrieval-mode controls (scope / mode / syntax / vector / RRF) so the query box
+     on row 1 keeps full width. */
+  .qrow-controls {
+    gap: 0.5rem;
   }
   /* The query field: a bordered wrapper holding a search glyph, the input, and the syntax pill. */
   .qfield {
@@ -1152,15 +1168,6 @@
   }
   .ac input:focus {
     outline: none;
-  }
-  .syntax-pill {
-    flex: 0 0 auto;
-    font-size: 9.5px;
-    color: var(--text-3);
-    border: 1px solid var(--line);
-    border-radius: 4px;
-    padding: 2px 5px;
-    white-space: nowrap;
   }
 
   /* BAND 2 — stats band spanning the rail + results. */
