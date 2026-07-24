@@ -12,7 +12,7 @@ runner); talks to the in-cluster Prometheus + gateway via a port-forward (or in-
 Reachable scales are measured; 100k rec/s + 1 TB are extrapolated in analysis (see scale-test-plan).
 Outputs results.json (milestone x metric). This is the orchestration; it does not itself fit/plot.
 """
-import json, os, subprocess, time, urllib.parse, urllib.request
+import json, os, subprocess, sys, time, urllib.parse, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 NS = os.environ.get("NAMESPACE", "growlerdb")
@@ -99,7 +99,7 @@ def run_loadgen(seconds=180):
     these scales). Runs against GATEWAY (a port-forward or in-cluster URL) via GROWLERDB_OS_URL."""
     out = os.path.join(HERE, ".staged-loadgen.json")
     r = subprocess.run(
-        ["python", os.path.join(HERE, "harness.py"), "query", WORKLOAD,
+        [sys.executable, os.path.join(HERE, "harness.py"), "query", WORKLOAD,
          "--duration", str(seconds), "--concurrency", CONCURRENCY, "--out", out],
         env={**os.environ, "GROWLERDB_OS_URL": GATEWAY}, capture_output=True, text=True)
     try:
@@ -116,7 +116,7 @@ def run_trino(seconds_label):
         return {"skipped": "trino not deployed"}
     out = os.path.join(HERE, ".staged-trino.json")
     subprocess.run(
-        ["python", os.path.join(HERE, "compare_trino.py")],
+        [sys.executable, os.path.join(HERE, "compare_trino.py")],
         env={**os.environ, "GATEWAY_URL": GATEWAY, "INDEX": INDEX, "OUT": out}, capture_output=True, text=True)
     try:
         return json.loads(open(out).read())
@@ -154,7 +154,7 @@ def main():
         time.sleep(120)  # let indexing drain so the milestone converges
         load = run_loadgen(180)
         trino = run_trino(gb)
-        conv = subprocess.run(["python", os.path.join(os.path.dirname(__file__), "convergence_check.py")],
+        conv = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "convergence_check.py")],
                               env={**os.environ, "TOLERANCE": "0"}, capture_output=True, text=True)
         m = {"target_gb": gb, "snapshot": snapshot(), "load": load, "trino": trino,
              "convergence_pass": conv.returncode == 0}
