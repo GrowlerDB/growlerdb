@@ -104,12 +104,17 @@ Coverage vs what a scale test needs:
 **Iceberg maintenance cadence:** the CronJob default (`deploy/k8s/streaming/maintenance.yaml`) is
 hourly — a *production* cadence. For a bounded test, run it **every ~10 min** (`*/10 * * * *`) so the
 compaction↔hydration relationship is visible within the run window; each `replace` snapshot marks a
-compaction to overlay on the hydration chart. Since the D30 slice-3 **background re-map**, hydration
-no longer pays a per-read locator refresh after a compaction — the node heals the locators in the
-background (`growlerdb_locator_remap_events_total` / `growlerdb_locator_remapped_rows_total` /
-`growlerdb_locator_dead_files`), so the run asserts `growlerdb_stale_locators_total` stays **≈ 0**
-across those markers (a rising counter despite re-map events means the re-map isn't keeping up) and
-hydration p99 stays **flat** across compactions.
+compaction to overlay on the hydration chart. **Compaction is a prerequisite for measuring hydrated
+queries, not an afterthought:** streaming appends one data-file per commit, so an unmaintained source
+accumulates thousands of tiny files (Run 7: **2769 files at 1 GB**) and hydration pays the small-file
+tax — compacting to ~128 MB files cut a top-20 hydrated `_search` **~2×** (30s→16s). Two open caveats
+the runs must watch (do **not** assume they hold): the maintenance CronJob is currently hardcoded to
+the non-windowed `growlerdb.http_logs` table, so a **windowed** run gets no compaction unless you run
+one targeting `…_windowed` ([[TASK-340]]); and the post-compaction locator heal does **not** yet
+demonstrably persist — Run 7 saw `growlerdb_stale_locators_total` **rise ~1 per hydrated hit** with
+topk latency flat across passes (re-refresh on every read), and the `growlerdb_locator_remap_*`
+metrics an earlier draft cited are **absent in 0.5.0** ([[TASK-339]]). So a run asserts hydration p99
+across compactions as a *measurement to report*, not an invariant known to hold.
 
 ## Operational prerequisites (learned bringing it up live)
 
