@@ -44,11 +44,21 @@ spec:
           imagePullPolicy: Always
           volumeMounts:
             - { name: workload-corpus, mountPath: /workload }
+          ports:
+            - { name: metrics, containerPort: 9109 }
           command: ["python", "-c"]
           args:
             - |
               import os, sys
-              sys.path.insert(0, "/workload")
+              sys.path.insert(0, "/workload")   # the mounted workload corpus.py
+              sys.path.insert(0, "/")           # genmetrics.py (baked into the seed image)
+              # Serve the uncompressed-corpus-bytes counters so the harness sizes milestones +
+              # index:source against the real raw corpus, not a hardcoded RAW_ROW_BYTES (TASK-342).
+              try:
+                  import genmetrics
+                  genmetrics.serve(int(os.environ.get("METRICS_PORT", "9109")))
+              except Exception as e:  # never let telemetry stop ingest
+                  print("genmetrics unavailable:", e, flush=True)
               import corpus
               corpus.stream(table=os.environ["TABLE"],
                             batch=int(os.environ["BATCH"]),

@@ -46,9 +46,21 @@ Each maps to metrics/graphs (dashboard: `deploy/k8s/observability/grafana.yaml`)
    that hydrates. The k8s drain gate `deploy/k8s/streaming/convergence-gate.sh` is the count-only,
    compaction-racing sibling.
 4. **Index:source size ratio,** stacked into **inverted-index / locator / fast-cache** (the size-attribution
-   breakdown) vs `growlerdb_source_bytes`.
+   breakdown). Reported against the **uncompressed raw-corpus size** (the OSB/ES-benchmark convention)
+   — *not* against `growlerdb_source_bytes`, which is Iceberg `total-files-size` = **compressed**
+   parquet and so shifts under storage config (parquet↔orc, zstd↔snappy) even though the logical data
+   is unchanged. Raw size is **ground truth from the generator**: it counts the uncompressed JSON bytes
+   it emits and serves `growlerdb_gen_raw_bytes_total` on `:9109` (correct for every workload +
+   variable-length rows, all replicas summed) — no hardcoded bytes/row. The compressed footprint +
+   compression ratio are reported alongside for context; milestone *sizes* (`STORAGE_GB`) are likewise
+   GB of uncompressed corpus. See [TASK-342].
 5. **Query performance at each storage milestone** (below).
-6. **GrowlerDB vs Iceberg-alone** (Trino over the same table) at each milestone.
+6. **GrowlerDB vs Iceberg-alone** (Trino over the same table) at each milestone — a **fair** baseline:
+   run it **after compaction** (an unmaintained streaming layout of thousands of tiny files penalizes
+   the scan for reasons unrelated to the engine), give Iceberg the skips it actually has (parquet
+   **bloom filters** on the equality columns + a **`day` partition predicate** — the scan analog of
+   GrowlerDB's window pruning), and label the deliberately-unbounded `[full scan]` queries as the
+   worst case, not the only case. See [TASK-343].
 7. **Compute required at each ingest + storage scale** (CPU/mem/disk/net per node).
 8. **Stability** — error rate + restarts.
 
@@ -64,7 +76,8 @@ cover the low/mid scales directly and **extrapolate** the top:
   huge `BATCH`:** the generator's `BATCH` is one Iceberg snapshot = the connector's commit size (it
   cuts only at snapshot boundaries), and commit latency is ~O(snapshot) — a 300k `BATCH` self-inflicts
   ~9.5s p99 commits, ~10–30k stays sub-2s (the connector-side split is chunked commit).
-- **Storage milestones:** grow the source to **1 GB → 10 GB → 100 GB** (fits the ~960 GB cluster disk);
+- **Storage milestones:** grow the source to **1 GB → 10 GB → 100 GB** of **uncompressed corpus**
+  (the compressed parquet on disk is ~5× smaller, so this fits the cluster disk comfortably);
   **1 TB** is **modeled**. At each milestone **freeze ingest, run the query load, and capture**:
   query p50/p95/p99, hydration latency, index:source ratio (+ breakdown), resource utilisation, and
   the **GrowlerDB-vs-Trino** comparison — into a results table + dashboard snapshots.
@@ -78,7 +91,9 @@ needs the Hetzner **dedicated-core limit raised** + more nodes/disk.
 
 ## Metrics & observability
 
-Every component serves Prometheus `/metrics` (control-plane `:9101`, node `:9102`, gateway `:9103`).
+Every component serves Prometheus `/metrics` (control-plane `:9101`, node `:9102`, gateway `:9103`,
+connector `:9091`, generator `:9109` — the last emits `growlerdb_gen_raw_bytes_total` /
+`growlerdb_gen_rows_total`, the uncompressed-corpus size the milestones are measured against).
 A **headless test cluster has no Prometheus** — deploy one (scraping those ports) and set the chart's
 `gateway.prometheusUrl` so the console's `/v1/stats/*` SLI panels have a backend (otherwise
 Observability/Ingestion pages error with an HTML/JSON parse failure).
