@@ -32,8 +32,9 @@ isn't) the right fit.
 
 ## Try it (one command)
 
-Bring up the **whole stack** (GrowlerDB + MinIO + Polaris + LGTM), which seeds a sample
-`growlerdb.docs` table, builds + serves an index over it, and opens the console:
+Bring up the **whole stack** (GrowlerDB + MinIO + Polaris + LGTM), which seeds three sample Iceberg
+tables — `growlerdb.movies` (a small Wikipedia movie-plots slice), `growlerdb.docs`, and the
+every-field-type `growlerdb.catalog` — builds + serves an index over each, and opens the console:
 
 ```sh
 # build + start everything (needs Docker + just); ~10 min on first build
@@ -41,7 +42,8 @@ just stack
 ```
 
 Open the console at **<http://localhost:8081>**, sign in with **`demo` / `demo`**, and search from
-the UI.
+the UI. It **opens on the `movies` index** (a `VECTOR` index), so lexical, **semantic**, and **hybrid**
+search are one click away.
 
 Or hit the API directly.
 
@@ -60,7 +62,7 @@ Then, in the same style as everything else:
 # connect an AI agent — prints MCP snippets for Claude Code/Desktop or any client
 just mcp-connect
 
-# optional: Wikipedia movie-plots corpus for real retrieval quality (local embeddings, no key)
+# optional: upgrade the movies index to the full Wikipedia movie-plots corpus (local embeddings, no key)
 just demo-data
 
 # tear it all down
