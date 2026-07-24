@@ -23,6 +23,21 @@ Getting started, install (Compose + Helm), configuration, the
 Both the docs site and the apex landing page follow [Brand v1.0](/product/brand/index.md) — see
 [brand surfaces](/product/brand/surfaces.md) for the homepage design and the docs theme.
 
+## Discoverability (SEO)
+
+Both hosts are built to be crawled and indexed. The apex `index.html` carries the on-page signals
+inline — `<title>`, meta `description`, `canonical`, a `robots` directive
+(`index, follow, max-image-preview:large`), Open Graph + Twitter card tags (1200×630 social image),
+and **schema.org JSON-LD** (`Organization` + `WebSite` + a free `SoftwareApplication`) — and ships a
+`robots.txt` + `sitemap.xml` (`www/`). The docs site emits per-page SEO/JSON-LD via `jekyll-seo-tag`
+and a full `sitemap.xml` via `jekyll-sitemap`, with a `robots.txt` advertising it. Each host has its
+**own** sitemap (apex is one page; docs is generated).
+
+Getting indexed is a one-time, account-based submission per property (anonymous sitemap pings were
+retired by Google and Bing in 2023): verify `growlerdb.com` and `docs.growlerdb.com` in Google Search
+Console and Bing Webmaster Tools and submit each sitemap. The runbook + verification commands live in
+[`www/README.md`](https://github.com/GrowlerDB/growlerdb/blob/main/www/README.md).
+
 ## Notes
 
 Publishing the site (Pages) and pointing the domain is part of going public — see the GA-release work.

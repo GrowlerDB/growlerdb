@@ -1,0 +1,5 @@
+# growlerdb.com — apex landing page. Crawlable by all well-behaved bots.
+User-agent: *
+Allow: /
+
+Sitemap: https://growlerdb.com/sitemap.xml
