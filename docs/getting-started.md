@@ -73,10 +73,12 @@ console opens on `movies`** — a `VECTOR` index — so semantic and hybrid sear
 
 When it settles, the console is at <http://localhost:8081> and Grafana at <http://localhost:3000>.
 
-> **Two indexes now, so every request names one.** With more than one index served, the gateway can't
-> guess a default: search and `keys:get` requests must include `"index":"docs"` or `"index":"catalog"`,
-> and the console's top-left selector switches between them. (Omitting `index` returns
-> `index required; endpoint serves 2 indexes`.)
+> **Three indexes now, so every request names one.** With more than one index served, the gateway
+> can't guess a default: search and `keys:get` requests must include `"index":"movies"`,
+> `"index":"docs"`, or `"index":"catalog"`, and the console's top-left selector switches between them.
+> (Omitting `index` returns `index required; endpoint serves 3 indexes`.) The console itself lands on
+> `movies` — that's the `GROWLERDB_DEFAULT_INDEX` the gateway advertises via `/v1/config` — but the REST
+> API has no default, so name the index yourself.
 
 ## 2. Log in
 
@@ -91,9 +93,9 @@ Open <http://localhost:8081> and you'll get a login form. Sign in with the baked
 ![GrowlerDB console: the closed-mode sign-in gate shown before authentication; sign in with the demo credential](img/console-login.png)
 
 The `demo` user has the reader and operator roles (query and read index metadata; it can't create,
-drop, or ingest) and is scoped to the `docs` and `catalog` indexes, so a token issued to it can only
-touch those two (per-index RBAC). Sign-in mints a short-lived session token the gateway validates on
-every request.
+drop, or ingest) and is scoped to the `movies`, `docs`, and `catalog` indexes, so a token issued to it
+can only touch those three (per-index RBAC). Sign-in mints a short-lived session token the gateway
+validates on every request.
 
 > A deliberately well-known demo credential, not a production account. Change it via the demo auth env
 > in `deploy/compose/docker-compose.yml`.
@@ -159,8 +161,9 @@ needed, with matched terms highlighted per cell:
 
 ![GrowlerDB console: Search category:(guide OR reference) over the catalog index returns five hits in a datatable, each row showing its cached fields as columns with matched terms highlighted](img/console-search.png)
 
-> **Tip:** the top-left selector now switches between the `docs` and `catalog` indexes, so pick the
-> one you want to query. In the console's Lucene box a bare word (`search`) queries that index's
+> **Tip:** the top-left selector switches between the `movies`, `docs`, and `catalog` indexes, so pick
+> the one you want to query (it opens on `movies`, the demo's default). In the console's Lucene box a
+> bare word (`search`) queries that index's
 > default field, so qualify it with a field, for example `body:search` or `title:iceberg`, to match.
 > Click a hit to hydrate the full row in the drawer.
 
@@ -177,12 +180,12 @@ needed, with matched terms highlighted per cell:
 
 ## 5. Query playground (the `catalog` index)
 
-The second seeded index, `catalog`, is a 10-row catalog of GrowlerDB concepts with a field of every
+The `catalog` index is a 10-row catalog of GrowlerDB concepts with a field of every
 type: text (`title`, `body`), keyword (`id`, `category`, `author`), numeric (`views` LONG, `rating`
 DOUBLE), a `published` DATE, a `server_ip` IP, and an `archived` BOOL. It's built for trying out the
 [query language](reference), and every operator below returns a small, known result.
 
-Because two indexes are served, name the index in every request:
+Because several indexes are served with no gateway default, name the index in every request:
 
 ```sh
 curl -s localhost:8081/v1/search \
@@ -512,7 +515,7 @@ exactly-once from the node's committed checkpoint.
 The `just pipeline` demo wires the whole streaming loop end to end (a generator → Redpanda (Kafka) →
 Iceberg → the connector → a live `telemetry_stream` index), so you can watch data flow and search it
 as it arrives, with no reindex step. It's a self-contained stack (a different node config than the
-`docs`/`catalog` demo), so stop the batch stack first:
+`movies`/`docs`/`catalog` batch demo), so stop the batch stack first:
 
 > **This step builds the Spark connector jar on your host** (not in a container), so it needs
 > [`mise`](https://mise.jdx.dev), which provisions JDK 21 and Maven on demand. Install it once and
@@ -532,7 +535,7 @@ sink, and Spark connector. Give it about 30 s for the first micro-batch to land 
 the `telemetry_stream` index; the gateway comes up once that node is ready.
 
 Tearing down the batch stack invalidated your earlier `$TOKEN`: a fresh stack signs session tokens
-with a new key, and here the demo user is re-seeded scoped to `telemetry_stream` (not `docs`/`catalog`).
+with a new key, and here the demo user is re-seeded scoped to `telemetry_stream` (not `movies`/`docs`/`catalog`).
 Once the gateway is up, log in again for a token that can query it:
 
 ```sh
@@ -578,12 +581,13 @@ just stack-down
 
 - **First `just stack` is slow (~10 min).** It compiles the GrowlerDB image once; subsequent starts
   reuse the cached image and take seconds.
-- **Search returns `0 results` in the console.** Select the right index (`docs` or `catalog`,
-  top-left) and qualify the term with a field, `body:search`, not a bare `search` (a bare term only
-  matches the default field).
-- **REST search/`keys:get` returns `index required; endpoint serves 2 indexes`.** The stack now serves
-  two indexes, so the gateway can't pick a default; add `"index":"docs"` or `"index":"catalog"` to
-  the request body.
+- **Search returns `0 results` in the console.** Select the right index (`movies`, `docs`, or
+  `catalog`, top-left) and qualify the term with a field, `body:search`, not a bare `search` (a bare
+  term only matches the default field).
+- **REST search/`keys:get` returns `index required; endpoint serves 3 indexes`.** The stack serves
+  three indexes, so the gateway can't pick a default; add `"index":"movies"`, `"index":"docs"`, or
+  `"index":"catalog"` to the request body. (The console lands on `movies` via `/v1/config`, but that
+  default doesn't apply to the REST API.)
 - **`keys:get` / hydration errors on the host** (`nodename nor servname` / connection refused): add the
   `127.0.0.1 minio` `/etc/hosts` entry from Prerequisites; host-side hydration reads object storage by
   that name.
