@@ -210,7 +210,6 @@ impl IcebergReader {
         // worth it for a single-reader-per-index source.
         let catalog = RestCatalogBuilder::default()
             .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-                configured_scheme: "s3".to_string(),
                 customized_credential_load: None,
             }))
             .load("growlerdb", cfg.props())
@@ -649,11 +648,12 @@ impl IcebergReader {
         let mut chunk: Vec<LocatedDoc> = Vec::new();
         for task in tasks {
             let data_file = task.data_file_path.clone();
-            let reader = ArrowReaderBuilder::new(file_io.clone()).build();
+            let reader =
+                ArrowReaderBuilder::new(file_io.clone(), iceberg::Runtime::current()).build();
             let task_stream =
                 futures::stream::once(async move { Ok::<FileScanTask, iceberg::Error>(task) })
                     .boxed();
-            let mut stream = reader.read(task_stream)?;
+            let mut stream = reader.read(task_stream)?.stream();
             let mut pos = 0u64;
             while let Some(batch) = stream.try_next().await? {
                 let n = batch.num_rows() as u64;
@@ -709,11 +709,12 @@ impl IcebergReader {
                 continue;
             }
             let data_file = task.data_file_path.clone();
-            let reader = ArrowReaderBuilder::new(file_io.clone()).build();
+            let reader =
+                ArrowReaderBuilder::new(file_io.clone(), iceberg::Runtime::current()).build();
             let task_stream =
                 futures::stream::once(async move { Ok::<FileScanTask, iceberg::Error>(task) })
                     .boxed();
-            let mut stream = reader.read(task_stream)?;
+            let mut stream = reader.read(task_stream)?.stream();
             let mut pos = 0u64;
             while let Some(batch) = stream.try_next().await? {
                 let n = batch.num_rows() as u64;
@@ -809,10 +810,10 @@ async fn read_tasks(
             continue;
         }
         let data_file = task.data_file_path.clone();
-        let reader = ArrowReaderBuilder::new(file_io.clone()).build();
+        let reader = ArrowReaderBuilder::new(file_io.clone(), iceberg::Runtime::current()).build();
         let task_stream =
             futures::stream::once(async move { Ok::<FileScanTask, iceberg::Error>(task) }).boxed();
-        let mut stream = reader.read(task_stream)?;
+        let mut stream = reader.read(task_stream)?.stream();
 
         let mut pos = 0u64;
         while let Some(batch) = stream.try_next().await? {
@@ -958,10 +959,10 @@ async fn stream_file_rows(
     task: FileScanTask,
     positions: &[u64],
 ) -> Result<BTreeMap<u64, BTreeMap<String, Value>>> {
-    let reader = ArrowReaderBuilder::new(file_io).build();
+    let reader = ArrowReaderBuilder::new(file_io, iceberg::Runtime::current()).build();
     let task_stream =
         futures::stream::once(async move { Ok::<FileScanTask, iceberg::Error>(task) }).boxed();
-    let mut stream = reader.read(task_stream)?;
+    let mut stream = reader.read(task_stream)?.stream();
     let max_pos = positions.iter().copied().max().unwrap_or(0);
     let mut batches = Vec::new();
     let mut rows_seen = 0u64;
@@ -1082,10 +1083,10 @@ async fn scan_stale_index(
     let mut duplicates = 0u64;
     'files: for task in tasks {
         let data_file = task.data_file_path.clone();
-        let reader = ArrowReaderBuilder::new(file_io.clone()).build();
+        let reader = ArrowReaderBuilder::new(file_io.clone(), iceberg::Runtime::current()).build();
         let task_stream =
             futures::stream::once(async move { Ok::<FileScanTask, iceberg::Error>(task) }).boxed();
-        let mut stream = reader.read(task_stream)?;
+        let mut stream = reader.read(task_stream)?.stream();
         let mut start_row = 0u64;
         while let Some(batch) = stream.try_next().await? {
             let n = batch.num_rows() as u64;
@@ -1486,7 +1487,7 @@ pub(crate) mod test_util {
         )
         .unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(group_size)
+            .set_max_row_group_row_count(Some(group_size))
             .build();
         let file = std::fs::File::create(path).unwrap();
         let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
