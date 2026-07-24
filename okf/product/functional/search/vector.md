@@ -149,10 +149,11 @@ tenant-scoped index with **no** verified claim **fails closed** (refuses) rather
 neighbors unscoped. (Tenancy stays opt-in — a single-tenant index carries no `tenant_field` and this is
 a no-op; see [RBAC & tenancy](/product/functional/rbac-and-tenancy.md).)
 
-> **Status.** In active build (M5). Shipped: the **field type, local BGE embedding at ingest (Candle),
-> the `Embedder` seam, per-document vector storage, the per-segment ANN sidecar (backed up), top-level
-> KNN, filtered / tenant-scoped KNN, RRF hybrid fusion, the authenticated multi-shard gateway
-> surface** (gRPC + REST, node-local embedding), the **console** search-mode UX + grounded Ask screen,
+> **Status.** In active build (M5). Shipped: the **field type, local BGE embedding at ingest (ONNX
+> Runtime), the `Embedder` seam, per-document vector storage, the per-segment ANN sidecar (backed up),
+> top-level KNN, filtered / tenant-scoped KNN, RRF hybrid fusion, the authenticated multi-shard gateway
+> surface** (gRPC + REST, node-local embedding), the **console** inline Semantic/Hybrid search-mode UX
+> (the standalone "Ask" screen was retired — retrieval lives in Search),
 > the **opt-in reranker** (local + external providers), and the **approximate HNSW index** (auto-selected
 > at scale, filtered KNN stays exact). Remaining: **distributed windowed** semantic search, the
 > **write-path embed stage** (LOCAL embedding on reindex/sync/reconcile, pooled/pipelined ingest, and

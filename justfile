@@ -157,6 +157,7 @@ connector-e2e:
 # catalog setup → seed → the `stack` services (builds the growlerdb image on first run).
 # Endpoints: Gateway REST http://localhost:8081/v1 · gRPC :50061 · Grafana http://localhost:3000
 # NOTE: host clients/tests still need `127.0.0.1 minio` in /etc/hosts (see README).
+# Pulls the released image by default; to run YOUR checkout (engine + console), use `just stack-dev`.
 stack:
     @echo "Model dir: {{ MODEL_HOST_DIR }} (bge-small-en-v1.5 fetched once, reused)"
     mkdir -p "$MODEL_HOST_DIR"
@@ -169,26 +170,52 @@ stack:
     # GROWLERDB_IMAGE=growlerdb-local:dev) — see docker-compose.yml's GROWLERDB_IMAGE note.
     docker compose -f deploy/compose/docker-compose.yml --profile stack pull node || docker compose -f deploy/compose/docker-compose.yml build node
     docker compose -f deploy/compose/docker-compose.yml --profile stack --profile catalog up -d
+    # Force-recreate the VECTOR index node so it does a clean COLD rebuild against the freshly re-seeded
+    # `catalog` table. On a re-run, `serve` background-syncs the new snapshot into the LEXICAL segments
+    # but not the vector sidecars (TASK-326), so without a rebuild semantic hits go stale ("row not
+    # found") — see the node-catalog command note.
+    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile catalog up -d --force-recreate node-catalog
+    # Ship a SMALL movie-plots index (Wikipedia movie plots, CC-BY-SA) in the default stack so
+    # semantic + hybrid search work out of the box and the console lands here
+    # (GROWLERDB_DEFAULT_INDEX=movies on the gateway). Loads 300 rows from the COMMITTED local
+    # parquet — no download, ~1s embed at build. `just demo-data` upgrades it to the full corpus.
+    DEMO_DATA_FILE=/local/movies-300.parquet DEMO_DATA_SIZE=300 \
+      docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data run --rm --build demo-data
+    # `--force-recreate`: the `run` above re-seeds `movies`, so cold-rebuild the node against the current
+    # table (same vector-staleness reason as node-catalog above).
+    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data up -d --force-recreate node-movies
     @echo ""
-    @echo "Console:           http://localhost:8081  (demo/demo)"
+    @echo "Console:           http://localhost:8081  (demo/demo)  — opens on 'movies' (try Semantic/Hybrid)"
     @echo "Grafana:           http://localhost:3000"
     @echo "Connect an agent:  just mcp-connect   (MCP over HTTP — Claude or any MCP client)"
+
+# Pins GROWLERDB_IMAGE to a local-only tag so the `pull` misses and compose builds the shared image
+# (engine binary + console) from deploy/Dockerfile. Every service (gateway, nodes) then runs your
+# code, so `/v1/config`, the console, and search all reflect the branch. First build is a full Rust
+# compile (cached after); re-run to pick up further changes.
+# Same as `just stack`, but runs YOUR checkout (engine + console) instead of the released image.
+stack-dev:
+    GROWLERDB_IMAGE=growlerdb-local:dev {{ just_executable() }} stack
 
 # Mint a demo bearer and print paste-ready MCP connect snippets (Claude Code one-liner, the
 # checked-in .mcp.json export, generic HTTP config, Claude Desktop bridge). Re-run to re-mint.
 mcp-connect:
     deploy/compose/mcp-connect.sh
 
-# Load the opt-in **movie demo corpus** (Wikipedia movie plots, CC-BY-SA) into the lakehouse and
-# stand up its vector-enabled `movies` index. Stack must be up first (`just stack`); the index
-# build embeds plot synopses locally with ONNX BGE (~500 docs/s in-container; default 5000 films
-# ≈ ~45s including build + serve — raise `DEMO_DATA_SIZE`, or `=0`, for the full corpus).
+# Upgrade the `movies` index to the FULL corpus (Wikipedia movie plots, CC-BY-SA). `just stack`
+# already ships a small 300-row `movies` for out-of-the-box semantic/hybrid; this downloads and
+# loads the full 5000-film slice (raise `DEMO_DATA_SIZE`, or `=0`, for the whole corpus). Stack must
+# be up first (`just stack`); the index build embeds plot synopses locally with ONNX BGE
+# (~500 docs/s in-container; 5000 films ≈ ~45s including build + serve).
 demo-data:
     # `--profile stack` rides along on every invocation: node-movies depends on control-plane +
     # model-fetch (stack profile), and compose validates depends_on across the ACTIVE profile set.
     docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data build demo-data
     docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data run --rm demo-data
-    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data up -d node-movies
+    # `--force-recreate`: this reloads `movies` to the full corpus, so cold-rebuild the node against the
+    # new table — a plain restart-less `serve` sync refreshes lexical but not the vector sidecars
+    # (TASK-326), leaving semantic hits stale. See the node-movies command note.
+    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data up -d --force-recreate node-movies
     @echo ""
     @echo "movies index building (local embedding; watch with:"
     @echo "  docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data logs -f node-movies)"

@@ -2,10 +2,12 @@ package io.growlerdb.trino;
 
 import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.ConnectorSplit;
+import io.trino.spi.connector.ConnectorTableCredentials;
 import io.trino.spi.function.FunctionProvider;
 import io.trino.spi.function.table.ConnectorTableFunctionHandle;
 import io.trino.spi.function.table.TableFunctionProcessorProvider;
 import io.trino.spi.function.table.TableFunctionSplitProcessor;
+import java.util.Optional;
 
 /** Supplies the worker-side executor for {@code growlerdb_search}. */
 public class GrowlerDbFunctionProvider implements FunctionProvider {
@@ -16,7 +18,10 @@ public class GrowlerDbFunctionProvider implements FunctionProvider {
     return new TableFunctionProcessorProvider() {
       @Override
       public TableFunctionSplitProcessor getSplitProcessor(
-          ConnectorSession session, ConnectorTableFunctionHandle handle, ConnectorSplit split) {
+          ConnectorSession session,
+          ConnectorTableFunctionHandle handle,
+          Optional<ConnectorTableCredentials> credentials,
+          ConnectorSplit split) {
         return new GrowlerDbSearchProcessor((GrowlerDbSearchHandle) handle);
       }
     };

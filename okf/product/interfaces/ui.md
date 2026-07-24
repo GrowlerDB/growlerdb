@@ -16,14 +16,21 @@ The **GrowlerDB console** — a Svelte single-page app (in `ui/`) served by the
 
 ## Screens
 
-- **Search / Explore** — query, facets, sort/paging, highlighted results, hydrate a hit, export. A
-  **Lexical / Semantic / Hybrid** mode toggle (shown when the index has a
-  [vector field](/product/functional/search/vector.md); hybrid exposes the RRF `k`), a **"more like
-  this"** action on a hit, and a **"vectorize a field"** step in create-index.
-- **Ask** — a grounded-retrieval screen: a question is hybrid-retrieved and answered with the source
-  **passages plus their exact Iceberg coordinates as citations**. There is intentionally **no answer
-  generation** — GrowlerDB never sends text to an LLM ([D42](/system/decisions/d42-retrieval-first.md));
-  the value is grounded retrieval an agent can build on.
+- **Search / Explore** — query, facets, sort/paging, highlighted results, hydrate a hit, export.
+  **Semantic and hybrid retrieval live here, inline** — a **Lexical / Semantic / Hybrid** mode toggle
+  (shown when the index has a [vector field](/product/functional/search/vector.md); hybrid exposes the
+  RRF `k`), a natural-language placeholder in the vector modes, a one-time **"Try semantic"** invitation
+  on a vector-capable index, a **"more like this"** action on a hit, and a **"vectorize a field"** step
+  in create-index. There is **one search box that gets smarter**, not a separate retrieval screen.
+- **The console's front door** is the deployment's default index (`GROWLERDB_DEFAULT_INDEX` →
+  `/v1/config`; the demo points at `movies`, which has a vector field), so a fresh visitor lands where
+  semantic/hybrid is one click away rather than on a lexical-only skeleton. Unset ⇒ the first index.
+- **No separate "Ask" screen.** An earlier standalone grounded-retrieval ("Ask") screen was **retired**
+  ([D42](/system/decisions/d42-retrieval-first.md) still holds — GrowlerDB never sends text to an LLM;
+  retrieval returns passages + their exact Iceberg coordinates as citations). It was a redundant second
+  door to what Search's Semantic/Hybrid modes already do, and the "Ask" label over a retrieval-only
+  feature invited the wrong expectation. The value — passages with governed provenance — is delivered
+  in Search results, not a separate tab.
 - **Indexes** — list/create/alter/drop/reindex/compact/backup, aliases, per-index detail.
 - **Ingestion** — per-index sync status, lag, streaming charts.
 - **Observability** — SLI dashboards (latency, ingest lag, shards, cold-cache), alerts.

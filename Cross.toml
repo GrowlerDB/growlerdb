@@ -1,8 +1,0 @@
-# `cross` runs the build inside a per-target container. growlerdb-proto's build script uses a
-# vendored protoc (protoc-bin-vendored), so no system protoc is needed here.
-#
-# Custom env vars are not forwarded into the container unless listed. The release binaries job sets
-# GROWLERDB_VERSION from the tag so the CLI's build.rs bakes the real version into `--version`
-# (ADR D29).
-[build.env]
-passthrough = ["GROWLERDB_VERSION"]

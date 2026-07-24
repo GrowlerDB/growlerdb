@@ -2,7 +2,10 @@
 // client routes are real paths.
 import { writable } from 'svelte/store';
 
-export const routes = ['/', '/rag', '/indexes', '/observability', '/settings'] as const;
+// NB: the standalone "Ask" (grounded-retrieval) screen was retired — semantic/hybrid retrieval lives
+// inline in Search (the mode toggle), so a second door was redundant and confusing. A bookmarked
+// '/rag' URL falls back to '/'. See okf/product/interfaces/ui.md.
+export const routes = ['/', '/indexes', '/observability', '/settings'] as const;
 export type Route = (typeof routes)[number];
 
 function normalize(pathname: string): Route {
