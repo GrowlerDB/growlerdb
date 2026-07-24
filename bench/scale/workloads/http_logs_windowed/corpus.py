@@ -19,6 +19,11 @@ import time
 import uuid
 from pathlib import Path
 
+try:  # generator telemetry (uncompressed-corpus bytes) — provided by the seed image; absent locally
+    import genmetrics as _genmetrics
+except ImportError:
+    _genmetrics = None
+
 BATCH = int(os.environ.get("BENCH_BATCH", "250000"))
 DAY_SECONDS = 86400
 BASE_TS = 893964000  # the OSB http_logs corpus era (1998) — windows line up either way
@@ -99,6 +104,18 @@ def _schemas():
     return pa_schema, ice, spec
 
 
+# Parquet write properties so a GrowlerDB-vs-Iceberg comparison is FAIR (TASK-343): bloom filters on
+# the high-selectivity equality columns let a scan engine (Trino) skip row groups on a point-lookup
+# (`id = …`) or term (`status = …`) predicate instead of scanning the whole file. Without these,
+# Iceberg's only skip is partition pruning on `day` — so an unbounded equality query full-scans and
+# looks artificially slow next to GrowlerDB's index. Set at table creation (applies to new files;
+# compaction rewrites carry them forward).
+WRITE_PROPERTIES = {
+    "write.parquet.bloom-filter-enabled.column.id": "true",
+    "write.parquet.bloom-filter-enabled.column.status": "true",
+}
+
+
 def load(table="growlerdb.http_logs_windowed", fraction=1.0):
     import pyarrow as pa
 
@@ -113,7 +130,7 @@ def load(table="growlerdb.http_logs_windowed", fraction=1.0):
         pass
     if _table_exists(catalog, table):
         catalog.drop_table(table)
-    tbl = catalog.create_table(table, schema=ice, partition_spec=spec)
+    tbl = catalog.create_table(table, schema=ice, partition_spec=spec, properties=WRITE_PROPERTIES)
 
     written = 0
     batch = {k: [] for k in cols}
@@ -161,7 +178,7 @@ def stream(table="growlerdb.http_logs_windowed", batch=10, sleep_s=5):
     catalog = _catalog()
     catalog.create_namespace_if_not_exists(table.split(".")[0])
     if not _table_exists(catalog, table):
-        catalog.create_table(table, schema=ice, partition_spec=spec)
+        catalog.create_table(table, schema=ice, partition_spec=spec, properties=WRITE_PROPERTIES)
         print(f"created {table} (partitioned by day)", flush=True)
     n = 1000
     while True:
@@ -170,7 +187,7 @@ def stream(table="growlerdb.http_logs_windowed", batch=10, sleep_s=5):
         day_index = n // logs_per_day
         ts_vals = [BASE_TS + day_index * DAY_SECONDS + random.randint(0, DAY_SECONDS - 1)
                    for _ in range(batch)]
-        tbl.append(pa.table({
+        cols = {
             "id": [f"req-{run}-{n + i}" for i in range(batch)],
             "ts": ts_vals,
             "clientip": [f"{random.randint(1,223)}.{random.randint(0,255)}."
@@ -180,7 +197,10 @@ def stream(table="growlerdb.http_logs_windowed", batch=10, sleep_s=5):
             "status": [random.choice(status) for _ in range(batch)],
             "size": [random.randint(0, 50_000) for _ in range(batch)],
             "day": [t // DAY_SECONDS for t in ts_vals],
-        }, schema=pa_schema))
+        }
+        tbl.append(pa.table(cols, schema=pa_schema))
+        if _genmetrics is not None:  # report the real uncompressed bytes produced (TASK-342)
+            _genmetrics.record_columns(cols, batch)
         print(f"appended {batch} rows to {table} (synthetic day {day_index})", flush=True)
         n += batch
         time.sleep(sleep_s)
