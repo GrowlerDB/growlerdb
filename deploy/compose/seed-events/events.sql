@@ -10,7 +10,16 @@
 -- writer chooses). The demo index (`deploy/compose/events.yaml`) maps `payload` as VARIANT with a
 -- flatten catch-all plus two shapes selected by the sibling `event_type` discriminator.
 
-CREATE TABLE IF NOT EXISTS stream.growlerdb.events (
+-- The namespace must exist before the table (a fresh catalog has none — don't rely on the
+-- pyiceberg seeds having created it).
+CREATE NAMESPACE IF NOT EXISTS stream.growlerdb;
+
+-- Drop + recreate so the seed is idempotent: a plain `INSERT ... VALUES` appends, so re-running
+-- (e.g. `just variant-demo` twice) would accumulate duplicate rows. A fresh table + a single
+-- append keeps exactly these rows and the append-only / delete-free invariant (no DVs).
+DROP TABLE IF EXISTS stream.growlerdb.events;
+
+CREATE TABLE stream.growlerdb.events (
   id          STRING,
   ts          BIGINT,   -- event time, epoch millis
   event_type  STRING,   -- discriminator (a sibling column)

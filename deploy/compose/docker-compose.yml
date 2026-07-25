@@ -725,6 +725,10 @@ services:
       - spark.sql.catalog.stream.s3.endpoint=http://minio:9000
       - --conf
       - spark.sql.catalog.stream.s3.path-style-access=true
+      # Polaris denies the Iceberg client's REPORT_WRITE_METRICS to `root` (ForbiddenException);
+      # metrics reporting is best-effort telemetry, so turn it off on the catalog client.
+      - --conf
+      - spark.sql.catalog.stream.rest-metrics-reporting-enabled=false
       - -f
       - /opt/growlerdb/events.sql
 
@@ -807,6 +811,9 @@ services:
       - spark.sql.catalog.stream.s3.endpoint=http://minio:9000
       - --conf
       - spark.sql.catalog.stream.s3.path-style-access=true
+      # Polaris denies REPORT_WRITE_METRICS / REPORT_READ_METRICS to `root`; disable client metrics.
+      - --conf
+      - spark.sql.catalog.stream.rest-metrics-reporting-enabled=false
       - --class
       - io.growlerdb.connector.ConnectorApp
       - /opt/growlerdb/connector.jar
