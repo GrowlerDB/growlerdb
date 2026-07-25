@@ -683,8 +683,8 @@ services:
   # Variant demo seed (D47/D48, TASK-348) — one-shot Spark job creating the append-only
   # `format-version=3` table `growlerdb.events` with a VARIANT `payload` column (GitHub-events
   # shaped). Uses the same Polaris REST catalog + MinIO as the other seeds, over Spark 4.1.3 +
-  # iceberg-spark-runtime-4.1_2.13:1.11.0 (variant writes). Gated behind the `variant` profile;
-  # run it with `just variant`. The existing pyiceberg seeds are untouched.
+  # iceberg-spark-runtime-4.1_2.13:1.11.0 (variant writes). In the `variant` profile, run as part of
+  # `just stack` (alongside node-events + connector-events). The existing pyiceberg seeds are untouched.
   seed-events:
     profiles: ["variant"]
     image: apache/spark:4.1.3
@@ -737,7 +737,7 @@ services:
   # (below) populates it, and hydration routes through Trino (GROWLERDB_TRINO_ENDPOINT). Part of the
   # `variant` profile — needs the `stack` (controlplane/gateway) up too.
   node-events:
-    profiles: ["variant-serve"]
+    profiles: ["variant"]
     <<: *growlerdb-image
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -775,7 +775,7 @@ services:
   # extracts the variant `payload` — flatten leaves + discriminator-selected shape values
   # (--variant-spec) — into the node. Mirrors the `connector` service's Spark/REST-catalog wiring.
   connector-events:
-    profiles: ["variant-serve"]
+    profiles: ["variant"]
     image: apache/spark:4.1.3
     restart: on-failure
     volumes:
