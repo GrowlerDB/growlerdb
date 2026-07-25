@@ -34,6 +34,10 @@ tower-http = { version = "0.6", features = ["fs", "timeout"] }
 # The MCP HTTP transport oneshots the /v1 router in-process.
 tower = { version = "0.5", features = ["util"] }
 libc = "0.2"
+# mTLS provider selection: two rustls provider features are compiled in (ring via tonic, aws-lc-rs
+# pulled transitively by opendal's reqwest TLS), so rustls can't auto-pick a process default. We
+# install `ring` explicitly in `tls` — the provider our mTLS used before opendal added the ambiguity.
+rustls = { version = "0.23", features = ["ring"] }
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -42,6 +46,6 @@ tokio-stream = { version = "0.1", features = ["net"] }
 http-body-util = "0.1"
 # The compaction-under-hydration regression test writes real parquet
 # fixture files — same major as growlerdb-source's pins.
-parquet = { version = "57", features = ["arrow"] }
-arrow-array = "57"
-arrow-schema = "57"
+parquet = { version = "58", features = ["arrow"] }
+arrow-array = "58"
+arrow-schema = "58"
