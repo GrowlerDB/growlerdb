@@ -97,8 +97,11 @@ kubectl -n "$NAMESPACE" wait --for=condition=complete job/polaris-catalog-setup 
 say "3/7 generator — creates $TABLE and starts feeding it"
 kubectl apply -f "$RENDER_DIR/generator.yaml"
 echo "waiting for the $TABLE table to be created ..."
+# The "created <table>" line is emitted ONCE at generator startup, then batch lines stream every few
+# seconds — so a small `--tail` scrolls past it and the grep never matches, burning the whole timeout
+# (TASK-345). Read the full log (`--tail=-1`) so the one-time line is always found.
 for _ in $(seq 1 40); do
-  kubectl -n "$NAMESPACE" logs deploy/growlerdb-generator --tail=5 2>/dev/null | grep -q "created $TABLE" && { echo "  table created"; break; }
+  kubectl -n "$NAMESPACE" logs deploy/growlerdb-generator --tail=-1 2>/dev/null | grep -q "created $TABLE" && { echo "  table created"; break; }
   sleep 6
 done
 

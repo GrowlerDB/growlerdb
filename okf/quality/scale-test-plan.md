@@ -49,11 +49,16 @@ Each maps to metrics/graphs (dashboard: `deploy/k8s/observability/grafana.yaml`)
    breakdown). Reported against the **uncompressed raw-corpus size** (the OSB/ES-benchmark convention)
    — *not* against `growlerdb_source_bytes`, which is Iceberg `total-files-size` = **compressed**
    parquet and so shifts under storage config (parquet↔orc, zstd↔snappy) even though the logical data
-   is unchanged. Raw size is **ground truth from the generator**: it counts the uncompressed JSON bytes
-   it emits and serves `growlerdb_gen_raw_bytes_total` on `:9109` (correct for every workload +
-   variable-length rows, all replicas summed) — no hardcoded bytes/row. The compressed footprint +
-   compression ratio are reported alongside for context; milestone *sizes* (`STORAGE_GB`) are likewise
-   GB of uncompressed corpus. See [TASK-342].
+   is unchanged. Raw size is **ground truth from the generator**, computed **restart-durably**: the
+   generator serves `growlerdb_gen_raw_bytes_total` / `growlerdb_gen_rows_total` on `:9109` (the
+   uncompressed JSON bytes + rows it emits), and the harness takes their **ratio** — mean uncompressed
+   bytes/row — × the cumulative `source_records`. The ratio is used (not the raw sum) because those
+   counters are per-pod and **reset when the generator restarts** (`set_ingest`/freeze/resume restart
+   it), so summing them undercounts the corpus; the ratio is invariant to the reset and `source_records`
+   never resets ([TASK-344], found in Run 8 where the naive sum read 0.80 GB vs ≈1.12 GB true). No
+   hardcoded bytes/row (that's only the pre-metric fallback). The compressed footprint + compression
+   ratio are reported alongside for context; milestone *sizes* (`STORAGE_GB`) are likewise GB of
+   uncompressed corpus. See [TASK-342].
 5. **Query performance at each storage milestone** (below).
 6. **GrowlerDB vs Iceberg-alone** (Trino over the same table) at each milestone — a **fair** baseline:
    run it **after compaction** (an unmaintained streaming layout of thousands of tiny files penalizes
@@ -76,11 +81,13 @@ cover the low/mid scales directly and **extrapolate** the top:
   huge `BATCH`:** the generator's `BATCH` is one Iceberg snapshot = the connector's commit size (it
   cuts only at snapshot boundaries), and commit latency is ~O(snapshot) — a 300k `BATCH` self-inflicts
   ~9.5s p99 commits, ~10–30k stays sub-2s (the connector-side split is chunked commit).
-- **Storage milestones:** grow the source to **1 GB → 10 GB → 100 GB** of **uncompressed corpus**
-  (the compressed parquet on disk is ~5× smaller, so this fits the cluster disk comfortably);
-  **1 TB** is **modeled**. At each milestone **freeze ingest, run the query load, and capture**:
-  query p50/p95/p99, hydration latency, index:source ratio (+ breakdown), resource utilisation, and
-  the **GrowlerDB-vs-Trino** comparison — into a results table + dashboard snapshots.
+- **Storage milestones:** grow the source to **5 GB → 10 GB → 100 GB** of **uncompressed corpus**
+  (baseline raised from 1 GB to **5 GB** for Run-7-comparable scale on the honest raw basis —
+  [TASK-347]; the compressed parquet on disk is ~5× smaller, so this fits the cluster disk
+  comfortably); **1 TB** is **modeled**. At each milestone **freeze ingest, run the query load, and
+  capture**: query p50/p95/p99, hydration latency, index:source ratio (+ breakdown), resource
+  utilisation, and the **GrowlerDB-vs-Trino** comparison. Each run's normalized numbers are appended
+  to [scale-run results](/quality/scale-results.md) so they're comparable run-over-run.
 - **Extrapolation:** fit the reachable points (query-latency vs data-size; resources vs ingest-rate;
   index:source ratio) and project **1 TB / 100k rec/s** with explicit assumptions + ±ranges.
   Clearly label modeled vs measured.
