@@ -13,16 +13,43 @@ reading this should be able to make a change correctly and leave the OKF up to d
 
 ## Contribution & PR process
 
-- **Branch → change → gate → PR.** Never commit to `main` directly; branch, open a PR, and let it be
-  reviewed and merged.
-- **The full gate must pass before a PR** (`just check` mirrors CI):
+GrowlerDB uses **feature-branch aggregation** — **one ask = one feature branch off `main` = one PR
+to `main`** ([D50](/system/decisions/d50-branching-model.md)). Incremental work accumulates on the
+feature branch; `main` only ever sees complete, gate-green, reviewed features.
+
+- **Feature branch per ask.** Branch off `main` with the usual type prefix (`feat/…`, `fix/…`,
+  `chore/…`, `docs/…`, `ci/…`). A small ask is one branch, a few commits, one PR — as before. A large
+  ask that would once have fragmented into many `main` PRs now fragments *inside* its feature branch.
+- **Sub-PRs stay off `main`.** For a large feature, slice it into sub-branches off the feature branch
+  (`feat/<name>/<slice>` → `feat/<name>`), PR'd **into the feature branch**; the implementing agent
+  **self-merges each sub-PR once its gate is green**. Sub-PRs are internal decomposition, not review
+  gates — the maintainer reviews the **feature → `main`** PR only, seeing the whole feature at once.
+- **Never commit to `main` directly.** The feature → `main` PR is **squash-merged** (one clean commit
+  per feature; `main` keeps a **linear history**), then reviewed and merged.
+- **The full gate must pass before the feature → `main` PR** (`just check` mirrors CI):
   - Rust: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
     `cargo test --workspace`.
   - Lint gates (every PR): typos, shellcheck, actionlint, yamllint, markdownlint; the console adds
     eslint + prettier + `svelte-check`. See [CI & gates](/quality/ci-and-gates.md).
-- **Commit trailer:** `Co-Authored-By: …`. **PR body trailer:** the generated-with note. Keep changes
-  small, self-contained, and honestly scoped.
-- Small, honest slices keep review tractable and the test suite meaningful as a behavior oracle.
+- **Commit trailer:** `Co-Authored-By: …`. **PR body trailer:** the generated-with note. Keep the
+  feature honestly scoped and each internal slice self-contained.
+- Small, honest slices keep review tractable and the test suite meaningful as a behavior oracle;
+  aggregating them on the feature branch keeps every PR to `main` a complete, confident unit.
+
+**`main` is protected** ([D50](/system/decisions/d50-branching-model.md)): require a PR, require the
+`ci-gate` status check, require **linear history** (squash-only), no direct pushes. Releases are
+unaffected — they stay **tag-derived and cut on demand from `main`**
+([D29](/system/decisions/d29-release-versioning.md)); there is no permanent `develop` and no
+`release/*`/`hotfix/*` branch. Repo admins apply the ruleset:
+
+```sh
+gh api -X PUT repos/GrowlerDB/growlerdb/branches/main/protection \
+  -f 'required_status_checks[strict]=true' \
+  -f 'required_status_checks[contexts][]=ci-gate' \
+  -F 'enforce_admins=true' \
+  -F 'required_pull_request_reviews[required_approving_review_count]=1' \
+  -f 'restrictions=' -F 'required_linear_history=true' -F 'allow_force_pushes=false'
+```
 
 ## Every PR updates the OKF
 

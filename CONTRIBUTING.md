@@ -27,8 +27,15 @@ just check          # fmt + clippy + tests — run this before opening a PR
 
 ## Pull requests
 
-- Keep changes focused and reviewable; reference the backlog task where relevant.
-- `just check` must pass (CI enforces fmt, clippy `-D warnings`, tests, and a
+GrowlerDB uses **feature-branch aggregation** ([D50](okf/system/decisions/d50-branching-model.md)):
+**one feature = one branch off `main` = one PR to `main`**, squash-merged. Decompose a large feature
+into sub-branches off the feature branch (`feat/<name>/<slice>` → `feat/<name>`) and merge those into
+the feature branch; open the PR to `main` only when the whole feature is complete. `main` is
+protected (PR + `ci-gate` check + linear history required); releases are cut on demand from tags, so
+there is no `develop`/`release`/`hotfix` branch to target.
+
+- Keep the feature focused and reviewable; reference the backlog task where relevant.
+- `just check` must pass before the PR to `main` (CI enforces fmt, clippy `-D warnings`, tests, and a
   license-audit gate via `cargo-deny`).
 - **Update the OKF.** Any change to behavior, interfaces, components, dependencies,
   decisions, or process must update the relevant concept(s) under [`okf/`](okf/) in
