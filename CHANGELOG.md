@@ -6,6 +6,56 @@ All notable changes to GrowlerDB are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-25
+
+The **Iceberg v3 variant** release — GrowlerDB reaches inside semi-structured `variant` columns and
+makes their leaves searchable, so a v3 lakehouse table with a JSON-shaped column is a first-class
+index. Enterprise scale-limit licensing also goes live end to end.
+
+### Added
+
+- **Iceberg v3 `VARIANT` fields — search inside semi-structured columns.** A `variant` column is
+  mapped through two composable modes: **flatten** (schema-less — every leaf indexed untyped as an
+  exact `path = value` term plus an optional analyzed text catch-all, so type conflicts can't arise
+  by construction) and **shapes** (declared, typed sub-schemas selected per row by a discriminator
+  path, with the full field-type/flag surface). Leaf extraction happens at read time, so nodes and
+  the wire model stay scalar-leaf-only; no whole-value blob is stored (declared paths may be
+  `cached`, the full object comes back via hydration). Ships **connector-first**: the Spark
+  connector reads variant today (bootstrap + changelog, incl. shredded files) via a
+  `VariantExtractor` / `--variant-spec`, and — because released iceberg-rust cannot yet parse a v3
+  schema that contains a variant column — a variant index's **create-time schema introspection and
+  hydration route through Trino** in the interim (key-predicated point reads, variant as JSON),
+  while every non-variant index keeps the native path untouched. The demo ships a variant `events`
+  index (`just stack`) so flatten + shapes work out of the box.
+  (ADR [D47](okf/system/decisions/d47-variant-mapping.md)/[D48](okf/system/decisions/d48-variant-delivery.md)/[D49](okf/system/decisions/d49-variant-iceberg-rust-routing.md)
+  · TASK-348…352)
+- **Enterprise scale-limit licensing is now active.** Beyond the free-tier node cap, the control
+  plane admits additional nodes only with an offline-verified Enterprise license — and the issuing
+  side now exists: `License::mint()` signs a token from an Ed25519 private key (held by GrowlerDB
+  LLC, never in-repo), the production **signing public key ships in the binary**, and Helm wires
+  `credentials.license → GROWLERDB_LICENSE` on the control plane (rendered only when set; empty ⇒
+  free tier). `just mint-license` / `just verify-license` wrap the operator ceremony. Existing nodes
+  and data are never disrupted — scale is the gate. (ADR [D38](okf/system/decisions/d38-scale-limit-entitlement.md) · TASK-346)
+
+### Changed
+
+- **Read stack advanced to Iceberg 0.10 / Arrow 58** (`iceberg-storage-opendal` 0.10) — the base the
+  native variant read path will land on once iceberg-rust ships v3 variant-schema parsing (tracked;
+  the interim Trino lane then demotes to the slow lane for delete-bearing files and the stale
+  fallback).
+- **Trino aligned to 483** across the Compose stack, the scale bench, and the k8s manifests.
+- **Quieter `just stack` startup** — the bring-up moved out of the justfile into
+  `deploy/compose/stack-up.sh`, which prints a handful of numbered step headers instead of echoing
+  the orchestration (and its explanatory prose) line by line; `--quiet-pull` drops the layer-pull
+  spam. No change to the sequence, profiles, or endpoints.
+
+### Docs
+
+- **SEO for the website & docs:** sitemaps, `robots.txt`, and JSON-LD structured data on both hosts,
+  plus a search-engine submission runbook.
+- The **`movies` vector index is featured as the demo default** across the getting-started flow and
+  the OKF (following its 0.5.0 debut as the console's landing index).
+
 ## [0.5.0] - 2026-07-23
 
 The **unified search experience** release — semantic and hybrid retrieval become one search box that
@@ -357,7 +407,8 @@ The initial public (Beta) surface.
   into the image, chart `appVersion`, binaries, and CLI `--version` while the tree stays `0.0.0`;
   the image gets an immutable `X.Y.Z` plus moving `X.Y`/`X`/`latest`. See [RELEASING.md](RELEASING.md).
 
-[Unreleased]: https://github.com/GrowlerDB/growlerdb/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/GrowlerDB/growlerdb/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/GrowlerDB/growlerdb/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.3.0...v0.4.0
