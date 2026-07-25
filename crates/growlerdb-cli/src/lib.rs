@@ -380,6 +380,26 @@ enum Command {
         #[command(flatten)]
         tls: ServerTlsArgs,
     },
+    /// Run a **pool node** (D52): one process serving the windows of **many** windowed indexes over
+    /// one gRPC endpoint, instead of one `serve` per index. Each `--index` must already be built on
+    /// disk (`growlerdb index`); reads are dispatched per `(index, window)`. This is the
+    /// interchangeable shard-host that kills the node-per-index wall. (Writes + CP-driven dynamic
+    /// placement are a follow-on; this serves pre-built windowed indexes read-only.)
+    ServePool {
+        /// A windowed index this node serves (repeatable). Each must already be defined + built on
+        /// disk under `{data_dir}/{index}`.
+        #[arg(long = "index", required = true)]
+        indexes: Vec<String>,
+        /// Address to bind the data-plane gRPC services (`host:port`).
+        #[arg(long, default_value = "127.0.0.1:50051")]
+        addr: String,
+        /// Shared service token closing this node's data-plane gRPC to callers that don't present it —
+        /// same gate as `serve`. Unset ⇒ open (single-node dev). Env: `GROWLERDB_SERVICE_TOKEN`.
+        #[arg(long, env = "GROWLERDB_SERVICE_TOKEN")]
+        service_token: Option<String>,
+        #[command(flatten)]
+        tls: ServerTlsArgs,
+    },
     /// Run a standalone Gateway: terminate the Engine API (gRPC + REST) and route to one or
     /// more remote Nodes over gRPC. The distributed counterpart to `serve`'s embedded gateway.
     ///
@@ -862,6 +882,22 @@ pub async fn run() -> anyhow::Result<()> {
                 })
                 .await?;
             }
+        }
+        Command::ServePool {
+            indexes,
+            addr,
+            service_token,
+            tls,
+        } => {
+            serve_pool(
+                &cli.data_dir,
+                &indexes,
+                &addr,
+                metrics_addr.as_deref(),
+                service_token,
+                tls.load()?,
+            )
+            .await?;
         }
         Command::Gateway {
             node_addr,
@@ -2457,6 +2493,140 @@ async fn serve_windowed(
         })
         .await?;
     println!("growlerdb serve: shut down cleanly");
+    Ok(())
+}
+
+/// Run a **pool node** (D52): serve the windows of *many* windowed indexes from one process over one
+/// gRPC endpoint. For each `--index` (already built on disk) this opens its window shards into a
+/// per-index window map and mounts the [`Pool*` services](growlerdb_engine::PoolSearchService), which
+/// dispatch each request first on its `index` selector to that index's windows, then on the window.
+/// One process therefore fronts many indexes' windows — the interchangeable shard-host that removes
+/// the node-per-index wall. Reads only for now (writes + CP-driven dynamic placement are follow-ons);
+/// each index's windows are the pre-built set on disk.
+async fn serve_pool(
+    data_dir: &str,
+    indexes: &[String],
+    addr: &str,
+    metrics_addr: Option<&str>,
+    service_token: Option<String>,
+    tls: Option<tonic::transport::ServerTlsConfig>,
+) -> anyhow::Result<()> {
+    use growlerdb_engine::{
+        AdminService, LookupService, PoolAdminService, PoolLookupService, PoolSearchService,
+        PoolSuggestService, SearchService, ShardHandle, SuggestService,
+    };
+    use growlerdb_index::ShardId;
+    use growlerdb_proto::{SystemServer, SystemService};
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, RwLock};
+    use tonic::transport::Server;
+
+    let store = growlerdb_index::LocalIndexStore::open(data_dir)?;
+    // The per-index window maps behind the four Pool multiplexers (index → window → service).
+    let search_idx: growlerdb_engine::SharedSearchIndexes = Arc::new(RwLock::new(BTreeMap::new()));
+    let suggest_idx: growlerdb_engine::SharedSuggestIndexes =
+        Arc::new(RwLock::new(BTreeMap::new()));
+    let lookup_idx: growlerdb_engine::SharedLookupIndexes = Arc::new(RwLock::new(BTreeMap::new()));
+    let admin_idx: growlerdb_engine::SharedAdminIndexes = Arc::new(RwLock::new(BTreeMap::new()));
+
+    let mut total_windows = 0usize;
+    for index in indexes {
+        let resolved = load_resolved(data_dir, index)?;
+        anyhow::ensure!(
+            resolved.windowing.is_some(),
+            "serve-pool serves windowed indexes; `{index}` is not windowed"
+        );
+        let table = match &resolved.source {
+            growlerdb_core::Source::Iceberg(s) => s.table.clone(),
+        };
+        // Open each of this index's window shards into the four per-window services. Cold read-through
+        // windows are not yet handled in pool mode (a follow-on) — pool serving targets hot windows.
+        let windows = store.window_shards(index)?;
+        let (search_w, suggest_w, lookup_w, admin_w) = {
+            let (store, resolved, index_s, table, windows) = (
+                store.clone(),
+                resolved.clone(),
+                index.clone(),
+                table.clone(),
+                windows.clone(),
+            );
+            tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                let mut search_w = BTreeMap::new();
+                let mut suggest_w = BTreeMap::new();
+                let mut lookup_w = BTreeMap::new();
+                let mut admin_w = BTreeMap::new();
+                for &w in &windows {
+                    let shard =
+                        Arc::new(store.open_shard(&ShardId::window(&index_s, w), &resolved)?);
+                    let handle = ShardHandle::new(shard);
+                    search_w.insert(w, SearchService::new(handle.clone()));
+                    suggest_w.insert(w, SuggestService::new(handle.clone()));
+                    lookup_w.insert(
+                        w,
+                        LookupService::new(
+                            handle.clone(),
+                            IcebergConfig::from_env(),
+                            table.clone(),
+                            resolved.clone(),
+                        ),
+                    );
+                    admin_w.insert(w, AdminService::new(handle.clone(), &index_s));
+                }
+                Ok((search_w, suggest_w, lookup_w, admin_w))
+            })
+            .await??
+        };
+        total_windows += windows.len();
+        search_idx
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(index.clone(), Arc::new(RwLock::new(search_w)));
+        suggest_idx
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(index.clone(), Arc::new(RwLock::new(suggest_w)));
+        lookup_idx
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(index.clone(), Arc::new(RwLock::new(lookup_w)));
+        admin_idx
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(index.clone(), Arc::new(RwLock::new(admin_w)));
+    }
+
+    let socket: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid --addr `{addr}`: {e}"))?;
+    println!(
+        "growlerdb serve-pool: {} index(es) [{}], {total_windows} window(s) total, on {socket}",
+        indexes.len(),
+        indexes.join(", ")
+    );
+    if service_token.is_none() {
+        eprintln!(
+            "serve-pool: WARNING data-plane gRPC is open (set GROWLERDB_SERVICE_TOKEN to close it)"
+        );
+    }
+    let readiness = spawn_health(metrics_addr).await?;
+    readiness.mark_ready();
+
+    let mut builder = Server::builder();
+    if let Some(tls) = tls {
+        builder = builder.tls_config(tls)?;
+    }
+    builder
+        .layer(growlerdb_engine::service_token_layer(service_token))
+        .add_service(PoolSearchService::new(search_idx).into_server())
+        .add_service(PoolSuggestService::new(suggest_idx).into_server())
+        .add_service(PoolLookupService::new(lookup_idx).into_server())
+        .add_service(PoolAdminService::new(admin_idx).into_server())
+        .add_service(SystemServer::new(SystemService::new(VERSION)))
+        .serve_with_shutdown(socket, async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
+    println!("growlerdb serve-pool: shut down cleanly");
     Ok(())
 }
 

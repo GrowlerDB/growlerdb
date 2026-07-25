@@ -48,15 +48,22 @@ whole stream. Writes have their own in-flight cap (`--max-inflight`).
 
 ## Availability & the designed pool model
 
-Today a `serve` process **binds to one index** and one `--shard-ordinal` (one primary, no live
-replica) — so every index needs its own StatefulSet and a node loss degrades reads to honest partial.
-The designed successor generalizes [D33](/system/decisions/d33-windowed-topology.md)'s windowed
+A plain `serve` process **binds to one index** and one `--shard-ordinal` (one primary, no live
+replica) — so every such index needs its own StatefulSet and a node loss degrades reads to honest
+partial. The successor generalizes [D33](/system/decisions/d33-windowed-topology.md)'s windowed
 placement pool to **every index**: a node becomes an interchangeable **shard host** serving a
 CP-assigned **set of `(index, shard|window)` units** from many indexes in one process
 ([D52](/system/decisions/d52-placement-pool.md), kills node-per-index), and the CP assigns **R holders
 per unit** — one primary writer + read replicas that hydrate read-through from shared object storage
 ([D53](/system/decisions/d53-unit-replication.md), zero-gap failover). See
-[high availability](/system/high-availability.md). Not yet built.
+[high availability](/system/high-availability.md).
+
+**Landing incrementally.** `growlerdb serve-pool --index A --index B …` already serves the windows of
+**many windowed indexes from one process** over one gRPC endpoint — reads dispatch per `(index,
+window)` through the pool multiplexers, so the node-per-index wall is gone for pre-built windowed
+indexes. Still to come: the write path on a pool node, and **CP-driven dynamic placement** (a node
+registering into the pool and being *assigned* units to load on demand, rather than serving a static
+`--index` list), plus per-unit replication.
 
 ## Notes
 
