@@ -61,9 +61,11 @@ per unit** — one primary writer + read replicas that hydrate read-through from
 **Landing incrementally.** `growlerdb serve-pool --index A --index B …` already serves the windows of
 **many windowed indexes from one process** over one gRPC endpoint — reads dispatch per `(index,
 window)` through the pool multiplexers, so the node-per-index wall is gone for pre-built windowed
-indexes. Still to come: the write path on a pool node, and **CP-driven dynamic placement** (a node
-registering into the pool and being *assigned* units to load on demand, rather than serving a static
-`--index` list), plus per-unit replication.
+indexes. With `--register` it heartbeats into the **index-agnostic placement pool** (`RegisterNode`
+now carries only the endpoint) and announces every served index's windows, so a cluster gateway can
+route to it. Still to come: the write path on a pool node, **dynamic assignment** (a node being
+*assigned* units to load on demand rather than serving a static `--index` list), and per-unit
+replication.
 
 ## Notes
 
