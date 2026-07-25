@@ -7,7 +7,7 @@ networks:
 
 services:
   trino:
-    image: trinodb/trino:470
+    image: trinodb/trino:483
     container_name: bench-trino
     volumes:
       - ./trino/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
