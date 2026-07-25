@@ -3444,7 +3444,7 @@ async fn resolve_windowed_routing_cp(
                 r
             }
         };
-        nodes.push(growlerdb_engine::WindowNode::new(Arc::new(remote), s.window).shared());
+        nodes.push(growlerdb_engine::WindowNode::new(Arc::new(remote), index, s.window).shared());
         descriptors.push((
             s.window,
             s.has_event_bounds.then_some((s.event_min, s.event_max)),
@@ -3960,7 +3960,7 @@ async fn gateway_windowed_from_registry(
                 r
             }
         };
-        nodes.push(growlerdb_engine::WindowNode::new(Arc::new(remote), *w).shared());
+        nodes.push(growlerdb_engine::WindowNode::new(Arc::new(remote), name, *w).shared());
         descriptors.push((*w, wa.event_min.zip(wa.event_max), wa.cold));
     }
     Ok(growlerdb_engine::Gateway::windowed(

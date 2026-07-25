@@ -352,26 +352,43 @@ impl Admin for WindowedAdminService {
     }
 }
 
-/// The **client** half of distributed windowed routing: a [`Node`] that wraps the remote
-/// node serving a window and **stamps that window's id** onto every search/suggest before
+/// The **client** half of distributed windowed routing: a [`Node`] that wraps the remote node
+/// serving a window and **stamps the `(index, window)` unit** onto every search/suggest before
 /// delegating, so the receiving multiplexer knows which shard to hit. The Gateway holds one per window
-/// (often several over the same endpoint) and scatters to them exactly as it would plain shards —
-/// the window addressing is localized here, so [`Gateway::windowed`](crate::gateway::Gateway::windowed)
-/// and its pruning are untouched.
+/// (often several over the same endpoint) and scatters to them exactly as it would plain shards — the
+/// unit addressing is localized here, so [`Gateway::windowed`](crate::gateway::Gateway::windowed) and
+/// its pruning are untouched.
+///
+/// Stamping the **index** too (not just the window) is what lets the Gateway front a **pool node**
+/// (D52): a node serving windows of many indexes over one endpoint routes on the request's index
+/// selector first ([`PoolSearchService`](crate::pool_routing::PoolSearchService)), then the window. A
+/// single-index windowed node ignores the index selector, so stamping it is harmless there.
 pub struct WindowNode {
     inner: Arc<dyn Node>,
+    index: String,
     window: i64,
 }
 
 impl WindowNode {
-    /// Front `inner` (a `RemoteNode` to the window's serving endpoint) as the node for `window`.
-    pub fn new(inner: Arc<dyn Node>, window: i64) -> Self {
-        Self { inner, window }
+    /// Front `inner` (a `RemoteNode` to the unit's serving endpoint) as the node for `(index,
+    /// window)`.
+    pub fn new(inner: Arc<dyn Node>, index: impl Into<String>, window: i64) -> Self {
+        Self {
+            inner,
+            index: index.into(),
+            window,
+        }
     }
 
     /// Erase to a shared `dyn Node` for the [Gateway](crate::gateway::Gateway).
     pub fn shared(self) -> Arc<dyn Node> {
         Arc::new(self)
+    }
+
+    /// Stamp this node's `(index, window)` unit onto a request selector pair.
+    fn stamp(&self, index: &mut String, window: &mut i64) {
+        index.clone_from(&self.index);
+        *window = self.window;
     }
 }
 
@@ -381,7 +398,8 @@ impl Node for WindowNode {
         &self,
         mut req: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
-        req.get_mut().window = self.window;
+        let r = req.get_mut();
+        self.stamp(&mut r.index, &mut r.window);
         self.inner.search(req).await
     }
 
@@ -389,7 +407,8 @@ impl Node for WindowNode {
         &self,
         mut req: Request<SuggestRequest>,
     ) -> Result<Response<SuggestResponse>, Status> {
-        req.get_mut().window = self.window;
+        let r = req.get_mut();
+        self.stamp(&mut r.index, &mut r.window);
         self.inner.suggest(req).await
     }
 
@@ -397,7 +416,8 @@ impl Node for WindowNode {
         &self,
         mut req: Request<GetByKeyRequest>,
     ) -> Result<Response<GetByKeyResponse>, Status> {
-        req.get_mut().window = self.window;
+        let r = req.get_mut();
+        self.stamp(&mut r.index, &mut r.window);
         self.inner.get_by_key(req).await
     }
 
@@ -405,7 +425,8 @@ impl Node for WindowNode {
         &self,
         mut req: Request<DescribeIndexRequest>,
     ) -> Result<Response<DescribeIndexResponse>, Status> {
-        req.get_mut().window = self.window;
+        let r = req.get_mut();
+        self.stamp(&mut r.index, &mut r.window);
         self.inner.describe_index(req).await
     }
 
@@ -413,7 +434,8 @@ impl Node for WindowNode {
         &self,
         mut req: Request<AggregateRequest>,
     ) -> Result<Response<AggregateResponse>, Status> {
-        req.get_mut().window = self.window;
+        let r = req.get_mut();
+        self.stamp(&mut r.index, &mut r.window);
         self.inner.aggregate(req).await
     }
 }
@@ -511,8 +533,17 @@ mod tests {
         );
     }
 
-    /// A [`Node`] that records the `window` selector of the last search/suggest it received.
-    struct RecordingNode(Mutex<i64>);
+    /// A [`Node`] that records the `(index, window)` selector of the last request it received.
+    struct RecordingNode(Mutex<(String, i64)>);
+
+    impl RecordingNode {
+        fn record(&self, index: &str, window: i64) {
+            *self.0.lock().unwrap() = (index.to_string(), window);
+        }
+        fn seen(&self) -> (String, i64) {
+            self.0.lock().unwrap().clone()
+        }
+    }
 
     #[tonic::async_trait]
     impl Node for RecordingNode {
@@ -520,44 +551,45 @@ mod tests {
             &self,
             req: Request<SearchRequest>,
         ) -> Result<Response<SearchResponse>, Status> {
-            *self.0.lock().unwrap() = req.get_ref().window;
+            self.record(&req.get_ref().index, req.get_ref().window);
             Ok(Response::new(SearchResponse::default()))
         }
         async fn suggest(
             &self,
             req: Request<SuggestRequest>,
         ) -> Result<Response<SuggestResponse>, Status> {
-            *self.0.lock().unwrap() = req.get_ref().window;
+            self.record(&req.get_ref().index, req.get_ref().window);
             Ok(Response::new(SuggestResponse::default()))
         }
         async fn get_by_key(
             &self,
             req: Request<GetByKeyRequest>,
         ) -> Result<Response<GetByKeyResponse>, Status> {
-            *self.0.lock().unwrap() = req.get_ref().window;
+            self.record(&req.get_ref().index, req.get_ref().window);
             Ok(Response::new(GetByKeyResponse::default()))
         }
         async fn describe_index(
             &self,
             req: Request<DescribeIndexRequest>,
         ) -> Result<Response<DescribeIndexResponse>, Status> {
-            *self.0.lock().unwrap() = req.get_ref().window;
+            self.record(&req.get_ref().index, req.get_ref().window);
             Ok(Response::new(DescribeIndexResponse::default()))
         }
     }
 
     #[tokio::test]
-    async fn window_node_stamps_the_selector_onto_search() {
-        let rec = Arc::new(RecordingNode(Mutex::new(-1)));
-        let node = WindowNode::new(rec.clone(), 7);
-        // A request the Gateway scatters carries no window; the WindowNode stamps its own.
+    async fn window_node_stamps_the_unit_onto_search() {
+        let rec = Arc::new(RecordingNode(Mutex::new((String::new(), -1))));
+        let node = WindowNode::new(rec.clone(), "logs", 7);
+        // A request the Gateway scatters carries neither index nor window; the WindowNode stamps its
+        // own (index, window) unit so a pool node dispatches on both.
         node.search(Request::new(SearchRequest {
             query: "*".into(),
             ..Default::default()
         }))
         .await
         .unwrap();
-        assert_eq!(*rec.0.lock().unwrap(), 7);
+        assert_eq!(rec.seen(), ("logs".to_string(), 7));
     }
 
     async fn suggest_texts(
@@ -623,8 +655,8 @@ mod tests {
 
     #[tokio::test]
     async fn window_node_stamps_the_selector_onto_suggest() {
-        let rec = Arc::new(RecordingNode(Mutex::new(-1)));
-        let node = WindowNode::new(rec.clone(), 9);
+        let rec = Arc::new(RecordingNode(Mutex::new((String::new(), -1))));
+        let node = WindowNode::new(rec.clone(), "logs", 9);
         node.suggest(Request::new(SuggestRequest {
             field: "id".into(),
             text: "x".into(),
@@ -632,7 +664,7 @@ mod tests {
         }))
         .await
         .unwrap();
-        assert_eq!(*rec.0.lock().unwrap(), 9);
+        assert_eq!(rec.seen(), ("logs".to_string(), 9));
     }
 
     async fn agg_ids(mux: &WindowedSearchService, window: i64) -> Result<String, tonic::Code> {
@@ -675,24 +707,24 @@ mod tests {
 
     #[tokio::test]
     async fn window_node_stamps_the_selector_onto_get_by_key() {
-        let rec = Arc::new(RecordingNode(Mutex::new(-1)));
-        let node = WindowNode::new(rec.clone(), 11);
+        let rec = Arc::new(RecordingNode(Mutex::new((String::new(), -1))));
+        let node = WindowNode::new(rec.clone(), "logs", 11);
         // The Gateway broadcasts a hydration with no window; the WindowNode stamps its own so the
         // receiving multiplexer knows which window's shard to hit.
         node.get_by_key(Request::new(GetByKeyRequest::default()))
             .await
             .unwrap();
-        assert_eq!(*rec.0.lock().unwrap(), 11);
+        assert_eq!(rec.seen(), ("logs".to_string(), 11));
     }
 
     #[tokio::test]
     async fn window_node_stamps_the_selector_onto_describe() {
-        let rec = Arc::new(RecordingNode(Mutex::new(-1)));
-        let node = WindowNode::new(rec.clone(), 13);
+        let rec = Arc::new(RecordingNode(Mutex::new((String::new(), -1))));
+        let node = WindowNode::new(rec.clone(), "logs", 13);
         node.describe_index(Request::new(DescribeIndexRequest::default()))
             .await
             .unwrap();
-        assert_eq!(*rec.0.lock().unwrap(), 13);
+        assert_eq!(rec.seen(), ("logs".to_string(), 13));
     }
 
     async fn describe_num_docs(
