@@ -77,6 +77,32 @@ pub trait RegistryBackend: Send + Sync {
 
     /// Durably persist the session-epoch sidecar. Best-effort at the call site.
     fn persist_sessions(&self, sessions: &BTreeMap<String, i64>) -> Result<()>;
+
+    // ---- leadership & change-polling (for N-replica HA over a shared store) -------------------
+    // The defaults model the local single-writer file: it is unconditionally the leader (its `flock`
+    // already made it the sole writer) and has no standbys polling for changes. A replicated backend
+    // overrides these so a read-only standby can detect the leader's writes and take over on its death.
+
+    /// The store's monotonic registry version, when the backend supports change-polling. A **standby**
+    /// polls this and calls [`Registry::reload`](crate::Registry::reload) when it advances — the
+    /// leader wrote. `None` = unsupported (the local JSON file has one writer and no standbys).
+    fn poll_version(&self) -> Result<Option<i64>> {
+        Ok(None)
+    }
+
+    /// Attempt to acquire write **leadership**. `Ok(true)` if this backend now holds it. A standby
+    /// calls this to promote itself when the previous leader dies. The default is unconditionally
+    /// leader — the [`JsonFileBackend`] already took an exclusive `flock` at open.
+    fn try_become_leader(&self) -> Result<bool> {
+        Ok(true)
+    }
+
+    /// Whether this backend currently holds write leadership. Default `true` (see
+    /// [`try_become_leader`](RegistryBackend::try_become_leader)). A backend that is **not** leader
+    /// must refuse every persist so a standby can never corrupt the shared store.
+    fn is_leader(&self) -> bool {
+        true
+    }
 }
 
 /// The persisted registry **envelope**: a `{ version, indexes, … }` document around the catalog,
