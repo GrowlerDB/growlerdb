@@ -1084,6 +1084,16 @@ fn spawn_locator_remap(
         );
         return;
     }
+    // A variant table's metadata can't be parsed by released iceberg-rust (D49), so the re-map
+    // poller (which plans over the table) would fail every tick. Skip it, once and loudly (D45):
+    // a variant index is connector-fed and its locators are refreshed lazily on hydration instead.
+    if handles[0].current().has_variant_fields() {
+        println!(
+            "remap `{label}`: skipped — variant table (iceberg-rust can't plan a v3 variant \
+             schema, D49); locators refresh lazily on hydration via the Trino lane"
+        );
+        return;
+    }
     tokio::spawn(async move {
         // Own shared reader: lazily connected, invalidated on failure so the next tick
         // reconnects (and its plan cache makes the steady-state poll one REST call).
@@ -1609,7 +1619,11 @@ async fn serve(cfg: ServeConfig<'_>) -> anyhow::Result<()> {
     let reindex_fence = growlerdb_engine::ReindexFence::new();
     let write = growlerdb_engine::WriteService::new(handle.clone(), index, max_inflight)
         .with_fence(reindex_fence.clone())
-        .with_source_recreated(source_recreated);
+        .with_source_recreated(source_recreated)
+        // Embed VECTOR fields on the streaming write path (D46) so a connector-fed index (e.g. a
+        // variant table, which can't cold-build — D49) still gets its LOCAL embeddings. No-op for a
+        // non-vector index.
+        .with_embedding(resolved.clone());
     let search = growlerdb_engine::SearchService::new(handle.clone());
     // GetByKey hydrates coordinates back to rows from the index's Iceberg source.
     let table = match &resolved.source {

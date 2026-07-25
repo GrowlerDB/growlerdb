@@ -68,6 +68,13 @@ pub struct WriteService {
     /// inspection; a reindex re-anchors and clears it. Set once at startup via
     /// [`with_source_recreated`](Self::with_source_recreated).
     source_recreated: bool,
+    /// When the served index maps a VECTOR field, the resolved index — so the streaming write path
+    /// can run the embed stage (D46) on each batch's upsert docs before commit. The connector sends
+    /// the source text, not the embedding, so without this a **connector-fed** index (which never
+    /// cold-builds — e.g. a variant table) would have empty vectors and no semantic/hybrid coverage.
+    /// `None` for a non-vector index (the embed stage is skipped entirely). Set via
+    /// [`with_embedding`](Self::with_embedding).
+    embedding: Option<Arc<growlerdb_core::ResolvedIndex>>,
 }
 
 impl WriteService {
@@ -86,6 +93,7 @@ impl WriteService {
             max_inflight: max_inflight.max(1),
             fence: ReindexFence::new(),
             source_recreated: false,
+            embedding: None,
         }
     }
 
@@ -93,6 +101,19 @@ impl WriteService {
     /// is in progress. Wire the same fence into the Admin service's `with_source`.
     pub fn with_fence(mut self, fence: ReindexFence) -> Self {
         self.fence = fence;
+        self
+    }
+
+    /// Run the embed stage (D46) on incoming batches for a VECTOR index — the streaming-write
+    /// counterpart of the cold-build/sync embed. `resolved` is the served index. A no-op when the
+    /// index has no VECTOR field, so serve can call this unconditionally. This is what gives a
+    /// **connector-fed** index (e.g. a variant table, which can't cold-build) its LOCAL embeddings.
+    pub fn with_embedding(mut self, resolved: growlerdb_core::ResolvedIndex) -> Self {
+        self.embedding = resolved
+            .fields
+            .iter()
+            .any(|f| f.ty == growlerdb_core::FieldType::Vector)
+            .then(|| Arc::new(resolved));
         self
     }
 
@@ -170,7 +191,7 @@ impl Write for WriteService {
             (self.max_inflight - self.inflight.available_permits()) as u64,
         );
 
-        let batch: CommitBatch = request
+        let mut batch: CommitBatch = request
             .into_inner()
             .batch
             .ok_or_else(|| {
@@ -191,7 +212,13 @@ impl Write for WriteService {
         let ops = batch.ops.len() as u64;
         let shard = self.shard.current();
         let started = std::time::Instant::now();
+        // Embed the batch's VECTOR fields (D46) for a connector-fed vector index — inside the
+        // blocking task, since embedding is CPU-bound like the commit. `None` (non-vector) skips it.
+        let embedding = self.embedding.clone();
         let snapshot = tokio::task::spawn_blocking(move || {
+            if let Some(idx) = &embedding {
+                growlerdb_embed::embed_commit_batch(idx, &mut batch);
+            }
             // Hold the admission permit for the TRUE duration of the blocking commit.
             // `spawn_blocking` tasks can't be cancelled, so when a client gives up (its deadline
             // fires and tonic drops this handler future), the commit keeps running. Moving the permit
