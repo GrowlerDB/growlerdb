@@ -1543,6 +1543,26 @@ impl ResolvedIndex {
     pub fn shard_router(&self, shards: u32) -> ShardRouter {
         ShardRouter::new(shards, self.routing_strategy())
     }
+
+    /// Whether this index maps an Iceberg v3 **variant** column (D47). This is the per-index
+    /// **routing fork** ([D48](../../../okf/system/decisions/d48-variant-delivery.md)): a variant
+    /// table's schema introspection, hydration, stats, and snapshot polling all route around
+    /// released iceberg-rust (which cannot parse a v3 variant schema) — hydration through Trino,
+    /// the rest through the connector / raw metadata — while a non-variant index keeps the native
+    /// path untouched.
+    pub fn has_variant_field(&self) -> bool {
+        self.fields.iter().any(|f| f.ty == FieldType::Variant)
+    }
+
+    /// The variant column name(s) mapped by this index, in definition order (usually one). Used by
+    /// the connector (extraction) and the Trino hydration seam (render `CAST(col AS JSON)`).
+    pub fn variant_columns(&self) -> Vec<&str> {
+        self.fields
+            .iter()
+            .filter(|f| f.ty == FieldType::Variant)
+            .map(|f| f.path.as_str())
+            .collect()
+    }
 }
 
 /// The impact of **altering** an index from one resolved definition to another:
