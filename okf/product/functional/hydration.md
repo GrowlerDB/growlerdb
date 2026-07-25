@@ -50,6 +50,20 @@ Under either strategy every fetched row is **verified** against the requested ke
 never returned), and a genuine duplicate key in the source is detected loudly
 (`growlerdb_duplicate_pks_total`; deterministic highest-`(file, position)` winner).
 
+## Variant tables: the interim Trino lane
+
+For an index over an Iceberg v3 [variant](/product/functional/index-management/variant.md) table,
+hydration takes a **separate lane** ([D48](/system/decisions/d48-variant-delivery.md),
+[D49](/system/decisions/d49-variant-iceberg-rust-routing.md)): released iceberg-rust cannot parse a
+v3 variant schema (it fails in `load_table`, which fronts even the direct-parquet point read), so a
+per-index fork (`ResolvedIndex::has_variant_field`) routes the read through **Trino** — a
+key-predicated point `SELECT` returning the variant column as JSON — while a non-variant index keeps
+the native path **completely untouched**. Trino unreachable degrades loudly
+([D45](/system/decisions/d45-degraded-vs-error.md)), never a silent miss. The seam returns the same
+result shape as the native reader, so when iceberg-rust ships variant the native path takes over
+without touching callers, leaving Trino as the permanent slow lane for delete-bearing files and the
+stale fallback.
+
 ## Notes
 
 Hydration is the "fetch-by-key from the lake" half of the [thesis](/overview.md) (find-by-text in the

@@ -25,10 +25,15 @@ the wire model stay scalar-leaf-only. No whole-value blob is stored: declared pa
 [hydration](/product/functional/hydration.md). Readers use Parquet-shredded subcolumns for
 declared paths where available.
 
-**Status.** Planned. Supersedes the variant clause of [D28](/system/decisions/d28-iceberg-v3.md)
+**Status.** Mapping model **implemented** in the Rust core (index-def resolution, the untyped
+flatten node index, the dotted-path query rewrite, and create-time cross-shape type validation);
+connector-side extraction and the interim hydration wiring are in progress
+([D48](/system/decisions/d48-variant-delivery.md), [D49](/system/decisions/d49-variant-iceberg-rust-routing.md)).
+Supersedes the variant clause of [D28](/system/decisions/d28-iceberg-v3.md)
 ("variant to flattened dotted paths") — flatten generalizes it and shapes add typed access; D28
-continues to cover the rest of the v3 types path (nanosecond timestamps). Gated on ecosystem
-variant support (iceberg-rust/Arrow reads, Spark extraction, Parquet shredding).
+continues to cover the rest of the v3 types path (nanosecond timestamps). Still gated on ecosystem
+variant support for the native read path (iceberg-rust/Arrow reads, Parquet shredding); Spark
+extraction is available today.
 
 **Why.**
 

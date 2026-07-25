@@ -34,10 +34,12 @@ mod key_scan;
 mod plan_cache;
 mod point_read;
 mod shared_reader;
+mod trino;
 
 pub use key_scan::read_file_key_rows;
 pub use plan_cache::{PlanCache, PLAN_CACHE_CAP};
 pub use shared_reader::SharedReader;
+pub use trino::{TrinoConfig, TrinoHydrator};
 
 // The table IO handle [`read_file_key_rows`] (and [`TablePlan`]) hands around — re-exported so
 // callers (the engine's re-map driver, its tests) needn't depend on the `iceberg` crate.
@@ -78,6 +80,11 @@ pub enum SourceError {
     /// rendered as a string, so the source crate needn't depend on the engine's error type.
     #[error("sink: {0}")]
     Sink(String),
+
+    /// The **interim Trino hydration lane** (D48) failed — Trino unreachable, a bad HTTP response,
+    /// or a query error. Surfaced as a loud error (D45), never a silent empty/partial hydration.
+    #[error("trino: {0}")]
+    Trino(String),
 }
 
 pub type Result<T> = std::result::Result<T, SourceError>;

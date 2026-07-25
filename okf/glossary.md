@@ -49,11 +49,13 @@ Core GrowlerDB terms. Concepts elsewhere in this bundle link here for definition
 - **Scatter-gather** — the gateway querying all target shards in parallel and merging their top-K.
 - **Alias / ILM** — a named pointer to one or more indexes enabling atomic reindex-and-swap and
   index-lifecycle retention.
-- **Variant field** *(planned)* — a mapped Iceberg v3 `variant` column: semi-structured, per-row
-  structure; indexed via flatten and/or shapes.
-- **Flatten (variant)** *(planned)* — the untyped catch-all over a variant value: every leaf as an
-  exact `path = value` term, plus an optional analyzed text field over string leaves.
-- **Shape** *(planned)* — a named, typed sub-mapping of paths under a variant column; one is
-  selected per row by the discriminator.
-- **Discriminator** *(planned)* — the declared path (in the variant or a sibling column) whose
+- **Variant field** *(mapping shipped; ingest/hydration in progress)* — a mapped Iceberg v3
+  `variant` column: semi-structured, per-row structure; indexed via flatten and/or shapes.
+- **Flatten (variant)** *(shipped)* — the untyped catch-all over a variant value: every leaf as an
+  exact `path = value` term (the node's `<col>#terms` field), plus an optional analyzed text field
+  over string leaves (`<col>#text`).
+- **Shape** *(mapping shipped)* — a named, typed sub-mapping of paths under a variant column; one is
+  selected per row by the discriminator. Resolves to typed `column.path` fields with the full flag
+  surface; connector-side `variant_get` extraction is in progress.
+- **Discriminator** *(shipped)* — the declared path (in the variant or a sibling column) whose
   value selects a row's shape.

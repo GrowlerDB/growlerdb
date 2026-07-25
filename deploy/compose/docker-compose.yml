@@ -134,7 +134,7 @@ services:
   # errors (non-zero) when the metastore is already bootstrapped — so wrap it to treat that case as
   # a no-op success, keeping restarts idempotent. (`$$` escapes `$` from compose interpolation.)
   polaris-bootstrap:
-    image: apache/polaris-admin-tool:latest
+    image: apache/polaris-admin-tool:1.6.0
     depends_on:
       polaris-db:
         condition: service_healthy
@@ -154,7 +154,7 @@ services:
         exit 1
 
   polaris:
-    image: apache/polaris:latest
+    image: apache/polaris:1.6.0
     restart: unless-stopped   # catalog server self-heals; recovers automatically when it returns
     depends_on:
       createbuckets:
@@ -186,7 +186,7 @@ services:
   # mismatch — so `--exit-code-from spark` gives pass/fail. Enable with: --profile spark
   spark:
     profiles: ["spark"]
-    image: apache/spark:4.0.0
+    image: apache/spark:4.1.3
     volumes:
       - ../../connector/target/growlerdb-connector-0.0.0.jar:/opt/growlerdb/connector.jar:ro
     entrypoint: ["/opt/spark/bin/spark-submit"]
@@ -197,7 +197,7 @@ services:
       - --conf
       - spark.jars.ivy=/tmp/.ivy2
       - --packages
-      - org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.10.0
+      - org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:1.11.0
       - --class
       - io.growlerdb.connector.ChangelogReadApp
       - /opt/growlerdb/connector.jar
@@ -589,7 +589,7 @@ services:
     # a transient failure self-heals: on restart it re-reads the Node's committed checkpoint and
     # resumes exactly-once, instead of leaving ingestion frozen while the source keeps growing.
     restart: on-failure
-    image: apache/spark:4.0.0
+    image: apache/spark:4.1.3
     volumes:
       - ../../connector/target/growlerdb-connector-0.0.0.jar:/opt/growlerdb/connector.jar:ro
     environment:
@@ -607,7 +607,7 @@ services:
       - --conf
       - spark.jars.ivy=/tmp/.ivy2
       - --packages
-      - org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.10.0,org.apache.iceberg:iceberg-aws-bundle:1.10.0
+      - org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:1.11.0,org.apache.iceberg:iceberg-aws-bundle:1.11.0
       # Polaris REST catalog `stream` → MinIO via S3FileIO (own creds; no STS delegation).
       - --conf
       - spark.sql.catalog.stream=org.apache.iceberg.spark.SparkCatalog
@@ -679,6 +679,54 @@ services:
       interval: 5s
       timeout: 3s
       retries: 40
+
+  # Variant demo seed (D47/D48, TASK-348) — one-shot Spark job creating the append-only
+  # `format-version=3` table `growlerdb.events` with a VARIANT `payload` column (GitHub-events
+  # shaped). Uses the same Polaris REST catalog + MinIO as the other seeds, over Spark 4.1.3 +
+  # iceberg-spark-runtime-4.1_2.13:1.11.0 (variant writes). Gated behind the `variant` profile;
+  # run it with `just variant`. The existing pyiceberg seeds are untouched.
+  seed-events:
+    profiles: ["variant"]
+    image: apache/spark:4.1.3
+    depends_on:
+      polaris:
+        condition: service_started
+      createbuckets:
+        condition: service_completed_successfully
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+    volumes:
+      - ./seed-events/events.sql:/opt/growlerdb/events.sql:ro
+    entrypoint: ["/opt/spark/bin/spark-sql"]
+    command:
+      - --conf
+      - spark.jars.ivy=/tmp/.ivy2
+      - --packages
+      - org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:1.11.0,org.apache.iceberg:iceberg-aws-bundle:1.11.0
+      - --conf
+      - spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+      - --conf
+      - spark.sql.catalog.stream=org.apache.iceberg.spark.SparkCatalog
+      - --conf
+      - spark.sql.catalog.stream.type=rest
+      - --conf
+      - spark.sql.catalog.stream.uri=http://polaris:8181/api/catalog
+      - --conf
+      - spark.sql.catalog.stream.warehouse=growlerdb
+      - --conf
+      - spark.sql.catalog.stream.credential=root:s3cr3t
+      - --conf
+      - spark.sql.catalog.stream.scope=PRINCIPAL_ROLE:ALL
+      - --conf
+      - spark.sql.catalog.stream.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+      - --conf
+      - spark.sql.catalog.stream.s3.endpoint=http://minio:9000
+      - --conf
+      - spark.sql.catalog.stream.s3.path-style-access=true
+      - -f
+      - /opt/growlerdb/events.sql
 
 volumes:
   minio-data:

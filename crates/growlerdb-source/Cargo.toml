@@ -20,6 +20,12 @@ arrow-schema = "58"
 parquet = { version = "58", features = ["arrow", "async"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 futures = "0.3"
+# Interim Trino-backed hydration for variant tables (D48): released iceberg-rust cannot parse a v3
+# variant schema, so variant-table hydration + schema introspection route through Trino SQL until
+# TASK-353 swaps in the native path. `blocking` is unused; the REST poll loop is async.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde.workspace = true
+serde_json = "1"
 
 [dev-dependencies]
 bytes = "1"

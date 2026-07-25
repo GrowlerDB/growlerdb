@@ -29,8 +29,14 @@ delivered in this order:
    line we already pin carries the decode machinery). Trino is then demoted to the **permanent
    slow lane**: delete-bearing files and the pass-2 stale-locator fallback.
 
-**Status.** Planned. The seam is designed so step 3 swaps the primary implementation without
-touching callers.
+**Status.** In progress. The interim hydration + schema-introspection **seam is implemented**
+(`growlerdb-source::trino` — key-predicated point `SELECT`s with the variant as JSON, `nextUri`
+poll loop, `information_schema` introspection, D45-loud errors; unit-tested), and the per-index
+routing fork (`ResolvedIndex::has_variant_field`) exists. The full per-call-site routing around
+released iceberg-rust — not just hydration — is recorded in
+[D49](/system/decisions/d49-variant-iceberg-rust-routing.md). Pending: wiring the fork into the
+engine's hydrate/create call sites and the connector's variant extraction (step 1). The seam is
+designed so step 3 swaps the primary implementation without touching callers.
 
 **Why.**
 
