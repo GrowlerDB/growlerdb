@@ -46,7 +46,7 @@ step 4 6 "Movies demo index (semantic + hybrid out of the box)"
 # A SMALL 300-row Wikipedia movie-plots slice (CC-BY-SA) from the COMMITTED local parquet — no download,
 # ~1s embed at build — so semantic/hybrid work immediately and the console lands here
 # (GROWLERDB_DEFAULT_INDEX=movies). `just demo-data` upgrades it to the full corpus.
-DEMO_DATA_FILE=/local/movies-300.parquet DEMO_DATA_SIZE=300 \
+DEMO_DATA_SIZE=300 \
   dc --profile stack --profile demo-data run --rm --build demo-data
 # `--force-recreate`: the run above re-seeds `movies`, so cold-rebuild the node against the current table.
 dc --profile stack --profile demo-data up -d --force-recreate node-movies
