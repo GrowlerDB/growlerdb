@@ -7,8 +7,10 @@
 //! shard, with replica promotion on primary loss). Durably backed by a JSON document with
 //! atomic writes.
 
+mod backend;
 mod registry;
 
+pub use backend::{JsonFileBackend, PersistedState, RegistryBackend, RegistrySnapshot};
 pub use registry::{
     glob_match, ActivityEvent, ApiToken, IndexEntry, IndexStatus, IndexSummary, NodeId, Registry,
     RegistryError, Result, SavedQuery, ShardAssignment, WindowAssignment,
