@@ -151,6 +151,13 @@ impl Readiness {
         self.0.store(true, Ordering::SeqCst);
     }
 
+    /// Withdraw readiness so a Kubernetes Service takes the pod out of rotation — e.g. an HA
+    /// control-plane standby that isn't the registry leader (readiness tracks leadership in
+    /// active-passive mode, so the Service routes only to the leader; see D51).
+    pub fn mark_not_ready(&self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+
     /// Whether the component has signalled readiness.
     pub fn is_ready(&self) -> bool {
         self.0.load(Ordering::SeqCst)

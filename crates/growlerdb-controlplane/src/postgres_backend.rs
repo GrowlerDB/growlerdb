@@ -22,13 +22,17 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::mpsc::{channel, Sender};
 
 use postgres::{Client, NoTls};
 use serde_json::Value;
 
 use crate::backend::{PersistedState, RegistryBackend, RegistryFile, RegistrySnapshot};
 use crate::registry::{ActivityEvent, RegistryError, Result};
+
+/// A unit of work handed to the backend's dedicated Postgres thread: it borrows the one `Client`,
+/// runs the query, and returns its own typed result to the caller over a private channel.
+type Job = Box<dyn FnOnce(&mut Client) + Send>;
 
 /// Fixed key for the session-level advisory lock that enforces single-writer across replicas — the
 /// Postgres successor to the JSON backend's `flock`. Any constant `bigint`; scoped to the database.
@@ -43,11 +47,16 @@ CREATE TABLE IF NOT EXISTS cp_state ( \
   doc JSONB NOT NULL \
 );";
 
-/// The externalized Postgres [`RegistryBackend`]. Holds one blocking client for the backend's
-/// lifetime; the same session is what holds the single-writer advisory lock once this replica is
-/// leader. `is_writer` tracks leadership so a standby refuses every persist until it is promoted.
+/// The externalized Postgres [`RegistryBackend`]. The blocking `postgres` client drives its **own**
+/// tokio runtime under the hood, so it must never be called from a thread that is already inside the
+/// control plane's async runtime (its gRPC handlers) — that panics with *"cannot start a runtime from
+/// within a runtime"*. So the `Client` is confined to one **dedicated worker thread** with no ambient
+/// runtime; every op is marshaled to it over [`jobs`](Self::jobs) and blocks for the reply. That one
+/// thread also holds the single session that owns the single-writer advisory lock, and serializes all
+/// access (no `Mutex<Client>` needed). `is_writer` tracks leadership so a standby refuses every
+/// persist until it is promoted.
 pub struct PostgresBackend {
-    client: Mutex<Client>,
+    jobs: Sender<Job>,
     is_writer: AtomicBool,
 }
 
@@ -71,22 +80,68 @@ impl PostgresBackend {
     /// backend can [`load`](RegistryBackend::load) and [`poll_version`](RegistryBackend::poll_version)
     /// (serve reads + watch for the leader's writes) but refuses every persist until promoted via
     /// [`try_become_leader`](RegistryBackend::try_become_leader).
+    ///
+    /// Spawns the dedicated worker thread and connects **on it** (off any runtime); the connect +
+    /// schema result is handed back so this returns the same errors the inline connect used to.
     pub fn open_standby(url: &str) -> Result<Self> {
-        let mut client = Client::connect(url, NoTls).map_err(backend_err)?;
-        client.batch_execute(SCHEMA).map_err(backend_err)?;
+        let (jobs, rx) = channel::<Job>();
+        let (ready_tx, ready_rx) = channel::<Result<()>>();
+        let url = url.to_string();
+        std::thread::Builder::new()
+            .name("cp-postgres".into())
+            .spawn(move || {
+                let mut client = match connect_and_migrate(&url) {
+                    Ok(c) => {
+                        let _ = ready_tx.send(Ok(()));
+                        c
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                };
+                // Serve marshaled jobs until the backend is dropped; then the sender closes, this
+                // loop ends, the `Client` drops, and Postgres releases the advisory lock — the exact
+                // signal a standby waits on to promote itself after the leader dies.
+                while let Ok(job) = rx.recv() {
+                    job(&mut client);
+                }
+            })
+            .map_err(backend_err)?;
+        ready_rx
+            .recv()
+            .map_err(|_| backend_err("control-plane postgres worker exited during connect"))??;
         Ok(Self {
-            client: Mutex::new(client),
+            jobs,
             is_writer: AtomicBool::new(false),
         })
     }
 
+    /// Run `f` against the confined `Client` on the worker thread and block for its result — the sole
+    /// path to the database, so no query ever runs on a runtime worker thread.
+    fn on_worker<R, F>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Client) -> Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        let (tx, rx) = channel();
+        self.jobs
+            .send(Box::new(move |client| {
+                let _ = tx.send(f(client));
+            }))
+            .map_err(|_| backend_err("control-plane postgres worker is gone"))?;
+        rx.recv()
+            .map_err(|_| backend_err("control-plane postgres worker dropped the reply"))?
+    }
+
     /// The registry envelope's monotonic `version` in the store (`0` when nothing is persisted yet).
     fn registry_version(&self) -> Result<i64> {
-        let mut client = self.client.lock().unwrap_or_else(|e| e.into_inner());
-        let row = client
-            .query_opt("SELECT version FROM cp_state WHERE key = 'registry'", &[])
-            .map_err(backend_err)?;
-        Ok(row.map(|r| r.get::<_, i64>(0)).unwrap_or(0))
+        self.on_worker(|client| {
+            let row = client
+                .query_opt("SELECT version FROM cp_state WHERE key = 'registry'", &[])
+                .map_err(backend_err)?;
+            Ok(row.map(|r| r.get::<_, i64>(0)).unwrap_or(0))
+        })
     }
 
     /// Refuse a write from a non-leader, so a standby can never corrupt the shared store even if a
@@ -102,43 +157,49 @@ impl PostgresBackend {
     }
 }
 
+/// Connect to `url` and ensure the schema — run **only** on the worker thread (the sync client makes
+/// its own runtime, so this must be off any ambient runtime).
+fn connect_and_migrate(url: &str) -> Result<Client> {
+    let mut client = Client::connect(url, NoTls).map_err(backend_err)?;
+    client.batch_execute(SCHEMA).map_err(backend_err)?;
+    Ok(client)
+}
+
 impl RegistryBackend for PostgresBackend {
     fn load(&self) -> Result<PersistedState> {
-        let mut client = self.client.lock().unwrap_or_else(|e| e.into_inner());
-        let core = match read_doc(&mut client, "registry")? {
-            Some(v) => serde_json::from_value::<RegistryFile>(v)?,
-            None => RegistryFile::empty(),
-        };
-        let activity = read_doc(&mut client, "activity")?
-            .map(serde_json::from_value)
-            .transpose()?
-            .unwrap_or_default();
-        let session_epochs = read_doc(&mut client, "sessions")?
-            .map(serde_json::from_value)
-            .transpose()?
-            .unwrap_or_default();
-        Ok(core.into_persisted(activity, session_epochs))
+        self.on_worker(|client| {
+            let core = match read_doc(client, "registry")? {
+                Some(v) => serde_json::from_value::<RegistryFile>(v)?,
+                None => RegistryFile::empty(),
+            };
+            let activity = read_doc(client, "activity")?
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default();
+            let session_epochs = read_doc(client, "sessions")?
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default();
+            Ok(core.into_persisted(activity, session_epochs))
+        })
     }
 
     fn persist_registry(&self, snapshot: RegistrySnapshot) -> Result<()> {
         self.ensure_leader()?;
         let doc = serde_json::to_value(RegistryFile::from_snapshot(snapshot))?;
-        let mut client = self.client.lock().unwrap_or_else(|e| e.into_inner());
-        upsert(&mut client, "registry", &doc)
+        self.on_worker(move |client| upsert(client, "registry", &doc))
     }
 
     fn persist_activity(&self, activity: &BTreeMap<String, Vec<ActivityEvent>>) -> Result<()> {
         self.ensure_leader()?;
         let doc = serde_json::to_value(activity)?;
-        let mut client = self.client.lock().unwrap_or_else(|e| e.into_inner());
-        upsert(&mut client, "activity", &doc)
+        self.on_worker(move |client| upsert(client, "activity", &doc))
     }
 
     fn persist_sessions(&self, sessions: &BTreeMap<String, i64>) -> Result<()> {
         self.ensure_leader()?;
         let doc = serde_json::to_value(sessions)?;
-        let mut client = self.client.lock().unwrap_or_else(|e| e.into_inner());
-        upsert(&mut client, "sessions", &doc)
+        self.on_worker(move |client| upsert(client, "sessions", &doc))
     }
 
     fn poll_version(&self) -> Result<Option<i64>> {
@@ -150,13 +211,12 @@ impl RegistryBackend for PostgresBackend {
         if self.is_writer.load(Ordering::SeqCst) {
             return Ok(true);
         }
-        let acquired: bool = {
-            let mut client = self.client.lock().unwrap_or_else(|e| e.into_inner());
-            client
+        let acquired: bool = self.on_worker(|client| {
+            Ok(client
                 .query_one("SELECT pg_try_advisory_lock($1)", &[&WRITER_LOCK_KEY])
                 .map_err(backend_err)?
-                .get(0)
-        };
+                .get(0))
+        })?;
         if acquired {
             self.is_writer.store(true, Ordering::SeqCst);
         }

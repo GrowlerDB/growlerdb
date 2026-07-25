@@ -34,13 +34,23 @@ mesh, independent of the user-auth mode. Unset ⇒ open (local dev). The control
 
 ## Availability
 
-Today the CP is a **single instance** (`replicas: 1`) — the cluster's one hard SPOF. The designed
-successor ([D51](/system/decisions/d51-controlplane-ha.md)) moves durable state behind a **backend
-seam**: the embedded single-writer JSON store stays the default for single-binary/Compose, and a new
-**externalized backend** (Postgres/etcd) holds all durable registry state so the CP runs as **N
-stateless replicas** behind a Service, delegating consensus to the store. Reads are already off the
-data lock and the node inventory is already ephemeral, so this is a store swap, not a new consensus
-engine. See [high availability](/system/high-availability.md). Not yet built.
+By default the CP is a **single instance** (`replicas: 1`) — the cluster's one hard SPOF. HA
+([D51](/system/decisions/d51-controlplane-ha.md)) moves durable state behind a **backend seam**: the
+embedded single-writer JSON store stays the default for single-binary/Compose, and an **externalized
+backend** (Postgres) holds all durable registry state so the CP runs as **N stateless replicas**
+behind a Service, delegating consensus to the store. Reads are already off the data lock and the node
+inventory is already ephemeral, so this is a store swap, not a new consensus engine.
+
+**Running it:** `control-plane --registry-postgres <url>` (env `GROWLERDB_REGISTRY_POSTGRES`; needs a
+build with the `postgres` feature) points every replica at one shared Postgres. Each starts as a warm
+**standby**: it serves reads and continuously reloads its in-memory catalog when the store's
+version advances (the leader wrote). Exactly one replica holds a **session-level advisory lock** — the
+leader — and is the sole writer; a non-leader refuses every persist so it can never corrupt the store.
+Coordination is **active-passive**: readiness tracks leadership, so `/readyz` is `200` only on the
+leader and the Service routes all traffic to it while standbys stay warm but out of rotation. When the
+leader dies, Postgres releases the lock, a standby wins it within a fraction of a second (`kill -9`
+→ promotion verified live), flips to ready, and joins the Service. Standbys **serving reads** directly
+(active-reads, per the D51 diagram) is a follow-up. See [high availability](/system/high-availability.md).
 
 ## Notes
 

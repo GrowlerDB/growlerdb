@@ -32,6 +32,12 @@ tonic.workspace = true
 axum = "0.8"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
 
+[features]
+# Enable the externalized Postgres registry backend so `control-plane --registry-postgres <url>` can
+# run N stateless replicas over a shared store (D51). Off by default — the default build keeps the
+# embedded single-writer JSON registry and pulls in no Postgres client.
+postgres = ["growlerdb-controlplane/postgres"]
+
 [dev-dependencies]
 growlerdb-proto.workspace = true
 growlerdb-client.workspace = true
