@@ -283,3 +283,18 @@ smoke:
 # (`--screenshots`) and bounded. e.g. `just capture "cold-tier validation" --window-min 90 --cost '$5'`.
 capture PURPOSE *ARGS:
     python bench/scale/capture.py --purpose {{ quote(PURPOSE) }} {{ ARGS }}
+
+# Mint a scale-limit license token (the internal issuing ceremony — the private key stays yours; only
+# the public half ships, embedded in growlerdb-engine/src/license.rs). Prints the token to stdout.
+# Usage: just mint-license ~/.ssh/gdb_license_ed25519.pem "GrowlerDB scale" 64 [exp_unix_seconds]
+mint-license key licensee max_nodes exp="":
+    #!/usr/bin/env sh
+    set -eu
+    cargo run -q -p growlerdb-engine --example mint_license -- "{{ key }}" "{{ licensee }}" "{{ max_nodes }}" {{ exp }}
+
+# Verify a license token against the SHIPPED public key — the self-serve end-to-end check that a
+# minted token matches the embedded key, no cluster needed. Usage: just verify-license "<token>"
+verify-license token:
+    #!/usr/bin/env sh
+    set -eu
+    printf '%s' "{{ token }}" | cargo run -q -p growlerdb-engine --example verify_license

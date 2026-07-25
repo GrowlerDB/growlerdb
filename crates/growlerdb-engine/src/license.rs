@@ -9,15 +9,13 @@ use serde::{Deserialize, Serialize};
 /// The free tier: a deployment with at most this many distinct live index nodes needs no license.
 pub const FREE_NODE_LIMIT: usize = 3;
 
-/// GrowlerDB LLC's license-signing **public** key (Ed25519). Licenses are minted with the matching
-/// private key, held privately by GrowlerDB LLC.
-///
-/// **This is a placeholder — replace it with the real public key before issuing licenses.** The
-/// private key must never live in this repository; the placeholder's private key was discarded, so no
-/// license can validate against it (the free tier still works — a valid license is only needed to
-/// exceed [`FREE_NODE_LIMIT`]).
+/// GrowlerDB LLC's license-signing **public** key (Ed25519) — the production key. Licenses are minted
+/// offline with the matching **private** key, which is held privately by GrowlerDB LLC and never lives
+/// in this repository; only this public half ships, to verify tokens at startup. The free tier works
+/// without any license — a valid license is only needed to exceed [`FREE_NODE_LIMIT`]. Rotating the key
+/// means minting against a new keypair and shipping its public half here.
 const LICENSE_PUBLIC_KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
-MCowBQYDK2VwAyEABNG/3dMk6d+l0GbP8zXkDnqT1h8ZkfY1NnCTDSf6CfA=\n\
+MCowBQYDK2VwAyEAyizufq7Ro4/FzX0FhQqH2945GnMat7aYVr2Vf0kzGks=\n\
 -----END PUBLIC KEY-----\n";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +66,32 @@ impl License {
             expires_at: data.claims.exp,
         })
     }
+
+    /// Mint (sign) a license token with an Ed25519 **private-key** PEM — the inverse of [`verify`].
+    /// Used only by the offline issuing ceremony (the `mint_license` example / the runbook in
+    /// `COMM-LICENSE.md`): the private key is held by GrowlerDB LLC and **never** lives in this repo,
+    /// so this is not a runtime path. The minted token is verified at startup against the embedded
+    /// public key ([`LICENSE_PUBLIC_KEY_PEM`]) — the two must be the matching pair.
+    pub fn mint(
+        private_key_pem: &str,
+        licensee: &str,
+        max_nodes: u32,
+        exp: Option<i64>,
+    ) -> Result<String, LicenseError> {
+        let claims = Claims {
+            licensee: licensee.to_string(),
+            max_nodes,
+            exp,
+        };
+        let key = jsonwebtoken::EncodingKey::from_ed_pem(private_key_pem.as_bytes())
+            .map_err(|e| LicenseError::Invalid(format!("license private key: {e}")))?;
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA),
+            &claims,
+            &key,
+        )
+        .map_err(|e| LicenseError::Invalid(e.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -89,12 +113,42 @@ MCowBQYDK2VwAyEAQzeuApLql4CLG7D9b86BdpwFU0w8MAf/JJVytr4KO7E=\n\
     }
 
     #[test]
+    fn embedded_public_key_is_well_formed() {
+        // Guards against a paste error in LICENSE_PUBLIC_KEY_PEM: the shipped production key must be a
+        // parseable Ed25519 SPKI PEM, else every real license silently falls back to the free tier.
+        DecodingKey::from_ed_pem(LICENSE_PUBLIC_KEY_PEM.as_bytes())
+            .expect("embedded license public key must be a valid Ed25519 SPKI PEM");
+    }
+
+    #[test]
     fn verifies_a_valid_license() {
         let token = sign(serde_json::json!({"licensee": "Acme Inc", "max_nodes": 12}));
         let lic = License::verify_with_pem(&token, TEST_PUBLIC_PEM).unwrap();
         assert_eq!(lic.licensee, "Acme Inc");
         assert_eq!(lic.max_nodes, 12);
         assert_eq!(lic.expires_at, None);
+    }
+
+    #[test]
+    fn mint_then_verify_roundtrips() {
+        // The issuing ceremony: mint with the private key, verify with the matching public key.
+        let token = License::mint(TEST_PRIVATE_PEM, "Scale Run", 64, None).unwrap();
+        let lic = License::verify_with_pem(&token, TEST_PUBLIC_PEM).unwrap();
+        assert_eq!(lic.licensee, "Scale Run");
+        assert_eq!(lic.max_nodes, 64);
+        assert_eq!(lic.expires_at, None);
+    }
+
+    #[test]
+    fn mint_carries_expiry_and_rejects_a_bad_private_key() {
+        let token = License::mint(TEST_PRIVATE_PEM, "Acme", 12, Some(4102444800)).unwrap();
+        assert_eq!(
+            License::verify_with_pem(&token, TEST_PUBLIC_PEM)
+                .unwrap()
+                .expires_at,
+            Some(4102444800)
+        );
+        assert!(License::mint("not a pem", "Acme", 12, None).is_err());
     }
 
     #[test]

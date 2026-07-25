@@ -53,6 +53,10 @@ credentials:
   # present it — the defense-in-depth boundary behind network policy. Empty = open (the node and
   # control-plane pods log a warning). Set it for any multi-pod deployment.
   serviceToken: ""
+  # Scale-limit license (GROWLERDB_LICENSE): a signed entitlement that raises the node cap above the
+  # free tier (3). Empty = free tier. Mint one with the `mint_license` example — see COMM-LICENSE.md.
+  # An invalid token warns and falls back to the free tier rather than failing startup.
+  license: ""
 
 # ---- The index the nodes build + serve -------------------------------------------------------
 # The index is partitioned into `shards` ordinals (virtual-bucket sharding). The node StatefulSet
