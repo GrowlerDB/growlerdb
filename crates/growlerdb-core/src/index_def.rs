@@ -190,6 +190,44 @@ pub enum DefError {
         /// The unresolved `source_field` reference.
         source_field: String,
     },
+
+    /// A `variant` config was declared on a field whose type isn't `VARIANT` — the flatten/shapes
+    /// config only means something for a variant column.
+    #[error("field `{0}` has a `variant` config but is not a VARIANT field")]
+    VariantConfigOnNonVariant(String),
+
+    /// A `type: VARIANT` field would index **nothing**: flatten is disabled and no shapes were
+    /// declared. Enable flatten (the default) or declare at least one shape.
+    #[error("VARIANT field `{0}` indexes nothing — enable `flatten` (the default) or declare at least one shape")]
+    VariantEmpty(String),
+
+    /// A VARIANT field declared `shapes` without a `discriminator` — shapes are selected per row
+    /// by the discriminator value, so one is required.
+    #[error("VARIANT field `{0}` declares shapes but no `discriminator` — a discriminator path selects the shape per row")]
+    VariantShapesNoDiscriminator(String),
+
+    /// The same path is declared in two shapes with **different** types — resolved shape field
+    /// names are shared across shapes (dotted `column.path`), so a cross-shape type disagreement
+    /// is a create-time error (D47).
+    #[error("VARIANT field `{column}`: path `{path}` is `{first:?}` in shape `{first_shape}` but `{second:?}` in shape `{second_shape}` — a path shared across shapes must have one type")]
+    VariantShapeTypeConflict {
+        /// The variant column.
+        column: String,
+        /// The conflicting dotted `column.path`.
+        path: String,
+        /// The first-seen type and its shape.
+        first: FieldType,
+        first_shape: String,
+        /// The disagreeing type and its shape.
+        second: FieldType,
+        second_shape: String,
+    },
+
+    /// A VARIANT column name (or a shape leaf path) contains the reserved `#` character. GrowlerDB
+    /// derives the flatten term/text field names as `<column>#terms` / `<column>#text`, so `#` in a
+    /// variant path would collide with the internal encoding.
+    #[error("VARIANT path `{0}` contains the reserved `#` character (used for the `<column>#terms`/`#text` flatten fields)")]
+    VariantReservedName(String),
 }
 
 /// Cache cap: a field whose declared `max_bytes` exceeds this is **big text** and
@@ -315,9 +353,11 @@ impl IndexDefinition {
         // Plus the `indexed` guardrails: a non-indexed field must have a columnar
         // query path (fast), and string types can't opt out at all.
         for f in &fields {
-            // A VECTOR field is intentionally non-indexed and non-fast (it carries no
-            // inverted index or columnar scalar) — the guardrail below doesn't apply.
-            if !f.indexed && f.ty != FieldType::Vector {
+            // A VECTOR field is intentionally non-indexed and non-fast (it carries no inverted
+            // index or columnar scalar), and a VARIANT field carries its own flatten index (not
+            // the per-field inverted/columnar surface) — the `indexed`/`fast` guardrail below
+            // doesn't apply to either.
+            if !f.indexed && !matches!(f.ty, FieldType::Vector | FieldType::Variant) {
                 if matches!(f.ty, FieldType::Text | FieldType::Keyword) {
                     return Err(DefError::IndexedFalseText(f.path.clone()));
                 }
@@ -645,15 +685,21 @@ impl Mapping {
                 } else {
                     HashSet::new()
                 };
-                let mut fields = source
+                let mut fields = Vec::new();
+                for sf in source
                     .fields
                     .iter()
                     .filter(|sf| !exclude.contains(sf.path.as_str()))
-                    .map(|sf| {
-                        let ovr = self.fields.iter().find(|f| f.path == sf.path);
-                        resolve_field(&sf.path, sf.ty, ovr)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                {
+                    let ovr = self.fields.iter().find(|f| f.path == sf.path);
+                    // A VARIANT override turns this source column into the flatten index + its
+                    // shape leaves (1+N fields); anything else resolves to a single field.
+                    if ovr.is_some_and(|o| o.ty == Some(FieldType::Variant)) {
+                        fields.extend(resolve_variant_field(ovr.unwrap())?);
+                    } else {
+                        fields.push(resolve_field(&sf.path, sf.ty, ovr)?);
+                    }
+                }
                 // Append the derived VECTOR fields — they aren't source leaves, so the
                 // source-driven pass above never emits them.
                 for f in self
@@ -669,17 +715,19 @@ impl Mapping {
                 if self.fields.is_empty() {
                     return Err(DefError::EmptyExplicit);
                 }
-                self.fields
-                    .iter()
-                    .map(|f| {
-                        if f.ty == Some(FieldType::Vector) {
-                            return resolve_vector_field(f);
-                        }
+                let mut fields = Vec::new();
+                for f in &self.fields {
+                    if f.ty == Some(FieldType::Vector) {
+                        fields.push(resolve_vector_field(f)?);
+                    } else if f.ty == Some(FieldType::Variant) {
+                        fields.extend(resolve_variant_field(f)?);
+                    } else {
                         // Safe: presence validated above.
                         let sf = source.field(&f.path).expect("validated present");
-                        resolve_field(&f.path, sf.ty, Some(f))
-                    })
-                    .collect()
+                        fields.push(resolve_field(&f.path, sf.ty, Some(f))?);
+                    }
+                }
+                Ok(fields)
             }
         }
     }
@@ -698,6 +746,11 @@ fn resolve_field(
     // `resolve_vector_field`, never here) — reject it on any other type.
     if ovr.is_some_and(|o| o.vector.is_some()) {
         return Err(DefError::VectorConfigOnNonVector(path.to_string()));
+    }
+    // Likewise a `variant` config only means something for a VARIANT field (resolved through
+    // `resolve_variant_field`, never here).
+    if ovr.is_some_and(|o| o.variant.is_some()) {
+        return Err(DefError::VariantConfigOnNonVariant(path.to_string()));
     }
     let format = ovr.and_then(|o| o.format);
     // A declared timestamp `format` makes the field a DATE regardless of its source
@@ -742,6 +795,7 @@ fn resolve_field(
         sensitive: ovr.is_some_and(|o| o.sensitive),
         max_bytes: ovr.and_then(|o| o.max_bytes),
         vector: None,
+        variant: None,
     })
 }
 
@@ -813,7 +867,128 @@ fn resolve_vector_field(f: &FieldMapping) -> Result<ResolvedField, DefError> {
         sensitive: false,
         max_bytes: None,
         vector: Some(spec),
+        variant: None,
     })
+}
+
+/// Resolve a `type: VARIANT` field mapping into its [`ResolvedField`]s (D47): the variant field
+/// itself (carrying the flatten index + the extraction spec for the connector) **plus** one
+/// resolved leaf field per unique dotted `column.path` declared across the shapes. `f.path` is the
+/// variant column (validated to exist in the source by the caller; its sub-paths are not — a
+/// variant has no fixed leaf schema). Shape leaf paths are relative to the column and are prefixed
+/// with it here; a path declared in two shapes with the same type is one field, a type
+/// disagreement is a [create-time error](DefError::VariantShapeTypeConflict).
+fn resolve_variant_field(f: &FieldMapping) -> Result<Vec<ResolvedField>, DefError> {
+    let column = f.path.clone();
+    if column.contains('#') {
+        return Err(DefError::VariantReservedName(column));
+    }
+    // A `variant:` config is optional — a bare `type: VARIANT` gets the default flatten.
+    let opts = f.variant.clone().unwrap_or_default();
+    let flatten = opts.flatten.clone();
+
+    // Shapes require a discriminator; a discriminator with no shapes is inert but harmless.
+    if !opts.shapes.is_empty() && opts.discriminator.is_none() {
+        return Err(DefError::VariantShapesNoDiscriminator(column));
+    }
+    // Nothing to index?
+    let flatten_indexes = flatten.enabled && (flatten.terms || flatten.text);
+    if !flatten_indexes && opts.shapes.is_empty() {
+        return Err(DefError::VariantEmpty(column));
+    }
+
+    // Resolve each shape's leaves into typed fields at the dotted `column.path`, deduping across
+    // shapes (same path+type = one field; a type disagreement is an error). `first_seen` remembers
+    // which shape first declared each path, for the conflict message.
+    let mut leaves: Vec<ResolvedField> = Vec::new();
+    let mut first_seen: std::collections::HashMap<String, (FieldType, String)> =
+        std::collections::HashMap::new();
+    let mut resolved_shapes: Vec<ResolvedShape> = Vec::new();
+    for shape in &opts.shapes {
+        let mut shape_paths: Vec<(String, FieldType)> = Vec::new();
+        for leaf in &shape.fields {
+            if leaf.path.contains('#') {
+                return Err(DefError::VariantReservedName(format!(
+                    "{column}.{}",
+                    leaf.path
+                )));
+            }
+            // Reparent the leaf onto the column: its resolved name is `column.path`, and a VECTOR
+            // leaf's `source_field` (which references a sibling leaf) is likewise column-qualified.
+            let dotted = format!("{column}.{}", leaf.path);
+            let mut reparented = leaf.clone();
+            reparented.path = dotted.clone();
+            if let Some(spec) = reparented.variant.as_ref() {
+                // Nested variant inside a shape is not supported.
+                let _ = spec;
+                return Err(DefError::VariantConfigOnNonVariant(dotted));
+            }
+            if let Some(vspec) = reparented.vector.as_mut() {
+                if !vspec.source_field.is_empty() && !vspec.source_field.contains('.') {
+                    vspec.source_field = format!("{column}.{}", vspec.source_field);
+                }
+            }
+            let resolved = if reparented.ty == Some(FieldType::Vector) {
+                resolve_vector_field(&reparented)?
+            } else {
+                // A shape leaf is a declared path, not a source leaf — its type is whatever the
+                // author declares (defaulting to KEYWORD, since a variant leaf has no source type
+                // to auto-derive from). `resolve_field` with `SourceType::Other` auto-derives
+                // KEYWORD when no `type` is given.
+                resolve_field(&dotted, SourceType::Other, Some(&reparented))?
+            };
+            // Cross-shape type agreement on the shared path name.
+            match first_seen.get(&dotted) {
+                Some((ty, prior_shape)) if *ty != resolved.ty => {
+                    return Err(DefError::VariantShapeTypeConflict {
+                        column: column.clone(),
+                        path: dotted.clone(),
+                        first: *ty,
+                        first_shape: prior_shape.clone(),
+                        second: resolved.ty,
+                        second_shape: shape.name.clone(),
+                    });
+                }
+                Some(_) => {} // same path + same type = the same field; don't re-emit
+                None => {
+                    first_seen.insert(dotted.clone(), (resolved.ty, shape.name.clone()));
+                    leaves.push(resolved.clone());
+                }
+            }
+            shape_paths.push((dotted, resolved.ty));
+        }
+        resolved_shapes.push(ResolvedShape {
+            name: shape.name.clone(),
+            when: shape.when.clone(),
+            paths: shape_paths,
+        });
+    }
+
+    // The variant field itself: no Tantivy typed field, only the flatten index + extraction spec.
+    let variant_field = ResolvedField {
+        path: column,
+        ty: FieldType::Variant,
+        analyzer: flatten.analyzer.clone(),
+        format: None,
+        fast: false,
+        indexed: false,
+        record: TextRecord::Position,
+        fieldnorms: true,
+        cached: false,
+        sensitive: false,
+        max_bytes: None,
+        vector: None,
+        variant: Some(ResolvedVariant {
+            flatten,
+            discriminator: opts.discriminator.clone(),
+            shapes: resolved_shapes,
+        }),
+    };
+
+    let mut out = Vec::with_capacity(1 + leaves.len());
+    out.push(variant_field);
+    out.extend(leaves);
+    Ok(out)
 }
 
 /// One field mapping entry: `path`, `type`, `analyzer`, and the `fast` / `cached`
@@ -874,6 +1049,10 @@ pub struct FieldMapping {
     /// VECTOR-only: embedding config (dims, model, metric, provider, source_field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vector: Option<VectorMappingOpts>,
+    /// VARIANT-only: flatten + shapes config (D47). Optional — a bare `type: VARIANT` gets the
+    /// default flatten (untyped path terms, no text catch-all, no shapes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<VariantMappingOpts>,
 }
 
 /// GrowlerDB field type.
@@ -899,6 +1078,15 @@ pub enum FieldType {
     /// [`vector`](FieldMapping::vector) config; never auto-derived (the source has no vector
     /// column — the embedding is produced from a text `source_field` at ingest).
     Vector,
+    /// An Iceberg v3 **variant** column — a semi-structured value indexed through two composable
+    /// modes ([variant fields](../../../okf/product/functional/index-management/variant.md), D47):
+    /// an untyped **flatten** catch-all (every leaf as an exact `path = value` term, plus an optional
+    /// analyzed TEXT catch-all) and declared, discriminator-selected **shapes** (typed sub-mappings).
+    /// Declared explicitly with a [`variant`](FieldMapping::variant) config; never auto-derived
+    /// (a variant column has no fixed leaf schema). Shape leaves resolve to their own dotted
+    /// `column.path` fields of the full type surface; the variant field itself carries only the
+    /// flatten index.
+    Variant,
 }
 
 impl FieldType {
@@ -977,6 +1165,174 @@ pub struct VectorMappingOpts {
     pub provider: Option<EmbedProvider>,
     /// Required: the text field to embed.
     pub source_field: String,
+}
+
+// ---- Variant field config (D47) --------------------------------------------
+
+/// Authoring DTO for a VARIANT field's [`variant`](FieldMapping::variant) config: the two
+/// composable modes of [D47](../../../okf/system/decisions/d47-variant-mapping.md) — schema-less
+/// [`flatten`](Self::flatten) and declared [`shapes`](Self::shapes) selected by a
+/// [`discriminator`](Self::discriminator). Both are optional and compose: flatten alone is fully
+/// schema-less, shapes alone is schema-only, both gives typed declared paths plus a flattened
+/// catch-all over the whole value. Resolved into a [`ResolvedVariant`] at
+/// [`resolve`](IndexDefinition::resolve).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct VariantMappingOpts {
+    /// Flatten (schema-less) config. Defaults to **enabled** (path terms on, no text catch-all) —
+    /// a bare `type: VARIANT` gets the untyped flatten index with no declaration, per D47.
+    #[serde(default)]
+    pub flatten: FlattenConfig,
+    /// The **discriminator** path selecting a shape per row — dotted, relative to the variant
+    /// column (a path inside the variant, e.g. `type`) or a sibling top-level column (e.g.
+    /// `event_type`). Required iff [`shapes`](Self::shapes) is non-empty; ignored otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discriminator: Option<String>,
+    /// Declared typed sub-schemas, selected per row by the discriminator. Empty ⇒ flatten-only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shapes: Vec<VariantShape>,
+}
+
+/// Flatten (schema-less) config for a VARIANT column. Enabled by default; set `flatten: false`
+/// (or `enabled: false`) for a shapes-only column. `terms` indexes every leaf as an exact
+/// `path = value` term; `text` feeds string leaves into one analyzed TEXT catch-all for full-text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlattenConfig {
+    /// Whether flatten is enabled at all. `false` ⇒ the column is shapes-only (no flatten index).
+    pub enabled: bool,
+    /// Index every leaf as an exact `path = value` term (the flatten term field). Default true.
+    pub terms: bool,
+    /// Feed the value's string leaves into one analyzed TEXT catch-all for full-text (BM25)
+    /// search over the whole object. Default false.
+    pub text: bool,
+    /// Analyzer for the text catch-all (only meaningful when `text` is set). Default analyzer
+    /// when unset.
+    pub analyzer: Option<String>,
+}
+
+impl Default for FlattenConfig {
+    fn default() -> Self {
+        // A bare `type: VARIANT` (no `variant.flatten` key) ⇒ untyped flatten with path terms,
+        // no text catch-all — "no declaration needed" (D47).
+        Self {
+            enabled: true,
+            terms: true,
+            text: false,
+            analyzer: None,
+        }
+    }
+}
+
+/// Wire form of [`FlattenConfig`]: authored as either a toggle (`flatten: false` /
+/// `flatten: true`) or an options map (`flatten: { text: true, analyzer: en }`). Absent ⇒ the
+/// [`Default`] (enabled, terms-on). A toggle `true` is the default enabled config; `false`
+/// disables flatten entirely.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum FlattenWire {
+    Toggle(bool),
+    Opts(FlattenOpts),
+}
+
+/// The options-map form of [`FlattenConfig`] on the wire — every knob optional.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FlattenOpts {
+    #[serde(default = "default_true")]
+    terms: bool,
+    #[serde(default)]
+    text: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    analyzer: Option<String>,
+}
+
+/// Default for a bare `flatten` toggle / an omitted `terms` — path terms on.
+fn default_true() -> bool {
+    true
+}
+
+impl Default for FlattenWire {
+    fn default() -> Self {
+        FlattenWire::Toggle(true)
+    }
+}
+
+impl From<FlattenWire> for FlattenConfig {
+    fn from(w: FlattenWire) -> Self {
+        match w {
+            FlattenWire::Toggle(true) => FlattenConfig::default(),
+            FlattenWire::Toggle(false) => FlattenConfig {
+                enabled: false,
+                terms: false,
+                text: false,
+                analyzer: None,
+            },
+            FlattenWire::Opts(o) => FlattenConfig {
+                enabled: true,
+                terms: o.terms,
+                text: o.text,
+                analyzer: o.analyzer,
+            },
+        }
+    }
+}
+
+impl From<FlattenConfig> for FlattenWire {
+    fn from(c: FlattenConfig) -> Self {
+        if !c.enabled {
+            FlattenWire::Toggle(false)
+        } else {
+            FlattenWire::Opts(FlattenOpts {
+                terms: c.terms,
+                text: c.text,
+                analyzer: c.analyzer,
+            })
+        }
+    }
+}
+
+impl Serialize for FlattenConfig {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        FlattenWire::from(self.clone()).serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for FlattenConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(FlattenWire::deserialize(d)?.into())
+    }
+}
+
+/// One declared **shape**: a named typed sub-mapping of paths under a variant column, selected
+/// for a row when the [discriminator](VariantMappingOpts::discriminator) equals one of
+/// [`when`](Self::when). Field `path`s are relative to the variant column; the resolved field
+/// name is the dotted `<column>.<path>`, shared across shapes (same path + same type = one field;
+/// a cross-shape type disagreement is a create-time error).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VariantShape {
+    /// Shape name — for diagnostics and the unmatched-discriminator ingest counter's labelling.
+    pub name: String,
+    /// Discriminator value(s) that select this shape. A row whose discriminator equals any of
+    /// these matches; a row matching no shape skips typed extraction (counted, D45) but stays
+    /// flatten-covered. Accepts a scalar or a list in YAML.
+    #[serde(default, deserialize_with = "string_or_seq")]
+    pub when: Vec<String>,
+    /// Typed sub-mappings. Each entry's `path` is relative to the variant column and gets the full
+    /// field-type/flag surface (TEXT/KEYWORD/LONG/DOUBLE/BOOL/DATE/IP/VECTOR, `fast`/`cached`/…).
+    pub fields: Vec<FieldMapping>,
+}
+
+/// Deserialize a `Vec<String>` from either a scalar (`when: opened`) or a sequence
+/// (`when: [opened, closed]`) — the ergonomic discriminator-match surface.
+fn string_or_seq<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    })
 }
 
 /// How much the inverted index records per TEXT-field posting — the
@@ -1349,6 +1705,13 @@ fn diff_field(path: &str, old: &ResolvedField, new: &ResolvedField, plan: &mut A
         plan.reindex_reasons
             .push(format!("field `{path}` vector config changed (re-embed)"));
     }
+    if old.variant != new.variant {
+        // The flatten term/text fields and the extracted shape leaves are all physically written
+        // per the variant config — any change (flatten toggle, discriminator, a shape's paths) is
+        // a rebuild. Shape-leaf field add/remove is separately caught by the field-set diff.
+        plan.reindex_reasons
+            .push(format!("field `{path}` variant config changed"));
+    }
 }
 
 /// How a source's **equality deletes** are applied to the index ([equality
@@ -1420,6 +1783,43 @@ pub struct ResolvedField {
     /// Present iff `ty == Vector`: the resolved embedding config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vector: Option<VectorSpec>,
+    /// Present iff `ty == Variant`: the resolved flatten + shape-extraction config. The variant
+    /// field itself carries only the flatten index (the node builds `<col>#terms`/`<col>#text`
+    /// from it); each shape leaf is a **separate** [`ResolvedField`] at its dotted `column.path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<ResolvedVariant>,
+}
+
+/// The resolved config of a VARIANT field ([`ResolvedField::variant`]): the flatten index plus
+/// the discriminator + shapes the **connector** uses to extract typed leaves (D47/D48). The
+/// resolved typed leaves themselves are emitted as separate top-level [`ResolvedField`]s (so the
+/// node's segment schema carries them); this struct is the extraction spec + flatten settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedVariant {
+    /// The flatten (schema-less) index settings.
+    pub flatten: FlattenConfig,
+    /// The discriminator path (dotted, relative to the variant column or a sibling column), or
+    /// `None` when the column is flatten-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discriminator: Option<String>,
+    /// The declared shapes, each a name + discriminator match values + the resolved leaf paths it
+    /// extracts. Empty for a flatten-only column.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shapes: Vec<ResolvedShape>,
+}
+
+/// One resolved shape ([`ResolvedVariant::shapes`]): its name, the discriminator values that
+/// select it, and the resolved leaf paths/types it extracts (dotted `column.path`, matching the
+/// separate top-level [`ResolvedField`]s). The connector reads this to run `variant_get` for each
+/// path on a row whose discriminator matches [`when`](Self::when).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedShape {
+    /// Shape name.
+    pub name: String,
+    /// Discriminator values that select this shape.
+    pub when: Vec<String>,
+    /// The resolved leaf paths this shape extracts, as `(dotted column.path, type)`.
+    pub paths: Vec<(String, FieldType)>,
 }
 
 #[cfg(test)]
@@ -2461,5 +2861,320 @@ mapping:
         )
         .unwrap();
         assert!(with.alter_to(&with_16).requires_reindex());
+    }
+
+    // ---- Variant fields (D47) ---------------------------------------------
+
+    /// A GitHub-events-shaped source: scalar key/time/discriminator columns plus a variant
+    /// `payload` column (opaque → `SourceType::Other`).
+    fn events_schema() -> SourceSchema {
+        SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("ts", SourceType::Long),
+                SourceField::new("event_type", SourceType::String),
+                SourceField::new("payload", SourceType::Other),
+            ],
+            vec![],
+            vec!["id".into()],
+        )
+    }
+
+    /// Resolve an `events` index whose EXPLICIT mapping is `mapping_fields` (the `fields:` YAML
+    /// block body, already indented).
+    fn resolve_events(mapping_fields: &str) -> Result<ResolvedIndex, DefError> {
+        let yaml = format!(
+            "name: events\nsource: {{ iceberg: {{ catalog: g, table: g.events }} }}\n\
+             key: {{ identifier_fields: [id] }}\n\
+             mapping:\n  selection: EXPLICIT\n  fields:\n{mapping_fields}"
+        );
+        IndexDefinition::from_yaml(&yaml)?.resolve(&events_schema())
+    }
+
+    /// Resolve an `events` index from a complete YAML `mapping:` block (correctly-indented raw
+    /// string) — for the shape tests, whose nested `variant.shapes` are clearer written out.
+    fn resolve_events_full(mapping_yaml: &str) -> Result<ResolvedIndex, DefError> {
+        let yaml = format!(
+            "name: events\nsource: {{ iceberg: {{ catalog: g, table: g.events }} }}\n\
+             key: {{ identifier_fields: [id] }}\n{mapping_yaml}"
+        );
+        IndexDefinition::from_yaml(&yaml)?.resolve(&events_schema())
+    }
+
+    #[test]
+    fn bare_variant_field_gets_default_flatten() {
+        // `type: VARIANT` with no `variant:` config ⇒ flatten on (terms), no text, no shapes.
+        let idx = resolve_events(
+            "    - { path: id, type: KEYWORD }\n    - { path: payload, type: VARIANT }\n",
+        )
+        .expect("resolve");
+        let v = idx.fields.iter().find(|f| f.path == "payload").unwrap();
+        assert_eq!(v.ty, FieldType::Variant);
+        let rv = v.variant.as_ref().unwrap();
+        assert!(rv.flatten.enabled && rv.flatten.terms && !rv.flatten.text);
+        assert!(rv.shapes.is_empty() && rv.discriminator.is_none());
+        // No shaped leaves emitted, and the variant field is not a typed inverted/columnar field.
+        assert_eq!(
+            idx.fields
+                .iter()
+                .filter(|f| f.path.starts_with("payload."))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn flatten_text_catch_all_and_disable_toggle() {
+        // `flatten: { text: true }` turns on the catch-all with an analyzer.
+        let idx = resolve_events(
+            "    - { path: id, type: KEYWORD }\n    - { path: payload, type: VARIANT, variant: { flatten: { text: true, analyzer: en } } }\n",
+        )
+        .unwrap();
+        let rv = idx
+            .fields
+            .iter()
+            .find(|f| f.path == "payload")
+            .unwrap()
+            .variant
+            .as_ref()
+            .unwrap();
+        assert!(rv.flatten.text);
+        assert_eq!(rv.flatten.analyzer.as_deref(), Some("en"));
+
+        // `flatten: false` with no shapes ⇒ nothing to index ⇒ error.
+        let err = resolve_events(
+            "    - { path: id, type: KEYWORD }\n    - { path: payload, type: VARIANT, variant: { flatten: false } }\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, DefError::VariantEmpty(ref p) if p == "payload"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn flatten_is_untyped_mixed_type_paths_are_no_declaration() {
+        // Flatten declares no per-path types at all — resolution never inspects leaf types, so a
+        // path that is a number in one row and a string in another simply cannot conflict. We
+        // assert the *shape* of that guarantee: a flatten-only variant resolves with zero typed
+        // fields under the column and no dynamic field growth.
+        let idx = resolve_events(
+            "    - { path: id, type: KEYWORD }\n    - { path: payload, type: VARIANT }\n",
+        )
+        .unwrap();
+        // Exactly: id + payload (the variant field). No per-leaf typed fields.
+        assert_eq!(idx.fields.len(), 2);
+    }
+
+    #[test]
+    fn two_shapes_share_a_path_of_the_same_type_as_one_field() {
+        // `payload.number` is LONG in both shapes ⇒ one resolved field; the shaped LONG is fast
+        // (range/sort-capable). `payload.action` is TEXT in one shape only.
+        let idx = resolve_events_full(
+            r#"mapping:
+  selection: EXPLICIT
+  fields:
+    - { path: id, type: KEYWORD }
+    - path: payload
+      type: VARIANT
+      variant:
+        discriminator: event_type
+        shapes:
+          - name: pr
+            when: [PullRequestEvent]
+            fields:
+              - { path: number, type: LONG, fast: true }
+              - { path: action, type: TEXT }
+          - name: issue
+            when: IssuesEvent
+            fields:
+              - { path: number, type: LONG, fast: true }
+"#,
+        )
+        .expect("resolve");
+        // One `payload.number` field (deduped across shapes), typed LONG + fast (sortable).
+        let numbers: Vec<_> = idx
+            .fields
+            .iter()
+            .filter(|f| f.path == "payload.number")
+            .collect();
+        assert_eq!(
+            numbers.len(),
+            1,
+            "shared same-type path deduped to one field"
+        );
+        assert_eq!(numbers[0].ty, FieldType::Long);
+        assert!(numbers[0].fast);
+        assert!(idx
+            .fields
+            .iter()
+            .any(|f| f.path == "payload.action" && f.ty == FieldType::Text));
+        // Discriminator + shapes recorded on the variant field for the connector.
+        let rv = idx
+            .fields
+            .iter()
+            .find(|f| f.path == "payload")
+            .unwrap()
+            .variant
+            .as_ref()
+            .unwrap();
+        assert_eq!(rv.discriminator.as_deref(), Some("event_type"));
+        assert_eq!(rv.shapes.len(), 2);
+        assert_eq!(rv.shapes[0].when, vec!["PullRequestEvent".to_string()]);
+        assert_eq!(rv.shapes[1].when, vec!["IssuesEvent".to_string()]);
+    }
+
+    #[test]
+    fn cross_shape_type_disagreement_is_a_create_time_error() {
+        let err = resolve_events_full(
+            r#"mapping:
+  selection: EXPLICIT
+  fields:
+    - { path: id, type: KEYWORD }
+    - path: payload
+      type: VARIANT
+      variant:
+        discriminator: event_type
+        shapes:
+          - { name: a, when: A, fields: [ { path: n, type: LONG } ] }
+          - { name: b, when: B, fields: [ { path: n, type: KEYWORD } ] }
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, DefError::VariantShapeTypeConflict { path, .. } if path == "payload.n"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn shapes_require_a_discriminator() {
+        let err = resolve_events_full(
+            r#"mapping:
+  selection: EXPLICIT
+  fields:
+    - { path: id, type: KEYWORD }
+    - path: payload
+      type: VARIANT
+      variant:
+        shapes: [ { name: a, when: A, fields: [ { path: n, type: LONG } ] } ]
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, DefError::VariantShapesNoDiscriminator(ref p) if p == "payload"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn shaped_vector_path_source_field_is_column_qualified() {
+        // A VECTOR leaf inside a shape whose `source_field` is a sibling shaped TEXT path: both get
+        // the `payload.` prefix, and the cross-field source_field check (over the full field set)
+        // passes.
+        let idx = resolve_events_full(
+            r#"mapping:
+  selection: EXPLICIT
+  fields:
+    - { path: id, type: KEYWORD }
+    - path: payload
+      type: VARIANT
+      variant:
+        discriminator: event_type
+        shapes:
+          - name: pr
+            when: PullRequestEvent
+            fields:
+              - { path: body, type: TEXT }
+              - { path: body_vec, type: VECTOR, vector: { source_field: body } }
+"#,
+        )
+        .expect("resolve");
+        let vec_field = idx
+            .fields
+            .iter()
+            .find(|f| f.path == "payload.body_vec")
+            .unwrap();
+        assert_eq!(vec_field.ty, FieldType::Vector);
+        assert_eq!(
+            vec_field.vector.as_ref().unwrap().source_field,
+            "payload.body"
+        );
+    }
+
+    #[test]
+    fn reserved_hash_in_variant_path_is_rejected() {
+        let err = resolve_events_full(
+            r#"mapping:
+  selection: EXPLICIT
+  fields:
+    - { path: id, type: KEYWORD }
+    - path: payload
+      type: VARIANT
+      variant:
+        discriminator: event_type
+        shapes: [ { name: a, when: A, fields: [ { path: "n#x", type: LONG } ] } ]
+"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DefError::VariantReservedName(_)), "got {err}");
+    }
+
+    #[test]
+    fn variant_config_on_non_variant_field_is_rejected() {
+        let err = resolve_events(
+            "    - { path: id, type: KEYWORD }\n    - { path: payload, type: KEYWORD, variant: { flatten: true } }\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, DefError::VariantConfigOnNonVariant(ref p) if p == "payload"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn variant_field_and_shapes_round_trip_through_yaml() {
+        // The full resolved definition serializes and re-parses unchanged (persisted form).
+        let idx = resolve_events_full(
+            r#"mapping:
+  selection: EXPLICIT
+  fields:
+    - { path: id, type: KEYWORD }
+    - path: payload
+      type: VARIANT
+      variant:
+        flatten: { text: true }
+        discriminator: event_type
+        shapes:
+          - name: pr
+            when: [PullRequestEvent]
+            fields: [ { path: number, type: LONG, fast: true } ]
+"#,
+        )
+        .unwrap();
+        let json = serde_json::to_string(&idx).unwrap();
+        let back: ResolvedIndex = serde_json::from_str(&json).unwrap();
+        assert_eq!(idx, back);
+    }
+
+    #[test]
+    fn flatten_toggle_wire_forms_parse() {
+        // `flatten: true` / `false` / a map all parse to the right FlattenConfig.
+        let parse = |v: &str| -> FlattenConfig {
+            serde_norway::from_str::<VariantMappingOpts>(&format!("flatten: {v}"))
+                .unwrap()
+                .flatten
+        };
+        assert_eq!(parse("true"), FlattenConfig::default());
+        assert!(!parse("false").enabled);
+        let m = parse("{ terms: false, text: true }");
+        assert!(m.enabled && !m.terms && m.text);
+        // Absent ⇒ default (enabled).
+        assert_eq!(
+            serde_norway::from_str::<VariantMappingOpts>("discriminator: t")
+                .unwrap()
+                .flatten,
+            FlattenConfig::default()
+        );
     }
 }

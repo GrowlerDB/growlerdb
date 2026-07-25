@@ -419,15 +419,47 @@ impl<'de> Deserialize<'de> for SourceCheckpoint {
 pub struct Document {
     /// The composite key, stored and returned with each hit.
     pub key: CompositeKey,
-    /// Field path → value. Only paths present in the index schema are indexed.
+    /// Field path → value. Only paths present in the index schema are indexed. Declared **shape**
+    /// leaves of a variant column ride here too, at their dotted `column.path` (they are typed
+    /// fields in the schema); the untyped **flatten** leaves ride [`variants`](Self::variants).
     pub fields: BTreeMap<String, Value>,
+    /// Extracted **variant flatten** leaves, one entry per variant column in the doc (D47/D48).
+    /// The connector walks the variant value and emits these; the node indexes them into the
+    /// column's flatten term / text-catch-all fields. Empty for a non-variant document.
+    pub variants: Vec<VariantLeaves>,
 }
 
 impl Document {
-    /// Build a document from a key and its field values.
+    /// Build a document from a key and its field values (no variant leaves).
     pub fn new(key: CompositeKey, fields: BTreeMap<String, Value>) -> Self {
-        Self { key, fields }
+        Self {
+            key,
+            fields,
+            variants: Vec::new(),
+        }
     }
+
+    /// Attach extracted variant flatten leaves (builder).
+    pub fn with_variants(mut self, variants: Vec<VariantLeaves>) -> Self {
+        self.variants = variants;
+        self
+    }
+}
+
+/// The extracted **flatten** leaves of one variant column in a [`Document`] (D47): every leaf as a
+/// `(full dotted path, scalar value)` pair, plus the row's discriminator value (for diagnostics /
+/// the shape-selection audit; shape extraction itself already happened connector-side and rides
+/// [`Document::fields`]). The node indexes each leaf as an exact `path = value` term and feeds each
+/// string leaf to the optional text catch-all.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VariantLeaves {
+    /// The variant column name, e.g. `payload`.
+    pub field: String,
+    /// Flatten leaves: `(full dotted path, scalar value)`. The path is column-qualified
+    /// (`payload.user.login`) so the node can index it verbatim as the flatten term key.
+    pub leaves: Vec<(String, Value)>,
+    /// The row's discriminator value, if the column declares one; `None` otherwise.
+    pub discriminator: Option<String>,
 }
 
 /// A batch of documents to build into a segment (upserts only).

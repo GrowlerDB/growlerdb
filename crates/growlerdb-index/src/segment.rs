@@ -62,6 +62,30 @@ pub const LOC_ID_FIELD: &str = "_locid";
 /// Writer heap budget.
 pub const WRITER_HEAP_BYTES: usize = 50_000_000;
 
+/// Separator between a variant flatten leaf's dotted path and its canonical value inside the
+/// single `<column>#terms` keyword token — e.g. `payload.user.login\u{1}octocat` (D47). SOH
+/// (`0x01`) never appears in a field path or a rendered scalar, so the `path`/`value` split is
+/// unambiguous and a query rewrite reconstructs the exact token.
+const FLATTEN_TERM_SEP: char = '\u{1}';
+
+/// The reserved Tantivy field name for a variant column's flatten **term** index (`path = value`
+/// keyword tokens). The `#` is rejected in any user-declared variant path
+/// ([`DefError::VariantReservedName`](growlerdb_core::DefError)), so this never collides.
+fn flatten_terms_field_name(column: &str) -> String {
+    format!("{column}#terms")
+}
+
+/// The reserved Tantivy field name for a variant column's analyzed TEXT **catch-all** (full-text
+/// over the value's string leaves). Also the field a bare `<column>:query` full-text hits.
+fn flatten_text_field_name(column: &str) -> String {
+    format!("{column}#text")
+}
+
+/// Encode a flatten leaf `(path, value)` into its `<column>#terms` keyword token.
+fn flatten_token(path: &str, value: &GValue) -> String {
+    format!("{path}{FLATTEN_TERM_SEP}{}", value.to_index_string())
+}
+
 /// Errors from building or reading a segment.
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
@@ -146,6 +170,22 @@ pub struct IndexSchema {
     /// the per-segment ANN index is built with. Empty for a non-vector index (the ANN build is then
     /// skipped entirely).
     vector_fields: Vec<VectorFieldInfo>,
+    /// The VARIANT columns' flatten fields (D47), keyed by column name. Each carries the reserved
+    /// `<column>#terms` / `<column>#text` Tantivy handles (present iff that flatten mode is on).
+    /// Empty for an index with no variant column — the flatten write path is then skipped.
+    variant_fields: Vec<VariantFieldInfo>,
+}
+
+/// One VARIANT column's flatten index handles ([`IndexSchema::variant_fields`]): the reserved
+/// `<column>#terms` keyword field (path=value tokens) and/or the `<column>#text` analyzed
+/// catch-all, whichever the [`FlattenConfig`](growlerdb_core::FlattenConfig) enabled.
+struct VariantFieldInfo {
+    /// The variant column name, e.g. `payload`.
+    column: String,
+    /// The `<column>#terms` keyword field — present iff flatten `terms` is on.
+    terms: Option<Field>,
+    /// The `<column>#text` analyzed catch-all — present iff flatten `text` is on.
+    text: Option<Field>,
 }
 
 /// One VECTOR field's ANN-build inputs: its path, the stored-bytes Tantivy field handle, and the
@@ -208,7 +248,45 @@ impl IndexSchema {
         let mut mapped_field_summaries = Vec::with_capacity(idx.fields.len());
         // VECTOR fields, captured with their `dims`/`metric` for the per-segment ANN build.
         let mut vector_fields = Vec::new();
+        // VARIANT columns' flatten fields (`<col>#terms` / `<col>#text`).
+        let mut variant_fields = Vec::new();
         for f in &idx.fields {
+            // A VARIANT field carries no single typed Tantivy field — only its flatten index
+            // (`<col>#terms` raw keyword tokens + an optional analyzed `<col>#text` catch-all).
+            // Its declared shape leaves are separate `ResolvedField`s handled by the normal arms.
+            if f.ty == FieldType::Variant {
+                let Some(v) = &f.variant else { continue };
+                let terms = v.flatten.enabled && v.flatten.terms;
+                let text = v.flatten.enabled && v.flatten.text;
+                let terms_field = terms.then(|| {
+                    // Raw, un-analyzed, indexed — exact `path=value` token match. Not fast/stored.
+                    builder.add_text_field(&flatten_terms_field_name(&f.path), STRING)
+                });
+                let text_field = text.then(|| {
+                    let indexing = TextFieldIndexing::default()
+                        .set_tokenizer("default")
+                        .set_index_option(IndexRecordOption::WithFreqsAndPositions)
+                        .set_fieldnorms(true);
+                    builder.add_text_field(
+                        &flatten_text_field_name(&f.path),
+                        TextOptions::default().set_indexing_options(indexing),
+                    )
+                });
+                variant_fields.push(VariantFieldInfo {
+                    column: f.path.clone(),
+                    terms: terms_field,
+                    text: text_field,
+                });
+                mapped_field_summaries.push(MappedFieldSummary {
+                    name: f.path.clone(),
+                    ty: "VARIANT".to_string(),
+                    fast: false,
+                    // "indexed" for a variant = queryable via the flatten index.
+                    indexed: terms || text,
+                    cached: false,
+                });
+                continue;
+            }
             if f.fast
                 && matches!(
                     f.ty,
@@ -250,6 +328,8 @@ impl IndexSchema {
                 // A vector is stored as raw LE-`f32` bytes: STORED so it round-trips per-doc,
                 // FAST so the ANN build can read it columnar. Not sortable.
                 FieldType::Vector => builder.add_bytes_field(&f.path, STORED | FAST),
+                // Handled above (its flatten fields are added, then `continue`) — never reached.
+                FieldType::Variant => unreachable!("variant field handled before the type match"),
             };
             if f.ty == FieldType::Vector {
                 if let Some(spec) = &f.vector {
@@ -288,6 +368,7 @@ impl IndexSchema {
             tenant_field: idx.tenant_field().map(str::to_string),
             location_strategy: idx.location_strategy,
             vector_fields,
+            variant_fields,
         }
     }
 
@@ -388,6 +469,24 @@ impl IndexSchema {
         for (path, field, ty, fmt) in &self.fields {
             if let Some(value) = doc.fields.get(path) {
                 add_typed_value(&mut td, *field, *ty, *fmt, path, value);
+            }
+        }
+        // Variant flatten leaves (D47): each `(path, value)` becomes an exact `path=value` keyword
+        // token in `<col>#terms`, and each **string** leaf feeds the analyzed `<col>#text`
+        // catch-all. Declared shape leaves already rode `doc.fields` above (typed fields).
+        for vc in &doc.variants {
+            let Some(info) = self.variant_fields.iter().find(|v| v.column == vc.field) else {
+                continue; // a variant column not in this schema — ignore its leaves
+            };
+            for (path, value) in &vc.leaves {
+                if let Some(terms) = info.terms {
+                    td.add_text(terms, flatten_token(path, value));
+                }
+                if let Some(text) = info.text {
+                    if let GValue::Str(s) = value {
+                        td.add_text(text, s);
+                    }
+                }
             }
         }
         td
@@ -520,6 +619,10 @@ fn add_typed_value(
                 td.add_bytes(field, &vec_f32_to_le_bytes(v));
             }
         }
+        // A VARIANT field has no single typed field: its flatten leaves are indexed separately in
+        // `to_tantivy` (`<col>#terms`/`<col>#text`), and it never appears in `self.fields`. A
+        // declared shape leaf reaches here under its own concrete type, not as `Variant`.
+        FieldType::Variant => {}
     }
 }
 
@@ -1852,6 +1955,19 @@ impl SegmentReader {
         match query {
             Query::MatchAll => Ok(Box::new(AllQuery)),
             Query::Term { field, value } => {
+                // A dotted `<col>.<path>:value` on an **undeclared** variant sub-path is a flatten
+                // exact-term match — rewrite to the single `<col>#terms` keyword field with the
+                // `path\u{1}value` token the write path indexed. A *declared* shaped path is a
+                // direct field (below), and full-text `<col>:value` resolves to the catch-all.
+                if let Some(name) = field.as_deref() {
+                    if let Some(terms) = self.flatten_terms_field(name) {
+                        let token = format!("{name}{FLATTEN_TERM_SEP}{value}");
+                        return Ok(Box::new(TermQuery::new(
+                            Term::from_field_text(terms, &token),
+                            IndexRecordOption::Basic,
+                        )));
+                    }
+                }
                 // A bare `field:value` on a numeric / date / bool / IP field is an **exact-value
                 // match**, not a text term — those columns are indexed but not analyzed, so a text
                 // `TermQuery` finds nothing and `resolve_field` (text-only) would reject the field as
@@ -1901,6 +2017,19 @@ impl SegmentReader {
                 Ok(Box::new(TermQuery::new(term, opt)))
             }
             Query::Terms { field, values } => {
+                // `IN (...)` over an undeclared variant sub-path → a set of flatten tokens.
+                if let Some(terms_field) = self.flatten_terms_field(field) {
+                    let terms = values
+                        .iter()
+                        .map(|v| {
+                            Term::from_field_text(
+                                terms_field,
+                                &format!("{field}{FLATTEN_TERM_SEP}{v}"),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    return Ok(Box::new(TermSetQuery::new(terms)));
+                }
                 let (field, is_text) = self.resolve_field(Some(field))?;
                 let terms = values
                     .iter()
@@ -2218,9 +2347,15 @@ impl SegmentReader {
                 if name == KEY_FIELD {
                     return Err(IndexError::UnknownField(name.to_string()));
                 }
-                let field = schema
-                    .get_field(name)
-                    .map_err(|_| IndexError::UnknownField(name.to_string()))?;
+                let field = match schema.get_field(name) {
+                    Ok(f) => f,
+                    // A bare variant column name (`payload`) has no field of its own — it resolves
+                    // to its analyzed flatten catch-all `<col>#text` (full-text over the value's
+                    // string leaves), when that mode is enabled.
+                    Err(_) => schema
+                        .get_field(&flatten_text_field_name(name))
+                        .map_err(|_| IndexError::UnknownField(name.to_string()))?,
+                };
                 match field_kind(&schema, field) {
                     Some(is_text) => Ok((field, is_text)),
                     None => Err(IndexError::UnknownField(name.to_string())),
@@ -2230,6 +2365,26 @@ impl SegmentReader {
                 .map(|f| (f, true))
                 .ok_or(IndexError::NoDefaultField),
         }
+    }
+
+    /// If `name` is an **undeclared** dotted sub-path under a variant column whose flatten term
+    /// index (`<col>#terms`) exists, return that field — the rewrite target for a flatten
+    /// `path = value` term query. `None` when `name` is a declared field (a shaped path uses its
+    /// own typed field) or no variant column is a dotted prefix of it. Scans dotted prefixes
+    /// longest-first, so the most specific variant column wins.
+    fn flatten_terms_field(&self, name: &str) -> Option<Field> {
+        let schema = self.index.schema();
+        if schema.get_field(name).is_ok() {
+            return None; // a declared field (incl. a shaped path) — not a flatten rewrite
+        }
+        let mut end = name.len();
+        while let Some(dot) = name[..end].rfind('.') {
+            if let Ok(f) = schema.get_field(&flatten_terms_field_name(&name[..dot])) {
+                return Some(f);
+            }
+            end = dot;
+        }
+        None
     }
 
     /// Resolve a named field to its handle + Tantivy field type (for typed
@@ -2526,6 +2681,203 @@ mapping:
             Some(Value::Int(i)) => *i,
             other => panic!("expected an int id, got {other:?}"),
         }
+    }
+
+    // ---- Variant flatten + shapes (D47, TASK-349/352) ---------------------
+
+    /// An `events` index over a variant `payload` column: flatten (terms + text catch-all) plus
+    /// two shapes (`pr` → LONG `number` fast + KEYWORD `action` fast; `issue` → LONG `number`).
+    fn events_variant_index() -> ResolvedIndex {
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("event_type", SourceType::String),
+                SourceField::new("payload", SourceType::Other),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        IndexDefinition::from_yaml(
+            r#"
+name: events
+source: { iceberg: { catalog: g, table: g.events } }
+key: { identifier_fields: [id] }
+mapping:
+  selection: EXPLICIT
+  fields:
+    - { path: id, type: KEYWORD }
+    - path: payload
+      type: VARIANT
+      variant:
+        flatten: { terms: true, text: true }
+        discriminator: event_type
+        shapes:
+          - name: pr
+            when: [PullRequestEvent]
+            fields:
+              - { path: number, type: LONG, fast: true }
+              - { path: action, type: KEYWORD, fast: true }
+          - name: issue
+            when: [IssuesEvent]
+            fields:
+              - { path: number, type: LONG, fast: true }
+"#,
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap()
+    }
+
+    /// Build an `events` document: `id`, a set of flatten `leaves` (dotted, column-qualified),
+    /// declared shape `shaped` values (typed fields), and the discriminator value.
+    fn event_doc(
+        id: i64,
+        discriminator: &str,
+        leaves: Vec<(&str, Value)>,
+        shaped: Vec<(&str, Value)>,
+    ) -> Document {
+        let key = CompositeKey::new(vec![], vec![("id".into(), id.into())]);
+        let mut fields = BTreeMap::new();
+        fields.insert("id".to_string(), id.into());
+        for (path, value) in shaped {
+            fields.insert(path.to_string(), value);
+        }
+        Document::new(key, fields).with_variants(vec![growlerdb_core::VariantLeaves {
+            field: "payload".into(),
+            leaves: leaves
+                .into_iter()
+                .map(|(p, v)| (p.to_string(), v))
+                .collect(),
+            discriminator: Some(discriminator.to_string()),
+        }])
+    }
+
+    #[test]
+    fn flatten_term_filter_and_text_catch_all_match_seeded_docs() {
+        // A GitHub-events-shaped batch. `count` is a **mixed-type** flatten leaf — Int in doc 1,
+        // Str in doc 2 — exercising the untyped guarantee (D47): both index without error and both
+        // are exact-term matchable, with no dynamic field growth.
+        let idx = events_variant_index();
+        let schema = IndexSchema::from_resolved(&idx);
+        let batch = DocBatch::new(vec![
+            event_doc(
+                1,
+                "PullRequestEvent",
+                vec![
+                    ("payload.user.login", Value::from("octocat")),
+                    ("payload.title", Value::from("Add a shiny feature")),
+                    ("payload.number", Value::Int(1347)),
+                    ("payload.count", Value::Int(5)),
+                ],
+                vec![
+                    ("payload.number", Value::Int(1347)),
+                    ("payload.action", Value::from("opened")),
+                ],
+            ),
+            event_doc(
+                2,
+                "IssuesEvent",
+                vec![
+                    ("payload.user.login", Value::from("defunkt")),
+                    ("payload.title", Value::from("Fix a subtle bug")),
+                    ("payload.number", Value::Int(99)),
+                    ("payload.count", Value::from("many")),
+                ],
+                vec![("payload.number", Value::Int(99))],
+            ),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        TantivySegmentCore
+            .build(&schema, &batch, dir.path())
+            .unwrap();
+        let r = TantivySegmentCore.open(dir.path()).unwrap();
+        let run = |s: &str| ids(&r.search(&q(s), 10).unwrap());
+
+        // Flatten exact-term on an UNDECLARED path (`payload.user.login`) → the one doc.
+        assert_eq!(run("payload.user.login:octocat"), vec![1]);
+        assert_eq!(run("payload.user.login:defunkt"), vec![2]);
+        // Full-text over the analyzed catch-all: `payload:<token>` matches string leaves.
+        assert_eq!(run("payload:feature"), vec![1]);
+        assert_eq!(run("payload:bug"), vec![2]);
+        // Mixed-type untyped path: both the Int and the Str value are exact-term matchable.
+        assert_eq!(run("payload.count:5"), vec![1]);
+        assert_eq!(run("payload.count:many"), vec![2]);
+        // An undeclared path that no doc has → no matches (not an error).
+        assert!(run("payload.nope:x").is_empty());
+
+        // No dynamic field growth: the Tantivy schema carries exactly the fixed fields —
+        // id, the two flatten fields (payload#terms/#text), the shaped payload.number +
+        // payload.action, plus the internal _key/_keyenc/_locid. Never a per-leaf field.
+        let names: Vec<String> = schema
+            .tantivy_schema()
+            .fields()
+            .map(|(_, e)| e.name().to_string())
+            .collect();
+        assert!(names.contains(&"payload#terms".to_string()));
+        assert!(names.contains(&"payload#text".to_string()));
+        assert!(names.contains(&"payload.number".to_string()));
+        assert!(!names
+            .iter()
+            .any(|n| n == "payload.user.login" || n == "payload.count"));
+    }
+
+    #[test]
+    fn shaped_paths_support_range_sort_and_exact_match() {
+        // TASK-352: a shaped LONG (`payload.number`, fast) is range- and sort-capable; a shaped
+        // KEYWORD (`payload.action`, fast) is exact-matchable — all via their typed fields, not
+        // the flatten term rewrite.
+        let idx = events_variant_index();
+        let schema = IndexSchema::from_resolved(&idx);
+        let batch = DocBatch::new(vec![
+            event_doc(
+                1,
+                "PullRequestEvent",
+                vec![("payload.number", Value::Int(1347))],
+                vec![
+                    ("payload.number", Value::Int(1347)),
+                    ("payload.action", Value::from("opened")),
+                ],
+            ),
+            event_doc(
+                2,
+                "PullRequestEvent",
+                vec![("payload.number", Value::Int(50))],
+                vec![
+                    ("payload.number", Value::Int(50)),
+                    ("payload.action", Value::from("closed")),
+                ],
+            ),
+            event_doc(
+                3,
+                "IssuesEvent",
+                vec![("payload.number", Value::Int(900))],
+                vec![("payload.number", Value::Int(900))],
+            ),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        TantivySegmentCore
+            .build(&schema, &batch, dir.path())
+            .unwrap();
+        let r = TantivySegmentCore.open(dir.path()).unwrap();
+
+        // Range on the shaped LONG.
+        assert_eq!(
+            ids(&r.search(&q("payload.number:[100 TO 2000]"), 10).unwrap()),
+            vec![1, 3]
+        );
+        // Exact value on the shaped LONG (routed through the typed range path, not flatten).
+        assert_eq!(
+            ids(&r.search(&q("payload.number:50"), 10).unwrap()),
+            vec![2]
+        );
+        // Exact match on the shaped KEYWORD.
+        assert_eq!(
+            ids(&r.search(&q("payload.action:opened"), 10).unwrap()),
+            vec![1]
+        );
+        // The shaped LONG is registered sortable (fast + numeric) — the exact contract the sort
+        // path's `ensure_sortable` accepts — so `sort=payload.number` is a valid, offered key.
+        assert!(schema.sort_fields().contains(&"payload.number"));
     }
 
     #[test]
