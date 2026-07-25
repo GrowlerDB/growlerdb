@@ -147,8 +147,12 @@ public final class ChangelogReader {
     String variantColumn = variant == null ? null : variant.spec().column;
     var cols = new java.util.HashMap<String, Value>();
     for (String column : columns) {
-      if (column.equals(variantColumn)) {
-        continue; // the variant column isn't a scalar field — extracted below
+      // The variant column itself and its shaped sub-paths (`payload`, `payload.number`, …) are
+      // NOT real changelog columns — they live inside the variant and are produced by the extractor
+      // below (`row.getAs("payload.number")` would fail as a struct-field access). Skip them here.
+      if (variantColumn != null
+          && (column.equals(variantColumn) || column.startsWith(variantColumn + "."))) {
+        continue;
       }
       Object value = row.getAs(column);
       if (value != null) {

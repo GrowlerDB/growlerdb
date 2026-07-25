@@ -184,8 +184,20 @@ stack:
     # `--force-recreate`: the `run` above re-seeds `movies`, so cold-rebuild the node against the current
     # table (same vector-staleness reason as node-catalog above).
     docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data up -d --force-recreate node-movies
+    # Iceberg v3 VARIANT demo index `events` (D47/D48). Unlike the pyiceberg-seeded, self-cold-building
+    # indexes above, a variant table is Spark-seeded (format-version=3), connector-fed (released
+    # iceberg-rust can't scan a variant table — D49 — so the node skips the native build) and
+    # Trino-hydrated. So this layer brings up Trino, builds the connector jar (needs JDK 21 via mise),
+    # Spark-seeds the table, serves `events`, then populates it via the connector. All variant commands
+    # run with the full profile set active so `node-events`' cross-profile deps resolve.
+    cd connector && mise exec -- mvn -q -DskipTests package
+    docker compose -f deploy/compose/docker-compose.yml --profile trino up -d trino
+    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile catalog --profile demo-data --profile trino --profile variant run --rm seed-events
+    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile catalog --profile demo-data --profile trino --profile variant up -d --force-recreate node-events
+    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile catalog --profile demo-data --profile trino --profile variant run --rm connector-events
     @echo ""
     @echo "Console:           http://localhost:8081  (demo/demo)  — opens on 'movies' (try Semantic/Hybrid)"
+    @echo "Indexes:           movies · catalog · docs · events (Iceberg v3 variant: flatten + shapes)"
     @echo "Grafana:           http://localhost:3000"
     @echo "Connect an agent:  just mcp-connect   (MCP over HTTP — Claude or any MCP client)"
 
@@ -226,28 +238,6 @@ demo-data:
 trino:
     docker compose -f deploy/compose/docker-compose.yml --profile trino up -d trino
     @echo 'Trino up on :8082. Query with: docker compose -f deploy/compose/docker-compose.yml exec trino trino'
-
-# seed the Iceberg v3 variant demo table `growlerdb.events` (D47/D48) + bring up Trino to read it.
-# The variant `payload` renders as JSON in Trino; index def is deploy/compose/events.yaml.
-variant:
-    docker compose -f deploy/compose/docker-compose.yml up -d minio createbuckets polaris
-    deploy/compose/setup-polaris.sh
-    docker compose -f deploy/compose/docker-compose.yml --profile variant run --rm seed-events
-    docker compose -f deploy/compose/docker-compose.yml --profile trino up -d trino
-    @echo 'Seeded growlerdb.events (format-version=3, VARIANT payload).'
-    @echo "Read it: docker compose -f deploy/compose/docker-compose.yml exec trino trino --execute \"SELECT id, event_type, CAST(payload AS JSON) FROM iceberg.growlerdb.events\""
-
-# full variant end-to-end demo (needs `just stack` up): seed the v3 table, build the connector jar,
-# serve the `events` index (create-time schema via Trino), then populate it via the connector.
-# Hydration + introspection route through Trino (D48/D49); search/hydrate via the gateway on :8081.
-variant-demo: variant
-    cd connector && mise exec -- mvn -q -DskipTests package
-    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile variant pull node-events || docker compose -f deploy/compose/docker-compose.yml build node-events
-    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile variant up -d --force-recreate node-events
-    docker compose -f deploy/compose/docker-compose.yml --profile variant run --rm connector-events
-    @echo ''
-    @echo 'events index served + populated. Try via the gateway (demo/demo) at http://localhost:8081, or:'
-    @echo "  curl -s localhost:8081/v1/indexes/events/_search -H 'content-type: application/json' -d '{\"q\":\"payload.user.login:octocat\"}'"
 
 # tear the full stack (and volumes) down
 stack-down:

@@ -31,7 +31,7 @@ mapping:
             fields:
               - { path: number, type: LONG, fast: true }
               - { path: action, type: KEYWORD, fast: true }
-              - { path: merged, type: BOOL, fast: true }
+              - { path: merged, type: BOOL }  # indexed (term-filterable); a fast-only BOOL has no term path
               - { path: title, type: TEXT, cached: true }
               - { path: title_vec, type: VECTOR, vector: { source_field: title, dims: 384, model: bge-small-en-v1.5 } }
           - name: issue

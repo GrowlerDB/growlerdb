@@ -4,13 +4,22 @@
 -- discriminator + a semi-structured `payload` VARIANT whose per-row structure differs by event
 -- type. format-version=3 is required for VARIANT; the table stays append-only (no deletes/DVs) so
 -- the connector's changelog read is well-defined and iceberg-rust could read the data files once
--- it parses v3 variant schemas. Run via `spark-sql -f` against the REST catalog (`just variant`).
+-- it parses v3 variant schemas. Run via `spark-sql -f` against the REST catalog (`just stack`).
 --
 -- Spark 4.1 `parse_json(...)` produces a VARIANT value; Iceberg 1.11 writes it (shredded where the
 -- writer chooses). The demo index (`deploy/compose/events.yaml`) maps `payload` as VARIANT with a
 -- flatten catch-all plus two shapes selected by the sibling `event_type` discriminator.
 
-CREATE TABLE IF NOT EXISTS stream.growlerdb.events (
+-- The namespace must exist before the table (a fresh catalog has none — don't rely on the
+-- pyiceberg seeds having created it).
+CREATE NAMESPACE IF NOT EXISTS stream.growlerdb;
+
+-- Drop + recreate so the seed is idempotent: a plain `INSERT ... VALUES` appends, so re-running
+-- (e.g. `just stack` twice) would accumulate duplicate rows. A fresh table + a single
+-- append keeps exactly these rows and the append-only / delete-free invariant (no DVs).
+DROP TABLE IF EXISTS stream.growlerdb.events;
+
+CREATE TABLE stream.growlerdb.events (
   id          STRING,
   ts          BIGINT,   -- event time, epoch millis
   event_type  STRING,   -- discriminator (a sibling column)
