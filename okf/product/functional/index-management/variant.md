@@ -62,14 +62,21 @@ No whole-value blob is stored in the index. Declared shape paths support `cached
 object comes back via [hydration](/product/functional/hydration.md) — the hit's coordinates
 resolve the authoritative row, variant included.
 
-## Extraction & gates
+## Extraction & delivery
 
 Shape selection and leaf extraction happen at extraction time — in the
 [reader/connector](/system/runtime/components/connector.md) — so nodes receive resolved scalar
 leaves and the wire value model stays scalar. Readers prefer Parquet-**shredded** typed
 subcolumns when a data file shreds a declared path, decoding the binary variant only for the
-residual. Delivery is gated on ecosystem support (iceberg-rust and Arrow variant reads, Spark
-variant extraction, Parquet shredding), in the same style as [D28](/system/decisions/d28-iceberg-v3.md).
+residual.
 
-Phasing: **first** flatten + hydration (schema-less end-to-end); **then** shapes — discriminator,
-typed fields and flags, shredding-aware reads.
+Delivery order is decided in [D48](/system/decisions/d48-variant-delivery.md): ingest ships
+**connector-first** (bootstrap + changelog; Spark reads variant today), hydration for variant
+tables routes through **Trino in the interim** (released iceberg-rust cannot yet plan over a
+variant schema), and the **native Rust path takes over** — batch build and in-point-read variant
+decode — once iceberg-rust ships variant support, leaving Trino as the permanent slow lane for
+delete-bearing files and the stale-locator fallback.
+
+Phasing: **first** flatten end-to-end (connector ingest + Trino-backed hydration); **then**
+shapes — discriminator, typed fields and flags, shredding-aware reads; **then** the native-path
+swap.
