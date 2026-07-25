@@ -1,0 +1,75 @@
+---
+type: Feature
+title: Variant fields (planned)
+description: Index Iceberg v3 variant columns — an untyped flattened catch-all (schema-less) plus declared, discriminator-selected sub-schemas (shapes) for typed access.
+tags: [feature, index, variant, mapping, roadmap]
+timestamp: 2026-07-24T12:00:00
+resource: https://iceberg.apache.org/spec/#variant
+---
+
+# Variant fields (planned)
+
+**Status: planned (roadmap).** Shaped by [D47](/system/decisions/d47-variant-mapping.md); part of
+the Iceberg v3 adoption path ([D28](/system/decisions/d28-iceberg-v3.md)).
+
+An Iceberg v3 **variant** column holds a semi-structured value whose structure is per-row — its
+paths are not in the table schema, so the existing rule that every mapped path resolves to a
+declared source leaf ([create](/product/functional/index-management/create.md)) cannot apply.
+A variant column gets its own mapping surface with two **composable** modes:
+
+## Flatten (schema-less)
+
+No declaration needed. The whole value is indexed as one field, untyped:
+
+- **Path terms** — every leaf is indexed as an exact `path = value` term, so
+  `payload.user.login:octocat` filters work without any declared mapping. Values are indexed in
+  canonical string form.
+- **Text catch-all** (optional) — the value's string leaves feed one analyzed TEXT field for
+  full-text (BM25) search over the whole object.
+
+Because flatten is untyped, **type conflicts cannot exist**: a path whose values are sometimes
+numbers and sometimes strings is just two terms. The trade-off is no ranges, sorts, or numeric
+semantics on flattened paths — typed access requires a shape.
+
+## Shapes (declared sub-schemas)
+
+One variant column often multiplexes several kinds of value (e.g. an event payload per event
+type). The mapping may declare several named **shapes** — typed sub-mappings of paths — and a
+**discriminator**: a path inside the variant (or a sibling column) whose value selects the shape
+for each row.
+
+- A shape's paths use the full field-type surface (TEXT/KEYWORD/LONG/DOUBLE/BOOL/DATE/IP/VECTOR)
+  and per-field flags (`fast`, `cached`, `indexed`, …) exactly like top-level fields; a VECTOR
+  path makes a variant's text semantically searchable
+  ([D46](/system/decisions/d46-embed-write-path-stage.md)).
+- Resolved field names are the dotted `column.path` — the same naming as struct flattening —
+  **not** namespaced per shape, so queries don't need to know which shape a document matched.
+  The same path declared in two shapes with the same type is the same field; with different
+  types it is a **create-time error**.
+- A row whose discriminator matches no declared shape skips typed extraction (an ingest counter
+  records it, per [D45](/system/decisions/d45-degraded-vs-error.md)'s loud-degradation posture);
+  flatten, if enabled, still covers it. A declared path whose value fails its type is dropped for
+  that document, likewise counted.
+
+Flatten and shapes compose per column: flatten alone is fully schema-less; shapes alone is
+schema-only; both gives typed declared paths plus a flattened catch-all over the whole value
+(flatten always covers the whole value, including declared paths).
+
+## Retrieval
+
+No whole-value blob is stored in the index. Declared shape paths support `cached` like any field
+(within the [cached-field policy](/system/decisions/d23-cached-field-policy.md)); the original
+object comes back via [hydration](/product/functional/hydration.md) — the hit's coordinates
+resolve the authoritative row, variant included.
+
+## Extraction & gates
+
+Shape selection and leaf extraction happen at extraction time — in the
+[reader/connector](/system/runtime/components/connector.md) — so nodes receive resolved scalar
+leaves and the wire value model stays scalar. Readers prefer Parquet-**shredded** typed
+subcolumns when a data file shreds a declared path, decoding the binary variant only for the
+residual. Delivery is gated on ecosystem support (iceberg-rust and Arrow variant reads, Spark
+variant extraction, Parquet shredding), in the same style as [D28](/system/decisions/d28-iceberg-v3.md).
+
+Phasing: **first** flatten + hydration (schema-less end-to-end); **then** shapes — discriminator,
+typed fields and flags, shredding-aware reads.
