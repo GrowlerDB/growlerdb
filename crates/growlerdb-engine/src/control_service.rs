@@ -1350,13 +1350,15 @@ impl ControlPlane for ControlPlaneService {
             return Err(Status::invalid_argument("index and endpoint are required"));
         }
         // A liveness heartbeat into the CP placement pool; the CP stamps its own clock so a
-        // skewed node clock can't fake liveness. In-memory only — no persist. The scale limit caps
-        // *new* nodes at the entitlement (free tier or license); re-heartbeats of a live node always
-        // pass, so an existing cluster is never disrupted.
+        // skewed node clock can't fake liveness. In-memory only — no persist. The pool is
+        // index-agnostic (D52): a node registers once as an interchangeable shard host, so `index`
+        // (still on the wire) no longer keys the pool. The scale limit caps *new* nodes at the
+        // entitlement (free tier or license); re-heartbeats of a live node always pass, so an
+        // existing cluster is never disrupted.
         let limit = self.entitled_nodes();
-        if let Err(current) =
-            self.registry
-                .register_node_capped(&req.index, &req.endpoint, now_ms(), limit)
+        if let Err(current) = self
+            .registry
+            .register_node_capped(&req.endpoint, now_ms(), limit)
         {
             return Err(Status::resource_exhausted(format!(
                 "scale limit reached: {current} nodes registered, entitlement is {limit} (free tier \
