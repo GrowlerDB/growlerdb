@@ -29,14 +29,16 @@ delivered in this order:
    line we already pin carries the decode machinery). Trino is then demoted to the **permanent
    slow lane**: delete-bearing files and the pass-2 stale-locator fallback.
 
-**Status.** In progress. The interim hydration + schema-introspection **seam is implemented**
-(`growlerdb-source::trino` — key-predicated point `SELECT`s with the variant as JSON, `nextUri`
-poll loop, `information_schema` introspection, D45-loud errors; unit-tested), and the per-index
-routing fork (`ResolvedIndex::has_variant_field`) exists. The full per-call-site routing around
-released iceberg-rust — not just hydration — is recorded in
-[D49](/system/decisions/d49-variant-iceberg-rust-routing.md). Pending: wiring the fork into the
-engine's hydrate/create call sites and the connector's variant extraction (step 1). The seam is
-designed so step 3 swaps the primary implementation without touching callers.
+**Status.** Steps 1–2 **implemented + live-verified**; step 3 pending the next iceberg-rust release.
+The connector extracts the variant column (step 1: `VariantExtractor` + `--variant-spec`; bootstrap +
+changelog, `create_changelog_view` handles variant), and the interim Trino lane (step 2:
+`growlerdb-source::trino` — key-predicated point `SELECT`s with the variant as JSON, `nextUri` poll,
+`information_schema` introspection, D45-loud errors) is wired into the engine's create + hydrate call
+sites behind the per-index fork (`declares_variant`/`has_variant_field`). Verified against the running
+stack: creating `events` over the live v3 table resolves via Trino, and keys hydrate returning
+`payload` as JSON. The full per-call-site routing around released iceberg-rust is recorded in
+[D49](/system/decisions/d49-variant-iceberg-rust-routing.md). The seam is designed so step 3 swaps
+the primary implementation without touching callers.
 
 **Why.**
 
