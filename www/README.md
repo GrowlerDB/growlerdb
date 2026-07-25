@@ -27,10 +27,11 @@ https://…   ─▶ 200, this index.html (Let's Encrypt cert)
 
 ## Deploy / update the page
 
-The page is a **self-contained static bundle** (Brand v1.0): `index.html` (inline CSS), `favicon.svg`
-(the waterline mark), and `fonts/` (self-hosted Archivo / Instrument Sans / Geist Mono woff2 — no font
-CDN). The only external reference is the social image, pulled from `docs.growlerdb.com`. To publish,
-sync the bundle (minus this README) to the Apache document root:
+The page is a **self-contained static bundle** (Brand v1.0): `index.html` (inline CSS + inline
+[schema.org JSON-LD](#seo--search-engine-submission)), `favicon.svg` (the waterline mark), `fonts/`
+(self-hosted Archivo / Instrument Sans / Geist Mono woff2 — no font CDN), plus `robots.txt` and
+`sitemap.xml` for crawlers. The only external reference is the social image, pulled from
+`docs.growlerdb.com`. To publish, sync the bundle (minus this README) to the Apache document root:
 
 ```sh
 # from the repo root, on a host with SSH access to the VM
@@ -53,6 +54,45 @@ curl -s  -o /dev/null -w '%{ssl_verify_result}\n' https://growlerdb.com/   # →
 
 Then open **https://growlerdb.com** and **https://www.growlerdb.com** in a browser and confirm the page
 loads over HTTPS with a valid certificate.
+
+## SEO & search-engine submission
+
+The apex page ships the on-page SEO signals directly:
+
+- **`<title>` + meta `description`**, a `canonical` URL, and a `robots` directive
+  (`index, follow, max-image-preview:large`).
+- **Open Graph + Twitter** card tags (title/description/url + the 1200×630 social image with alt +
+  dimensions) so shared links unfurl.
+- **[schema.org](https://schema.org) JSON-LD** inline in `index.html` — an `Organization`, a `WebSite`,
+  and a free `SoftwareApplication` (`@graph`), so engines model the project (name, description,
+  AGPL-3.0 license, GitHub `codeRepository`) for richer results.
+- **`robots.txt`** allows all crawlers and advertises `https://growlerdb.com/sitemap.xml`.
+- **`sitemap.xml`** lists the apex homepage. The docs are a **separate host**
+  (`docs.growlerdb.com`) and publish **their own** sitemap: `jekyll-sitemap` (enabled in
+  [`../docs/_config.yml`](../docs/_config.yml)) emits `https://docs.growlerdb.com/sitemap.xml`, and
+  [`../docs/robots.txt`](../docs/robots.txt) points at it. Submit **both** sitemaps.
+
+Search engines no longer accept anonymous sitemap "pings" (Google dropped it in 2023; Bing too), so
+submission is a one-time, **account-based** step per property. Do it once for **both**
+`growlerdb.com` and `docs.growlerdb.com`:
+
+1. **Google Search Console** (<https://search.google.com/search-console>) — add each property,
+   verify ownership (easiest is a **DNS `TXT`** record on `growlerdb.com`, which covers both the apex
+   and the subdomain via a Domain property), then **Sitemaps → add** `sitemap.xml` for each.
+2. **Bing Webmaster Tools** (<https://www.bing.com/webmasters>) — add + verify each site (you can
+   **import from Google Search Console** to skip re-verification), then submit each sitemap. Bing feeds
+   DuckDuckGo, Ecosia, and Yahoo.
+3. **(optional) IndexNow** for instant Bing/Yandex recrawls after an update: generate a key, host it at
+   `https://growlerdb.com/<key>.txt`, and `POST` changed URLs to `https://api.indexnow.org/indexnow`.
+
+Verify the crawl surface after any deploy:
+
+```sh
+curl -s https://growlerdb.com/robots.txt            # → Allow: / + Sitemap: line
+curl -s https://growlerdb.com/sitemap.xml | head -3 # → <urlset> with the apex URL
+curl -s https://docs.growlerdb.com/sitemap.xml | head -3   # → jekyll-sitemap output
+# Confirm the JSON-LD parses: paste the page into https://validator.schema.org/
+```
 
 ## Editing
 

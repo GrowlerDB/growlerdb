@@ -97,8 +97,11 @@ kubectl -n "$NAMESPACE" wait --for=condition=complete job/polaris-catalog-setup 
 say "3/7 generator — creates $TABLE and starts feeding it"
 kubectl apply -f "$RENDER_DIR/generator.yaml"
 echo "waiting for the $TABLE table to be created ..."
+# The "created <table>" line is emitted ONCE at generator startup, then batch lines stream every few
+# seconds — so a small `--tail` scrolls past it and the grep never matches, burning the whole timeout
+# (TASK-345). Read the full log (`--tail=-1`) so the one-time line is always found.
 for _ in $(seq 1 40); do
-  kubectl -n "$NAMESPACE" logs deploy/growlerdb-generator --tail=5 2>/dev/null | grep -q "created $TABLE" && { echo "  table created"; break; }
+  kubectl -n "$NAMESPACE" logs deploy/growlerdb-generator --tail=-1 2>/dev/null | grep -q "created $TABLE" && { echo "  table created"; break; }
   sleep 6
 done
 
@@ -114,11 +117,19 @@ if [ "$WINDOWED" = true ] && [ "$COLD_TIER" = true ]; then
              --set coldTier.parkIntervalSecs="${COLD_PARK_INTERVAL_SECS:-120}")
   say "cold-tiering ON — park every ${COLD_PARK_INTERVAL_SECS:-120}s → bucket ${COLD_BUCKET:-growlerdb-backups} (hot_windows from the index def)"
 fi
+# Scale-limit license (TASK-346): with $GROWLERDB_LICENSE set, the control plane admits all $SHARDS
+# nodes deterministically instead of relying on the free-tier (3) registration leak. Passed as an env
+# (never committed) via --set-string. Empty = free tier (works today only because the cap leaks).
+LICENSE_ARGS=()
+if [ -n "${GROWLERDB_LICENSE:-}" ]; then
+  LICENSE_ARGS=(--set-string credentials.license="$GROWLERDB_LICENSE")
+  say "scale-limit license provided — control plane will admit all $SHARDS nodes (no free-tier leak)"
+fi
 helm upgrade --install gdb "$HELM_CHART" -f "$HELM_CHART/values-scale.yaml" -n "$NAMESPACE" \
   --set image.tag="$IMAGE_TAG" --set index.shards="$SHARDS" \
   --set index.windowed="$WINDOWED" \
   --set index.name="$INDEX" --set index.sourceTable="$TABLE" \
-  "${COLD_ARGS[@]}" \
+  "${COLD_ARGS[@]}" "${LICENSE_ARGS[@]}" \
   --set-file index.definition="$INDEX_DEF"
 echo "waiting for $SHARDS node $([ "$WINDOWED" = true ] && echo pods || echo shards) to become Ready ..."
 for _ in $(seq 1 40); do

@@ -37,9 +37,12 @@ nav_external_links:
 footer_content: "GrowlerDB — AGPL-3.0. Search returns coordinates; rows hydrate from Iceberg."
 
 # Needed for the GitHub Pages native build to apply a remote theme + emit social/OG meta.
+# jekyll-seo-tag emits per-page <title>/description/OG/Twitter + JSON-LD; jekyll-sitemap
+# publishes /sitemap.xml (submitted to search engines — see ../www/README.md).
 plugins:
   - jekyll-remote-theme
   - jekyll-seo-tag
+  - jekyll-sitemap
 
 # Don't publish docs-tooling files as pages.
 exclude:

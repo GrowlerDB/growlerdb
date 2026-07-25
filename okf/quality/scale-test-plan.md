@@ -46,9 +46,26 @@ Each maps to metrics/graphs (dashboard: `deploy/k8s/observability/grafana.yaml`)
    that hydrates. The k8s drain gate `deploy/k8s/streaming/convergence-gate.sh` is the count-only,
    compaction-racing sibling.
 4. **Index:source size ratio,** stacked into **inverted-index / locator / fast-cache** (the size-attribution
-   breakdown) vs `growlerdb_source_bytes`.
+   breakdown). Reported against the **uncompressed raw-corpus size** (the OSB/ES-benchmark convention)
+   — *not* against `growlerdb_source_bytes`, which is Iceberg `total-files-size` = **compressed**
+   parquet and so shifts under storage config (parquet↔orc, zstd↔snappy) even though the logical data
+   is unchanged. Raw size is **ground truth from the generator**, computed **restart-durably**: the
+   generator serves `growlerdb_gen_raw_bytes_total` / `growlerdb_gen_rows_total` on `:9109` (the
+   uncompressed JSON bytes + rows it emits), and the harness takes their **ratio** — mean uncompressed
+   bytes/row — × the cumulative `source_records`. The ratio is used (not the raw sum) because those
+   counters are per-pod and **reset when the generator restarts** (`set_ingest`/freeze/resume restart
+   it), so summing them undercounts the corpus; the ratio is invariant to the reset and `source_records`
+   never resets ([TASK-344], found in Run 8 where the naive sum read 0.80 GB vs ≈1.12 GB true). No
+   hardcoded bytes/row (that's only the pre-metric fallback). The compressed footprint + compression
+   ratio are reported alongside for context; milestone *sizes* (`STORAGE_GB`) are likewise GB of
+   uncompressed corpus. See [TASK-342].
 5. **Query performance at each storage milestone** (below).
-6. **GrowlerDB vs Iceberg-alone** (Trino over the same table) at each milestone.
+6. **GrowlerDB vs Iceberg-alone** (Trino over the same table) at each milestone — a **fair** baseline:
+   run it **after compaction** (an unmaintained streaming layout of thousands of tiny files penalizes
+   the scan for reasons unrelated to the engine), give Iceberg the skips it actually has (parquet
+   **bloom filters** on the equality columns + a **`day` partition predicate** — the scan analog of
+   GrowlerDB's window pruning), and label the deliberately-unbounded `[full scan]` queries as the
+   worst case, not the only case. See [TASK-343].
 7. **Compute required at each ingest + storage scale** (CPU/mem/disk/net per node).
 8. **Stability** — error rate + restarts.
 
@@ -64,10 +81,13 @@ cover the low/mid scales directly and **extrapolate** the top:
   huge `BATCH`:** the generator's `BATCH` is one Iceberg snapshot = the connector's commit size (it
   cuts only at snapshot boundaries), and commit latency is ~O(snapshot) — a 300k `BATCH` self-inflicts
   ~9.5s p99 commits, ~10–30k stays sub-2s (the connector-side split is chunked commit).
-- **Storage milestones:** grow the source to **1 GB → 10 GB → 100 GB** (fits the ~960 GB cluster disk);
-  **1 TB** is **modeled**. At each milestone **freeze ingest, run the query load, and capture**:
-  query p50/p95/p99, hydration latency, index:source ratio (+ breakdown), resource utilisation, and
-  the **GrowlerDB-vs-Trino** comparison — into a results table + dashboard snapshots.
+- **Storage milestones:** grow the source to **5 GB → 10 GB → 100 GB** of **uncompressed corpus**
+  (baseline raised from 1 GB to **5 GB** for Run-7-comparable scale on the honest raw basis —
+  [TASK-347]; the compressed parquet on disk is ~5× smaller, so this fits the cluster disk
+  comfortably); **1 TB** is **modeled**. At each milestone **freeze ingest, run the query load, and
+  capture**: query p50/p95/p99, hydration latency, index:source ratio (+ breakdown), resource
+  utilisation, and the **GrowlerDB-vs-Trino** comparison. Each run's normalized numbers are appended
+  to [scale-run results](/quality/scale-results.md) so they're comparable run-over-run.
 - **Extrapolation:** fit the reachable points (query-latency vs data-size; resources vs ingest-rate;
   index:source ratio) and project **1 TB / 100k rec/s** with explicit assumptions + ±ranges.
   Clearly label modeled vs measured.
@@ -78,7 +98,9 @@ needs the Hetzner **dedicated-core limit raised** + more nodes/disk.
 
 ## Metrics & observability
 
-Every component serves Prometheus `/metrics` (control-plane `:9101`, node `:9102`, gateway `:9103`).
+Every component serves Prometheus `/metrics` (control-plane `:9101`, node `:9102`, gateway `:9103`,
+connector `:9091`, generator `:9109` — the last emits `growlerdb_gen_raw_bytes_total` /
+`growlerdb_gen_rows_total`, the uncompressed-corpus size the milestones are measured against).
 A **headless test cluster has no Prometheus** — deploy one (scraping those ports) and set the chart's
 `gateway.prometheusUrl` so the console's `/v1/stats/*` SLI panels have a backend (otherwise
 Observability/Ingestion pages error with an HTML/JSON parse failure).
@@ -104,12 +126,17 @@ Coverage vs what a scale test needs:
 **Iceberg maintenance cadence:** the CronJob default (`deploy/k8s/streaming/maintenance.yaml`) is
 hourly — a *production* cadence. For a bounded test, run it **every ~10 min** (`*/10 * * * *`) so the
 compaction↔hydration relationship is visible within the run window; each `replace` snapshot marks a
-compaction to overlay on the hydration chart. Since the D30 slice-3 **background re-map**, hydration
-no longer pays a per-read locator refresh after a compaction — the node heals the locators in the
-background (`growlerdb_locator_remap_events_total` / `growlerdb_locator_remapped_rows_total` /
-`growlerdb_locator_dead_files`), so the run asserts `growlerdb_stale_locators_total` stays **≈ 0**
-across those markers (a rising counter despite re-map events means the re-map isn't keeping up) and
-hydration p99 stays **flat** across compactions.
+compaction to overlay on the hydration chart. **Compaction is a prerequisite for measuring hydrated
+queries, not an afterthought:** streaming appends one data-file per commit, so an unmaintained source
+accumulates thousands of tiny files (Run 7: **2769 files at 1 GB**) and hydration pays the small-file
+tax — compacting to ~128 MB files cut a top-20 hydrated `_search` **~2×** (30s→16s). Two open caveats
+the runs must watch (do **not** assume they hold): the maintenance CronJob is currently hardcoded to
+the non-windowed `growlerdb.http_logs` table, so a **windowed** run gets no compaction unless you run
+one targeting `…_windowed` ([[TASK-340]]); and the post-compaction locator heal does **not** yet
+demonstrably persist — Run 7 saw `growlerdb_stale_locators_total` **rise ~1 per hydrated hit** with
+topk latency flat across passes (re-refresh on every read), and the `growlerdb_locator_remap_*`
+metrics an earlier draft cited are **absent in 0.5.0** ([[TASK-339]]). So a run asserts hydration p99
+across compactions as a *measurement to report*, not an invariant known to hold.
 
 ## Operational prerequisites (learned bringing it up live)
 

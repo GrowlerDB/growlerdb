@@ -7,17 +7,65 @@
 <meta name="description" content="GrowlerDB is an open-source retrieval engine — full-text, vector, and hybrid search over your data. Your source stays the system of record; a fast derived index resolves matches back to the authoritative row. No second copy.">
 <link rel="canonical" href="https://growlerdb.com/">
 <link rel="icon" href="/favicon.svg">
+<!-- Crawling: index + follow, and let Google show a large image + full snippet. -->
+<meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1">
+<meta name="theme-color" content="#141517">
+<link rel="sitemap" type="application/xml" href="/sitemap.xml">
 <!-- Social unfurl -->
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="GrowlerDB">
+<meta property="og:locale" content="en_US">
 <meta property="og:title" content="GrowlerDB — full-text, vector, and hybrid search over your data">
 <meta property="og:description" content="Open-source retrieval engine — full-text, vector, and hybrid search over your data. Matches resolve back to authoritative rows in your source — no second copy of your data.">
 <meta property="og:url" content="https://growlerdb.com/">
 <meta property="og:image" content="https://docs.growlerdb.com/img/social-preview.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="GrowlerDB — full-text, vector, and hybrid search over your data">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="GrowlerDB — full-text, vector, and hybrid search over your data">
 <meta name="twitter:description" content="Open-source retrieval — full-text, vector, and hybrid search over your data. Matches resolve back to authoritative rows in your source.">
 <meta name="twitter:image" content="https://docs.growlerdb.com/img/social-preview.png">
+<meta name="twitter:image:alt" content="GrowlerDB — full-text, vector, and hybrid search over your data">
+<!-- Structured data (schema.org) — helps search engines model the site, the org, and the project. -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "Organization",
+      "@id": "https://growlerdb.com/#org",
+      "name": "GrowlerDB",
+      "url": "https://growlerdb.com/",
+      "logo": "https://docs.growlerdb.com/img/social-preview.png",
+      "sameAs": ["https://github.com/GrowlerDB/growlerdb"]
+    },
+    {
+      "@type": "WebSite",
+      "@id": "https://growlerdb.com/#website",
+      "name": "GrowlerDB",
+      "url": "https://growlerdb.com/",
+      "description": "Open-source retrieval engine — full-text, vector, and hybrid search over your data.",
+      "publisher": { "@id": "https://growlerdb.com/#org" },
+      "inLanguage": "en"
+    },
+    {
+      "@type": "SoftwareApplication",
+      "@id": "https://growlerdb.com/#software",
+      "name": "GrowlerDB",
+      "url": "https://growlerdb.com/",
+      "description": "Open-source retrieval engine — full-text, vector, and hybrid search over Apache Iceberg. Search returns coordinates that hydrate back to the authoritative rows in your source; no second copy of your data.",
+      "applicationCategory": "DeveloperApplication",
+      "operatingSystem": "Linux, macOS",
+      "license": "https://www.gnu.org/licenses/agpl-3.0.html",
+      "isAccessibleForFree": true,
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+      "codeRepository": "https://github.com/GrowlerDB/growlerdb",
+      "publisher": { "@id": "https://growlerdb.com/#org" }
+    }
+  ]
+}
+</script>
 <style>
   /* Self-hosted brand typography (no font CDN) — see /fonts. */
   @font-face { font-family: 'Archivo'; font-weight: 600; font-display: swap; src: url('/fonts/archivo-latin-600-normal.woff2') format('woff2'); }

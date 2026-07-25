@@ -12,7 +12,7 @@ runner); talks to the in-cluster Prometheus + gateway via a port-forward (or in-
 Reachable scales are measured; 100k rec/s + 1 TB are extrapolated in analysis (see scale-test-plan).
 Outputs results.json (milestone x metric). This is the orchestration; it does not itself fit/plot.
 """
-import json, os, subprocess, time, urllib.parse, urllib.request
+import json, os, subprocess, sys, time, urllib.parse, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 NS = os.environ.get("NAMESPACE", "growlerdb")
@@ -28,8 +28,36 @@ CONCURRENCY = os.environ.get("CONCURRENCY", "16")
 # connector's 50k maxCommitRows) and hit the rate with a shorter SLEEP_S, rather than a huge BATCH
 # (a 300k BATCH self-inflicts ~9.5s p99 commits).
 INGEST_STEPS = [(1000, 10000, 10), (10000, 30000, 3)]
-STORAGE_GB = [float(x) for x in os.environ.get("STORAGE_GB", "1,10,100").split(",")]
-ROW_BYTES = 28.0  # measured http_logs bytes/row; milestone target rows = GB / ROW_BYTES
+# Baseline 5 GB (raw uncompressed) — Run-7-comparable scale on the honest raw basis (TASK-347).
+# ~26M http_logs rows; at the ~8.9k docs/s single-node ceiling that's ~50 min of ingest, so raise
+# GENERATORS to parallelize a real run. Override with STORAGE_GB=... for a quick/cheap pass.
+STORAGE_GB = [float(x) for x in os.environ.get("STORAGE_GB", "5,10,100").split(",")]
+# Milestones + index:source are sized against the UNCOMPRESSED raw-corpus size (the OSB / ES-benchmark
+# convention), NOT the compressed parquet on-disk size. `growlerdb_source_bytes` is Iceberg's
+# `total-files-size` (compressed) — that basis SHIFTS under storage config that doesn't change the
+# logical data (parquet↔orc, zstd↔snappy, dictionary/RLE), so numbers stop being comparable across
+# runs. Raw uncompressed is stable (TASK-342).
+#
+# Ground truth = the generator's own uncompressed byte count, but the raw COUNTER
+# (`growlerdb_gen_raw_bytes_total`) is per-pod and RESETS whenever the generator restarts —
+# `set_ingest`/`freeze`/`resume` all restart it — so summing it undercounts the cumulative corpus
+# (TASK-344; Run 8 read 0.80 GB vs ≈1.12 GB true). So take the generator's mean uncompressed
+# bytes/row (raw_bytes / rows — a RATIO, invariant to the counter resetting since both reset
+# together) and multiply by the cumulative `source_records` (Iceberg, never resets). RAW_ROW_BYTES is
+# the fallback mean for runs whose generator predates the metric (http_logs ≈ 140, OSB ≈ 128).
+# STORAGE_GB is GB of uncompressed corpus.
+RAW_ROW_BYTES = float(os.environ.get("RAW_ROW_BYTES", "140"))
+
+
+def raw_source_bytes():
+    """Uncompressed corpus size, restart-durable (TASK-344): the generator's mean bytes/row (a ratio,
+    so unaffected by its per-pod counter resetting on restart) × the cumulative `source_records`.
+    Falls back to RAW_ROW_BYTES × rows when the generator metric is absent (older runs). Returns bytes."""
+    rows = prom("sum(growlerdb_gen_rows_total)")
+    raw = prom("sum(growlerdb_gen_raw_bytes_total)")
+    src = prom("max(growlerdb_source_records)")
+    mean_bytes_per_row = (raw / rows) if rows > 0 else RAW_ROW_BYTES
+    return src * mean_bytes_per_row
 
 
 def kubectl(*args):
@@ -67,9 +95,9 @@ def resume_ingest():
 
 def snapshot():
     """One capture of the metric set — GrowlerDB-native metrics (no external exporter dependency)."""
-    return {
+    snap = {
         "source_records": prom("max(growlerdb_source_records)"),
-        "source_bytes": prom("max(growlerdb_source_bytes)"),
+        "source_bytes": prom("max(growlerdb_source_bytes)"),  # COMPRESSED parquet on-disk (total-files-size)
         "index_bytes": prom("sum(growlerdb_index_bytes)"),
         "index_docs": prom("sum(growlerdb_index_docs)"),
         "rows_behind": prom("max(growlerdb_source_records) - sum(growlerdb_index_docs)"),
@@ -78,6 +106,7 @@ def snapshot():
         "query_p95_s": prom("histogram_quantile(0.95,sum(rate(growlerdb_query_duration_seconds_bucket[2m]))by(le))"),
         "hydration_p95_s": prom("histogram_quantile(0.95,sum(rate(growlerdb_hydration_duration_seconds_bucket[2m]))by(le))"),
         "node_cpu_cores": prom("sum(rate(node_cpu_seconds_total{mode!=\"idle\"}[2m]))"),
+        # index:source vs COMPRESSED parquet — kept for continuity, but config-dependent (see below).
         "index_source_ratio": prom("sum(growlerdb_index_bytes) / max(growlerdb_source_bytes)"),
         # Per-component index bytes: term/postings/positions/fieldnorms (the inverted index), fast,
         # store, locator, other — sums to index_bytes, so a ratio change is attributable to the
@@ -89,6 +118,18 @@ def snapshot():
         "segments_live": prom("sum(growlerdb_segments_live)"),
         "index_deleted_docs": prom("sum(growlerdb_index_deleted_docs)"),
     }
+    # UNCOMPRESSED-raw basis (TASK-342): the stable, config-independent headline. raw_source_bytes =
+    # rows × RAW_ROW_BYTES; index_source_ratio_raw = index_bytes / raw_source_bytes (index vs the
+    # logical corpus, not vs the codec-dependent parquet footprint). compression_ratio exposes how
+    # much of the "index:source vs compressed" number is just parquet doing its job.
+    snap["raw_source_bytes"] = raw_source_bytes()
+    snap["index_source_ratio_raw"] = (
+        snap["index_bytes"] / snap["raw_source_bytes"] if snap["raw_source_bytes"] else 0.0
+    )
+    snap["compression_ratio"] = (
+        snap["raw_source_bytes"] / snap["source_bytes"] if snap["source_bytes"] else 0.0
+    )
+    return snap
 
 
 def run_loadgen(seconds=180):
@@ -99,7 +140,7 @@ def run_loadgen(seconds=180):
     these scales). Runs against GATEWAY (a port-forward or in-cluster URL) via GROWLERDB_OS_URL."""
     out = os.path.join(HERE, ".staged-loadgen.json")
     r = subprocess.run(
-        ["python", os.path.join(HERE, "harness.py"), "query", WORKLOAD,
+        [sys.executable, os.path.join(HERE, "harness.py"), "query", WORKLOAD,
          "--duration", str(seconds), "--concurrency", CONCURRENCY, "--out", out],
         env={**os.environ, "GROWLERDB_OS_URL": GATEWAY}, capture_output=True, text=True)
     try:
@@ -116,7 +157,7 @@ def run_trino(seconds_label):
         return {"skipped": "trino not deployed"}
     out = os.path.join(HERE, ".staged-trino.json")
     subprocess.run(
-        ["python", os.path.join(HERE, "compare_trino.py")],
+        [sys.executable, os.path.join(HERE, "compare_trino.py")],
         env={**os.environ, "GATEWAY_URL": GATEWAY, "INDEX": INDEX, "OUT": out}, capture_output=True, text=True)
     try:
         return json.loads(open(out).read())
@@ -146,21 +187,22 @@ def main():
     # --- storage milestones: query perf at each size ---
     resume_ingest()
     for gb in STORAGE_GB:
-        target_rows = gb * 1e9 / ROW_BYTES
-        while prom("max(growlerdb_source_records)") < target_rows:
-            print(f"  waiting for {gb} GB ({prom('max(growlerdb_source_records)'):.0f}/{target_rows:.0f} rows)", flush=True)
+        target_bytes = gb * 1e9  # GB of UNCOMPRESSED corpus, from the generator's own counter (TASK-342)
+        while raw_source_bytes() < target_bytes:
+            print(f"  waiting for {gb:g} GB uncompressed ({raw_source_bytes() / 1e9:.2f}/{gb:g} GB)", flush=True)
             time.sleep(60)
         freeze_ingest()
         time.sleep(120)  # let indexing drain so the milestone converges
         load = run_loadgen(180)
         trino = run_trino(gb)
-        conv = subprocess.run(["python", os.path.join(os.path.dirname(__file__), "convergence_check.py")],
+        conv = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "convergence_check.py")],
                               env={**os.environ, "TOLERANCE": "0"}, capture_output=True, text=True)
         m = {"target_gb": gb, "snapshot": snapshot(), "load": load, "trino": trino,
              "convergence_pass": conv.returncode == 0}
         results["storage_milestones"].append(m)
         print(f"milestone {gb} GB: query_p95={m['snapshot']['query_p95_s']*1000:.1f}ms "
-              f"ratio={m['snapshot']['index_source_ratio']:.2f}x converged={m['convergence_pass']} "
+              f"idx:src(raw)={m['snapshot']['index_source_ratio_raw']:.2f}x "
+              f"(vs-compressed={m['snapshot']['index_source_ratio']:.2f}x) converged={m['convergence_pass']} "
               f"delete_debt={m['snapshot']['index_deleted_docs']:.0f} "
               f"segments={m['snapshot']['segments_live']:.0f}", flush=True)
         resume_ingest()

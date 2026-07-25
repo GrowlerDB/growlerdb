@@ -17,6 +17,20 @@ import random
 import time
 import uuid
 
+try:  # generator telemetry (uncompressed-corpus bytes) — provided by the seed image; absent locally
+    import genmetrics as _genmetrics
+except ImportError:
+    _genmetrics = None
+
+# Parquet bloom filters so a GrowlerDB-vs-Iceberg comparison is FAIR (TASK-343). This table is
+# UNPARTITIONED (hash-routed by request_id), so there's no partition pruning at all — a bloom filter
+# on the equality/point-lookup columns is Iceberg's *only* row-group skip; without it every
+# `request_id=` / `status=` predicate full-scans and looks artificially slow next to the index.
+WRITE_PROPERTIES = {
+    "write.parquet.bloom-filter-enabled.column.request_id": "true",
+    "write.parquet.bloom-filter-enabled.column.status": "true",
+}
+
 BATCH = int(os.environ.get("BENCH_BATCH", "50000"))
 ROWS = int(os.environ.get("BENCH_ROWS", "1000000"))
 
@@ -139,7 +153,7 @@ def load(table="growlerdb.http_logs", fraction=1.0):
         pass
     if _table_exists(catalog, table):
         catalog.drop_table(table)
-    tbl = catalog.create_table(table, schema=schema)
+    tbl = catalog.create_table(table, schema=schema, properties=WRITE_PROPERTIES)
 
     total = int(ROWS * fraction)
     written = 0
@@ -168,12 +182,15 @@ def stream(table="growlerdb.http_logs", batch=10, sleep_s=5):
             NestedField(i + 1, f.name, LongType() if f.type == pa.int64() else StringType(), required=False)
             for i, f in enumerate(schema)
         ])
-        catalog.create_table(table, schema=ice)
+        catalog.create_table(table, schema=ice, properties=WRITE_PROPERTIES)
         print(f"created {table}", flush=True)
     n = 0
     while True:
         tbl = catalog.load_table(table)  # reload for the latest snapshot
-        tbl.append(pa.table(_rows(batch, n, gen_ip), schema=schema))
+        cols = _rows(batch, n, gen_ip)
+        tbl.append(pa.table(cols, schema=schema))
+        if _genmetrics is not None:  # report the real uncompressed bytes produced (TASK-342)
+            _genmetrics.record_columns(cols, batch)
         n += batch
         print(f"appended {batch} rows to {table} (total ~{n})", flush=True)
         time.sleep(sleep_s)

@@ -38,22 +38,24 @@ a single-host alternative to the Kubernetes deployment, and the environment inte
 run against.
 
 ```sh
-just stack        # deps + seed, then control-plane + node + node-catalog + gateway + LGTM
+just stack        # deps + seed, then control-plane + node + node-catalog + node-movies + gateway + LGTM
 just mcp-connect  # mint a demo token + print MCP connect snippets (Claude or any agent)
-just demo-data    # optional: load the Wikipedia movie-plots corpus + its vector index
+just demo-data    # optional: upgrade movies to the full Wikipedia movie-plots corpus
 just stack-down   # tear it all down (removes volumes)
 ```
 
 Once up, `just mcp-connect` makes the stack an **agent retrieval tool** over MCP (Streamable HTTP
-at `/mcp` on the gateway, same port as the console — no extra binary; see getting-started §7), and
-`just demo-data` adds the opt-in **movie demo corpus** (`demo-data` compose profile: a loader
-writes `growlerdb.movies` into Iceberg, then `node-movies` builds + serves its vector index — see
-[docs: Demo corpus](https://docs.growlerdb.com/demo-corpus)).
+at `/mcp` on the gateway, same port as the console — no extra binary; see getting-started §7). The
+console **opens on `movies`**, the demo's `VECTOR` star (`GROWLERDB_DEFAULT_INDEX`), so semantic and
+hybrid search work out of the box. `just stack` ships a small 300-row `movies` slice from a committed
+parquet (no download); `just demo-data` **upgrades** it to the full 5000-film corpus (`demo-data`
+compose profile: a loader reloads `growlerdb.movies` in Iceberg, then `node-movies` cold-rebuilds its
+vector index — see [docs: Demo corpus](https://docs.growlerdb.com/demo-corpus)).
 
-`just stack` activates two Compose profiles: `stack` (control-plane, node, gateway, LGTM) and
-`catalog` (the second `node-catalog`). The streaming demo (`just pipeline`) activates `stack` +
-`pipeline` and deliberately leaves `node-catalog` out — there is no seeded `growlerdb.catalog` source
-there.
+`just stack` activates three Compose profiles: `stack` (control-plane, node, gateway, LGTM), `catalog`
+(the second `node-catalog`), and `demo-data` (the `node-movies` vector node + its one-shot loader). The
+streaming demo (`just pipeline`) activates `stack` + `pipeline` and deliberately leaves `node-catalog`
+and `node-movies` out — there is no seeded `growlerdb.catalog` / `growlerdb.movies` source there.
 
 Services (all on the compose network; published to the host):
 
@@ -62,6 +64,7 @@ Services (all on the compose network; published to the host):
 | **gateway** | public Engine API + the **console UI** (built-in auth, all-indexes routing) | **console `http://localhost:8081`**, REST `/v1`, gRPC `:50061` |
 | **node** | builds + serves the `docs` index | gRPC `:50051`, health `:9102` |
 | **node-catalog** | builds + serves the richer `catalog` index (`catalog` profile) | gRPC `:50052`, health `:9104` |
+| **node-movies** | builds + serves the `movies` **`VECTOR`** index — the console default (`demo-data` profile) | gRPC `:50053`, health `:9106` |
 | **controlplane** | cluster index registry + `/v1/login` (seeds `demo`/`demo` + `admin`/`admin`) | gRPC `:50071`, health `:9101` |
 | **lgtm** | Grafana + Loki/Tempo/Mimir + OTLP | Grafana `http://localhost:3000`, OTLP `:4318` |
 
@@ -89,7 +92,8 @@ registry until something calls `CreateIndex`).
 - Health/readiness (`/healthz`, `/readyz`) and Prometheus `/metrics` are on each service's
   `--metrics-addr` port; Docker healthchecks gate `depends_on` (the gateway waits for a ready node).
 - Smoke test once up: `curl localhost:9103/readyz` (gateway ready). REST queries need a **login
-  token** and an **index name** now (the stack serves `docs` + `catalog` with built-in auth) — see the
+  token** and an **index name** now (the stack serves `movies` + `docs` + `catalog` with built-in
+  auth) — see the
   [getting-started tutorial](../../docs/getting-started.md) §2–§3 for the `/v1/login` → `/v1/search`
   flow.
 

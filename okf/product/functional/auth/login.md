@@ -31,7 +31,7 @@ RBAC restricts that session to exactly those indexes (see
 
 The Compose demo (`just stack`) runs **authenticated, not open**: the gateway enforces built-in login
 and the control plane mints session tokens. A well-known `demo` / `demo` credential — roles
-`reader` + `operator`, scoped to the demo indexes (`docs`, `catalog`) — lets the walkthrough show
+`reader` + `operator`, scoped to the demo indexes (`movies`, `docs`, `catalog`) — lets the walkthrough show
 login and per-index scoping working end to end. It is a demo credential, not a production account.
 
 ## Notes

@@ -73,7 +73,9 @@ def ingest_table(steps):
 
 def storage_table(ms):
     print("## Storage milestones (perf vs size)\n")
-    print("| source | index | ratio | query p95 | hydration p95 | CPU cores | converged | Trino best speedup |")
+    print("_`source (raw)` = uncompressed corpus (the stable, config-independent basis); "
+          "`ratio(raw)` = index vs that. Compressed parquet footprint shown in parens (TASK-342)._\n")
+    print("| source (raw) | index | ratio(raw) | query p95 | hydration p95 | CPU cores | converged | Trino best speedup |")
     print("|---:|---:|---:|---:|---:|---:|:--:|---:|")
     for m in ms:
         s = m.get("snapshot", {})
@@ -81,8 +83,12 @@ def storage_table(ms):
         cmps = tr.get("comparisons", []) if isinstance(tr, dict) else []
         best = max((c.get("speedup_x", 0) for c in cmps), default=None)
         best_s = f"{best:g}x" if best is not None else ("skipped" if tr.get("skipped") else "—")
-        print(f"| {_h(s.get('source_bytes', 0))} | {_h(s.get('index_bytes', 0))} "
-              f"| {s.get('index_source_ratio', 0):.2f}x | {s.get('query_p95_s', 0) * 1000:.1f} ms "
+        raw = s.get("raw_source_bytes", 0)
+        src_cell = f"{_h(raw)} ({_h(s.get('source_bytes', 0))} zst)" if raw else _h(s.get('source_bytes', 0))
+        ratio_cell = (f"{s.get('index_source_ratio_raw', 0):.2f}x "
+                      f"({s.get('index_source_ratio', 0):.2f}x/zst)")
+        print(f"| {src_cell} | {_h(s.get('index_bytes', 0))} "
+              f"| {ratio_cell} | {s.get('query_p95_s', 0) * 1000:.1f} ms "
               f"| {s.get('hydration_p95_s', 0) * 1000:.1f} ms | {s.get('node_cpu_cores', 0):.1f} "
               f"| {'✅' if m.get('convergence_pass') else '❌'} | {best_s} |")
     print()
@@ -91,7 +97,9 @@ def storage_table(ms):
 def extrapolation(data):
     print("## Extrapolation (measured → modeled)\n")
     ms = data.get("storage_milestones", [])
-    src = [m["snapshot"].get("source_bytes", 0) for m in ms]
+    # Extrapolate on the UNCOMPRESSED-raw size axis (TASK-342) so "1 TB" means 1 TB of corpus, not
+    # 1 TB of parquet; fall back to compressed only if a run predates raw_source_bytes.
+    src = [m["snapshot"].get("raw_source_bytes") or m["snapshot"].get("source_bytes", 0) for m in ms]
     if any(src):
         print("**Index bytes → 1 TB source** (is the index:source ratio stable at scale?)")
         print(project(src, [m["snapshot"].get("index_bytes", 0) for m in ms], TB, unit=" B"))

@@ -1,0 +1,8 @@
+---
+# Front matter (even empty) makes Jekyll render this so {{ }} resolves; still served at /robots.txt.
+---
+# docs.growlerdb.com — the GrowlerDB documentation. Crawlable by all well-behaved bots.
+User-agent: *
+Allow: /
+
+Sitemap: {{ '/sitemap.xml' | absolute_url }}

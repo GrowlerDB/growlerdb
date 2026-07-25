@@ -107,6 +107,16 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 {{- end -}}
 
+{{/* The scale-limit license (GROWLERDB_LICENSE) — read only by the CONTROL PLANE, which enforces the
+     node cap. Emitted only when configured (or when reusing an existing secret, which must then carry
+     the `license` key). Empty/invalid = free tier. Mint one with the `mint_license` example. */}}
+{{- define "growlerdb.licenseEnv" -}}
+{{- if or .Values.credentials.license .Values.credentials.existingSecret }}
+- name: GROWLERDB_LICENSE
+  valueFrom: { secretKeyRef: { name: {{ include "growlerdb.secretName" . }}, key: license, optional: true } }
+{{- end }}
+{{- end -}}
+
 {{- define "growlerdb.coldTierEnv" -}}
 {{- if .Values.coldTier.enabled }}
 - name: GROWLERDB_BACKUP_BUCKET

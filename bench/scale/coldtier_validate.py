@@ -120,7 +120,7 @@ def query_round_harness(gateway, workload, duration_s, concurrency):
     proven query driver (the same one staged_run.py uses) instead of hand-building query bodies."""
     out = os.path.join(HERE, ".coldtier-query.json")
     proc = subprocess.run(
-        ["python", os.path.join(HERE, "harness.py"), "query", workload,
+        [sys.executable, os.path.join(HERE, "harness.py"), "query", workload,
          "--duration", str(duration_s), "--concurrency", str(concurrency), "--out", out],
         env={**os.environ, "GROWLERDB_OS_URL": gateway}, capture_output=True, text=True,
     )
@@ -130,18 +130,28 @@ def query_round_harness(gateway, workload, duration_s, concurrency):
     except Exception:
         return {"ok": False, "hits": 0, "errors": 1, "latency_s": None,
                 "detail": proc.stderr[-500:]}
-    # harness reports per-query stats; treat the time-window query as the read-through probe.
-    queries = data.get("queries", data) if isinstance(data, dict) else {}
+    # harness reports per-query stats under `per_query`; each entry has count/errors/p50 (ms).
+    # Treat the time-window query as the read-through probe.
+    queries = (data.get("per_query") or data.get("queries") or {}) if isinstance(data, dict) else {}
     hits = errors = 0
     lat = None
+
+    def _p50_s(q):  # harness emits p50 in ms; normalize to seconds
+        v = q.get("p50_s")
+        if v is None and q.get("p50") is not None:
+            v = q["p50"] / 1000.0
+        return v
+
     for name, q in (queries.items() if isinstance(queries, dict) else []):
+        if not isinstance(q, dict):
+            continue
         errors += int(q.get("errors", 0))
         if "time" in name or "window" in name or "range" in name:
             hits += int(q.get("hits", q.get("count", 0)) or 0)
-            lat = q.get("p50_s", q.get("p50")) or lat
+            lat = _p50_s(q) or lat
     if hits == 0:  # no dedicated time-window query — fall back to total hits/count
         hits = sum(int(q.get("hits", q.get("count", 0)) or 0)
-                   for q in (queries.values() if isinstance(queries, dict) else []))
+                   for q in (queries.values() if isinstance(queries, dict) else []) if isinstance(q, dict))
     return {"ok": proc.returncode == 0, "hits": hits, "errors": errors, "latency_s": lat}
 
 
