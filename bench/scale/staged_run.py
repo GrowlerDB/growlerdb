@@ -28,25 +28,36 @@ CONCURRENCY = os.environ.get("CONCURRENCY", "16")
 # connector's 50k maxCommitRows) and hit the rate with a shorter SLEEP_S, rather than a huge BATCH
 # (a 300k BATCH self-inflicts ~9.5s p99 commits).
 INGEST_STEPS = [(1000, 10000, 10), (10000, 30000, 3)]
-STORAGE_GB = [float(x) for x in os.environ.get("STORAGE_GB", "1,10,100").split(",")]
+# Baseline 5 GB (raw uncompressed) — Run-7-comparable scale on the honest raw basis (TASK-347).
+# ~26M http_logs rows; at the ~8.9k docs/s single-node ceiling that's ~50 min of ingest, so raise
+# GENERATORS to parallelize a real run. Override with STORAGE_GB=... for a quick/cheap pass.
+STORAGE_GB = [float(x) for x in os.environ.get("STORAGE_GB", "5,10,100").split(",")]
 # Milestones + index:source are sized against the UNCOMPRESSED raw-corpus size (the OSB / ES-benchmark
 # convention), NOT the compressed parquet on-disk size. `growlerdb_source_bytes` is Iceberg's
 # `total-files-size` (compressed) — that basis SHIFTS under storage config that doesn't change the
 # logical data (parquet↔orc, zstd↔snappy, dictionary/RLE), so numbers stop being comparable across
 # runs. Raw uncompressed is stable (TASK-342).
 #
-# Ground truth = the generator's own `growlerdb_gen_raw_bytes_total` counter (it produces the rows, so
-# it counts the exact uncompressed JSON bytes — correct for every workload + variable-length rows, all
-# replicas summed). RAW_ROW_BYTES is only a FALLBACK for runs whose generator predates that metric:
-# mean uncompressed JSON bytes/row (http_logs ≈ 140, OSB ≈ 128). STORAGE_GB is GB of uncompressed corpus.
+# Ground truth = the generator's own uncompressed byte count, but the raw COUNTER
+# (`growlerdb_gen_raw_bytes_total`) is per-pod and RESETS whenever the generator restarts —
+# `set_ingest`/`freeze`/`resume` all restart it — so summing it undercounts the cumulative corpus
+# (TASK-344; Run 8 read 0.80 GB vs ≈1.12 GB true). So take the generator's mean uncompressed
+# bytes/row (raw_bytes / rows — a RATIO, invariant to the counter resetting since both reset
+# together) and multiply by the cumulative `source_records` (Iceberg, never resets). RAW_ROW_BYTES is
+# the fallback mean for runs whose generator predates the metric (http_logs ≈ 140, OSB ≈ 128).
+# STORAGE_GB is GB of uncompressed corpus.
 RAW_ROW_BYTES = float(os.environ.get("RAW_ROW_BYTES", "140"))
 
 
 def raw_source_bytes():
-    """Uncompressed corpus size: the generator counter if present (ground truth, replicas summed),
-    else rows × RAW_ROW_BYTES for older runs. Returns bytes."""
-    v = prom("sum(growlerdb_gen_raw_bytes_total)")
-    return v if v > 0 else prom("max(growlerdb_source_records)") * RAW_ROW_BYTES
+    """Uncompressed corpus size, restart-durable (TASK-344): the generator's mean bytes/row (a ratio,
+    so unaffected by its per-pod counter resetting on restart) × the cumulative `source_records`.
+    Falls back to RAW_ROW_BYTES × rows when the generator metric is absent (older runs). Returns bytes."""
+    rows = prom("sum(growlerdb_gen_rows_total)")
+    raw = prom("sum(growlerdb_gen_raw_bytes_total)")
+    src = prom("max(growlerdb_source_records)")
+    mean_bytes_per_row = (raw / rows) if rows > 0 else RAW_ROW_BYTES
+    return src * mean_bytes_per_row
 
 
 def kubectl(*args):

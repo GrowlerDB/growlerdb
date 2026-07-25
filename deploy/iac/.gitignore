@@ -7,3 +7,6 @@ terraform.tfvars
 *.auto.tfvars
 kubeconfig.yaml
 crash.log
+
+# local Hetzner token (never commit)
+.hcloud.env
