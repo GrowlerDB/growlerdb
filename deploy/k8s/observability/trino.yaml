@@ -32,7 +32,7 @@ spec:
     spec:
       containers:
         - name: trino
-          image: trinodb/trino:468
+          image: trinodb/trino:483
           ports: [{ containerPort: 8080 }]
           resources:
             requests: { cpu: "1", memory: 4Gi }

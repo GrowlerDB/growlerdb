@@ -66,7 +66,9 @@ Trino pre-compaction are flagged — their speedups flatter GrowlerDB.
   honest basis.
 - **idx:src**: only compare the **RAW** column across runs — the compressed column shifts with codec
   ([TASK-342]). Run 7's RAW value is derived, not measured (predates the metric).
-- **Trino**: only compare **post-compaction/fair** rows; Run 7's Trino is pre-compaction.
+- **Trino**: only compare **post-compaction/fair** rows; Run 7's Trino is pre-compaction. Runs ≤8
+  measured against Trino **470**; the bench image is **483** from Run 9 onward (aligned with the
+  `connector-trino` SPI pin).
 - **Query latency** includes the client→cluster RTT floor and is not the server-side number.
 
 ## Metric definitions

@@ -662,7 +662,7 @@ services:
   # then `docker compose exec trino trino` and `SELECT * FROM iceberg.growlerdb.docs;`.
   trino:
     profiles: ["trino"]
-    image: trinodb/trino:470
+    image: trinodb/trino:483
     depends_on:
       polaris:
         condition: service_started
