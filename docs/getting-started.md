@@ -73,12 +73,13 @@ console opens on `movies`** — a `VECTOR` index — so semantic and hybrid sear
 
 When it settles, the console is at <http://localhost:8081> and Grafana at <http://localhost:3000>.
 
-> **Three indexes now, so every request names one.** With more than one index served, the gateway
-> can't guess a default: search and `keys:get` requests must include `"index":"movies"`,
-> `"index":"docs"`, or `"index":"catalog"`, and the console's top-left selector switches between them.
-> (Omitting `index` returns `index required; endpoint serves 3 indexes`.) The console itself lands on
-> `movies` — that's the `GROWLERDB_DEFAULT_INDEX` the gateway advertises via `/v1/config` — but the REST
-> API has no default, so name the index yourself.
+> **Four indexes now, so every request names one.** `just stack` serves `movies`, `catalog`,
+> `docs`, and `events` (an Iceberg v3 **variant** demo — see section 12). With more than one index
+> served, the gateway can't guess a default: search and `keys:get` requests must include, e.g.,
+> `"index":"movies"` (or `docs` / `catalog` / `events`), and the console's top-left selector switches
+> between them. (Omitting `index` returns `index required; endpoint serves 4 indexes`.) The console
+> itself lands on `movies` — that's the `GROWLERDB_DEFAULT_INDEX` the gateway advertises via
+> `/v1/config` — but the REST API has no default, so name the index yourself.
 
 ## 2. Log in
 
@@ -571,7 +572,49 @@ So the two paths, side by side:
 Full details + tuning knobs are in [`deploy/compose/pipeline/README.md`](https://github.com/GrowlerDB/growlerdb/blob/main/deploy/compose/pipeline/README.md).
 Tear the streaming demo down with `just pipeline-down`.
 
-## 12. Tear down
+## 12. Iceberg v3 variant search (the `events` index)
+
+`just stack` also serves **`events`**, an Apache Iceberg **v3 `variant`** table
+(`growlerdb.events`, GitHub-events shaped): scalar `id`/`ts`/`event_type` columns plus a
+semi-structured `payload` variant whose shape differs per row. A variant column has no fixed leaf
+schema, so GrowlerDB maps it two composable ways ([variant fields](https://github.com/GrowlerDB/growlerdb/blob/main/okf/product/functional/index-management/variant.md)):
+
+- **Flatten** — every leaf is indexed untyped as an exact `path = value` term, plus an analyzed
+  full-text catch-all over string leaves. No declaration needed; covers the whole value.
+- **Shapes** — named typed sub-mappings (`payload.number` LONG, `payload.title` TEXT + a VECTOR,
+  …) selected per row by a **discriminator** (`event_type`), giving ranges/sorts/hybrid on declared
+  paths. See [`deploy/compose/events.yaml`](https://github.com/GrowlerDB/growlerdb/blob/main/deploy/compose/events.yaml).
+
+Because released iceberg-rust can't yet scan a v3 variant table, `events` is **connector-fed** (its
+rows are extracted by the Spark connector) and **hydrated through Trino** — transparently; you query
+it exactly like any other index. Reusing the `$TOKEN` from section 2:
+
+```sh
+# Flatten term on an UNDECLARED path (works with no mapping):
+curl -s localhost:8081/v1/search -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"index":"events","query":"payload.user.login:octocat"}' | jq '.hits[].coordinates'
+
+# Full-text over the flatten catch-all:
+curl -s localhost:8081/v1/search -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"index":"events","query":"payload:variant"}' | jq '.total'
+
+# Range + exact on typed SHAPE paths (LONG / KEYWORD / BOOL):
+curl -s localhost:8081/v1/search -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"index":"events","query":"payload.number:[1000 TO 2000]","sort":[{"field":"payload.number","order":"desc"}]}' | jq '.hits[].coordinates'
+
+# Hydrate a hit — the whole variant comes back as JSON (fetched via Trino):
+curl -s localhost:8081/v1/search -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"index":"events","query":"payload.number:1347","hydrate":true}' | jq '.hits[0].row.payload'
+
+# Hybrid (lexical + vector) over the shaped VECTOR `payload.title_vec`:
+curl -s "localhost:8081/v1/search:hybrid" -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"index":"events","vector_field":"payload.title_vec","query_text":"connect the SQL query engine","k":3}' | jq '.hits[].coordinates'
+```
+
+A row whose `event_type` matches no declared shape (e.g. a `WatchEvent`) is still fully
+flatten-covered — you'll find it by `payload.*` term — but has no typed shape fields.
+
+## 13. Tear down
 
 ```sh
 just stack-down
@@ -584,10 +627,10 @@ just stack-down
 - **Search returns `0 results` in the console.** Select the right index (`movies`, `docs`, or
   `catalog`, top-left) and qualify the term with a field, `body:search`, not a bare `search` (a bare
   term only matches the default field).
-- **REST search/`keys:get` returns `index required; endpoint serves 3 indexes`.** The stack serves
-  three indexes, so the gateway can't pick a default; add `"index":"movies"`, `"index":"docs"`, or
-  `"index":"catalog"` to the request body. (The console lands on `movies` via `/v1/config`, but that
-  default doesn't apply to the REST API.)
+- **REST search/`keys:get` returns `index required; endpoint serves 4 indexes`.** The stack serves
+  four indexes, so the gateway can't pick a default; add `"index":"movies"`, `"index":"docs"`,
+  `"index":"catalog"`, or `"index":"events"` to the request body. (The console lands on `movies` via
+  `/v1/config`, but that default doesn't apply to the REST API.)
 - **`keys:get` / hydration errors on the host** (`nodename nor servname` / connection refused): add the
   `127.0.0.1 minio` `/etc/hosts` entry from Prerequisites; host-side hydration reads object storage by
   that name.
