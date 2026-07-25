@@ -10,7 +10,9 @@
 
 GrowlerDB keeps Apache Iceberg as the system of record and maintains a fast, derived
 index — **full-text, vector, and hybrid** — of your data. Search returns the matching **primary keys
-(document coordinates)**, which resolve back to the authoritative rows in Iceberg.
+(document coordinates)**, which resolve back to the authoritative rows in Iceberg. That now reaches
+**Iceberg v3 `variant`** columns too — semi-structured data whose paths aren't in the table schema
+becomes searchable (see [Features](#features)).
 
 ![The GrowlerDB console — full-text search over an Iceberg table, returning ranked coordinates](docs/img/console-search.png)
 
@@ -32,9 +34,10 @@ isn't) the right fit.
 
 ## Try it (one command)
 
-Bring up the **whole stack** (GrowlerDB + MinIO + Polaris + LGTM), which seeds three sample Iceberg
-tables — `growlerdb.movies` (a small Wikipedia movie-plots slice), `growlerdb.docs`, and the
-every-field-type `growlerdb.catalog` — builds + serves an index over each, and opens the console:
+Bring up the **whole stack** (GrowlerDB + MinIO + Polaris + LGTM), which seeds four sample Iceberg
+tables — `growlerdb.movies` (a small Wikipedia movie-plots slice), `growlerdb.docs`, the
+every-field-type `growlerdb.catalog`, and an **Iceberg v3 `events`** table with a `variant` column —
+builds + serves an index over each, and opens the console:
 
 ```sh
 # build + start everything (needs Docker + just); ~10 min on first build
@@ -79,6 +82,11 @@ just stack-down
 - **Full-text, vector & hybrid retrieval** — lexical (Lucene/KQL), semantic (local-default
   embeddings), and hybrid (RRF) search, with an optional reranker and a read-only **MCP server** for
   AI agents.
+- **Iceberg v3 `variant` columns** — index semi-structured `variant` data two ways: a schema-less
+  **flatten** mode (every leaf becomes a searchable `path = value` term, plus an optional analyzed
+  text catch-all) and declared, typed **shapes** selected per row by a discriminator path. Ships
+  end-to-end today via the Spark connector (hydration for variant tables runs through Trino until the
+  native read path lands). See [variant fields](okf/product/functional/index-management/variant.md).
 - **Query language** — native structured AST + a Lucene/KQL string parser.
 - **Distributed** — control plane (registry), stateful searcher/index nodes, and a scatter-gather
   Gateway; hash/partition sharding.

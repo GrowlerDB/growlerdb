@@ -1,13 +1,13 @@
 ---
 type: Feature
-title: Variant fields (planned)
+title: Variant fields
 description: Index Iceberg v3 variant columns — an untyped flattened catch-all (schema-less) plus declared, discriminator-selected sub-schemas (shapes) for typed access.
 tags: [feature, index, variant, mapping, roadmap]
 timestamp: 2026-07-24T12:00:00
 resource: https://iceberg.apache.org/spec/#variant
 ---
 
-# Variant fields (planned)
+# Variant fields
 
 **Status: end-to-end via the connector + interim Trino lane; native Rust path pending.** The Rust
 core — the [D47](/system/decisions/d47-variant-mapping.md) mapping model (untyped flatten +
