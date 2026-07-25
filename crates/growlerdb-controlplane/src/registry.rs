@@ -3,14 +3,14 @@
 //! half-written catalog.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
 use std::path::PathBuf;
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use fs2::FileExt;
 use growlerdb_core::routing::{BucketMap, Reassignment};
 use growlerdb_core::ResolvedIndex;
 use serde::{Deserialize, Serialize};
+
+use crate::backend::{JsonFileBackend, PersistedState, RegistryBackend, RegistrySnapshot};
 
 /// A fixed dummy argon2 PHC hash that makes [`Registry::verify_credential`] do equivalent work for
 /// an unknown subject as for a real one, closing a username-enumeration timing oracle. Computed
@@ -127,49 +127,10 @@ pub struct IndexSummary {
     pub status: IndexStatus,
 }
 
-/// On-disk schema version for `registry.json`. A versioned envelope means a future format change
-/// can be detected and migrated instead of mis-parsed.
-const REGISTRY_VERSION: u32 = 1;
-
 /// How long a windowed node's heartbeat is trusted before it drops out of the CP placement pool.
 /// Sized at ~3× a node's re-register interval (~10 s) so one missed heartbeat doesn't eject a
 /// healthy node, while a genuinely dead node's windows get re-placed within ~30 s.
 pub const NODE_HEARTBEAT_TTL_MS: i64 = 30_000;
-
-/// The persisted `registry.json` document: a `{ version, indexes }` envelope around the catalog,
-/// rather than a bare map — so the format is self-describing and evolvable.
-#[derive(Debug, Serialize, Deserialize)]
-struct RegistryFile {
-    version: u32,
-    indexes: BTreeMap<String, IndexEntry>,
-    /// Index **aliases**: `alias → set of member index names`. A stable name a client can
-    /// search/route through; re-pointing it is the atomic reindex-and-swap. Defaulted so registry
-    /// files without aliases load cleanly.
-    #[serde(default)]
-    aliases: BTreeMap<String, BTreeSet<String>>,
-    /// Saved searches: `id → `[`SavedQuery`]. Per-subject persisted query state. Defaulted so
-    /// registry files without it load cleanly.
-    #[serde(default)]
-    saved_queries: BTreeMap<String, SavedQuery>,
-    /// Local role bindings: `subject → roles`. Admin-managed grants that augment the roles a token
-    /// carries; the control plane merges them when authorizing. Defaulted.
-    #[serde(default)]
-    role_bindings: BTreeMap<String, Vec<String>>,
-    /// API tokens: `id → `[`ApiToken`]. Only the SHA-256 hash is stored, never the secret.
-    /// Defaulted.
-    #[serde(default)]
-    tokens: BTreeMap<String, ApiToken>,
-    /// Built-in local credentials: `subject → argon2 PHC hash` (salt embedded in the string). Never
-    /// the plaintext password. Powers `/v1/login` for closed mode without an external IdP.
-    /// Defaulted.
-    #[serde(default)]
-    credentials: BTreeMap<String, String>,
-    /// Per-subject **index allowlist** for built-in login: `subject → allowed index names`. When a
-    /// subject has a binding, their minted session JWT carries these as the `indexes` claim, so
-    /// per-index RBAC restricts them to exactly this set. Absent/empty = unrestricted. Defaulted.
-    #[serde(default)]
-    index_bindings: BTreeMap<String, Vec<String>>,
-}
 
 /// A persisted API token: long-lived programmatic credential. Only the secret's hash is stored —
 /// the raw secret is shown once at creation and never persisted.
@@ -333,9 +294,11 @@ pub type Result<T> = std::result::Result<T, RegistryError>;
 /// rename over the target) so a crash never leaves a partially-written registry. Cheap to
 /// share across threads — internally `RwLock`-guarded.
 ///
-/// **Single-writer:** [`open`](Self::open) takes an exclusive advisory `flock` on a `.lock`
-/// sibling, held for the registry's lifetime, so a second control-plane process fails fast instead
-/// of last-writer-wins clobbering a stale in-memory map.
+/// **Persistence backend:** durable storage sits behind a [`RegistryBackend`]; the default
+/// [`open`](Self::open) uses the local single-writer [`JsonFileBackend`] (an exclusive advisory
+/// `flock` held for the registry's lifetime, so a second control-plane process over the same file
+/// fails fast instead of last-writer-wins clobbering a stale in-memory map). A replicated backend
+/// (D51) swaps in via [`with_backend`](Self::with_backend) without changing any logic below.
 ///
 /// **Lock-order invariant:** each data map has its own `RwLock`. A mutation holds
 /// **only the one map it changes**, drops it, then calls [`persist_snapshot`](Self::persist_snapshot)
@@ -346,7 +309,10 @@ pub type Result<T> = std::result::Result<T, RegistryError>;
 /// The derived `token_by_hash` index and the `activity`/`session_epochs` sidecars are independent,
 /// always taken one-at-a-time. Keep new lock acquisitions on this order — never the reverse.
 pub struct Registry {
-    path: PathBuf,
+    /// Where durable state lives (the local JSON store by default; a replicated store under D51).
+    /// Every persist path — [`persist_snapshot`](Self::persist_snapshot), the activity flush, the
+    /// session-epoch write — goes through here, off any data lock.
+    backend: Box<dyn RegistryBackend>,
     indexes: RwLock<BTreeMap<String, IndexEntry>>,
     /// Index aliases: `alias → member index names`. A separate lock from `indexes`; every code path
     /// acquires **`indexes` before `aliases`** to avoid deadlock.
@@ -380,8 +346,6 @@ pub struct Registry {
     /// `activity.json` (non-critical, lossy-on-corruption) so the registry's atomic envelope stays
     /// small. Lock is independent (acquired last).
     activity: RwLock<BTreeMap<String, Vec<ActivityEvent>>>,
-    /// Path of the activity sidecar file.
-    activity_path: PathBuf,
     /// Debounce/coalescing state for the activity-sidecar flush. Its own mutex also serializes
     /// concurrent flushes (last snapshot wins the file) — like `flush_lock` for the main registry —
     /// and is never nested under the activity data lock.
@@ -391,8 +355,6 @@ pub struct Registry {
     /// role-downgrade for outstanding session JWTs. Persisted to a separate `sessions.json` sidecar
     /// (independent lock, acquired last).
     session_epochs: RwLock<BTreeMap<String, i64>>,
-    /// Path of the session-epoch sidecar file.
-    session_epochs_path: PathBuf,
     /// Serializes registry-file writes: a mutation applies its change in memory, releases its data
     /// lock, then persists off-lock under this — so routing reads never block on the fsync, and two
     /// concurrent persists can't lose a change from the file (each snapshots the latest memory; the
@@ -404,62 +366,41 @@ pub struct Registry {
     /// within a heartbeat interval, so persisting it would only add write amplification. Window
     /// *assignments* (which node owns a window) stay durable in [`IndexEntry::windows`].
     node_heartbeats: RwLock<BTreeMap<String, BTreeMap<String, i64>>>,
-    /// Held for the process lifetime to keep the exclusive `flock`; released on drop / exit.
-    _lock: File,
 }
 
 impl Registry {
-    /// Open the registry at `path`, loading the existing catalog if present (else empty). Takes an
-    /// exclusive lock first (fails fast with [`Locked`](RegistryError::Locked) if another process
-    /// holds it — single-writer). If the file fails to parse, fall back to the last-known-good
-    /// `.prev` copy with a loud warning rather than hard-failing startup.
+    /// Open the registry at `path` over the default local [`JsonFileBackend`]: load the existing
+    /// catalog if present (else empty), taking an exclusive lock first (fails fast with
+    /// [`Locked`](RegistryError::Locked) if another process holds it — single-writer). If the file
+    /// fails to parse, the backend falls back to the last-known-good `.prev` copy with a loud warning
+    /// rather than hard-failing startup.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
-        let path = path.into();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // Exclusive single-writer lock on a stable `.lock` sibling (the data file is renamed over,
-        // so locking it directly wouldn't be stable across writes).
-        let lock_path = path.with_extension("lock");
-        let lock = File::create(&lock_path)?;
-        lock.try_lock_exclusive()
-            .map_err(|_| RegistryError::Locked(lock_path))?;
+        Self::with_backend(Box::new(JsonFileBackend::open(path)?))
+    }
 
-        let (indexes, aliases, saved_queries, role_bindings, tokens, credentials, index_bindings) =
-            if path.exists() {
-                load(&path)?
-            } else {
-                (
-                    BTreeMap::new(),
-                    BTreeMap::new(),
-                    BTreeMap::new(),
-                    BTreeMap::new(),
-                    BTreeMap::new(),
-                    BTreeMap::new(),
-                    BTreeMap::new(),
-                )
-            };
-        // Activity log sidecar: best-effort — a missing/corrupt log starts empty rather than
-        // failing registry startup (it's an audit convenience, not catalog state).
-        let activity_path = path.with_file_name("activity.json");
-        let activity = std::fs::read(&activity_path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
-        // Session-epoch sidecar: best-effort load, like the activity log. A missing file means no
-        // revocations are in effect (all outstanding sessions valid until `exp`).
-        let session_epochs_path = path.with_file_name("sessions.json");
-        let session_epochs = std::fs::read(&session_epochs_path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+    /// Build a registry over an arbitrary persistence [`backend`](RegistryBackend) — the seam that
+    /// lets the control plane run on the local JSON store ([`open`](Self::open), the default) or a
+    /// replicated external store (D51), with identical in-memory logic. Loads the backend's persisted
+    /// state into memory; the derived `token_by_hash` index is rebuilt here (never persisted).
+    pub fn with_backend(backend: Box<dyn RegistryBackend>) -> Result<Self> {
+        let PersistedState {
+            indexes,
+            aliases,
+            saved_queries,
+            role_bindings,
+            tokens,
+            credentials,
+            index_bindings,
+            activity,
+            session_epochs,
+        } = backend.load()?;
         // Build the hash→id lookup index from the loaded tokens (derived, not persisted).
         let token_by_hash: std::collections::HashMap<String, String> = tokens
             .iter()
             .map(|(id, t)| (t.hash.clone(), id.clone()))
             .collect();
         Ok(Self {
-            path,
+            backend,
             indexes: RwLock::new(indexes),
             aliases: RwLock::new(aliases),
             saved_queries: RwLock::new(saved_queries),
@@ -471,13 +412,10 @@ impl Registry {
             credentials: RwLock::new(credentials),
             index_bindings: RwLock::new(index_bindings),
             activity: RwLock::new(activity),
-            activity_path,
             activity_flush: std::sync::Mutex::new(ActivityFlush::default()),
             session_epochs: RwLock::new(session_epochs),
-            session_epochs_path,
             flush_lock: std::sync::Mutex::new(()),
             node_heartbeats: RwLock::new(BTreeMap::new()),
-            _lock: lock,
         })
     }
 
@@ -558,9 +496,8 @@ impl Registry {
     fn persist_snapshot(&self) -> Result<()> {
         let _flush = self.flush_lock.lock().unwrap_or_else(|e| e.into_inner());
         // Clone each map under a brief read lock; the guards are temporaries released at the end of
-        // this statement, before any I/O.
-        let file = RegistryFile {
-            version: REGISTRY_VERSION,
+        // this statement, before any I/O the backend does.
+        let snapshot = RegistrySnapshot {
             indexes: self.read_map().clone(),
             aliases: self.read_aliases().clone(),
             saved_queries: self.read_saved().clone(),
@@ -569,9 +506,7 @@ impl Registry {
             credentials: self.read_credentials().clone(),
             index_bindings: self.read_index_bindings().clone(),
         };
-        let json = serde_json::to_vec_pretty(&file)?;
-        growlerdb_core::durable::write_keeping_prev(&self.path, &json)?;
-        Ok(())
+        self.backend.persist_registry(snapshot)
     }
 
     /// Register a new index (status [`Building`](IndexStatus::Building)). Errors if the name
@@ -1033,7 +968,7 @@ impl Registry {
             .clone();
         flush.last_flush_ms = now;
         flush.dirty = false;
-        if let Err(e) = persist_activity(&self.activity_path, &snapshot) {
+        if let Err(e) = self.backend.persist_activity(&snapshot) {
             tracing::warn!(error = %e, "failed to persist activity log");
         }
     }
@@ -1059,7 +994,7 @@ impl Registry {
             .write()
             .unwrap_or_else(|e| e.into_inner());
         epochs.insert(subject.to_string(), now_ms());
-        if let Err(e) = persist_sessions(&self.session_epochs_path, &epochs) {
+        if let Err(e) = self.backend.persist_sessions(&epochs) {
             tracing::warn!(error = %e, "failed to persist session epochs");
         }
     }
@@ -1521,16 +1456,13 @@ impl Drop for Registry {
             .unwrap_or(false);
         if dirty {
             let log = self.activity.get_mut().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = persist_activity(&self.activity_path, log) {
+            if let Err(e) = self.backend.persist_activity(log) {
                 tracing::warn!(error = %e, "failed to flush activity log on shutdown");
             }
         }
     }
 }
 
-/// Load the catalog from `path`, parsing the `{ version, indexes }` envelope. On a parse failure
-/// (a corrupt file), fall back to the last-known-good `.prev` copy with a loud warning instead of
-/// hard-failing — bricking the control plane on a single bad file would be worse.
 /// Match an index `pattern` (a `*`-glob like `events-*` / `*-2025` / `a*b`) against `name`.
 /// `*` matches any (possibly empty) run of characters; there is no `?`. Index names are ASCII
 /// identifiers, so byte-slicing on the literal segments is safe. Public so clients filtering a
@@ -1563,68 +1495,6 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
     true
 }
 
-#[allow(clippy::type_complexity)]
-type LoadedRegistry = (
-    BTreeMap<String, IndexEntry>,
-    BTreeMap<String, BTreeSet<String>>,
-    BTreeMap<String, SavedQuery>,
-    BTreeMap<String, Vec<String>>,
-    BTreeMap<String, ApiToken>,
-    BTreeMap<String, String>,
-    BTreeMap<String, Vec<String>>,
-);
-
-fn load(path: &std::path::Path) -> Result<LoadedRegistry> {
-    fn parse(bytes: &[u8]) -> Result<LoadedRegistry> {
-        let f = serde_json::from_slice::<RegistryFile>(bytes)?;
-        Ok((
-            f.indexes,
-            f.aliases,
-            f.saved_queries,
-            f.role_bindings,
-            f.tokens,
-            f.credentials,
-            f.index_bindings,
-        ))
-    }
-    match std::fs::read(path)
-        .map_err(RegistryError::from)
-        .and_then(|b| parse(&b))
-    {
-        Ok(loaded) => Ok(loaded),
-        Err(primary) => {
-            let prev = growlerdb_core::durable::prev_path(path);
-            if prev.exists() {
-                tracing::warn!(
-                    path = %path.display(),
-                    fallback = %prev.display(),
-                    error = %primary,
-                    "registry failed to load; falling back to the previous snapshot"
-                );
-                parse(&std::fs::read(&prev)?)
-            } else {
-                Err(primary)
-            }
-        }
-    }
-}
-
-/// Persist the activity sidecar durably (temp + rename + fsync).
-fn persist_activity(
-    path: &std::path::Path,
-    log: &BTreeMap<String, Vec<ActivityEvent>>,
-) -> Result<()> {
-    let json = serde_json::to_vec_pretty(log)?;
-    growlerdb_core::durable::write_keeping_prev(path, &json)?;
-    Ok(())
-}
-
-fn persist_sessions(path: &std::path::Path, epochs: &BTreeMap<String, i64>) -> Result<()> {
-    let json = serde_json::to_vec_pretty(epochs)?;
-    growlerdb_core::durable::write_keeping_prev(path, &json)?;
-    Ok(())
-}
-
 /// Epoch milliseconds.
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -1636,7 +1506,105 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{PersistedState, RegistryBackend, RegistrySnapshot};
     use growlerdb_core::{IndexDefinition, SourceField, SourceSchema, SourceType};
+    use std::sync::{Arc, Mutex};
+
+    /// A non-file [`RegistryBackend`] backed by a shared in-memory store — proves the seam is real:
+    /// the registry drives its whole lifecycle over a backend that touches no disk, and two
+    /// registries over the *same* store round-trip (a simulated "reopen" without a JSON file). This
+    /// is the shape a replicated store (D51) plugs in as.
+    #[derive(Default)]
+    struct SharedStore {
+        indexes: BTreeMap<String, IndexEntry>,
+        aliases: BTreeMap<String, BTreeSet<String>>,
+        saved_queries: BTreeMap<String, SavedQuery>,
+        role_bindings: BTreeMap<String, Vec<String>>,
+        tokens: BTreeMap<String, ApiToken>,
+        credentials: BTreeMap<String, String>,
+        index_bindings: BTreeMap<String, Vec<String>>,
+        activity: BTreeMap<String, Vec<ActivityEvent>>,
+        session_epochs: BTreeMap<String, i64>,
+    }
+
+    #[derive(Clone, Default)]
+    struct InMemoryBackend(Arc<Mutex<SharedStore>>);
+
+    impl RegistryBackend for InMemoryBackend {
+        fn load(&self) -> Result<PersistedState> {
+            let s = self.0.lock().unwrap();
+            Ok(PersistedState {
+                indexes: s.indexes.clone(),
+                aliases: s.aliases.clone(),
+                saved_queries: s.saved_queries.clone(),
+                role_bindings: s.role_bindings.clone(),
+                tokens: s.tokens.clone(),
+                credentials: s.credentials.clone(),
+                index_bindings: s.index_bindings.clone(),
+                activity: s.activity.clone(),
+                session_epochs: s.session_epochs.clone(),
+            })
+        }
+        fn persist_registry(&self, snap: RegistrySnapshot) -> Result<()> {
+            let mut s = self.0.lock().unwrap();
+            s.indexes = snap.indexes;
+            s.aliases = snap.aliases;
+            s.saved_queries = snap.saved_queries;
+            s.role_bindings = snap.role_bindings;
+            s.tokens = snap.tokens;
+            s.credentials = snap.credentials;
+            s.index_bindings = snap.index_bindings;
+            Ok(())
+        }
+        fn persist_activity(&self, activity: &BTreeMap<String, Vec<ActivityEvent>>) -> Result<()> {
+            self.0.lock().unwrap().activity = activity.clone();
+            Ok(())
+        }
+        fn persist_sessions(&self, sessions: &BTreeMap<String, i64>) -> Result<()> {
+            self.0.lock().unwrap().session_epochs = sessions.clone();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn registry_runs_over_a_custom_backend_and_round_trips() {
+        // The whole registry lifecycle works over a non-file backend, and a second registry over the
+        // SAME store loads the first's writes — the seam a replicated backend (D51) plugs into.
+        let store = InMemoryBackend::default();
+        {
+            let reg = Registry::with_backend(Box::new(store.clone())).unwrap();
+            reg.create(resolved("docs")).unwrap();
+            reg.activate("docs").unwrap();
+            reg.set_alias("d", ["docs"]).unwrap();
+            reg.set_credential("alice", "pw").unwrap();
+            reg.create_token(ApiToken {
+                id: "tok1".into(),
+                label: "l".into(),
+                prefix: "gdb".into(),
+                hash: "H1".into(),
+                roles: vec!["reader".into()],
+                owner: "alice".into(),
+                created_at_ms: 0,
+                expires_at_ms: None,
+            })
+            .unwrap();
+            reg.record_activity("docs", "index.created", "created");
+        }
+        // "Reopen" over the same in-memory store: every persisted map is loaded back, and the derived
+        // token-by-hash index is rebuilt so find_token works.
+        let reg2 = Registry::with_backend(Box::new(store.clone())).unwrap();
+        assert_eq!(reg2.get("docs").unwrap().status, IndexStatus::Active);
+        assert_eq!(reg2.alias_targets("d"), Some(vec!["docs".to_string()]));
+        assert!(reg2.verify_credential("alice", "pw"));
+        assert_eq!(reg2.find_token("H1").unwrap().id, "tok1");
+        assert_eq!(reg2.list_activity("docs", 0).len(), 1);
+
+        // A custom backend does NOT enforce the file's single-writer flock — two live registries over
+        // one store is exactly what a replicated backend supports (single-writer becomes the store's
+        // concern, not the file lock's).
+        let reg3 = Registry::with_backend(Box::new(store)).unwrap();
+        assert!(reg3.get("docs").is_some());
+    }
 
     #[test]
     fn scale_limit_caps_new_nodes_but_allows_reheartbeats() {
