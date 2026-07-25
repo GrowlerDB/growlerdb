@@ -718,9 +718,19 @@ mapping:
         assert_eq!(result.rows.len(), 2, "both keys hydrate, in request order");
         assert_eq!(result.rows[0].key, key("evt-1"));
         // Scalars typed by the schema.
-        assert_eq!(result.rows[0].fields.get("event_type"), Some(&Value::from("PullRequestEvent")));
+        assert_eq!(
+            result.rows[0].fields.get("event_type"),
+            Some(&Value::from("PullRequestEvent"))
+        );
         // The variant column comes back as JSON text carrying the nested object.
-        let payload = result.rows[0].fields.get("payload").unwrap().to_index_string();
-        assert!(payload.contains("octocat") && payload.contains("1347"), "variant JSON: {payload}");
+        let payload = result.rows[0]
+            .fields
+            .get("payload")
+            .unwrap()
+            .to_index_string();
+        assert!(
+            payload.contains("octocat") && payload.contains("1347"),
+            "variant JSON: {payload}"
+        );
     }
 }
