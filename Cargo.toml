@@ -16,6 +16,10 @@ clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_norway = "0.9"
 serde_json = "1"
+# Synchronous PostgreSQL client (pure-Rust, tokio-postgres under its own runtime — no libpq/C dep)
+# for the OPTIONAL externalized control-plane registry backend (D51). Behind the controlplane crate's
+# `postgres` feature, so the default build and single-binary path pull none of it in.
+postgres = "0.19"
 # Timestamp string parsing: RFC3339/ISO-8601 + date-only → canonical micros. No clock or
 # tz database needed (parsing only), so drop the default features (iana-time-zone/js-sys/wasm).
 chrono = { version = "0.4", default-features = false, features = ["std"] }
