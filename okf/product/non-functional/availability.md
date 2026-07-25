@@ -14,4 +14,8 @@ timestamp: 2026-07-04T14:22:00
   hard failure.
 
 **Status.** v1 **design target**; the self-healing behavior is exercised under
-[reliability/chaos](/quality/reliability.md).
+[reliability/chaos](/quality/reliability.md). Today the [control plane](/system/runtime/components/control-plane.md)
+is still a single instance and nodes have no live replica (reads degrade to honest partial during a
+restart). **True HA** — no SPOF, zero-gap node failover — is designed in
+[high availability](/system/high-availability.md) (D51–D53, the `true-ha` epic): a replicated control
+plane plus a placement pool of interchangeable, multi-index, replicated nodes; not yet built.

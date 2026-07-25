@@ -36,3 +36,7 @@ Zero-downtime per-shard **replicas** (windowed/multi-shard segment shipping) are
 [replicas](/product/functional/replicas.md) and
 [known limitations](/quality/known-limitations/index.md). Availability under fault is validated by
 [chaos drills](/quality/reliability.md).
+
+This topology is the **v1 posture**; it still has the control-plane SPOF and no live node replica. The
+designed successor — a replicated control plane plus a placement pool of interchangeable, multi-index,
+replicated nodes — is in [high availability](/system/high-availability.md) (D51–D53, `true-ha` epic).

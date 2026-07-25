@@ -46,6 +46,18 @@ across all served shards and windows. Saturation load-sheds with `RESOURCE_EXHAU
 of exports can't starve every other query's blocking work; the permit is held for an export's
 whole stream. Writes have their own in-flight cap (`--max-inflight`).
 
+## Availability & the designed pool model
+
+Today a `serve` process **binds to one index** and one `--shard-ordinal` (one primary, no live
+replica) — so every index needs its own StatefulSet and a node loss degrades reads to honest partial.
+The designed successor generalizes [D33](/system/decisions/d33-windowed-topology.md)'s windowed
+placement pool to **every index**: a node becomes an interchangeable **shard host** serving a
+CP-assigned **set of `(index, shard|window)` units** from many indexes in one process
+([D52](/system/decisions/d52-placement-pool.md), kills node-per-index), and the CP assigns **R holders
+per unit** — one primary writer + read replicas that hydrate read-through from shared object storage
+([D53](/system/decisions/d53-unit-replication.md), zero-gap failover). See
+[high availability](/system/high-availability.md). Not yet built.
+
 ## Notes
 
 One StatefulSet pod per shard in the sharded chart (ordinal = pod index). In `growlerdb-engine`.

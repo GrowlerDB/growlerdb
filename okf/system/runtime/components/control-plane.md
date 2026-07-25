@@ -32,6 +32,16 @@ matching token (constant-time checked) or is rejected — closing the internal R
 mesh, independent of the user-auth mode. Unset ⇒ open (local dev). The control plane can also serve over
 [TLS/mTLS](/product/functional/auth/mtls.md), optional and off by default.
 
+## Availability
+
+Today the CP is a **single instance** (`replicas: 1`) — the cluster's one hard SPOF. The designed
+successor ([D51](/system/decisions/d51-controlplane-ha.md)) moves durable state behind a **backend
+seam**: the embedded single-writer JSON store stays the default for single-binary/Compose, and a new
+**externalized backend** (Postgres/etcd) holds all durable registry state so the CP runs as **N
+stateless replicas** behind a Service, delegating consensus to the store. Reads are already off the
+data lock and the node inventory is already ephemeral, so this is a store swap, not a new consensus
+engine. See [high availability](/system/high-availability.md). Not yet built.
+
 ## Notes
 
 Implemented in `growlerdb-controlplane`. Its persistent state is small; durability is temp+fsync+rename.

@@ -23,3 +23,10 @@ throughput and availability.
 Single-shard replica today; a windowed/multi-shard zero-downtime replica set is future work — see
 [known limitations](/quality/known-limitations/index.md). HA today = shards spread + PDBs + PV
 self-heal + honest partial results during a shard restart.
+
+**Designed successor.** [D53](/system/decisions/d53-unit-replication.md) replaces this single-shard
+`serve --replica` model with a **per-unit replication factor** over the
+[placement pool](/system/decisions/d52-placement-pool.md): the control plane assigns R holders per
+`(index, shard|window)` unit (one primary writer + R−1 read replicas), reads scatter to any live
+holder, and replicas hydrate **read-through from shared object storage** (cold-tier-led) so failover
+is metadata-bound. See [high availability](/system/high-availability.md). Not yet built.
