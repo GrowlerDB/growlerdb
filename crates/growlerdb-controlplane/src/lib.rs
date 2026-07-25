@@ -8,9 +8,13 @@
 //! atomic writes.
 
 mod backend;
+#[cfg(feature = "postgres")]
+mod postgres_backend;
 mod registry;
 
 pub use backend::{JsonFileBackend, PersistedState, RegistryBackend, RegistrySnapshot};
+#[cfg(feature = "postgres")]
+pub use postgres_backend::PostgresBackend;
 pub use registry::{
     glob_match, ActivityEvent, ApiToken, IndexEntry, IndexStatus, IndexSummary, NodeId, Registry,
     RegistryError, Result, SavedQuery, ShardAssignment, WindowAssignment,

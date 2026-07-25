@@ -21,9 +21,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::registry::{ActivityEvent, ApiToken, IndexEntry, RegistryError, Result, SavedQuery};
 
-/// On-disk schema version for `registry.json`. A versioned envelope means a future format change
-/// can be detected and migrated instead of mis-parsed.
-const REGISTRY_VERSION: u32 = 1;
+/// On-disk schema version for the registry envelope. A versioned envelope means a future format
+/// change can be detected and migrated instead of mis-parsed. Shared by every backend (the JSON file
+/// and the externalized store persist the same envelope).
+pub(crate) const REGISTRY_VERSION: u32 = 1;
 
 /// The full state loaded from a backend on [`Registry`](crate::Registry) open: the core catalog maps
 /// plus the two sidecar maps (activity log, session epochs). The registry moves each field into its
@@ -78,11 +79,13 @@ pub trait RegistryBackend: Send + Sync {
     fn persist_sessions(&self, sessions: &BTreeMap<String, i64>) -> Result<()>;
 }
 
-/// The persisted `registry.json` document: a `{ version, indexes, … }` envelope around the catalog,
+/// The persisted registry **envelope**: a `{ version, indexes, … }` document around the catalog,
 /// rather than a bare map — so the format is self-describing and evolvable. `#[serde(default)]` on
-/// every non-core map means older registry files (written before a field existed) load cleanly.
+/// every non-core map means older files (written before a field existed) load cleanly. Every backend
+/// serializes exactly this envelope (the JSON file writes it to disk; the Postgres backend stores it
+/// as a JSONB document), so the two are byte-for-byte interchangeable.
 #[derive(Debug, Serialize, Deserialize)]
-struct RegistryFile {
+pub(crate) struct RegistryFile {
     version: u32,
     indexes: BTreeMap<String, IndexEntry>,
     #[serde(default)]
@@ -97,6 +100,56 @@ struct RegistryFile {
     credentials: BTreeMap<String, String>,
     #[serde(default)]
     index_bindings: BTreeMap<String, Vec<String>>,
+}
+
+impl RegistryFile {
+    /// An empty envelope at the current version (a store with nothing persisted yet).
+    pub(crate) fn empty() -> Self {
+        Self {
+            version: REGISTRY_VERSION,
+            indexes: BTreeMap::new(),
+            aliases: BTreeMap::new(),
+            saved_queries: BTreeMap::new(),
+            role_bindings: BTreeMap::new(),
+            tokens: BTreeMap::new(),
+            credentials: BTreeMap::new(),
+            index_bindings: BTreeMap::new(),
+        }
+    }
+
+    /// Wrap a core [`RegistrySnapshot`] as a versioned envelope, ready to serialize.
+    pub(crate) fn from_snapshot(snapshot: RegistrySnapshot) -> Self {
+        Self {
+            version: REGISTRY_VERSION,
+            indexes: snapshot.indexes,
+            aliases: snapshot.aliases,
+            saved_queries: snapshot.saved_queries,
+            role_bindings: snapshot.role_bindings,
+            tokens: snapshot.tokens,
+            credentials: snapshot.credentials,
+            index_bindings: snapshot.index_bindings,
+        }
+    }
+
+    /// Combine this core envelope with the separately-stored sidecars into the full
+    /// [`PersistedState`] the registry loads into memory.
+    pub(crate) fn into_persisted(
+        self,
+        activity: BTreeMap<String, Vec<ActivityEvent>>,
+        session_epochs: BTreeMap<String, i64>,
+    ) -> PersistedState {
+        PersistedState {
+            indexes: self.indexes,
+            aliases: self.aliases,
+            saved_queries: self.saved_queries,
+            role_bindings: self.role_bindings,
+            tokens: self.tokens,
+            credentials: self.credentials,
+            index_bindings: self.index_bindings,
+            activity,
+            session_epochs,
+        }
+    }
 }
 
 /// The default backend: the local **single-writer JSON store**. Holds the exclusive `flock` for the
@@ -142,16 +195,7 @@ impl RegistryBackend for JsonFileBackend {
         let core = if self.path.exists() {
             load_core(&self.path)?
         } else {
-            RegistryFile {
-                version: REGISTRY_VERSION,
-                indexes: BTreeMap::new(),
-                aliases: BTreeMap::new(),
-                saved_queries: BTreeMap::new(),
-                role_bindings: BTreeMap::new(),
-                tokens: BTreeMap::new(),
-                credentials: BTreeMap::new(),
-                index_bindings: BTreeMap::new(),
-            }
+            RegistryFile::empty()
         };
         // Sidecars are best-effort: a missing/corrupt log or session file starts empty rather than
         // failing registry startup (they're a non-critical audit convenience / revocation state, not
@@ -164,31 +208,11 @@ impl RegistryBackend for JsonFileBackend {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
-        Ok(PersistedState {
-            indexes: core.indexes,
-            aliases: core.aliases,
-            saved_queries: core.saved_queries,
-            role_bindings: core.role_bindings,
-            tokens: core.tokens,
-            credentials: core.credentials,
-            index_bindings: core.index_bindings,
-            activity,
-            session_epochs,
-        })
+        Ok(core.into_persisted(activity, session_epochs))
     }
 
     fn persist_registry(&self, snapshot: RegistrySnapshot) -> Result<()> {
-        let file = RegistryFile {
-            version: REGISTRY_VERSION,
-            indexes: snapshot.indexes,
-            aliases: snapshot.aliases,
-            saved_queries: snapshot.saved_queries,
-            role_bindings: snapshot.role_bindings,
-            tokens: snapshot.tokens,
-            credentials: snapshot.credentials,
-            index_bindings: snapshot.index_bindings,
-        };
-        let json = serde_json::to_vec_pretty(&file)?;
+        let json = serde_json::to_vec_pretty(&RegistryFile::from_snapshot(snapshot))?;
         growlerdb_core::durable::write_keeping_prev(&self.path, &json)?;
         Ok(())
     }

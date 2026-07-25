@@ -231,6 +231,10 @@ pub enum RegistryError {
     /// Reading or writing the persisted registry failed.
     #[error("registry io: {0}")]
     Io(#[from] std::io::Error),
+    /// An externalized registry backend (e.g. Postgres, D51) failed — connect, schema, query, or the
+    /// single-writer lock. Carries the store's error text.
+    #[error("registry backend: {0}")]
+    Backend(String),
     /// Encoding/decoding the persisted registry failed.
     #[error("registry codec: {0}")]
     Codec(#[from] serde_json::Error),
