@@ -500,6 +500,14 @@ enum Command {
         /// `GROWLERDB_SERVICE_TOKEN`.
         #[arg(long, env = "GROWLERDB_SERVICE_TOKEN")]
         service_token: Option<String>,
+        /// **HA mode:** back the registry with a shared Postgres instead of the local
+        /// `registry.json`, so the control plane runs as **N stateless replicas** over one durable
+        /// store (D51). Each replica starts as a warm standby; exactly one holds the single-writer
+        /// advisory lock (the leader) and reports ready, standbys reload on the leader's writes and
+        /// promote on its death. Requires a build with `--features postgres`. Env:
+        /// `GROWLERDB_REGISTRY_POSTGRES`.
+        #[arg(long, env = "GROWLERDB_REGISTRY_POSTGRES")]
+        registry_postgres: Option<String>,
         #[command(flatten)]
         tls: ServerTlsArgs,
     },
@@ -904,6 +912,7 @@ pub async fn run() -> anyhow::Result<()> {
             admin_user,
             admin_password,
             service_token,
+            registry_postgres,
             tls,
         } => {
             control_plane(
@@ -918,6 +927,7 @@ pub async fn run() -> anyhow::Result<()> {
                 admin_user,
                 admin_password,
                 service_token,
+                registry_postgres,
                 tls.load()?,
             )
             .await?;
@@ -4096,6 +4106,7 @@ async fn control_plane(
     admin_user: String,
     admin_password: Option<String>,
     service_token: Option<String>,
+    registry_postgres: Option<String>,
     tls: Option<tonic::transport::ServerTlsConfig>,
 ) -> anyhow::Result<()> {
     use std::sync::Arc;
@@ -4106,7 +4117,44 @@ async fn control_plane(
         .map_err(|e| anyhow::anyhow!("invalid --addr `{addr}`: {e}"))?;
     let registry_path = std::path::Path::new(data_dir).join("registry.json");
     std::fs::create_dir_all(data_dir)?;
-    let registry = Arc::new(growlerdb_controlplane::Registry::open(&registry_path)?);
+
+    // HA (D51): with `--registry-postgres`, every replica opens the registry as a warm **standby**
+    // over the shared store (no writer lock yet) and a background loop races for leadership; without
+    // it, the embedded single-writer JSON store — unchanged. `ha_managed` means the leadership loop
+    // owns readiness (only the leader is ready), so the k8s Service routes to the one writer.
+    #[cfg(feature = "postgres")]
+    let (registry, ha_managed) = if let Some(url) = registry_postgres.as_deref() {
+        let backend = growlerdb_controlplane::PostgresBackend::open_standby(url)?;
+        (
+            Arc::new(growlerdb_controlplane::Registry::with_backend(Box::new(
+                backend,
+            ))?),
+            true,
+        )
+    } else {
+        (
+            Arc::new(growlerdb_controlplane::Registry::open(&registry_path)?),
+            false,
+        )
+    };
+    #[cfg(not(feature = "postgres"))]
+    let (registry, ha_managed) = {
+        if registry_postgres.is_some() {
+            anyhow::bail!(
+                "--registry-postgres needs a build with `--features postgres`; this binary was \
+                 compiled without the Postgres registry backend"
+            );
+        }
+        (
+            Arc::new(growlerdb_controlplane::Registry::open(&registry_path)?),
+            false,
+        )
+    };
+
+    // The leadership loop needs its own registry handle: `registry` is moved into the gRPC service
+    // below. (Only the HA path spawns the loop; cloned regardless in a postgres build, cheap.)
+    #[cfg(feature = "postgres")]
+    let ha_registry = registry.clone();
 
     // Optional scale-limit license from GROWLERDB_LICENSE (a signed entitlement). An invalid one
     // warns and falls back to the free tier rather than failing startup.
@@ -4211,10 +4259,17 @@ async fn control_plane(
     };
     let svc = svc.with_license(license);
 
-    println!(
-        "control plane: registry on {socket} (registry at {})",
-        registry_path.display()
-    );
+    if ha_managed {
+        println!(
+            "control plane: registry on {socket} (HA: externalized Postgres store, N-replica \
+             leader/standby — starting as standby, racing for leadership)"
+        );
+    } else {
+        println!(
+            "control plane: registry on {socket} (registry at {})",
+            registry_path.display()
+        );
+    }
     // Service-credential gate: closes the internal RPCs (registration, shard-map reads, placement)
     // to callers outside the mesh, independent of user auth — so `--login-secret` (open user-auth)
     // no longer leaves the internal RPCs reachable without a credential. Unset ⇒ open (bare dev).
@@ -4235,9 +4290,16 @@ async fn control_plane(
     // Keep the ingestion-lag + shard-availability gauges fresh for Prometheus regardless of console
     // polling.
     svc.spawn_ingestion_metrics_sampler(15);
-    // Registry opened → ready.
     let readiness = spawn_health(metrics_addr).await?;
-    readiness.mark_ready();
+    // In HA mode the leadership loop owns readiness — only the replica that holds the writer lock is
+    // marked ready, so the Service routes to the single leader (active-passive). Otherwise (embedded
+    // JSON, single writer) the registry is open → ready immediately.
+    if ha_managed {
+        #[cfg(feature = "postgres")]
+        spawn_cp_leadership(ha_registry, readiness.clone());
+    } else {
+        readiness.mark_ready();
+    }
     let service = growlerdb_engine::intercept_service_token(svc.into_server(), service_token);
     let mut builder = Server::builder();
     if let Some(tls) = tls {
@@ -4251,6 +4313,65 @@ async fn control_plane(
         .await?;
     println!("growlerdb control-plane: shut down cleanly");
     Ok(())
+}
+
+/// The HA control-plane **leadership + standby-reload loop** (D51), spawned once per replica when
+/// `--registry-postgres` is set. Runs on a dedicated OS thread because the Postgres backend is a
+/// blocking client (its calls must not park a tokio worker). Active-passive: readiness tracks
+/// leadership, so a k8s Service routes only to the single leader.
+///
+/// - **Standby** — not the leader: report not-ready (out of the Service), then `try_become_leader`.
+///   Still a standby → poll the store version and [`reload`](growlerdb_controlplane::Registry::reload)
+///   when the leader wrote, staying warm for a fast failover.
+/// - **Promotion** — `try_become_leader` succeeds (the previous leader died and Postgres released the
+///   advisory lock): reload once to catch any write since the last poll, then mark ready — this
+///   replica joins the Service as the writer.
+/// - **Leader** — keep readiness on; it writes to the store directly, so there is nothing to reload.
+#[cfg(feature = "postgres")]
+fn spawn_cp_leadership(
+    registry: std::sync::Arc<growlerdb_controlplane::Registry>,
+    readiness: growlerdb_telemetry::Readiness,
+) {
+    std::thread::spawn(move || {
+        // Fast enough that a standby promotes within a fraction of a second of the leader's death
+        // (Postgres releases the advisory lock ~immediately on the leader's connection close), and
+        // cheap enough — one `SELECT version` — to poll continuously.
+        let interval = std::time::Duration::from_millis(250);
+        let mut last_version: Option<i64> = None;
+        loop {
+            if registry.is_leader() {
+                readiness.mark_ready();
+            } else {
+                match registry.try_become_leader() {
+                    Ok(true) => {
+                        // Promoted: resync in case the ex-leader wrote after our last poll, then serve.
+                        if let Err(e) = registry.reload() {
+                            eprintln!("control plane: reload after promotion failed: {e}");
+                        }
+                        println!("control plane: promoted to registry leader — now serving writes");
+                        readiness.mark_ready();
+                    }
+                    Ok(false) => {
+                        // Still a standby: out of the Service, but keep the in-memory catalog warm.
+                        readiness.mark_not_ready();
+                        match registry.backend_version() {
+                            Ok(v) if v != last_version => match registry.reload() {
+                                Ok(()) => last_version = v,
+                                Err(e) => eprintln!("control plane: standby reload failed: {e}"),
+                            },
+                            Ok(_) => {}
+                            Err(e) => eprintln!("control plane: version poll failed: {e}"),
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("control plane: leadership acquisition failed: {e}");
+                        readiness.mark_not_ready();
+                    }
+                }
+            }
+            std::thread::sleep(interval);
+        }
+    });
 }
 
 /// Load a shard's persisted resolved definition (`<data_dir>/<index>/index.json`), falling back
@@ -4612,6 +4733,35 @@ mod tests {
     use super::*;
     use growlerdb_controlplane::Registry;
     use growlerdb_core::{IndexDefinition, RoutingStrategy, SourceField, SourceSchema, SourceType};
+
+    /// The HA opt-in flag parses (from the flag and its env var) and defaults to `None` — so the
+    /// embedded JSON registry stays the default and `control_plane` only takes the Postgres branch
+    /// when a URL is supplied.
+    #[test]
+    fn control_plane_registry_postgres_flag_parses() {
+        use clap::Parser;
+        let url = "postgresql://postgres:pw@127.0.0.1:55432/cp";
+
+        let cli = Cli::try_parse_from(["growlerdb", "control-plane", "--registry-postgres", url])
+            .expect("control-plane accepts --registry-postgres");
+        let Command::ControlPlane {
+            registry_postgres, ..
+        } = cli.command
+        else {
+            panic!("expected the control-plane subcommand");
+        };
+        assert_eq!(registry_postgres.as_deref(), Some(url));
+
+        // Default: no flag ⇒ None (embedded JSON registry).
+        let cli = Cli::try_parse_from(["growlerdb", "control-plane"]).unwrap();
+        let Command::ControlPlane {
+            registry_postgres, ..
+        } = cli.command
+        else {
+            panic!("expected the control-plane subcommand");
+        };
+        assert_eq!(registry_postgres, None);
+    }
 
     #[test]
     fn env_truthy_parses_common_forms() {
