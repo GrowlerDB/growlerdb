@@ -68,6 +68,32 @@ impl License {
             expires_at: data.claims.exp,
         })
     }
+
+    /// Mint (sign) a license token with an Ed25519 **private-key** PEM — the inverse of [`verify`].
+    /// Used only by the offline issuing ceremony (the `mint_license` example / the runbook in
+    /// `COMM-LICENSE.md`): the private key is held by GrowlerDB LLC and **never** lives in this repo,
+    /// so this is not a runtime path. The minted token is verified at startup against the embedded
+    /// public key ([`LICENSE_PUBLIC_KEY_PEM`]) — the two must be the matching pair.
+    pub fn mint(
+        private_key_pem: &str,
+        licensee: &str,
+        max_nodes: u32,
+        exp: Option<i64>,
+    ) -> Result<String, LicenseError> {
+        let claims = Claims {
+            licensee: licensee.to_string(),
+            max_nodes,
+            exp,
+        };
+        let key = jsonwebtoken::EncodingKey::from_ed_pem(private_key_pem.as_bytes())
+            .map_err(|e| LicenseError::Invalid(format!("license private key: {e}")))?;
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA),
+            &claims,
+            &key,
+        )
+        .map_err(|e| LicenseError::Invalid(e.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -95,6 +121,28 @@ MCowBQYDK2VwAyEAQzeuApLql4CLG7D9b86BdpwFU0w8MAf/JJVytr4KO7E=\n\
         assert_eq!(lic.licensee, "Acme Inc");
         assert_eq!(lic.max_nodes, 12);
         assert_eq!(lic.expires_at, None);
+    }
+
+    #[test]
+    fn mint_then_verify_roundtrips() {
+        // The issuing ceremony: mint with the private key, verify with the matching public key.
+        let token = License::mint(TEST_PRIVATE_PEM, "Scale Run", 64, None).unwrap();
+        let lic = License::verify_with_pem(&token, TEST_PUBLIC_PEM).unwrap();
+        assert_eq!(lic.licensee, "Scale Run");
+        assert_eq!(lic.max_nodes, 64);
+        assert_eq!(lic.expires_at, None);
+    }
+
+    #[test]
+    fn mint_carries_expiry_and_rejects_a_bad_private_key() {
+        let token = License::mint(TEST_PRIVATE_PEM, "Acme", 12, Some(4102444800)).unwrap();
+        assert_eq!(
+            License::verify_with_pem(&token, TEST_PUBLIC_PEM)
+                .unwrap()
+                .expires_at,
+            Some(4102444800)
+        );
+        assert!(License::mint("not a pem", "Acme", 12, None).is_err());
     }
 
     #[test]

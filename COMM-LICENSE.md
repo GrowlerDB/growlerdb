@@ -45,3 +45,27 @@ Commercial and OEM licensing, and pricing, are handled by **GrowlerDB LLC**. Ema
 **[support@growlerdb.com](mailto:support@growlerdb.com)** (or see the channels in
 [`SUPPORT.md`](SUPPORT.md)). Tell us your use case (embedding, SaaS, enterprise features, scale) and
 we'll scope the right agreement.
+
+## Issuing a scale-limit license (internal runbook)
+
+The scale-limit entitlement ([D38](okf/system/decisions/d38-scale-limit-entitlement.md)) is an
+Ed25519-signed token, minted **offline** by GrowlerDB LLC. The signing **private key is held privately
+and never committed**; only the matching public key is embedded in the binary
+(`crates/growlerdb-engine/src/license.rs`, `LICENSE_PUBLIC_KEY_PEM`).
+
+```sh
+# 1. Generate the signing keypair ONCE, offline. Keep the private key in a secret manager.
+openssl genpkey -algorithm ed25519 -out license_ed25519.pem
+openssl pkey -in license_ed25519.pem -pubout -out license_ed25519.pub.pem
+
+# 2. Install the PUBLIC key: paste license_ed25519.pub.pem into LICENSE_PUBLIC_KEY_PEM (replacing the
+#    placeholder) and ship a build. (This is the one-time step that activates licensing.)
+
+# 3. Mint a token (e.g. 64 nodes, no expiry) — prints the JWT to stdout:
+cargo run -p growlerdb-engine --example mint_license -- license_ed25519.pem "GrowlerDB scale" 64
+
+# 4. Deploy it as GROWLERDB_LICENSE on the control plane: set credentials.license in the Helm values
+#    (or `--set-string credentials.license=$GROWLERDB_LICENSE`). scale-up.sh forwards $GROWLERDB_LICENSE.
+```
+
+An invalid or absent token falls back to the free tier with a warning (never a startup failure).

@@ -33,6 +33,12 @@ credentials:
   catalogCredential: "root:s3cr3t"
   s3AccessKey: "minioadmin"
   s3SecretKey: "minioadmin"
+  # Scale-limit license so the control plane admits all N nodes deterministically instead of relying
+  # on the free-tier (3) registration leak (TASK-346). Empty here = paste a minted token, or pass it
+  # via `helm ... --set credentials.license=$GROWLERDB_LICENSE` (scale-up.sh forwards $GROWLERDB_LICENSE).
+  # Mint one with the mint_license example — see COMM-LICENSE.md. Requires the real signing key to be
+  # installed (LICENSE_PUBLIC_KEY_PEM in growlerdb-engine/src/license.rs is a placeholder until then).
+  license: ""
 
 node:
   persistence:
