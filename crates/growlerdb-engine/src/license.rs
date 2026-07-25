@@ -9,15 +9,13 @@ use serde::{Deserialize, Serialize};
 /// The free tier: a deployment with at most this many distinct live index nodes needs no license.
 pub const FREE_NODE_LIMIT: usize = 3;
 
-/// GrowlerDB LLC's license-signing **public** key (Ed25519). Licenses are minted with the matching
-/// private key, held privately by GrowlerDB LLC.
-///
-/// **This is a placeholder — replace it with the real public key before issuing licenses.** The
-/// private key must never live in this repository; the placeholder's private key was discarded, so no
-/// license can validate against it (the free tier still works — a valid license is only needed to
-/// exceed [`FREE_NODE_LIMIT`]).
+/// GrowlerDB LLC's license-signing **public** key (Ed25519) — the production key. Licenses are minted
+/// offline with the matching **private** key, which is held privately by GrowlerDB LLC and never lives
+/// in this repository; only this public half ships, to verify tokens at startup. The free tier works
+/// without any license — a valid license is only needed to exceed [`FREE_NODE_LIMIT`]. Rotating the key
+/// means minting against a new keypair and shipping its public half here.
 const LICENSE_PUBLIC_KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
-MCowBQYDK2VwAyEABNG/3dMk6d+l0GbP8zXkDnqT1h8ZkfY1NnCTDSf6CfA=\n\
+MCowBQYDK2VwAyEAyizufq7Ro4/FzX0FhQqH2945GnMat7aYVr2Vf0kzGks=\n\
 -----END PUBLIC KEY-----\n";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +110,14 @@ MCowBQYDK2VwAyEAQzeuApLql4CLG7D9b86BdpwFU0w8MAf/JJVytr4KO7E=\n\
     fn sign(claims: serde_json::Value) -> String {
         let key = EncodingKey::from_ed_pem(TEST_PRIVATE_PEM.as_bytes()).unwrap();
         encode(&Header::new(Algorithm::EdDSA), &claims, &key).unwrap()
+    }
+
+    #[test]
+    fn embedded_public_key_is_well_formed() {
+        // Guards against a paste error in LICENSE_PUBLIC_KEY_PEM: the shipped production key must be a
+        // parseable Ed25519 SPKI PEM, else every real license silently falls back to the free tier.
+        DecodingKey::from_ed_pem(LICENSE_PUBLIC_KEY_PEM.as_bytes())
+            .expect("embedded license public key must be a valid Ed25519 SPKI PEM");
     }
 
     #[test]
