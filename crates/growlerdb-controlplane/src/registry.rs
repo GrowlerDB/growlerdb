@@ -52,6 +52,27 @@ impl<S: Into<String>> From<S> for NodeId {
     }
 }
 
+/// A **placement unit** (D52): the atom the control plane places on a pool node. Either an ordinal
+/// **shard** of a hash/partition-sharded index or a **window** of a windowed index — the two live in
+/// the same [`IndexEntry`] (`shards` vs `windows`) and go through one placement path
+/// ([`Registry::resolve_unit_owner`]). `Copy` so it threads freely through the placement logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unit {
+    /// Ordinal shard of a hash/partition-sharded index (`IndexEntry::shards[ordinal]`).
+    Shard(u32),
+    /// Time window of a windowed index (`IndexEntry::windows[window]`).
+    Window(i64),
+}
+
+impl std::fmt::Display for Unit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unit::Shard(o) => write!(f, "shard {o}"),
+            Unit::Window(w) => write!(f, "window {w}"),
+        }
+    }
+}
+
 /// Which nodes serve one shard: the **primary** (accepts writes + reads) and zero or more
 /// read **replicas**. The shard map is `shard ordinal → ShardAssignment`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,12 +239,11 @@ pub enum RegistryError {
         shard: u32,
         primary: String,
     },
-    /// `resolve_window_owner` when no node has heartbeated within the TTL — there is nowhere to place
-    /// the window. The caller retries once a node registers.
-    #[error(
-        "no live node to place window {window} of `{index}` (none heartbeated within the TTL)"
-    )]
-    NoLiveNode { index: String, window: i64 },
+    /// [`resolve_unit_owner`](Registry::resolve_unit_owner) when no node has heartbeated within the
+    /// TTL — the pool is empty, so there is nowhere to place the unit. The caller retries once a node
+    /// registers.
+    #[error("no live node to place {unit} of `{index}` (none heartbeated within the TTL)")]
+    NoLiveNode { index: String, unit: String },
     /// Another process holds the registry's exclusive lock — single-writer is enforced, so a
     /// second control plane fails fast rather than last-writer-wins clobbering.
     #[error("registry `{0}` is locked by another process")]
@@ -364,12 +384,14 @@ pub struct Registry {
     /// concurrent persists can't lose a change from the file (each snapshots the latest memory; the
     /// last write wins with the full state).
     flush_lock: std::sync::Mutex<()>,
-    /// Per-index **node inventory** for CP-driven windowed placement: `index → (node endpoint →
-    /// last-heartbeat epoch-ms)`. **In-memory only** (like `token_by_hash`) — liveness is ephemeral
-    /// runtime state, not durable topology: after a control-plane restart every node re-registers
-    /// within a heartbeat interval, so persisting it would only add write amplification. Window
-    /// *assignments* (which node owns a window) stay durable in [`IndexEntry::windows`].
-    node_heartbeats: RwLock<BTreeMap<String, BTreeMap<String, i64>>>,
+    /// The **placement pool** (D52): `node endpoint → last-heartbeat epoch-ms`. One flat pool of
+    /// interchangeable shard hosts, **not** keyed by index — any live node can be assigned units
+    /// (shards or windows) from any index, which is what lets one node process serve many indexes and
+    /// kills the node-per-index wall. **In-memory only** (like `token_by_hash`) — liveness is
+    /// ephemeral runtime state, not durable topology: after a control-plane restart every node
+    /// re-registers within a heartbeat interval, so persisting it would only add write amplification.
+    /// Unit *assignments* (which node owns a shard/window) stay durable in [`IndexEntry`].
+    node_pool: RwLock<BTreeMap<String, i64>>,
 }
 
 impl Registry {
@@ -419,7 +441,7 @@ impl Registry {
             activity_flush: std::sync::Mutex::new(ActivityFlush::default()),
             session_epochs: RwLock::new(session_epochs),
             flush_lock: std::sync::Mutex::new(()),
-            node_heartbeats: RwLock::new(BTreeMap::new()),
+            node_pool: RwLock::new(BTreeMap::new()),
         })
     }
 
@@ -1346,137 +1368,129 @@ impl Registry {
         self.persist_snapshot()
     }
 
-    // ---- CP-driven windowed placement ------------------------------------------
+    // ---- CP-driven universal placement pool (D52) ------------------------------
 
-    /// Record a node's liveness **heartbeat** for a windowed `index`: the node calls this on
-    /// registration + on an interval to stay in the placement pool. In-memory only (see
-    /// [`node_heartbeats`](Self::node_heartbeats)); `now_ms` is the control plane's wall clock. No
-    /// index existence check — a node may heartbeat before its first window is placed.
-    pub fn register_node(&self, index: &str, endpoint: &str, now_ms: i64) {
-        self.node_heartbeats
+    /// Record a node's liveness **heartbeat** into the [placement pool](Self::node_pool): the node
+    /// calls this on registration + on an interval to stay eligible for unit placement. In-memory
+    /// only; `now_ms` is the control plane's wall clock. The pool is index-agnostic — a node is an
+    /// interchangeable shard host, not bound to one index.
+    pub fn register_node(&self, endpoint: &str, now_ms: i64) {
+        self.node_pool
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .entry(index.to_string())
-            .or_default()
             .insert(endpoint.to_string(), now_ms);
     }
 
     /// Like [`register_node`](Self::register_node), but **refuses to admit a *new* node** once
-    /// `max_nodes` distinct live endpoints are already registered — the scale limit. Re-registering
+    /// `max_nodes` distinct live endpoints are already in the pool — the scale limit. Re-registering
     /// an already-live endpoint always succeeds (it's a heartbeat, not new capacity), so an existing
     /// cluster is never disrupted. Atomic under the write lock. On rejection returns the current
     /// distinct live node count.
     pub fn register_node_capped(
         &self,
-        index: &str,
         endpoint: &str,
         now_ms: i64,
         max_nodes: usize,
     ) -> std::result::Result<(), usize> {
-        let mut hb = self
-            .node_heartbeats
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        let known = hb.values().any(|m| {
-            m.get(endpoint)
-                .is_some_and(|&t| now_ms - t <= NODE_HEARTBEAT_TTL_MS)
-        });
+        let mut pool = self.node_pool.write().unwrap_or_else(|e| e.into_inner());
+        let known = pool
+            .get(endpoint)
+            .is_some_and(|&t| now_ms - t <= NODE_HEARTBEAT_TTL_MS);
         if !known {
-            let distinct: std::collections::HashSet<&str> = hb
+            let live = pool
                 .values()
-                .flat_map(|m| m.iter())
-                .filter(|(_, &t)| now_ms - t <= NODE_HEARTBEAT_TTL_MS)
-                .map(|(e, _)| e.as_str())
-                .collect();
-            if distinct.len() >= max_nodes {
-                return Err(distinct.len());
+                .filter(|&&t| now_ms - t <= NODE_HEARTBEAT_TTL_MS)
+                .count();
+            if live >= max_nodes {
+                return Err(live);
             }
         }
-        hb.entry(index.to_string())
-            .or_default()
-            .insert(endpoint.to_string(), now_ms);
+        pool.insert(endpoint.to_string(), now_ms);
         Ok(())
     }
 
-    /// Count of distinct live node endpoints across all indexes — the deployment's node usage, for
-    /// the scale-limit meter and the license view.
+    /// Count of distinct live node endpoints in the pool — the deployment's node usage, for the
+    /// scale-limit meter and the license view.
     pub fn distinct_live_nodes(&self, now_ms: i64) -> usize {
-        self.node_heartbeats
+        self.node_pool
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .flat_map(|m| m.iter())
-            .filter(|(_, &t)| now_ms - t <= NODE_HEARTBEAT_TTL_MS)
-            .map(|(e, _)| e.as_str())
-            .collect::<std::collections::HashSet<_>>()
-            .len()
+            .filter(|&&t| now_ms - t <= NODE_HEARTBEAT_TTL_MS)
+            .count()
     }
 
     /// The endpoints of nodes whose heartbeat is within [`NODE_HEARTBEAT_TTL_MS`] of `now_ms` — the
-    /// **live** placement pool for `index` (sorted, so tie-breaks are deterministic).
-    pub fn live_nodes(&self, index: &str, now_ms: i64) -> Vec<String> {
-        self.node_heartbeats
+    /// **live** placement pool (sorted, since `node_pool` is a `BTreeMap`, so tie-breaks are
+    /// deterministic).
+    pub fn live_nodes(&self, now_ms: i64) -> Vec<String> {
+        self.node_pool
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .get(index)
-            .into_iter()
-            .flatten()
-            .filter(|(_, hb)| now_ms - **hb <= NODE_HEARTBEAT_TTL_MS)
+            .iter()
+            .filter(|(_, &t)| now_ms - t <= NODE_HEARTBEAT_TTL_MS)
             .map(|(ep, _)| ep.clone())
             .collect()
     }
 
-    /// Resolve the node that owns `window` of `index`, **placing it on first ask** — the CP-driven
-    /// windowed assignment. The connector/writer calls this to learn where to route a row whose
-    /// window it just computed.
+    /// Resolve the node that owns a placement [`Unit`] (a shard or a window) of `index`, **placing it
+    /// on first ask** — the CP-driven universal-pool assignment (D52). The connector/writer calls this
+    /// to learn where to route a row once it has computed the row's unit (its window, or its
+    /// bucket→shard ordinal).
     ///
-    /// - **Idempotent:** a window already assigned to a **live** node returns that node (`created =
+    /// - **Idempotent:** a unit already assigned to a **live** node returns that node (`created =
     ///   false`), so repeated asks are stable.
-    /// - **Placement:** an unassigned window — or one whose owner is **dead** (no heartbeat within the
-    ///   TTL) — is placed on the **least-loaded** live node (fewest windows currently owned; ties
-    ///   broken by endpoint, so placement is deterministic), recorded via the durable window map, and
-    ///   returned with `created = true`.
+    /// - **Placement:** an unassigned unit — or one whose owner is **dead** (no heartbeat within the
+    ///   TTL) — is placed on the **least-loaded** live pool node and returned with `created = true`.
+    ///   Load is the node's unit count **across every index** (shards + windows), so placement
+    ///   bin-packs the whole pool — the density win that lets many small indexes share nodes. Ties
+    ///   break by endpoint (`node_pool` is a `BTreeMap`), so placement is deterministic. The
+    ///   assignment is recorded in the durable [`IndexEntry`] (`shards` or `windows`).
     ///
-    /// Errors if the index is unregistered, or if **no live node** is available to place a needed
-    /// window (the caller retries once a node heartbeats). Re-placing a dead owner's window only moves
-    /// the *assignment* — the new owner rebuilds that window's data from source on demand (a later
-    /// stage); this method is the placement authority, not the data mover.
-    pub fn resolve_window_owner(
+    /// Errors if the index is unregistered, or if **no live node** is available (the caller retries
+    /// once a node heartbeats). Re-placing a dead owner's unit only moves the *assignment* — the new
+    /// owner rebuilds that unit's data from source / cold tier on demand; this method is the placement
+    /// authority, not the data mover.
+    pub fn resolve_unit_owner(
         &self,
         index: &str,
-        window: i64,
+        unit: Unit,
         now_ms: i64,
     ) -> Result<(String, bool)> {
-        let live = self.live_nodes(index, now_ms);
+        let live = self.live_nodes(now_ms);
         let mut map = self.write_map();
-        let entry = map
-            .get_mut(index)
-            .ok_or_else(|| RegistryError::NotFound(index.to_string()))?;
+        if !map.contains_key(index) {
+            return Err(RegistryError::NotFound(index.to_string()));
+        }
         // A live current owner is authoritative — idempotent, no write.
-        if let Some(primary) = entry
-            .windows
-            .get(&window)
-            .and_then(|w| w.assignment.primary.as_ref())
-        {
-            if live.iter().any(|e| e == &primary.0) {
-                return Ok((primary.0.clone(), false));
+        if let Some(primary) = unit_primary(&map[index], unit) {
+            if live.iter().any(|e| e == &primary) {
+                return Ok((primary, false));
             }
         }
-        // Needs placement (unassigned or dead owner). Count each live node's current window load,
-        // then pick the least-loaded (BTreeMap iterates endpoints sorted, so the first minimum is the
-        // smallest endpoint — deterministic ties).
+        // Needs placement (unassigned or dead owner). Count each live node's current unit load across
+        // ALL indexes, then pick the least-loaded (BTreeMap iterates endpoints sorted, so the first
+        // minimum is the smallest endpoint — deterministic ties).
         if live.is_empty() {
             return Err(RegistryError::NoLiveNode {
                 index: index.to_string(),
-                window,
+                unit: unit.to_string(),
             });
         }
         let mut load: BTreeMap<&str, usize> = live.iter().map(|e| (e.as_str(), 0usize)).collect();
-        for wa in entry.windows.values() {
-            if let Some(p) = &wa.assignment.primary {
+        let tally = |load: &mut BTreeMap<&str, usize>, node: Option<&NodeId>| {
+            if let Some(p) = node {
                 if let Some(c) = load.get_mut(p.0.as_str()) {
                     *c += 1;
                 }
+            }
+        };
+        for e in map.values() {
+            for sa in e.shards.values() {
+                tally(&mut load, sa.primary.as_ref());
+            }
+            for wa in e.windows.values() {
+                tally(&mut load, wa.assignment.primary.as_ref());
             }
         }
         let chosen = load
@@ -1484,10 +1498,47 @@ impl Registry {
             .min_by_key(|(_, c)| **c)
             .map(|(ep, _)| ep.to_string())
             .expect("live pool non-empty");
-        entry.windows.entry(window).or_default().assignment.primary = Some(chosen.clone().into());
+        let entry = map.get_mut(index).expect("index presence checked above");
+        match unit {
+            Unit::Shard(ordinal) => {
+                entry.shards.entry(ordinal).or_default().primary = Some(chosen.clone().into());
+            }
+            Unit::Window(window) => {
+                entry.windows.entry(window).or_default().assignment.primary =
+                    Some(chosen.clone().into());
+            }
+        }
         drop(map);
         self.persist_snapshot()?;
         Ok((chosen, true))
+    }
+
+    /// Resolve the owner of a **window** — the windowed special case of
+    /// [`resolve_unit_owner`](Self::resolve_unit_owner). Kept as the connector's window entry point.
+    pub fn resolve_window_owner(
+        &self,
+        index: &str,
+        window: i64,
+        now_ms: i64,
+    ) -> Result<(String, bool)> {
+        self.resolve_unit_owner(index, Unit::Window(window), now_ms)
+    }
+}
+
+/// The current primary owner (if any) of a [`Unit`] within an [`IndexEntry`] — the shared read both
+/// the idempotency check and the placement write key off.
+fn unit_primary(entry: &IndexEntry, unit: Unit) -> Option<String> {
+    match unit {
+        Unit::Shard(ordinal) => entry
+            .shards
+            .get(&ordinal)
+            .and_then(|s| s.primary.as_ref())
+            .map(|n| n.0.clone()),
+        Unit::Window(window) => entry
+            .windows
+            .get(&window)
+            .and_then(|w| w.assignment.primary.as_ref())
+            .map(|n| n.0.clone()),
     }
 }
 
@@ -1658,26 +1709,16 @@ mod tests {
         let reg = Registry::open(dir.path().join("registry.json")).unwrap();
         let t = 1_000_000;
         // Limit of 2 for the test: two distinct nodes are admitted.
-        assert!(reg
-            .register_node_capped("idx", "node-a:50051", t, 2)
-            .is_ok());
-        assert!(reg
-            .register_node_capped("idx", "node-b:50051", t, 2)
-            .is_ok());
+        assert!(reg.register_node_capped("node-a:50051", t, 2).is_ok());
+        assert!(reg.register_node_capped("node-b:50051", t, 2).is_ok());
         assert_eq!(reg.distinct_live_nodes(t), 2);
         // A third *new* node is rejected (returns the current count).
-        assert_eq!(
-            reg.register_node_capped("idx", "node-c:50051", t, 2),
-            Err(2)
-        );
+        assert_eq!(reg.register_node_capped("node-c:50051", t, 2), Err(2));
         // But an already-live node re-heartbeats fine — no new capacity, never disrupt the cluster.
-        assert!(reg
-            .register_node_capped("idx", "node-a:50051", t + 100, 2)
-            .is_ok());
-        // A node also serving a second index isn't double-counted.
-        assert!(reg
-            .register_node_capped("idx2", "node-a:50051", t + 100, 2)
-            .is_ok());
+        assert!(reg.register_node_capped("node-a:50051", t + 100, 2).is_ok());
+        // Re-heartbeats never grow the count (the pool is a flat endpoint set — a node isn't
+        // double-counted no matter how many indexes' units it serves).
+        assert!(reg.register_node_capped("node-a:50051", t + 100, 2).is_ok());
         assert_eq!(reg.distinct_live_nodes(t + 100), 2);
     }
 
@@ -1828,7 +1869,7 @@ mod tests {
         reg.create(resolved("logs")).unwrap();
         let t0 = 1_000_000;
         for n in ["node-a", "node-b", "node-c"] {
-            reg.register_node("logs", n, t0);
+            reg.register_node(n, t0);
         }
         // Placing 6 windows round-robins evenly across the 3 live nodes (least-loaded each step).
         let mut owners = Vec::new();
@@ -1861,13 +1902,13 @@ mod tests {
         let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
         reg.create(resolved("logs")).unwrap();
         let t0 = 1_000_000;
-        reg.register_node("logs", "node-a", t0);
+        reg.register_node("node-a", t0);
         let (ep, _) = reg.resolve_window_owner("logs", 7, t0).unwrap();
         assert_eq!(ep, "node-a");
 
         // node-a goes silent; only node-b heartbeats, past node-a's TTL → node-a is dead.
         let t1 = t0 + NODE_HEARTBEAT_TTL_MS + 1;
-        reg.register_node("logs", "node-b", t1);
+        reg.register_node("node-b", t1);
         let (ep, created) = reg.resolve_window_owner("logs", 7, t1).unwrap();
         assert_eq!(
             ep, "node-b",
@@ -1891,6 +1932,75 @@ mod tests {
             reg.resolve_window_owner("logs", 99, t2),
             Err(RegistryError::NoLiveNode { .. })
         ));
+    }
+
+    #[test]
+    fn universal_pool_places_shard_and_window_units_across_indexes() {
+        // D52: one flat pool of interchangeable nodes serves UNITS (shards + windows) from MANY
+        // indexes through one resolve_unit_owner path; load is counted cross-index, so placement
+        // bin-packs the whole pool.
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
+        reg.create(resolved("hashidx")).unwrap();
+        reg.create(resolved("winidx")).unwrap();
+        let t0 = 1_000_000;
+        // A node registers ONCE into the pool (not per-index) and is eligible for any index's units.
+        for n in ["node-a", "node-b"] {
+            reg.register_node(n, t0);
+        }
+
+        // Hash-shard units of one index and window units of another go through the SAME path and land
+        // on the durable `shards` / `windows` maps respectively.
+        let (s0, c0) = reg
+            .resolve_unit_owner("hashidx", Unit::Shard(0), t0)
+            .unwrap();
+        assert!(c0);
+        let (s1, _) = reg
+            .resolve_unit_owner("hashidx", Unit::Shard(1), t0)
+            .unwrap();
+        let (w0, _) = reg
+            .resolve_unit_owner("winidx", Unit::Window(100), t0)
+            .unwrap();
+        let (w1, _) = reg
+            .resolve_unit_owner("winidx", Unit::Window(200), t0)
+            .unwrap();
+        // Cross-index least-loaded ⇒ the 4 units spread 2/2 over the pool (each node hosts units from
+        // BOTH indexes — the multi-index-per-node property that kills node-per-index).
+        let owners = [s0.clone(), s1, w0, w1];
+        for n in ["node-a", "node-b"] {
+            assert_eq!(
+                owners.iter().filter(|e| *e == n).count(),
+                2,
+                "{n} should host 2 of the 4 units across both indexes"
+            );
+        }
+        // Recorded on the right durable map per unit kind.
+        assert_eq!(
+            reg.shard_map("hashidx").unwrap()[&0]
+                .primary
+                .as_ref()
+                .unwrap()
+                .0,
+            s0
+        );
+        assert!(reg.window_map("winidx").unwrap().contains_key(&100));
+
+        // Idempotent for a live owner, and a shard unit re-places on a dead owner just like a window.
+        let (again, created) = reg
+            .resolve_unit_owner("hashidx", Unit::Shard(0), t0)
+            .unwrap();
+        assert_eq!(again, s0);
+        assert!(!created);
+        let t1 = t0 + NODE_HEARTBEAT_TTL_MS + 1;
+        reg.register_node("node-c", t1); // only node-c is live now; a/b are stale
+        let (moved, created) = reg
+            .resolve_unit_owner("hashidx", Unit::Shard(0), t1)
+            .unwrap();
+        assert_eq!(
+            moved, "node-c",
+            "dead owner's shard re-places on the live node"
+        );
+        assert!(created);
     }
 
     #[test]
