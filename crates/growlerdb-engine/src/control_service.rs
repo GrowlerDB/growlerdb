@@ -1346,13 +1346,13 @@ impl ControlPlane for ControlPlaneService {
     ) -> Result<Response<RegisterNodeResponse>, Status> {
         self.gate("RegisterNode", &request)?;
         let req = request.into_inner();
-        if req.index.is_empty() || req.endpoint.is_empty() {
-            return Err(Status::invalid_argument("index and endpoint are required"));
+        if req.endpoint.is_empty() {
+            return Err(Status::invalid_argument("endpoint is required"));
         }
         // A liveness heartbeat into the CP placement pool; the CP stamps its own clock so a
         // skewed node clock can't fake liveness. In-memory only — no persist. The pool is
-        // index-agnostic (D52): a node registers once as an interchangeable shard host, so `index`
-        // (still on the wire) no longer keys the pool. The scale limit caps *new* nodes at the
+        // index-agnostic (D52): a node registers once as an interchangeable shard host. The scale
+        // limit caps *new* nodes at the
         // entitlement (free tier or license); re-heartbeats of a live node always pass, so an
         // existing cluster is never disrupted.
         let limit = self.entitled_nodes();
@@ -2128,10 +2128,9 @@ mod tests {
         // With no node registered yet, placement is retryable (Unavailable), not a hard failure.
         assert_eq!(resolve(10).await.unwrap_err().code(), Code::Unavailable);
 
-        // Two nodes register as available.
+        // Two nodes register into the (index-agnostic) pool.
         for ep in ["http://node-a:50051", "http://node-b:50051"] {
             svc.register_node(Request::new(RegisterNodeRequest {
-                index: "logs".into(),
                 endpoint: ep.into(),
             }))
             .await

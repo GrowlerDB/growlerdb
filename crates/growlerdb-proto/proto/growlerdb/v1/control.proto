@@ -346,14 +346,14 @@ message RegisterServedIndexResponse {
   string name = 1;  // the registered index name
 }
 
-// A windowed node announces itself to the control-plane placement pool — a liveness
-// heartbeat sent on startup and on an interval. The CP places each new time window on a live node
-// (fewest-loaded); a node that stops heartbeating past the TTL drops out of the pool and its windows
-// are re-placed on the next ResolveWindowOwner. This is the inverse of RegisterServedIndex: the CP
-// decides placement, rather than the node announcing what it already serves.
+// A node announces itself to the control-plane placement pool — a liveness heartbeat sent on
+// startup and on an interval. The pool is **index-agnostic** (D52): a node registers once as an
+// interchangeable shard host, and the CP places units (shards/windows) from any index on the
+// least-loaded live node; a node that stops heartbeating past the TTL drops out and its units are
+// re-placed on the next resolve. This is the inverse of RegisterServedIndex: the CP decides
+// placement, rather than the node announcing what it already serves.
 message RegisterNodeRequest {
-  string index = 1;     // the windowed index this node can serve windows for
-  string endpoint = 2;  // the node's routable gRPC endpoint, e.g. "http://node:50051"
+  string endpoint = 1;  // the node's routable gRPC endpoint, e.g. "http://node:50051"
 }
 message RegisterNodeResponse {}
 

@@ -393,6 +393,15 @@ enum Command {
         /// Address to bind the data-plane gRPC services (`host:port`).
         #[arg(long, default_value = "127.0.0.1:50051")]
         addr: String,
+        /// Register into the Control-Plane placement pool at this gRPC endpoint and announce the
+        /// served windows of every `--index`, so a cluster gateway can route to this node. The node
+        /// heartbeats into the pool once (index-agnostic) and re-announces each index's windows.
+        #[arg(long, requires = "advertise_addr")]
+        register: Option<String>,
+        /// The routable gRPC endpoint other services reach this node at (recorded when `--register`
+        /// is set, since `--addr` is often a bind-only wildcard).
+        #[arg(long)]
+        advertise_addr: Option<String>,
         /// Shared service token closing this node's data-plane gRPC to callers that don't present it —
         /// same gate as `serve`. Unset ⇒ open (single-node dev). Env: `GROWLERDB_SERVICE_TOKEN`.
         #[arg(long, env = "GROWLERDB_SERVICE_TOKEN")]
@@ -886,6 +895,8 @@ pub async fn run() -> anyhow::Result<()> {
         Command::ServePool {
             indexes,
             addr,
+            register,
+            advertise_addr,
             service_token,
             tls,
         } => {
@@ -893,6 +904,8 @@ pub async fn run() -> anyhow::Result<()> {
                 &cli.data_dir,
                 &indexes,
                 &addr,
+                register.as_deref(),
+                advertise_addr.as_deref(),
                 metrics_addr.as_deref(),
                 service_token,
                 tls.load()?,
@@ -2503,10 +2516,13 @@ async fn serve_windowed(
 /// One process therefore fronts many indexes' windows — the interchangeable shard-host that removes
 /// the node-per-index wall. Reads only for now (writes + CP-driven dynamic placement are follow-ons);
 /// each index's windows are the pre-built set on disk.
+#[allow(clippy::too_many_arguments)]
 async fn serve_pool(
     data_dir: &str,
     indexes: &[String],
     addr: &str,
+    register: Option<&str>,
+    advertise_addr: Option<&str>,
     metrics_addr: Option<&str>,
     service_token: Option<String>,
     tls: Option<tonic::transport::ServerTlsConfig>,
@@ -2516,6 +2532,7 @@ async fn serve_pool(
         PoolSuggestService, SearchService, ShardHandle, SuggestService,
     };
     use growlerdb_index::ShardId;
+    use growlerdb_proto::v1::ServedWindow;
     use growlerdb_proto::{SystemServer, SystemService};
     use std::collections::BTreeMap;
     use std::sync::{Arc, RwLock};
@@ -2529,6 +2546,8 @@ async fn serve_pool(
     let lookup_idx: growlerdb_engine::SharedLookupIndexes = Arc::new(RwLock::new(BTreeMap::new()));
     let admin_idx: growlerdb_engine::SharedAdminIndexes = Arc::new(RwLock::new(BTreeMap::new()));
 
+    // Per-index (resolved def, served windows) for the CP announce when `--register` is set.
+    let mut announcements: Vec<(growlerdb_core::ResolvedIndex, Vec<ServedWindow>)> = Vec::new();
     let mut total_windows = 0usize;
     for index in indexes {
         let resolved = load_resolved(data_dir, index)?;
@@ -2542,7 +2561,7 @@ async fn serve_pool(
         // Open each of this index's window shards into the four per-window services. Cold read-through
         // windows are not yet handled in pool mode (a follow-on) — pool serving targets hot windows.
         let windows = store.window_shards(index)?;
-        let (search_w, suggest_w, lookup_w, admin_w) = {
+        let (search_w, suggest_w, lookup_w, admin_w, served) = {
             let (store, resolved, index_s, table, windows) = (
                 store.clone(),
                 resolved.clone(),
@@ -2555,9 +2574,11 @@ async fn serve_pool(
                 let mut suggest_w = BTreeMap::new();
                 let mut lookup_w = BTreeMap::new();
                 let mut admin_w = BTreeMap::new();
+                let mut served = Vec::with_capacity(windows.len());
                 for &w in &windows {
                     let shard =
                         Arc::new(store.open_shard(&ShardId::window(&index_s, w), &resolved)?);
+                    let zone = shard.event_bounds()?;
                     let handle = ShardHandle::new(shard);
                     search_w.insert(w, SearchService::new(handle.clone()));
                     suggest_w.insert(w, SuggestService::new(handle.clone()));
@@ -2571,8 +2592,15 @@ async fn serve_pool(
                         ),
                     );
                     admin_w.insert(w, AdminService::new(handle.clone(), &index_s));
+                    served.push(ServedWindow {
+                        window: w,
+                        event_min: zone.map(|(lo, _)| lo).unwrap_or(0),
+                        event_max: zone.map(|(_, hi)| hi).unwrap_or(0),
+                        has_event_bounds: zone.is_some(),
+                        cold: false,
+                    });
                 }
-                Ok((search_w, suggest_w, lookup_w, admin_w))
+                Ok((search_w, suggest_w, lookup_w, admin_w, served))
             })
             .await??
         };
@@ -2593,6 +2621,7 @@ async fn serve_pool(
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(index.clone(), Arc::new(RwLock::new(admin_w)));
+        announcements.push((resolved, served));
     }
 
     let socket: std::net::SocketAddr = addr
@@ -2609,7 +2638,21 @@ async fn serve_pool(
         );
     }
     let readiness = spawn_health(metrics_addr).await?;
-    readiness.mark_ready();
+    // Register into the placement pool + announce every served index's windows, so a cluster gateway
+    // routes to this node; `/readyz` stays not-ready until the first successful registration. Without
+    // `--register` the node serves immediately (local/standalone).
+    if let (Some(cp), Some(endpoint)) = (register, advertise_addr) {
+        let label = format!("pool node at {endpoint} [{}]", indexes.join(", "));
+        spawn_pool_registration(
+            cp.to_string(),
+            endpoint.to_string(),
+            announcements,
+            readiness.clone(),
+            label,
+        );
+    } else {
+        readiness.mark_ready();
+    }
 
     let mut builder = Server::builder();
     if let Some(tls) = tls {
@@ -4137,13 +4180,12 @@ async fn register_served_index(
     Ok(())
 }
 
-/// Heartbeat this windowed node into the control-plane **placement pool** so the CP can
-/// place newly-seen windows on it (answering the connector's `ResolveWindowOwner`).
-async fn register_node(control_plane: &str, index: &str, endpoint: &str) -> anyhow::Result<()> {
+/// Heartbeat this node into the control-plane **placement pool** so the CP keeps it eligible for unit
+/// placement. Index-agnostic (D52): the pool is a flat set of interchangeable shard hosts.
+async fn register_node(control_plane: &str, endpoint: &str) -> anyhow::Result<()> {
     let mut client = connect_cp(control_plane, false).await?;
     client
         .register_node(growlerdb_proto::v1::RegisterNodeRequest {
-            index: index.to_string(),
             endpoint: endpoint.to_string(),
         })
         .await
@@ -4173,7 +4215,7 @@ fn spawn_windowed_registration(
                 async move {
                     // Heartbeat first (keeps the node in the placement pool), then re-announce the
                     // current served windows + their zone-maps for the cluster gateway to prune on.
-                    register_node(&control_plane, &resolved.name, &endpoint).await?;
+                    register_node(&control_plane, &endpoint).await?;
                     register_served_index(
                         &control_plane,
                         &endpoint,
@@ -4183,6 +4225,54 @@ fn spawn_windowed_registration(
                         write_service.served_windows(),
                     )
                     .await
+                }
+            },
+            &readiness,
+            &label,
+            REGISTER_INITIAL_BACKOFF,
+            REGISTER_MAX_BACKOFF,
+            REGISTER_REANNOUNCE_INTERVAL,
+        )
+        .await;
+    });
+}
+
+/// Pool-node registration (D52): heartbeat into the placement pool (once, index-agnostic) and
+/// announce the served windows of **every** index this node hosts, so a cluster gateway can route to
+/// it. The multi-index counterpart to [`spawn_windowed_registration`]; retries until reachable, marks
+/// `readiness` ready on the first success, and re-announces on an interval (an idempotent upsert, so a
+/// control-plane restart re-learns the node).
+fn spawn_pool_registration(
+    control_plane: String,
+    endpoint: String,
+    announcements: Vec<(
+        growlerdb_core::ResolvedIndex,
+        Vec<growlerdb_proto::v1::ServedWindow>,
+    )>,
+    readiness: growlerdb_telemetry::Readiness,
+    label: String,
+) {
+    tokio::spawn(async move {
+        registration_loop(
+            || {
+                let control_plane = control_plane.clone();
+                let endpoint = endpoint.clone();
+                let announcements = announcements.clone();
+                async move {
+                    // Heartbeat into the pool first, then announce each served index's windows.
+                    register_node(&control_plane, &endpoint).await?;
+                    for (resolved, windows) in &announcements {
+                        register_served_index(
+                            &control_plane,
+                            &endpoint,
+                            resolved,
+                            1,
+                            vec![],
+                            windows.clone(),
+                        )
+                        .await?;
+                    }
+                    Ok(())
                 }
             },
             &readiness,
