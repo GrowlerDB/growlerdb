@@ -733,7 +733,7 @@ services:
   # (below) populates it, and hydration routes through Trino (GROWLERDB_TRINO_ENDPOINT). Part of the
   # `variant` profile — needs the `stack` (controlplane/gateway) up too.
   node-events:
-    profiles: ["variant"]
+    profiles: ["variant-serve"]
     <<: *growlerdb-image
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -771,7 +771,7 @@ services:
   # extracts the variant `payload` — flatten leaves + discriminator-selected shape values
   # (--variant-spec) — into the node. Mirrors the `connector` service's Spark/REST-catalog wiring.
   connector-events:
-    profiles: ["variant"]
+    profiles: ["variant-serve"]
     image: apache/spark:4.1.3
     restart: on-failure
     volumes:

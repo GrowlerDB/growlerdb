@@ -242,16 +242,16 @@ variant:
 # Hydration + introspection route through Trino (D48/D49); search/hydrate via the gateway on :8081.
 variant-demo: variant
     cd connector && mise exec -- mvn -q -DskipTests package
-    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile variant pull node-events || docker compose -f deploy/compose/docker-compose.yml build node-events
-    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile variant up -d --force-recreate node-events
-    docker compose -f deploy/compose/docker-compose.yml --profile variant run --rm connector-events
+    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile trino --profile variant-serve pull node-events || docker compose -f deploy/compose/docker-compose.yml --profile variant-serve build node-events
+    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile trino --profile variant-serve up -d --force-recreate node-events
+    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile trino --profile variant-serve run --rm connector-events
     @echo ''
     @echo 'events index served + populated. Try via the gateway (demo/demo) at http://localhost:8081, or:'
     @echo "  curl -s localhost:8081/v1/indexes/events/_search -H 'content-type: application/json' -d '{\"q\":\"payload.user.login:octocat\"}'"
 
 # tear the full stack (and volumes) down
 stack-down:
-    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile catalog --profile seed --profile trino --profile variant down -v
+    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile catalog --profile seed --profile trino --profile variant --profile variant-serve down -v
 
 # chaos drill: crash a core service on the running stack, assert it self-heals.
 # SERVICE defaults to `node`; e.g. `just chaos gateway`. Requires `just stack` up first.
