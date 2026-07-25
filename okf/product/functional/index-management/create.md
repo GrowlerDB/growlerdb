@@ -20,9 +20,10 @@ Define an index over an Iceberg table and build it. The definition chooses:
   + **`fieldnorms`** (posting detail and
   BM25 norms; see [data model](/system/storage/data-model.md)) flags; optionally a
   declared **timestamp** field and [windowing](/product/functional/windowing-time.md). Iceberg v3
-  **variant** columns will get their own mapping surface
-  ([planned](/product/functional/index-management/variant.md)), since their paths are per-row
-  rather than in the source schema.
+  **variant** columns have their own `type: VARIANT` mapping surface
+  ([variant fields](/product/functional/index-management/variant.md)) — untyped `flatten` and/or
+  discriminator-selected typed `shapes` — because their paths are per-row rather than in the source
+  schema; `resolve()` accepts a variant column without resolving its (non-existent) leaf schema.
 - **Sharding** — shard count + routing.
 - **Location strategy** (`location_strategy`, [D30](/system/decisions/d30-layered-locator.md)) —
   how [hydration](/product/functional/hydration.md) locates a key's source row: `COORDINATES`
