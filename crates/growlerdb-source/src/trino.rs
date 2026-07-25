@@ -449,9 +449,16 @@ fn row_to_fields(
     for v in &cols.variants {
         if let Some(cell) = pos.get(v.as_str()).and_then(|i| row.get(*i)) {
             if !cell.is_null() {
-                // The whole variant object as compact JSON text — the "variant returned as JSON"
-                // hydration payload (D48).
-                fields.insert(v.clone(), Value::Str(cell.to_string()));
+                // The whole variant object as JSON text — the "variant returned as JSON" hydration
+                // payload (D48). Trino returns `CAST(col AS JSON)` as a JSON **string** in the REST
+                // `data` array, so the cell is already the JSON text — take it verbatim rather than
+                // re-quoting it (`to_string()` on a JSON string double-encodes). A non-string cell
+                // (some drivers hand back the parsed value) is compact-serialized.
+                let json = match cell {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                fields.insert(v.clone(), Value::Str(json));
             }
         }
     }
