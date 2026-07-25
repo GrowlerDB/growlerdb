@@ -8,6 +8,7 @@ import java.util.stream.Collectors;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.functions;
 
 /**
  * Reads the Iceberg **changelog** for a table via Iceberg's
@@ -35,6 +36,23 @@ public final class ChangelogReader {
       String table,
       Long startSnapshotId,
       List<String> identifierColumns) {
+    return changelog(spark, catalog, table, startSnapshotId, identifierColumns, null);
+  }
+
+  /**
+   * As {@link #changelog(SparkSession, String, String, Long, List)}, but when {@code variantColumn}
+   * is non-null that column is projected as {@code to_json(col)} so it reaches the driver as a JSON
+   * <b>string</b> — {@link VariantExtractor} parses it (avoiding the {@code VariantVal} external
+   * type) into flatten leaves + shaped values (D47/D48). {@code create_changelog_view} handles
+   * variant columns (verified), so this reuses the normal changelog path.
+   */
+  public static Dataset<Row> changelog(
+      SparkSession spark,
+      String catalog,
+      String table,
+      Long startSnapshotId,
+      List<String> identifierColumns,
+      String variantColumn) {
     String view = "growlerdb_changelog_view";
     String ids =
         identifierColumns.stream()
@@ -54,7 +72,13 @@ public final class ChangelogReader {
             + ", identifier_columns => " + ids
             + options
             + ")");
-    return spark.table(view).orderBy("_change_ordinal");
+    Dataset<Row> df = spark.table(view);
+    if (variantColumn != null) {
+      // Render the variant column as JSON text so it arrives as a String (VariantExtractor parses
+      // it); to_json handles the shredded/unshredded VARIANT uniformly.
+      df = df.withColumn(variantColumn, functions.to_json(functions.col(variantColumn)));
+    }
+    return df.orderBy("_change_ordinal");
   }
 
   /**
@@ -66,6 +90,16 @@ public final class ChangelogReader {
    * Locator is a placeholder (see class docs).
    */
   public static Iterator<ChangelogRow> rowIterator(Dataset<Row> changelog, List<String> columns) {
+    return rowIterator(changelog, columns, null);
+  }
+
+  /**
+   * As {@link #rowIterator(Dataset, List)}, but with a {@code variant} extractor: each row's variant
+   * column (a JSON string, see the {@code variantColumn} overload of {@link #changelog}) is walked
+   * into flatten leaves + discriminator-selected shape values (D47/D48). {@code null} = no variant.
+   */
+  public static Iterator<ChangelogRow> rowIterator(
+      Dataset<Row> changelog, List<String> columns, VariantExtractor variant) {
     Iterator<Row> rows = changelog.toLocalIterator();
     return new Iterator<>() {
       @Override
@@ -75,7 +109,7 @@ public final class ChangelogReader {
 
       @Override
       public ChangelogRow next() {
-        return toRow(rows.next(), columns);
+        return toRow(rows.next(), columns, variant);
       }
     };
   }
@@ -94,17 +128,75 @@ public final class ChangelogReader {
   /** Map one changelog {@link Row} to a {@link ChangelogRow}, projecting {@code columns} as wire
    *  {@link Value}s. Placeholder locator (hydration fills it lazily). */
   static ChangelogRow toRow(Row row, List<String> columns) {
+    return toRow(row, columns, null);
+  }
+
+  /** JSON parser for the variant column (rendered as a JSON string by the {@code changelog}
+   *  overload). Thread-safe once configured; the driver reads rows single-threaded per partition. */
+  private static final com.fasterxml.jackson.databind.ObjectMapper VARIANT_JSON =
+      new com.fasterxml.jackson.databind.ObjectMapper();
+
+  /** As {@link #toRow(Row, List)}, but with a {@code variant} extractor (D47/D48): the variant
+   *  column (a JSON string) is walked into flatten leaves (carried on the {@link ChangelogRow}) plus
+   *  discriminator-selected shape values (merged into {@code columns}, so they ride the document's
+   *  normal typed fields). {@code null} = no variant column. */
+  static ChangelogRow toRow(Row row, List<String> columns, VariantExtractor variant) {
     ChangeType type = ChangeType.fromIceberg(row.getAs("_change_type"));
     long ordinal = ((Number) row.getAs("_change_ordinal")).longValue();
     long snapshot = ((Number) row.getAs("_commit_snapshot_id")).longValue();
+    String variantColumn = variant == null ? null : variant.spec().column;
     var cols = new java.util.HashMap<String, Value>();
     for (String column : columns) {
+      if (column.equals(variantColumn)) {
+        continue; // the variant column isn't a scalar field — extracted below
+      }
       Object value = row.getAs(column);
       if (value != null) {
         cols.put(column, toValue(value));
       }
     }
-    return new ChangelogRow(type, ordinal, snapshot, cols, "", 0);
+    java.util.List<io.growlerdb.proto.v1.VariantColumn> variants = java.util.List.of();
+    if (variant != null) {
+      Object raw = row.getAs(variantColumn);
+      String jsonText = raw == null ? null : raw.toString();
+      com.fasterxml.jackson.databind.JsonNode json = null;
+      if (jsonText != null && !jsonText.isEmpty()) {
+        try {
+          json = VARIANT_JSON.readTree(jsonText);
+        } catch (Exception e) {
+          json = null; // an unparseable variant value → no leaves for this row (still ingested)
+        }
+      }
+      String discriminatorValue = resolveDiscriminator(row, json, variant.spec());
+      VariantExtractor.Extracted extracted = variant.extract(json, discriminatorValue);
+      cols.putAll(extracted.shapedFields);
+      variants = java.util.List.of(extracted.variantColumn);
+    }
+    return new ChangelogRow(type, ordinal, snapshot, cols, "", 0, variants);
+  }
+
+  /** Resolve a row's discriminator value: a path inside the variant (qualified with the column)
+   *  reads from the parsed variant JSON; anything else is a sibling column read off the row. */
+  private static String resolveDiscriminator(
+      Row row, com.fasterxml.jackson.databind.JsonNode json, VariantSpec spec) {
+    if (spec.discriminator == null) {
+      return null;
+    }
+    String prefix = spec.column + ".";
+    if (spec.discriminator.startsWith(prefix)) {
+      com.fasterxml.jackson.databind.JsonNode n = json;
+      for (String seg : spec.discriminator.substring(prefix.length()).split("\\.")) {
+        n = n == null ? null : n.get(seg);
+      }
+      return n == null || n.isNull() ? null : n.asText();
+    }
+    Object v;
+    try {
+      v = row.getAs(spec.discriminator);
+    } catch (IllegalArgumentException missing) {
+      return null; // discriminator column not in the changelog projection
+    }
+    return v == null ? null : v.toString();
   }
 
   /** Microseconds per UTC day — Spark DATE (days since epoch) → canonical micros. */

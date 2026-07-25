@@ -27,13 +27,18 @@ A non-variant index keeps the **native path untouched** — every routing below 
 | **Snapshot polling / lineage** — `current_snapshot(_ordered)` / `snapshot_timestamps` / `table_uuid` | `load_table` metadata | **Raw REST metadata** (the catalog's `GET .../table` JSON carries snapshots + `table-uuid` without needing schema parse) — a thin metadata read that skips iceberg-rust's schema deserialization. Interim; folds into the native path at TASK-353. |
 | **Reconciliation / compaction re-map** — `scan_stale_index` / `read_documents_in_partition` / `current_plan` / `read_file_key_rows` | native scan + key scan | **Scoped out (interim)** for variant tables: reconciliation and the compaction re-map poller are disabled with a D45-loud degradation flag; the connector's changelog is the source of truth until the native path lands. |
 
-**Status.** Planned → **partially implemented.** Shipped: the fork predicate
-(`has_variant_field`), the Trino hydration + introspection seam (`growlerdb-source::trino`,
-unit-tested), and D45-loud `SourceError::Trino`. Pending (needs the running stack + connector
-variant ingest to verify): wiring the fork into the engine's hydrate/create call sites, the raw-REST
-metadata reads for snapshot/stats, and the D45-loud scope-outs for Rust build/reconcile on a variant
-index. The native path (TASK-353) collapses every "Trino / raw REST / scoped-out" cell back to
-native once iceberg-rust ships variant, leaving Trino only as the permanent slow lane (D48).
+**Status.** **Implemented for the create + hydrate + ingest lanes; live-verified.** Shipped: the
+fork predicates (`IndexDefinition::declares_variant` / `ResolvedIndex::has_variant_field`), the Trino
+seam (`growlerdb-source::trino`, `shared_hydrator()`), and the wiring — **create** introspects a
+variant table's schema via Trino (`index_shard`/`define_index`/`create_index`) and **skips the
+native cold build** (loudly; connector-fed), and **hydration** forks in `hydrate::get_by_key` + the
+node `LookupService` onto the Trino lane. Ingest is the connector (`--variant-spec`). Verified
+against the running stack: creating `events` over the live v3 table resolves its schema + shapes via
+Trino, and `TrinoHydrator` hydrates keys returning `payload` as JSON. Still scoped-out (interim,
+D45-loud where hit): source **stats**/**snapshot-poll**/**reconcile** and **alter**/**describe_source**
+on a variant table (no def to fork `describe_source`; raw-REST metadata reads are the follow-up). The
+native path (TASK-353) collapses every "Trino / scoped-out" cell back to native once iceberg-rust
+ships variant, leaving Trino only as the permanent slow lane (D48).
 
 **Why.**
 

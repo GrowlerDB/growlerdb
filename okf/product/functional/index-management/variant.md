@@ -9,16 +9,18 @@ resource: https://iceberg.apache.org/spec/#variant
 
 # Variant fields (planned)
 
-**Status: mapping + flatten indexing shipped; connector extraction and Trino-hydration wiring in
-progress.** The Rust core — the [D47](/system/decisions/d47-variant-mapping.md) mapping model
-(untyped flatten + discriminator-selected shapes), the node's flatten indexing (`<col>#terms` path
-terms + an optional analyzed `<col>#text` catch-all), the dotted-path query rewrite, and the
-create-time cross-shape type validation — is implemented and tested. The connector-side extraction
-([D48](/system/decisions/d48-variant-delivery.md) step 1) and the engine wiring of the interim
-Trino hydration seam ([D48](/system/decisions/d48-variant-delivery.md) step 2,
-[D49](/system/decisions/d49-variant-iceberg-rust-routing.md)) are in progress; the native Rust path
-(step 3) waits on the next iceberg-rust release. Part of the Iceberg v3 adoption path
-([D28](/system/decisions/d28-iceberg-v3.md)).
+**Status: end-to-end via the connector + interim Trino lane; native Rust path pending.** The Rust
+core — the [D47](/system/decisions/d47-variant-mapping.md) mapping model (untyped flatten +
+discriminator-selected shapes), the node's flatten indexing (`<col>#terms` path terms + an optional
+analyzed `<col>#text` catch-all), the dotted-path query rewrite, and create-time cross-shape type
+validation — is implemented and tested. The connector-side extraction
+([D48](/system/decisions/d48-variant-delivery.md) step 1) and the engine wiring of the interim Trino
+lane ([D48](/system/decisions/d48-variant-delivery.md) step 2,
+[D49](/system/decisions/d49-variant-iceberg-rust-routing.md)) are **wired**: index creation
+introspects a variant table's schema via Trino, ingest runs through the connector (`--variant-spec`),
+and hydration forks onto Trino — the create + hydrate lanes are verified live against the seeded v3
+table. The native Rust path (step 3) waits on the next iceberg-rust release. Part of the Iceberg v3
+adoption path ([D28](/system/decisions/d28-iceberg-v3.md)).
 
 An Iceberg v3 **variant** column holds a semi-structured value whose structure is per-row — its
 paths are not in the table schema, so the existing rule that every mapped path resolves to a

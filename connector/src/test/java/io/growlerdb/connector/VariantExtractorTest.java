@@ -37,7 +37,28 @@ class VariantExtractorTest {
             "issue",
             Set.of("IssuesEvent"),
             List.of(new VariantSpec.Path("number", VariantSpec.Type.LONG)));
-    return new VariantSpec("payload", true, true, List.of(pr, issue));
+    return new VariantSpec("payload", "event_type", true, true, List.of(pr, issue));
+  }
+
+  @Test
+  void fromJsonParsesColumnDiscriminatorAndShapes() {
+    VariantSpec spec =
+        VariantSpec.fromJson(
+            "{\"column\":\"payload\",\"discriminator\":\"event_type\","
+                + "\"flatten\":{\"terms\":true,\"text\":true},"
+                + "\"shapes\":[{\"name\":\"pr\",\"when\":[\"PullRequestEvent\"],"
+                + "\"paths\":[{\"path\":\"number\",\"type\":\"LONG\"},"
+                + "{\"path\":\"title\",\"type\":\"TEXT\"}]}]}");
+    assertEquals("payload", spec.column);
+    assertEquals("event_type", spec.discriminator);
+    assertTrue(spec.flattenTerms);
+    assertTrue(spec.flattenText);
+    assertEquals(1, spec.shapes.size());
+    assertEquals(Set.of("PullRequestEvent"), spec.shapes.get(0).when);
+    assertEquals(VariantSpec.Type.LONG, spec.shapes.get(0).paths.get(0).type);
+    // A full extract using the parsed spec still produces the shaped value.
+    var e = new VariantExtractor(spec).extract(json("{\"number\":7,\"title\":\"x\"}"), "PullRequestEvent");
+    assertEquals(7L, e.shapedFields.get("payload.number").getInt());
   }
 
   private static JsonNode json(String s) {

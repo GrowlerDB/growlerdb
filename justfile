@@ -237,6 +237,18 @@ variant:
     @echo 'Seeded growlerdb.events (format-version=3, VARIANT payload).'
     @echo "Read it: docker compose -f deploy/compose/docker-compose.yml exec trino trino --execute \"SELECT id, event_type, CAST(payload AS JSON) FROM iceberg.growlerdb.events\""
 
+# full variant end-to-end demo (needs `just stack` up): seed the v3 table, build the connector jar,
+# serve the `events` index (create-time schema via Trino), then populate it via the connector.
+# Hydration + introspection route through Trino (D48/D49); search/hydrate via the gateway on :8081.
+variant-demo: variant
+    cd connector && mise exec -- mvn -q -DskipTests package
+    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile variant pull node-events || docker compose -f deploy/compose/docker-compose.yml build node-events
+    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile variant up -d --force-recreate node-events
+    docker compose -f deploy/compose/docker-compose.yml --profile variant run --rm connector-events
+    @echo ''
+    @echo 'events index served + populated. Try via the gateway (demo/demo) at http://localhost:8081, or:'
+    @echo "  curl -s localhost:8081/v1/indexes/events/_search -H 'content-type: application/json' -d '{\"q\":\"payload.user.login:octocat\"}'"
+
 # tear the full stack (and volumes) down
 stack-down:
     docker compose -f deploy/compose/docker-compose.yml --profile stack --profile catalog --profile seed --profile trino --profile variant down -v

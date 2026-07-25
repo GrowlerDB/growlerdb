@@ -47,6 +47,9 @@ public final class ConnectorJob {
   private final long maxCommitRows;
   /** Shard-group mode: executor-side filter to this worker's owned rows; null = all. */
   private final OwnedRowFilter ownedFilter;
+  /** Variant extraction (D47/D48): walks each row's variant column into flatten leaves + shaped
+   *  values. Null when the index maps no variant column. */
+  private final VariantExtractor variantExtractor;
 
   /**
    * @param catalog Spark catalog name (e.g. {@code demo})
@@ -89,6 +92,26 @@ public final class ConnectorJob {
       Set<Long> replaceSnapshotIds,
       long maxCommitRows,
       OwnedRowFilter ownedFilter) {
+    this(
+        catalog,
+        table,
+        mapping,
+        identifierColumns,
+        replaceSnapshotIds,
+        maxCommitRows,
+        ownedFilter,
+        null);
+  }
+
+  private ConnectorJob(
+      String catalog,
+      String table,
+      IndexMapping mapping,
+      List<String> identifierColumns,
+      Set<Long> replaceSnapshotIds,
+      long maxCommitRows,
+      OwnedRowFilter ownedFilter,
+      VariantExtractor variantExtractor) {
     this.catalog = catalog;
     this.table = table;
     this.mapping = mapping;
@@ -96,6 +119,21 @@ public final class ConnectorJob {
     this.replaceSnapshotIds = Set.copyOf(replaceSnapshotIds);
     this.maxCommitRows = maxCommitRows > 0 ? maxCommitRows : DEFAULT_MAX_COMMIT_ROWS;
     this.ownedFilter = ownedFilter;
+    this.variantExtractor = variantExtractor;
+  }
+
+  /** A copy of this job that extracts a variant column (D47/D48) via {@code extractor} —
+   *  flatten leaves + discriminator-selected shape values per row. Composes with {@link #ownedBy}. */
+  public ConnectorJob withVariant(VariantExtractor extractor) {
+    return new ConnectorJob(
+        catalog,
+        table,
+        mapping,
+        identifierColumns,
+        replaceSnapshotIds,
+        maxCommitRows,
+        ownedFilter,
+        extractor);
   }
 
   /**
@@ -112,7 +150,8 @@ public final class ConnectorJob {
         identifierColumns,
         replaceSnapshotIds,
         maxCommitRows,
-        OwnedRowFilter.of(mapping, router, owned));
+        OwnedRowFilter.of(mapping, router, owned),
+        variantExtractor);
   }
 
   /**
@@ -138,7 +177,13 @@ public final class ConnectorJob {
     }
 
     Dataset<Row> changelog =
-        ChangelogReader.changelog(spark, catalog, table, startSnapshotId, identifierColumns);
+        ChangelogReader.changelog(
+            spark,
+            catalog,
+            table,
+            startSnapshotId,
+            identifierColumns,
+            variantExtractor == null ? null : variantExtractor.spec().column);
 
     // Expected-row-count gate: guards against an under-read — a changelog scan that returns fewer
     // rows than the window's snapshots committed, letting the empty/short window jump the in-memory
@@ -194,7 +239,7 @@ public final class ConnectorJob {
     long[] lastCommitted = {-1L};
     int[] totalOps = {0};
     streamCommits(
-        ChangelogReader.rowIterator(changelog, projectedColumns()),
+        ChangelogReader.rowIterator(changelog, projectedColumns(), variantExtractor),
         maxCommitRows,
         startSnapshotId,
         current,
@@ -449,6 +494,15 @@ public final class ConnectorJob {
     cols.addAll(mapping.partitionFields);
     cols.addAll(mapping.identifierFields);
     cols.addAll(mapping.fields);
+    // A variant column is read (and extracted) even though it isn't a scalar mapping field; a
+    // sibling discriminator column must be read too so shape selection can see it.
+    if (variantExtractor != null) {
+      cols.add(variantExtractor.spec().column);
+      String disc = variantExtractor.spec().discriminator;
+      if (disc != null && !disc.startsWith(variantExtractor.spec().column + ".")) {
+        cols.add(disc);
+      }
+    }
     return new ArrayList<>(cols);
   }
 

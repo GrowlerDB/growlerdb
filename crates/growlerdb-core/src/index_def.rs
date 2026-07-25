@@ -341,6 +341,19 @@ impl IndexDefinition {
         Ok(def)
     }
 
+    /// Whether this **unresolved** definition maps a `variant` column — a field mapping declared
+    /// `type: VARIANT`. Checked before [`resolve`](Self::resolve) so the create path can route
+    /// schema introspection around released iceberg-rust (which fails to parse a v3 variant
+    /// schema) to the Trino lane ([D48](../../../okf/system/decisions/d48-variant-delivery.md),
+    /// [D49](../../../okf/system/decisions/d49-variant-iceberg-rust-routing.md)) before it ever
+    /// calls `load_table`. The resolved counterpart is [`ResolvedIndex::has_variant_field`].
+    pub fn declares_variant(&self) -> bool {
+        self.mapping
+            .fields
+            .iter()
+            .any(|f| f.ty == Some(FieldType::Variant))
+    }
+
     /// Resolve this definition against a concrete `source` schema: derive the
     /// composite key, auto-map / override field types, and validate that every
     /// referenced path exists in the source.
@@ -2919,6 +2932,20 @@ mapping:
              key: {{ identifier_fields: [id] }}\n{mapping_yaml}"
         );
         IndexDefinition::from_yaml(&yaml)?.resolve(&events_schema())
+    }
+
+    #[test]
+    fn declares_variant_detects_the_unresolved_variant_mapping() {
+        let with = IndexDefinition::from_yaml(
+            "name: events\nsource: { iceberg: { catalog: g, table: g.events } }\nkey: { identifier_fields: [id] }\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD }, { path: payload, type: VARIANT } ] }\n",
+        )
+        .unwrap();
+        assert!(with.declares_variant());
+        let without = IndexDefinition::from_yaml(
+            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD } ] }\n",
+        )
+        .unwrap();
+        assert!(!without.declares_variant());
     }
 
     #[test]

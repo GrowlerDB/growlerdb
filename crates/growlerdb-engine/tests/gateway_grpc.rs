@@ -76,7 +76,12 @@ async fn gateway_front(shard: Arc<Shard>) -> std::net::SocketAddr {
     let node = LocalNode::new(
         SearchService::new(shard.clone()),
         SuggestService::new(shard.clone()),
-        LookupService::new(shard.clone(), IcebergConfig::local(), "g.docs"),
+        LookupService::new(
+            shard.clone(),
+            IcebergConfig::local(),
+            "g.docs",
+            docs_resolved(),
+        ),
         AdminService::new(shard, "docs"),
     );
     let gw = Arc::new(Gateway::new(node.shared()));
@@ -198,4 +203,19 @@ async fn grpc_front_reports_unrouted_methods_as_unimplemented() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::Unimplemented);
+}
+
+/// A minimal non-variant `docs` index. `LookupService` consults the resolved index only for the
+/// variant hydration fork (`has_variant_field()`), so any non-variant index serves these tests.
+fn docs_resolved() -> growlerdb_core::ResolvedIndex {
+    growlerdb_core::IndexDefinition::from_yaml(
+        "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nmapping: { selection: EXPLICIT, fields: [{ path: id, type: KEYWORD }] }\n",
+    )
+    .unwrap()
+    .resolve(&growlerdb_core::SourceSchema::new(
+        vec![growlerdb_core::SourceField::new("id", growlerdb_core::SourceType::String)],
+        vec![],
+        vec!["id".into()],
+    ))
+    .unwrap()
 }

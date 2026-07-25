@@ -119,7 +119,12 @@ fn two_tenant_node(root: &std::path::Path) -> (Arc<dyn Node>, Arc<ApiKeyStore>, 
     let node = LocalNode::new(
         SearchService::new(handle.clone()),
         SuggestService::new(handle.clone()),
-        LookupService::new(handle.clone(), IcebergConfig::local(), "g.docs"),
+        LookupService::new(
+            handle.clone(),
+            IcebergConfig::local(),
+            "g.docs",
+            docs_resolved(),
+        ),
         AdminService::new(handle.clone(), "docs"),
     )
     .shared();
@@ -615,4 +620,19 @@ async fn suggest_fails_closed_on_a_tenant_scoped_index() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
+}
+
+/// A minimal non-variant `docs` index. `LookupService` consults the resolved index only for the
+/// variant hydration fork (`has_variant_field()`), so any non-variant index serves these tests.
+fn docs_resolved() -> growlerdb_core::ResolvedIndex {
+    growlerdb_core::IndexDefinition::from_yaml(
+        "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nmapping: { selection: EXPLICIT, fields: [{ path: id, type: KEYWORD }] }\n",
+    )
+    .unwrap()
+    .resolve(&growlerdb_core::SourceSchema::new(
+        vec![growlerdb_core::SourceField::new("id", growlerdb_core::SourceType::String)],
+        vec![],
+        vec!["id".into()],
+    ))
+    .unwrap()
 }

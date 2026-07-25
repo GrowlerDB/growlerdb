@@ -756,6 +756,7 @@ mod tests {
                     one_doc_shard(t1.path(), "a"),
                     IcebergConfig::local(),
                     "g.docs",
+                    crate::test_docs_resolved(),
                 ),
             ),
             (
@@ -764,6 +765,7 @@ mod tests {
                     one_doc_shard(t2.path(), "b"),
                     IcebergConfig::local(),
                     "g.docs",
+                    crate::test_docs_resolved(),
                 ),
             ),
         ]))));

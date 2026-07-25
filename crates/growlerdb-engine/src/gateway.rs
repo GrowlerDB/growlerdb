@@ -3151,6 +3151,7 @@ mod tests {
                 shard.clone(),
                 growlerdb_source::IcebergConfig::local(),
                 "g.docs",
+                crate::test_docs_resolved(),
             ),
             crate::AdminService::new(shard, "docs"),
         )
@@ -3207,6 +3208,7 @@ mod tests {
                 shard.clone(),
                 growlerdb_source::IcebergConfig::local(),
                 "g.docs",
+                crate::test_docs_resolved(),
             ),
             crate::AdminService::new(shard, "docs"),
         )

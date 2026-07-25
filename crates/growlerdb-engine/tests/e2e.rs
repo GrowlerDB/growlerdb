@@ -353,6 +353,7 @@ async fn stale_locator_self_heals_via_verify_and_fall_back() {
     let rows = get_by_key(
         &shard,
         &reader,
+        &resolved,
         "growlerdb.docs",
         std::slice::from_ref(&key),
         &Projection::All,
@@ -367,9 +368,16 @@ async fn stale_locator_self_heals_via_verify_and_fall_back() {
     // second hydrate (now via the fast located path) still returns the row.
     let healed = shard.locate(&key).unwrap().expect("locator");
     assert_ne!(healed.iceberg_file, bogus, "locator refreshed");
-    let again = get_by_key(&shard, &reader, "growlerdb.docs", &[key], &Projection::All)
-        .await
-        .unwrap();
+    let again = get_by_key(
+        &shard,
+        &reader,
+        &resolved,
+        "growlerdb.docs",
+        &[key],
+        &Projection::All,
+    )
+    .await
+    .unwrap();
     assert_eq!(again[0].fields["title"].to_index_string(), "iceberg search");
 }
 
@@ -545,6 +553,7 @@ async fn mcp_http_transport_searches_and_hydrates_the_real_stack() {
             shard.clone(),
             IcebergConfig::local(),
             "growlerdb.docs",
+            resolved.clone(),
             auth.clone(),
         ),
         AdminService::with_auth(shard, "docs", auth),

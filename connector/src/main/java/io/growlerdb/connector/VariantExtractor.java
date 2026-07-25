@@ -35,6 +35,11 @@ public final class VariantExtractor {
     this.spec = spec;
   }
 
+  /** The spec this extractor was built from (the caller reads its column + discriminator). */
+  public VariantSpec spec() {
+    return spec;
+  }
+
   /** The result of extracting one row's variant value. */
   public static final class Extracted {
     /** The flatten leaves + discriminator for the wire (empty leaves if flatten is off). */

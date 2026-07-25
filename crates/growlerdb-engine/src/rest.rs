@@ -2654,6 +2654,7 @@ mod tests {
                 shard.clone(),
                 IcebergConfig::local(),
                 "g.docs",
+                crate::test_docs_resolved(),
                 auth.clone(),
             ),
             AdminService::with_auth(shard, "docs", auth),
@@ -2801,7 +2802,13 @@ mod tests {
         let node = crate::node::LocalNode::new(
             SearchService::with_auth(sh.clone(), auth.clone()),
             SuggestService::with_auth(sh.clone(), auth.clone()),
-            LookupService::with_auth(sh.clone(), IcebergConfig::local(), "g.docs", auth.clone()),
+            LookupService::with_auth(
+                sh.clone(),
+                IcebergConfig::local(),
+                "g.docs",
+                crate::test_docs_resolved(),
+                auth.clone(),
+            ),
             AdminService::with_auth(sh, "docs", auth),
         );
         let app = router(Arc::new(Gateway::new(node.shared()).serving("docs")));
@@ -3210,7 +3217,12 @@ mod tests {
         let node = crate::node::LocalNode::new(
             SearchService::new(sh.clone()),
             SuggestService::new(sh.clone()),
-            LookupService::new(sh.clone(), IcebergConfig::local(), "g.docs"),
+            LookupService::new(
+                sh.clone(),
+                IcebergConfig::local(),
+                "g.docs",
+                crate::test_docs_resolved(),
+            ),
             AdminService::new(sh, "docs"),
         );
         let app = router_with_ui(Arc::new(Gateway::new(node.shared())), ui.path());

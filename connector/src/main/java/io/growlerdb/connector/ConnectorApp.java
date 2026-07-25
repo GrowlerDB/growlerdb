@@ -146,6 +146,18 @@ public final class ConnectorApp {
     ConnectorJob job =
         new ConnectorJob(catalog, table, mapping, identifier, java.util.Set.of(), maxCommitRows);
 
+    // Variant extraction (D47/D48): `--variant-spec <json>` declares the variant column + its
+    // flatten flags, discriminator, and shapes; the connector walks each row's variant value into
+    // flatten leaves + discriminator-selected typed shape values. Absent ⇒ no variant column.
+    // (`--fields` must include the shaped `column.path`s so they ride the document's typed fields.)
+    if (opts.containsKey("variant-spec")) {
+      VariantSpec spec = VariantSpec.fromJson(opts.get("variant-spec"));
+      job = job.withVariant(new VariantExtractor(spec));
+      System.out.printf(
+          "variant: extracting column '%s' (discriminator '%s', %d shapes)%n",
+          spec.column, spec.discriminator, spec.shapes.size());
+    }
+
     java.util.SortedSet<Integer> owned = null;
     ShardRouter router = null;
     if (workers != null) {
