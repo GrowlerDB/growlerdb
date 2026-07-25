@@ -245,6 +245,7 @@ mod tests {
                     sensitive: false,
                     max_bytes: None,
                     vector: None,
+                    variant: None,
                 },
                 ResolvedField {
                     path: "body_vec".into(),
@@ -259,6 +260,7 @@ mod tests {
                     sensitive: false,
                     max_bytes: None,
                     vector: Some(spec(8)),
+                    variant: None,
                 },
             ],
             equality_deletes: Default::default(),

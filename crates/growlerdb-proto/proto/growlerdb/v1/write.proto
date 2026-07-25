@@ -14,6 +14,27 @@ import "growlerdb/v1/common.proto";
 message Document {
   Coordinates key = 1;
   map<string, Value> fields = 2;
+  // Extracted variant flatten leaves, one entry per variant column (D47/D48). The wire model
+  // stays scalar-leaf-only: a variant column is delivered as this composite of scalar leaves +
+  // the row's discriminator, never a nested/JSON Value kind. Declared shape leaves ride `fields`
+  // at their dotted `column.path` (they are typed schema fields); the untyped flatten leaves ride
+  // here.
+  repeated VariantColumn variants = 3;
+}
+
+// One variant column's extracted flatten leaves for a document (D47).
+message VariantColumn {
+  string field = 1;                 // the variant column name, e.g. "payload"
+  repeated VariantLeaf leaves = 2;  // untyped flatten leaves (canonical scalar form)
+  // The row's discriminator value (shape selection already ran connector-side); "" when the
+  // column declares no discriminator.
+  string discriminator = 3;
+}
+
+// One flatten leaf: a column-qualified dotted path + its scalar value.
+message VariantLeaf {
+  string path = 1;   // full dotted path, e.g. "payload.user.login"
+  Value value = 2;   // scalar leaf value, canonical form
 }
 
 // A document paired with where its row lives in the source (for the locator).

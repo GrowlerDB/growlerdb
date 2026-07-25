@@ -37,6 +37,18 @@ batches to the [nodes](/system/runtime/components/node.md)' Write gRPC services 
 - Apply insert/update/delete with idempotent batch ids →
   [exactly-once](/product/functional/ingestion/checkpoints-exactly-once.md) resume via `GetCheckpoint`.
 - Reconnect on a node roll (new pod IP) instead of wedging.
+- **Variant extraction** ([variant fields](/product/functional/index-management/variant.md),
+  [D47](/system/decisions/d47-variant-mapping.md)/[D48](/system/decisions/d48-variant-delivery.md)):
+  for an index that maps a `variant` column, the connector walks each row's variant value
+  (`VariantExtractor`) into the composite wire shape the node indexes — untyped **flatten** leaves
+  (every scalar leaf as a column-qualified `path`+`value`) plus the declared **shape** paths
+  extracted by the discriminator (`variant_get`, riding the document's normal typed fields) — so the
+  wire stays scalar-leaf-only. A row whose discriminator matches no shape skips typed extraction with
+  a loud ingest counter ([D45](/system/decisions/d45-degraded-vs-error.md)) and stays flatten-covered.
+  **`create_changelog_view` handles variant columns** — verified against a `format-version=3` table:
+  the view is created and the variant column reads through (`to_json`), so variant tables use the
+  normal changelog path, **no append-only fallback needed**. This is why variant ingest ships
+  connector-first while the native Rust read path waits on iceberg-rust (D48).
 
 ## Notes
 

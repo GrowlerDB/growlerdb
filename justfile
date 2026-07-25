@@ -227,9 +227,19 @@ trino:
     docker compose -f deploy/compose/docker-compose.yml --profile trino up -d trino
     @echo 'Trino up on :8082. Query with: docker compose -f deploy/compose/docker-compose.yml exec trino trino'
 
+# seed the Iceberg v3 variant demo table `growlerdb.events` (D47/D48) + bring up Trino to read it.
+# The variant `payload` renders as JSON in Trino; index def is deploy/compose/events.yaml.
+variant:
+    docker compose -f deploy/compose/docker-compose.yml up -d minio createbuckets polaris
+    deploy/compose/setup-polaris.sh
+    docker compose -f deploy/compose/docker-compose.yml --profile variant run --rm seed-events
+    docker compose -f deploy/compose/docker-compose.yml --profile trino up -d trino
+    @echo 'Seeded growlerdb.events (format-version=3, VARIANT payload).'
+    @echo "Read it: docker compose -f deploy/compose/docker-compose.yml exec trino trino --execute \"SELECT id, event_type, CAST(payload AS JSON) FROM iceberg.growlerdb.events\""
+
 # tear the full stack (and volumes) down
 stack-down:
-    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile catalog --profile seed --profile trino down -v
+    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile catalog --profile seed --profile trino --profile variant down -v
 
 # chaos drill: crash a core service on the running stack, assert it self-heals.
 # SERVICE defaults to `node`; e.g. `just chaos gateway`. Requires `just stack` up first.

@@ -1,0 +1,42 @@
+# Demo index over the Iceberg v3 variant table `growlerdb.events` (D47/D48, TASK-348/352).
+#
+# `payload` is a VARIANT column mapped two ways at once:
+#   * flatten (terms + an analyzed text catch-all) — schema-less, covers every leaf, so
+#     `payload.user.login:octocat` (an undeclared path) filters and `payload:variant` full-texts;
+#   * two shapes selected per row by the sibling `event_type` discriminator — typed `payload.*`
+#     fields with the full flag surface (range/sort on the LONG `number`, exact on `action`,
+#     hybrid on the VECTOR `title_vec`). A path shared across shapes (`number`, `action`, `title`)
+#     is one field, same type in both.
+name: events
+source:
+  iceberg:
+    catalog: growlerdb
+    table: growlerdb.events
+key:
+  identifier_fields: [id]
+mapping:
+  selection: EXPLICIT
+  fields:
+    - { path: id, type: KEYWORD }
+    - { path: ts, type: DATE, format: epoch_ms, fast: true }
+    - { path: event_type, type: KEYWORD, fast: true }
+    - path: payload
+      type: VARIANT
+      variant:
+        flatten: { terms: true, text: true }
+        discriminator: event_type
+        shapes:
+          - name: pull_request
+            when: [PullRequestEvent]
+            fields:
+              - { path: number, type: LONG, fast: true }
+              - { path: action, type: KEYWORD, fast: true }
+              - { path: merged, type: BOOL, fast: true }
+              - { path: title, type: TEXT, cached: true }
+              - { path: title_vec, type: VECTOR, vector: { source_field: title, dims: 384, model: bge-small-en-v1.5 } }
+          - name: issue
+            when: [IssuesEvent]
+            fields:
+              - { path: number, type: LONG, fast: true }
+              - { path: action, type: KEYWORD, fast: true }
+              - { path: title, type: TEXT, cached: true }

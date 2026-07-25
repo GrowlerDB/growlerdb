@@ -9,8 +9,16 @@ resource: https://iceberg.apache.org/spec/#variant
 
 # Variant fields (planned)
 
-**Status: planned (roadmap).** Shaped by [D47](/system/decisions/d47-variant-mapping.md); part of
-the Iceberg v3 adoption path ([D28](/system/decisions/d28-iceberg-v3.md)).
+**Status: mapping + flatten indexing shipped; connector extraction and Trino-hydration wiring in
+progress.** The Rust core — the [D47](/system/decisions/d47-variant-mapping.md) mapping model
+(untyped flatten + discriminator-selected shapes), the node's flatten indexing (`<col>#terms` path
+terms + an optional analyzed `<col>#text` catch-all), the dotted-path query rewrite, and the
+create-time cross-shape type validation — is implemented and tested. The connector-side extraction
+([D48](/system/decisions/d48-variant-delivery.md) step 1) and the engine wiring of the interim
+Trino hydration seam ([D48](/system/decisions/d48-variant-delivery.md) step 2,
+[D49](/system/decisions/d49-variant-iceberg-rust-routing.md)) are in progress; the native Rust path
+(step 3) waits on the next iceberg-rust release. Part of the Iceberg v3 adoption path
+([D28](/system/decisions/d28-iceberg-v3.md)).
 
 An Iceberg v3 **variant** column holds a semi-structured value whose structure is per-row — its
 paths are not in the table schema, so the existing rule that every mapped path resolves to a
@@ -70,12 +78,23 @@ leaves and the wire value model stays scalar. Readers prefer Parquet-**shredded*
 subcolumns when a data file shreds a declared path, decoding the binary variant only for the
 residual.
 
+On the node, a variant field carries no single typed field: flatten builds a reserved
+`<column>#terms` raw-keyword field whose tokens are `path\u{1}value` (an exact `path = value` term),
+and — when `text` is enabled — a `<column>#text` analyzed catch-all over the value's string leaves.
+Declared shape leaves are ordinary typed fields at their dotted `column.path`. The query layer
+routes a dotted term over an **undeclared** sub-path (`payload.user.login:octocat`) to the
+`#terms` token, a bare `payload:query` to the `#text` catch-all, and a **declared** shaped path to
+its own typed field (so ranges/sorts work). The extracted leaves reach the node over the wire's
+composite variant-leaf shape (`VariantColumn`: column-qualified path + scalar value + the row's
+discriminator) — the value model stays scalar-leaf-only, no nested/JSON `Value` kind.
+
 Delivery order is decided in [D48](/system/decisions/d48-variant-delivery.md): ingest ships
 **connector-first** (bootstrap + changelog; Spark reads variant today), hydration for variant
 tables routes through **Trino in the interim** (released iceberg-rust cannot yet plan over a
-variant schema), and the **native Rust path takes over** — batch build and in-point-read variant
-decode — once iceberg-rust ships variant support, leaving Trino as the permanent slow lane for
-delete-bearing files and the stale-locator fallback.
+variant schema — see [D49](/system/decisions/d49-variant-iceberg-rust-routing.md) for the full
+per-call-site routing), and the **native Rust path takes over** — batch build and in-point-read
+variant decode — once iceberg-rust ships variant support, leaving Trino as the permanent slow lane
+for delete-bearing files and the stale-locator fallback.
 
 Phasing: **first** flatten end-to-end (connector ingest + Trino-backed hydration); **then**
 shapes — discriminator, typed fields and flags, shredding-aware reads; **then** the native-path

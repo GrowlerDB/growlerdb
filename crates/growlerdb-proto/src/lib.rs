@@ -164,6 +164,50 @@ impl TryFrom<v1::SourceCheckpoint> for growlerdb_core::SourceCheckpoint {
 
 // ---- Write path bridge (DocBatch / DocOp / Document) -----------------------
 
+impl From<growlerdb_core::VariantLeaves> for v1::VariantColumn {
+    fn from(v: growlerdb_core::VariantLeaves) -> Self {
+        v1::VariantColumn {
+            field: v.field,
+            leaves: v
+                .leaves
+                .into_iter()
+                // A variant flatten leaf is a scalar (canonical form); a vector can never be a
+                // flatten leaf, so the filter keeps the bridge total without a vector wire kind.
+                .filter(|(_, value)| !matches!(value, growlerdb_core::Value::Vector(_)))
+                .map(|(path, value)| v1::VariantLeaf {
+                    path,
+                    value: Some(value.into()),
+                })
+                .collect(),
+            discriminator: v.discriminator.unwrap_or_default(),
+        }
+    }
+}
+
+impl TryFrom<v1::VariantColumn> for growlerdb_core::VariantLeaves {
+    type Error = MissingField;
+    fn try_from(v: v1::VariantColumn) -> Result<Self, MissingField> {
+        let leaves = v
+            .leaves
+            .into_iter()
+            .map(|l| {
+                Ok((
+                    l.path,
+                    l.value
+                        .ok_or(MissingField("VariantLeaf.value"))?
+                        .try_into()?,
+                ))
+            })
+            .collect::<Result<_, MissingField>>()?;
+        Ok(growlerdb_core::VariantLeaves {
+            field: v.field,
+            leaves,
+            // Empty string on the wire (proto3 default) ⇒ no discriminator declared.
+            discriminator: (!v.discriminator.is_empty()).then_some(v.discriminator),
+        })
+    }
+}
+
 impl From<growlerdb_core::Document> for v1::Document {
     fn from(doc: growlerdb_core::Document) -> Self {
         v1::Document {
@@ -176,6 +220,7 @@ impl From<growlerdb_core::Document> for v1::Document {
                 .filter(|(_, value)| !matches!(value, growlerdb_core::Value::Vector(_)))
                 .map(|(name, value)| (name, value.into()))
                 .collect(),
+            variants: doc.variants.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -189,7 +234,12 @@ impl TryFrom<v1::Document> for growlerdb_core::Document {
             .into_iter()
             .map(|(name, value)| Ok((name, value.try_into()?)))
             .collect::<Result<_, MissingField>>()?;
-        Ok(growlerdb_core::Document::new(key, fields))
+        let variants = doc
+            .variants
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<_, MissingField>>()?;
+        Ok(growlerdb_core::Document::new(key, fields).with_variants(variants))
     }
 }
 
@@ -361,6 +411,44 @@ mod tests {
             let wire: v1::Value = v.clone().into();
             assert_eq!(growlerdb_core::Value::try_from(wire).unwrap(), v);
         }
+    }
+
+    #[test]
+    fn document_with_variant_leaves_round_trips() {
+        let key = growlerdb_core::CompositeKey::new(
+            vec![],
+            vec![("id".into(), growlerdb_core::Value::from("evt-1"))],
+        );
+        let mut fields = std::collections::BTreeMap::new();
+        // A declared shape leaf rides `fields` at its dotted path.
+        fields.insert("payload.number".to_string(), growlerdb_core::Value::Int(42));
+        let doc = growlerdb_core::Document::new(key, fields).with_variants(vec![
+            growlerdb_core::VariantLeaves {
+                field: "payload".into(),
+                leaves: vec![
+                    (
+                        "payload.user.login".into(),
+                        growlerdb_core::Value::from("octocat"),
+                    ),
+                    ("payload.number".into(), growlerdb_core::Value::Int(42)),
+                ],
+                discriminator: Some("PullRequestEvent".into()),
+            },
+        ]);
+        let wire: v1::Document = doc.clone().into();
+        assert_eq!(wire.variants.len(), 1);
+        assert_eq!(wire.variants[0].discriminator, "PullRequestEvent");
+        assert_eq!(growlerdb_core::Document::try_from(wire).unwrap(), doc);
+
+        // No discriminator ⇒ empty string on the wire ⇒ None back.
+        let bare = growlerdb_core::VariantLeaves {
+            field: "payload".into(),
+            leaves: vec![("payload.a".into(), growlerdb_core::Value::from("x"))],
+            discriminator: None,
+        };
+        let wire: v1::VariantColumn = bare.clone().into();
+        assert_eq!(wire.discriminator, "");
+        assert_eq!(growlerdb_core::VariantLeaves::try_from(wire).unwrap(), bare);
     }
 
     #[test]
