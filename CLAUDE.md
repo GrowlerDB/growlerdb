@@ -6,10 +6,14 @@ is and how it works is the **OKF** in [`okf/`](okf/index.md) — start there.
 
 ## Session flow
 
-- **Every implementation change goes on a branch and into a PR** — never commit to `main`. A single
-  PR may cover several tasks.
-- **The user reviews and merges the PR** before we continue. Don't start dependent follow-on work on
-  `main` until the PR is merged.
+- **Feature-branch aggregation — one ask = one feature branch off `main` = one PR to `main`** (never
+  commit to `main`). Incremental work (several tasks, and for a large feature its sub-PRs) accumulates
+  on the feature branch; it lands on `main` as **one squash PR = the whole feature**, gate-green and
+  OKF-updated. Sub-PRs go **into the feature branch** (`feat/<name>/<slice>` → `feat/<name>`) and the
+  agent self-merges them once their gate is green — they are internal decomposition, not review gates.
+  See [D50](okf/system/decisions/d50-branching-model.md).
+- **The user reviews and merges the feature → `main` PR** before we continue — that single PR is where
+  the whole feature is reviewed. Don't start dependent follow-on work on `main` until it's merged.
 - **Before opening a PR, the full gate must pass:** `just check` (mirrors CI — Rust fmt/clippy/tests
   + the lint set; the console adds eslint/prettier/svelte-check).
 - **Every PR updates the OKF** in the same PR — new/changed behavior, interface, or decision updates

@@ -19,8 +19,9 @@ The GitHub repository is how users and contributors engage the open-source proje
 - **Report issues** and request features via the **issue forms** (bug / feature), or open a
   **Discussion** for questions (see [how issues are handled](/quality/issues.md)). Security reports go
   privately through [GitHub Security Advisories](https://github.com/GrowlerDB/growlerdb/security/advisories/new).
-- **Contribute** — open PRs following the [workflow](/workflow.md) (branch → gate → PR; every PR
-  updates this OKF). `CODEOWNERS` routes reviews; a PR template encodes the checklist.
+- **Contribute** — open PRs following the [workflow](/workflow.md): **feature-branch aggregation** —
+  one feature branch off `main`, one squash PR = the whole feature ([D50](/system/decisions/d50-branching-model.md));
+  every PR updates this OKF. `CODEOWNERS` routes reviews; a PR template encodes the checklist.
 
 ## Notes
 
