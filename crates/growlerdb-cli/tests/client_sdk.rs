@@ -84,7 +84,12 @@ fn seed(root: &std::path::Path) {
 }
 
 async fn client(url: &str) -> Client {
-    for _ in 0..80 {
+    // Poll until the spawned `serve` binds. The budget is generous (10s): a healthy server returns
+    // the instant it accepts (~2s cold-start for a debug build here), so this only bounds the
+    // *failure* path. A tight 2s budget flaked once the read-stack bump (opendal 0.57 + a larger
+    // dependency tree, #200) nudged debug cold-start past it — readiness, not liveness, was the
+    // gap, so widen the wait rather than assert a fixed startup time.
+    for _ in 0..400 {
         if let Ok(c) = Client::connect(url.to_string()).await {
             return c;
         }
