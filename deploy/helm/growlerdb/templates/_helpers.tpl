@@ -117,6 +117,21 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 {{- end -}}
 
+{{/* HA registry DSN (GROWLERDB_REGISTRY_POSTGRES) — read only by the control plane, only in HA mode
+     (controlPlane.externalRegistry.enabled). Sourced from the same Secret as the other credentials
+     (chart-managed or existing, which must then carry the `registryPostgresDsn` key). Fails the render
+     when enabled with no DSN configured and no existing secret, so a misconfigured HA install can't
+     silently start empty. */}}
+{{- define "growlerdb.registryPostgresEnv" -}}
+{{- if .Values.controlPlane.externalRegistry.enabled }}
+{{- if and (not .Values.credentials.registryPostgresDsn) (not .Values.credentials.existingSecret) }}
+{{- fail "controlPlane.externalRegistry.enabled requires credentials.registryPostgresDsn (or an existingSecret carrying the registryPostgresDsn key)" }}
+{{- end }}
+- name: GROWLERDB_REGISTRY_POSTGRES
+  valueFrom: { secretKeyRef: { name: {{ include "growlerdb.secretName" . }}, key: registryPostgresDsn } }
+{{- end }}
+{{- end -}}
+
 {{- define "growlerdb.coldTierEnv" -}}
 {{- if .Values.coldTier.enabled }}
 - name: GROWLERDB_BACKUP_BUCKET

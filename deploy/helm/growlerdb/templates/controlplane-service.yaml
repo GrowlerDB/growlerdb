@@ -6,8 +6,13 @@ metadata:
     {{- include "growlerdb.labels" . | nindent 4 }}
     app.kubernetes.io/component: control-plane
 spec:
-  # Headless: stable DNS for the (single-writer) registry; doubles as the StatefulSet serviceName.
+  {{- if not .Values.controlPlane.externalRegistry.enabled }}
+  # Embedded mode: headless for stable DNS to the single-writer registry; doubles as the StatefulSet
+  # serviceName. HA mode uses a normal ClusterIP so kube-proxy routes the VIP to the single ready
+  # (leader) endpoint and shifts to the promoted standby on failover — active-passive with no
+  # client-side re-resolution.
   clusterIP: None
+  {{- end }}
   selector:
     {{- include "growlerdb.selectorLabels" . | nindent 4 }}
     app.kubernetes.io/component: control-plane
