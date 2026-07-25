@@ -513,6 +513,48 @@ impl Registry {
         self.backend.persist_registry(snapshot)
     }
 
+    /// Reload the whole in-memory catalog from the backend — a **standby** control plane calls this
+    /// when the store's [`backend_version`](Self::backend_version) advances (the leader wrote), so it
+    /// stays warm for a fast failover. Each map is replaced under its own write lock (never two at
+    /// once, so no lock-order risk), and the derived token→hash index is rebuilt. The process-local
+    /// **node heartbeats are left untouched** — they are this replica's own liveness view, and nodes
+    /// re-register with a new leader within a heartbeat after failover ([D33](/system/decisions/d33-windowed-topology.md)).
+    pub fn reload(&self) -> Result<()> {
+        let s = self.backend.load()?;
+        *self.write_map() = s.indexes;
+        *self.write_aliases() = s.aliases;
+        *self.write_saved() = s.saved_queries;
+        *self.write_bindings() = s.role_bindings;
+        *self.write_tokens() = s.tokens;
+        *self.write_credentials() = s.credentials;
+        *self.write_index_bindings() = s.index_bindings;
+        *self.activity.write().unwrap_or_else(|e| e.into_inner()) = s.activity;
+        *self
+            .session_epochs
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = s.session_epochs;
+        self.rebuild_token_index();
+        Ok(())
+    }
+
+    /// The backend's monotonic registry version, if it supports change-polling — a standby's reload
+    /// signal. `None` for the local JSON file (single-writer, no standbys).
+    pub fn backend_version(&self) -> Result<Option<i64>> {
+        self.backend.poll_version()
+    }
+
+    /// Attempt to acquire write **leadership** over the backend — a standby promoting itself when the
+    /// previous leader dies. `Ok(true)` if this control plane is now the leader.
+    pub fn try_become_leader(&self) -> Result<bool> {
+        self.backend.try_become_leader()
+    }
+
+    /// Whether this control plane currently holds write leadership (always `true` on the local JSON
+    /// backend). A non-leader's mutations are refused at the persist boundary.
+    pub fn is_leader(&self) -> bool {
+        self.backend.is_leader()
+    }
+
     /// Register a new index (status [`Building`](IndexStatus::Building)). Errors if the name
     /// is already taken.
     pub fn create(&self, definition: ResolvedIndex) -> Result<()> {
