@@ -159,47 +159,7 @@ connector-e2e:
 # NOTE: host clients/tests still need `127.0.0.1 minio` in /etc/hosts (see README).
 # Pulls the released image by default; to run YOUR checkout (engine + console), use `just stack-dev`.
 stack:
-    @echo "Model dir: {{ MODEL_HOST_DIR }} (bge-small-en-v1.5 fetched once, reused)"
-    mkdir -p "$MODEL_HOST_DIR"
-    docker compose -f deploy/compose/docker-compose.yml up -d minio createbuckets polaris
-    deploy/compose/setup-polaris.sh
-    docker compose -f deploy/compose/docker-compose.yml --profile seed run --rm --build seed
-    # control-plane / node / gateway share one image: pull the latest official release once so the
-    # stack starts in a pull, not a ~10-minute source build. Falls back to building from your
-    # checkout when the image can't be pulled (developing GrowlerDB itself, or
-    # GROWLERDB_IMAGE=growlerdb-local:dev) — see docker-compose.yml's GROWLERDB_IMAGE note.
-    docker compose -f deploy/compose/docker-compose.yml --profile stack pull node || docker compose -f deploy/compose/docker-compose.yml build node
-    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile catalog up -d
-    # Force-recreate the VECTOR index node so it does a clean COLD rebuild against the freshly re-seeded
-    # `catalog` table. On a re-run, `serve` background-syncs the new snapshot into the LEXICAL segments
-    # but not the vector sidecars (TASK-326), so without a rebuild semantic hits go stale ("row not
-    # found") — see the node-catalog command note.
-    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile catalog up -d --force-recreate node-catalog
-    # Ship a SMALL movie-plots index (Wikipedia movie plots, CC-BY-SA) in the default stack so
-    # semantic + hybrid search work out of the box and the console lands here
-    # (GROWLERDB_DEFAULT_INDEX=movies on the gateway). Loads 300 rows from the COMMITTED local
-    # parquet — no download, ~1s embed at build. `just demo-data` upgrades it to the full corpus.
-    DEMO_DATA_FILE=/local/movies-300.parquet DEMO_DATA_SIZE=300 \
-      docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data run --rm --build demo-data
-    # `--force-recreate`: the `run` above re-seeds `movies`, so cold-rebuild the node against the current
-    # table (same vector-staleness reason as node-catalog above).
-    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data up -d --force-recreate node-movies
-    # Iceberg v3 VARIANT demo index `events` (D47/D48). Unlike the pyiceberg-seeded, self-cold-building
-    # indexes above, a variant table is Spark-seeded (format-version=3), connector-fed (released
-    # iceberg-rust can't scan a variant table — D49 — so the node skips the native build) and
-    # Trino-hydrated. So this layer brings up Trino, builds the connector jar (needs JDK 21 via mise),
-    # Spark-seeds the table, serves `events`, then populates it via the connector. All variant commands
-    # run with the full profile set active so `node-events`' cross-profile deps resolve.
-    cd connector && mise exec -- mvn -q -DskipTests package
-    docker compose -f deploy/compose/docker-compose.yml --profile trino up -d trino
-    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile catalog --profile demo-data --profile trino --profile variant run --rm seed-events
-    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile catalog --profile demo-data --profile trino --profile variant up -d --force-recreate node-events
-    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile catalog --profile demo-data --profile trino --profile variant run --rm connector-events
-    @echo ""
-    @echo "Console:           http://localhost:8081  (demo/demo)  — opens on 'movies' (try Semantic/Hybrid)"
-    @echo "Indexes:           movies · catalog · docs · events (Iceberg v3 variant: flatten + shapes)"
-    @echo "Grafana:           http://localhost:3000"
-    @echo "Connect an agent:  just mcp-connect   (MCP over HTTP — Claude or any MCP client)"
+    @deploy/compose/stack-up.sh
 
 # Pins GROWLERDB_IMAGE to a local-only tag so the `pull` misses and compose builds the shared image
 # (engine binary + console) from deploy/Dockerfile. Every service (gateway, nodes) then runs your

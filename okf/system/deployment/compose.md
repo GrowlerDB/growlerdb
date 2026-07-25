@@ -16,6 +16,10 @@ profile — GrowlerDB itself (control-plane + **two nodes** + gateway) plus the
 [LGTM](/system/runtime/dependencies/lgtm.md) stack. The fastest path to a running GrowlerDB, and the
 environment [CI e2e](/quality/ci-and-gates.md) runs against.
 
+`just stack` is a thin wrapper over **`deploy/compose/stack-up.sh`**, which sequences the bring-up
+(deps → catalog bootstrap → seed → core services → the `movies` and variant `events` demo indexes) and
+prints numbered step headers rather than echoing the orchestration line by line.
+
 ## Notes
 
 Profiles: `seed` (sample tables), `stack` (GrowlerDB + LGTM), `catalog` (the second `node-catalog`),
