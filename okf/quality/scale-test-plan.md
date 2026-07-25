@@ -53,7 +53,11 @@ Each maps to metrics/graphs (dashboard: `deploy/k8s/observability/grafana.yaml`)
    it emits and serves `growlerdb_gen_raw_bytes_total` on `:9109` (correct for every workload +
    variable-length rows, all replicas summed) — no hardcoded bytes/row. The compressed footprint +
    compression ratio are reported alongside for context; milestone *sizes* (`STORAGE_GB`) are likewise
-   GB of uncompressed corpus. See [TASK-342].
+   GB of uncompressed corpus. See [TASK-342]. **Caveat (Run 8):** this counter is **per-pod and resets
+   when the generator restarts** — and `staged_run` restarts it on every `set_ingest`/freeze/resume — so
+   `sum(growlerdb_gen_raw_bytes_total)` counts only bytes since the last restart and **undercounts the
+   true cumulative corpus** (Run 8: 0.80 GB counter vs ≈1.12 GB true, ~28% low), skewing the raw ratio
+   until the count is made restart-durable ([TASK-344]).
 5. **Query performance at each storage milestone** (below).
 6. **GrowlerDB vs Iceberg-alone** (Trino over the same table) at each milestone — a **fair** baseline:
    run it **after compaction** (an unmaintained streaming layout of thousands of tiny files penalizes
