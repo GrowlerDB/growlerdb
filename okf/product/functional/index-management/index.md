@@ -9,4 +9,4 @@ Creating, evolving, and operating indexes over Iceberg tables.
 * [Compact](/product/functional/index-management/compact.md) - merge segments; health-driven auto-compaction
 * [Backup & restore](/product/functional/index-management/backup-restore.md) - durable backup to object storage; rebuildable
 * [Aliases & ILM](/product/functional/index-management/aliases-ilm.md) - atomic reindex-and-swap, retention
-* [Variant fields](/product/functional/index-management/variant.md) - **planned**: index Iceberg v3 variant columns — schema-less flatten + typed shapes
+* [Variant fields](/product/functional/index-management/variant.md) - index Iceberg v3 variant columns — schema-less flatten + typed shapes (connector + Trino lane live; native read path pending)
