@@ -1619,6 +1619,7 @@ async fn serve(cfg: ServeConfig<'_>) -> anyhow::Result<()> {
         handle.clone(),
         IcebergConfig::from_env(),
         table.clone(),
+        resolved.clone(),
     );
     let suggest = growlerdb_engine::SuggestService::new(handle.clone());
     // Admin can plan alters and reindex: it resolves candidate definitions against the
@@ -1862,8 +1863,12 @@ async fn serve_replica(
         growlerdb_core::Source::Iceberg(s) => s.table.clone(),
     };
     let search = growlerdb_engine::SearchService::new(handle.clone());
-    let lookup =
-        growlerdb_engine::LookupService::new(handle.clone(), IcebergConfig::from_env(), table);
+    let lookup = growlerdb_engine::LookupService::new(
+        handle.clone(),
+        IcebergConfig::from_env(),
+        table,
+        resolved.clone(),
+    );
     let suggest = growlerdb_engine::SuggestService::new(handle.clone());
     let admin = growlerdb_engine::AdminService::new(handle.clone(), index);
     let system = SystemService::new(VERSION);
@@ -2120,7 +2125,12 @@ async fn serve_windowed(
                 let node = LocalNode::new(
                     SearchService::new(handle.clone()),
                     SuggestService::new(handle.clone()),
-                    LookupService::new(handle.clone(), IcebergConfig::from_env(), table.clone()),
+                    LookupService::new(
+                        handle.clone(),
+                        IcebergConfig::from_env(),
+                        table.clone(),
+                        resolved.clone(),
+                    ),
                     AdminService::new(handle.clone(), &index_s),
                 )
                 .shared();
@@ -2128,7 +2138,12 @@ async fn serve_windowed(
                     node,
                     SearchService::new(handle.clone()),
                     SuggestService::new(handle.clone()),
-                    LookupService::new(handle.clone(), IcebergConfig::from_env(), table.clone()),
+                    LookupService::new(
+                        handle.clone(),
+                        IcebergConfig::from_env(),
+                        table.clone(),
+                        resolved.clone(),
+                    ),
                     AdminService::new(handle.clone(), &index_s),
                     handle,
                 )

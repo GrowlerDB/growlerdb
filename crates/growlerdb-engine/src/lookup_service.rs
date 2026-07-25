@@ -6,7 +6,7 @@
 //!
 //! [`SearchService`]: crate::SearchService
 
-use growlerdb_core::{CompositeKey, HydratedRow, Projection};
+use growlerdb_core::{CompositeKey, HydratedRow, Projection, ResolvedIndex};
 use growlerdb_proto::v1::{
     Error as WireError, Field as WireField, GetByKeyRequest, GetByKeyResponse,
     HydratedRow as WireRow,
@@ -39,19 +39,25 @@ pub struct LookupService {
     shard: ShardHandle,
     reader: Arc<SharedReader>,
     table: String,
+    /// The resolved index — carried so hydration can fork a **variant** table onto the interim
+    /// Trino lane (D48/D49): `TrinoHydrator::hydrate` needs the full `ResolvedIndex`, and the
+    /// `Shard` alone doesn't retain it. `Arc` keeps the per-request `Clone` cheap.
+    resolved: Arc<ResolvedIndex>,
     auth: SharedAuth,
 }
 
 impl LookupService {
     /// A Lookup service hydrating `shard`'s coordinates from `table` in the Iceberg
     /// catalog `iceberg`, with the default no-op auth hook. Accepts an `Arc<Shard>` (fresh
-    /// handle) or a shared [`ShardHandle`].
+    /// handle) or a shared [`ShardHandle`]. `resolved` is the served index (drives the variant
+    /// hydration fork).
     pub fn new(
         shard: impl Into<ShardHandle>,
         iceberg: IcebergConfig,
         table: impl Into<String>,
+        resolved: ResolvedIndex,
     ) -> Self {
-        Self::with_auth(shard, iceberg, table, default_auth())
+        Self::with_auth(shard, iceberg, table, resolved, default_auth())
     }
 
     /// As [`new`](Self::new), with a specific [auth hook](SharedAuth).
@@ -59,12 +65,14 @@ impl LookupService {
         shard: impl Into<ShardHandle>,
         iceberg: IcebergConfig,
         table: impl Into<String>,
+        resolved: ResolvedIndex,
         auth: SharedAuth,
     ) -> Self {
         Self {
             shard: shard.into(),
             reader: Arc::new(SharedReader::new(iceberg)),
             table: table.into(),
+            resolved: Arc::new(resolved),
             auth,
         }
     }
@@ -163,15 +171,26 @@ impl Lookup for LookupService {
         // any locators Iceberg rewrote so later lookups stay fast. The shared reader
         // connects on the first RPC and is reused after; a source failure
         // drops it so the *next* RPC reconnects instead of reusing a dead client.
-        let reader = match self.reader.get().await {
-            Ok(reader) => reader,
-            Err(e) => return Err(engine_status(EngineError::Source(e))),
-        };
-        let result = match reader.hydrate(&self.table, &located, &projection).await {
-            Ok(result) => result,
-            Err(e) => {
-                self.reader.invalidate().await;
-                return Err(engine_status(EngineError::Source(e)));
+        // Variant fork (D48/D49): a variant-table index hydrates through the interim Trino lane
+        // (released iceberg-rust can't scan a v3 variant table). Non-variant indexes keep the
+        // native `SharedReader` path — lazily connected + reused, dropped on a source failure so
+        // the next RPC reconnects.
+        let result = if self.resolved.has_variant_field() {
+            growlerdb_source::shared_hydrator()
+                .hydrate(&self.resolved, &located, &projection)
+                .await
+                .map_err(|e| engine_status(EngineError::Source(e)))?
+        } else {
+            let reader = match self.reader.get().await {
+                Ok(reader) => reader,
+                Err(e) => return Err(engine_status(EngineError::Source(e))),
+            };
+            match reader.hydrate(&self.table, &located, &projection).await {
+                Ok(result) => result,
+                Err(e) => {
+                    self.reader.invalidate().await;
+                    return Err(engine_status(EngineError::Source(e)));
+                }
             }
         };
         if let Some(hit) = result.plan_cache_hit {
@@ -324,7 +343,13 @@ mod tests {
             ),
         )
         .unwrap();
-        LookupService::with_auth(Arc::new(shard), IcebergConfig::local(), "g.docs", auth)
+        LookupService::with_auth(
+            Arc::new(shard),
+            IcebergConfig::local(),
+            "g.docs",
+            crate::test_docs_resolved(),
+            auth,
+        )
     }
 
     fn coord(id: &str) -> Coordinates {
@@ -451,7 +476,12 @@ mod tests {
             ),
         )
         .unwrap();
-        LookupService::new(Arc::new(shard), IcebergConfig::local(), "g.docs")
+        LookupService::new(
+            Arc::new(shard),
+            IcebergConfig::local(),
+            "g.docs",
+            crate::test_docs_resolved(),
+        )
     }
 
     /// As [`service`], but the index uses the **PREDICATE** location strategy.
@@ -487,7 +517,12 @@ mod tests {
             ),
         )
         .unwrap();
-        LookupService::new(Arc::new(shard), IcebergConfig::local(), "g.docs")
+        LookupService::new(
+            Arc::new(shard),
+            IcebergConfig::local(),
+            "g.docs",
+            crate::test_docs_resolved(),
+        )
     }
 
     #[tokio::test(flavor = "current_thread")]

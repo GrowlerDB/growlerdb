@@ -173,7 +173,12 @@ impl WindowedWriteService {
         let node = LocalNode::new(
             SearchService::new(handle.clone()),
             SuggestService::new(handle.clone()),
-            LookupService::new(handle.clone(), self.iceberg.clone(), self.table.clone()),
+            LookupService::new(
+                handle.clone(),
+                self.iceberg.clone(),
+                self.table.clone(),
+                self.resolved.clone(),
+            ),
             AdminService::new(handle.clone(), &self.index_name),
         )
         .shared();
@@ -194,7 +199,12 @@ impl WindowedWriteService {
             .unwrap_or_else(|e| e.into_inner())
             .insert(
                 window,
-                LookupService::new(handle.clone(), self.iceberg.clone(), self.table.clone()),
+                LookupService::new(
+                    handle.clone(),
+                    self.iceberg.clone(),
+                    self.table.clone(),
+                    self.resolved.clone(),
+                ),
             );
         self.admin
             .write()

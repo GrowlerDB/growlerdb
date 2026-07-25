@@ -77,7 +77,12 @@ async fn distributed_gateway(shard: Arc<Shard>) -> Gateway {
 
     let search = SearchService::new(shard.clone());
     let suggest = SuggestService::new(shard.clone());
-    let lookup = LookupService::new(shard.clone(), IcebergConfig::local(), "g.docs");
+    let lookup = LookupService::new(
+        shard.clone(),
+        IcebergConfig::local(),
+        "g.docs",
+        docs_resolved(),
+    );
     let admin = AdminService::new(shard, "docs");
     tokio::spawn(
         Server::builder()
@@ -198,4 +203,19 @@ async fn gateway_propagates_node_errors_over_the_wire() {
     };
     let err = gw.get_by_key(Request::new(missing)).await.unwrap_err();
     assert_eq!(err.code(), Code::NotFound);
+}
+
+/// A minimal non-variant `docs` index. `LookupService` consults the resolved index only for the
+/// variant hydration fork (`has_variant_field()`), so any non-variant index serves these tests.
+fn docs_resolved() -> growlerdb_core::ResolvedIndex {
+    growlerdb_core::IndexDefinition::from_yaml(
+        "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nmapping: { selection: EXPLICIT, fields: [{ path: id, type: KEYWORD }] }\n",
+    )
+    .unwrap()
+    .resolve(&growlerdb_core::SourceSchema::new(
+        vec![growlerdb_core::SourceField::new("id", growlerdb_core::SourceType::String)],
+        vec![],
+        vec!["id".into()],
+    ))
+    .unwrap()
 }

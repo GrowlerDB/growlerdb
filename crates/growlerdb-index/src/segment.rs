@@ -379,6 +379,13 @@ impl IndexSchema {
         !self.vector_fields.is_empty()
     }
 
+    /// Whether this index maps an Iceberg v3 **variant** column (D47) — the cheap, schema-only
+    /// counterpart of [`ResolvedIndex::has_variant_field`](growlerdb_core::ResolvedIndex::has_variant_field)
+    /// for the hydration fork on paths that hold only the [`IndexSchema`].
+    pub fn has_variant_fields(&self) -> bool {
+        !self.variant_fields.is_empty()
+    }
+
     /// The index's [location strategy](LocationStrategy) (D30) — how the store's commit
     /// path and the engine's hydration path locate source rows.
     pub fn location_strategy(&self) -> LocationStrategy {

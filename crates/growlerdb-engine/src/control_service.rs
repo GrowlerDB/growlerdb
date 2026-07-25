@@ -642,16 +642,27 @@ impl ControlPlane for ControlPlaneService {
             return Err(registry_status(RegistryError::AlreadyExists(name)));
         }
 
-        // Resolve against the source schema, then register.
+        // Resolve against the source schema, then register. A variant table's introspection routes
+        // through Trino (D49): released iceberg-rust can't parse a v3 variant schema in
+        // `load_table`, so a def declaring a variant reads its columns from Trino `information_schema`
+        // instead of the native reader. Non-variant defs keep the native path.
         let Source::Iceberg(src) = &def.source;
         let table = src.table.clone();
-        let reader = IcebergReader::connect(&self.iceberg)
-            .await
-            .map_err(|e| to_status(Code::Internal, WireError::new("INTERNAL", e.to_string())))?;
-        let source = reader
-            .read_source_schema(&table)
-            .await
-            .map_err(|e| to_status(Code::Internal, WireError::new("INTERNAL", e.to_string())))?;
+        let internal = |e: String| to_status(Code::Internal, WireError::new("INTERNAL", e));
+        let source = if def.declares_variant() {
+            growlerdb_source::shared_hydrator()
+                .read_source_schema(&table)
+                .await
+                .map_err(|e| internal(e.to_string()))?
+        } else {
+            let reader = IcebergReader::connect(&self.iceberg)
+                .await
+                .map_err(|e| internal(e.to_string()))?;
+            reader
+                .read_source_schema(&table)
+                .await
+                .map_err(|e| internal(e.to_string()))?
+        };
         let resolved = def
             .resolve(&source)
             .map_err(|e| Status::invalid_argument(format!("definition does not resolve: {e}")))?;

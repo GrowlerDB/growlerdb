@@ -39,7 +39,7 @@ mod trino;
 pub use key_scan::read_file_key_rows;
 pub use plan_cache::{PlanCache, PLAN_CACHE_CAP};
 pub use shared_reader::SharedReader;
-pub use trino::{TrinoConfig, TrinoHydrator};
+pub use trino::{shared_hydrator, TrinoConfig, TrinoHydrator};
 
 // The table IO handle [`read_file_key_rows`] (and [`TablePlan`]) hands around — re-exported so
 // callers (the engine's re-map driver, its tests) needn't depend on the `iceberg` crate.

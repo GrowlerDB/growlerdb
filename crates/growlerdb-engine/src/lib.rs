@@ -87,3 +87,23 @@ pub use write_service::WriteService;
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
+
+/// A minimal non-variant `docs` [`ResolvedIndex`](growlerdb_core::ResolvedIndex) for tests.
+/// `LookupService` consults its resolved index only for the variant hydration fork
+/// (`has_variant_field()`), so any non-variant index serves the non-variant test paths.
+#[cfg(test)]
+pub(crate) fn test_docs_resolved() -> growlerdb_core::ResolvedIndex {
+    growlerdb_core::IndexDefinition::from_yaml(
+        "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nmapping: { selection: EXPLICIT, fields: [{ path: id, type: KEYWORD }] }\n",
+    )
+    .unwrap()
+    .resolve(&growlerdb_core::SourceSchema::new(
+        vec![growlerdb_core::SourceField::new(
+            "id",
+            growlerdb_core::SourceType::String,
+        )],
+        vec![],
+        vec!["id".into()],
+    ))
+    .unwrap()
+}

@@ -71,7 +71,12 @@ async fn spawn_mtls_node(shard: Arc<Shard>) -> String {
 
     let search = SearchService::new(shard.clone());
     let suggest = SuggestService::new(shard.clone());
-    let lookup = LookupService::new(shard.clone(), IcebergConfig::local(), "g.docs");
+    let lookup = LookupService::new(
+        shard.clone(),
+        IcebergConfig::local(),
+        "g.docs",
+        docs_resolved(),
+    );
     let admin = AdminService::new(shard, "docs");
     tokio::spawn(
         Server::builder()
@@ -138,4 +143,19 @@ async fn a_peer_with_no_client_cert_is_rejected() {
         try_describe(&endpoint, tls).await.is_err(),
         "a client with no certificate must be rejected by a mutual-TLS server"
     );
+}
+
+/// A minimal non-variant `docs` index. `LookupService` consults the resolved index only for the
+/// variant hydration fork (`has_variant_field()`), so any non-variant index serves these tests.
+fn docs_resolved() -> growlerdb_core::ResolvedIndex {
+    growlerdb_core::IndexDefinition::from_yaml(
+        "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nmapping: { selection: EXPLICIT, fields: [{ path: id, type: KEYWORD }] }\n",
+    )
+    .unwrap()
+    .resolve(&growlerdb_core::SourceSchema::new(
+        vec![growlerdb_core::SourceField::new("id", growlerdb_core::SourceType::String)],
+        vec![],
+        vec!["id".into()],
+    ))
+    .unwrap()
 }

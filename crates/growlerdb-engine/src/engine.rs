@@ -210,20 +210,20 @@ impl Engine {
         shards: u32,
         shard_ordinal: u32,
     ) -> Result<IndexOutcome, EngineError> {
-        let reader = IcebergReader::connect(&self.iceberg).await?;
-        let source_schema = reader.read_source_schema(table).await?;
+        // Parse the def first so a variant column is detected *before* touching iceberg-rust —
+        // released iceberg-rust can't parse a v3 variant schema in `load_table` (D49), so a variant
+        // table's schema introspection routes through Trino.
+        let parsed = def_yaml.map(IndexDefinition::from_yaml).transpose()?;
+        let declares_variant = parsed.as_ref().is_some_and(|d| d.declares_variant());
+        let source_schema = self.introspect_source(declares_variant, table).await?;
 
-        let resolved = match def_yaml {
-            Some(yaml) => IndexDefinition::from_yaml(yaml)?.resolve(&source_schema)?,
+        let resolved = match parsed {
+            Some(def) => def.resolve(&source_schema)?,
             None => self
                 .default_definition(table, name, &source_schema)?
                 .resolve(&source_schema)?,
         };
         let index_name = resolved.name.clone();
-
-        // The per-shard build filter: keep only docs this ordinal owns. None for a single-shard
-        // (full) build. Windowed indexes shard by time window, so ordinal sharding doesn't apply.
-        let filter = shard_build_filter(&resolved, shards, shard_ordinal)?;
 
         // A `growlerdb index` run is a full build. If a previously-built index for this name persists
         // on disk with a *different* schema (a mapped field added/removed/renamed, or a type/fast-ness
@@ -234,6 +234,27 @@ impl Engine {
 
         self.persist_definition(&index_name, &resolved)?;
 
+        // A variant index cannot be cold-built natively — iceberg-rust can't scan a v3 variant table
+        // (D49) — so it is populated connector-first (D48): the connector's bootstrap + changelog
+        // fill it. Define it (schema persisted, shard created empty on first serve) and skip the
+        // native build, loudly (never a silent empty index).
+        if resolved.has_variant_field() {
+            tracing::warn!(
+                index = %index_name,
+                "variant index: skipping native cold build (iceberg-rust cannot scan a v3 variant \
+                 table, D49) — populate it via the connector (bootstrap + changelog)"
+            );
+            return Ok(IndexOutcome {
+                name: index_name,
+                snapshot: Snapshot(0),
+                doc_count: 0,
+            });
+        }
+
+        // The per-shard build filter: keep only docs this ordinal owns. None for a single-shard
+        // (full) build. Windowed indexes shard by time window, so ordinal sharding doesn't apply.
+        let filter = shard_build_filter(&resolved, shards, shard_ordinal)?;
+        let reader = IcebergReader::connect(&self.iceberg).await?;
         let (snapshot, doc_count) = self
             .build_from_source(&reader, table, &resolved, filter.as_ref())
             .await?;
@@ -242,6 +263,26 @@ impl Engine {
             snapshot,
             doc_count,
         })
+    }
+
+    /// Read the [`SourceSchema`] for a definition, routing a **variant** table's introspection
+    /// through Trino ([D49](../../../okf/system/decisions/d49-variant-iceberg-rust-routing.md)):
+    /// released iceberg-rust fails to parse a v3 variant schema inside `load_table`, so a def that
+    /// declares a variant column reads its columns from Trino `information_schema` instead of the
+    /// native reader. Non-variant tables keep the native path untouched.
+    async fn introspect_source(
+        &self,
+        declares_variant: bool,
+        table: &str,
+    ) -> Result<growlerdb_core::SourceSchema, EngineError> {
+        if declares_variant {
+            Ok(growlerdb_source::shared_hydrator()
+                .read_source_schema(table)
+                .await?)
+        } else {
+            let reader = IcebergReader::connect(&self.iceberg).await?;
+            Ok(reader.read_source_schema(table).await?)
+        }
     }
 
     /// Persist an index's **definition only** — resolve `table`'s schema into `index.json` and write
@@ -257,10 +298,11 @@ impl Engine {
         def_yaml: Option<&str>,
         name: Option<&str>,
     ) -> Result<IndexOutcome, EngineError> {
-        let reader = IcebergReader::connect(&self.iceberg).await?;
-        let source_schema = reader.read_source_schema(table).await?;
-        let resolved = match def_yaml {
-            Some(yaml) => IndexDefinition::from_yaml(yaml)?.resolve(&source_schema)?,
+        let parsed = def_yaml.map(IndexDefinition::from_yaml).transpose()?;
+        let declares_variant = parsed.as_ref().is_some_and(|d| d.declares_variant());
+        let source_schema = self.introspect_source(declares_variant, table).await?;
+        let resolved = match parsed {
+            Some(def) => def.resolve(&source_schema)?,
             None => self
                 .default_definition(table, name, &source_schema)?
                 .resolve(&source_schema)?,
@@ -497,7 +539,7 @@ impl Engine {
             let keys: Vec<CompositeKey> = hits.iter().map(|h| h.key.clone()).collect();
             let table = source_table(&resolved);
             let reader = IcebergReader::connect(&self.iceberg).await?;
-            Some(hydrate::get_by_key(&shard, &reader, &table, &keys, &projection).await?)
+            Some(hydrate::get_by_key(&shard, &reader, &resolved, &table, &keys, &projection).await?)
         } else {
             None
         };
@@ -584,7 +626,7 @@ impl Engine {
             let keys: Vec<CompositeKey> = hits.iter().map(|h| h.key.clone()).collect();
             let table = source_table(&resolved);
             let reader = IcebergReader::connect(&self.iceberg).await?;
-            Some(hydrate::get_by_key(&shard, &reader, &table, &keys, &projection).await?)
+            Some(hydrate::get_by_key(&shard, &reader, &resolved, &table, &keys, &projection).await?)
         } else {
             None
         };
@@ -690,7 +732,7 @@ impl Engine {
             let keys: Vec<CompositeKey> = hits.iter().map(|h| h.key.clone()).collect();
             let table = source_table(&resolved);
             let reader = IcebergReader::connect(&self.iceberg).await?;
-            Some(hydrate::get_by_key(&shard, &reader, &table, &keys, &projection).await?)
+            Some(hydrate::get_by_key(&shard, &reader, &resolved, &table, &keys, &projection).await?)
         } else {
             None
         };

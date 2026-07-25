@@ -71,6 +71,20 @@ impl TrinoConfig {
     }
 }
 
+/// The process-wide interim Trino hydrator, built from the environment ([`TrinoConfig::from_env`]).
+/// Lazily initialized on first variant-table hydration and reused (the reqwest client pools
+/// connections), so the engine's per-index fork can reach it without threading a [`TrinoConfig`]
+/// through every service constructor. Non-variant indexes never call this, so a stack with no
+/// variant index never builds it.
+pub fn shared_hydrator() -> &'static TrinoHydrator {
+    static SHARED: std::sync::OnceLock<TrinoHydrator> = std::sync::OnceLock::new();
+    SHARED.get_or_init(|| {
+        // reqwest client construction only fails on a TLS-backend init error, which would fail
+        // every request anyway — surface it loudly at first use rather than mask it.
+        TrinoHydrator::new(TrinoConfig::from_env()).expect("build the Trino HTTP client")
+    })
+}
+
 /// The interim variant-table hydrator (D48). Holds a Trino [`TrinoConfig`] + a reusable HTTP
 /// client; `hydrate` runs one key-predicated point query per call.
 pub struct TrinoHydrator {

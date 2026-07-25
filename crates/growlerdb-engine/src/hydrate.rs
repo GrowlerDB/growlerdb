@@ -88,14 +88,31 @@ pub fn apply_live_file_bitmap(
 /// fell back (Iceberg rewrote their file) are **refreshed** in the store so subsequent
 /// lookups are fast again; under `PREDICATE` there is nothing to refresh — the pruned
 /// scan is the read path itself, not a fallback.
+///
+/// **Variant fork** ([D48](../../../okf/system/decisions/d48-variant-delivery.md)/[D49]): a
+/// variant-table index (`index.has_variant_field()`) routes hydration through the interim Trino
+/// lane instead of the native reader — released iceberg-rust can't scan a v3 variant table. The
+/// Trino lane re-finds rows by key predicate (no per-row locator to refresh, so nothing to write
+/// back), returning the variant column(s) as JSON. Non-variant indexes are untouched.
+///
+/// [D49]: ../../../okf/system/decisions/d49-variant-iceberg-rust-routing.md
 pub async fn get_by_key(
     shard: &Shard,
     source: &IcebergReader,
+    index: &growlerdb_core::ResolvedIndex,
     table: &str,
     keys: &[CompositeKey],
     projection: &Projection,
 ) -> Result<Vec<HydratedRow>, EngineError> {
     let located = resolve_requests(shard, keys)?;
+    if index.has_variant_field() {
+        let result = growlerdb_source::shared_hydrator()
+            .hydrate(index, &located, projection)
+            .await?;
+        growlerdb_telemetry::sli::duplicate_pks(result.duplicate_pks);
+        // The Trino lane has no per-row locator to refresh (it re-finds by key predicate).
+        return Ok(result.rows);
+    }
     let result = source.hydrate(table, &located, projection).await?;
     growlerdb_telemetry::sli::duplicate_pks(result.duplicate_pks);
     if shard.location_strategy() == LocationStrategy::Coordinates {
