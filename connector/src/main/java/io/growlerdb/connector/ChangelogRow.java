@@ -1,6 +1,8 @@
 package io.growlerdb.connector;
 
 import io.growlerdb.proto.v1.Value;
+import io.growlerdb.proto.v1.VariantColumn;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -20,6 +22,8 @@ public final class ChangelogRow {
   public final String icebergFile;
   /** Row position within {@link #icebergFile}. */
   public final long rowPosition;
+  /** Extracted variant flatten columns (D47/D48) — one per variant column; empty when none. */
+  public final List<VariantColumn> variants;
 
   public ChangelogRow(
       ChangeType changeType,
@@ -28,11 +32,23 @@ public final class ChangelogRow {
       Map<String, Value> columns,
       String icebergFile,
       long rowPosition) {
+    this(changeType, changeOrdinal, commitSnapshotId, columns, icebergFile, rowPosition, List.of());
+  }
+
+  public ChangelogRow(
+      ChangeType changeType,
+      long changeOrdinal,
+      long commitSnapshotId,
+      Map<String, Value> columns,
+      String icebergFile,
+      long rowPosition,
+      List<VariantColumn> variants) {
     this.changeType = changeType;
     this.changeOrdinal = changeOrdinal;
     this.commitSnapshotId = commitSnapshotId;
     this.columns = columns;
     this.icebergFile = icebergFile;
     this.rowPosition = rowPosition;
+    this.variants = variants;
   }
 }

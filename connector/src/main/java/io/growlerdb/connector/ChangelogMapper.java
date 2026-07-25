@@ -123,6 +123,9 @@ public final class ChangelogMapper {
         doc.putFields(name, value);
       }
     }
+    // Extracted variant leaves (D47/D48): shape values already merged into row.columns above (they
+    // ride the typed fields); the untyped flatten leaves ride the document's variant columns.
+    doc.addAllVariants(row.variants);
     LocatedDoc located =
         LocatedDoc.newBuilder()
             .setDoc(doc)
