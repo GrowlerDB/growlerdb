@@ -2374,6 +2374,13 @@ impl Shard {
         self.schema.location_strategy()
     }
 
+    /// Whether this shard's index maps an Iceberg v3 **variant** column (D47) — the compaction
+    /// re-map / stats pollers use this to skip a variant table, whose metadata released
+    /// iceberg-rust can't parse (D49).
+    pub fn has_variant_fields(&self) -> bool {
+        self.schema.has_variant_fields()
+    }
+
     /// The mapped DATE field names — the time columns a console time filter can range a
     /// query on; a query ranging the windowing field additionally prunes windows.
     pub fn date_fields(&self) -> Vec<String> {

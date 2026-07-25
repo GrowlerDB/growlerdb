@@ -251,6 +251,25 @@ pub fn embed_located_docs(idx: &ResolvedIndex, docs: &mut [growlerdb_core::Locat
     embed_docs(idx, &mut refs);
 }
 
+/// Embed each VECTOR field across a [`CommitBatch`](growlerdb_core::CommitBatch)'s **upsert** docs —
+/// the embed stage on the node's streaming write path (D46). The connector sends the source text
+/// (e.g. a shaped `payload.title`) but not the embedding; running this before commit fills in the
+/// LOCAL vectors, so a **connector-fed** index (which never cold-builds — e.g. a variant table)
+/// still gets semantic/hybrid coverage. A no-op for an index with no VECTOR fields (the common
+/// case), so callers can invoke it unconditionally.
+pub fn embed_commit_batch(idx: &ResolvedIndex, batch: &mut growlerdb_core::CommitBatch) {
+    use growlerdb_core::DocOp;
+    let mut refs: Vec<&mut Document> = batch
+        .ops
+        .iter_mut()
+        .filter_map(|op| match op {
+            DocOp::Upsert(located) => Some(&mut located.doc),
+            DocOp::Delete(_) => None,
+        })
+        .collect();
+    embed_docs(idx, &mut refs);
+}
+
 /// Shared core: fill in each vector field's embedding across `docs`, batching the embed call per
 /// field. Best-effort (a missing source text embeds `""`), but never silently: an EXTERNAL field
 /// that fails closed (no key/endpoint) skips the field with a warning rather than writing
@@ -369,6 +388,61 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|v| v.len() == 384));
 
+        std::env::remove_var("GROWLERDB_MODEL_DIR");
+    }
+
+    #[test]
+    fn embed_commit_batch_fills_vector_fields_on_upserts() {
+        // The streaming-write embed stage (D46): a CommitBatch whose upsert carries the source text
+        // but no vector gets the VECTOR field filled in (hash embedder in CI → 384-dim).
+        use growlerdb_core::{
+            CommitBatch, CompositeKey, DocOp, Document, IndexDefinition, LocatedDoc,
+            SourceCheckpoint, SourceField, SourceSchema, SourceType, Value,
+        };
+        let _g = crate::env_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("GROWLERDB_MODEL_DIR", tmp.path());
+
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("body", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        let idx = IndexDefinition::from_yaml(
+            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD }, { path: body, type: TEXT }, { path: body_vec, type: VECTOR, vector: { source_field: body, dims: 384 } } ] }\n",
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert("id".to_string(), Value::from("doc-1"));
+        fields.insert("body".to_string(), Value::from("hello world"));
+        let doc = Document::new(
+            CompositeKey::new(vec![], vec![("id".into(), Value::from("doc-1"))]),
+            fields,
+        );
+        let located = LocatedDoc {
+            doc,
+            iceberg_file: "f".into(),
+            row_position: 0,
+        };
+        let mut batch =
+            CommitBatch::from_upserts(vec![located], SourceCheckpoint::iceberg(1), "b1");
+        assert!(!batch.ops.is_empty());
+
+        embed_commit_batch(&idx, &mut batch);
+
+        let DocOp::Upsert(out) = &batch.ops[0] else {
+            panic!("expected an upsert");
+        };
+        match out.doc.fields.get("body_vec") {
+            Some(Value::Vector(v)) => assert_eq!(v.len(), 384, "vector field embedded"),
+            other => panic!("body_vec not embedded: {other:?}"),
+        }
         std::env::remove_var("GROWLERDB_MODEL_DIR");
     }
 

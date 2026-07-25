@@ -59,10 +59,11 @@ and **`catalog`** (10 rows, one field of every type) — served together and rou
 `--all-indexes` gateway ([Compose](/system/deployment/compose.md)). The **query playground** walks every
 Lucene/KQL operator over `catalog` (term, phrase, keyword, set, numeric/float/date range, CIDR,
 wildcard, prefix, fuzzy, boost, bool, `NOT`, match-all, regex) with the exact rows each returns, and the
-**semantic & hybrid** section features the `movies` `VECTOR` index (the console front door). Because
-three indexes are served with no gateway default,
-every REST search / `keys:get` names its `index`; the console selector switches between them and lands
-on `movies` (the `GROWLERDB_DEFAULT_INDEX` advertised via `/v1/config`).
+**semantic & hybrid** section features the `movies` `VECTOR` index (the console front door). A fourth
+index, **`events`**, demos Iceberg v3 **variant** search (untyped flatten + discriminator-selected
+typed shapes over a semi-structured `payload` column). Because four indexes are served with no
+gateway default, every REST search / `keys:get` names its `index`; the console selector switches
+between them and lands on `movies` (the `GROWLERDB_DEFAULT_INDEX` advertised via `/v1/config`).
 
 An optional **`trino` profile** (`just trino`) runs Trino over the *same* Polaris/MinIO Iceberg
 catalog the seed writes, so users can `SELECT` (and `INSERT`) the source rows GrowlerDB indexes and
