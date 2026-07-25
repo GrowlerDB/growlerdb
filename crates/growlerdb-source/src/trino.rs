@@ -701,4 +701,26 @@ mapping:
         .unwrap();
         assert_eq!(rows[0].fields.keys().collect::<Vec<_>>(), vec!["payload"]);
     }
+
+    /// Live hydration against the seeded variant table (D48). Prereqs: `just variant` (creates
+    /// `growlerdb.events` + brings up Trino on host `:8082`). Run:
+    ///   `cargo test -p growlerdb-source -- --ignored trino_hydrates_the_live_events_table`
+    #[tokio::test]
+    #[ignore = "requires the local dev stack with the variant table (just variant)"]
+    async fn trino_hydrates_the_live_events_table() {
+        let hydrator = TrinoHydrator::new(TrinoConfig::local()).expect("hydrator");
+        let idx = events_index();
+        let requests = vec![(key("evt-1"), None), (key("evt-3"), None)];
+        let result = hydrator
+            .hydrate(&idx, &requests, &Projection::All)
+            .await
+            .expect("live Trino hydrate");
+        assert_eq!(result.rows.len(), 2, "both keys hydrate, in request order");
+        assert_eq!(result.rows[0].key, key("evt-1"));
+        // Scalars typed by the schema.
+        assert_eq!(result.rows[0].fields.get("event_type"), Some(&Value::from("PullRequestEvent")));
+        // The variant column comes back as JSON text carrying the nested object.
+        let payload = result.rows[0].fields.get("payload").unwrap().to_index_string();
+        assert!(payload.contains("octocat") && payload.contains("1347"), "variant JSON: {payload}");
+    }
 }

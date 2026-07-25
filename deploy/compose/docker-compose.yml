@@ -728,11 +728,115 @@ services:
       - -f
       - /opt/growlerdb/events.sql
 
+  # Serve the variant `events` index (D47/D48). Creates it (schema introspected via Trino, since
+  # released iceberg-rust can't parse a v3 variant schema — D49) then serves it; the connector
+  # (below) populates it, and hydration routes through Trino (GROWLERDB_TRINO_ENDPOINT). Part of the
+  # `variant` profile — needs the `stack` (controlplane/gateway) up too.
+  node-events:
+    profiles: ["variant"]
+    <<: *growlerdb-image
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        rm -rf /data/* 2>/dev/null;
+        growlerdb index growlerdb.events --def /events.yaml --name events &&
+        growlerdb serve events --addr 0.0.0.0:50054 --rest-addr 0.0.0.0:8085 --metrics-addr 0.0.0.0:9107
+        --register http://controlplane:50071 --advertise-addr http://node-events:50054
+    environment:
+      <<: *growlerdb-env
+      # Variant hydration routes through the in-network Trino (D48/D49); its gRPC-free REST API.
+      GROWLERDB_TRINO_ENDPOINT: http://trino:8080
+      GROWLERDB_TRINO_CATALOG: iceberg
+    depends_on:
+      controlplane:
+        condition: service_healthy
+      trino:
+        condition: service_healthy
+      model-fetch:
+        condition: service_completed_successfully
+    ports:
+      - "50054:50054"
+      - "9107:9107"
+    volumes:
+      - node-events-data:/data
+      - ./events.yaml:/events.yaml:ro
+      - ${MODEL_HOST_DIR:-./model-cache}:/models
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9107/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+
+  # Populate `events` from the v3 variant table via the connector (D48): a one-shot bootstrap that
+  # extracts the variant `payload` — flatten leaves + discriminator-selected shape values
+  # (--variant-spec) — into the node. Mirrors the `connector` service's Spark/REST-catalog wiring.
+  connector-events:
+    profiles: ["variant"]
+    image: apache/spark:4.1.3
+    restart: on-failure
+    volumes:
+      - ../../connector/target/growlerdb-connector-0.0.0.jar:/opt/growlerdb/connector.jar:ro
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+      GROWLERDB_SERVICE_TOKEN: demo-stack-service-token-change-me
+    entrypoint: ["/opt/spark/bin/spark-submit"]
+    command:
+      - --master
+      - "local[2]"
+      - --conf
+      - spark.jars.ivy=/tmp/.ivy2
+      - --packages
+      - org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:1.11.0,org.apache.iceberg:iceberg-aws-bundle:1.11.0
+      - --conf
+      - spark.sql.catalog.stream=org.apache.iceberg.spark.SparkCatalog
+      - --conf
+      - spark.sql.catalog.stream.type=rest
+      - --conf
+      - spark.sql.catalog.stream.uri=http://polaris:8181/api/catalog
+      - --conf
+      - spark.sql.catalog.stream.warehouse=growlerdb
+      - --conf
+      - spark.sql.catalog.stream.credential=root:s3cr3t
+      - --conf
+      - spark.sql.catalog.stream.scope=PRINCIPAL_ROLE:ALL
+      - --conf
+      - spark.sql.catalog.stream.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+      - --conf
+      - spark.sql.catalog.stream.s3.endpoint=http://minio:9000
+      - --conf
+      - spark.sql.catalog.stream.s3.path-style-access=true
+      - --class
+      - io.growlerdb.connector.ConnectorApp
+      - /opt/growlerdb/connector.jar
+      - --catalog
+      - stream
+      - --table
+      - growlerdb.events
+      - --identifier
+      - id
+      # The scalar key/time columns + the declared shape paths (which ride the doc's typed fields).
+      - --fields
+      - id,ts,event_type,payload.number,payload.action,payload.merged,payload.title
+      - --variant-spec
+      - '{"column":"payload","discriminator":"event_type","flatten":{"terms":true,"text":true},"shapes":[{"name":"pull_request","when":["PullRequestEvent"],"paths":[{"path":"number","type":"LONG"},{"path":"action","type":"KEYWORD"},{"path":"merged","type":"BOOL"},{"path":"title","type":"TEXT"}]},{"name":"issue","when":["IssuesEvent"],"paths":[{"path":"number","type":"LONG"},{"path":"action","type":"KEYWORD"},{"path":"title","type":"TEXT"}]}]}'
+      - --node
+      - node-events:50054
+      - --control-plane
+      - controlplane:50071
+      - --index
+      - events
+    depends_on:
+      node-events:
+        condition: service_healthy
+
 volumes:
   minio-data:
   cp-data:
   node-data:
   node-catalog-data:
   node-movies-data:
+  node-events-data:
   polaris-db:
   spark-ivy:
