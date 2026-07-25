@@ -20,6 +20,7 @@ pub mod lookup_service;
 pub mod mcp_http;
 pub mod node;
 pub mod opensearch;
+pub mod pool_routing;
 pub mod rbac;
 pub mod remap;
 pub mod rest;
@@ -70,6 +71,10 @@ pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|p| p.into_inner())
 }
 
+pub use pool_routing::{
+    PoolAdminService, PoolLookupService, PoolSearchService, PoolSuggestService, SharedAdminIndexes,
+    SharedLookupIndexes, SharedSearchIndexes, SharedSuggestIndexes,
+};
 pub use service_auth::{
     intercept as intercept_service_token, layer as service_token_layer, ServiceTokenAuth,
 };
