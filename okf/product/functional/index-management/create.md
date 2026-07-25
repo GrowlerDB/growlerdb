@@ -19,7 +19,10 @@ Define an index over an Iceberg table and build it. The definition chooses:
   the columnar path answers ranges/sorts but has no postings to match a term) / TEXT-only **`record`**
   + **`fieldnorms`** (posting detail and
   BM25 norms; see [data model](/system/storage/data-model.md)) flags; optionally a
-  declared **timestamp** field and [windowing](/product/functional/windowing-time.md).
+  declared **timestamp** field and [windowing](/product/functional/windowing-time.md). Iceberg v3
+  **variant** columns will get their own mapping surface
+  ([planned](/product/functional/index-management/variant.md)), since their paths are per-row
+  rather than in the source schema.
 - **Sharding** — shard count + routing.
 - **Location strategy** (`location_strategy`, [D30](/system/decisions/d30-layered-locator.md)) —
   how [hydration](/product/functional/hydration.md) locates a key's source row: `COORDINATES`
