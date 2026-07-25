@@ -1,7 +1,11 @@
 GrowlerDB is installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
 
 Topology (Design 14 sharded cluster):
+{{- if .Values.controlPlane.externalRegistry.enabled }}
+  • control-plane  Deployment   {{ .Values.controlPlane.replicas }} replica(s) (HA over Postgres)   — index registry (gRPC :{{ .Values.controlPlane.grpcPort }})
+{{- else }}
   • control-plane  StatefulSet  {{ .Values.controlPlane.replicas }} replica(s)   — index registry (gRPC :{{ .Values.controlPlane.grpcPort }})
+{{- end }}
   • node           StatefulSet  {{ .Values.index.shards }} shard pod(s)   — one per shard ordinal of "{{ .Values.index.name }}", on PVs
   • gateway        Deployment   {{ if .Values.gateway.autoscaling.enabled }}{{ .Values.gateway.autoscaling.minReplicas }}–{{ .Values.gateway.autoscaling.maxReplicas }} (HPA){{ else }}{{ .Values.gateway.replicas }} replica(s){{ end }}   — public Engine API + console UI
 
@@ -10,7 +14,11 @@ ordinal, and self-registers with the control plane; the gateway reads the live s
 control plane and fronts each shard's primary (hot-reloading on change).
 
 Watch it come up:
+{{- if .Values.controlPlane.externalRegistry.enabled }}
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "growlerdb.controlplane.fullname" . }}
+{{- else }}
   kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ include "growlerdb.controlplane.fullname" . }}
+{{- end }}
   kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ include "growlerdb.node.fullname" . }}
   kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "growlerdb.gateway.fullname" . }}
 

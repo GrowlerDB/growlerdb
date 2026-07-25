@@ -1,3 +1,19 @@
+{{- if and .Values.controlPlane.externalRegistry.enabled .Values.controlPlane.podDisruptionBudget.enabled (gt (int .Values.controlPlane.replicas) 1) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "growlerdb.controlplane.fullname" . }}
+  labels:
+    {{- include "growlerdb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+spec:
+  minAvailable: {{ .Values.controlPlane.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "growlerdb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: control-plane
+{{- end }}
+---
 {{- if and .Values.node.podDisruptionBudget.enabled (gt (int .Values.index.shards) 1) }}
 apiVersion: policy/v1
 kind: PodDisruptionBudget

@@ -1,15 +1,18 @@
-{{- if not .Values.controlPlane.externalRegistry.enabled }}
-# Embedded mode: the single-writer JSON registry on a PV. HA mode (externalRegistry.enabled) renders a
-# stateless Deployment instead — see controlplane-deployment.yaml.
+{{- if .Values.controlPlane.externalRegistry.enabled }}
+# HA mode (D51): N stateless control-plane replicas over the externalized Postgres registry. Each
+# replica is a warm standby that serves reads; exactly one holds the single-writer advisory lock (the
+# leader) and is the only pod that reports /readyz 200, so the Service routes to it (active-passive).
+# Standbys reload on the leader's writes and promote on its death. No PV — durable state lives in
+# Postgres. Embedded (single-writer JSON) mode renders a StatefulSet instead; see
+# controlplane-statefulset.yaml.
 apiVersion: apps/v1
-kind: StatefulSet
+kind: Deployment
 metadata:
   name: {{ include "growlerdb.controlplane.fullname" . }}
   labels:
     {{- include "growlerdb.labels" . | nindent 4 }}
     app.kubernetes.io/component: control-plane
 spec:
-  serviceName: {{ include "growlerdb.controlplane.fullname" . }}
   replicas: {{ .Values.controlPlane.replicas }}
   selector:
     matchLabels:
@@ -37,7 +40,10 @@ spec:
             - 0.0.0.0:{{ .Values.controlPlane.grpcPort }}
             - --metrics-addr
             - 0.0.0.0:{{ .Values.controlPlane.metricsPort }}
+          # HA is selected by GROWLERDB_REGISTRY_POSTGRES (the --registry-postgres env fallback), set
+          # from the credentials Secret below.
           env:
+            {{- include "growlerdb.registryPostgresEnv" . | nindent 12 }}
             {{- include "growlerdb.icebergEnv" . | nindent 12 }}
             {{- include "growlerdb.serviceTokenEnv" . | nindent 12 }}
             {{- include "growlerdb.licenseEnv" . | nindent 12 }}
@@ -55,24 +61,22 @@ spec:
       {{- with .Values.controlPlane.tolerations }}
       tolerations: {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.controlPlane.affinity }}
-      affinity: {{- toYaml . | nindent 8 }}
+      {{- if .Values.controlPlane.affinity }}
+      affinity: {{- toYaml .Values.controlPlane.affinity | nindent 8 }}
+      {{- else if .Values.controlPlane.spreadReplicas }}
+      # Spread replicas across cluster nodes so one host loss can't take the leader + its standbys.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "growlerdb.selectorLabels" . | nindent 20 }}
+                    app.kubernetes.io/component: control-plane
       {{- end }}
-      {{- if not .Values.controlPlane.persistence.enabled }}
+      # Stateless: durable registry state is in Postgres, so /data is a scratch dir, not a PV.
       volumes:
         - { name: data, emptyDir: {} }
-      {{- end }}
-  {{- if .Values.controlPlane.persistence.enabled }}
-  volumeClaimTemplates:
-    - metadata:
-        name: data
-      spec:
-        accessModes: {{ .Values.controlPlane.persistence.accessModes | toJson }}
-        {{- with .Values.controlPlane.persistence.storageClass }}
-        storageClassName: {{ . | quote }}
-        {{- end }}
-        resources:
-          requests:
-            storage: {{ .Values.controlPlane.persistence.size | quote }}
-  {{- end }}
 {{- end }}
