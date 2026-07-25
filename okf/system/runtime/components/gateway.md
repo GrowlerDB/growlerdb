@@ -24,7 +24,12 @@ without forking — the [extension seam](/system/decisions/d37-extension-seams.m
   A gateway fronts **one index** (`--index`) *or* **every registered index** (`--all-indexes`), routing
   each request to its named index's shard-set — resolved lazily from the control plane on first use and
   hot-reloaded per index ([D35](/system/decisions/d35-multi-index-routing.md)). An empty `index`
-  resolves to the endpoint's default/sole index, else is rejected.
+  resolves to the endpoint's default/sole index, else is rejected. Windowed routing resolves each
+  `(index, window)` **unit** to its holder and stamps that unit on the request, so the gateway fronts a
+  **pool node** serving many indexes' windows over one endpoint unchanged
+  ([D52](/system/decisions/d52-placement-pool.md)): the per-window `WindowNode` stamps the index too,
+  and the node dispatches on it. A window whose holder is briefly down doesn't blank the route (the
+  swap keeps the last servable topology; lazy connect fails that unit fast to a `partial`).
 - **Scatter-gather** — fans Search/Suggest out to the target shards, merges top-K, **dedupes** by
   composite key (safe mid-reshard), and surfaces an honest `partial` flag; enforces **per-shard
   deadlines** and a **page-fetch ceiling**.
