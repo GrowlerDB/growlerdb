@@ -41,29 +41,47 @@ pub(crate) const MAX_NODE_FETCH: usize = 10_000;
 pub struct SearchService {
     shard: ShardHandle,
     auth: SharedAuth,
-    /// Admission for the HEAVY read ops (`export`, `aggregate` — full scans on the blocking
-    /// pool). Defaults to the process-wide semaphore ([`heavy_reads`]) so every service on this
-    /// node shares ONE budget; saturation load-sheds with `RESOURCE_EXHAUSTED` rather than
-    /// queueing unbounded blocking work.
+    /// Node-wide admission for the HEAVY read ops (`export`, `aggregate` — full scans on the blocking
+    /// pool). Defaults to the process-wide semaphore ([`heavy_reads`]) so every service on this node
+    /// shares ONE budget; saturation load-sheds with `RESOURCE_EXHAUSTED` rather than queueing
+    /// unbounded blocking work.
     heavy: Arc<tokio::sync::Semaphore>,
+    /// Per-**index** heavy-read share, acquired *before* [`heavy`](Self::heavy). On a
+    /// universal-pool node co-resident indexes share one process (D52), so this caps how much of the
+    /// node budget any single index can hold — a flood of exports/aggregations on one index sheds
+    /// here once it holds its slice and can't starve a co-tenant's queries. Default is effectively
+    /// unbounded (a lone index is bounded by [`heavy`](Self::heavy) alone — no behavior change); the
+    /// pool builder ([`with_index_heavy_budget`](Self::with_index_heavy_budget)) gives every service
+    /// of one index a shared, fair-share semaphore.
+    heavy_index: Arc<tokio::sync::Semaphore>,
 }
 
-/// The node-wide heavy-read budget: at most `GROWLERDB_MAX_HEAVY_READS` (default 8, `0` treated
-/// as 1) concurrent exports/aggregations across ALL served shards/windows — these run full scans
-/// on the blocking pool, so an unbounded flood starves every other query's blocking work. Sized
-/// once at first use from the env.
+/// The configured node-wide heavy-read cap: `GROWLERDB_MAX_HEAVY_READS` (default 8, `0` treated as
+/// 1). The pool divides this into per-index shares.
+pub fn heavy_reads_cap() -> usize {
+    std::env::var("GROWLERDB_MAX_HEAVY_READS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(8)
+        .max(1)
+}
+
+/// The node-wide heavy-read budget: at most [`heavy_reads_cap`] concurrent exports/aggregations
+/// across ALL served shards/windows — these run full scans on the blocking pool, so an unbounded
+/// flood starves every other query's blocking work. Sized once at first use from the env.
 fn heavy_reads() -> Arc<tokio::sync::Semaphore> {
     static GLOBAL: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     GLOBAL
-        .get_or_init(|| {
-            let n = std::env::var("GROWLERDB_MAX_HEAVY_READS")
-                .ok()
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or(8)
-                .max(1);
-            Arc::new(tokio::sync::Semaphore::new(n))
-        })
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(heavy_reads_cap())))
         .clone()
+}
+
+/// A non-binding per-index budget (the default): a fresh, effectively unlimited semaphore, so a
+/// service that isn't on a shared pool node is bounded only by the node-wide [`heavy_reads`].
+fn unbounded_index_budget() -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(
+        tokio::sync::Semaphore::MAX_PERMITS,
+    ))
 }
 
 impl SearchService {
@@ -81,19 +99,75 @@ impl SearchService {
         self
     }
 
+    /// Give this service a shared **per-index** heavy-read share (D52 pool fairness): every service of
+    /// one index on a pool node passes the same semaphore, so that index can hold at most its slice of
+    /// the node budget and can't starve a co-resident index. See [`heavy_index`](Self::heavy_index).
+    pub fn with_index_heavy_budget(mut self, index_budget: Arc<tokio::sync::Semaphore>) -> Self {
+        self.heavy_index = index_budget;
+        self
+    }
+
+    /// Share an explicit node-wide heavy-read budget across services (the general form of
+    /// [`with_heavy_limit`](Self::with_heavy_limit), which mints a fresh one). Production defaults to
+    /// the process-wide [`heavy_reads`] semaphore, so all services on a node already share one budget.
+    pub fn with_shared_heavy_budget(mut self, budget: Arc<tokio::sync::Semaphore>) -> Self {
+        self.heavy = budget;
+        self
+    }
+
     /// A Search service over `shard` with a specific [auth hook](SharedAuth).
     pub fn with_auth(shard: impl Into<ShardHandle>, auth: SharedAuth) -> Self {
         Self {
             shard: shard.into(),
             auth,
             heavy: heavy_reads(),
+            heavy_index: unbounded_index_budget(),
         }
+    }
+
+    /// Admit one heavy read (export/aggregate): take the per-**index** share first — so a single
+    /// index sheds once it holds its slice and can never monopolize the node budget — then the
+    /// node-wide permit. Both are held together for the op's lifetime; dropping the returned
+    /// [`HeavyPermit`] releases both. Load-sheds with `RESOURCE_EXHAUSTED` at either cap.
+    fn admit_heavy(&self) -> Result<HeavyPermit, Status> {
+        let index = self
+            .heavy_index
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| heavy_shed())?;
+        let global = self
+            .heavy
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| heavy_shed())?;
+        Ok(HeavyPermit {
+            _index: index,
+            _global: global,
+        })
     }
 
     /// Wrap as a mountable tonic [`SearchServer`].
     pub fn into_server(self) -> SearchServer<Self> {
         SearchServer::new(self)
     }
+}
+
+/// Both permits for one admitted heavy read: the per-index share and the node-wide global. Held
+/// together for the op's lifetime; dropping releases both.
+struct HeavyPermit {
+    _index: tokio::sync::OwnedSemaphorePermit,
+    _global: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// The load-shed status when a heavy read hits either the per-index or node-wide cap.
+fn heavy_shed() -> Status {
+    to_status(
+        Code::ResourceExhausted,
+        WireError::new(
+            "RESOURCE_EXHAUSTED",
+            "node at its concurrent heavy-read limit (exports/aggregations) — retry with backoff (GROWLERDB_MAX_HEAVY_READS tunes this)",
+        ),
+    )
 }
 
 #[tonic::async_trait]
@@ -480,17 +554,9 @@ impl Search for SearchService {
         let given_pit = req.pit_id;
 
         // Admission: an export is a full scan holding a PIT + blocking-pool time for its whole
-        // stream — take a node-wide heavy-read permit (held until the stream finishes) or
-        // load-shed now with an honest retry signal.
-        let permit = self.heavy.clone().try_acquire_owned().map_err(|_| {
-            to_status(
-                Code::ResourceExhausted,
-                WireError::new(
-                    "RESOURCE_EXHAUSTED",
-                    "node at its concurrent heavy-read limit (exports/aggregations) — retry                      with backoff (GROWLERDB_MAX_HEAVY_READS tunes this)",
-                ),
-            )
-        })?;
+        // stream — take a heavy-read permit (per-index share + node-wide, held until the stream
+        // finishes) or load-shed now with an honest retry signal.
+        let permit = self.admit_heavy()?;
         // Stream pages from a blocking task over a bounded channel (backpressure: the
         // producer parks on `blocking_send` until the client drains).
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<SearchResponse, Status>>(4);
@@ -584,16 +650,8 @@ impl Search for SearchService {
         growlerdb_core::validate_aggs(&aggs).map_err(invalid)?;
 
         // Admission: an aggregation scans every matching doc's fast fields on the blocking
-        // pool — same node-wide heavy-read budget as export (permit held through the run).
-        let _permit = self.heavy.clone().try_acquire_owned().map_err(|_| {
-            to_status(
-                Code::ResourceExhausted,
-                WireError::new(
-                    "RESOURCE_EXHAUSTED",
-                    "node at its concurrent heavy-read limit (exports/aggregations) — retry                      with backoff (GROWLERDB_MAX_HEAVY_READS tunes this)",
-                ),
-            )
-        })?;
+        // pool — same heavy-read budget as export (per-index share + node-wide, held through the run).
+        let _permit = self.admit_heavy()?;
         let shard = self.shard.current();
         // Tenant scoping: aggregations over another tenant's rows would leak counts/
         // sums, so the same mandatory filter applies before the agg runs.
@@ -1454,6 +1512,68 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(ok, "the heavy budget frees once the export finishes");
+    }
+
+    /// D52 pool fairness: two co-resident indexes share the node-wide heavy budget, but each has its
+    /// own per-index share. A flood of heavy reads on index A exhausts A's share (and sheds further A
+    /// reads) yet index B still admits — one index cannot starve another on a shared pool node.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn per_index_share_keeps_a_flood_from_starving_a_co_tenant() {
+        use tokio_stream::StreamExt;
+        let ta = tempfile::tempdir().unwrap();
+        let tb = tempfile::tempdir().unwrap();
+        // One shared node budget (2), and a per-index share of 1 for each of the two indexes — so a
+        // single index can hold at most one of the two node permits.
+        let global = Arc::new(tokio::sync::Semaphore::new(2));
+        let (svc_a, _sa) = service_and_shard(ta.path());
+        let (svc_b, _sb) = service_and_shard(tb.path());
+        let svc_a = svc_a
+            .with_shared_heavy_budget(global.clone())
+            .with_index_heavy_budget(Arc::new(tokio::sync::Semaphore::new(1)));
+        let svc_b = svc_b
+            .with_shared_heavy_budget(global.clone())
+            .with_index_heavy_budget(Arc::new(tokio::sync::Semaphore::new(1)));
+
+        // Index A floods: an undrained export holds A's per-index permit (+ one node permit).
+        let mut a_stream = svc_a
+            .export(Request::new(ExportRequest {
+                query: "rank:[0 TO 1000]".into(),
+                page_size: 1,
+                sort: rank_asc(),
+                pit_id: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // A second heavy read on A is shed — A can't exceed its per-index share.
+        let a_again = svc_a
+            .aggregate(Request::new(AggregateRequest {
+                query: "rank:[0 TO 1000]".into(),
+                aggs: r#"{"r": {"Stats": {"field": "rank"}}}"#.into(),
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(
+            a_again.unwrap_err().code(),
+            Code::ResourceExhausted,
+            "index A is capped at its own share"
+        );
+
+        // ...but index B still admits — its own share is free and a node permit remains.
+        svc_b
+            .aggregate(Request::new(AggregateRequest {
+                query: "rank:[0 TO 1000]".into(),
+                aggs: r#"{"r": {"Stats": {"field": "rank"}}}"#.into(),
+                ..Default::default()
+            }))
+            .await
+            .expect("B is not starved by A's flood");
+
+        // Drain A so the test tears down cleanly.
+        while let Some(page) = a_stream.next().await {
+            page.unwrap();
+        }
     }
 
     /// `page_size` is clamped to [`MAX_NODE_FETCH`] like every other paged endpoint: a

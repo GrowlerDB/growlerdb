@@ -56,7 +56,7 @@ pub use node::{LocalNode, Node, RemoteNode};
 pub use opensearch::opensearch_router;
 pub use rbac::{scope_for_method, RbacPolicy, Scope};
 pub use remap::{remap_shard, remap_tick, RemapOutcome, RemapState};
-pub use search_service::SearchService;
+pub use search_service::{heavy_reads_cap, SearchService};
 /// Serialize every test that mutates a process-global env var (`GROWLERDB_*_API_KEY`, ...).
 /// `set_var`/`remove_var` are process-wide, so env-touching tests across modules race under
 /// `cargo test`'s parallelism unless they share ONE crate-level lock (the same lesson the embed
