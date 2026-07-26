@@ -49,7 +49,7 @@ pub use error::EngineError;
 pub use fence::{ReindexFence, ReindexGuard};
 pub use gateway::{Gateway, GatewayLimits, IndexRoute, RouteResolver, WindowRouting};
 pub use hydrate::{apply_live_file_bitmap, get_by_key, resolve_locators};
-pub use license::{License, LicenseError, FREE_NODE_LIMIT};
+pub use license::{License, LicenseError, FREE_UNIT_LIMIT};
 pub use lookup_service::LookupService;
 pub use mcp_http::mcp_router;
 pub use node::{FailoverNode, LocalNode, Node, RemoteNode};

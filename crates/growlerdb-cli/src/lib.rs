@@ -4792,7 +4792,8 @@ async fn control_plane(
             match growlerdb_engine::License::verify(token.trim()) {
                 Ok(lic) => {
                     println!(
-                        "control plane: Enterprise license for `{}` — node limit {}",
+                        "control plane: Enterprise license for `{}` — unit limit {} (primary-held \
+                         units; replicas free)",
                         lic.licensee, lic.max_nodes
                     );
                     Some(lic)

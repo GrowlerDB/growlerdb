@@ -446,9 +446,11 @@ message GetLicenseResponse {
   bool licensed = 1;
   // Who the license is issued to (empty on the free tier).
   string licensee = 2;
-  // The entitled node cap (free-tier limit, or the license's max_nodes).
+  // The entitled scale cap, in **primary-held units** (D53): the free-tier limit or the license's
+  // entitlement. The field keeps its historical `max_nodes` name; its meaning is units, not node
+  // processes — read replicas are free.
   uint32 max_nodes = 3;
-  // Distinct live index nodes currently registered.
+  // Primary-held units currently serving (the billable scale metric; replicas excluded).
   uint32 current_nodes = 4;
 }
 

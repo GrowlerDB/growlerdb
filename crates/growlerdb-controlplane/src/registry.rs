@@ -1423,8 +1423,7 @@ impl Registry {
         Ok(())
     }
 
-    /// Count of distinct live node endpoints in the pool — the deployment's node usage, for the
-    /// scale-limit meter and the license view.
+    /// Count of distinct live node endpoints in the pool — the deployment's raw node usage.
     pub fn distinct_live_nodes(&self, now_ms: i64) -> usize {
         self.node_pool
             .read()
@@ -1432,6 +1431,33 @@ impl Registry {
             .values()
             .filter(|&&t| now_ms - t <= NODE_HEARTBEAT_TTL_MS)
             .count()
+    }
+
+    /// The number of **units with an assigned primary** across every index (shards + windows) — the
+    /// D53 scale-limit metric. The entitlement counts *primary-held units* (the served data
+    /// partitions), **not** raw node processes, so enabling read replicas (`R > 1`, more holder nodes)
+    /// never consumes the allowance — a replica isn't a new primary of any unit. See
+    /// [D38](/system/decisions/d38-scale-limit-entitlement.md).
+    pub fn count_primary_units(&self) -> usize {
+        self.read_map()
+            .values()
+            .map(|e| {
+                e.shards.values().filter(|s| s.primary.is_some()).count()
+                    + e.windows
+                        .values()
+                        .filter(|w| w.assignment.primary.is_some())
+                        .count()
+            })
+            .sum()
+    }
+
+    /// Whether `unit` of `index` already has a primary assigned (regardless of liveness) — the CP
+    /// checks this before placement so re-resolving an existing unit, or re-placing its dead owner,
+    /// is never counted as a **new** unit against the entitlement.
+    pub fn unit_has_primary(&self, index: &str, unit: Unit) -> bool {
+        self.read_map()
+            .get(index)
+            .is_some_and(|e| unit_primary(e, unit).is_some())
     }
 
     /// The endpoints of nodes whose heartbeat is within [`NODE_HEARTBEAT_TTL_MS`] of `now_ms` — the
