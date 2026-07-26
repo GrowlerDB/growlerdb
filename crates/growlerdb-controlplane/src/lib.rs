@@ -17,5 +17,5 @@ pub use backend::{JsonFileBackend, PersistedState, RegistryBackend, RegistrySnap
 pub use postgres_backend::PostgresBackend;
 pub use registry::{
     glob_match, ActivityEvent, ApiToken, IndexEntry, IndexStatus, IndexSummary, NodeId, Registry,
-    RegistryError, Result, SavedQuery, ShardAssignment, Unit, WindowAssignment,
+    RegistryError, Result, SavedQuery, ShardAssignment, Unit, UnitHolders, WindowAssignment,
 };
