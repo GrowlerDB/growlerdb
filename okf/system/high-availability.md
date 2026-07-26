@@ -69,8 +69,9 @@ the hot query path — it stays a registry, never a query router ([D35](/system/
 Today `growlerdb serve` binds to **one** index and one `--shard-ordinal` — so every index needs its
 own StatefulSet, and a shard has exactly one holder. [D33](/system/decisions/d33-windowed-topology.md)
 already broke both assumptions **for windowed indexes**: nodes start empty, register into a
-**placement pool**, and the CP assigns them windows on first ask (`RegisterNode` / `ResolveWindowOwner`),
-so any node hosts any window.
+**placement pool**, and the CP assigns them windows on first ask (`RegisterNode` / `ResolveUnitOwner`,
+the unit-general placement call D52 generalized the former window-only `ResolveWindowOwner` into), so
+any node hosts any window.
 
 **[D52](/system/decisions/d52-placement-pool.md) generalizes that pool to every index and shard
 type.** A node becomes a generic **shard host**: it serves the set of `(index, shard|window)`

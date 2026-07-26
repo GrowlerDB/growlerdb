@@ -3,8 +3,8 @@ package io.growlerdb.connector;
 import io.growlerdb.proto.v1.ControlPlaneGrpc;
 import io.growlerdb.proto.v1.GetIndexRequest;
 import io.growlerdb.proto.v1.GetIndexResponse;
-import io.growlerdb.proto.v1.ResolveWindowOwnerRequest;
-import io.growlerdb.proto.v1.ResolveWindowOwnerResponse;
+import io.growlerdb.proto.v1.ResolveUnitOwnerRequest;
+import io.growlerdb.proto.v1.ResolveUnitOwnerResponse;
 import io.grpc.ClientInterceptor;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
@@ -57,9 +57,19 @@ public final class ControlPlaneClient implements AutoCloseable {
    * it on the least-loaded live node on first ask. The connector calls this with each row's computed
    * window id to learn where to stream that window's writes. Idempotent for an already-placed window.
    */
-  public ResolveWindowOwnerResponse resolveWindowOwner(String index, long window) {
-    return stub.resolveWindowOwner(
-        ResolveWindowOwnerRequest.newBuilder().setIndex(index).setWindow(window).build());
+  public ResolveUnitOwnerResponse resolveWindowOwner(String index, long window) {
+    return stub.resolveUnitOwner(
+        ResolveUnitOwnerRequest.newBuilder().setIndex(index).setWindow(window).build());
+  }
+
+  /**
+   * Resolve the node that owns an ordinal {@code shard} of a hash/partition-sharded {@code index},
+   * placing it on the least-loaded live node on first ask — the hash-unit counterpart to
+   * {@link #resolveWindowOwner}. Idempotent for an already-placed shard.
+   */
+  public ResolveUnitOwnerResponse resolveShardOwner(String index, int shard) {
+    return stub.resolveUnitOwner(
+        ResolveUnitOwnerRequest.newBuilder().setIndex(index).setShard(shard).build());
   }
 
   @Override

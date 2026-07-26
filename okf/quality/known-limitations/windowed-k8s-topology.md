@@ -28,8 +28,9 @@ instead of hash ordinals:
   windowing and serves an empty windowed index. It heartbeats into the control plane's **placement
   pool** (`RegisterNode`).
 - **The control plane places windows.** The connector computes each row's window
-  (`WindowRouter`, byte-identical to the engine) and asks `ResolveWindowOwner`, which assigns the
-  window to the least-loaded live node on first ask; the connector streams that window's rows there.
+  (`WindowRouter`, byte-identical to the engine) and asks `ResolveUnitOwner` (the unit-general
+  placement call, with the window as its unit), which assigns the window to the least-loaded live node
+  on first ask; the connector streams that window's rows there.
 - **Nodes create windows on first write** (`WindowedWriteService`) and publish them live (shared
   search/suggest mux + `Gateway::swap_windowed`); they re-announce served windows + zone-maps each
   tick, so the **cluster gateway hot-reloads** the window set and prunes time-filtered queries.

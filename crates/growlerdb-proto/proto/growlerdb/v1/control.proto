@@ -357,16 +357,22 @@ message RegisterNodeRequest {
 }
 message RegisterNodeResponse {}
 
-// Resolve (assigning on first ask) the node that owns a time `window` of a windowed index:
-// the connector calls this with a row's computed window id to learn where to route the write.
-// Idempotent for a window already placed on a live node; an unassigned window — or one whose owner is
-// dead — is placed on the least-loaded live node and recorded.
-message ResolveWindowOwnerRequest {
+// Resolve (assigning on first ask) the node that owns a placement **unit** of an index — an ordinal
+// `shard` of a hash/partition-sharded index or a time `window` of a windowed one (D52). The connector
+// calls this with a row's computed unit to learn where to route the write. Idempotent for a unit
+// already placed on a live node; an unassigned unit — or one whose owner is dead — is placed on the
+// least-loaded live node and recorded. Generalizes the former window-only ResolveWindowOwner so hash
+// and windowed indexes share one placement path.
+message ResolveUnitOwnerRequest {
   string index = 1;
-  int64 window = 2;   // window id (epoch-ms of the window start)
+  // The unit to resolve. Required — an unset `unit` is an INVALID_ARGUMENT.
+  oneof unit {
+    uint32 shard = 2;   // ordinal shard of a hash/partition-sharded index
+    int64 window = 3;   // window id (epoch-ms of the window start) of a windowed index
+  }
 }
-message ResolveWindowOwnerResponse {
-  string endpoint = 1;  // the node that owns (or was just assigned) this window
+message ResolveUnitOwnerResponse {
+  string endpoint = 1;  // the node that owns (or was just assigned) this unit
   bool created = 2;     // true iff this call made or moved the assignment
 }
 
@@ -449,11 +455,11 @@ service ControlPlane {
   rpc DescribeSource(DescribeSourceRequest) returns (DescribeSourceResponse);
   // A serving node self-registers its locally-built index + shard assignment.
   rpc RegisterServedIndex(RegisterServedIndexRequest) returns (RegisterServedIndexResponse);
-  // CP-driven windowed placement: a windowed node heartbeats into the placement pool
-  // (RegisterNode); the connector resolves each window's owning node (ResolveWindowOwner, placing on
-  // first ask).
+  // CP-driven pool placement: a node heartbeats into the placement pool (RegisterNode, index-agnostic);
+  // the connector resolves each unit's owning node (ResolveUnitOwner — a `(index, shard|window)` unit,
+  // placing on first ask).
   rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
-  rpc ResolveWindowOwner(ResolveWindowOwnerRequest) returns (ResolveWindowOwnerResponse);
+  rpc ResolveUnitOwner(ResolveUnitOwnerRequest) returns (ResolveUnitOwnerResponse);
   // Ingestion (sync) status: source head vs. each shard's committed checkpoint.
   rpc IngestionStatus(IngestionStatusRequest) returns (IngestionStatusResponse);
   // Scale-limit license status: the entitlement + current node usage, for the console.

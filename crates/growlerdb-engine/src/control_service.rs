@@ -27,7 +27,7 @@ use growlerdb_proto::v1::{
     ListUsersRequest, ListUsersResponse, LoginRequest, LoginResponse, MoveBucketRequest,
     MoveBucketResponse, PlanReshardRequest, PlanReshardResponse, RegisterNodeRequest,
     RegisterNodeResponse, RegisterServedIndexRequest, RegisterServedIndexResponse,
-    ReindexIndexRequest, ResolveWindowOwnerRequest, ResolveWindowOwnerResponse, RevokeTokenRequest,
+    ReindexIndexRequest, ResolveUnitOwnerRequest, ResolveUnitOwnerResponse, RevokeTokenRequest,
     RevokeTokenResponse, RoleBinding, RoutingStrategy as WireRouting, SaveSavedQueryRequest,
     SaveSavedQueryResponse, SavedQuery as WireSavedQuery, SetAliasRequest, SetAliasResponse,
     SetUserRolesRequest, SetUserRolesResponse, ShardIngestion, ShardStatus, SourceFieldInfo,
@@ -1283,7 +1283,7 @@ impl ControlPlane for ControlPlaneService {
 
         // Classify by the DEFINITION, not by whether `windows` is populated: a windowed
         // node that starts **empty** (streaming-first — it creates windows on first write) still
-        // reports zero windows, and must register as a *windowed* entry so `ResolveWindowOwner` can
+        // reports zero windows, and must register as a *windowed* entry so `ResolveUnitOwner` can
         // place windows on it — not be misclassified as an ordinal single-shard index.
         let is_windowed = resolved.windowing.is_some();
         // Upsert: create on first announce, idempotent on restart (a re-announce just re-points
@@ -1386,22 +1386,33 @@ impl ControlPlane for ControlPlaneService {
         }))
     }
 
-    async fn resolve_window_owner(
+    async fn resolve_unit_owner(
         &self,
-        request: Request<ResolveWindowOwnerRequest>,
-    ) -> Result<Response<ResolveWindowOwnerResponse>, Status> {
-        self.gate("ResolveWindowOwner", &request)?;
+        request: Request<ResolveUnitOwnerRequest>,
+    ) -> Result<Response<ResolveUnitOwnerResponse>, Status> {
+        use growlerdb_proto::v1::resolve_unit_owner_request::Unit as WireUnit;
+        self.gate("ResolveUnitOwner", &request)?;
         let req = request.into_inner();
+        // Map the wire unit oneof to the registry's `(shard | window)` unit — one placement path.
+        let unit = match req.unit {
+            Some(WireUnit::Shard(ordinal)) => growlerdb_controlplane::Unit::Shard(ordinal),
+            Some(WireUnit::Window(window)) => growlerdb_controlplane::Unit::Window(window),
+            None => {
+                return Err(Status::invalid_argument(
+                    "ResolveUnitOwnerRequest.unit is required (shard or window)",
+                ))
+            }
+        };
         let (endpoint, created) = self
             .registry
-            .resolve_window_owner(&req.index, req.window, now_ms())
+            .resolve_unit_owner(&req.index, unit, now_ms())
             .map_err(|e| match e {
                 // No node has heartbeated yet (a transient bring-up state) — retryable, so the
                 // connector backs off and re-asks rather than failing the ingest batch.
                 RegistryError::NoLiveNode { .. } => Status::unavailable(e.to_string()),
                 other => registry_status(other),
             })?;
-        Ok(Response::new(ResolveWindowOwnerResponse {
+        Ok(Response::new(ResolveUnitOwnerResponse {
             endpoint,
             created,
         }))
@@ -2117,15 +2128,15 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn cp_driven_window_placement_via_rpc() {
         // Nodes heartbeat into the pool (RegisterNode), the connector resolves each window's
-        // owner (ResolveWindowOwner, placing on first ask), and GetIndex reflects the placement.
+        // owner (ResolveUnitOwner, placing on first ask), and GetIndex reflects the placement.
         let tmp = tempfile::tempdir().unwrap();
         let svc = service(tmp.path());
         svc.registry.create(resolved_windowed("logs")).unwrap();
 
         let resolve = |w: i64| {
-            svc.resolve_window_owner(Request::new(ResolveWindowOwnerRequest {
+            svc.resolve_unit_owner(Request::new(ResolveUnitOwnerRequest {
                 index: "logs".into(),
-                window: w,
+                unit: Some(growlerdb_proto::v1::resolve_unit_owner_request::Unit::Window(w)),
             }))
         };
 
@@ -2188,9 +2199,9 @@ mod tests {
 
         // Resolving a window of an unregistered index is NotFound (not a placement retry).
         assert_eq!(
-            svc.resolve_window_owner(Request::new(ResolveWindowOwnerRequest {
+            svc.resolve_unit_owner(Request::new(ResolveUnitOwnerRequest {
                 index: "ghost".into(),
-                window: 1,
+                unit: Some(growlerdb_proto::v1::resolve_unit_owner_request::Unit::Window(1)),
             }))
             .await
             .unwrap_err()
