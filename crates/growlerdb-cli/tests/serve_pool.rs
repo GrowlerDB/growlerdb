@@ -11,7 +11,8 @@ use growlerdb_core::{
 };
 use growlerdb_index::{LocalIndexStore, ShardId};
 use growlerdb_proto::v1::search_client::SearchClient;
-use growlerdb_proto::v1::SearchRequest;
+use growlerdb_proto::v1::write_client::WriteClient;
+use growlerdb_proto::v1::{DocBatch, SearchRequest, WriteRequest};
 use tonic::transport::Channel;
 
 /// A minimal windowed index (`id` KEYWORD + a `ts` window field) named `index`.
@@ -65,6 +66,18 @@ fn build_windowed_index(data_dir: &std::path::Path, index: &str, only: &str) {
     .unwrap();
 }
 
+/// Define `index` on disk (its `index.json`) but build **no** window shard — a pool node then serves
+/// zero windows for it at boot, and the first write must create the window lazily.
+fn define_windowed_index(data_dir: &std::path::Path, index: &str) {
+    let resolved = windowed_index(index);
+    std::fs::create_dir_all(data_dir.join(index)).unwrap();
+    std::fs::write(
+        data_dir.join(index).join("index.json"),
+        serde_json::to_vec(&resolved).unwrap(),
+    )
+    .unwrap();
+}
+
 /// A spawned `growlerdb` process that is killed on drop.
 struct Server(Child);
 impl Drop for Server {
@@ -82,6 +95,34 @@ async fn connect(url: &str) -> SearchClient<Channel> {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     panic!("growlerdb serve-pool did not come up at {url}");
+}
+
+async fn connect_write(url: &str) -> WriteClient<Channel> {
+    for _ in 0..120 {
+        if let Ok(client) = WriteClient::connect(url.to_string()).await {
+            return client;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("growlerdb serve-pool Write did not come up at {url}");
+}
+
+/// A one-doc changelog batch: upsert `id` with window field `ts` (epoch-ms), as a wire `DocBatch`.
+fn one_doc_batch(id: &str, ts_ms: i64, batch_id: &str) -> DocBatch {
+    let key = CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]);
+    let mut fields = BTreeMap::new();
+    fields.insert("id".to_string(), Value::from(id));
+    fields.insert("ts".to_string(), Value::from(ts_ms));
+    CommitBatch::from_upserts(
+        vec![LocatedDoc {
+            doc: Document::new(key, fields),
+            iceberg_file: "f0".into(),
+            row_position: 0,
+        }],
+        SourceCheckpoint::iceberg(1),
+        batch_id,
+    )
+    .into()
 }
 
 /// Search `(index, window)` and return the matched `id`s.
@@ -169,5 +210,87 @@ async fn serve_pool_dispatches_search_across_two_indexes() {
         unserved.unwrap_err().code(),
         tonic::Code::InvalidArgument,
         "an unserved index is rejected, not silently empty"
+    );
+}
+
+#[tokio::test]
+async fn serve_pool_dispatches_writes_across_two_indexes_and_creates_windows_lazily() {
+    // One day in epoch-ms / canonical-micros: a `ts` of `n` days lands in daily window `n * DAY_US`.
+    const DAY_MS: i64 = 86_400_000;
+    const DAY_US: i64 = 86_400_000_000;
+
+    let tmp = tempfile::tempdir().unwrap();
+    // Two windowed indexes DEFINED but not built — no window shards on disk yet.
+    define_windowed_index(tmp.path(), "alpha");
+    define_windowed_index(tmp.path(), "beta");
+
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let addr = format!("127.0.0.1:{port}");
+    let _server = Server(
+        Command::new(env!("CARGO_BIN_EXE_growlerdb"))
+            .args([
+                "--data-dir",
+                tmp.path().to_str().unwrap(),
+                "serve-pool",
+                "--index",
+                "alpha",
+                "--index",
+                "beta",
+                "--addr",
+                &addr,
+            ])
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn growlerdb serve-pool"),
+    );
+
+    let url = format!("http://{addr}");
+    let mut writer = connect_write(&url).await;
+
+    // Write one doc into each index at day 10 — the (index, window) selector dispatches to that
+    // index's writer, which creates the day-10 window on first write.
+    writer
+        .write(WriteRequest {
+            batch: Some(one_doc_batch("alphadoc", 10 * DAY_MS, "a1")),
+            index: "alpha".into(),
+        })
+        .await
+        .expect("write to alpha");
+    writer
+        .write(WriteRequest {
+            batch: Some(one_doc_batch("betadoc", 10 * DAY_MS, "b1")),
+            index: "beta".into(),
+        })
+        .await
+        .expect("write to beta");
+
+    // Each write landed in the CORRECT index's freshly-created day-10 window — queryable with no
+    // restart (the writer shares the read pool's window maps).
+    let mut client = connect(&url).await;
+    assert_eq!(
+        search_ids(&mut client, "alpha", 10 * DAY_US).await,
+        vec!["alphadoc"],
+        "alpha write → alpha's day-10 window"
+    );
+    assert_eq!(
+        search_ids(&mut client, "beta", 10 * DAY_US).await,
+        vec!["betadoc"],
+        "beta write → beta's day-10 window"
+    );
+
+    // A write to an index this node doesn't serve is a loud InvalidArgument (as on the read path).
+    let unserved = writer
+        .write(WriteRequest {
+            batch: Some(one_doc_batch("gammadoc", 10 * DAY_MS, "g1")),
+            index: "gamma".into(),
+        })
+        .await;
+    assert_eq!(
+        unserved.unwrap_err().code(),
+        tonic::Code::InvalidArgument,
+        "a write to an unserved index is rejected"
     );
 }

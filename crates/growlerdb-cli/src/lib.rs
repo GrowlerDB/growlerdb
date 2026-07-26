@@ -402,6 +402,10 @@ enum Command {
         /// is set, since `--addr` is often a bind-only wildcard).
         #[arg(long)]
         advertise_addr: Option<String>,
+        /// Seconds between **auto-compaction** health checks per served window (as `serve`); `0`
+        /// disables. Default 60.
+        #[arg(long, default_value_t = 60)]
+        compact_interval_secs: u64,
         /// Shared service token closing this node's data-plane gRPC to callers that don't present it —
         /// same gate as `serve`. Unset ⇒ open (single-node dev). Env: `GROWLERDB_SERVICE_TOKEN`.
         #[arg(long, env = "GROWLERDB_SERVICE_TOKEN")]
@@ -897,6 +901,7 @@ pub async fn run() -> anyhow::Result<()> {
             addr,
             register,
             advertise_addr,
+            compact_interval_secs,
             service_token,
             tls,
         } => {
@@ -907,6 +912,7 @@ pub async fn run() -> anyhow::Result<()> {
                 register.as_deref(),
                 advertise_addr.as_deref(),
                 metrics_addr.as_deref(),
+                compact_interval_secs,
                 service_token,
                 tls.load()?,
             )
@@ -2514,8 +2520,16 @@ async fn serve_windowed(
 /// per-index window map and mounts the [`Pool*` services](growlerdb_engine::PoolSearchService), which
 /// dispatch each request first on its `index` selector to that index's windows, then on the window.
 /// One process therefore fronts many indexes' windows — the interchangeable shard-host that removes
-/// the node-per-index wall. Reads only for now (writes + CP-driven dynamic placement are follow-ons);
-/// each index's windows are the pre-built set on disk.
+/// the node-per-index wall.
+///
+/// **Writes** dispatch the same way: a per-index [`WindowedWriteService`](growlerdb_engine::WindowedWriteService)
+/// (sharing that index's live window maps, so a window it creates on first write is immediately
+/// queryable) sits behind a [`PoolWriteService`](growlerdb_engine::PoolWriteService) that routes each
+/// `Write` / `GetCheckpoint` on the `(index, window)` selector — so the connector streams ingest to a
+/// pool node exactly as to a single-index windowed node, but for many indexes at once. Each served
+/// window gets its own auto-compaction loop (boot windows now, runtime-created windows via
+/// `on_new_window`). CP-driven **dynamic assignment** (loading a unit on demand rather than from the
+/// static `--index` list) and cold read-through in pool mode remain follow-ons.
 #[allow(clippy::too_many_arguments)]
 async fn serve_pool(
     data_dir: &str,
@@ -2524,12 +2538,14 @@ async fn serve_pool(
     register: Option<&str>,
     advertise_addr: Option<&str>,
     metrics_addr: Option<&str>,
+    compact_interval_secs: u64,
     service_token: Option<String>,
     tls: Option<tonic::transport::ServerTlsConfig>,
 ) -> anyhow::Result<()> {
     use growlerdb_engine::{
-        AdminService, LookupService, PoolAdminService, PoolLookupService, PoolSearchService,
-        PoolSuggestService, SearchService, ShardHandle, SuggestService,
+        AdminService, Gateway, LocalNode, LookupService, Node, OnNewWindow, PoolAdminService,
+        PoolLookupService, PoolSearchService, PoolSuggestService, PoolWriteService, SearchService,
+        ShardHandle, SharedSearchWindows, SuggestService, WindowSeed, WindowedWriteService,
     };
     use growlerdb_index::ShardId;
     use growlerdb_proto::v1::ServedWindow;
@@ -2539,15 +2555,18 @@ async fn serve_pool(
     use tonic::transport::Server;
 
     let store = growlerdb_index::LocalIndexStore::open(data_dir)?;
-    // The per-index window maps behind the four Pool multiplexers (index → window → service).
+    // The per-index window maps behind the four Pool read multiplexers (index → window → service),
+    // plus the per-index writers behind the Pool write multiplexer (index → windowed writer).
     let search_idx: growlerdb_engine::SharedSearchIndexes = Arc::new(RwLock::new(BTreeMap::new()));
     let suggest_idx: growlerdb_engine::SharedSuggestIndexes =
         Arc::new(RwLock::new(BTreeMap::new()));
     let lookup_idx: growlerdb_engine::SharedLookupIndexes = Arc::new(RwLock::new(BTreeMap::new()));
     let admin_idx: growlerdb_engine::SharedAdminIndexes = Arc::new(RwLock::new(BTreeMap::new()));
+    let write_idx: growlerdb_engine::SharedWriteIndexes = Arc::new(RwLock::new(BTreeMap::new()));
 
-    // Per-index (resolved def, served windows) for the CP announce when `--register` is set.
-    let mut announcements: Vec<(growlerdb_core::ResolvedIndex, Vec<ServedWindow>)> = Vec::new();
+    // Per-index (resolved def, writer) for the CP announce when `--register` is set: the writer's
+    // live `served_windows()` is read each re-announce, so a window created since boot is advertised.
+    let mut announcements: Vec<(growlerdb_core::ResolvedIndex, WindowedWriteService)> = Vec::new();
     // Per-index fair share of the node-wide heavy-read budget (D52 pool fairness): co-resident indexes
     // share one process, so cap each at an equal slice so a flood of exports/aggregations on one index
     // can't starve queries on another. `max(1)` guarantees every index at least one heavy permit.
@@ -2555,19 +2574,20 @@ async fn serve_pool(
     let mut total_windows = 0usize;
     for index in indexes {
         let resolved = load_resolved(data_dir, index)?;
-        anyhow::ensure!(
-            resolved.windowing.is_some(),
-            "serve-pool serves windowed indexes; `{index}` is not windowed"
-        );
+        let windowing = resolved.windowing.clone().ok_or_else(|| {
+            anyhow::anyhow!("serve-pool serves windowed indexes; `{index}` is not windowed")
+        })?;
         let table = match &resolved.source {
             growlerdb_core::Source::Iceberg(s) => s.table.clone(),
         };
-        // Open each of this index's window shards into the four per-window services. Cold read-through
-        // windows are not yet handled in pool mode (a follow-on) — pool serving targets hot windows.
+        // Open each of this index's window shards into the per-window read services + an in-process
+        // node (backing the write service's gateway swap), keyed as the writer's boot seed. Cold
+        // read-through windows are not yet handled in pool mode (a follow-on) — pool serving targets
+        // hot windows.
         let windows = store.window_shards(index)?;
         // One shared per-index heavy-read budget across all of this index's window services.
         let index_heavy = Arc::new(tokio::sync::Semaphore::new(per_index_heavy));
-        let (search_w, suggest_w, lookup_w, admin_w, served) = {
+        let (search_w, suggest_w, lookup_w, admin_w, seed, served) = {
             let (store, resolved, index_s, table, windows, index_heavy) = (
                 store.clone(),
                 resolved.clone(),
@@ -2581,6 +2601,7 @@ async fn serve_pool(
                 let mut suggest_w = BTreeMap::new();
                 let mut lookup_w = BTreeMap::new();
                 let mut admin_w = BTreeMap::new();
+                let mut seed: BTreeMap<i64, WindowSeed> = BTreeMap::new();
                 let mut served = Vec::with_capacity(windows.len());
                 for &w in &windows {
                     let shard =
@@ -2603,6 +2624,22 @@ async fn serve_pool(
                         ),
                     );
                     admin_w.insert(w, AdminService::new(handle.clone(), &index_s));
+                    // The in-process node fronting this window (the write service swaps its own
+                    // windowed gateway over these on new-window creation; not served over REST in
+                    // pool mode — a cluster gateway fronts pool nodes over gRPC).
+                    let node: Arc<dyn Node> = LocalNode::new(
+                        SearchService::new(handle.clone()),
+                        SuggestService::new(handle.clone()),
+                        LookupService::new(
+                            handle.clone(),
+                            IcebergConfig::from_env(),
+                            table.clone(),
+                            resolved.clone(),
+                        ),
+                        AdminService::new(handle.clone(), &index_s),
+                    )
+                    .shared();
+                    seed.insert(w, (handle, node, zone));
                     served.push(ServedWindow {
                         window: w,
                         event_min: zone.map(|(lo, _)| lo).unwrap_or(0),
@@ -2611,28 +2648,75 @@ async fn serve_pool(
                         cold: false,
                     });
                 }
-                Ok((search_w, suggest_w, lookup_w, admin_w, served))
+                Ok((search_w, suggest_w, lookup_w, admin_w, seed, served))
             })
             .await??
         };
         total_windows += windows.len();
+
+        // The shared window maps: the SAME Arcs back both the Pool read services and this index's
+        // writer, so a window the writer creates on first write is immediately queryable.
+        let search_shared: SharedSearchWindows = Arc::new(RwLock::new(search_w));
+        let suggest_shared = Arc::new(RwLock::new(suggest_w));
+        let lookup_shared = Arc::new(RwLock::new(lookup_w));
+        let admin_shared = Arc::new(RwLock::new(admin_w));
         search_idx
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(index.clone(), Arc::new(RwLock::new(search_w)));
+            .insert(index.clone(), search_shared.clone());
         suggest_idx
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(index.clone(), Arc::new(RwLock::new(suggest_w)));
+            .insert(index.clone(), suggest_shared.clone());
         lookup_idx
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(index.clone(), Arc::new(RwLock::new(lookup_w)));
+            .insert(index.clone(), lookup_shared.clone());
         admin_idx
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(index.clone(), Arc::new(RwLock::new(admin_w)));
-        announcements.push((resolved, served));
+            .insert(index.clone(), admin_shared.clone());
+
+        // The write service's in-process windowed gateway (rebuilt on new-window creation) + a
+        // per-window auto-compaction loop for the boot windows.
+        let nodes: Vec<Arc<dyn Node>> = seed.values().map(|(_, n, _)| n.clone()).collect();
+        // `(window, event-zone, cold=false)` descriptors for the writer's in-process gateway.
+        let descriptors = seed
+            .iter()
+            .map(|(w, (_, _, z))| (*w, *z, false))
+            .collect::<Vec<_>>();
+        for (w, (handle, _, _)) in &seed {
+            spawn_auto_compaction(
+                handle.clone(),
+                format!("{index} w{w}"),
+                compact_interval_secs,
+            );
+        }
+        let gateway = Arc::new(Gateway::windowed(nodes, windowing.clone(), descriptors));
+        let on_new_window: OnNewWindow = {
+            let idx = index.clone();
+            let ci = compact_interval_secs;
+            Arc::new(move |w, handle| spawn_auto_compaction(handle, format!("{idx} w{w}"), ci))
+        };
+        let write_service = WindowedWriteService::new(
+            store.clone(),
+            resolved.clone(),
+            table.clone(),
+            IcebergConfig::from_env(),
+            seed,
+            search_shared,
+            suggest_shared,
+            lookup_shared,
+            admin_shared,
+            gateway,
+            on_new_window,
+        )?;
+        write_idx
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(index.clone(), write_service.clone());
+        announcements.push((resolved, write_service));
+        let _ = served; // (per-window ServedWindow now re-read from the writer at announce time)
     }
 
     let socket: std::net::SocketAddr = addr
@@ -2675,6 +2759,7 @@ async fn serve_pool(
         .add_service(PoolSuggestService::new(suggest_idx).into_server())
         .add_service(PoolLookupService::new(lookup_idx).into_server())
         .add_service(PoolAdminService::new(admin_idx).into_server())
+        .add_service(PoolWriteService::new(write_idx).into_server())
         .add_service(SystemServer::new(SystemService::new(VERSION)))
         .serve_with_shutdown(socket, async {
             let _ = tokio::signal::ctrl_c().await;
@@ -4258,7 +4343,7 @@ fn spawn_pool_registration(
     endpoint: String,
     announcements: Vec<(
         growlerdb_core::ResolvedIndex,
-        Vec<growlerdb_proto::v1::ServedWindow>,
+        growlerdb_engine::WindowedWriteService,
     )>,
     readiness: growlerdb_telemetry::Readiness,
     label: String,
@@ -4270,16 +4355,19 @@ fn spawn_pool_registration(
                 let endpoint = endpoint.clone();
                 let announcements = announcements.clone();
                 async move {
-                    // Heartbeat into the pool first, then announce each served index's windows.
+                    // Heartbeat into the pool first, then announce each served index's windows —
+                    // read fresh from the writer each tick, so a window created since boot (or
+                    // since the last announce) is advertised, exactly as the single-index windowed
+                    // registration does.
                     register_node(&control_plane, &endpoint).await?;
-                    for (resolved, windows) in &announcements {
+                    for (resolved, writer) in &announcements {
                         register_served_index(
                             &control_plane,
                             &endpoint,
                             resolved,
                             1,
                             vec![],
-                            windows.clone(),
+                            writer.served_windows(),
                         )
                         .await?;
                     }

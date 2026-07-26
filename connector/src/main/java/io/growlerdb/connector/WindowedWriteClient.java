@@ -53,7 +53,9 @@ public final class WindowedWriteClient implements BatchWriter {
   public long write(DocBatch batch) {
     long maxSnapshot = 0L;
     for (var entry : partition(batch, windowRouter, windowClient.keySet()).entrySet()) {
-      maxSnapshot = Math.max(maxSnapshot, clientForWindow(entry.getKey()).write(entry.getValue()));
+      // Tag each sub-batch with this index, so a pool node serving many indexes dispatches it.
+      maxSnapshot =
+          Math.max(maxSnapshot, clientForWindow(entry.getKey()).write(entry.getValue(), index));
     }
     return maxSnapshot;
   }
@@ -150,7 +152,7 @@ public final class WindowedWriteClient implements BatchWriter {
         continue;
       }
       WriteClient client = byEndpoint.computeIfAbsent(s.getPrimary(), WindowedWriteClient::connect);
-      WriteClient.ShardCheckpoint cp = client.checkpoint(s.getWindow());
+      WriteClient.ShardCheckpoint cp = client.checkpoint(s.getWindow(), index);
       if (cp != null) {
         out.add(cp); // an un-committed (just-placed) window doesn't constrain resume
       }
