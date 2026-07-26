@@ -3486,7 +3486,7 @@ fn windowing_from_get_index(
 // `(window id, primary endpoint, cold)` per window. `cold` is in the fingerprint so a tier flip
 // (park/pre-warm) — same window, same placement — still triggers a gateway topology reload, keeping
 // `/v1/cold` live instead of frozen at the boot tier.
-type WindowFingerprint = Vec<(i64, String, bool)>;
+type WindowFingerprint = Vec<(i64, String, Vec<String>, bool)>;
 
 /// The windowed routing resolved from a live-CP `GetIndex`: one [`WindowNode`] per window (deduped by
 /// endpoint), the windowing config, the per-window zone-map descriptors, and the fingerprint.
@@ -3528,28 +3528,55 @@ async fn resolve_windowed_routing_cp(
                 s.window
             );
         }
-        let remote = match conns.get(&s.primary) {
-            Some(r) => r.clone(),
-            None => {
-                let r = connect_node(&s.primary, node_tls.clone())
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("window {} primary `{}`: {e}", s.window, s.primary)
-                    })?;
-                conns.insert(s.primary.clone(), r.clone());
-                r
+        // This window's **holders** (D53): the primary first, then its read replicas — deduped,
+        // blanks dropped. Each connects **lazily** so a currently-down holder doesn't fail the whole
+        // resolution (it fails fast at query time instead); a `FailoverNode` then serves each read
+        // from a live holder, failing a down primary over to a replica with no gap.
+        let mut holder_eps: Vec<String> = vec![s.primary.clone()];
+        for r in &s.replicas {
+            if !r.is_empty() && !holder_eps.contains(r) {
+                holder_eps.push(r.clone());
             }
-        };
-        nodes.push(growlerdb_engine::WindowNode::new(Arc::new(remote), index, s.window).shared());
+        }
+        let mut holders: Vec<Arc<dyn growlerdb_engine::Node>> =
+            Vec::with_capacity(holder_eps.len());
+        for ep in &holder_eps {
+            let remote = match conns.get(ep) {
+                Some(r) => r.clone(),
+                None => {
+                    let r = connect_node_lazy(ep, node_tls.clone())
+                        .map_err(|e| anyhow::anyhow!("window {} holder `{ep}`: {e}", s.window))?;
+                    conns.insert(ep.clone(), r.clone());
+                    r
+                }
+            };
+            holders.push(
+                growlerdb_engine::WindowNode::new(Arc::new(remote), index, s.window).shared(),
+            );
+        }
+        let mut holders = holders.into_iter();
+        let primary = holders.next().expect("holder_eps starts with the primary");
+        nodes.push(growlerdb_engine::FailoverNode::new(primary, holders.collect()).shared());
         descriptors.push((
             s.window,
             s.has_event_bounds.then_some((s.event_min, s.event_max)),
             s.cold,
         ));
     }
+    // Fingerprint the full holder set (primary + sorted replicas) so the routing loop re-resolves
+    // when the CP moves or re-replicates a window, not just on a primary change.
     let mut fingerprint: WindowFingerprint = windows
         .iter()
-        .map(|s| (s.window, s.primary.clone(), s.cold))
+        .map(|s| {
+            let mut reps: Vec<String> = s
+                .replicas
+                .iter()
+                .filter(|r| !r.is_empty())
+                .cloned()
+                .collect();
+            reps.sort();
+            (s.window, s.primary.clone(), reps, s.cold)
+        })
         .collect();
     fingerprint.sort();
     Ok((nodes, windowing, descriptors, fingerprint))
@@ -5374,6 +5401,55 @@ mod tests {
             },
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn windowed_routing_builds_failover_holders_from_replicas() {
+        // D53: each window resolves to a FailoverNode over its primary + replicas, and the routing
+        // fingerprint carries the full (primary + sorted replicas) holder set so a replica-set change
+        // re-resolves — not just a primary change. Lazy connect means the down holders don't dial.
+        use growlerdb_proto::v1::{GetIndexResponse, ShardStatus, WindowingConfig};
+        let resp = GetIndexResponse {
+            windowing: Some(WindowingConfig {
+                field: "ts".into(),
+                granularity: "daily".into(),
+                ..Default::default()
+            }),
+            shard_status: vec![
+                ShardStatus {
+                    window: 100,
+                    primary: "http://p:50051".into(),
+                    // Deliberately unsorted, to prove the fingerprint sorts them.
+                    replicas: vec!["http://r2:50051".into(), "http://r1:50051".into()],
+                    ..Default::default()
+                },
+                // A window with no replicas → a single-holder FailoverNode (the pre-D53 case).
+                ShardStatus {
+                    window: 200,
+                    primary: "http://p2:50051".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let (nodes, _windowing, descriptors, fp) = resolve_windowed_routing_cp("logs", &resp, None)
+            .await
+            .unwrap();
+        // One holder-group node (a FailoverNode) per window.
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(descriptors.len(), 2);
+        assert_eq!(
+            fp,
+            vec![
+                (
+                    100_i64,
+                    "http://p:50051".to_string(),
+                    vec!["http://r1:50051".to_string(), "http://r2:50051".to_string()],
+                    false
+                ),
+                (200_i64, "http://p2:50051".to_string(), vec![], false),
+            ]
+        );
     }
 
     #[test]
