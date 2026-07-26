@@ -6,13 +6,15 @@
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 
-/// The free tier: a deployment with at most this many distinct live index nodes needs no license.
-pub const FREE_NODE_LIMIT: usize = 3;
+/// The free tier: a deployment serving at most this many **primary-held units** (the D53/D52 scale
+/// metric — served data partitions, not raw node processes, so read replicas are free) needs no
+/// license. See [D38](/system/decisions/d38-scale-limit-entitlement.md).
+pub const FREE_UNIT_LIMIT: usize = 3;
 
 /// GrowlerDB LLC's license-signing **public** key (Ed25519) — the production key. Licenses are minted
 /// offline with the matching **private** key, which is held privately by GrowlerDB LLC and never lives
 /// in this repository; only this public half ships, to verify tokens at startup. The free tier works
-/// without any license — a valid license is only needed to exceed [`FREE_NODE_LIMIT`]. Rotating the key
+/// without any license — a valid license is only needed to exceed [`FREE_UNIT_LIMIT`]. Rotating the key
 /// means minting against a new keypair and shipping its public half here.
 const LICENSE_PUBLIC_KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
 MCowBQYDK2VwAyEAyizufq7Ro4/FzX0FhQqH2945GnMat7aYVr2Vf0kzGks=\n\
@@ -22,7 +24,8 @@ MCowBQYDK2VwAyEAyizufq7Ro4/FzX0FhQqH2945GnMat7aYVr2Vf0kzGks=\n\
 struct Claims {
     /// Who the license is issued to (shown in the console).
     licensee: String,
-    /// Maximum distinct index nodes this license entitles.
+    /// Maximum **primary-held units** this license entitles (the D53 scale metric — replicas are
+    /// free). The signed claim keeps the historical `max_nodes` name; its meaning is units.
     max_nodes: u32,
     /// Optional expiry (unix seconds). Parsed but NOT enforced yet — see task-266.
     #[serde(default)]

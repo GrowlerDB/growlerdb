@@ -337,7 +337,9 @@ async fn list_indexes_handler(
     Ok(Json(IndexListDto::from(resp.into_inner())))
 }
 
-/// Scale-limit license status for the console settings page (proxied to the control plane).
+/// Scale-limit license status for the console settings page (proxied to the control plane). The
+/// `*_nodes` fields keep their names but the accounting is **primary-held units** (D53) — replicas
+/// are free.
 #[derive(serde::Serialize)]
 struct LicenseDto {
     licensed: bool,

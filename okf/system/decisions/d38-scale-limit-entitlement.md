@@ -1,17 +1,26 @@
 ---
 type: Decision
 title: 'D38. Scale-limit entitlement (offline license)'
-description: The free tier runs up to a fixed node count; more requires an offline-verified Ed25519 license. New nodes are capped; existing nodes are never disrupted.
+description: The free tier serves up to a fixed number of primary-held units; more requires an offline-verified Ed25519 license. New units are capped at placement; existing units are never disrupted, and read replicas are free (D53).
 tags: [decision, adr]
 timestamp: 2026-07-11T00:00:00
 ---
 
 # D38. Scale-limit entitlement (offline license)
 
-**Decision.** The open-source tier runs up to a fixed number of index nodes per deployment
-(`FREE_NODE_LIMIT`) at no cost. Beyond that, the control plane refuses to admit **new** node
-registrations until a valid **Enterprise license** raises the cap — **existing nodes and data are never
-disrupted** (a re-heartbeat of a live node always passes; only genuinely new capacity is gated).
+**Decision.** The open-source tier serves up to a fixed number of **primary-held units** per deployment
+(`FREE_UNIT_LIMIT`) at no cost. Beyond that, the control plane refuses to place a **new** primary unit
+until a valid **Enterprise license** raises the cap — **existing units and data are never disrupted**
+(re-resolving an already-placed unit, or re-placing its dead owner, always passes; only genuinely new
+capacity is gated).
+
+**Counting units, not node processes ([D53](/system/decisions/d53-unit-replication.md)).** The metric
+is the number of `(index, shard|window)` units with an assigned **primary** — the served data
+partitions — enforced at unit **placement** (`ResolveUnitOwner`). Node registration (`RegisterNode`) is
+**uncapped**: a node is interchangeable pool capacity, and a **read replica is free** (it adds no new
+primary unit), so enabling replication (`R > 1`, more holder nodes) never consumes the allowance. The
+license claim keeps its historical `max_nodes` name, but its meaning is units; `GetLicense` reports
+current/entitled units.
 
 The license is a compact **Ed25519-signed token** (`GROWLERDB_LICENSE` on the control plane), verified
 **offline** against a public key baked into the binary — no phone-home
@@ -30,10 +39,10 @@ without removing any capability.
 the token via `credentials.license` in the Helm chart → the `GROWLERDB_LICENSE` env on the control
 plane (only the control plane enforces the cap). See `COMM-LICENSE.md` for the runbook.
 
-**Scale runs** should carry a license so all N nodes are admitted **deterministically**: the cap is
-**leaky under staggered pod startup** — heartbeat-TTL gaps during the boot race can let more than
-`FREE_NODE_LIMIT` nodes into the registry, and re-heartbeats then keep them (Run 8 reached 6/6 this
-way). That leak is race-dependent and must not be relied on ([TASK-346]).
+**Scale runs** should carry a license so all N units are admitted **deterministically**. Since the cap
+is now on **units placed** (not nodes registered), placement is serialized through the CP so counting is
+exact — the old node-registration leak under staggered pod startup no longer applies (nodes are
+uncapped). A scale run beyond `FREE_UNIT_LIMIT` units still needs a license ([TASK-346]).
 
 **Status.** Accepted. The embedded `LICENSE_PUBLIC_KEY_PEM` is currently a **placeholder** (its private
 key was discarded), so no license validates yet — installing the real signing keypair + minting the

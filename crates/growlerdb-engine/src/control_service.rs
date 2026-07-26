@@ -251,12 +251,13 @@ impl ControlPlaneService {
         self
     }
 
-    /// The entitled node cap: the license's `max_nodes`, or [`FREE_NODE_LIMIT`](crate::license::FREE_NODE_LIMIT).
-    fn entitled_nodes(&self) -> usize {
+    /// The entitled cap in **primary-held units** (D53): the license's `max_nodes` claim (whose
+    /// meaning is now units — replicas are free), or [`FREE_UNIT_LIMIT`](crate::license::FREE_UNIT_LIMIT).
+    fn entitled_units(&self) -> usize {
         self.license
             .as_ref()
             .map(|l| l.max_nodes as usize)
-            .unwrap_or(crate::license::FREE_NODE_LIMIT)
+            .unwrap_or(crate::license::FREE_UNIT_LIMIT)
     }
 
     /// Install an [authenticator](crate::authn) so the control plane validates the bearer itself —
@@ -1439,21 +1440,12 @@ impl ControlPlane for ControlPlaneService {
         }
         // A liveness heartbeat into the CP placement pool; the CP stamps its own clock so a
         // skewed node clock can't fake liveness. In-memory only — no persist. The pool is
-        // index-agnostic (D52): a node registers once as an interchangeable shard host. The scale
-        // limit caps *new* nodes at the
-        // entitlement (free tier or license); re-heartbeats of a live node always pass, so an
-        // existing cluster is never disrupted.
-        let limit = self.entitled_nodes();
-        if let Err(current) = self
-            .registry
-            .register_node_capped(&req.endpoint, now_ms(), limit)
-        {
-            return Err(Status::resource_exhausted(format!(
-                "scale limit reached: {current} nodes registered, entitlement is {limit} (free tier \
-                 is {}). An Enterprise license raises the limit — see COMM-LICENSE.md.",
-                crate::license::FREE_NODE_LIMIT
-            )));
-        }
+        // index-agnostic (D52): a node registers once as an interchangeable shard host.
+        //
+        // Node registration is **uncapped** (D53): the scale entitlement counts *primary-held units*,
+        // not node processes, so a read-replica node adds capacity for free and never trips a node
+        // limit — the cap is enforced at unit placement (`ResolveUnitOwner`) instead.
+        self.registry.register_node(&req.endpoint, now_ms());
         Ok(Response::new(RegisterNodeResponse {}))
     }
 
@@ -1469,8 +1461,10 @@ impl ControlPlane for ControlPlaneService {
                 .as_ref()
                 .map(|l| l.licensee.clone())
                 .unwrap_or_default(),
-            max_nodes: self.entitled_nodes() as u32,
-            current_nodes: self.registry.distinct_live_nodes(now_ms()) as u32,
+            // The proto fields keep their historical `*_nodes` names, but the accounting is now
+            // **primary-held units** (D53): replicas don't count, so HA never eats the free tier.
+            max_nodes: self.entitled_units() as u32,
+            current_nodes: self.registry.count_primary_units() as u32,
         }))
     }
 
@@ -1491,6 +1485,23 @@ impl ControlPlane for ControlPlaneService {
                 ))
             }
         };
+        // Scale-limit entitlement (D38/D53): the cap is on **primary-held units**, enforced here at
+        // placement (node registration is uncapped). A *new* unit — one with no primary yet — beyond
+        // the entitlement is refused; re-resolving an existing unit, or re-placing its dead owner,
+        // always passes (it's already counted), so a live cluster is never disrupted. Replicas are
+        // free (a replica adds no new primary unit).
+        let entitled = self.entitled_units();
+        if !self.registry.unit_has_primary(&req.index, unit)
+            && self.registry.count_primary_units() >= entitled
+        {
+            return Err(Status::resource_exhausted(format!(
+                "scale limit reached: {} primary units serving, entitlement is {entitled} (free tier \
+                 is {}). Read replicas are free; an Enterprise license raises the unit limit — see \
+                 COMM-LICENSE.md.",
+                self.registry.count_primary_units(),
+                crate::license::FREE_UNIT_LIMIT,
+            )));
+        }
         // No node has heartbeated yet (a transient bring-up state) → retryable, so the connector
         // backs off and re-asks rather than failing the ingest batch.
         let to_status = |e: RegistryError| match e {
@@ -2295,6 +2306,94 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn entitlement_counts_primary_units_not_node_processes() {
+        // D53/D38: the scale cap is on PRIMARY-HELD UNITS, enforced at placement — node registration
+        // is uncapped, so replica nodes join freely. Free tier = FREE_UNIT_LIMIT (3) units.
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path()); // R=1, no license → 3-unit free tier
+        svc.registry.create(resolved_windowed("logs")).unwrap();
+        // Register MORE nodes than the old node cap — registration is now uncapped.
+        for i in 0..6 {
+            svc.register_node(Request::new(RegisterNodeRequest {
+                endpoint: format!("http://n{i}:50051"),
+            }))
+            .await
+            .unwrap();
+        }
+        let resolve = |w: i64| {
+            svc.resolve_unit_owner(Request::new(ResolveUnitOwnerRequest {
+                index: "logs".into(),
+                unit: Some(growlerdb_proto::v1::resolve_unit_owner_request::Unit::Window(w)),
+            }))
+        };
+        // Three window units = three primary units → all within the free tier.
+        for w in [10_i64, 20, 30] {
+            assert!(
+                resolve(w).await.is_ok(),
+                "unit {w} within the 3-unit free tier"
+            );
+        }
+        // A fourth NEW unit exceeds the 3-unit entitlement.
+        assert_eq!(
+            resolve(40).await.unwrap_err().code(),
+            Code::ResourceExhausted,
+            "a 4th primary unit is over the free-tier unit limit"
+        );
+        // Re-resolving an already-placed unit still passes (it's already counted).
+        assert!(
+            resolve(10).await.is_ok(),
+            "idempotent re-resolve isn't a new unit"
+        );
+        // GetLicense reports PRIMARY UNITS (3), not the 6 registered nodes.
+        let lic = svc
+            .get_license(Request::new(GetLicenseRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            lic.current_nodes, 3,
+            "3 primary units serving (not 6 nodes)"
+        );
+        assert_eq!(lic.max_nodes, 3, "free-tier unit entitlement");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replicas_are_free_against_the_unit_entitlement() {
+        // AC#1: enabling replication (R>1) doesn't reduce the allowance — a replica is no new primary.
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path()).with_replication_factor(2);
+        svc.registry.create(resolved_windowed("logs")).unwrap();
+        for i in 0..4 {
+            svc.register_node(Request::new(RegisterNodeRequest {
+                endpoint: format!("http://n{i}:50051"),
+            }))
+            .await
+            .unwrap();
+        }
+        // 3 units at R=2 = 3 primaries + 3 replicas = 6 holder slots, but only 3 PRIMARY units.
+        for w in [10_i64, 20, 30] {
+            assert!(
+                svc.resolve_unit_owner(Request::new(ResolveUnitOwnerRequest {
+                    index: "logs".into(),
+                    unit: Some(growlerdb_proto::v1::resolve_unit_owner_request::Unit::Window(w)),
+                }))
+                .await
+                .is_ok(),
+                "unit {w} places its primary + replica within the free tier"
+            );
+        }
+        let lic = svc
+            .get_license(Request::new(GetLicenseRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            lic.current_nodes, 3,
+            "3 primary units — the 3 read replicas don't consume the entitlement"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn subscribe_assignments_pushes_placement_to_the_holder_node() {
         // D53 push: a node subscribes and, when the CP places a unit that lands on it (as primary or
         // replica), the node's stream is pushed a fresh snapshot carrying that unit — so a placed
@@ -2359,7 +2458,13 @@ mod tests {
         // Nodes heartbeat into the pool (RegisterNode), the connector resolves each window's
         // owner (ResolveUnitOwner, placing on first ask), and GetIndex reflects the placement.
         let tmp = tempfile::tempdir().unwrap();
-        let svc = service(tmp.path());
+        // A license raises the unit entitlement above the free tier so this 4-window placement
+        // isn't scale-gated (the free-tier unit cap is covered by its own test).
+        let svc = service(tmp.path()).with_license(Some(crate::license::License {
+            licensee: "test".into(),
+            max_nodes: 100,
+            expires_at: None,
+        }));
         svc.registry.create(resolved_windowed("logs")).unwrap();
 
         let resolve = |w: i64| {
