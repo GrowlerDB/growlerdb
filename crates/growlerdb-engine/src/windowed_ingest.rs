@@ -760,7 +760,18 @@ mod tests {
                 std::fs::copy(e.path(), cold.join(e.file_name())).unwrap();
             }
         }
-        std::fs::remove_dir_all(&index_dir).unwrap();
+        // Evict the local copy. Unlike the CLI park loop (which only parks windows past their
+        // write horizon), the test parks a just-written window, so a tantivy merge thread can
+        // still drop a segment file into the dir mid-removal — retry briefly until it quiesces.
+        for attempt in 0.. {
+            match std::fs::remove_dir_all(&index_dir) {
+                Ok(()) => break,
+                Err(_) if attempt < 50 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("evicting {index_dir:?}: {e}"),
+            }
+        }
         let op = opendal::Operator::new(
             opendal::services::Fs::default().root(&store_root.path().to_string_lossy()),
         )

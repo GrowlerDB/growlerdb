@@ -148,14 +148,17 @@ and **CP replica/leader loss under mutation** (assert routing + registration con
 
 ## Status
 
-**Built on `feat/true-ha`, under audit-driven hardening.** The D51–D53 slices have landed on the
-feature branch (CP backend seam → externalized store → placement pool → per-unit replication →
-cold-tier fast-bootstrap → chaos drills). A full adversarial audit of the branch
+**Built and audit-hardened on `feat/true-ha`, awaiting the feature → `main` PR.** The D51–D53
+slices landed on the feature branch (CP backend seam → externalized store → placement pool →
+per-unit replication → cold-tier fast-bootstrap → chaos drills). A full adversarial audit
 ([2026-07-26 audit](/quality/audits/2026-07-26-true-ha-adversarial-review.md)) found the
-steady-state plumbing sound but the topology-change paths incomplete — write fencing, failover
-error handling, CP leader handoff, connector placement refresh, and the Helm rollout/PDB
-lifecycle — tracked as fix subtasks of the `true-ha` epic and being closed on the same branch
-before the feature → `main` PR. Until that PR merges, HA on `main` is as the
+steady-state plumbing sound but the topology-change paths incomplete; all fourteen fix tasks
+(357.12–357.25 — write fencing, failover error handling, CP leader handoff, placement
+push/sweep/entitlement, connector placement refresh, Helm rollout/PDB lifecycle, CI Postgres lane,
+serve-pool ops, fairness) are closed on the same branch, with one follow-up open (357.26,
+proactive replica top-up when capacity joins). Known residual scope: hot windows have a single
+live copy until hot-tail shipping
+([windowed replica gap](/quality/known-limitations/windowed-replica-gap.md)). Until that PR merges, HA on `main` is as the
 [availability](/product/non-functional/availability.md) NFR and
 [sharded HA](/system/deployment/sharded-ha.md) describe: shards spread + PDBs + PV self-heal + honest
 partial results, with the CP a single instance.
