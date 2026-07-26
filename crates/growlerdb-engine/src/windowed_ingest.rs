@@ -469,6 +469,54 @@ impl WindowedWriteService {
             .swap_windowed(nodes, self.windowing.clone(), descriptors);
     }
 
+    /// **Unload** `window` from this node's serving set (D53 de-assignment, HA-G1): remove its
+    /// entries from the shared read mux maps (search/suggest/lookup/admin — the same Arcs the pool
+    /// multiplexers front, so the window stops being routable immediately) and from this writer's
+    /// authoritative window states, then rebuild the in-process gateway without it. Dropping the
+    /// map entries is safe for in-flight requests: the muxes **clone the service (an `Arc`'d shard
+    /// handle) out from under the read lock** before dispatching, so the last clone keeps the shard
+    /// (mmaps and all) alive until those requests finish — removal only unpublishes. A replica-held
+    /// (read-through) window has mux entries but no writer state; both shapes are handled. Returns
+    /// `true` iff the node was actually serving the window (anything was removed).
+    pub fn unload_window(&self, window: i64) -> bool {
+        let mut any = false;
+        any |= self
+            .search
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&window)
+            .is_some();
+        any |= self
+            .suggest
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&window)
+            .is_some();
+        any |= self
+            .lookup
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&window)
+            .is_some();
+        any |= self
+            .admin
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&window)
+            .is_some();
+        let had_state = self
+            .windows
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&window)
+            .is_some();
+        if had_state {
+            // The node's own in-process gateway (REST scatter) must drop the window too.
+            self.publish_new_windows(&[]);
+        }
+        any || had_state
+    }
+
     /// The windows this node currently serves, as [`ServedWindow`]s for control-plane registration —
     /// read fresh each announce so a window created since boot is advertised.
     pub fn served_windows(&self) -> Vec<ServedWindow> {

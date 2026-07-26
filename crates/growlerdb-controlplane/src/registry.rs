@@ -456,6 +456,14 @@ pub struct Registry {
     /// re-registers within a heartbeat interval, so persisting it would only add write amplification.
     /// Unit *assignments* (which node owns a shard/window) stay durable in [`IndexEntry`].
     node_pool: RwLock<BTreeMap<String, i64>>,
+    /// The endpoints whose **latest heartbeat declared replica capability** (HA-G2): the node has an
+    /// object store configured, so it can open replica windows read-through (D53). Replica top-up
+    /// places ONLY on these — a node that never declares (old binary, `--register` without an
+    /// object store) never receives replica units it could not serve. In-memory beside
+    /// [`node_pool`](Self::node_pool) (same ephemeral-liveness rationale); membership is refreshed
+    /// on every heartbeat, so a node that loses its object store stops attracting new replicas
+    /// within one re-announce.
+    replica_capable: RwLock<BTreeSet<String>>,
     /// **Placement-change hook** (HA-D1): invoked after any successful persist/reload whose
     /// placement fingerprint differs from the last one — the single choke point that pushes fresh
     /// assignment snapshots to subscribed nodes. Lives at the persist boundary (not per mutation) so
@@ -524,6 +532,7 @@ impl Registry {
             flush_lock: std::sync::Mutex::new(()),
             rollback_failed: std::sync::atomic::AtomicBool::new(false),
             node_pool: RwLock::new(BTreeMap::new()),
+            replica_capable: RwLock::new(BTreeSet::new()),
             placement_listener: RwLock::new(None),
             last_placement_hash: std::sync::Mutex::new(0),
             grace_anchor_ms: std::sync::atomic::AtomicI64::new(-1),
@@ -1839,11 +1848,42 @@ impl Registry {
     /// calls this on registration + on an interval to stay eligible for unit placement. In-memory
     /// only; `now_ms` is the control plane's wall clock. The pool is index-agnostic — a node is an
     /// interchangeable shard host, not bound to one index.
+    ///
+    /// Convenience form that declares the node **replica-capable** — the common case in tests and
+    /// the historical behavior. The RPC handler goes through
+    /// [`register_node_with_capability`](Self::register_node_with_capability) with the flag the node
+    /// actually sent (HA-G2), so an object-store-less node never attracts replica placements.
     pub fn register_node(&self, endpoint: &str, now_ms: i64) {
+        self.register_node_with_capability(endpoint, true, now_ms);
+    }
+
+    /// [`register_node`](Self::register_node) with an explicit **replica capability** declaration
+    /// (HA-G2): `replica_capable = true` iff the node has an object store configured and can open
+    /// replica windows read-through (D53). Replica top-up in
+    /// [`resolve_unit_holders`](Self::resolve_unit_holders) places only on currently-capable nodes;
+    /// primaries are unaffected. Refreshed every heartbeat — a `false` after a `true` (the node lost
+    /// its object store config) removes it from the capable set.
+    pub fn register_node_with_capability(
+        &self,
+        endpoint: &str,
+        replica_capable: bool,
+        now_ms: i64,
+    ) {
         self.node_pool
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(endpoint.to_string(), now_ms);
+        {
+            let mut cap = self
+                .replica_capable
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            if replica_capable {
+                cap.insert(endpoint.to_string());
+            } else {
+                cap.remove(endpoint);
+            }
+        }
         // First heartbeat since boot/promotion arms the liveness grace anchor (HA-D5): for one TTL
         // from here, owners that haven't re-registered yet are treated live-unknown.
         let _ = self.grace_anchor_ms.compare_exchange(
@@ -1942,6 +1982,12 @@ impl Registry {
             }
         }
         pool.insert(endpoint.to_string(), now_ms);
+        drop(pool);
+        // Same default as `register_node`: the capped convenience form declares capability.
+        self.replica_capable
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(endpoint.to_string());
         Ok(())
     }
 
@@ -2218,14 +2264,29 @@ impl Registry {
             moved = true;
         }
 
-        // 3. Top up replicas toward R−1 on least-loaded live nodes not already holding the unit.
+        // 3. Top up replicas toward R−1 on least-loaded live **replica-capable** nodes not already
+        //    holding the unit. Capability (HA-G2) filters REPLICAS only: a replica is served
+        //    read-through from the object store, so a node without one could never answer for it —
+        //    placing there would silently absent HA. Primaries (step 2) are unaffected.
+        let incapable: BTreeSet<String> = {
+            let cap = self
+                .replica_capable
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            live_set
+                .iter()
+                .filter(|e| !cap.contains(*e))
+                .cloned()
+                .collect()
+        };
         while a.replicas.len() + 1 < r {
             let mut exclude: BTreeSet<String> = a.replicas.iter().map(|n| n.0.clone()).collect();
             if let Some(p) = &a.primary {
                 exclude.insert(p.0.clone());
             }
+            exclude.extend(incapable.iter().cloned());
             let Some(pick) = pick_least_loaded(&load, &exclude) else {
-                break; // fewer live nodes than R — hold what we can
+                break; // fewer live capable nodes than R — hold what we can
             };
             *load.get_mut(&pick).expect("picked a live node") += 1;
             a.replicas.push(pick.into());
@@ -3892,6 +3953,91 @@ mod tests {
             reg.shard_map("idx").unwrap()[&0].replicas.is_empty(),
             "R=1 holds no replicas after promotion + trim"
         );
+    }
+
+    #[test]
+    fn replicas_place_only_on_replica_capable_nodes() {
+        // HA-G2: a node without an object store can never serve a replica window read-through, so
+        // replica selection must skip it — placing there would silently absent HA. Primaries are
+        // unaffected by capability.
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
+        reg.create(resolved("idx")).unwrap();
+        let t0 = 1_000_000;
+        reg.register_node_with_capability("node-a", true, t0);
+        reg.register_node_with_capability("node-b", true, t0);
+        reg.register_node_with_capability("node-c", false, t0);
+        let h = reg
+            .resolve_unit_holders("idx", Unit::Window(1), 3, usize::MAX, t0)
+            .unwrap();
+        assert_eq!(h.primary, "node-a", "least-loaded primary, tie → first");
+        assert_eq!(
+            h.replicas,
+            vec!["node-b".to_string()],
+            "R=3 with one other CAPABLE node holds what it can — never the incapable node"
+        );
+    }
+
+    #[test]
+    fn replica_top_up_skips_incapable_nodes_and_capability_refreshes_per_heartbeat() {
+        // The top-up path (an existing unit re-resolved at a higher R) filters on capability too,
+        // and capability follows the LATEST heartbeat: a node that loses its object store stops
+        // attracting new replicas, while an incapable node can still take a primary.
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
+        reg.create(resolved("idx")).unwrap();
+        let t0 = 1_000_000;
+        reg.register_node_with_capability("node-a", true, t0);
+        reg.register_node_with_capability("node-b", false, t0);
+        reg.register_node_with_capability("node-c", true, t0);
+        // Disarm the startup grace so the assigned-unit re-resolve below isn't frozen by it.
+        reg.set_placement_grace_anchor(t0 - NODE_HEARTBEAT_TTL_MS - 1);
+        let h1 = reg
+            .resolve_unit_holders("idx", Unit::Window(1), 1, usize::MAX, t0)
+            .unwrap();
+        assert_eq!((h1.primary.as_str(), h1.replicas.len()), ("node-a", 0));
+        // R raised to 3: top-up may only pick node-c (node-b is live but incapable).
+        let h3 = reg
+            .resolve_unit_holders("idx", Unit::Window(1), 3, usize::MAX, t0)
+            .unwrap();
+        assert_eq!(h3.primary, "node-a", "top-up never moves the primary");
+        assert_eq!(
+            h3.replicas,
+            vec!["node-c".to_string()],
+            "the top-up placed the capable node and skipped the incapable one"
+        );
+        // The next heartbeats withdraw capability everywhere (object stores lost) → a fresh unit
+        // finds NO replica slot at all (without the filter, top-up would happily place two), but
+        // still gets a primary — which may be an incapable node (least-loaded is node-b here).
+        reg.register_node_with_capability("node-a", false, t0);
+        reg.register_node_with_capability("node-c", false, t0);
+        let h = reg
+            .resolve_unit_holders("idx", Unit::Window(2), 3, usize::MAX, t0)
+            .unwrap();
+        assert_eq!(
+            h.primary, "node-b",
+            "primaries are placed by load alone — capability never gates them"
+        );
+        assert!(
+            h.replicas.is_empty(),
+            "no capable node left ⇒ hold what we can (zero replicas), never a bogus placement"
+        );
+    }
+
+    #[test]
+    fn register_node_defaults_to_replica_capable() {
+        // The convenience heartbeat (tests, in-process callers) keeps the historical intent:
+        // a plainly-registered node is a full holder, so R>1 fixtures keep placing replicas.
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
+        reg.create(resolved("idx")).unwrap();
+        let t0 = 1_000_000;
+        reg.register_node("node-a", t0);
+        reg.register_node("node-b", t0);
+        let h = reg
+            .resolve_unit_holders("idx", Unit::Window(1), 2, usize::MAX, t0)
+            .unwrap();
+        assert_eq!(h.replicas.len(), 1, "default-capable nodes take replicas");
     }
 
     #[test]

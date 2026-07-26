@@ -146,12 +146,30 @@ pub fn s3_store(cfg: &S3Config) -> Result<Operator> {
     Ok(with_retry(Operator::new(b)?.finish()))
 }
 
+/// Hidden directory (under the fs store root) where [`fs_store`] stages writes before the atomic
+/// rename into place. Never collides with GrowlerDB object keys — every store listing/deletion is
+/// prefix-scoped (`backups/…`, `cold/…`), never the bare root.
+pub const FS_ATOMIC_WRITE_DIR: &str = ".atomic-writes";
+
 /// An [`Operator`] over a local directory — a filesystem backup target (mounted volume / NFS),
 /// and the backend the tests use. Retries transient failures (NFS can blip too).
+///
+/// **Writes are atomic** (HA-G4): opendal's fs service writes in place by default, so a concurrent
+/// reader — a replica fetching `cold.json` / `manifest.json` while a re-park overwrites it — could
+/// observe a torn object. `atomic_write_dir` makes every write land in a tempfile under
+/// [`FS_ATOMIC_WRITE_DIR`] and **rename** into place on close; POSIX rename is atomic on one
+/// filesystem, which holds because the staging dir lives under the same root. S3-style backends
+/// need none of this (a PUT is already all-or-nothing) and are untouched. A crash mid-write can
+/// leave a stale tempfile behind — harmless, bounded by write frequency, and outside every listed
+/// prefix.
 pub fn fs_store(root: impl AsRef<Path>) -> Result<Operator> {
     let root = root.as_ref();
     std::fs::create_dir_all(root)?;
-    let b = opendal::services::Fs::default().root(&root.to_string_lossy());
+    let atomic = root.join(FS_ATOMIC_WRITE_DIR);
+    std::fs::create_dir_all(&atomic)?;
+    let b = opendal::services::Fs::default()
+        .root(&root.to_string_lossy())
+        .atomic_write_dir(&atomic.to_string_lossy());
     Ok(with_retry(Operator::new(b)?.finish()))
 }
 
@@ -847,6 +865,55 @@ mod tests {
             iceberg_file: "f".into(),
             row_position: 0,
         }
+    }
+
+    /// HA-G4: the local-fs object store must never overwrite an object **in place** — a replica
+    /// reading `cold.json`/`manifest.json` while a re-park rewrites it would see a torn object.
+    /// [`fs_store`] stages every write in the hidden [`FS_ATOMIC_WRITE_DIR`] and renames it into
+    /// place: proven here by the object's **inode changing** across an overwrite (an in-place write
+    /// keeps the inode; a rename swaps in a new file), with no tempfile leak and no staging-dir
+    /// pollution of prefix-scoped listings.
+    #[tokio::test]
+    async fn fs_store_overwrites_are_atomic_renames_not_in_place_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let op = fs_store(tmp.path()).unwrap();
+        let key = "cold/logs/w1/cold.json";
+        op.write(key, vec![b'a'; 4096]).await.unwrap();
+        let on_disk = tmp.path().join(key);
+        #[cfg(unix)]
+        let ino_before = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&on_disk).unwrap().ino()
+        };
+        op.write(key, vec![b'b'; 8192]).await.unwrap();
+        assert_eq!(
+            op.read(key).await.unwrap().to_vec(),
+            vec![b'b'; 8192],
+            "the overwrite is fully visible"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_ne!(
+                ino_before,
+                std::fs::metadata(&on_disk).unwrap().ino(),
+                "an overwrite must REPLACE the object via rename (new inode), never patch the \
+                 bytes a concurrent reader may hold open"
+            );
+        }
+        // Completed writes drain their tempfiles, and the staging dir stays invisible to the
+        // prefix-scoped listings every consumer uses.
+        let staging = tmp.path().join(FS_ATOMIC_WRITE_DIR);
+        assert!(staging.is_dir());
+        assert_eq!(
+            std::fs::read_dir(&staging).unwrap().count(),
+            0,
+            "no tempfile leaks after completed writes"
+        );
+        assert_eq!(
+            list_object_keys(&op, "cold/").await.unwrap(),
+            vec![key.to_string()]
+        );
     }
 
     /// The torn-refresh hazard and its guard. A refresh pass fetches the mutable objects

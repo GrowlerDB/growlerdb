@@ -363,6 +363,13 @@ message RegisterNodeRequest {
   // (non-empty, `[http[s]://]host:port`) — a malformed endpoint is INVALID_ARGUMENT, never a pool
   // entry that placement could prefer.
   string endpoint = 2;
+  // Whether this node can serve **read replicas** (D53): replica windows are opened read-through
+  // from the shared object store, so only a node with an object store configured can serve them.
+  // The CP places replica units ONLY on nodes that declared this on their latest heartbeat —
+  // absent/false (including every pre-capability binary) means replicas never land here, instead of
+  // being silently assigned to a node that can never serve them (HA-G2). Primaries are unaffected:
+  // a primary writes its own local shard and needs no object store to serve it.
+  bool replica_capable = 3;
 }
 message RegisterNodeResponse {}
 

@@ -219,6 +219,140 @@ async fn serve_pool_dispatches_search_across_two_indexes() {
     );
 }
 
+/// HA-G4: one corrupt window shard must be QUARANTINED at boot — logged and skipped — not fail the
+/// whole multi-index pool process. The healthy index keeps serving; the poisoned unit answers the
+/// structured `UNIT_NOT_SERVED` refusal (the stale-route signal a registered pool's CP/gateway
+/// walk past), exactly as if the node never held it.
+#[tokio::test]
+async fn serve_pool_quarantines_a_corrupt_window_shard_and_serves_the_rest() {
+    let tmp = tempfile::tempdir().unwrap();
+    build_windowed_index(tmp.path(), "alpha", "alphadoc");
+    build_windowed_index(tmp.path(), "beta", "betadoc");
+    // Poison alpha/w10: garbage over the Tantivy meta so the shard cannot open.
+    std::fs::write(
+        tmp.path()
+            .join("alpha")
+            .join("w10")
+            .join("index")
+            .join("meta.json"),
+        b"{ definitely not tantivy meta",
+    )
+    .unwrap();
+
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let addr = format!("127.0.0.1:{port}");
+    let _server = Server(
+        Command::new(env!("CARGO_BIN_EXE_growlerdb"))
+            .args([
+                "--data-dir",
+                tmp.path().to_str().unwrap(),
+                "serve-pool",
+                "--index",
+                "alpha",
+                "--index",
+                "beta",
+                "--addr",
+                &addr,
+            ])
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn growlerdb serve-pool"),
+    );
+
+    // The process came up (a pre-fix binary crashed here) and the healthy index serves.
+    let mut client = connect(&format!("http://{addr}")).await;
+    assert_eq!(
+        search_ids(&mut client, "beta", 10).await,
+        vec!["betadoc"],
+        "the healthy index serves despite the sibling's corrupt shard"
+    );
+    // The quarantined unit is a structured refusal, not a crash and not a silent empty page.
+    let err = client
+        .search(SearchRequest {
+            query: "*".into(),
+            limit: 10,
+            index: "alpha".into(),
+            window: 10,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        growlerdb_engine::is_unit_not_served(&err),
+        "a quarantined shard reads as not-served: {err:?}"
+    );
+}
+
+/// HA-G4: plain Kubernetes stops a pod with SIGTERM (only the Helm preStop sends SIGINT) — the
+/// node must drain and exit cleanly on it, not die on the default disposition mid-request.
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_pool_shuts_down_cleanly_on_sigterm() {
+    use std::io::Read;
+
+    let tmp = tempfile::tempdir().unwrap();
+    build_windowed_index(tmp.path(), "alpha", "alphadoc");
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let addr = format!("127.0.0.1:{port}");
+    let mut server = Server(
+        Command::new(env!("CARGO_BIN_EXE_growlerdb"))
+            .args([
+                "--data-dir",
+                tmp.path().to_str().unwrap(),
+                "serve-pool",
+                "--index",
+                "alpha",
+                "--addr",
+                &addr,
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn growlerdb serve-pool"),
+    );
+    // Fully up and serving before the signal.
+    let mut client = connect(&format!("http://{addr}")).await;
+    assert_eq!(search_ids(&mut client, "alpha", 10).await, vec!["alphadoc"]);
+
+    let status = Command::new("kill")
+        .args(["-TERM", &server.0.id().to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(status.success(), "kill -TERM delivered");
+    // Graceful drain: the process exits ZERO within a bounded wait (an unhandled SIGTERM would be
+    // a signal death — non-zero / signaled).
+    let exited = {
+        let mut exited = None;
+        for _ in 0..200 {
+            if let Some(st) = server.0.try_wait().expect("try_wait") {
+                exited = Some(st);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        exited.expect("serve-pool did not exit within 10s of SIGTERM")
+    };
+    assert!(exited.success(), "clean zero exit on SIGTERM: {exited:?}");
+    let mut out = String::new();
+    server
+        .0
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .read_to_string(&mut out)
+        .unwrap();
+    assert!(
+        out.contains("shut down cleanly"),
+        "the graceful-shutdown path ran (stdout: {out:?})"
+    );
+}
+
 #[tokio::test]
 async fn serve_pool_dispatches_writes_across_two_indexes_and_creates_windows_lazily() {
     // One day in epoch-ms / canonical-micros: a `ts` of `n` days lands in daily window `n * DAY_US`.

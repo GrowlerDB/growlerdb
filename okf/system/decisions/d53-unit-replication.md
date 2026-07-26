@@ -59,7 +59,13 @@ follow-up. **One-writer enforcement is node-side too**: a holder running from CP
 atomically-swapped primary-holder view and refuses `Write`/`GetCheckpoint` for units it does not hold
 as primary (structured `NOT_PRIMARY`; a replica-held read-through window is never overwritten by a
 misrouted write) — so a stale or split-brain connector cannot commit to, or fabricate a resume
-checkpoint on, a demoted/replica holder (see the [node](/system/runtime/components/node.md)). New
+checkpoint on, a demoted/replica holder (see the [node](/system/runtime/components/node.md)).
+**Replica serving requires the object store**, so it becomes a node *capability*: the pool heartbeat
+carries a `replica_capable` declaration and placement puts replica units **only on capable nodes** —
+a store-less node still hosts primaries but never silently absorbs replicas it could not serve
+(HA-G2). And assignment reconcile must be a **two-way sync**: a de-assigned unit is *unloaded*
+(mux entries, writer state, read-through scratch), or every node accretes mmaps and scratch for
+every unit it ever held (HA-G1). New
 [chaos](/quality/reliability.md) drills assert zero-gap failover (kill a unit's primary
 under sustained query, assert no `partial` and continued answers with a live replica).
 

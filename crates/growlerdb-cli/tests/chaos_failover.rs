@@ -145,6 +145,30 @@ async fn wait_for_grpc(endpoint: &str) {
     panic!("process did not come up at {endpoint}");
 }
 
+/// Poll a node's `/readyz` (its `--metrics-addr`) until it reports ready — i.e. the node's first
+/// pool registration succeeded. The R=2 drills must hold the FIRST resolve until **both** nodes
+/// are in the placement pool: a resolve that lands while only one node has registered places a
+/// single holder, and the CP's post-boot liveness grace (one heartbeat TTL) then freezes the
+/// assigned unit's holder set — the late node would never be topped up within the test budget.
+async fn wait_until_ready(metrics_addr: &str) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for _ in 0..600 {
+        if let Ok(mut s) = tokio::net::TcpStream::connect(metrics_addr).await {
+            let req = format!("GET /readyz HTTP/1.0\r\nHost: {metrics_addr}\r\n\r\n");
+            if s.write_all(req.as_bytes()).await.is_ok() {
+                let mut buf = Vec::new();
+                let _ = s.read_to_end(&mut buf).await;
+                let head = String::from_utf8_lossy(&buf);
+                if head.lines().next().is_some_and(|l| l.contains(" 200")) {
+                    return;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("node at {metrics_addr} never became ready (pool registration)");
+}
+
 /// The sorted `id`s a windowed gateway returns for a `*` search (window unset → the gateway fans to
 /// every window). A transport error *or* an honest `partial` is an `Err` — for this drill a
 /// degraded page with a live replica available is exactly as much a failure as no page at all.
@@ -205,9 +229,12 @@ fn failover_gateway(units: &[(i64, String, String)]) -> Gateway {
 }
 
 /// Poll `endpoint` (a lone `WindowNode` over `(IDX, window)`) until it serves the parked window's
-/// doc — i.e. the node has picked up the CP assignment and opened it read-through.
+/// doc — i.e. the node has picked up the CP assignment and opened it read-through. The budget is
+/// generous (30 s) because the tests in this file run in parallel: several CP + node processes
+/// each cold-opening windows contend for CPU/IO, and the pre-serve convergence (register →
+/// subscribe → push → cold open) is exactly what slows down under that load.
 async fn wait_until_serving(endpoint: &str, window: i64, doc: &str) {
-    for _ in 0..200 {
+    for _ in 0..600 {
         if let Ok(remote) = RemoteNode::connect(endpoint.to_string(), None).await {
             let node: Arc<dyn Node> = WindowNode::new(Arc::new(remote), IDX, window).shared();
             let gw = Gateway::windowed(
@@ -260,9 +287,11 @@ async fn killing_a_units_primary_fails_reads_over_to_the_replica() {
     define_index(a_dir.path());
     define_index(b_dir.path());
 
-    // Distinct ports for the CP + the two nodes (bound together so they can't collide).
-    let addrs = free_addrs(3);
+    // Distinct ports for the CP + the two nodes + their health endpoints (bound together so they
+    // can't collide).
+    let addrs = free_addrs(5);
     let (cp_addr, a_addr, b_addr) = (addrs[0].clone(), addrs[1].clone(), addrs[2].clone());
+    let (a_health, b_health) = (addrs[3].clone(), addrs[4].clone());
 
     // 3. Control plane at R=2.
     let cp_dir = tempfile::tempdir().unwrap();
@@ -285,12 +314,14 @@ async fn killing_a_units_primary_fails_reads_over_to_the_replica() {
     // 4. Two pool nodes: registered into the pool, reading the parked windows through the shared store.
     let a_ep = format!("http://{a_addr}");
     let b_ep = format!("http://{b_addr}");
-    let spawn_node = |dir: &std::path::Path, addr: &str, ep: &str| {
+    let spawn_node = |dir: &std::path::Path, addr: &str, ep: &str, health: &str| {
         Proc(
             Command::new(env!("CARGO_BIN_EXE_growlerdb"))
                 .args([
                     "--data-dir",
                     dir.to_str().unwrap(),
+                    "--metrics-addr",
+                    health,
                     "serve-pool",
                     "--index",
                     IDX,
@@ -307,10 +338,13 @@ async fn killing_a_units_primary_fails_reads_over_to_the_replica() {
                 .expect("spawn serve-pool"),
         )
     };
-    let mut node_a = spawn_node(a_dir.path(), &a_addr, &a_ep);
-    let mut node_b = spawn_node(b_dir.path(), &b_addr, &b_ep);
+    let mut node_a = spawn_node(a_dir.path(), &a_addr, &a_ep, &a_health);
+    let mut node_b = spawn_node(b_dir.path(), &b_addr, &b_ep, &b_health);
     wait_for_grpc(&a_ep).await;
     wait_for_grpc(&b_ep).await;
+    // BOTH nodes must be pool-registered before the first resolve — see `wait_until_ready`.
+    wait_until_ready(&a_health).await;
+    wait_until_ready(&b_health).await;
 
     // 5. Place both windows (R=2 → primary + replica each; with two nodes, both hold both windows).
     let mut cp = {
@@ -411,6 +445,128 @@ async fn killing_a_units_primary_fails_reads_over_to_the_replica() {
     );
 }
 
+/// HA-G1 end-to-end: a unit the CP **de-assigns is unloaded** — the node stops serving it (the
+/// structured `UNIT_NOT_SERVED` refusal, as if it never held it) and the unit's `.replica`
+/// read-through scratch is deleted after the short drain grace. `DropIndex` is the cleanest
+/// de-assignment driver: the CP's next pushed snapshot simply no longer contains the unit.
+#[tokio::test]
+async fn a_deassigned_unit_is_unloaded_and_its_replica_scratch_cleaned() {
+    use growlerdb_proto::v1::search_client::SearchClient;
+    use growlerdb_proto::v1::DropIndexRequest;
+
+    let store_dir = tempfile::tempdir().unwrap();
+    park_window(store_dir.path(), W1, DOC1).await;
+
+    let a_dir = tempfile::tempdir().unwrap();
+    define_index(a_dir.path());
+
+    let addrs = free_addrs(2);
+    let (cp_addr, a_addr) = (addrs[0].clone(), addrs[1].clone());
+    let cp_dir = tempfile::tempdir().unwrap();
+    let _cp = Proc(
+        Command::new(env!("CARGO_BIN_EXE_growlerdb"))
+            .args([
+                "--data-dir",
+                cp_dir.path().to_str().unwrap(),
+                "control-plane",
+                "--addr",
+                &cp_addr,
+            ])
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn control-plane"),
+    );
+    let cp_ep = format!("http://{cp_addr}");
+    let a_ep = format!("http://{a_addr}");
+    let _node = Proc(
+        Command::new(env!("CARGO_BIN_EXE_growlerdb"))
+            .args([
+                "--data-dir",
+                a_dir.path().to_str().unwrap(),
+                "serve-pool",
+                "--index",
+                IDX,
+                "--addr",
+                &a_addr,
+                "--register",
+                &cp_ep,
+                "--advertise-addr",
+                &a_ep,
+            ])
+            .env("GROWLERDB_OBJECT_STORE_FS", store_dir.path())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn serve-pool"),
+    );
+    wait_for_grpc(&a_ep).await;
+
+    let mut cp = {
+        let mut client = None;
+        for _ in 0..200 {
+            if let Ok(c) = ControlPlaneClient::connect(cp_ep.clone()).await {
+                client = Some(c);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        client.expect("connect control plane")
+    };
+    let primary = resolve_primary(&mut cp, W1).await;
+    assert_eq!(primary, a_ep, "the sole node holds the unit");
+    wait_until_serving(&a_ep, W1, DOC1).await;
+    let scratch = a_dir
+        .path()
+        .join(".replica")
+        .join(IDX)
+        .join(format!("w{W1}"));
+    assert!(
+        scratch.is_dir(),
+        "read-through scratch exists while the unit is assigned"
+    );
+
+    // De-assign: drop the index — the CP pushes a snapshot without the unit.
+    cp.drop_index(Request::new(DropIndexRequest { name: IDX.into() }))
+        .await
+        .expect("drop index");
+
+    // The node UNLOADS the window: the very shard it just answered from becomes the structured
+    // not-served refusal (pre-fix it kept serving the de-assigned unit forever).
+    let mut search = SearchClient::connect(a_ep.clone()).await.unwrap();
+    let mut unloaded = false;
+    for _ in 0..400 {
+        let res = search
+            .search(SearchRequest {
+                query: "*".into(),
+                limit: 10,
+                index: IDX.into(),
+                window: W1,
+                ..Default::default()
+            })
+            .await;
+        if let Err(status) = res {
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+            unloaded = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(unloaded, "the de-assigned unit was never unloaded");
+
+    // …and its scratch is deleted once the drain grace elapses (pre-fix it accumulated forever).
+    let mut cleaned = false;
+    for _ in 0..400 {
+        if !scratch.exists() {
+            cleaned = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        cleaned,
+        "the de-assigned unit's replica scratch was never cleaned"
+    );
+}
+
 /// 357.12 (HA-A1..A3) end-to-end: the node-side **write fence**. With a CP at R=2 both nodes hold a
 /// parked window — one as primary, one as replica. A `Write` / `GetCheckpoint` addressed to the
 /// REPLICA holder is refused with the structured `NOT_PRIMARY` detail (never committed, never a
@@ -432,8 +588,9 @@ async fn a_write_to_a_replica_held_window_is_fenced_and_the_parked_data_survives
     define_index(a_dir.path());
     define_index(b_dir.path());
 
-    let addrs = free_addrs(3);
+    let addrs = free_addrs(5);
     let (cp_addr, a_addr, b_addr) = (addrs[0].clone(), addrs[1].clone(), addrs[2].clone());
+    let (a_health, b_health) = (addrs[3].clone(), addrs[4].clone());
 
     let cp_dir = tempfile::tempdir().unwrap();
     let _cp = Proc(
@@ -454,12 +611,14 @@ async fn a_write_to_a_replica_held_window_is_fenced_and_the_parked_data_survives
 
     let a_ep = format!("http://{a_addr}");
     let b_ep = format!("http://{b_addr}");
-    let spawn_node = |dir: &std::path::Path, addr: &str, ep: &str| {
+    let spawn_node = |dir: &std::path::Path, addr: &str, ep: &str, health: &str| {
         Proc(
             Command::new(env!("CARGO_BIN_EXE_growlerdb"))
                 .args([
                     "--data-dir",
                     dir.to_str().unwrap(),
+                    "--metrics-addr",
+                    health,
                     "serve-pool",
                     "--index",
                     IDX,
@@ -476,10 +635,13 @@ async fn a_write_to_a_replica_held_window_is_fenced_and_the_parked_data_survives
                 .expect("spawn serve-pool"),
         )
     };
-    let _node_a = spawn_node(a_dir.path(), &a_addr, &a_ep);
-    let _node_b = spawn_node(b_dir.path(), &b_addr, &b_ep);
+    let _node_a = spawn_node(a_dir.path(), &a_addr, &a_ep, &a_health);
+    let _node_b = spawn_node(b_dir.path(), &b_addr, &b_ep, &b_health);
     wait_for_grpc(&a_ep).await;
     wait_for_grpc(&b_ep).await;
+    // BOTH nodes must be pool-registered before the first resolve — see `wait_until_ready`.
+    wait_until_ready(&a_health).await;
+    wait_until_ready(&b_health).await;
 
     // Place the window (R=2 → with two nodes, one primary + one replica) and wait until BOTH
     // holders serve it read-through — which also proves each processed an assignment snapshot, so

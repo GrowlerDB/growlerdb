@@ -4,7 +4,7 @@ title: Node
 description: Builds and serves an index (or a shard/window); stateful but rebuildable.
 tags: [component, node, index, serve]
 resource: /crates/growlerdb-engine
-timestamp: 2026-07-04T14:22:00
+timestamp: 2026-07-26T12:00:00
 ---
 
 # Node
@@ -85,18 +85,40 @@ an empty resume point on the wrong node. Defense in depth: a window the node ser
 **read-through** (a replica-held parked snapshot) is never overwritten by a misrouted first write —
 that's a `WINDOW_PARKED` refusal, and the replica reconcile inserts its cold entry only if the
 window is still absent, so a hot window created meanwhile always wins. When a unit's primary moves
-away, the node starts refusing on the very next snapshot (unloading the unit is a follow-on).
+away, the node starts refusing on the very next snapshot — and **unloads** the unit (below).
 Standalone (no `--register`) the fence is unrestricted — classic `serve` / `serve-pool`
 create-on-first-write is unchanged.
 
-**Replica serving** ([D53](/system/decisions/d53-unit-replication.md)): a pool node registered into the
-pool also **subscribes to CP assignment pushes** (`SubscribeAssignments`) and, for each **replica**
-window the CP assigns it, fetches the parked window's cold marker from object storage and opens it
-**read-through** (`open_cold_replica`) into the same per-index maps the read multiplexers front — so a
-placed replica starts serving with no rebuild and no copy stream, and the gateway's failover routes
-reach it. Needs the object store (`GROWLERDB_BACKUP_BUCKET`); cold/parked windows today. Still to come:
-**dynamic assignment** (a node loading a primary unit it wasn't started with), hot-window replica
-shipping, and hash-shard replica serving.
+**Replica serving & capability** ([D53](/system/decisions/d53-unit-replication.md)): a pool node
+registered into the pool also **subscribes to CP assignment pushes** (`SubscribeAssignments`; first
+subscribe waits for the first successful registration, reconnects with jittered exponential backoff)
+and, for each **replica** window the CP assigns it, fetches the parked window's cold marker from
+object storage and opens it **read-through** (`open_cold_replica`) into the same per-index maps the
+read multiplexers front — so a placed replica starts serving with no rebuild and no copy stream, and
+the gateway's failover routes reach it. Serving replicas needs the object store
+(`GROWLERDB_BACKUP_BUCKET` / `GROWLERDB_OBJECT_STORE_FS`), so the node's pool heartbeat carries a
+**`replica_capable`** declaration — true only when one is configured — and the CP **places replica
+units only on capable nodes** (an old binary or a store-less `--register` never silently absorbs
+replicas it could not serve; primaries are placed by load alone). Cold/parked windows today. Still to
+come: **dynamic assignment** (a node loading a primary unit it wasn't started with), hot-window
+replica shipping, and hash-shard replica serving.
+
+**Unit unload** (HA-G1): assignment reconcile is a two-way sync. Each pushed snapshot's de-assigned
+set — units a *previous* snapshot assigned to this node (either role) that the new one doesn't — is
+**unloaded**: the window's read-mux entries and writer state are dropped (in-flight requests hold the
+shard `Arc`, so removal only unpublishes; mmaps close when the last request finishes) and the unit's
+`.replica/{index}/w{N}` read-through scratch is deleted after a short drain grace (a re-assignment
+later just re-downloads the sidecars). Boot windows the CP never assigned are **not** unloaded —
+only assignment-driven units are. The first snapshot after boot also sweeps `.replica` scratch
+orphaned by previous runs (only then: a blind sweep at startup would race the subscription).
+
+**Boot quarantine & shutdown** (HA-G4): a window shard that fails to *open* at `serve-pool` boot is
+**quarantined** — logged loudly and skipped, the rest of the process serves; the unit reads as
+`UNIT_NOT_SERVED` and a registered pool's CP re-places it (misconfiguration such as a bad
+`--data-dir` or unresolvable definition still fails the boot). `serve-pool` shuts down gracefully on
+**SIGINT or SIGTERM** (plain Kubernetes sends SIGTERM; only the Helm preStop sends SIGINT). There is
+no deregistration RPC — a stopping node simply ceases to heartbeat and ages out of the pool's
+liveness TTL, after which the dead-owner sweeper re-places its units.
 
 ## Notes
 

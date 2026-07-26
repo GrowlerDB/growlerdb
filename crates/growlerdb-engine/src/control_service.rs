@@ -1542,7 +1542,12 @@ impl ControlPlane for ControlPlaneService {
         // Node registration is **uncapped** (D53): the scale entitlement counts *primary-held units*,
         // not node processes, so a read-replica node adds capacity for free and never trips a node
         // limit — the cap is enforced at unit placement (`ResolveUnitOwner`) instead.
-        self.registry.register_node(&req.endpoint, now_ms());
+        //
+        // The node's replica-capability declaration rides the heartbeat (HA-G2): only a node with
+        // an object store can serve replica windows read-through, so replica placement filters on
+        // it. Absent (old binary) decodes false — the safe default (no replicas placed there).
+        self.registry
+            .register_node_with_capability(&req.endpoint, req.replica_capable, now_ms());
         Ok(Response::new(RegisterNodeResponse {}))
     }
 
@@ -2391,6 +2396,7 @@ mod tests {
         for ep in ["http://node-a:50051", "http://node-b:50051"] {
             svc.register_node(Request::new(RegisterNodeRequest {
                 endpoint: ep.into(),
+                replica_capable: true,
             }))
             .await
             .unwrap();
@@ -2425,6 +2431,63 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn resolve_places_replicas_only_on_replica_capable_nodes() {
+        // HA-G2 over the wire: a node that heartbeats WITHOUT `replica_capable` (an old binary, or
+        // `serve-pool --register` with no object store) must never be handed replica units it
+        // could not serve read-through — while primaries still place on it by load alone.
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path()).with_replication_factor(2);
+        svc.registry.create(resolved_windowed("logs")).unwrap();
+        let cap = "http://cap:50051";
+        let nocap = "http://nocap:50051";
+        for (ep, capable) in [(cap, true), (nocap, false)] {
+            svc.register_node(Request::new(RegisterNodeRequest {
+                endpoint: ep.into(),
+                replica_capable: capable,
+            }))
+            .await
+            .unwrap();
+        }
+        let resolve = |w: i64| {
+            svc.resolve_unit_owner(Request::new(ResolveUnitOwnerRequest {
+                index: "logs".into(),
+                unit: Some(growlerdb_proto::v1::resolve_unit_owner_request::Unit::Window(w)),
+            }))
+        };
+        // First unit: primary lands on the capable node (least-loaded tie → lexicographic first);
+        // the only other node is incapable, so at R=2 the unit holds ZERO replicas rather than
+        // placing one on a node that could never serve it.
+        assert_eq!(resolve(10).await.unwrap().into_inner().endpoint, cap);
+        // Second unit: load now favors the incapable node for the PRIMARY (capability never gates
+        // primaries), and the capable node takes the replica slot.
+        assert_eq!(resolve(20).await.unwrap().into_inner().endpoint, nocap);
+        let gi = svc
+            .get_index(Request::new(GetIndexRequest {
+                name: "logs".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let replicas_of = |w: i64| {
+            gi.shard_status
+                .iter()
+                .find(|s| s.window == w)
+                .expect("window placed")
+                .replicas
+                .clone()
+        };
+        assert!(
+            replicas_of(10).is_empty(),
+            "no capable second node ⇒ no replica — never the incapable node"
+        );
+        assert_eq!(
+            replicas_of(20),
+            vec![cap.to_string()],
+            "the capable node takes the replica of the incapable node's primary"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn entitlement_counts_live_index_node_pairs_not_units_or_processes() {
         // D53/D38 (updated for HA-D3c): the scale cap is on distinct live (index, primary node)
         // PAIRS, enforced atomically at placement — node registration is uncapped, a windowed index
@@ -2438,6 +2501,7 @@ mod tests {
         for i in 0..6 {
             svc.register_node(Request::new(RegisterNodeRequest {
                 endpoint: format!("http://n{i}:50051"),
+                replica_capable: true,
             }))
             .await
             .unwrap();
@@ -2489,6 +2553,7 @@ mod tests {
         for i in 0..4 {
             svc.register_node(Request::new(RegisterNodeRequest {
                 endpoint: format!("http://n{i}:50051"),
+                replica_capable: true,
             }))
             .await
             .unwrap();
@@ -2533,6 +2598,7 @@ mod tests {
         for ep in ["http://node-a:50051", "http://node-b:50051"] {
             svc.register_node(Request::new(RegisterNodeRequest {
                 endpoint: ep.into(),
+                replica_capable: true,
             }))
             .await
             .unwrap();
@@ -2590,9 +2656,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let svc = service(tmp.path());
         let b = "http://node-b:50051";
-        svc.register_node(Request::new(RegisterNodeRequest { endpoint: b.into() }))
-            .await
-            .unwrap();
+        svc.register_node(Request::new(RegisterNodeRequest {
+            endpoint: b.into(),
+            replica_capable: true,
+        }))
+        .await
+        .unwrap();
         let mut stream = svc
             .subscribe_assignments(Request::new(SubscribeAssignmentsRequest {
                 endpoint: b.into(),
@@ -2654,6 +2723,7 @@ mod tests {
         for ep in ["http://node-a:50051", b] {
             svc.register_node(Request::new(RegisterNodeRequest {
                 endpoint: ep.into(),
+                replica_capable: true,
             }))
             .await
             .unwrap();
@@ -2722,6 +2792,7 @@ mod tests {
         // After RegisterNode the same subscribe succeeds.
         svc.register_node(Request::new(RegisterNodeRequest {
             endpoint: ep.into(),
+            replica_capable: true,
         }))
         .await
         .unwrap();
@@ -2751,6 +2822,7 @@ mod tests {
             let err = svc
                 .register_node(Request::new(RegisterNodeRequest {
                     endpoint: bad.into(),
+                    replica_capable: true,
                 }))
                 .await
                 .expect_err(&format!("`{bad}` must be rejected"));
@@ -2760,6 +2832,7 @@ mod tests {
             assert!(
                 svc.register_node(Request::new(RegisterNodeRequest {
                     endpoint: good.into(),
+                    replica_capable: true,
                 }))
                 .await
                 .is_ok(),
@@ -2875,6 +2948,7 @@ mod tests {
         for ep in ["http://node-a:50051", "http://node-b:50051"] {
             svc.register_node(Request::new(RegisterNodeRequest {
                 endpoint: ep.into(),
+                replica_capable: true,
             }))
             .await
             .unwrap();

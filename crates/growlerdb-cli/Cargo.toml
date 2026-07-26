@@ -42,4 +42,4 @@ postgres = ["growlerdb-controlplane/postgres"]
 growlerdb-proto.workspace = true
 growlerdb-client.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }

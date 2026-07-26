@@ -2624,9 +2624,31 @@ async fn serve_pool(
                 let mut seed: BTreeMap<i64, WindowSeed> = BTreeMap::new();
                 let mut served = Vec::with_capacity(windows.len());
                 for &w in &windows {
-                    let shard =
-                        Arc::new(store.open_shard(&ShardId::window(&index_s, w), &resolved)?);
-                    let zone = shard.event_bounds()?;
+                    // Quarantine, don't crash (HA-G4): one corrupt window shard must not take down
+                    // the whole multi-index pool process — log it loudly, skip it, and serve the
+                    // rest. The CP sees the unit unserved and (with the dead-owner sweeper /
+                    // re-announce) re-places it, so the pool self-heals. Only the PER-UNIT open is
+                    // quarantined; a misconfiguration (bad --data-dir, unreadable index dir,
+                    // unresolvable definition) still fails the boot via the `?`s above this loop.
+                    let opened = store
+                        .open_shard(&ShardId::window(&index_s, w), &resolved)
+                        .and_then(|shard| {
+                            let shard = Arc::new(shard);
+                            let zone = shard.event_bounds()?;
+                            Ok((shard, zone))
+                        });
+                    let (shard, zone) = match opened {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!(
+                                "serve-pool: QUARANTINED {index_s}/w{w} — window shard failed to \
+                                 open ({e}); serving the remaining windows (repair or delete the \
+                                 shard dir; a registered pool's control plane will re-place the \
+                                 unit)"
+                            );
+                            continue;
+                        }
+                    };
                     let handle = ShardHandle::new(shard);
                     search_w.insert(
                         w,
@@ -2672,7 +2694,7 @@ async fn serve_pool(
             })
             .await??
         };
-        total_windows += windows.len();
+        total_windows += seed.len();
 
         // The shared window maps: the SAME Arcs back both the Pool read services and this index's
         // writer, so a window the writer creates on first write is immediately queryable.
@@ -2750,7 +2772,9 @@ async fn serve_pool(
     // *replica* window read-through, so a re-placed/replica holder answers without a rebuild.
     // Absent the object store, the node still fences writes but serves only its local/primary
     // windows (no replica failover).
+    let mut replica_capable = false;
     if let (Some(cp), Some(endpoint)) = (register, advertise_addr) {
+        let replica_root = std::path::PathBuf::from(data_dir).join(".replica");
         let replica = match object_store_from_env() {
             Ok(op) => Some(ReplicaServing {
                 meta: replica_meta,
@@ -2761,19 +2785,33 @@ async fn serve_pool(
                 store: store.clone(),
                 op,
                 cache: growlerdb_index::RangeCache::new(cold_cache_bytes()),
-                replica_root: std::path::PathBuf::from(data_dir).join(".replica"),
+                replica_root: replica_root.clone(),
                 live_indexes: live_indexes.clone(),
             }),
             Err(e) => {
                 eprintln!(
-                    "serve-pool: replica failover disabled — no object store ({e}); set \
-                     GROWLERDB_BACKUP_BUCKET (S3) or GROWLERDB_OBJECT_STORE_FS (local dir) to \
-                     enable D53 replica serving (write fencing stays active)"
+                    "serve-pool: replica failover disabled — no object store ({e}); the node \
+                     registers as NOT replica-capable, so the control plane will not assign \
+                     replica windows to it. Set GROWLERDB_BACKUP_BUCKET (S3) or \
+                     GROWLERDB_OBJECT_STORE_FS (local dir) to enable D53 replica serving (write \
+                     fencing stays active)"
                 );
                 None
             }
         };
-        spawn_assignment_reconcile(cp.to_string(), endpoint.to_string(), fence.clone(), replica);
+        // The heartbeat's replica-capability declaration (HA-G2) mirrors whether the replica
+        // serving path above is actually wired.
+        replica_capable = replica.is_some();
+        spawn_assignment_reconcile(
+            cp.to_string(),
+            endpoint.to_string(),
+            fence.clone(),
+            AssignmentUnload {
+                write_idx: write_idx.clone(),
+                replica_root,
+            },
+            replica,
+        );
     }
 
     let socket: std::net::SocketAddr = addr
@@ -2799,6 +2837,7 @@ async fn serve_pool(
             cp.to_string(),
             endpoint.to_string(),
             announcements,
+            replica_capable,
             readiness.clone(),
             label,
         );
@@ -2818,12 +2857,44 @@ async fn serve_pool(
         .add_service(PoolAdminService::new(admin_idx).into_server())
         .add_service(PoolWriteService::new(write_idx).into_server())
         .add_service(SystemServer::new(SystemService::new(VERSION)))
-        .serve_with_shutdown(socket, async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        // SIGINT *or* SIGTERM (HA-G4): plain Kubernetes stops a pod with SIGTERM (the Helm preStop
+        // sends SIGINT, but not every deployment runs the chart) — both must drain gracefully, not
+        // die on the default disposition. There is no deregistration RPC in control.proto (a node
+        // leaves the pool by ceasing to heartbeat and aging out of the liveness TTL), so shutdown
+        // sends nothing to the CP; the dead-owner sweeper re-places this node's units after the TTL.
+        .serve_with_shutdown(socket, shutdown_signal())
         .await?;
     println!("growlerdb serve-pool: shut down cleanly");
     Ok(())
+}
+
+/// Resolve when the process receives **SIGINT (Ctrl-C) or SIGTERM** — the serve-pool shutdown
+/// trigger. `ctrl_c` alone misses SIGTERM, which is what a plain Kubernetes pod stop (and most
+/// process supervisors) send; missing it means an ungraceful kill mid-request. Non-unix targets
+/// keep the Ctrl-C-only behavior (there is no SIGTERM there).
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = ctrl_c => {}
+                    _ = term.recv() => {}
+                }
+            }
+            // Installing the SIGTERM handler can only really fail in exotic environments; fall
+            // back to Ctrl-C-only rather than refusing to serve.
+            Err(_) => {
+                let _ = ctrl_c.await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ctrl_c.await;
+    }
 }
 
 /// Per-index context a pool node needs to open an assigned **replica** window (D53): its resolved
@@ -2857,21 +2928,69 @@ struct ReplicaServing {
     live_indexes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
+/// What the assignment loop needs to **unload de-assigned units** (HA-G1) — always present when the
+/// node runs from CP assignments, independent of whether replica serving is enabled: even a
+/// fence-only node must stop *reading* for a unit the CP moved away.
+struct AssignmentUnload {
+    /// The per-index writers: [`WindowedWriteService::unload_window`] removes a window from the
+    /// shared read mux maps + the writer's states and rebuilds the in-process gateway.
+    write_idx: growlerdb_engine::SharedWriteIndexes,
+    /// `{data_dir}/.replica` — a de-assigned unit's read-through scratch is deleted from here
+    /// (after a short drain), and orphans from previous runs are swept once the first snapshot
+    /// arrives.
+    replica_root: std::path::PathBuf,
+}
+
+/// Reconnect backoff for the assignment stream (HA-G4): jittered exponential, so a CP restart
+/// doesn't re-subscribe the whole fleet in 3-second lockstep. Reset on every received snapshot.
+const ASSIGN_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+const ASSIGN_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+/// Drain grace before a de-assigned unit's `.replica` scratch is deleted: in-flight requests hold
+/// the shard `Arc` (dropping the mux entry never aborts them), and a few seconds keeps the files
+/// under any read that was already mid-flight when the unit unloaded. A re-assignment later simply
+/// re-downloads the sidecars (`open_cold_replica` recreates the scratch dir).
+const SCRATCH_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Subscribe to CP **assignment pushes** (D53) and apply each pushed snapshot: first swap the
 /// node's primary-holder **write fence** (357.12 — so a unit whose primary moved away is refused on
-/// the very next snapshot), then serve any assigned replica windows via
-/// [`reconcile_replica_windows`]. Reconnects with a short backoff if the stream drops (the CP
-/// re-sends a full snapshot on resubscribe, so nothing is lost).
+/// the very next snapshot), then **unload de-assigned units** (HA-G1 — window units this node
+/// served *because of a previous snapshot* that the new snapshot no longer assigns to it, in either
+/// role: drop their mux entries + writer state and delete their `.replica` scratch after a short
+/// drain; boot windows the CP never assigned are left alone), and finally serve any newly-assigned
+/// replica windows via [`reconcile_replica_windows`]. The first snapshot also sweeps `.replica`
+/// scratch orphaned by previous runs. Reconnects with jittered exponential backoff if the stream
+/// drops (the CP re-sends a full snapshot on resubscribe, so nothing is lost).
 fn spawn_assignment_reconcile(
     cp: String,
     endpoint: String,
     fence: growlerdb_engine::PrimaryFence,
+    unload: AssignmentUnload,
     replica: Option<ReplicaServing>,
 ) {
+    let replica_capable = replica.is_some();
     tokio::spawn(async move {
+        // Window units assigned to this node by any PREVIOUSLY applied snapshot — the
+        // "assignment-driven" set. Only these are ever unloaded: a boot window the CP never
+        // assigned (standalone data, a not-yet-announced window) must not be yanked by a snapshot
+        // that simply doesn't know it. Survives stream reconnects (each snapshot is full).
+        let mut assignment_seen: std::collections::HashSet<(String, i64)> =
+            std::collections::HashSet::new();
+        let mut orphans_swept = false;
+        let mut backoff = ASSIGN_INITIAL_BACKOFF;
         loop {
             if let Err(e) = async {
                 let mut client = connect_cp(&cp, false).await?;
+                // Heartbeat FIRST (idempotent), on the same connection: `SubscribeAssignments`
+                // refuses an endpoint with no live registration (FAILED_PRECONDITION), and racing
+                // the parallel registration loop at startup would only burn this loop's reconnect
+                // backoff on an ordering artifact. The extra heartbeat is free — registration is
+                // uncapped and in-memory.
+                client
+                    .register_node(growlerdb_proto::v1::RegisterNodeRequest {
+                        endpoint: endpoint.clone(),
+                        replica_capable,
+                    })
+                    .await?;
                 let mut stream = client
                     .subscribe_assignments(growlerdb_proto::v1::SubscribeAssignmentsRequest {
                         endpoint: endpoint.clone(),
@@ -2880,9 +2999,37 @@ fn spawn_assignment_reconcile(
                     .into_inner();
                 // A full snapshot on subscribe + on every placement change; reconcile each.
                 while let Some(snapshot) = stream.message().await? {
-                    // Fence first: the write path must see the tightened primary set before (and
-                    // regardless of whether) any replica window is opened.
+                    backoff = ASSIGN_INITIAL_BACKOFF; // a live stream re-arms the reconnect backoff
+                                                      // Fence first: the write path must see the tightened primary set before (and
+                                                      // regardless of whether) any replica window is opened or unloaded.
                     fence.apply_snapshot(&snapshot.units);
+                    // This node's current window-unit set (either role) from the snapshot.
+                    use growlerdb_proto::v1::unit_assignment::Unit as WireUnit;
+                    let current: std::collections::HashSet<(String, i64)> = snapshot
+                        .units
+                        .iter()
+                        .filter_map(|u| match u.unit {
+                            Some(WireUnit::Window(w)) => Some((u.index.clone(), w)),
+                            _ => None,
+                        })
+                        .collect();
+                    // HA-G1: unload units a previous snapshot assigned here that this one doesn't.
+                    for (index, window) in assignment_seen.iter().filter(|u| !current.contains(u)) {
+                        unload_unit(&unload, index, *window);
+                    }
+                    // The first snapshot is also the authority on which `.replica` scratch dirs
+                    // from PREVIOUS runs are still assigned — sweep the rest (a blind sweep at
+                    // startup would race the subscription and delete still-assigned scratch).
+                    if !orphans_swept {
+                        orphans_swept = true;
+                        let root = unload.replica_root.clone();
+                        let keep = current.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            sweep_orphan_replica_scratch(&root, &keep)
+                        })
+                        .await;
+                    }
+                    assignment_seen = current;
                     if let Some(r) = &replica {
                         reconcile_replica_windows(
                             &snapshot.units,
@@ -2918,9 +3065,70 @@ fn spawn_assignment_reconcile(
                     "serve-pool replica: assignment subscription dropped ({e}); reconnecting"
                 );
             }
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            // Jittered exponential backoff (matches the registration loop's idiom) — a fixed sleep
+            // would re-subscribe every node of a fleet in lockstep after a CP restart.
+            tokio::time::sleep(jittered(backoff, 0.2)).await;
+            backoff = (backoff * 2).min(ASSIGN_MAX_BACKOFF);
         }
     });
+}
+
+/// Unload one de-assigned `(index, window)` unit (HA-G1): remove it from the read mux maps and the
+/// writer's window states (via [`WindowedWriteService::unload_window`] — in-flight requests hold
+/// the shard `Arc`, so this only unpublishes), then delete its `.replica` read-through scratch
+/// after [`SCRATCH_DRAIN_GRACE`]. An index this node was never started with has nothing loaded —
+/// a no-op.
+fn unload_unit(unload: &AssignmentUnload, index: &str, window: i64) {
+    let writer = unload
+        .write_idx
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(index)
+        .cloned();
+    if let Some(writer) = writer {
+        if writer.unload_window(window) {
+            println!(
+                "serve-pool: unloaded {index}/w{window} — the control plane de-assigned it from \
+                 this node"
+            );
+        }
+    }
+    let scratch = unload.replica_root.join(index).join(format!("w{window}"));
+    if scratch.exists() {
+        tokio::spawn(async move {
+            tokio::time::sleep(SCRATCH_DRAIN_GRACE).await;
+            let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&scratch)).await;
+        });
+    }
+}
+
+/// Delete `.replica/{index}/w{N}` scratch dirs for units NOT in `keep` — the first-snapshot sweep
+/// of scratch orphaned by previous runs (a node restarted after de-assignments it never processed).
+/// Best-effort: an unreadable root (usually: no replica ever served, so no dir) is a no-op.
+fn sweep_orphan_replica_scratch(
+    replica_root: &std::path::Path,
+    keep: &std::collections::HashSet<(String, i64)>,
+) {
+    let Ok(indexes) = std::fs::read_dir(replica_root) else {
+        return;
+    };
+    for index_entry in indexes.flatten() {
+        let index = index_entry.file_name().to_string_lossy().to_string();
+        let Ok(windows) = std::fs::read_dir(index_entry.path()) else {
+            continue;
+        };
+        for w_entry in windows.flatten() {
+            let name = w_entry.file_name().to_string_lossy().to_string();
+            let Some(w) = name.strip_prefix('w').and_then(|s| s.parse::<i64>().ok()) else {
+                continue;
+            };
+            if !keep.contains(&(index.clone(), w))
+                && std::fs::remove_dir_all(w_entry.path()).is_ok()
+            {
+                println!("serve-pool: removed orphaned replica scratch {index}/w{w}");
+            }
+        }
+    }
 }
 
 /// Reconcile one pushed assignment snapshot (D53): for each **replica window** assigned to this node
@@ -4675,11 +4883,18 @@ async fn register_served_index(
 
 /// Heartbeat this node into the control-plane **placement pool** so the CP keeps it eligible for unit
 /// placement. Index-agnostic (D52): the pool is a flat set of interchangeable shard hosts.
-async fn register_node(control_plane: &str, endpoint: &str) -> anyhow::Result<()> {
+/// `replica_capable` declares whether this node can serve **replica** windows read-through (it has
+/// an object store configured) — the CP places replicas only on capable nodes (HA-G2).
+async fn register_node(
+    control_plane: &str,
+    endpoint: &str,
+    replica_capable: bool,
+) -> anyhow::Result<()> {
     let mut client = connect_cp(control_plane, false).await?;
     client
         .register_node(growlerdb_proto::v1::RegisterNodeRequest {
             endpoint: endpoint.to_string(),
+            replica_capable,
         })
         .await
         .map_err(|e| anyhow::anyhow!("node heartbeat to control plane: {e}"))?;
@@ -4708,7 +4923,9 @@ fn spawn_windowed_registration(
                 async move {
                     // Heartbeat first (keeps the node in the placement pool), then re-announce the
                     // current served windows + their zone-maps for the cluster gateway to prune on.
-                    register_node(&control_plane, &endpoint).await?;
+                    // Never replica-capable: the single-index windowed serve mode has no assignment
+                    // reconcile, so it could not serve a replica window the CP placed on it.
+                    register_node(&control_plane, &endpoint, false).await?;
                     register_served_index(
                         &control_plane,
                         &endpoint,
@@ -4742,6 +4959,7 @@ fn spawn_pool_registration(
         growlerdb_core::ResolvedIndex,
         growlerdb_engine::WindowedWriteService,
     )>,
+    replica_capable: bool,
     readiness: growlerdb_telemetry::Readiness,
     label: String,
 ) {
@@ -4755,8 +4973,10 @@ fn spawn_pool_registration(
                     // Heartbeat into the pool first, then announce each served index's windows —
                     // read fresh from the writer each tick, so a window created since boot (or
                     // since the last announce) is advertised, exactly as the single-index windowed
-                    // registration does.
-                    register_node(&control_plane, &endpoint).await?;
+                    // registration does. The heartbeat carries the replica-capability declaration
+                    // (HA-G2): true only when this node has an object store, so the CP never
+                    // places replica windows on a node that could not serve them.
+                    register_node(&control_plane, &endpoint, replica_capable).await?;
                     for (resolved, writer) in &announcements {
                         register_served_index(
                             &control_plane,
