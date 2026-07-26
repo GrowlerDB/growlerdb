@@ -18,8 +18,11 @@ asserting recovery**.
   means a crash never corrupts the index.
 - **Chaos drills** — repeatable fault-injection: process crash (self-restart + `/readyz` recovery +
   search still answers), catalog outage (search stays up, ingestion resumes), source-recreated,
-  streaming under node churn. Compose drills run against a live stack; a Kubernetes chaos harness runs
-  on the cluster.
+  streaming under node churn, and **zero-gap read failover** ([D53](/system/decisions/d53-unit-replication.md)):
+  a `cargo test` drill (`chaos_failover`) stands up a control plane at `R=2` + two pool nodes serving a
+  parked window read-through from a shared object store (the `GROWLERDB_OBJECT_STORE_FS` local-fs mode,
+  so no MinIO), **kills the primary node under query, and asserts continued answers via the replica with
+  no `partial`**. Compose drills run against a live stack; a Kubernetes chaos harness runs on the cluster.
 - **Recovery objectives** — RTO/RPO encoded as assertions so a regression in self-healing fails the
   suite.
 
