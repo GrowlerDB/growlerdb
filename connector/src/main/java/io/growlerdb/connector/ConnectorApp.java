@@ -1,6 +1,9 @@
 package io.growlerdb.connector;
 
+import io.growlerdb.proto.v1.GetIndexResponse;
+import io.growlerdb.proto.v1.ShardStatus;
 import io.growlerdb.proto.v1.WindowingConfig;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
@@ -85,6 +88,12 @@ public final class ConnectorApp {
 
     // Target one Node (`--node host:port`) or a sharded cluster (`--nodes h1:p1,h2:p2,…`).
     List<String> nodes = csv(opts.getOrDefault("nodes", opts.getOrDefault("node", "127.0.0.1:50051")));
+    // Did the operator pin endpoints explicitly? If not, a hash index with `--control-plane` sources
+    // each shard's owning node from the registry (below) instead of this default.
+    boolean explicitNodes = opts.containsKey("nodes") || opts.containsKey("node");
+    // Tag every sharded sub-batch with the index, so a pool node serving many indexes can dispatch it
+    // by `(index, shard)`; empty (no `--index`) ⇒ the node's sole served index ignores it.
+    String indexTag = opts.getOrDefault("index", "");
 
     // Routing source of truth: when a `--control-plane host:port` (+ `--index`) is given, fetch the
     // shard count and strategy from the registry — the same source the Gateway reads — and fail fast
@@ -120,13 +129,26 @@ public final class ConnectorApp {
               "windowed index %s: window field=%s granularity=%s%n",
               index, windowing.getField(), windowing.getGranularity());
         } else {
-          routing = resolveRouting(entry.getShardCount(), strategyOf(entry.getRouting()), nodes.size(), partition);
           if (entry.getBucketOwnersCount() > 0) {
             bucketOwners = entry.getBucketOwnersList().stream().mapToInt(Integer::intValue).toArray();
           }
+          // CP-driven placement: unless the operator pinned endpoints with `--nodes`, source each
+          // shard's owning node from the registry's shard map — the same placement the Gateway reads
+          // for routing — so writes follow the control plane instead of static config and can't drift
+          // from where reads look. `resolveShardOwner` (pool placement-on-first-ask) is reserved for
+          // pool nodes; a per-index sharded Node's ordinal is pinned, so its live owner comes from the
+          // shard map, not a least-loaded re-placement.
+          if (!explicitNodes) {
+            nodes = shardEndpointsFromCp(entry);
+          }
+          routing = resolveRouting(entry.getShardCount(), strategyOf(entry.getRouting()), nodes.size(), partition);
           System.out.printf(
-              "routing from registry: index=%s shards=%d strategy=%s buckets=%s%n",
-              index, entry.getShardCount(), routing, bucketOwners != null ? "yes" : "no");
+              "routing from registry: index=%s shards=%d strategy=%s buckets=%s endpoints=%s%n",
+              index,
+              entry.getShardCount(),
+              routing,
+              bucketOwners != null ? "yes" : "no",
+              explicitNodes ? "static" : "control-plane");
         }
       } finally {
         if (!keepCp) {
@@ -196,8 +218,8 @@ public final class ConnectorApp {
         windowing != null
             ? new WindowedWriteClient(require(opts, "index"), windowedCp, windowing, lineage)
             : owned != null
-                ? new ShardGroupWriteClient(nodes, router, lineage, owned)
-                : writerFor(nodes, routing, bucketOwners, lineage)) {
+                ? new ShardGroupWriteClient(nodes, router, lineage, owned, indexTag)
+                : writerFor(nodes, routing, bucketOwners, lineage, indexTag)) {
       // Resume exactly-once: unless an explicit --start override is given, pick up
       // from the checkpoint the Node has durably committed. null = the shard is
       // empty, so read the changelog from the beginning.
@@ -355,6 +377,42 @@ public final class ConnectorApp {
   }
 
   /**
+   * The per-ordinal owning-node endpoints of a hash-sharded index, read from the registry's shard map
+   * ({@code GetIndex.shard_status}) — the same placement the Gateway routes reads to, so CP-driven
+   * writes land where reads look. Returned in ordinal order ({@code [0, shard_count)}); each `scheme://`
+   * is stripped to the {@code host:port} the write clients dial. Fails fast if a shard has no live
+   * primary yet (the serve node hasn't registered) rather than silently dropping its writes — the
+   * operator brings all shard nodes up before starting the connector, as the read path already needs.
+   */
+  static List<String> shardEndpointsFromCp(GetIndexResponse entry) {
+    int count = entry.getShardCount();
+    String[] byOrdinal = new String[count];
+    for (ShardStatus s : entry.getShardStatusList()) {
+      if (s.getWindow() != 0) {
+        continue; // ordinal shards only (a windowed index never reaches here)
+      }
+      int ordinal = s.getOrdinal();
+      if (ordinal >= 0 && ordinal < count && !s.getPrimary().isEmpty()) {
+        byOrdinal[ordinal] = s.getPrimary().replaceFirst("^https?://", "");
+      }
+    }
+    List<String> endpoints = new ArrayList<>(count);
+    for (int ordinal = 0; ordinal < count; ordinal++) {
+      if (byOrdinal[ordinal] == null) {
+        throw new IllegalStateException(
+            "index has no live primary for shard "
+                + ordinal
+                + " of "
+                + count
+                + " yet — ensure every shard's serve node is registered with the control plane before"
+                + " starting the connector (or pass --nodes to pin endpoints)");
+      }
+      endpoints.add(byOrdinal[ordinal]);
+    }
+    return endpoints;
+  }
+
+  /**
    * One Node → a direct {@link WriteClient}; several → a {@link ShardedWriteClient}. When
    * {@code bucketOwners} is non-empty, the sharded writer routes through that bucket map
    * (matching the Gateway); otherwise {@code fnv % shards}. A single node always routes to
@@ -364,20 +422,31 @@ public final class ConnectorApp {
     return writerFor(nodes, routing, bucketOwners, SnapshotLineage.none());
   }
 
-  /**
-   * As above, with the source table's {@link SnapshotLineage} so the sharded resume-min orders
-   * diverged shard checkpoints by sequence number instead of the random snapshot id.
-   */
+  /** As below, untagged (empty index — a single-index sharded deployment). */
   static BatchWriter writerFor(
       List<String> nodes, ShardRouter.Strategy routing, int[] bucketOwners, SnapshotLineage lineage) {
+    return writerFor(nodes, routing, bucketOwners, lineage, "");
+  }
+
+  /**
+   * As above, with the source table's {@link SnapshotLineage} so the sharded resume-min orders
+   * diverged shard checkpoints by sequence number instead of the random snapshot id, and an
+   * {@code index} tag on each sub-batch so a pool node can dispatch by {@code (index, shard)}.
+   */
+  static BatchWriter writerFor(
+      List<String> nodes,
+      ShardRouter.Strategy routing,
+      int[] bucketOwners,
+      SnapshotLineage lineage,
+      String index) {
     if (nodes.size() == 1) {
       String[] hp = nodes.get(0).split(":", 2);
       return new WriteClient(hp[0].trim(), Integer.parseInt(hp[1].trim()));
     }
     if (bucketOwners != null && bucketOwners.length > 0) {
-      return new ShardedWriteClient(nodes, ShardRouter.bucketed(routing, bucketOwners), lineage);
+      return new ShardedWriteClient(nodes, ShardRouter.bucketed(routing, bucketOwners), lineage, index);
     }
-    return new ShardedWriteClient(nodes, new ShardRouter(nodes.size(), routing), lineage);
+    return new ShardedWriteClient(nodes, new ShardRouter(nodes.size(), routing), lineage, index);
   }
 
   /**
