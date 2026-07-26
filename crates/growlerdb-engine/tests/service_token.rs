@@ -169,7 +169,10 @@ async fn write_checkpoint(endpoint: &str, token: Option<&str>) -> Result<(), ton
     }
     client
         .expect("node never came up")
-        .get_checkpoint(growlerdb_proto::v1::GetCheckpointRequest { window: 0 })
+        .get_checkpoint(growlerdb_proto::v1::GetCheckpointRequest {
+            window: 0,
+            index: String::new(),
+        })
         .await
         .map(|_| ())
 }

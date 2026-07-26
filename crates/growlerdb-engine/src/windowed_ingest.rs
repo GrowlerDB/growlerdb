@@ -29,8 +29,9 @@ use crate::windowed_routing::{
 use crate::{AdminService, LocalNode, LookupService, Node, SearchService, SuggestService};
 
 /// Max decoded size of an inbound windowed `Write` (mirrors [`write_service`](crate::write_service)):
-/// a catch-up commit spanning many windows can be large.
-const MAX_WRITE_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
+/// a catch-up commit spanning many windows can be large. `pub(crate)` so the pool write dispatcher
+/// ([`pool_routing`](crate::pool_routing)) mounts its `WriteServer` with the same cap.
+pub(crate) const MAX_WRITE_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 
 /// One window's authoritative serving state on this node: the swappable shard handle, the
 /// in-process node fronting it (for the node's own REST gateway scatter), and its event-time
@@ -626,6 +627,7 @@ mod tests {
         );
         svc.write(Request::new(WriteRequest {
             batch: Some(batch.into()),
+            index: String::new(),
         }))
         .await
         .unwrap();
@@ -651,6 +653,7 @@ mod tests {
         );
         svc.write(Request::new(WriteRequest {
             batch: Some(batch2.into()),
+            index: String::new(),
         }))
         .await
         .unwrap();
@@ -673,13 +676,17 @@ mod tests {
                 )
                 .into(),
             ),
+            index: String::new(),
         }))
         .await
         .unwrap();
 
         // The window we wrote resumes from its committed checkpoint (Iceberg snapshot 42).
         let cp = svc
-            .get_checkpoint(Request::new(GetCheckpointRequest { window: day(10) }))
+            .get_checkpoint(Request::new(GetCheckpointRequest {
+                window: day(10),
+                index: String::new(),
+            }))
             .await
             .unwrap()
             .into_inner();
@@ -691,7 +698,10 @@ mod tests {
 
         // A window this node never created has no checkpoint → the connector starts it from scratch.
         let none = svc
-            .get_checkpoint(Request::new(GetCheckpointRequest { window: day(99) }))
+            .get_checkpoint(Request::new(GetCheckpointRequest {
+                window: day(99),
+                index: String::new(),
+            }))
             .await
             .unwrap()
             .into_inner();
@@ -714,6 +724,7 @@ mod tests {
                 )
                 .into(),
             ),
+            index: String::new(),
         }))
         .await
         .unwrap();
@@ -731,6 +742,7 @@ mod tests {
                 )
                 .into(),
             ),
+            index: String::new(),
         }))
         .await
         .expect("a delete broadcast must not fail on a parked window");
@@ -756,6 +768,7 @@ mod tests {
                 )
                 .into(),
             ),
+            index: String::new(),
         }))
         .await
         .unwrap();
@@ -773,6 +786,7 @@ mod tests {
                     )
                     .into(),
                 ),
+                index: String::new(),
             }))
             .await
             .expect_err("a write into a parked window must be refused");

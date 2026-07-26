@@ -326,6 +326,7 @@ mod tests {
         let batch = CommitBatch::from_upserts(vec![doc], SourceCheckpoint::iceberg(42), "b1");
         svc.write(Request::new(WriteRequest {
             batch: Some(batch.into()),
+            index: String::new(),
         }))
         .await
         .unwrap();
@@ -364,6 +365,7 @@ mod tests {
                 batch: Some(
                     CommitBatch::from_upserts(vec![doc], SourceCheckpoint::iceberg(1), "b1").into(),
                 ),
+                index: String::new(),
             }
         };
 
@@ -403,6 +405,7 @@ mod tests {
                 batch: Some(
                     CommitBatch::from_upserts(vec![doc], SourceCheckpoint::iceberg(1), "b1").into(),
                 ),
+                index: String::new(),
             }
         };
 
@@ -437,6 +440,7 @@ mod tests {
                         .with_from_checkpoint(from.map(SourceCheckpoint::iceberg))
                         .into(),
                 ),
+                index: String::new(),
             }
         };
 
@@ -495,6 +499,7 @@ mod tests {
             batch: Some(
                 CommitBatch::from_upserts(vec![doc], SourceCheckpoint::iceberg(1), "b1").into(),
             ),
+            index: String::new(),
         }))
         .await
         .unwrap();
@@ -507,6 +512,7 @@ mod tests {
                     .with_from_checkpoint(Some(SourceCheckpoint::iceberg(1)))
                     .into(),
             ),
+            index: String::new(),
         }))
         .await
         .unwrap();
@@ -529,6 +535,7 @@ mod tests {
                     .with_from_checkpoint(Some(SourceCheckpoint::iceberg(1)))
                     .into(),
             ),
+            index: String::new(),
         }))
         .await
         .unwrap();
