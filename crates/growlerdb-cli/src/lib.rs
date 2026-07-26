@@ -2143,9 +2143,10 @@ async fn serve_windowed(
         .iter()
         .any(|&w| matches!(store.cold_marker(index, w), Ok(Some(_))));
     let object_store = if any_cold || park_interval > 0 {
-        // Fail fast: parking with no backup bucket configured is a misconfiguration, not a silent
-        // no-op (`backup_s3_config` errors when `GROWLERDB_BACKUP_BUCKET` is unset).
-        Some(growlerdb_backup::s3_store(&backup_s3_config()?)?)
+        // Fail fast: parking/cold with no object store configured is a misconfiguration, not a silent
+        // no-op (`object_store_from_env` errors when neither GROWLERDB_OBJECT_STORE_FS nor
+        // GROWLERDB_BACKUP_BUCKET is set).
+        Some(object_store_from_env()?)
     } else {
         None
     };
@@ -2732,9 +2733,7 @@ async fn serve_pool(
     // the subscription) and the object store (for the parked data); absent either, the node serves
     // only its local/primary windows (no replica failover).
     if let (Some(cp), Some(endpoint)) = (register, advertise_addr) {
-        match backup_s3_config()
-            .and_then(|cfg| growlerdb_backup::s3_store(&cfg).map_err(anyhow::Error::from))
-        {
+        match object_store_from_env() {
             Ok(op) => {
                 spawn_replica_reconcile(
                     cp.to_string(),
@@ -2752,7 +2751,8 @@ async fn serve_pool(
             }
             Err(e) => eprintln!(
                 "serve-pool: replica failover disabled — no object store ({e}); set \
-                 GROWLERDB_BACKUP_BUCKET to enable D53 replica serving"
+                 GROWLERDB_BACKUP_BUCKET (S3) or GROWLERDB_OBJECT_STORE_FS (local dir) to enable \
+                 D53 replica serving"
             ),
         }
     }
@@ -2902,11 +2902,10 @@ async fn reconcile_replica_windows(
     use std::sync::Arc;
     let mut served = 0usize;
     for u in units {
-        // The primary path (local hot windows + the write service) handles primary units; here we
-        // only bring up *replica* windows. Hash-shard replicas are a follow-on — windowed only.
-        if u.primary {
-            continue;
-        }
+        // Serve any assigned **cold** (parked) window read-through, for either role — a parked window
+        // is read-only, so a primary holder serves it exactly like a replica (late writes to a parked
+        // window are refused regardless). A HOT window has no cold marker below and is skipped here —
+        // it's served by the boot / local-write path. Hash-shard units are a follow-on (windowed only).
         let Some(WireUnit::Window(window)) = u.unit else {
             continue;
         };
@@ -5045,6 +5044,20 @@ fn replication_factor_from_env() -> usize {
         .unwrap_or(1)
 }
 
+/// Build the node's object store (for cold-tier / D53 replica read-through) from the environment.
+/// `GROWLERDB_OBJECT_STORE_FS=<dir>` uses a **local filesystem** store — a single-host dev/test mode
+/// (multiple processes on the box share the dir) that needs no S3/MinIO; otherwise the S3 store from
+/// [`backup_s3_config`] (`GROWLERDB_BACKUP_BUCKET` + `GROWLERDB_S3_*`).
+fn object_store_from_env() -> anyhow::Result<growlerdb_backup::Operator> {
+    match std::env::var("GROWLERDB_OBJECT_STORE_FS")
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
+        Some(dir) => growlerdb_backup::fs_store(&dir).map_err(anyhow::Error::from),
+        None => growlerdb_backup::s3_store(&backup_s3_config()?).map_err(anyhow::Error::from),
+    }
+}
+
 /// Build the backup object-store config from the environment: the bucket from
 /// `GROWLERDB_BACKUP_BUCKET` and credentials/endpoint from the same `GROWLERDB_S3_*` the source
 /// uses (set the endpoint for MinIO; leave it unset for AWS S3).
@@ -5823,7 +5836,8 @@ mod tests {
             "an already-served window isn't re-opened"
         );
 
-        // A PRIMARY unit is ignored by the replica reconcile (the primary path serves those).
+        // The same window assigned as PRIMARY is a no-op — it's already served (a parked window is
+        // read-only, so it serves read-through for either role).
         let primary_units = vec![UnitAssignment {
             index: "logs".into(),
             unit: Some(WireUnit::Window(w)),
@@ -5844,7 +5858,7 @@ mod tests {
             )
             .await,
             0,
-            "a primary assignment is not served as a replica"
+            "an already-served window isn't re-opened, whatever the role"
         );
     }
 

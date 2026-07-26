@@ -1378,7 +1378,12 @@ impl ControlPlane for ControlPlaneService {
         // Upsert: create on first announce, idempotent on restart (a re-announce just re-points
         // the shard/window map at the — possibly new — endpoint below).
         if self.registry.get(&name).is_none() {
-            self.registry.create(resolved).map_err(registry_status)?;
+            // Idempotent under a race: two nodes serving the same index (D53 replication) can both
+            // find it absent and try to create it — treat the loser's `AlreadyExists` as success.
+            match self.registry.create(resolved) {
+                Ok(_) | Err(RegistryError::AlreadyExists(_)) => {}
+                Err(e) => return Err(registry_status(e)),
+            }
         }
         if !is_windowed {
             // Ordinal shard map. A node serving specific ordinals
