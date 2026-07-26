@@ -25,7 +25,7 @@ use growlerdb_proto::v1::{
 };
 use growlerdb_proto::{Admin, Lookup, Search, Suggest};
 use tonic::transport::{Channel, Endpoint};
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 
 use crate::{AdminService, LookupService, SearchService, SuggestService};
 
@@ -448,9 +448,308 @@ impl Node for RemoteNode {
     }
 }
 
+/// Whether a Node error means "this holder is down/unreachable" — so failing over to another holder
+/// can help — rather than a request-level error that would recur on every holder. Matches the
+/// connector's transient-transport set (`Unavailable`/`DeadlineExceeded`).
+fn is_holder_down(status: &Status) -> bool {
+    matches!(status.code(), Code::Unavailable | Code::DeadlineExceeded)
+}
+
+/// Try each holder in order for a **read** RPC, failing over past a down holder to the next and
+/// returning the first success (or the last transport error when every holder is down). The request
+/// body is cloned per attempt (proto messages are `Clone`).
+macro_rules! failover_read {
+    ($self:expr, $method:ident, $req:expr) => {{
+        let msg = $req.into_inner();
+        let mut last: Option<Status> = None;
+        for holder in &$self.holders {
+            match holder.$method(Request::new(msg.clone())).await {
+                Ok(resp) => return Ok(resp),
+                // The holder is down/unreachable — remember the error and try the next holder.
+                Err(status) if is_holder_down(&status) => last = Some(status),
+                // A request-level error recurs on every holder — surface it now, don't burn replicas.
+                Err(status) => return Err(status),
+            }
+        }
+        Err(last.unwrap_or_else(|| Status::unavailable("no holders for unit")))
+    }};
+}
+
+/// A [`Node`] that fronts a unit's **holders** — its primary first, then read replicas (D53) — and
+/// serves each read from a live one: it tries the holders in order and, on a **retriable transport
+/// error** ([`is_holder_down`] — the holder is down or unreachable), fails over to the next, returning
+/// the first success (or the last error when every holder is down). So a single node loss is a
+/// **zero-gap read failover** instead of the honest-`partial` degradation a single-holder route gives.
+///
+/// **Reads fail over; mutations don't.** The write-fenced RPCs (reindex / alter / compact / backup)
+/// target the sole writer, so they go to the **primary** (the first holder) with no failover — a read
+/// replica is read-only and must never accept them.
+pub struct FailoverNode {
+    /// Primary first, then replicas. Always non-empty (a primary is required).
+    holders: Vec<Arc<dyn Node>>,
+}
+
+impl FailoverNode {
+    /// Front `primary` (the writer + preferred read target) plus zero or more read `replicas`.
+    pub fn new(primary: Arc<dyn Node>, replicas: Vec<Arc<dyn Node>>) -> Self {
+        let mut holders = Vec::with_capacity(1 + replicas.len());
+        holders.push(primary);
+        holders.extend(replicas);
+        Self { holders }
+    }
+
+    /// Erase to a shared `dyn Node` for the [Gateway](crate::gateway::Gateway).
+    pub fn shared(self) -> Arc<dyn Node> {
+        Arc::new(self)
+    }
+}
+
+#[tonic::async_trait]
+impl Node for FailoverNode {
+    async fn search(
+        &self,
+        req: Request<SearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        failover_read!(self, search, req)
+    }
+
+    async fn semantic_search(
+        &self,
+        req: Request<SemanticSearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        failover_read!(self, semantic_search, req)
+    }
+
+    async fn suggest(
+        &self,
+        req: Request<SuggestRequest>,
+    ) -> Result<Response<SuggestResponse>, Status> {
+        failover_read!(self, suggest, req)
+    }
+
+    async fn get_by_key(
+        &self,
+        req: Request<GetByKeyRequest>,
+    ) -> Result<Response<GetByKeyResponse>, Status> {
+        failover_read!(self, get_by_key, req)
+    }
+
+    async fn describe_index(
+        &self,
+        req: Request<DescribeIndexRequest>,
+    ) -> Result<Response<DescribeIndexResponse>, Status> {
+        failover_read!(self, describe_index, req)
+    }
+
+    async fn aggregate(
+        &self,
+        req: Request<AggregateRequest>,
+    ) -> Result<Response<AggregateResponse>, Status> {
+        failover_read!(self, aggregate, req)
+    }
+
+    async fn explain(
+        &self,
+        req: Request<ExplainRequest>,
+    ) -> Result<Response<ExplainResponse>, Status> {
+        failover_read!(self, explain, req)
+    }
+
+    // Mutations target the sole writer → the primary, never a read replica. No failover.
+    async fn reindex_index(
+        &self,
+        req: Request<ReindexIndexRequest>,
+    ) -> Result<Response<ReindexIndexResponse>, Status> {
+        self.holders[0].reindex_index(req).await
+    }
+
+    async fn alter_index(
+        &self,
+        req: Request<AlterIndexRequest>,
+    ) -> Result<Response<AlterIndexResponse>, Status> {
+        self.holders[0].alter_index(req).await
+    }
+
+    async fn compact_index(
+        &self,
+        req: Request<CompactIndexRequest>,
+    ) -> Result<Response<CompactIndexResponse>, Status> {
+        self.holders[0].compact_index(req).await
+    }
+
+    async fn backup_index(
+        &self,
+        req: Request<BackupIndexRequest>,
+    ) -> Result<Response<BackupIndexResponse>, Status> {
+        self.holders[0].backup_index(req).await
+    }
+
+    async fn backup_status(
+        &self,
+        req: Request<BackupStatusRequest>,
+    ) -> Result<Response<BackupStatusResponse>, Status> {
+        self.holders[0].backup_status(req).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A stub Node that records how many times it was called and answers by `mode`: `Ok` succeeds,
+    /// `Err(code)` returns that status. Overrides `search` (a read) + `reindex_index` (a mutation).
+    struct MockNode {
+        mode: Result<(), Code>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl MockNode {
+        fn up(calls: Arc<AtomicUsize>) -> Arc<Self> {
+            Arc::new(Self {
+                mode: Ok(()),
+                calls,
+            })
+        }
+        fn erroring(code: Code, calls: Arc<AtomicUsize>) -> Arc<Self> {
+            Arc::new(Self {
+                mode: Err(code),
+                calls,
+            })
+        }
+    }
+
+    #[tonic::async_trait]
+    impl Node for MockNode {
+        async fn search(
+            &self,
+            _req: Request<SearchRequest>,
+        ) -> Result<Response<SearchResponse>, Status> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.mode {
+                Ok(()) => Ok(Response::new(SearchResponse::default())),
+                Err(code) => Err(Status::new(code, "mock")),
+            }
+        }
+        async fn suggest(
+            &self,
+            _req: Request<SuggestRequest>,
+        ) -> Result<Response<SuggestResponse>, Status> {
+            Err(Status::unimplemented("suggest"))
+        }
+        async fn get_by_key(
+            &self,
+            _req: Request<GetByKeyRequest>,
+        ) -> Result<Response<GetByKeyResponse>, Status> {
+            Err(Status::unimplemented("get_by_key"))
+        }
+        async fn describe_index(
+            &self,
+            _req: Request<DescribeIndexRequest>,
+        ) -> Result<Response<DescribeIndexResponse>, Status> {
+            Err(Status::unimplemented("describe_index"))
+        }
+        async fn reindex_index(
+            &self,
+            _req: Request<ReindexIndexRequest>,
+        ) -> Result<Response<ReindexIndexResponse>, Status> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.mode {
+                Ok(()) => Ok(Response::new(ReindexIndexResponse::default())),
+                Err(code) => Err(Status::new(code, "mock")),
+            }
+        }
+    }
+
+    fn count() -> Arc<AtomicUsize> {
+        Arc::new(AtomicUsize::new(0))
+    }
+
+    #[tokio::test]
+    async fn failover_skips_a_down_primary_to_a_replica() {
+        let (p, r) = (count(), count());
+        let fo = FailoverNode::new(
+            MockNode::erroring(Code::Unavailable, p.clone()),
+            vec![MockNode::up(r.clone())],
+        );
+        Node::search(&fo, Request::new(SearchRequest::default()))
+            .await
+            .expect("a down primary fails over to the replica");
+        assert_eq!(p.load(Ordering::SeqCst), 1, "primary was tried first");
+        assert_eq!(r.load(Ordering::SeqCst), 1, "replica answered");
+    }
+
+    #[tokio::test]
+    async fn failover_prefers_the_primary_when_up() {
+        let (p, r) = (count(), count());
+        let fo = FailoverNode::new(MockNode::up(p.clone()), vec![MockNode::up(r.clone())]);
+        Node::search(&fo, Request::new(SearchRequest::default()))
+            .await
+            .unwrap();
+        assert_eq!(p.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            r.load(Ordering::SeqCst),
+            0,
+            "the primary answered; the replica isn't queried"
+        );
+    }
+
+    #[tokio::test]
+    async fn failover_errors_when_every_holder_is_down() {
+        let (p, r) = (count(), count());
+        let fo = FailoverNode::new(
+            MockNode::erroring(Code::Unavailable, p),
+            vec![MockNode::erroring(Code::DeadlineExceeded, r)],
+        );
+        let err = Node::search(&fo, Request::new(SearchRequest::default()))
+            .await
+            .unwrap_err();
+        // The last holder's transport error surfaces — the unit is genuinely unavailable.
+        assert_eq!(err.code(), Code::DeadlineExceeded);
+    }
+
+    #[tokio::test]
+    async fn a_request_error_is_not_retried_on_replicas() {
+        let (p, r) = (count(), count());
+        let fo = FailoverNode::new(
+            MockNode::erroring(Code::InvalidArgument, p.clone()),
+            vec![MockNode::up(r.clone())],
+        );
+        let err = Node::search(&fo, Request::new(SearchRequest::default()))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::InvalidArgument,
+            "a request error surfaces as-is"
+        );
+        assert_eq!(
+            r.load(Ordering::SeqCst),
+            0,
+            "the replica isn't burned on a request error"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutations_pin_to_the_primary_and_do_not_fail_over() {
+        // A reindex targets the writer: it goes to the primary and, even when the primary errors,
+        // never falls through to a read replica.
+        let (p, r) = (count(), count());
+        let fo = FailoverNode::new(
+            MockNode::erroring(Code::Unavailable, p.clone()),
+            vec![MockNode::up(r.clone())],
+        );
+        let err = Node::reindex_index(&fo, Request::new(ReindexIndexRequest::default()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::Unavailable);
+        assert_eq!(p.load(Ordering::SeqCst), 1, "the mutation hit the primary");
+        assert_eq!(
+            r.load(Ordering::SeqCst),
+            0,
+            "a mutation never touches a replica"
+        );
+    }
 
     /// Lazy connect must **build without dialing** — so a Gateway can front a shard whose
     /// node is currently down (the build doesn't fail), and the channel reconnects/re-resolves later.
