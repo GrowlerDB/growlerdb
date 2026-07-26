@@ -14,7 +14,11 @@ The automated gates a change passes before merge — the quality process encoded
 ## The gate (every PR)
 
 - **Rust** — `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`,
-  `cargo test --workspace`.
+  `cargo test --workspace`, plus the Postgres HA registry lane: `build-test` runs a `postgres:16`
+  service container and `cargo test -p growlerdb-controlplane --features postgres` with
+  `GROWLERDB_TEST_POSTGRES_URL` set, so the env-gated control-plane HA tests (leader lock, standby
+  reload, promotion) actually run instead of silently skipping. Local mirror: `just test-postgres`
+  (throwaway dockerized Postgres).
 - **Lint** — typos, shellcheck, actionlint, yamllint, markdownlint (repo-wide); the console adds
   eslint + prettier + `svelte-check`.
 - **UI** — eslint, prettier, svelte-check, unit tests (all four also in local `just check` via

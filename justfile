@@ -18,6 +18,21 @@ build:
 test:
     cargo test --workspace
 
+# The env-gated Postgres registry tests (control-plane HA, D51: leader lock / standby reload /
+# promotion) against a throwaway dockerized Postgres — the local mirror of CI's postgres:16
+# service container in build-test. Without GROWLERDB_TEST_POSTGRES_URL these tests skip, so a
+# plain `just test` never runs them.
+test-postgres:
+    #!/usr/bin/env sh
+    set -eu
+    docker rm -f growlerdb-test-postgres >/dev/null 2>&1 || true
+    docker run -d --name growlerdb-test-postgres -e POSTGRES_PASSWORD=postgres \
+      -p 55432:5432 postgres:16 >/dev/null
+    trap 'docker rm -f growlerdb-test-postgres >/dev/null' EXIT
+    until docker exec growlerdb-test-postgres pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
+    GROWLERDB_TEST_POSTGRES_URL=postgres://postgres:postgres@127.0.0.1:55432/postgres \
+      cargo test -p growlerdb-controlplane --features postgres
+
 fmt:
     cargo fmt --all
 

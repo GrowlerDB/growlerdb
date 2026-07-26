@@ -14,12 +14,35 @@ metadata:
     app.kubernetes.io/component: control-plane
 spec:
   replicas: {{ .Values.controlPlane.replicas }}
+  # Leader-only readiness means at most ONE pod is ever Ready, so the default rolling-update
+  # constraints (25% surge / 25%→0 maxUnavailable for small N) wedge every update permanently: the
+  # surged standby never becomes Ready, the old ReplicaSet never scales down, and the old leader
+  # never releases the advisory lock. `maxUnavailable: 100%` (minAvailable 0) is the only setting
+  # that lets the controller delete the old LEADER — any smaller value blocks on
+  # available(1) ≤ minAvailable(N-1). `maxSurge: 1` starts a new-version standby alongside first so
+  # promotion is immediate once the old pods go. Expect a brief control-plane write gap (a few
+  # seconds) during a rollout; the data plane (gateway/nodes) keeps serving throughout.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 100%
+  # availableReplicas tops out at 1 by design, so with replicas > 1 the Deployment never reports
+  # "complete" and the default 600s progress deadline would mark a healthy rollout as failed.
+  # Effectively disable it (max int32); watch for ONE Ready pod instead (see NOTES.txt).
+  progressDeadlineSeconds: 2147483647
   selector:
     matchLabels:
       {{- include "growlerdb.selectorLabels" . | nindent 6 }}
       app.kubernetes.io/component: control-plane
   template:
     metadata:
+      # Roll the pods when the chart-managed credentials Secret changes (registry DSN /
+      # service-token rotation would otherwise never reach running pods). A constant no-op with
+      # `credentials.existingSecret` (secret.yaml renders empty) — rotate out-of-band, then
+      # `kubectl rollout restart` this Deployment.
+      annotations:
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
       labels:
         {{- include "growlerdb.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: control-plane
@@ -29,11 +52,23 @@ spec:
       imagePullSecrets: {{- toYaml . | nindent 8 }}
       {{- end }}
       securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      # Prompt leader handoff on pod deletion. The binary runs as the container's PID 1 and installs
+      # a handler only for SIGINT (tokio ctrl_c), and PID 1 IGNORES unhandled signals — so the
+      # SIGTERM Kubernetes sends does nothing, and without help a terminating leader would sit on
+      # the advisory lock until the SIGKILL at grace expiry. The preStop hook converts termination
+      # into SIGINT: the process exits cleanly, its Postgres session closes, Postgres releases the
+      # advisory lock, and a standby promotes within its 250ms poll. The short grace period bounds
+      # the worst case (SIGKILL also closes the session, releasing the lock).
+      terminationGracePeriodSeconds: 10
       containers:
         - name: control-plane
           image: {{ include "growlerdb.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "kill -INT 1"]
           args:
             - control-plane
             - --addr

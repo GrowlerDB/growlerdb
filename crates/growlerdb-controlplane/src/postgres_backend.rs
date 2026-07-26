@@ -420,8 +420,9 @@ mod tests {
     use growlerdb_core::{IndexDefinition, SourceField, SourceSchema, SourceType};
 
     /// The live Postgres to test against. Unset ⇒ the test **skips** (default `cargo test --features
-    /// postgres` stays green without a database); CI's integration lane sets it. E.g.
-    /// `postgresql://postgres:pw@127.0.0.1:55432/cp`.
+    /// postgres` stays green without a database). CI's `build-test` job sets it against a postgres:16
+    /// service container; locally, `just test-postgres` spins up a throwaway dockerized Postgres and
+    /// sets it. E.g. `postgresql://postgres:pw@127.0.0.1:55432/cp`.
     fn test_url() -> Option<String> {
         std::env::var("GROWLERDB_TEST_POSTGRES_URL").ok()
     }

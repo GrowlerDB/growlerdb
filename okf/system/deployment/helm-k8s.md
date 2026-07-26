@@ -31,8 +31,21 @@ a **StatefulSet** (single-writer JSON registry on a PV). Setting `controlPlane.e
 ships the `postgres` backend. Coordination is **active-passive**: only the leader (the pod holding the
 store's advisory lock) reports `/readyz` 200, so the CP Service is a plain **ClusterIP** whose VIP
 routes to that one ready endpoint and shifts to the promoted standby on failover, with no client
-re-resolution. A CP `PodDisruptionBudget` and pod anti-affinity (`controlPlane.spreadReplicas`) keep a
-quorum spread across hosts. The chart's default embedded path is unchanged. *(The universal node
+re-resolution. Pod anti-affinity (`controlPlane.spreadReplicas`) spreads replicas across hosts.
+Leader-only readiness shapes the lifecycle machinery around it: the Deployment uses an explicit
+`maxUnavailable: 100%` / `maxSurge: 1` rolling strategy (any smaller `maxUnavailable` wedges the
+rollout forever — the controller can never scale down the old leader when only 1 pod is ever
+available; expect a brief CP write gap per rollout) with the progress deadline effectively disabled;
+a `preStop` SIGINT hook + 10s grace makes a terminating leader release the advisory lock promptly
+(the binary is container PID 1 and handles SIGINT only, so Kubernetes' SIGTERM would otherwise be
+ignored until SIGKILL); the CP deliberately has **no PodDisruptionBudget** (any budget requiring ≥1
+healthy pod pins `disruptionsAllowed` to 0 and wedges drains — eviction is safe, a standby promotes
+in ~250ms); and a `checksum/secret` pod annotation rolls the CP pods on DSN/service-token rotation.
+Don't wait on `kubectl rollout status` for the HA CP (it never completes at replicas > 1) — NOTES.txt
+gives the honest wait (`availableReplicas` = 1). Toggling `externalRegistry.enabled` on a live
+release is refused at upgrade time (immutable Service `clusterIP`, and registry data does not
+migrate between the embedded `registry.json` and Postgres — values.yaml documents the manual path).
+The chart's default embedded path is unchanged. *(The universal node
 **placement pool** — a capacity-sized node pool serving many indexes, [D52](/system/decisions/d52-placement-pool.md)
 — is a separate slice; the node here is still the per-index StatefulSet.)*
 

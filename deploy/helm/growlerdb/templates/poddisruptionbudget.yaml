@@ -1,19 +1,10 @@
-{{- if and .Values.controlPlane.externalRegistry.enabled .Values.controlPlane.podDisruptionBudget.enabled (gt (int .Values.controlPlane.replicas) 1) }}
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: {{ include "growlerdb.controlplane.fullname" . }}
-  labels:
-    {{- include "growlerdb.labels" . | nindent 4 }}
-    app.kubernetes.io/component: control-plane
-spec:
-  minAvailable: {{ .Values.controlPlane.podDisruptionBudget.minAvailable }}
-  selector:
-    matchLabels:
-      {{- include "growlerdb.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: control-plane
-{{- end }}
----
+# NOTE: deliberately NO PodDisruptionBudget for the HA control plane. Leader-only readiness means
+# exactly one CP pod is ever healthy, so ANY budget with desiredHealthy ≥ 1 (e.g. the previous
+# `minAvailable: 1`, or even `maxUnavailable: 1` at replicas ≥ 2) computes disruptionsAllowed = 0
+# forever and wedges `kubectl drain` on the leader's host. Evicting the leader is safe by design:
+# it releases the advisory lock on exit and a warm standby promotes within its 250ms poll — the
+# protection a PDB would buy is already provided by fast promotion + pod anti-affinity
+# (controlPlane.spreadReplicas), and a CP PDB can only ever block drains.
 {{- if and .Values.node.podDisruptionBudget.enabled (gt (int .Values.index.shards) 1) }}
 apiVersion: policy/v1
 kind: PodDisruptionBudget
