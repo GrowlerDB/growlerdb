@@ -3780,16 +3780,47 @@ type CpWindowedRouting = (
     WindowFingerprint,
 );
 
+/// The [`WindowFingerprint`] of a `GetIndex` response — `(window, primary, sorted replicas, cold)`
+/// per assigned window, sorted. Computed **without connecting anything**, so a reloader tick can
+/// decide "routing unchanged → keep the live gateway" (warm channels + [`FailoverNode`]
+/// (growlerdb_engine::FailoverNode) holder-health state intact) before building a single node.
+fn window_fingerprint_from_get_index(
+    resp: &growlerdb_proto::v1::GetIndexResponse,
+) -> WindowFingerprint {
+    let mut fingerprint: WindowFingerprint = resp
+        .shard_status
+        .iter()
+        .filter(|s| s.window != 0)
+        .map(|s| {
+            let mut reps: Vec<String> = s
+                .replicas
+                .iter()
+                .filter(|r| !r.is_empty())
+                .cloned()
+                .collect();
+            reps.sort();
+            (s.window, s.primary.clone(), reps, s.cold)
+        })
+        .collect();
+    fingerprint.sort();
+    fingerprint
+}
+
 /// Resolve a windowed index's routing from a live-CP `GetIndex` response: connect one
 /// [`WindowNode`] per window (deduped by endpoint — a node fronts many windows on one channel), the
 /// windowing config + per-window event-time zone-maps for pruning, and the topology fingerprint.
 /// Shared by the startup build and the hot-reload loop (so a window created at runtime is picked up).
+///
+/// `conns` is the caller's endpoint → connection cache: endpoints already present are **reused**
+/// (a tonic `Channel` is a cheap handle, so the warm connection carries over) and endpoints the new
+/// routing no longer references are pruned. A reloader keeps one cache across ticks so a topology
+/// change only dials the endpoints that actually changed; one-shot callers pass a fresh map.
 async fn resolve_windowed_routing_cp(
     index: &str,
     resp: &growlerdb_proto::v1::GetIndexResponse,
     node_tls: Option<tonic::transport::ClientTlsConfig>,
+    conns: &mut std::collections::HashMap<String, growlerdb_engine::RemoteNode>,
 ) -> anyhow::Result<CpWindowedRouting> {
-    use std::collections::HashMap;
     use std::sync::Arc;
     let wc = resp
         .windowing
@@ -3801,9 +3832,9 @@ async fn resolve_windowed_routing_cp(
     if windows.is_empty() {
         anyhow::bail!("windowed index `{index}` has no assigned windows yet");
     }
-    let mut conns: HashMap<String, growlerdb_engine::RemoteNode> = HashMap::new();
     let mut nodes: Vec<Arc<dyn growlerdb_engine::Node>> = Vec::with_capacity(windows.len());
     let mut descriptors = Vec::with_capacity(windows.len());
+    let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
     for s in &windows {
         if s.primary.is_empty() {
             anyhow::bail!(
@@ -3824,6 +3855,7 @@ async fn resolve_windowed_routing_cp(
         let mut holders: Vec<Arc<dyn growlerdb_engine::Node>> =
             Vec::with_capacity(holder_eps.len());
         for ep in &holder_eps {
+            referenced.insert(ep.clone());
             let remote = match conns.get(ep) {
                 Some(r) => r.clone(),
                 None => {
@@ -3846,23 +3878,17 @@ async fn resolve_windowed_routing_cp(
             s.cold,
         ));
     }
+    // Prune connections no window references any more, so a long-lived reloader cache doesn't grow
+    // without bound as pods churn endpoints.
+    conns.retain(|ep, _| referenced.contains(ep));
     // Fingerprint the full holder set (primary + sorted replicas) so the routing loop re-resolves
     // when the CP moves or re-replicates a window, not just on a primary change.
-    let mut fingerprint: WindowFingerprint = windows
-        .iter()
-        .map(|s| {
-            let mut reps: Vec<String> = s
-                .replicas
-                .iter()
-                .filter(|r| !r.is_empty())
-                .cloned()
-                .collect();
-            reps.sort();
-            (s.window, s.primary.clone(), reps, s.cold)
-        })
-        .collect();
-    fingerprint.sort();
-    Ok((nodes, windowing, descriptors, fingerprint))
+    Ok((
+        nodes,
+        windowing,
+        descriptors,
+        window_fingerprint_from_get_index(resp),
+    ))
 }
 
 /// Build a windowed [`Gateway`] + its [`WindowFingerprint`] from a live-CP `GetIndex`.
@@ -3872,7 +3898,7 @@ async fn windowed_gateway_from_get_index(
     node_tls: Option<tonic::transport::ClientTlsConfig>,
 ) -> anyhow::Result<(growlerdb_engine::Gateway, WindowFingerprint)> {
     let (nodes, windowing, descriptors, fp) =
-        resolve_windowed_routing_cp(index, resp, node_tls).await?;
+        resolve_windowed_routing_cp(index, resp, node_tls, &mut Default::default()).await?;
     // Temporal-field units from the CP's field mapping, so the gateway's `_search` adapter converts
     // range bounds to canonical micros (keeping pruning + node execution consistent).
     let date_formats = date_formats_from_get_index(resp);
@@ -4026,10 +4052,14 @@ impl growlerdb_engine::RouteResolver for CpRouteResolver {
         };
 
         if resp.windowing.is_some() {
-            let (nodes, windowing, descriptors, _fp) =
-                resolve_windowed_routing_cp(index, &resp, self.node_tls.clone())
-                    .await
-                    .map_err(|e| e.to_string())?;
+            let (nodes, windowing, descriptors, _fp) = resolve_windowed_routing_cp(
+                index,
+                &resp,
+                self.node_tls.clone(),
+                &mut Default::default(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
             let route = growlerdb_engine::IndexRoute::new(
                 nodes,
                 growlerdb_core::ShardRouter::hashed(descriptors.len().max(1) as u32),
@@ -4084,6 +4114,12 @@ fn spawn_index_route_reloader(
 ) {
     tokio::spawn(async move {
         let mut client: Option<growlerdb_proto::service_token::CpClient> = None;
+        // Windowed reload state: the last-applied fingerprint (skip the swap when routing is
+        // unchanged, keeping warm channels + holder-health state) and the endpoint → connection
+        // cache reused across ticks (a changed topology only dials endpoints that are new).
+        let mut last: Option<WindowFingerprint> = None;
+        let mut conns: std::collections::HashMap<String, growlerdb_engine::RemoteNode> =
+            Default::default();
         tokio::time::sleep(jittered(std::time::Duration::from_secs(secs), 0.5)).await;
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
         tick.tick().await; // the immediate first tick is the startup state
@@ -4118,9 +4154,19 @@ fn spawn_index_route_reloader(
                 }
             };
             if windowed {
-                match resolve_windowed_routing_cp(&index, &resp, node_tls.clone()).await {
-                    Ok((nodes, windowing, descriptors, _fp)) => {
+                // Unchanged routing → keep the live route: swapping would discard warm node
+                // channels and the FailoverNode holder-health state for nothing. (The first tick
+                // always applies once — `last` starts empty — then only real changes swap.)
+                let fp = window_fingerprint_from_get_index(&resp);
+                if last.as_ref() == Some(&fp) {
+                    growlerdb_telemetry::sli::background_success("route-reload");
+                    continue;
+                }
+                match resolve_windowed_routing_cp(&index, &resp, node_tls.clone(), &mut conns).await
+                {
+                    Ok((nodes, windowing, descriptors, fp)) => {
                         route.swap_windowed(nodes, windowing, descriptors);
+                        last = Some(fp);
                         growlerdb_telemetry::sli::background_success("route-reload");
                     }
                     Err(e) => {
@@ -4256,7 +4302,12 @@ fn spawn_control_plane_reloader(
 /// [`swap_windowed`](growlerdb_engine::Gateway::swap_windowed) so the cluster gateway picks up windows
 /// **created/placed at runtime** — the temporal workload's timeline advances continuously, so new
 /// windows must become queryable through the gateway with no restart. A read error keeps the current
-/// window set; `startup_fp` seeds `last` so the first tick logs only on a real change.
+/// window set; `startup_fp` seeds `last` so an unchanged-routing tick **skips the swap entirely**
+/// (HA-B6): swapping every tick would replace warm node channels with fresh lazy ones and reset the
+/// [`FailoverNode`](growlerdb_engine::FailoverNode) holder-health state for no topology gain. When
+/// the routing does change, the endpoint → connection cache reuses the channels of every endpoint
+/// that persists across the change (a tonic `Channel` is a cheap clonable handle), so only genuinely
+/// new endpoints dial.
 fn spawn_windowed_control_plane_reloader(
     gateway: std::sync::Arc<growlerdb_engine::Gateway>,
     cp: String,
@@ -4268,6 +4319,10 @@ fn spawn_windowed_control_plane_reloader(
     tokio::spawn(async move {
         let mut client: Option<growlerdb_proto::service_token::CpClient> = None;
         let mut last: Option<WindowFingerprint> = Some(startup_fp);
+        // Endpoint → connection cache, kept across ticks so a topology change reuses the warm
+        // channel of every endpoint that persists (resolve prunes endpoints that drop out).
+        let mut conns: std::collections::HashMap<String, growlerdb_engine::RemoteNode> =
+            Default::default();
         tokio::time::sleep(jittered(std::time::Duration::from_secs(secs), 0.5)).await;
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
         tick.tick().await; // immediate first tick is the startup state
@@ -4301,16 +4356,22 @@ fn spawn_windowed_control_plane_reloader(
                     continue;
                 }
             };
-            match resolve_windowed_routing_cp(&index, &resp, node_tls.clone()).await {
+            // Routing unchanged → skip the swap entirely: the live gateway keeps its warm node
+            // channels and the FailoverNode holder-health (down-mark) state. The fingerprint is
+            // computed straight off the response — no node connects on a no-change tick.
+            let fp = window_fingerprint_from_get_index(&resp);
+            if last.as_ref() == Some(&fp) {
+                growlerdb_telemetry::sli::background_success("cp-reload-windowed");
+                continue;
+            }
+            match resolve_windowed_routing_cp(&index, &resp, node_tls.clone(), &mut conns).await {
                 Ok((nodes, windowing, descriptors, fp)) => {
                     gateway.swap_windowed(nodes, windowing, descriptors);
-                    if Some(&fp) != last.as_ref() {
-                        eprintln!(
-                            "gateway: hot-reloaded `{index}` windows ({} live) from {cp}",
-                            gateway.shard_count()
-                        );
-                        last = Some(fp);
-                    }
+                    eprintln!(
+                        "gateway: hot-reloaded `{index}` windows ({} live) from {cp}",
+                        gateway.shard_count()
+                    );
+                    last = Some(fp);
                     growlerdb_telemetry::sli::background_success("cp-reload-windowed");
                 }
                 Err(e) => {
@@ -6081,9 +6142,10 @@ mod tests {
             ],
             ..Default::default()
         };
-        let (nodes, _windowing, descriptors, fp) = resolve_windowed_routing_cp("logs", &resp, None)
-            .await
-            .unwrap();
+        let (nodes, _windowing, descriptors, fp) =
+            resolve_windowed_routing_cp("logs", &resp, None, &mut Default::default())
+                .await
+                .unwrap();
         // One holder-group node (a FailoverNode) per window.
         assert_eq!(nodes.len(), 2);
         assert_eq!(descriptors.len(), 2);
@@ -6098,6 +6160,114 @@ mod tests {
                 ),
                 (200_i64, "http://p2:50051".to_string(), vec![], false),
             ]
+        );
+        // The cheap fingerprint (no connects) matches the resolved one — the reloader's skip-swap
+        // decision (`fp == last` ⇒ keep the live gateway) keys off exactly this equality.
+        assert_eq!(window_fingerprint_from_get_index(&resp), fp);
+    }
+
+    /// HA-B6 (reloader half): an unchanged `GetIndex` response fingerprints identically —
+    /// regardless of shard/replica listing order — so a reloader tick skips the swap; any holder,
+    /// placement, or tier change fingerprints differently and triggers a real swap.
+    #[test]
+    fn window_fingerprint_is_order_insensitive_and_change_sensitive() {
+        use growlerdb_proto::v1::{GetIndexResponse, ShardStatus};
+        let status = |window: i64, primary: &str, replicas: &[&str], cold: bool| ShardStatus {
+            window,
+            primary: primary.into(),
+            replicas: replicas.iter().map(|r| r.to_string()).collect(),
+            cold,
+            ..Default::default()
+        };
+        let resp = |shards: Vec<ShardStatus>| GetIndexResponse {
+            shard_status: shards,
+            ..Default::default()
+        };
+        let base = resp(vec![
+            status(100, "http://p:1", &["http://r1:1", "http://r2:1"], false),
+            status(200, "http://p2:1", &[], true),
+        ]);
+        // Same routing, different wire order → same fingerprint → the reloader skips the swap.
+        let reordered = resp(vec![
+            status(200, "http://p2:1", &[], true),
+            status(100, "http://p:1", &["http://r2:1", "http://r1:1"], false),
+        ]);
+        let fp = window_fingerprint_from_get_index(&base);
+        assert_eq!(fp, window_fingerprint_from_get_index(&reordered));
+        // A replica-set change, a primary move, and a tier flip each change the fingerprint.
+        for changed in [
+            resp(vec![
+                status(100, "http://p:1", &["http://r1:1"], false),
+                status(200, "http://p2:1", &[], true),
+            ]),
+            resp(vec![
+                status(
+                    100,
+                    "http://elsewhere:1",
+                    &["http://r1:1", "http://r2:1"],
+                    false,
+                ),
+                status(200, "http://p2:1", &[], true),
+            ]),
+            resp(vec![
+                status(100, "http://p:1", &["http://r1:1", "http://r2:1"], false),
+                status(200, "http://p2:1", &[], false),
+            ]),
+        ] {
+            assert_ne!(fp, window_fingerprint_from_get_index(&changed));
+        }
+    }
+
+    /// The reloader's connection cache reuses an endpoint's connection across resolves and prunes
+    /// endpoints the new routing no longer references (lazy connects — nothing dials here).
+    #[tokio::test]
+    async fn windowed_resolve_reuses_and_prunes_the_connection_cache() {
+        use growlerdb_proto::v1::{GetIndexResponse, ShardStatus, WindowingConfig};
+        let resp = |shards: Vec<(i64, &str, Vec<&str>)>| GetIndexResponse {
+            windowing: Some(WindowingConfig {
+                field: "ts".into(),
+                granularity: "daily".into(),
+                ..Default::default()
+            }),
+            shard_status: shards
+                .into_iter()
+                .map(|(window, primary, replicas)| ShardStatus {
+                    window,
+                    primary: primary.into(),
+                    replicas: replicas.into_iter().map(String::from).collect(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut conns = std::collections::HashMap::new();
+        resolve_windowed_routing_cp(
+            "logs",
+            &resp(vec![(100, "http://a:1", vec!["http://b:1"])]),
+            None,
+            &mut conns,
+        )
+        .await
+        .unwrap();
+        let mut eps: Vec<&String> = conns.keys().collect();
+        eps.sort();
+        assert_eq!(eps, ["http://a:1", "http://b:1"]);
+        // The next topology drops `b` and adds `c`: `a`'s connection persists (warm-channel reuse),
+        // `b` is pruned, `c` is dialed lazily.
+        resolve_windowed_routing_cp(
+            "logs",
+            &resp(vec![(100, "http://a:1", vec!["http://c:1"])]),
+            None,
+            &mut conns,
+        )
+        .await
+        .unwrap();
+        let mut eps: Vec<&String> = conns.keys().collect();
+        eps.sort();
+        assert_eq!(
+            eps,
+            ["http://a:1", "http://c:1"],
+            "persisting endpoints are kept, dropped ones pruned"
         );
     }
 

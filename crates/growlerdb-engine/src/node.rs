@@ -9,6 +9,7 @@
 //! (`get_by_key`), and `describe_index`. Writes go connector → Node `Write` gRPC directly
 //! (not through the Gateway).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,6 +42,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// How long to wait for a keepalive ping ack before the connection is declared dead.
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a [`FailoverNode`] holder stays **down-marked** after a transport-down failure before
+/// one read probes it again (half-open). Short by design: it only has to bridge the window between
+/// a holder dying and either its channel reconnecting or the gateway's CP poll re-placing the unit —
+/// long enough that a blackholed peer doesn't cost every read a probe, short enough that a recovered
+/// holder is back in rotation within a few seconds.
+const HOLDER_DOWN_COOLDOWN: Duration = Duration::from_secs(3);
 
 /// The shared [`Endpoint`] shape for a Node channel: connect + per-request timeouts, and HTTP/2
 /// keepalive (pinging while idle too) so an established channel to a silently-dead peer fails fast
@@ -480,13 +487,19 @@ fn is_holder_down(status: &Status) -> bool {
 /// ([`is_holder_down`]) or that answers "unit not served" ([`is_unit_not_served`] — a stale route or
 /// a not-yet-warmed replica; another holder may well serve it), returning the first success.
 ///
+/// Holders carry **health memory**: a transport-down failure (or a hung attempt) down-marks the
+/// holder, and later reads skip it while the mark is younger than [`HOLDER_DOWN_COOLDOWN`]
+/// (see [`FailoverNode::candidates`]) — so a dead/blackholed primary costs one probe per cooldown,
+/// not one per read. A success clears the holder's mark.
+///
 /// The gateway-stamped metadata (verified tenant/principal claims, `grpc-timeout`) is preserved on
 /// **every** attempt: the request is split once via `into_parts` and each attempt rebuilt from the
 /// same metadata + message ([`Extensions`] aren't `Clone`; nothing on this path carries any).
 ///
 /// Each attempt runs under a slice of the per-request budget — [`REQUEST_TIMEOUT`] divided by the
-/// holder count — so a hung primary can't exhaust the Gateway's scatter deadline (which equals
-/// [`REQUEST_TIMEOUT`]) before a replica is tried; a single-holder unit keeps the full budget.
+/// **candidate** count — so a hung primary can't exhaust the Gateway's scatter deadline (which
+/// equals [`REQUEST_TIMEOUT`]) before a replica is tried; a single-candidate read keeps the full
+/// budget.
 ///
 /// When every holder is exhausted, the last transport error surfaces as-is (an honest
 /// `Unavailable`/`DeadlineExceeded`); an all-holders-not-serving run maps to `Unavailable` — the
@@ -494,16 +507,24 @@ fn is_holder_down(status: &Status) -> bool {
 macro_rules! failover_read {
     ($self:expr, $method:ident, $req:expr) => {{
         let (meta, _ext, msg) = $req.into_parts();
-        let per_attempt = REQUEST_TIMEOUT / $self.holders.len().max(1) as u32;
+        let candidates = $self.candidates();
+        let per_attempt = REQUEST_TIMEOUT / candidates.len().max(1) as u32;
         let mut last: Option<Status> = None;
-        for holder in &$self.holders {
+        for idx in candidates {
+            let holder = &$self.holders[idx];
             let attempt = Request::from_parts(meta.clone(), Extensions::default(), msg.clone());
-            match tokio::time::timeout(per_attempt, holder.$method(attempt)).await {
-                Ok(Ok(resp)) => return Ok(resp),
-                // The holder is down/unreachable — remember the error and try the next holder.
-                Ok(Err(status)) if is_holder_down(&status) => last = Some(status),
+            match tokio::time::timeout(per_attempt, holder.node.$method(attempt)).await {
+                Ok(Ok(resp)) => {
+                    holder.mark_up();
+                    return Ok(resp);
+                }
+                // The holder is down/unreachable — down-mark it, remember the error, try the next.
+                Ok(Err(status)) if is_holder_down(&status) => {
+                    holder.mark_down($self.now_ms());
+                    last = Some(status);
+                }
                 // The holder doesn't serve this unit — try the next; if none does, that is
-                // unavailability, not a request error.
+                // unavailability, not a request error. The holder itself is alive: no down-mark.
                 Ok(Err(status)) if is_unit_not_served(&status) => {
                     last = Some(Status::unavailable(format!(
                         "no holder serves the unit: {}",
@@ -514,6 +535,7 @@ macro_rules! failover_read {
                 Ok(Err(status)) => return Err(status),
                 // The attempt overran its slice of the budget — a hung holder, treated as down.
                 Err(_elapsed) => {
+                    holder.mark_down($self.now_ms());
                     last = Some(Status::deadline_exceeded(format!(
                         "holder did not answer within the {per_attempt:?} failover slice"
                     )));
@@ -522,6 +544,48 @@ macro_rules! failover_read {
         }
         Err(last.unwrap_or_else(|| Status::unavailable("no holders for unit")))
     }};
+}
+
+/// One holder inside a [`FailoverNode`]: the node plus its **down-mark** — the lock-free health
+/// memory that lets reads skip a recently-dead holder instead of re-probing it on every request.
+struct HolderHealth {
+    node: Arc<dyn Node>,
+    /// `0` = no down-mark (healthy / never failed). Otherwise `1 + millis-since-`[`FailoverNode::base`]
+    /// of the last transport-down classification (the `+1` keeps a failure in the very first
+    /// millisecond distinguishable from the "up" sentinel).
+    down_mark_ms: AtomicU64,
+}
+
+impl HolderHealth {
+    fn new(node: Arc<dyn Node>) -> Self {
+        Self {
+            node,
+            down_mark_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Down-mark this holder as of `now_ms` (millis since the owning node's base instant).
+    fn mark_down(&self, now_ms: u64) {
+        self.down_mark_ms.store(now_ms + 1, Ordering::Relaxed);
+    }
+
+    /// Clear the down-mark (the holder answered). Steady-state reads skip the store — the mark is
+    /// already clear — so a healthy holder costs no atomic write per read.
+    fn mark_up(&self) {
+        if self.down_mark_ms.load(Ordering::Relaxed) != 0 {
+            self.down_mark_ms.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether this holder should be skipped at `now_ms`: down-marked less than
+    /// [`HOLDER_DOWN_COOLDOWN`] ago. An expired mark makes the holder eligible again — the next
+    /// read probes it (half-open) and either clears the mark (success) or refreshes it (failure).
+    fn skip(&self, now_ms: u64) -> bool {
+        match self.down_mark_ms.load(Ordering::Relaxed) {
+            0 => false,
+            mark => (now_ms + 1).saturating_sub(mark) < HOLDER_DOWN_COOLDOWN.as_millis() as u64,
+        }
+    }
 }
 
 /// A [`Node`] that fronts a unit's **holders** — its primary first, then read replicas (D53) — and
@@ -538,23 +602,67 @@ macro_rules! failover_read {
 /// **`require_complete` pins to the primary** (D53): a replica trails the primary by its snapshot
 /// advance, so a caller that opted out of any degradation gets the sole writer's answer or an
 /// honest error — never a possibly-stale replica answer dressed as complete.
+///
+/// **Health memory (down-marking).** Each holder carries a lock-free last-failure timestamp
+/// ([`HolderHealth`]): a transport-down failure down-marks the holder, and ordinary failover reads
+/// **skip** a holder down-marked less than [`HOLDER_DOWN_COOLDOWN`] ago — so after a primary dies,
+/// reads go straight to a replica instead of paying the dead primary's probe (up to a connect
+/// timeout when blackholed) on every request until the gateway's CP poll re-places the unit. Once a
+/// mark expires the next read probes the holder again (half-open) and either clears the mark or
+/// refreshes it. Two deliberate exceptions ignore down-marks:
+/// - if **every** holder is down-marked, reads try all of them anyway (fast-failing without probing
+///   would turn a blip on a single-holder unit into a cooldown of guaranteed errors);
+/// - **`require_complete` pinned reads and mutations** always go to the primary regardless of its
+///   mark — an honest error beats a silently stale replica, and they neither consult nor update the
+///   health state.
 pub struct FailoverNode {
     /// Primary first, then replicas. Always non-empty (a primary is required).
-    holders: Vec<Arc<dyn Node>>,
+    holders: Vec<HolderHealth>,
+    /// The zero point the down-mark timestamps count from (this node's construction). A tokio
+    /// instant so paused-clock tests drive the cooldown deterministically.
+    base: tokio::time::Instant,
 }
 
 impl FailoverNode {
     /// Front `primary` (the writer + preferred read target) plus zero or more read `replicas`.
     pub fn new(primary: Arc<dyn Node>, replicas: Vec<Arc<dyn Node>>) -> Self {
         let mut holders = Vec::with_capacity(1 + replicas.len());
-        holders.push(primary);
-        holders.extend(replicas);
-        Self { holders }
+        holders.push(HolderHealth::new(primary));
+        holders.extend(replicas.into_iter().map(HolderHealth::new));
+        Self {
+            holders,
+            base: tokio::time::Instant::now(),
+        }
     }
 
     /// Erase to a shared `dyn Node` for the [Gateway](crate::gateway::Gateway).
     pub fn shared(self) -> Arc<dyn Node> {
         Arc::new(self)
+    }
+
+    /// Milliseconds since [`base`](Self::base) — the clock the down-marks are stamped in.
+    fn now_ms(&self) -> u64 {
+        self.base.elapsed().as_millis() as u64
+    }
+
+    /// The primary holder's node — the sole target for mutations and pinned reads.
+    fn primary(&self) -> &Arc<dyn Node> {
+        &self.holders[0].node
+    }
+
+    /// The holder indices a failover read tries, in holder order (primary first): holders with a
+    /// fresh down-mark are skipped; if that leaves nothing, **all** holders are candidates (an
+    /// all-down unit must still probe rather than manufacture errors from stale marks).
+    fn candidates(&self) -> Vec<usize> {
+        let now = self.now_ms();
+        let live: Vec<usize> = (0..self.holders.len())
+            .filter(|&i| !self.holders[i].skip(now))
+            .collect();
+        if live.is_empty() {
+            (0..self.holders.len()).collect()
+        } else {
+            live
+        }
     }
 }
 
@@ -566,7 +674,7 @@ impl Node for FailoverNode {
     ) -> Result<Response<SearchResponse>, Status> {
         // `require_complete` pins to the primary: no replica failover, zero read-your-writes lag.
         if req.get_ref().require_complete {
-            return self.holders[0].search(req).await;
+            return self.primary().search(req).await;
         }
         failover_read!(self, search, req)
     }
@@ -576,7 +684,7 @@ impl Node for FailoverNode {
         req: Request<SemanticSearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         if req.get_ref().require_complete {
-            return self.holders[0].semantic_search(req).await;
+            return self.primary().semantic_search(req).await;
         }
         failover_read!(self, semantic_search, req)
     }
@@ -621,35 +729,35 @@ impl Node for FailoverNode {
         &self,
         req: Request<ReindexIndexRequest>,
     ) -> Result<Response<ReindexIndexResponse>, Status> {
-        self.holders[0].reindex_index(req).await
+        self.primary().reindex_index(req).await
     }
 
     async fn alter_index(
         &self,
         req: Request<AlterIndexRequest>,
     ) -> Result<Response<AlterIndexResponse>, Status> {
-        self.holders[0].alter_index(req).await
+        self.primary().alter_index(req).await
     }
 
     async fn compact_index(
         &self,
         req: Request<CompactIndexRequest>,
     ) -> Result<Response<CompactIndexResponse>, Status> {
-        self.holders[0].compact_index(req).await
+        self.primary().compact_index(req).await
     }
 
     async fn backup_index(
         &self,
         req: Request<BackupIndexRequest>,
     ) -> Result<Response<BackupIndexResponse>, Status> {
-        self.holders[0].backup_index(req).await
+        self.primary().backup_index(req).await
     }
 
     async fn backup_status(
         &self,
         req: Request<BackupStatusRequest>,
     ) -> Result<Response<BackupStatusResponse>, Status> {
-        self.holders[0].backup_status(req).await
+        self.primary().backup_status(req).await
     }
 }
 
@@ -660,6 +768,7 @@ mod tests {
     use std::sync::Mutex;
 
     /// How a [`MockNode`] answers each call.
+    #[derive(Clone, Copy)]
     enum Mode {
         /// Succeed with a default response.
         Up,
@@ -677,7 +786,7 @@ mod tests {
     /// metadata it saw) and answers by [`Mode`]. Overrides `search` (a read) + `reindex_index`
     /// (a mutation).
     struct MockNode {
-        mode: Mode,
+        mode: Mutex<Mode>,
         calls: Arc<AtomicUsize>,
         tenant_seen: Mutex<Option<String>>,
     }
@@ -685,10 +794,14 @@ mod tests {
     impl MockNode {
         fn with_mode(mode: Mode, calls: Arc<AtomicUsize>) -> Arc<Self> {
             Arc::new(Self {
-                mode,
+                mode: Mutex::new(mode),
                 calls,
                 tenant_seen: Mutex::new(None),
             })
+        }
+        /// Flip how this node answers mid-test (e.g. a dead holder coming back up).
+        fn set_mode(&self, mode: Mode) {
+            *self.mode.lock().unwrap() = mode;
         }
         fn up(calls: Arc<AtomicUsize>) -> Arc<Self> {
             Self::with_mode(Mode::Up, calls)
@@ -700,7 +813,9 @@ mod tests {
             self.tenant_seen.lock().unwrap().clone()
         }
         async fn answer<T: Default>(&self) -> Result<Response<T>, Status> {
-            match self.mode {
+            // Copy the mode out so the lock isn't held across the Hang await.
+            let mode = *self.mode.lock().unwrap();
+            match mode {
                 Mode::Up => Ok(Response::new(T::default())),
                 Mode::Err(code) => Err(Status::new(code, "mock")),
                 Mode::NotServed => Err(crate::windowed_routing::unit_not_served(
@@ -976,6 +1091,124 @@ mod tests {
             "two holders split the request budget evenly"
         );
         assert_eq!(r.load(Ordering::SeqCst), 1, "replica answered");
+    }
+
+    /// Health memory (HA-B6): a transport-down failure down-marks the holder, so within the
+    /// cooldown later reads skip it entirely (no probe per read against a dead/blackholed primary);
+    /// once the mark expires the next read probes it again (half-open).
+    #[tokio::test(start_paused = true)]
+    async fn a_down_marked_holder_is_skipped_within_the_cooldown_then_probed_after() {
+        let (p, r) = (count(), count());
+        let fo = FailoverNode::new(
+            MockNode::erroring(Code::Unavailable, p.clone()),
+            vec![MockNode::up(r.clone())],
+        );
+        // First read probes the dead primary (down-marking it) and fails over.
+        Node::search(&fo, Request::new(SearchRequest::default()))
+            .await
+            .unwrap();
+        assert_eq!((p.load(Ordering::SeqCst), r.load(Ordering::SeqCst)), (1, 1));
+        // Within the cooldown the primary is skipped — the read goes straight to the replica.
+        tokio::time::advance(HOLDER_DOWN_COOLDOWN / 2).await;
+        Node::search(&fo, Request::new(SearchRequest::default()))
+            .await
+            .unwrap();
+        assert_eq!(
+            (p.load(Ordering::SeqCst), r.load(Ordering::SeqCst)),
+            (1, 2),
+            "a fresh down-mark skips the dead primary"
+        );
+        // After the cooldown the mark has decayed: one read probes the primary again.
+        tokio::time::advance(HOLDER_DOWN_COOLDOWN).await;
+        Node::search(&fo, Request::new(SearchRequest::default()))
+            .await
+            .unwrap();
+        assert_eq!(
+            (p.load(Ordering::SeqCst), r.load(Ordering::SeqCst)),
+            (2, 3),
+            "an expired mark half-opens: the primary is probed once more"
+        );
+    }
+
+    /// A recovered holder's half-open probe succeeds → the mark clears and the primary is
+    /// preferred again immediately (no waiting out another cooldown).
+    #[tokio::test(start_paused = true)]
+    async fn a_successful_probe_clears_the_down_mark() {
+        let (p, r) = (count(), count());
+        let primary = MockNode::erroring(Code::Unavailable, p.clone());
+        let fo = FailoverNode::new(primary.clone(), vec![MockNode::up(r.clone())]);
+        Node::search(&fo, Request::new(SearchRequest::default()))
+            .await
+            .unwrap();
+        // The primary comes back up, but its mark is still fresh — reads keep skipping it.
+        primary.set_mode(Mode::Up);
+        Node::search(&fo, Request::new(SearchRequest::default()))
+            .await
+            .unwrap();
+        assert_eq!((p.load(Ordering::SeqCst), r.load(Ordering::SeqCst)), (1, 2));
+        // The probe after cooldown succeeds and clears the mark...
+        tokio::time::advance(HOLDER_DOWN_COOLDOWN).await;
+        Node::search(&fo, Request::new(SearchRequest::default()))
+            .await
+            .unwrap();
+        assert_eq!((p.load(Ordering::SeqCst), r.load(Ordering::SeqCst)), (2, 2));
+        // ...so the very next read (no time advance) prefers the primary again.
+        Node::search(&fo, Request::new(SearchRequest::default()))
+            .await
+            .unwrap();
+        assert_eq!(
+            (p.load(Ordering::SeqCst), r.load(Ordering::SeqCst)),
+            (3, 2),
+            "a cleared mark restores primary preference immediately"
+        );
+    }
+
+    /// `require_complete` pinned reads IGNORE down-marks: even a freshly down-marked primary is
+    /// tried (honest error beats silent replica), and the replica is never consulted.
+    #[tokio::test(start_paused = true)]
+    async fn require_complete_ignores_down_marks() {
+        let (p, r) = (count(), count());
+        let fo = FailoverNode::new(
+            MockNode::erroring(Code::Unavailable, p.clone()),
+            vec![MockNode::up(r.clone())],
+        );
+        // A normal read down-marks the primary.
+        Node::search(&fo, Request::new(SearchRequest::default()))
+            .await
+            .unwrap();
+        assert_eq!(p.load(Ordering::SeqCst), 1);
+        // A pinned read inside the cooldown still hits the primary and surfaces its error.
+        let err = Node::search(
+            &fo,
+            Request::new(SearchRequest {
+                require_complete: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("pinned read surfaces the down primary honestly");
+        assert_eq!(err.code(), Code::Unavailable);
+        assert_eq!(p.load(Ordering::SeqCst), 2, "the down-mark was ignored");
+        assert_eq!(r.load(Ordering::SeqCst), 1, "the replica stays untouched");
+    }
+
+    /// When EVERY holder is down-marked the marks are ignored — a single-holder unit (the R=1
+    /// default) must keep probing on each read, not fast-fail from stale health state for a whole
+    /// cooldown after one blip.
+    #[tokio::test(start_paused = true)]
+    async fn an_all_down_marked_unit_still_probes_every_read() {
+        let p = count();
+        let fo = FailoverNode::new(MockNode::erroring(Code::Unavailable, p.clone()), vec![]);
+        for expected in 1..=3 {
+            Node::search(&fo, Request::new(SearchRequest::default()))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                p.load(Ordering::SeqCst),
+                expected,
+                "the sole holder is probed on every read despite its down-mark"
+            );
+        }
     }
 
     /// Lazy connect must **build without dialing** — so a Gateway can front a shard whose

@@ -84,9 +84,13 @@ nodes; adding an index is a CP registration, not a new StatefulSet.
 **[D53](/system/decisions/d53-unit-replication.md) adds a replication factor** to the pool: the CP
 assigns **R holders per unit** — one **primary** (the sole writer, so the continuity guard
 [D31](/system/decisions/d31-ingest-loss-guards.md) is preserved) and R−1 **read replicas**. Writes
-go to the primary; reads scatter to **any live holder** (health-aware selection). A dead node's units
+go to the primary; reads scatter to **any live holder** (health-aware selection: the gateway's
+failover node down-marks a transport-dead holder and skips it for a short cooldown before
+re-probing, so reads don't re-pay a dead primary's probe on every request). A dead node's units
 **re-place onto survivors** (D33's idempotent dead-owner re-placement, now generalized) while a warm
-replica keeps serving — so a node loss is a **zero-gap read failover**, not the partial-results
+replica keeps serving — so a node loss is a **zero-gap read failover** for every unit a replica can
+serve (parked/cold windows today — see the
+[known limitation](/quality/known-limitations/windowed-replica-gap.md)), not the partial-results
 degradation of today. The [durability](/product/non-functional/durability.md) RPO=0 story is unchanged
 (writes still ack on the primary's durable commit); replicas are a read/availability layer.
 
@@ -98,8 +102,10 @@ by subscribing to a CP push** (`SubscribeAssignments` — the CP streams each no
 its holder set on every placement change) and obtains its data by **reading the parked unit's frozen
 sidecars + segments read-through from object storage** (`open_cold_replica`) — no rebuild, no copy
 stream. So placing a replica → the node opens it read-through → the gateway fails reads over to it,
-end to end. (Cold/parked windows today; continuous hot-window shipping is a later step, and hash-shard
-replica serving follows the pool hash path.)
+end to end. (Cold/parked windows today — a **hot** window's tail exists only on its primary until
+the window parks, so a hot-window node loss degrades honestly until re-placement + revive; see the
+[known limitation](/quality/known-limitations/windowed-replica-gap.md). Continuous hot-window
+shipping is a later step, and hash-shard replica serving follows the pool hash path.)
 
 Same primitive, three wins: **multi-index density** (kills node-per-index), **read failover**
 (kills the node SPOF), and **rebalancing** (moving a unit is placing a unit).
@@ -131,7 +137,8 @@ segment-shipped copies), so a replica never needs its own local rebuild.
 - **Connector** — unchanged; the single-connector *ingest* SPOF is documented and the connector-set
   ([D32](/system/decisions/d32-parallel-ingest.md)) is the HA ingest path.
 - **Node** — replicated units + cold-tier-fast re-placement ⇒ a node loss is a zero-gap read
-  failover; many indexes share one pool.
+  failover for replica-served (parked/cold) units — the hot tail is the
+  [remaining gap](/quality/known-limitations/windowed-replica-gap.md); many indexes share one pool.
 - **Control plane** — N stateless replicas over a replicated store ⇒ no SPOF; a replica loss is a
   reconnect, a leader loss is a store failover.
 
