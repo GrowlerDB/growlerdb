@@ -28,8 +28,12 @@ without forking — the [extension seam](/system/decisions/d37-extension-seams.m
   `(index, window)` **unit** to its holder and stamps that unit on the request, so the gateway fronts a
   **pool node** serving many indexes' windows over one endpoint unchanged
   ([D52](/system/decisions/d52-placement-pool.md)): the per-window `WindowNode` stamps the index too,
-  and the node dispatches on it. A window whose holder is briefly down doesn't blank the route (the
-  swap keeps the last servable topology; lazy connect fails that unit fast to a `partial`).
+  and the node dispatches on it. Each window resolves to **all its holders** — primary + read replicas
+  ([D53](/system/decisions/d53-unit-replication.md)) — behind a `FailoverNode`: a read tries the
+  primary and, if it's down/unreachable, **fails over** to a live replica (no gap, no forced
+  `partial`); mutations still pin to the primary. Holders connect **lazily**, so a down holder never
+  blanks resolution — a window with no live holder fails fast to a `partial`, and the routing
+  fingerprint tracks the full holder set so a re-placement or re-replication hot-reloads the route.
 - **Scatter-gather** — fans Search/Suggest out to the target shards, merges top-K, **dedupes** by
   composite key (safe mid-reshard), and surfaces an honest `partial` flag; enforces **per-shard
   deadlines** and a **page-fetch ceiling**.
