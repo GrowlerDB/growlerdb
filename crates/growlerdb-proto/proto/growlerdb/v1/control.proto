@@ -376,6 +376,27 @@ message ResolveUnitOwnerResponse {
   bool created = 2;     // true iff this call made or moved the assignment
 }
 
+// D53 assignment push: a node subscribes with its endpoint and the control plane streams the set of
+// units it currently holds — a full SNAPSHOT on subscribe and again on every placement change — so the
+// node reconciles its serving set idempotently (open newly-assigned units, drop de-assigned ones)
+// rather than tracking deltas.
+message SubscribeAssignmentsRequest {
+  string endpoint = 1;  // the subscribing node's routable endpoint (its holder identity)
+}
+// One unit this node holds, and in what role.
+message UnitAssignment {
+  string index = 1;
+  oneof unit {
+    uint32 shard = 2;   // ordinal shard of a hash-sharded index
+    int64 window = 3;   // window id of a windowed index
+  }
+  bool primary = 4;     // true = the primary (sole writer); false = a read replica (served read-through)
+}
+// The node's full current assignment set (a snapshot).
+message NodeAssignments {
+  repeated UnitAssignment units = 1;
+}
+
 // Ingestion (sync) status for one or all indexes — what the Ingestion screen renders. GrowlerDB
 // has no separate "connector" entity: every index is kept in sync with exactly one Iceberg source
 // by changelog ingestion, so "ingestion status" = source head vs. the shards' committed checkpoint.
@@ -460,6 +481,9 @@ service ControlPlane {
   // placing on first ask).
   rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
   rpc ResolveUnitOwner(ResolveUnitOwnerRequest) returns (ResolveUnitOwnerResponse);
+  // D53 assignment push: a node subscribes and the CP streams its current holder assignments (a
+  // snapshot on subscribe and on every placement change), so a placed replica starts serving.
+  rpc SubscribeAssignments(SubscribeAssignmentsRequest) returns (stream NodeAssignments);
   // Ingestion (sync) status: source head vs. each shard's committed checkpoint.
   rpc IngestionStatus(IngestionStatusRequest) returns (IngestionStatusResponse);
   // Scale-limit license status: the entitlement + current node usage, for the console.

@@ -79,7 +79,8 @@ pub fn scope_for_method(method: &str) -> Option<Scope> {
         | "MoveBucket"
         | "RegisterServedIndex"
         | "RegisterNode"
-        | "ResolveUnitOwner" => Scope::Ops,
+        | "ResolveUnitOwner"
+        | "SubscribeAssignments" => Scope::Ops,
         _ => return None,
     })
 }

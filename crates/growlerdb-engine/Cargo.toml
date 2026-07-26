@@ -28,7 +28,7 @@ getrandom = "0.2"
 base64 = "0.22"
 tonic.workspace = true
 tokio = { workspace = true, features = ["rt", "sync"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["fs", "timeout"] }
 # The MCP HTTP transport oneshots the /v1 router in-process.

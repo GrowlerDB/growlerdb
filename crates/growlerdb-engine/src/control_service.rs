@@ -25,13 +25,14 @@ use growlerdb_proto::v1::{
     ListIndexesRequest, ListIndexesResponse, ListRolesRequest, ListRolesResponse,
     ListSavedQueriesRequest, ListSavedQueriesResponse, ListTokensRequest, ListTokensResponse,
     ListUsersRequest, ListUsersResponse, LoginRequest, LoginResponse, MoveBucketRequest,
-    MoveBucketResponse, PlanReshardRequest, PlanReshardResponse, RegisterNodeRequest,
-    RegisterNodeResponse, RegisterServedIndexRequest, RegisterServedIndexResponse,
-    ReindexIndexRequest, ResolveUnitOwnerRequest, ResolveUnitOwnerResponse, RevokeTokenRequest,
-    RevokeTokenResponse, RoleBinding, RoutingStrategy as WireRouting, SaveSavedQueryRequest,
-    SaveSavedQueryResponse, SavedQuery as WireSavedQuery, SetAliasRequest, SetAliasResponse,
-    SetUserRolesRequest, SetUserRolesResponse, ShardIngestion, ShardStatus, SourceFieldInfo,
-    WindowingConfig,
+    MoveBucketResponse, NodeAssignments, PlanReshardRequest, PlanReshardResponse,
+    RegisterNodeRequest, RegisterNodeResponse, RegisterServedIndexRequest,
+    RegisterServedIndexResponse, ReindexIndexRequest, ResolveUnitOwnerRequest,
+    ResolveUnitOwnerResponse, RevokeTokenRequest, RevokeTokenResponse, RoleBinding,
+    RoutingStrategy as WireRouting, SaveSavedQueryRequest, SaveSavedQueryResponse,
+    SavedQuery as WireSavedQuery, SetAliasRequest, SetAliasResponse, SetUserRolesRequest,
+    SetUserRolesResponse, ShardIngestion, ShardStatus, SourceFieldInfo,
+    SubscribeAssignmentsRequest, UnitAssignment, WindowingConfig,
 };
 use growlerdb_proto::{to_status, ControlPlane, ControlPlaneServer, WriteClient};
 use growlerdb_source::{IcebergConfig, IcebergReader};
@@ -113,6 +114,76 @@ impl LoginThrottle {
     }
 }
 
+/// Per-node assignment-push subscribers (D53): `node endpoint → a watch sender holding the node's
+/// latest assignment snapshot`. A node's `SubscribeAssignments` call subscribes here; a placement
+/// change pushes a fresh snapshot to every node. `watch` **coalesces to the latest value**, so a slow
+/// node never wedges the CP and always converges on the current assignment set (snapshots are
+/// idempotent — the node reconciles). `Arc<Mutex<…>>` so every clone of the (`Clone`)
+/// [`ControlPlaneService`] shares one subscriber set.
+#[derive(Clone, Default)]
+struct AssignmentHub {
+    senders: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::watch::Sender<NodeAssignments>>,
+        >,
+    >,
+}
+
+impl AssignmentHub {
+    /// Subscribe `endpoint`, seeding the stream with `initial`. Reuses the node's existing watch
+    /// sender (so a later push reaches every live receiver) and refreshes it to `initial`.
+    fn subscribe(
+        &self,
+        endpoint: &str,
+        initial: NodeAssignments,
+    ) -> tokio::sync::watch::Receiver<NodeAssignments> {
+        let mut map = self.senders.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = map
+            .entry(endpoint.to_string())
+            .or_insert_with(|| tokio::sync::watch::channel(initial.clone()).0);
+        let _ = tx.send(initial); // refresh to the snapshot at (re)subscribe time
+        tx.subscribe()
+    }
+
+    /// Push a fresh snapshot to every subscribed node — called after a placement change so a placed
+    /// replica starts serving. Each node's snapshot is recomputed from the registry; a node with no
+    /// live receiver is a no-op `send` (its sender is kept for a reconnect).
+    fn notify_all(&self, registry: &Registry) {
+        let endpoints: Vec<String> = {
+            let map = self.senders.lock().unwrap_or_else(|e| e.into_inner());
+            map.keys().cloned().collect()
+        };
+        for ep in endpoints {
+            let snap = node_assignments_wire(registry.node_assignments(&ep));
+            let map = self.senders.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(tx) = map.get(&ep) {
+                let _ = tx.send(snap);
+            }
+        }
+    }
+}
+
+/// Convert the registry's `(index, unit, is_primary)` rows into the wire [`NodeAssignments`] snapshot.
+fn node_assignments_wire(
+    units: Vec<(String, growlerdb_controlplane::Unit, bool)>,
+) -> NodeAssignments {
+    use growlerdb_controlplane::Unit;
+    use growlerdb_proto::v1::unit_assignment::Unit as WireUnit;
+    NodeAssignments {
+        units: units
+            .into_iter()
+            .map(|(index, unit, primary)| UnitAssignment {
+                index,
+                primary,
+                unit: Some(match unit {
+                    Unit::Shard(o) => WireUnit::Shard(o),
+                    Unit::Window(w) => WireUnit::Window(w),
+                }),
+            })
+            .collect(),
+    }
+}
+
 /// A `ControlPlane` service over a shared [`Registry`]. `CreateIndex` resolves against the
 /// index's Iceberg source (`iceberg`); drop/list are pure registry operations.
 #[derive(Clone)]
@@ -139,6 +210,9 @@ pub struct ControlPlaneService {
     /// `ResolveUnitOwner` path is then byte-identical to before. `> 1` engages
     /// [`resolve_unit_holders`](Registry::resolve_unit_holders) so a resolve also places replicas.
     replication_factor: usize,
+    /// D53 assignment-push subscribers: nodes subscribe (`SubscribeAssignments`) and a placement
+    /// change pushes each its current holder set, so a placed replica starts serving.
+    assignments: AssignmentHub,
 }
 
 impl ControlPlaneService {
@@ -159,6 +233,7 @@ impl ControlPlaneService {
             login_throttle: Arc::new(LoginThrottle::new()),
             license: None,
             replication_factor: 1,
+            assignments: AssignmentHub::default(),
         }
     }
 
@@ -1435,10 +1510,37 @@ impl ControlPlane for ControlPlaneService {
                 .resolve_unit_owner(&req.index, unit, now_ms())
                 .map_err(to_status)?
         };
+        // Placement changed → push each subscribed node its fresh assignment set (D53), so a newly
+        // placed replica opens + serves the unit read-through.
+        if created {
+            self.assignments.notify_all(&self.registry);
+        }
         Ok(Response::new(ResolveUnitOwnerResponse {
             endpoint,
             created,
         }))
+    }
+
+    type SubscribeAssignmentsStream =
+        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<NodeAssignments, Status>> + Send>>;
+
+    async fn subscribe_assignments(
+        &self,
+        request: Request<SubscribeAssignmentsRequest>,
+    ) -> Result<Response<Self::SubscribeAssignmentsStream>, Status> {
+        self.gate("SubscribeAssignments", &request)?;
+        let endpoint = request.into_inner().endpoint;
+        if endpoint.is_empty() {
+            return Err(Status::invalid_argument("endpoint is required"));
+        }
+        // Seed the stream with the node's current assignment snapshot, then hand back a watch-backed
+        // stream that yields a fresh snapshot on every placement change (`notify_all`). The node
+        // reconciles its serving set against each snapshot idempotently.
+        let snapshot = node_assignments_wire(self.registry.node_assignments(&endpoint));
+        let rx = self.assignments.subscribe(&endpoint, snapshot);
+        use tokio_stream::StreamExt;
+        let stream = tokio_stream::wrappers::WatchStream::new(rx).map(Ok);
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn ingestion_status(
@@ -2190,6 +2292,66 @@ mod tests {
         assert_eq!(w.primary, primary, "the write target is the primary");
         assert_eq!(w.replicas.len(), 1, "R=2 ⇒ one read replica");
         assert_ne!(w.replicas[0], primary, "the replica is a distinct node");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribe_assignments_pushes_placement_to_the_holder_node() {
+        // D53 push: a node subscribes and, when the CP places a unit that lands on it (as primary or
+        // replica), the node's stream is pushed a fresh snapshot carrying that unit — so a placed
+        // replica knows to open + serve it.
+        use tokio_stream::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path()).with_replication_factor(2);
+        svc.registry.create(resolved_windowed("logs")).unwrap();
+        for ep in ["http://node-a:50051", "http://node-b:50051"] {
+            svc.register_node(Request::new(RegisterNodeRequest {
+                endpoint: ep.into(),
+            }))
+            .await
+            .unwrap();
+        }
+
+        // node-b subscribes; its first snapshot is empty (it holds nothing yet).
+        let mut stream = svc
+            .subscribe_assignments(Request::new(SubscribeAssignmentsRequest {
+                endpoint: "http://node-b:50051".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            stream.next().await.unwrap().unwrap().units.is_empty(),
+            "initial snapshot: node-b holds nothing"
+        );
+
+        // Resolving window 10 at R=2 lands a primary on one node and a replica on the other, so
+        // node-b holds it either way — and the push delivers node-b its updated snapshot.
+        let r = svc
+            .resolve_unit_owner(Request::new(ResolveUnitOwnerRequest {
+                index: "logs".into(),
+                unit: Some(growlerdb_proto::v1::resolve_unit_owner_request::Unit::Window(10)),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let pushed = stream.next().await.unwrap().unwrap();
+        let held: Vec<_> = pushed
+            .units
+            .iter()
+            .filter(|u| {
+                matches!(
+                    u.unit,
+                    Some(growlerdb_proto::v1::unit_assignment::Unit::Window(10))
+                )
+            })
+            .collect();
+        assert_eq!(held.len(), 1, "node-b was pushed its window-10 assignment");
+        assert_eq!(
+            held[0].primary,
+            r.endpoint == "http://node-b:50051",
+            "node-b's role matches whether it's the resolved primary"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
