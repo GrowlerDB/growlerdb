@@ -1538,6 +1538,37 @@ impl Registry {
         self.resolve_unit_owner(index, Unit::Window(window), now_ms)
     }
 
+    /// The units `endpoint` currently holds, as `(index, unit, is_primary)` — a node's **assignment
+    /// snapshot** (D53), which the control plane pushes so the node opens/serves exactly these units
+    /// (`is_primary = false` ⇒ a read replica it opens read-through). Scans every index's shard +
+    /// window maps; a node that holds neither the primary nor a replica slot of a unit doesn't appear.
+    pub fn node_assignments(&self, endpoint: &str) -> Vec<(String, Unit, bool)> {
+        let role = |sa: &ShardAssignment| -> Option<bool> {
+            if sa.primary.as_ref().is_some_and(|p| p.0 == endpoint) {
+                Some(true)
+            } else if sa.replicas.iter().any(|r| r.0 == endpoint) {
+                Some(false)
+            } else {
+                None
+            }
+        };
+        let map = self.read_map();
+        let mut out = Vec::new();
+        for (name, entry) in map.iter() {
+            for (ordinal, sa) in &entry.shards {
+                if let Some(is_primary) = role(sa) {
+                    out.push((name.clone(), Unit::Shard(*ordinal), is_primary));
+                }
+            }
+            for (window, wa) in &entry.windows {
+                if let Some(is_primary) = role(&wa.assignment) {
+                    out.push((name.clone(), Unit::Window(*window), is_primary));
+                }
+            }
+        }
+        out
+    }
+
     /// Resolve the **R holders** of a unit (D53): one **primary** (sole writer) + up to
     /// `replication_factor − 1` read **replicas** over the live [placement pool](Self::node_pool).
     ///
