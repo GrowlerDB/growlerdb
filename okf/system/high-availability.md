@@ -93,10 +93,13 @@ degradation of today. The [durability](/product/non-functional/durability.md) RP
 R is a **cluster-wide** setting (`GROWLERDB_REPLICATION_FACTOR`, default `1` = primary-only, the D52
 behavior). At `R > 1` a resolve places the replica holders into the durable shard map, and the gateway
 reads that holder set to route each read through a **failover node** across a unit's `[primary,
-replicas…]` (trying the primary, failing over to a live replica). A replica obtains its data by
-**reading the parked unit's frozen sidecars + segments read-through from object storage**
-(`open_cold_replica`) — no rebuild, no copy stream. (Wiring the CP→node assignment push that makes a
-placed replica start serving is in progress.)
+replicas…]` (trying the primary, failing over to a live replica). A replica **learns its assignments
+by subscribing to a CP push** (`SubscribeAssignments` — the CP streams each node a fresh snapshot of
+its holder set on every placement change) and obtains its data by **reading the parked unit's frozen
+sidecars + segments read-through from object storage** (`open_cold_replica`) — no rebuild, no copy
+stream. So placing a replica → the node opens it read-through → the gateway fails reads over to it,
+end to end. (Cold/parked windows today; continuous hot-window shipping is a later step, and hash-shard
+replica serving follows the pool hash path.)
 
 Same primitive, three wins: **multi-index density** (kills node-per-index), **read failover**
 (kills the node SPOF), and **rebalancing** (moving a unit is placing a unit).

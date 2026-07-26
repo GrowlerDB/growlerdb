@@ -2567,6 +2567,9 @@ async fn serve_pool(
     // Per-index (resolved def, writer) for the CP announce when `--register` is set: the writer's
     // live `served_windows()` is read each re-announce, so a window created since boot is advertised.
     let mut announcements: Vec<(growlerdb_core::ResolvedIndex, WindowedWriteService)> = Vec::new();
+    // Per-index (def, source table, heavy budget) the D53 replica reconcile needs to open an
+    // assigned replica window read-through and publish it into this index's maps.
+    let mut replica_meta: ReplicaIndexMeta = std::collections::HashMap::new();
     // Per-index fair share of the node-wide heavy-read budget (D52 pool fairness): co-resident indexes
     // share one process, so cap each at an equal slice so a flood of exports/aggregations on one index
     // can't starve queries on another. `max(1)` guarantees every index at least one heavy permit.
@@ -2715,8 +2718,43 @@ async fn serve_pool(
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(index.clone(), write_service.clone());
+        replica_meta.insert(
+            index.clone(),
+            (resolved.clone(), table.clone(), index_heavy.clone()),
+        );
         announcements.push((resolved, write_service));
         let _ = served; // (per-window ServedWindow now re-read from the writer at announce time)
+    }
+
+    // D53 replica serving: when this node registers into the pool AND a backup object store is
+    // configured, subscribe to CP assignment pushes and open each assigned *replica* window
+    // read-through, so a re-placed/replica holder answers without a rebuild. Needs both the CP (for
+    // the subscription) and the object store (for the parked data); absent either, the node serves
+    // only its local/primary windows (no replica failover).
+    if let (Some(cp), Some(endpoint)) = (register, advertise_addr) {
+        match backup_s3_config()
+            .and_then(|cfg| growlerdb_backup::s3_store(&cfg).map_err(anyhow::Error::from))
+        {
+            Ok(op) => {
+                spawn_replica_reconcile(
+                    cp.to_string(),
+                    endpoint.to_string(),
+                    replica_meta,
+                    search_idx.clone(),
+                    suggest_idx.clone(),
+                    lookup_idx.clone(),
+                    admin_idx.clone(),
+                    store.clone(),
+                    op,
+                    growlerdb_index::RangeCache::new(cold_cache_bytes()),
+                    std::path::PathBuf::from(data_dir).join(".replica"),
+                );
+            }
+            Err(e) => eprintln!(
+                "serve-pool: replica failover disabled — no object store ({e}); set \
+                 GROWLERDB_BACKUP_BUCKET to enable D53 replica serving"
+            ),
+        }
     }
 
     let socket: std::net::SocketAddr = addr
@@ -2767,6 +2805,211 @@ async fn serve_pool(
         .await?;
     println!("growlerdb serve-pool: shut down cleanly");
     Ok(())
+}
+
+/// Per-index context a pool node needs to open an assigned **replica** window (D53): its resolved
+/// definition, source table (for hydration), and the per-index heavy-read budget the replica's
+/// `SearchService` shares. Keyed by index name.
+type ReplicaIndexMeta = std::collections::HashMap<
+    String,
+    (
+        growlerdb_core::ResolvedIndex,
+        String,
+        std::sync::Arc<tokio::sync::Semaphore>,
+    ),
+>;
+
+/// Subscribe to CP **assignment pushes** and serve this node's assigned replica windows (D53):
+/// each pushed snapshot is reconciled by [`reconcile_replica_windows`]. Reconnects with a short
+/// backoff if the stream drops (the CP re-sends a full snapshot on resubscribe, so nothing is lost).
+#[allow(clippy::too_many_arguments)]
+fn spawn_replica_reconcile(
+    cp: String,
+    endpoint: String,
+    meta: ReplicaIndexMeta,
+    search_idx: growlerdb_engine::SharedSearchIndexes,
+    suggest_idx: growlerdb_engine::SharedSuggestIndexes,
+    lookup_idx: growlerdb_engine::SharedLookupIndexes,
+    admin_idx: growlerdb_engine::SharedAdminIndexes,
+    store: growlerdb_index::LocalIndexStore,
+    op: growlerdb_backup::Operator,
+    cache: growlerdb_index::RangeCache,
+    replica_root: std::path::PathBuf,
+) {
+    tokio::spawn(async move {
+        loop {
+            if let Err(e) = async {
+                let mut client = connect_cp(&cp, false).await?;
+                let mut stream = client
+                    .subscribe_assignments(growlerdb_proto::v1::SubscribeAssignmentsRequest {
+                        endpoint: endpoint.clone(),
+                    })
+                    .await?
+                    .into_inner();
+                // A full snapshot on subscribe + on every placement change; reconcile each.
+                while let Some(snapshot) = stream.message().await? {
+                    reconcile_replica_windows(
+                        &snapshot.units,
+                        &meta,
+                        &search_idx,
+                        &suggest_idx,
+                        &lookup_idx,
+                        &admin_idx,
+                        &store,
+                        &op,
+                        &cache,
+                        &replica_root,
+                    )
+                    .await;
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+            .await
+            {
+                eprintln!(
+                    "serve-pool replica: assignment subscription dropped ({e}); reconnecting"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+    });
+}
+
+/// Reconcile one pushed assignment snapshot (D53): for each **replica window** assigned to this node
+/// that it isn't already serving, fetch the window's [`ColdMarker`](growlerdb_index::ColdMarker) from
+/// object storage and open it **read-through** ([`open_cold_replica`](growlerdb_index::LocalIndexStore::open_cold_replica)),
+/// publishing it into the same per-index window maps the Pool read services front — so the gateway's
+/// failover routing reaches it. Snapshots are idempotent: an already-served or de-assigned window is
+/// skipped (dropping a de-assigned window is a follow-on; an over-served window is harmless). Returns
+/// the number of windows newly served.
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_replica_windows(
+    units: &[growlerdb_proto::v1::UnitAssignment],
+    meta: &ReplicaIndexMeta,
+    search_idx: &growlerdb_engine::SharedSearchIndexes,
+    suggest_idx: &growlerdb_engine::SharedSuggestIndexes,
+    lookup_idx: &growlerdb_engine::SharedLookupIndexes,
+    admin_idx: &growlerdb_engine::SharedAdminIndexes,
+    store: &growlerdb_index::LocalIndexStore,
+    op: &growlerdb_backup::Operator,
+    cache: &growlerdb_index::RangeCache,
+    replica_root: &std::path::Path,
+) -> usize {
+    use growlerdb_engine::{
+        AdminService, LookupService, SearchService, ShardHandle, SuggestService,
+    };
+    use growlerdb_proto::v1::unit_assignment::Unit as WireUnit;
+    use std::sync::Arc;
+    let mut served = 0usize;
+    for u in units {
+        // The primary path (local hot windows + the write service) handles primary units; here we
+        // only bring up *replica* windows. Hash-shard replicas are a follow-on — windowed only.
+        if u.primary {
+            continue;
+        }
+        let Some(WireUnit::Window(window)) = u.unit else {
+            continue;
+        };
+        // This node must have been started with `--index {u.index}` (so it holds the def + maps).
+        let Some((resolved, table, heavy)) = meta.get(&u.index) else {
+            continue;
+        };
+        let Some(search_windows) = search_idx
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&u.index)
+            .cloned()
+        else {
+            continue;
+        };
+        if search_windows
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&window)
+        {
+            continue; // already serving this window
+        }
+        // Fetch the marker + open the window read-through (blocking → off the async runtime).
+        let prefix = format!("cold/{}/w{}", u.index, window);
+        let marker = match growlerdb_backup::fetch_cold_marker(op, &prefix).await {
+            Ok(Some(m)) => m,
+            Ok(None) => continue, // not parked yet — retry on the next snapshot
+            Err(e) => {
+                eprintln!("serve-pool replica: marker fetch {prefix}: {e}");
+                continue;
+            }
+        };
+        let scratch = replica_root.join(&u.index).join(format!("w{window}"));
+        let (store2, resolved2, op2, cache2) =
+            (store.clone(), resolved.clone(), op.clone(), cache.clone());
+        let opened = tokio::task::spawn_blocking(move || {
+            store2.open_cold_replica(&resolved2, &scratch, op2, &marker, cache2)
+        })
+        .await;
+        let shard = match opened {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                eprintln!("serve-pool replica: open {}/w{window}: {e}", u.index);
+                continue;
+            }
+            Err(e) => {
+                eprintln!("serve-pool replica: open task {}/w{window}: {e}", u.index);
+                continue;
+            }
+        };
+        let handle = ShardHandle::new(Arc::new(shard));
+        // Publish into the four per-index maps (the SAME Arcs the Pool read services front, so the
+        // window is queryable with no restart).
+        search_windows
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                window,
+                SearchService::new(handle.clone()).with_index_heavy_budget(heavy.clone()),
+            );
+        if let Some(m) = suggest_idx
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&u.index)
+            .cloned()
+        {
+            m.write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(window, SuggestService::new(handle.clone()));
+        }
+        if let Some(m) = lookup_idx
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&u.index)
+            .cloned()
+        {
+            m.write().unwrap_or_else(|e| e.into_inner()).insert(
+                window,
+                LookupService::new(
+                    handle.clone(),
+                    IcebergConfig::from_env(),
+                    table.clone(),
+                    resolved.clone(),
+                ),
+            );
+        }
+        if let Some(m) = admin_idx
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&u.index)
+            .cloned()
+        {
+            m.write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(window, AdminService::new(handle.clone(), &u.index));
+        }
+        served += 1;
+        println!(
+            "serve-pool replica: serving {}/w{window} read-through (D53)",
+            u.index
+        );
+    }
+    served
 }
 
 /// Everything [`gateway`] needs, bundled into one struct instead of many positional
@@ -5421,6 +5664,187 @@ mod tests {
             },
         )
         .is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_serves_an_assigned_replica_window_read_through() {
+        // D53 end-to-end (node side): a pushed REPLICA assignment makes the node fetch the parked
+        // window's marker + open it read-through, publishing it into the pool maps so it's queryable
+        // — with no local copy and no rebuild.
+        use growlerdb_core::{
+            CommitBatch, CompositeKey, Document, IndexDefinition, IndexWriter, LocatedDoc,
+            SourceCheckpoint, SourceField, SourceSchema, SourceType, Value,
+        };
+        use growlerdb_index::{LocalIndexStore, ShardId};
+        use growlerdb_proto::v1::unit_assignment::Unit as WireUnit;
+        use growlerdb_proto::v1::UnitAssignment;
+        use std::collections::{BTreeMap, HashMap};
+        use std::sync::{Arc, RwLock};
+
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("ts", SourceType::Long),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        let resolved = IndexDefinition::from_yaml(
+            "name: logs\nsource: { iceberg: { catalog: g, table: g.logs } }\nwindowing: { field: ts, granularity: daily }\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD, fast: true }, { path: ts, format: epoch_ms, fast: true } ] }\n",
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+        let w: i64 = 1_700_000_000_000;
+        let id = ShardId::window("logs", w);
+
+        // --- primary node: build + park the window to shared object storage ---
+        let primary_root = tempfile::tempdir().unwrap();
+        let primary = LocalIndexStore::open(primary_root.path()).unwrap();
+        let shard = primary.create_shard(&id, &resolved).unwrap();
+        let key = CompositeKey::new(vec![], vec![("id".into(), Value::from("doc-1"))]);
+        let mut f = BTreeMap::new();
+        f.insert("id".to_string(), Value::from("doc-1"));
+        f.insert("ts".to_string(), Value::from(1_i64));
+        IndexWriter::write(
+            &shard,
+            &CommitBatch::from_upserts(
+                vec![LocatedDoc {
+                    doc: Document::new(key, f),
+                    iceberg_file: "f".into(),
+                    row_position: 0,
+                }],
+                SourceCheckpoint::iceberg(1),
+                "b1",
+            ),
+        )
+        .unwrap();
+        let window_dir = primary.shard_path(&id);
+        let backup_root = tempfile::tempdir().unwrap();
+        let op = growlerdb_backup::fs_store(backup_root.path()).unwrap();
+        growlerdb_backup::cold_park(
+            shard,
+            "logs",
+            w,
+            &window_dir,
+            &primary_root.path().join(".stg"),
+            &op,
+            &format!("cold/logs/w{w}"),
+            Some(serde_json::to_string(&resolved).unwrap()),
+        )
+        .await
+        .unwrap();
+
+        // --- replica node: empty pool maps + meta; reconcile a replica assignment ---
+        let replica_root = tempfile::tempdir().unwrap();
+        let replica_store = LocalIndexStore::open(replica_root.path()).unwrap();
+        // One served index ("logs") with an empty window map behind each Pool multiplexer.
+        let search_idx: growlerdb_engine::SharedSearchIndexes = Arc::new(RwLock::new(
+            BTreeMap::from([("logs".to_string(), Arc::new(RwLock::new(BTreeMap::new())))]),
+        ));
+        let suggest_idx: growlerdb_engine::SharedSuggestIndexes = Arc::new(RwLock::new(
+            BTreeMap::from([("logs".to_string(), Arc::new(RwLock::new(BTreeMap::new())))]),
+        ));
+        let lookup_idx: growlerdb_engine::SharedLookupIndexes = Arc::new(RwLock::new(
+            BTreeMap::from([("logs".to_string(), Arc::new(RwLock::new(BTreeMap::new())))]),
+        ));
+        let admin_idx: growlerdb_engine::SharedAdminIndexes = Arc::new(RwLock::new(
+            BTreeMap::from([("logs".to_string(), Arc::new(RwLock::new(BTreeMap::new())))]),
+        ));
+        let mut meta: ReplicaIndexMeta = HashMap::new();
+        meta.insert(
+            "logs".to_string(),
+            (
+                resolved.clone(),
+                "g.logs".to_string(),
+                Arc::new(tokio::sync::Semaphore::new(4)),
+            ),
+        );
+        let cache = growlerdb_index::RangeCache::new(8 * 1024 * 1024);
+        let replica_units = vec![UnitAssignment {
+            index: "logs".into(),
+            unit: Some(WireUnit::Window(w)),
+            primary: false,
+        }];
+
+        let served = reconcile_replica_windows(
+            &replica_units,
+            &meta,
+            &search_idx,
+            &suggest_idx,
+            &lookup_idx,
+            &admin_idx,
+            &replica_store,
+            &op,
+            &cache,
+            replica_root.path(),
+        )
+        .await;
+        assert_eq!(served, 1, "the assigned replica window is opened + served");
+
+        // Queryable through the pool read path — read-through, with no local copy.
+        let mux = growlerdb_engine::PoolSearchService::new(search_idx.clone());
+        let resp = growlerdb_proto::Search::search(
+            &mux,
+            tonic::Request::new(growlerdb_proto::v1::SearchRequest {
+                query: "*".into(),
+                limit: 10,
+                index: "logs".into(),
+                window: w,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            resp.hits.len(),
+            1,
+            "the replica serves the doc read-through via the pool"
+        );
+
+        // Idempotent: a second reconcile serves nothing new.
+        assert_eq!(
+            reconcile_replica_windows(
+                &replica_units,
+                &meta,
+                &search_idx,
+                &suggest_idx,
+                &lookup_idx,
+                &admin_idx,
+                &replica_store,
+                &op,
+                &cache,
+                replica_root.path(),
+            )
+            .await,
+            0,
+            "an already-served window isn't re-opened"
+        );
+
+        // A PRIMARY unit is ignored by the replica reconcile (the primary path serves those).
+        let primary_units = vec![UnitAssignment {
+            index: "logs".into(),
+            unit: Some(WireUnit::Window(w)),
+            primary: true,
+        }];
+        assert_eq!(
+            reconcile_replica_windows(
+                &primary_units,
+                &meta,
+                &search_idx,
+                &suggest_idx,
+                &lookup_idx,
+                &admin_idx,
+                &replica_store,
+                &op,
+                &cache,
+                replica_root.path(),
+            )
+            .await,
+            0,
+            "a primary assignment is not served as a replica"
+        );
     }
 
     #[tokio::test]
