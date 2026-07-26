@@ -2581,10 +2581,13 @@ async fn serve_pool(
     // Per-index (def, source table, heavy budget) the D53 replica reconcile needs to open an
     // assigned replica window read-through and publish it into this index's maps.
     let mut replica_meta: ReplicaIndexMeta = std::collections::HashMap::new();
-    // Per-index fair share of the node-wide heavy-read budget (D52 pool fairness): co-resident indexes
-    // share one process, so cap each at an equal slice so a flood of exports/aggregations on one index
-    // can't starve queries on another. `max(1)` guarantees every index at least one heavy permit.
-    let per_index_heavy = (growlerdb_engine::heavy_reads_cap() / indexes.len().max(1)).max(1);
+    // Per-index fair share of the node-wide heavy-read budget (D52 pool fairness, 357.25): co-resident
+    // indexes share one process, so each gets an equal soft share so a flood of exports/aggregations
+    // on one index can't starve queries on another — while staying work-conserving (an index may
+    // overflow into globally free capacity). The share denominator is this LIVE served-index count,
+    // shared with the assignment reconcile below so it tracks the dispatch map as assignments change
+    // (D53) rather than freezing at boot.
+    let live_indexes = Arc::new(std::sync::atomic::AtomicUsize::new(indexes.len().max(1)));
     let mut total_windows = 0usize;
     for index in indexes {
         let resolved = load_resolved(data_dir, index)?;
@@ -2599,8 +2602,11 @@ async fn serve_pool(
         // read-through windows are not yet handled in pool mode (a follow-on) — pool serving targets
         // hot windows.
         let windows = store.window_shards(index)?;
-        // One shared per-index heavy-read budget across all of this index's window services.
-        let index_heavy = Arc::new(tokio::sync::Semaphore::new(per_index_heavy));
+        // One shared per-index heavy-read share across all of this index's window services.
+        let index_heavy = growlerdb_engine::IndexHeavyShare::new(
+            growlerdb_engine::heavy_reads_cap(),
+            live_indexes.clone(),
+        );
         let (search_w, suggest_w, lookup_w, admin_w, seed, served) = {
             let (store, resolved, index_s, table, windows, index_heavy) = (
                 store.clone(),
@@ -2625,7 +2631,7 @@ async fn serve_pool(
                     search_w.insert(
                         w,
                         SearchService::new(handle.clone())
-                            .with_index_heavy_budget(index_heavy.clone()),
+                            .with_index_heavy_share(index_heavy.clone()),
                     );
                     suggest_w.insert(w, SuggestService::new(handle.clone()));
                     lookup_w.insert(
@@ -2756,6 +2762,7 @@ async fn serve_pool(
                 op,
                 cache: growlerdb_index::RangeCache::new(cold_cache_bytes()),
                 replica_root: std::path::PathBuf::from(data_dir).join(".replica"),
+                live_indexes: live_indexes.clone(),
             }),
             Err(e) => {
                 eprintln!(
@@ -2820,14 +2827,14 @@ async fn serve_pool(
 }
 
 /// Per-index context a pool node needs to open an assigned **replica** window (D53): its resolved
-/// definition, source table (for hydration), and the per-index heavy-read budget the replica's
+/// definition, source table (for hydration), and the per-index heavy-read share the replica's
 /// `SearchService` shares. Keyed by index name.
 type ReplicaIndexMeta = std::collections::HashMap<
     String,
     (
         growlerdb_core::ResolvedIndex,
         String,
-        std::sync::Arc<tokio::sync::Semaphore>,
+        std::sync::Arc<growlerdb_engine::IndexHeavyShare>,
     ),
 >;
 
@@ -2844,6 +2851,10 @@ struct ReplicaServing {
     op: growlerdb_backup::Operator,
     cache: growlerdb_index::RangeCache,
     replica_root: std::path::PathBuf,
+    /// The heavy-read share denominator (357.25): refreshed to the dispatch map's size after each
+    /// applied snapshot, so per-index fair shares track the LIVE served index set as assignments
+    /// change (D53) instead of the boot-time index count.
+    live_indexes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Subscribe to CP **assignment pushes** (D53) and apply each pushed snapshot: first swap the
@@ -2886,6 +2897,17 @@ fn spawn_assignment_reconcile(
                             &r.replica_root,
                         )
                         .await;
+                        // Refresh the heavy-read share denominator to the LIVE served index set
+                        // (357.25): the dispatch map is what actually serves reads, so per-index
+                        // fair shares track it as assignments change, not the boot-time count.
+                        let live = r
+                            .search_idx
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .len()
+                            .max(1);
+                        r.live_indexes
+                            .store(live, std::sync::atomic::Ordering::Release);
                     }
                 }
                 Ok::<(), anyhow::Error>(())
@@ -3000,7 +3022,7 @@ async fn reconcile_replica_windows(
             }
             sw.insert(
                 window,
-                SearchService::new(handle.clone()).with_index_heavy_budget(heavy.clone()),
+                SearchService::new(handle.clone()).with_index_heavy_share(heavy.clone()),
             );
         }
         if let Some(m) = suggest_idx
@@ -6022,7 +6044,10 @@ mod tests {
             (
                 resolved.clone(),
                 "g.logs".to_string(),
-                Arc::new(tokio::sync::Semaphore::new(4)),
+                growlerdb_engine::IndexHeavyShare::new(
+                    4,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+                ),
             ),
         );
         let cache = growlerdb_index::RangeCache::new(8 * 1024 * 1024);
