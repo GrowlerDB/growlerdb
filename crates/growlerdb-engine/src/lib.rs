@@ -84,8 +84,9 @@ pub use suggest_service::SuggestService;
 pub use topology::{shard_primaries, ShardTopologyError};
 pub use windowed_ingest::{OnNewWindow, WindowSeed, WindowedWriteService};
 pub use windowed_routing::{
-    SharedAdminWindows, SharedLookupWindows, SharedSearchWindows, SharedSuggestWindows, WindowNode,
-    WindowedAdminService, WindowedLookupService, WindowedSearchService, WindowedSuggestService,
+    is_unit_not_served, unit_not_served, SharedAdminWindows, SharedLookupWindows,
+    SharedSearchWindows, SharedSuggestWindows, WindowNode, WindowedAdminService,
+    WindowedLookupService, WindowedSearchService, WindowedSuggestService, UNIT_NOT_SERVED,
 };
 pub use write_service::WriteService;
 

@@ -27,7 +27,7 @@ sha2 = "0.10"
 getrandom = "0.2"
 base64 = "0.22"
 tonic.workspace = true
-tokio = { workspace = true, features = ["rt", "sync"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["fs", "timeout"] }
@@ -41,7 +41,7 @@ rustls = { version = "0.23", features = ["ring"] }
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "test-util"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 http-body-util = "0.1"
 # The compaction-under-hydration regression test writes real parquet

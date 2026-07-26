@@ -20,6 +20,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
+use growlerdb_proto::v1::Error as WireError;
 use growlerdb_proto::v1::{
     AggregateRequest, AggregateResponse, AlterIndexRequest, AlterIndexResponse, BackupIndexRequest,
     BackupIndexResponse, BackupStatusRequest, BackupStatusResponse, ClosePitRequest,
@@ -30,12 +31,58 @@ use growlerdb_proto::v1::{
     SearchResponse, SemanticSearchRequest, SuggestRequest, SuggestResponse,
 };
 use growlerdb_proto::{
-    Admin, AdminServer, Lookup, LookupServer, Search, SearchServer, Suggest, SuggestServer,
+    error_details, to_status, Admin, AdminServer, Lookup, LookupServer, Search, SearchServer,
+    Suggest, SuggestServer,
 };
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 
 use crate::{AdminService, LookupService, Node, SearchService, SuggestService};
+
+/// Structured wire code for "this node does not serve the addressed unit" — a **routing-staleness**
+/// signal, not a request error: the CP may have re-placed the unit or a replica may not have warmed
+/// it yet, and another holder can well serve it. Responders (the window muxes here,
+/// [`route_index`](crate::pool_routing) on a pool node) attach it as the structured
+/// [`Error`](growlerdb_proto::v1::Error) detail on a `FailedPrecondition`, and read failover
+/// ([`FailoverNode`](crate::FailoverNode)) matches it to try the next holder instead of aborting.
+pub const UNIT_NOT_SERVED: &str = "UNIT_NOT_SERVED";
+
+/// A `FailedPrecondition` carrying the [`UNIT_NOT_SERVED`] structured code.
+pub fn unit_not_served(message: impl Into<String>) -> Status {
+    to_status(
+        Code::FailedPrecondition,
+        WireError::new(UNIT_NOT_SERVED, message),
+    )
+}
+
+/// Whether `status` is a responder's [`UNIT_NOT_SERVED`] answer — matched on the structured detail,
+/// not the message text, so it survives rewording and the wire hop.
+pub fn is_unit_not_served(status: &Status) -> bool {
+    status.code() == Code::FailedPrecondition
+        && error_details(status).is_some_and(|e| e.code == UNIT_NOT_SERVED)
+}
+
+/// Route a window selector to its entry in a shared `window id → service` map. `window == 0`
+/// (unset) is a request-level `InvalidArgument` — a windowed node always expects a selector, and no
+/// holder can satisfy a request that names none. A **set but unserved** window is
+/// [`unit_not_served`]: the route is stale or this holder hasn't warmed it — try-the-next-holder
+/// territory, not a client error.
+fn route_window<T: Clone>(
+    windows: &Arc<RwLock<BTreeMap<i64, T>>>,
+    window: i64,
+) -> Result<T, Status> {
+    if window == 0 {
+        return Err(Status::invalid_argument(
+            "a windowed node requires a window selector",
+        ));
+    }
+    windows
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&window)
+        .cloned()
+        .ok_or_else(|| unit_not_served(format!("window {window} is not served by this node")))
+}
 
 /// A node's live `window id → SearchService` map behind a shared lock (dynamic windowed
 /// ingest): the windowed write path **inserts** a new window's service on first write, and the
@@ -55,8 +102,8 @@ pub type SharedAdminWindows = Arc<RwLock<BTreeMap<i64, AdminService>>>;
 /// The **server** half of distributed windowed routing: a `Search` service that fronts a
 /// node's many window shards (`window id → SearchService`) and dispatches each request to the shard
 /// its [`SearchRequest::window`] selector names. A request for a window this node doesn't serve is
-/// an `InvalidArgument` (the Gateway only routes a window to a node that owns it, so this means a
-/// stale shard map). `window = 0` (unset) also fails — a windowed node always expects a selector.
+/// the structured [`unit_not_served`] refusal (a stale route the caller's failover can walk past);
+/// `window = 0` (unset) is an `InvalidArgument` — a windowed node always expects a selector.
 ///
 /// The window map is **shared + mutable** ([`SharedSearchWindows`]) so the windowed write
 /// path can add a newly-created window without rebuilding the service.
@@ -75,17 +122,10 @@ impl WindowedSearchService {
         SearchServer::new(self)
     }
 
-    /// A clone of the [`SearchService`] for `window`, or `InvalidArgument` if this node doesn't serve
-    /// it. Cloned out of the read lock so the request runs without holding it.
+    /// A clone of the [`SearchService`] for `window` ([`route_window`] — [`unit_not_served`] when
+    /// this node doesn't serve it). Cloned out of the read lock so the request runs without holding it.
     fn route(&self, window: i64) -> Result<SearchService, Status> {
-        self.windows
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&window)
-            .cloned()
-            .ok_or_else(|| {
-                Status::invalid_argument(format!("window {window} is not served by this node"))
-            })
+        route_window(&self.windows, window)
     }
 }
 
@@ -169,7 +209,7 @@ impl Search for WindowedSearchService {
 /// node's `window id → SuggestService` map that dispatches each request to the shard its
 /// [`SuggestRequest::window`] selector names. Suggest fans out to *every* window (a term can live in
 /// any of them — no time pruning), so the Gateway scatters to all windows and each is dispatched
-/// here. Unknown/unset window → `InvalidArgument`.
+/// here. Unserved window → [`unit_not_served`]; unset → `InvalidArgument`.
 pub struct WindowedSuggestService {
     windows: SharedSuggestWindows,
 }
@@ -186,14 +226,7 @@ impl WindowedSuggestService {
     }
 
     fn route(&self, window: i64) -> Result<SuggestService, Status> {
-        self.windows
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&window)
-            .cloned()
-            .ok_or_else(|| {
-                Status::invalid_argument(format!("window {window} is not served by this node"))
-            })
+        route_window(&self.windows, window)
     }
 }
 
@@ -213,8 +246,8 @@ impl Suggest for WindowedSuggestService {
 /// service over a node's `window id → LookupService` map that dispatches each hydration to the shard
 /// its [`GetByKeyRequest::window`] selector names. Unlike search there's no time pruning — a key's
 /// coordinate carries no window — so the Gateway **broadcasts** to every window and each is dispatched
-/// here; the window that owns the key returns its row, the rest return nothing. Unknown/unset window
-/// → `InvalidArgument` (the Gateway only routes a window to a node that serves it).
+/// here; the window that owns the key returns its row, the rest return nothing. Unserved window →
+/// [`unit_not_served`]; unset → `InvalidArgument`.
 pub struct WindowedLookupService {
     windows: SharedLookupWindows,
 }
@@ -231,14 +264,7 @@ impl WindowedLookupService {
     }
 
     fn route(&self, window: i64) -> Result<LookupService, Status> {
-        self.windows
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&window)
-            .cloned()
-            .ok_or_else(|| {
-                Status::invalid_argument(format!("window {window} is not served by this node"))
-            })
+        route_window(&self.windows, window)
     }
 }
 
@@ -275,14 +301,7 @@ impl WindowedAdminService {
     }
 
     fn route(&self, window: i64) -> Result<AdminService, Status> {
-        self.windows
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&window)
-            .cloned()
-            .ok_or_else(|| {
-                Status::invalid_argument(format!("window {window} is not served by this node"))
-            })
+        route_window(&self.windows, window)
     }
 }
 
@@ -522,15 +541,53 @@ mod tests {
         // Each selector reaches exactly its own window's shard...
         assert_eq!(hit_ids(&mux, 10).await.unwrap(), vec!["win10doc"]);
         assert_eq!(hit_ids(&mux, 20).await.unwrap(), vec!["win20doc"]);
-        // ...and a window this node doesn't serve (incl. the unset `0`) is a loud InvalidArgument.
+        // ...a window this node doesn't serve is the structured not-served refusal (failover walks
+        // past it), and the unset `0` is a request-level InvalidArgument.
         assert_eq!(
             hit_ids(&mux, 99).await.unwrap_err(),
-            tonic::Code::InvalidArgument
+            tonic::Code::FailedPrecondition
         );
         assert_eq!(
             hit_ids(&mux, 0).await.unwrap_err(),
             tonic::Code::InvalidArgument
         );
+    }
+
+    /// The unserved-window refusal carries the structured [`UNIT_NOT_SERVED`] detail — the signal
+    /// [`is_unit_not_served`] (and so `FailoverNode`) matches on, robust to message rewording.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unserved_window_is_the_structured_unit_not_served_refusal() {
+        let t1 = tempfile::tempdir().unwrap();
+        let mux = WindowedSearchService::new(Arc::new(RwLock::new(BTreeMap::from([(
+            10,
+            one_doc_service(t1.path(), "win10doc"),
+        )]))));
+        let err = Search::search(
+            &mux,
+            Request::new(SearchRequest {
+                query: "*".into(),
+                window: 99,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            is_unit_not_served(&err),
+            "structured detail attached: {err:?}"
+        );
+        // The unset selector is NOT a not-served answer — no holder could ever satisfy it.
+        let err = Search::search(
+            &mux,
+            Request::new(SearchRequest {
+                query: "*".into(),
+                window: 0,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(!is_unit_not_served(&err));
     }
 
     /// A [`Node`] that records the `(index, window)` selector of the last request it received.
@@ -642,10 +699,11 @@ mod tests {
             suggest_texts(&mux, 20, "win2").await.unwrap(),
             vec!["win20doc"]
         );
-        // A window this node doesn't serve (incl. unset `0`) is a loud InvalidArgument.
+        // An unserved window is the structured not-served refusal; the unset `0` stays a
+        // request-level InvalidArgument.
         assert_eq!(
             suggest_texts(&mux, 99, "win").await.unwrap_err(),
-            tonic::Code::InvalidArgument
+            tonic::Code::FailedPrecondition
         );
         assert_eq!(
             suggest_texts(&mux, 0, "win").await.unwrap_err(),
@@ -698,10 +756,10 @@ mod tests {
             "window 10 agg leaked window 20: {r10}"
         );
         assert!(agg_ids(&mux, 20).await.unwrap().contains("win20doc"));
-        // A window this node doesn't serve is a loud InvalidArgument.
+        // A window this node doesn't serve is the structured not-served refusal.
         assert_eq!(
             agg_ids(&mux, 99).await.unwrap_err(),
-            tonic::Code::InvalidArgument
+            tonic::Code::FailedPrecondition
         );
     }
 
@@ -749,13 +807,13 @@ mod tests {
             (10, AdminService::new(one_doc_shard(t1.path(), "a"), "docs")),
             (20, AdminService::new(one_doc_shard(t2.path(), "b"), "docs")),
         ]))));
-        // Each window reports its own one doc (dispatch, not a broadcast sum); an unserved/unset
-        // window is a loud InvalidArgument.
+        // Each window reports its own one doc (dispatch, not a broadcast sum); an unserved window
+        // is the structured not-served refusal, the unset `0` an InvalidArgument.
         assert_eq!(describe_num_docs(&mux, 10).await.unwrap(), 1);
         assert_eq!(describe_num_docs(&mux, 20).await.unwrap(), 1);
         assert_eq!(
             describe_num_docs(&mux, 99).await.unwrap_err(),
-            tonic::Code::InvalidArgument
+            tonic::Code::FailedPrecondition
         );
         assert_eq!(
             describe_num_docs(&mux, 0).await.unwrap_err(),
@@ -765,7 +823,7 @@ mod tests {
 
     async fn lookup_code(mux: &WindowedLookupService, window: i64) -> tonic::Code {
         // Empty keys → the routed LookupService returns Ok with no rows (no Iceberg read), isolating
-        // the *dispatch*: a served window succeeds; an unserved/unset one is InvalidArgument.
+        // the *dispatch*: a served window succeeds; unserved → not-served, unset → InvalidArgument.
         let req = GetByKeyRequest {
             window,
             ..Default::default()
@@ -803,7 +861,7 @@ mod tests {
         ]))));
         assert_eq!(lookup_code(&mux, 10).await, tonic::Code::Ok);
         assert_eq!(lookup_code(&mux, 20).await, tonic::Code::Ok);
-        assert_eq!(lookup_code(&mux, 99).await, tonic::Code::InvalidArgument);
+        assert_eq!(lookup_code(&mux, 99).await, tonic::Code::FailedPrecondition);
         assert_eq!(lookup_code(&mux, 0).await, tonic::Code::InvalidArgument);
     }
 }

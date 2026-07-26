@@ -196,7 +196,8 @@ async fn serve_pool_dispatches_search_across_two_indexes() {
         vec!["betadoc"],
         "beta/w10 → beta's doc"
     );
-    // An index this node doesn't serve is a loud InvalidArgument (not a silent empty result).
+    // An index this node doesn't serve is the structured not-served refusal (not a silent empty
+    // result) — FailedPrecondition with the UNIT_NOT_SERVED detail, surviving the wire hop.
     let unserved = client
         .search(SearchRequest {
             query: "*".into(),
@@ -206,10 +207,15 @@ async fn serve_pool_dispatches_search_across_two_indexes() {
             ..Default::default()
         })
         .await;
+    let err = unserved.unwrap_err();
     assert_eq!(
-        unserved.unwrap_err().code(),
-        tonic::Code::InvalidArgument,
+        err.code(),
+        tonic::Code::FailedPrecondition,
         "an unserved index is rejected, not silently empty"
+    );
+    assert!(
+        growlerdb_engine::is_unit_not_served(&err),
+        "the structured UNIT_NOT_SERVED detail survives the wire: {err:?}"
     );
 }
 
@@ -281,7 +287,8 @@ async fn serve_pool_dispatches_writes_across_two_indexes_and_creates_windows_laz
         "beta write → beta's day-10 window"
     );
 
-    // A write to an index this node doesn't serve is a loud InvalidArgument (as on the read path).
+    // A write to an index this node doesn't serve is the structured not-served refusal (as on the
+    // read path).
     let unserved = writer
         .write(WriteRequest {
             batch: Some(one_doc_batch("gammadoc", 10 * DAY_MS, "g1")),
@@ -290,7 +297,7 @@ async fn serve_pool_dispatches_writes_across_two_indexes_and_creates_windows_laz
         .await;
     assert_eq!(
         unserved.unwrap_err().code(),
-        tonic::Code::InvalidArgument,
+        tonic::Code::FailedPrecondition,
         "a write to an unserved index is rejected"
     );
 }

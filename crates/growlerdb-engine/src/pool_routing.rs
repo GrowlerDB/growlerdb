@@ -11,9 +11,10 @@
 //! The two layers compose cleanly: the index map holds one [`SharedSearchWindows`] per served index
 //! (the same shared, mutable maps the windowed write path already grows), and the inner
 //! [`WindowedSearchService`] is rebuilt per call — cheap, it just wraps an `Arc`. An index this node
-//! doesn't serve is an `InvalidArgument`, exactly as an unserved window is; an **empty** index
-//! selector defaults to the sole served index when there is exactly one (so a pool service is a
-//! drop-in even for a node that happens to serve a single index).
+//! doesn't serve is the structured [`unit_not_served`] refusal, exactly as an unserved window is —
+//! a stale-route signal read failover walks past; an **empty** index selector defaults to the sole
+//! served index when there is exactly one (so a pool service is a drop-in even for a node that
+//! happens to serve a single index).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
@@ -37,8 +38,9 @@ use tonic::{Request, Response, Status};
 
 use crate::windowed_ingest::{WindowedWriteService, MAX_WRITE_MESSAGE_BYTES};
 use crate::windowed_routing::{
-    SharedAdminWindows, SharedLookupWindows, SharedSearchWindows, SharedSuggestWindows,
-    WindowedAdminService, WindowedLookupService, WindowedSearchService, WindowedSuggestService,
+    unit_not_served, SharedAdminWindows, SharedLookupWindows, SharedSearchWindows,
+    SharedSuggestWindows, WindowedAdminService, WindowedLookupService, WindowedSearchService,
+    WindowedSuggestService,
 };
 
 /// A pool node's live `index → SharedSearchWindows` map behind a shared lock: an index this node is
@@ -59,10 +61,12 @@ pub type SharedAdminIndexes = Arc<RwLock<BTreeMap<String, SharedAdminWindows>>>;
 /// inserted without a restart (the read maps grow the same way, one level down at the window).
 pub type SharedWriteIndexes = Arc<RwLock<BTreeMap<String, WindowedWriteService>>>;
 
-/// Route an index selector to its per-index shared map `T` (one of the `SharedX` window maps), or an
-/// `InvalidArgument` when this node doesn't serve it. An **empty** selector resolves to the sole
-/// served index when there is exactly one — a pool service then works unchanged for a single-index
-/// node whose caller didn't stamp the index.
+/// Route an index selector to its per-index shared map `T` (one of the `SharedX` window maps), or
+/// the structured [`unit_not_served`] refusal when this node doesn't serve it (a stale route —
+/// try-the-next-holder territory, like an unserved window). An **empty** selector resolves to the
+/// sole served index when there is exactly one — a pool service then works unchanged for a
+/// single-index node whose caller didn't stamp the index; ambiguous (multi-index) it stays a
+/// request-level `InvalidArgument` — no holder could satisfy it either.
 fn route_index<T: Clone>(
     by_index: &Arc<RwLock<BTreeMap<String, T>>>,
     index: &str,
@@ -76,9 +80,9 @@ fn route_index<T: Clone>(
             "a pool node serving multiple indexes requires an index selector",
         ));
     }
-    map.get(index).cloned().ok_or_else(|| {
-        Status::invalid_argument(format!("index `{index}` is not served by this node"))
-    })
+    map.get(index)
+        .cloned()
+        .ok_or_else(|| unit_not_served(format!("index `{index}` is not served by this node")))
 }
 
 /// The **index-dispatch** `Search` service for a pool node: routes each request on its
@@ -100,7 +104,7 @@ impl PoolSearchService {
         SearchServer::new(self)
     }
 
-    /// The inner windowed mux for `index`, or `InvalidArgument` if unserved.
+    /// The inner windowed mux for `index`, or [`unit_not_served`] if unserved.
     fn windowed(&self, index: &str) -> Result<WindowedSearchService, Status> {
         Ok(WindowedSearchService::new(route_index(
             &self.by_index,
@@ -340,7 +344,7 @@ impl PoolWriteService {
         WriteServer::new(self).max_decoding_message_size(MAX_WRITE_MESSAGE_BYTES)
     }
 
-    /// The single-index windowed writer for `index`, or `InvalidArgument` if unserved (an empty
+    /// The single-index windowed writer for `index`, or [`unit_not_served`] if unserved (an empty
     /// selector resolves to the sole served index when there is exactly one).
     fn writer(&self, index: &str) -> Result<WindowedWriteService, Status> {
         route_index(&self.by_index, index)
@@ -597,7 +601,8 @@ mod tests {
         .into_inner();
         assert_eq!(cp.snapshot, 1);
 
-        // An index this node doesn't serve is a loud InvalidArgument (as on the read path).
+        // An index this node doesn't serve is the structured not-served refusal (as on the read
+        // path — a stale route, not a malformed request).
         assert_eq!(
             pool_write(
                 &writes,
@@ -610,7 +615,7 @@ mod tests {
             )
             .await
             .unwrap_err(),
-            tonic::Code::InvalidArgument
+            tonic::Code::FailedPrecondition
         );
         // An empty selector with >1 index served is ambiguous → InvalidArgument.
         assert_eq!(
@@ -648,15 +653,15 @@ mod tests {
         // Each (index, window) reaches exactly its own shard...
         assert_eq!(hit_ids(&mux, "alpha", 10).await.unwrap(), vec!["alphadoc"]);
         assert_eq!(hit_ids(&mux, "beta", 10).await.unwrap(), vec!["betadoc"]);
-        // ...a served index but an unserved window is the inner windowed mux's InvalidArgument...
+        // ...a served index but an unserved window is the inner windowed mux's not-served refusal...
         assert_eq!(
             hit_ids(&mux, "alpha", 99).await.unwrap_err(),
-            tonic::Code::InvalidArgument
+            tonic::Code::FailedPrecondition
         );
-        // ...and an index this node doesn't serve is a loud InvalidArgument at the outer layer.
+        // ...and an index this node doesn't serve is the same refusal at the outer layer.
         assert_eq!(
             hit_ids(&mux, "gamma", 10).await.unwrap_err(),
-            tonic::Code::InvalidArgument
+            tonic::Code::FailedPrecondition
         );
     }
 

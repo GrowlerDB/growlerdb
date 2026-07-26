@@ -61,7 +61,10 @@ per unit** — one primary writer + read replicas that hydrate read-through from
 **Landing incrementally.** `growlerdb serve-pool --index A --index B …` already serves the windows of
 **many windowed indexes from one process** over one gRPC endpoint — reads dispatch per `(index,
 window)` through the pool multiplexers, so the node-per-index wall is gone for pre-built windowed
-indexes. With `--register` it heartbeats into the **index-agnostic placement pool** (`RegisterNode`
+indexes. A request addressed to a unit the node doesn't serve is refused with the structured
+`UNIT_NOT_SERVED` detail (`FAILED_PRECONDITION`) — a stale-route signal, not a client error, that the
+gateway's read failover matches to try the unit's next holder (a missing selector stays
+`INVALID_ARGUMENT`: no holder could satisfy it). With `--register` it heartbeats into the **index-agnostic placement pool** (`RegisterNode`
 now carries only the endpoint) and announces every served index's windows, so a cluster gateway can
 route to it. **Writes** land the same way: `serve-pool` mounts a `PoolWriteService` that dispatches
 each `Write` / `GetCheckpoint` on the `(index, window)` selector (`WriteRequest` /
