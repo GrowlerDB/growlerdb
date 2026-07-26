@@ -60,6 +60,19 @@ advanced, the delete pass is skipped that cycle (`deletes_skipped`) — the alwa
 still runs — and the next reconcile retries once the shard is quiescent. See the TOCTOU guard in
 [D9](/system/decisions/d09-sync-model.md).
 
+## Shared-process fairness (D52)
+
+The [universal placement pool](/system/decisions/d52-placement-pool.md) packs units from **many
+indexes into one node process**, so the node's resource budgets became **cross-index** — a
+noisy-neighbor risk where a flood on one index could starve a co-resident one. The node-wide
+**heavy-read** budget (`GROWLERDB_MAX_HEAVY_READS`, exports/aggregations on the blocking pool) now
+carries a **per-index share** on a pool node: each index is capped at an equal slice
+(`cap / indexes`, ≥1), acquired *before* the node-wide permit, so one index sheds at its share and
+can't monopolize the budget. The **write** in-flight cap is per-index by construction (one write
+service per served index). Residual: shares are static/equal (not weighted by load or priority), and
+CPU/heap aren't yet partitioned — a pathological aggregation still competes for blocking-pool threads
+within its share. Per-tenant weighting is a later refinement.
+
 ## Cheap, high-leverage wins
 
 Small, mostly pure-GrowlerDB changes that raise headroom well before the structural work:

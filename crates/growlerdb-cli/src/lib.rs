@@ -2548,6 +2548,10 @@ async fn serve_pool(
 
     // Per-index (resolved def, served windows) for the CP announce when `--register` is set.
     let mut announcements: Vec<(growlerdb_core::ResolvedIndex, Vec<ServedWindow>)> = Vec::new();
+    // Per-index fair share of the node-wide heavy-read budget (D52 pool fairness): co-resident indexes
+    // share one process, so cap each at an equal slice so a flood of exports/aggregations on one index
+    // can't starve queries on another. `max(1)` guarantees every index at least one heavy permit.
+    let per_index_heavy = (growlerdb_engine::heavy_reads_cap() / indexes.len().max(1)).max(1);
     let mut total_windows = 0usize;
     for index in indexes {
         let resolved = load_resolved(data_dir, index)?;
@@ -2561,13 +2565,16 @@ async fn serve_pool(
         // Open each of this index's window shards into the four per-window services. Cold read-through
         // windows are not yet handled in pool mode (a follow-on) — pool serving targets hot windows.
         let windows = store.window_shards(index)?;
+        // One shared per-index heavy-read budget across all of this index's window services.
+        let index_heavy = Arc::new(tokio::sync::Semaphore::new(per_index_heavy));
         let (search_w, suggest_w, lookup_w, admin_w, served) = {
-            let (store, resolved, index_s, table, windows) = (
+            let (store, resolved, index_s, table, windows, index_heavy) = (
                 store.clone(),
                 resolved.clone(),
                 index.clone(),
                 table.clone(),
                 windows.clone(),
+                index_heavy.clone(),
             );
             tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                 let mut search_w = BTreeMap::new();
@@ -2580,7 +2587,11 @@ async fn serve_pool(
                         Arc::new(store.open_shard(&ShardId::window(&index_s, w), &resolved)?);
                     let zone = shard.event_bounds()?;
                     let handle = ShardHandle::new(shard);
-                    search_w.insert(w, SearchService::new(handle.clone()));
+                    search_w.insert(
+                        w,
+                        SearchService::new(handle.clone())
+                            .with_index_heavy_budget(index_heavy.clone()),
+                    );
                     suggest_w.insert(w, SuggestService::new(handle.clone()));
                     lookup_w.insert(
                         w,
