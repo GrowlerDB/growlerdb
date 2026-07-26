@@ -156,7 +156,16 @@ public final class WriteClient implements BatchWriter {
 
   /** Commit a batch; returns the committed index snapshot. */
   public long write(DocBatch batch) {
-    WriteRequest request = WriteRequest.newBuilder().setBatch(batch).build();
+    return write(batch, "");
+  }
+
+  /**
+   * Commit a batch tagged with its target {@code index} — for a <b>pool node</b> serving many indexes
+   * over one endpoint, which dispatches the write on this selector. Empty selects the node's sole
+   * served index (a single-index node ignores it). Returns the committed index snapshot.
+   */
+  public long write(DocBatch batch, String index) {
+    WriteRequest request = WriteRequest.newBuilder().setBatch(batch).setIndex(index).build();
     WriteResponse response = callWithRetry("write", () -> deadlined().write(request));
     return response.getSnapshot();
   }
@@ -189,12 +198,24 @@ public final class WriteClient implements BatchWriter {
    * resumes each window independently. {@code window == 0} reads the node's single (ordinal) shard.
    */
   public ShardCheckpoint checkpoint(long window) {
+    return checkpoint(window, "");
+  }
+
+  /**
+   * As {@link #checkpoint(long)}, tagged with the {@code index} the window belongs to — for a pool
+   * node serving many indexes (empty = its sole served index).
+   */
+  public ShardCheckpoint checkpoint(long window, String index) {
     GetCheckpointResponse response =
         callWithRetry(
             "getCheckpoint",
             () ->
                 deadlined()
-                    .getCheckpoint(GetCheckpointRequest.newBuilder().setWindow(window).build()));
+                    .getCheckpoint(
+                        GetCheckpointRequest.newBuilder()
+                            .setWindow(window)
+                            .setIndex(index)
+                            .build()));
     if (!response.hasCheckpoint()) {
       return null;
     }

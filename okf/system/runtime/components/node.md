@@ -63,13 +63,15 @@ per unit** — one primary writer + read replicas that hydrate read-through from
 window)` through the pool multiplexers, so the node-per-index wall is gone for pre-built windowed
 indexes. With `--register` it heartbeats into the **index-agnostic placement pool** (`RegisterNode`
 now carries only the endpoint) and announces every served index's windows, so a cluster gateway can
-route to it. The **write wire is now unit-addressable** to match the read wire: `WriteRequest` and
-`GetCheckpointRequest` carry an `index` selector (empty = the sole served index, a drop-in for a
-single-index node), and the engine's `PoolWriteService` dispatches each write / checkpoint on
-`(index, window)` to that index's windowed writer — which still creates the window shard on first
-write. Still to come: mounting that write service on `serve-pool` (so a running pool node accepts
-ingest) and the connector stamping the index; **dynamic assignment** (a node being *assigned* units
-to load on demand rather than serving a static `--index` list); and per-unit replication.
+route to it. **Writes** land the same way: `serve-pool` mounts a `PoolWriteService` that dispatches
+each `Write` / `GetCheckpoint` on the `(index, window)` selector (`WriteRequest` /
+`GetCheckpointRequest` carry an `index`; empty = the sole served index, a drop-in for a single-index
+node) to that index's windowed writer, which creates the window shard on first write and publishes it
+into the same live maps the read multiplexers front — so a just-ingested window is queryable and
+re-announced with no restart. The connector stamps the index on each sub-batch, so it streams ingest
+to a pool node exactly as to a single-index windowed node. Still to come: **dynamic assignment** (a
+node being *assigned* units to load on demand rather than serving a static `--index` list), cold
+read-through in pool mode, and per-unit replication.
 
 ## Notes
 
