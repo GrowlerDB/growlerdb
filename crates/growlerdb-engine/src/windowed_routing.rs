@@ -62,6 +62,31 @@ pub fn is_unit_not_served(status: &Status) -> bool {
         && error_details(status).is_some_and(|e| e.code == UNIT_NOT_SERVED)
 }
 
+/// Structured wire code for "this node holds the addressed unit, but **not as its primary**" — the
+/// write-path fencing refusal (D53: one writer per unit). Distinct from [`UNIT_NOT_SERVED`] so a
+/// caller can tell *wrong node for writes* (re-resolve the primary) from *not serving at all* (try
+/// the next holder). Emitted by the windowed write path
+/// ([`WindowedWriteService`](crate::windowed_ingest::WindowedWriteService)) when a `Write` /
+/// `GetCheckpoint` addresses a `(index, window)` outside the node's CP-assigned primary set.
+/// `FAILED_PRECONDITION`, so the connector treats it as non-retryable and re-resolves placement on
+/// its restart path instead of hammering the wrong node.
+pub const NOT_PRIMARY: &str = "NOT_PRIMARY";
+
+/// A `FailedPrecondition` carrying the [`NOT_PRIMARY`] structured code.
+pub fn not_primary(message: impl Into<String>) -> Status {
+    to_status(
+        Code::FailedPrecondition,
+        WireError::new(NOT_PRIMARY, message),
+    )
+}
+
+/// Whether `status` is a responder's [`NOT_PRIMARY`] refusal — matched on the structured detail,
+/// not the message text, so it survives rewording and the wire hop.
+pub fn is_not_primary(status: &Status) -> bool {
+    status.code() == Code::FailedPrecondition
+        && error_details(status).is_some_and(|e| e.code == NOT_PRIMARY)
+}
+
 /// Route a window selector to its entry in a shared `window id → service` map. `window == 0`
 /// (unset) is a request-level `InvalidArgument` — a windowed node always expects a selector, and no
 /// holder can satisfy a request that names none. A **set but unserved** window is

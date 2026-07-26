@@ -22,7 +22,11 @@ use growlerdb_core::{
 use growlerdb_engine::{FailoverNode, Gateway, Node, RemoteNode, WindowNode};
 use growlerdb_index::{LocalIndexStore, ShardId};
 use growlerdb_proto::v1::control_plane_client::ControlPlaneClient;
-use growlerdb_proto::v1::{resolve_unit_owner_request, ResolveUnitOwnerRequest, SearchRequest};
+use growlerdb_proto::v1::write_client::WriteClient;
+use growlerdb_proto::v1::{
+    resolve_unit_owner_request, GetCheckpointRequest, ResolveUnitOwnerRequest, SearchRequest,
+    WriteRequest,
+};
 use tonic::transport::Channel;
 use tonic::Request;
 
@@ -405,4 +409,170 @@ async fn killing_a_units_primary_fails_reads_over_to_the_replica() {
         both,
         "a fresh gateway fails over past the dead primary too"
     );
+}
+
+/// 357.12 (HA-A1..A3) end-to-end: the node-side **write fence**. With a CP at R=2 both nodes hold a
+/// parked window — one as primary, one as replica. A `Write` / `GetCheckpoint` addressed to the
+/// REPLICA holder is refused with the structured `NOT_PRIMARY` detail (never committed, never a
+/// fabricated empty checkpoint); a `Write` to the PRIMARY holder of the parked window is refused
+/// `WINDOW_PARKED` instead of overwriting the served snapshot with a fresh empty shard (HA-A2). And
+/// after both refusals, both holders still serve the parked doc read-through — nothing was clobbered.
+#[tokio::test]
+async fn a_write_to_a_replica_held_window_is_fenced_and_the_parked_data_survives() {
+    // A window id on a real daily boundary, so a written doc's `ts` routes to exactly this window.
+    const DAY_US: i64 = 86_400_000_000;
+    const DAY_MS: i64 = 86_400_000;
+    const WD: i64 = 10 * DAY_US;
+
+    let store_dir = tempfile::tempdir().unwrap();
+    park_window(store_dir.path(), WD, DOC1).await;
+
+    let a_dir = tempfile::tempdir().unwrap();
+    let b_dir = tempfile::tempdir().unwrap();
+    define_index(a_dir.path());
+    define_index(b_dir.path());
+
+    let addrs = free_addrs(3);
+    let (cp_addr, a_addr, b_addr) = (addrs[0].clone(), addrs[1].clone(), addrs[2].clone());
+
+    let cp_dir = tempfile::tempdir().unwrap();
+    let _cp = Proc(
+        Command::new(env!("CARGO_BIN_EXE_growlerdb"))
+            .args([
+                "--data-dir",
+                cp_dir.path().to_str().unwrap(),
+                "control-plane",
+                "--addr",
+                &cp_addr,
+            ])
+            .env("GROWLERDB_REPLICATION_FACTOR", "2")
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn control-plane"),
+    );
+    let cp_ep = format!("http://{cp_addr}");
+
+    let a_ep = format!("http://{a_addr}");
+    let b_ep = format!("http://{b_addr}");
+    let spawn_node = |dir: &std::path::Path, addr: &str, ep: &str| {
+        Proc(
+            Command::new(env!("CARGO_BIN_EXE_growlerdb"))
+                .args([
+                    "--data-dir",
+                    dir.to_str().unwrap(),
+                    "serve-pool",
+                    "--index",
+                    IDX,
+                    "--addr",
+                    addr,
+                    "--register",
+                    &cp_ep,
+                    "--advertise-addr",
+                    ep,
+                ])
+                .env("GROWLERDB_OBJECT_STORE_FS", store_dir.path())
+                .stdout(Stdio::null())
+                .spawn()
+                .expect("spawn serve-pool"),
+        )
+    };
+    let _node_a = spawn_node(a_dir.path(), &a_addr, &a_ep);
+    let _node_b = spawn_node(b_dir.path(), &b_addr, &b_ep);
+    wait_for_grpc(&a_ep).await;
+    wait_for_grpc(&b_ep).await;
+
+    // Place the window (R=2 → with two nodes, one primary + one replica) and wait until BOTH
+    // holders serve it read-through — which also proves each processed an assignment snapshot, so
+    // the write fence on each is armed with its role.
+    let mut cp = {
+        let mut client = None;
+        for _ in 0..200 {
+            if let Ok(c) = ControlPlaneClient::connect(cp_ep.clone()).await {
+                client = Some(c);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        client.expect("connect control plane")
+    };
+    let primary_ep = resolve_primary(&mut cp, WD).await;
+    assert!(primary_ep == a_ep || primary_ep == b_ep);
+    let replica_ep = if primary_ep == a_ep {
+        b_ep.clone()
+    } else {
+        a_ep.clone()
+    };
+    wait_until_serving(&primary_ep, WD, DOC1).await;
+    wait_until_serving(&replica_ep, WD, DOC1).await;
+
+    // A one-doc batch whose `ts` (epoch-ms) buckets into WD.
+    let batch = || {
+        let key = CompositeKey::new(vec![], vec![("id".into(), Value::from("intruder"))]);
+        let mut f = BTreeMap::new();
+        f.insert("id".to_string(), Value::from("intruder"));
+        f.insert("ts".to_string(), Value::from(10 * DAY_MS));
+        let b: growlerdb_proto::v1::DocBatch = CommitBatch::from_upserts(
+            vec![LocatedDoc {
+                doc: Document::new(key, f),
+                iceberg_file: "f".into(),
+                row_position: 0,
+            }],
+            SourceCheckpoint::iceberg(9),
+            "intrude-1",
+        )
+        .into();
+        b
+    };
+
+    // HA-A1/A2: the REPLICA holder refuses the write with the structured NOT_PRIMARY detail —
+    // previously it silently created a fresh empty shard and overwrote the served parked snapshot.
+    let mut writer = WriteClient::connect(replica_ep.clone()).await.unwrap();
+    let err = writer
+        .write(WriteRequest {
+            batch: Some(batch()),
+            index: IDX.into(),
+        })
+        .await
+        .expect_err("a write to a replica-held window must be refused");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        growlerdb_engine::is_not_primary(&err),
+        "the structured NOT_PRIMARY detail survives the wire: {err:?}"
+    );
+
+    // HA-A3: GetCheckpoint on the replica holder is the same refusal — never "no checkpoint,
+    // snapshot 0", which would instruct a connector to re-ingest the window here from scratch.
+    let err = writer
+        .get_checkpoint(GetCheckpointRequest {
+            window: WD,
+            index: IDX.into(),
+        })
+        .await
+        .expect_err("a checkpoint read on a replica-held window must be refused");
+    assert!(
+        growlerdb_engine::is_not_primary(&err),
+        "checkpoint refusal carries NOT_PRIMARY: {err:?}"
+    );
+
+    // HA-A2 (primary side): the PRIMARY holds this window as a parked read-through snapshot — a
+    // write is WINDOW_PARKED (revive/reroute), not an overwrite with a fresh empty shard.
+    let mut writer = WriteClient::connect(primary_ep.clone()).await.unwrap();
+    let err = writer
+        .write(WriteRequest {
+            batch: Some(batch()),
+            index: IDX.into(),
+        })
+        .await
+        .expect_err("a write into the primary's parked window must be refused");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        growlerdb_proto::error_details(&err)
+            .expect("structured error")
+            .code,
+        "WINDOW_PARKED"
+    );
+
+    // After all refusals, BOTH holders still serve the parked doc — the mux entries are intact.
+    wait_until_serving(&primary_ep, WD, DOC1).await;
+    wait_until_serving(&replica_ep, WD, DOC1).await;
 }

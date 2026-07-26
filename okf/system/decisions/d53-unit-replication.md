@@ -55,7 +55,12 @@ first queries, bounded by the pre-warm path ([D39](/system/decisions/d39-automat
 first ([D51](/system/decisions/d51-controlplane-ha.md)). **Entitlement**: replicas are additional
 running nodes, so the scale-limit entitlement ([D38](/system/decisions/d38-scale-limit-entitlement.md))
 must count *units*/primaries rather than raw node processes, or HA would eat the free tier — a policy
-follow-up. New [chaos](/quality/reliability.md) drills assert zero-gap failover (kill a unit's primary
+follow-up. **One-writer enforcement is node-side too**: a holder running from CP assignments keeps an
+atomically-swapped primary-holder view and refuses `Write`/`GetCheckpoint` for units it does not hold
+as primary (structured `NOT_PRIMARY`; a replica-held read-through window is never overwritten by a
+misrouted write) — so a stale or split-brain connector cannot commit to, or fabricate a resume
+checkpoint on, a demoted/replica holder (see the [node](/system/runtime/components/node.md)). New
+[chaos](/quality/reliability.md) drills assert zero-gap failover (kill a unit's primary
 under sustained query, assert no `partial` and continued answers with a live replica).
 
 **Status.** Accepted (design). Implementation staged in the `true-ha` epic; not yet built. Supersedes

@@ -74,6 +74,21 @@ into the same live maps the read multiplexers front — so a just-ingested windo
 re-announced with no restart. The connector stamps the index on each sub-batch, so it streams ingest
 to a pool node exactly as to a single-index windowed node.
 
+**Write fencing** ([D53](/system/decisions/d53-unit-replication.md)'s one-writer-per-unit, node
+side): when the node runs from CP assignments (`--register`), every pushed assignment snapshot
+atomically swaps its **primary-holder view**, and a `Write` / `GetCheckpoint` addressed to an
+`(index, window)` the node does not hold as **primary** is refused with the structured `NOT_PRIMARY`
+detail (`FAILED_PRECONDITION` — distinct from `UNIT_NOT_SERVED`, so callers can tell *wrong node
+for writes* from *not serving*; the connector treats it as non-retryable and re-resolves placement).
+A refused write creates no shard and touches no read map; a refused checkpoint read never fabricates
+an empty resume point on the wrong node. Defense in depth: a window the node serves only
+**read-through** (a replica-held parked snapshot) is never overwritten by a misrouted first write —
+that's a `WINDOW_PARKED` refusal, and the replica reconcile inserts its cold entry only if the
+window is still absent, so a hot window created meanwhile always wins. When a unit's primary moves
+away, the node starts refusing on the very next snapshot (unloading the unit is a follow-on).
+Standalone (no `--register`) the fence is unrestricted — classic `serve` / `serve-pool`
+create-on-first-write is unchanged.
+
 **Replica serving** ([D53](/system/decisions/d53-unit-replication.md)): a pool node registered into the
 pool also **subscribes to CP assignment pushes** (`SubscribeAssignments`) and, for each **replica**
 window the CP assigns it, fetches the parked window's cold marker from object storage and opens it

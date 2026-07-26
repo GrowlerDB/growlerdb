@@ -82,11 +82,12 @@ pub use service_auth::{
 pub use shard_handle::ShardHandle;
 pub use suggest_service::SuggestService;
 pub use topology::{shard_primaries, ShardTopologyError};
-pub use windowed_ingest::{OnNewWindow, WindowSeed, WindowedWriteService};
+pub use windowed_ingest::{OnNewWindow, PrimaryFence, WindowSeed, WindowedWriteService};
 pub use windowed_routing::{
-    is_unit_not_served, unit_not_served, SharedAdminWindows, SharedLookupWindows,
-    SharedSearchWindows, SharedSuggestWindows, WindowNode, WindowedAdminService,
-    WindowedLookupService, WindowedSearchService, WindowedSuggestService, UNIT_NOT_SERVED,
+    is_not_primary, is_unit_not_served, not_primary, unit_not_served, SharedAdminWindows,
+    SharedLookupWindows, SharedSearchWindows, SharedSuggestWindows, WindowNode,
+    WindowedAdminService, WindowedLookupService, WindowedSearchService, WindowedSuggestService,
+    NOT_PRIMARY, UNIT_NOT_SERVED,
 };
 pub use write_service::WriteService;
 

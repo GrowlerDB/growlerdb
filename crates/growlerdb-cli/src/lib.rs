@@ -2565,6 +2565,16 @@ async fn serve_pool(
     let admin_idx: growlerdb_engine::SharedAdminIndexes = Arc::new(RwLock::new(BTreeMap::new()));
     let write_idx: growlerdb_engine::SharedWriteIndexes = Arc::new(RwLock::new(BTreeMap::new()));
 
+    // The node-side write fence (357.12): when this node runs from CP assignments (`--register` +
+    // `--advertise-addr`), every per-index writer refuses writes/checkpoints for `(index, window)`
+    // units the CP hasn't assigned to it as PRIMARY (structured NOT_PRIMARY) — updated atomically
+    // from each pushed assignment snapshot below. Standalone (no CP) it stays unrestricted, so
+    // classic create-on-first-write behavior is unchanged.
+    let fence = if register.is_some() && advertise_addr.is_some() {
+        growlerdb_engine::PrimaryFence::fenced()
+    } else {
+        growlerdb_engine::PrimaryFence::unrestricted()
+    };
     // Per-index (resolved def, writer) for the CP announce when `--register` is set: the writer's
     // live `served_windows()` is read each re-announce, so a window created since boot is advertised.
     let mut announcements: Vec<(growlerdb_core::ResolvedIndex, WindowedWriteService)> = Vec::new();
@@ -2714,7 +2724,8 @@ async fn serve_pool(
             admin_shared,
             gateway,
             on_new_window,
-        )?;
+        )?
+        .with_primary_fence(fence.clone());
         write_idx
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -2727,34 +2738,35 @@ async fn serve_pool(
         let _ = served; // (per-window ServedWindow now re-read from the writer at announce time)
     }
 
-    // D53 replica serving: when this node registers into the pool AND a backup object store is
-    // configured, subscribe to CP assignment pushes and open each assigned *replica* window
-    // read-through, so a re-placed/replica holder answers without a rebuild. Needs both the CP (for
-    // the subscription) and the object store (for the parked data); absent either, the node serves
-    // only its local/primary windows (no replica failover).
+    // D53 assignment subscription: when this node registers into the pool, subscribe to CP
+    // assignment pushes. Every snapshot updates the write fence (primary-holder view — needs only
+    // the CP); when a backup object store is also configured, it additionally opens each assigned
+    // *replica* window read-through, so a re-placed/replica holder answers without a rebuild.
+    // Absent the object store, the node still fences writes but serves only its local/primary
+    // windows (no replica failover).
     if let (Some(cp), Some(endpoint)) = (register, advertise_addr) {
-        match object_store_from_env() {
-            Ok(op) => {
-                spawn_replica_reconcile(
-                    cp.to_string(),
-                    endpoint.to_string(),
-                    replica_meta,
-                    search_idx.clone(),
-                    suggest_idx.clone(),
-                    lookup_idx.clone(),
-                    admin_idx.clone(),
-                    store.clone(),
-                    op,
-                    growlerdb_index::RangeCache::new(cold_cache_bytes()),
-                    std::path::PathBuf::from(data_dir).join(".replica"),
+        let replica = match object_store_from_env() {
+            Ok(op) => Some(ReplicaServing {
+                meta: replica_meta,
+                search_idx: search_idx.clone(),
+                suggest_idx: suggest_idx.clone(),
+                lookup_idx: lookup_idx.clone(),
+                admin_idx: admin_idx.clone(),
+                store: store.clone(),
+                op,
+                cache: growlerdb_index::RangeCache::new(cold_cache_bytes()),
+                replica_root: std::path::PathBuf::from(data_dir).join(".replica"),
+            }),
+            Err(e) => {
+                eprintln!(
+                    "serve-pool: replica failover disabled — no object store ({e}); set \
+                     GROWLERDB_BACKUP_BUCKET (S3) or GROWLERDB_OBJECT_STORE_FS (local dir) to \
+                     enable D53 replica serving (write fencing stays active)"
                 );
+                None
             }
-            Err(e) => eprintln!(
-                "serve-pool: replica failover disabled — no object store ({e}); set \
-                 GROWLERDB_BACKUP_BUCKET (S3) or GROWLERDB_OBJECT_STORE_FS (local dir) to enable \
-                 D53 replica serving"
-            ),
-        }
+        };
+        spawn_assignment_reconcile(cp.to_string(), endpoint.to_string(), fence.clone(), replica);
     }
 
     let socket: std::net::SocketAddr = addr
@@ -2819,13 +2831,10 @@ type ReplicaIndexMeta = std::collections::HashMap<
     ),
 >;
 
-/// Subscribe to CP **assignment pushes** and serve this node's assigned replica windows (D53):
-/// each pushed snapshot is reconciled by [`reconcile_replica_windows`]. Reconnects with a short
-/// backoff if the stream drops (the CP re-sends a full snapshot on resubscribe, so nothing is lost).
-#[allow(clippy::too_many_arguments)]
-fn spawn_replica_reconcile(
-    cp: String,
-    endpoint: String,
+/// Everything the assignment loop needs to open + publish an assigned **replica** window (D53) —
+/// `None` in [`spawn_assignment_reconcile`] when no backup object store is configured: the write
+/// fence still updates from every snapshot, only the replica read-through serving is disabled.
+struct ReplicaServing {
     meta: ReplicaIndexMeta,
     search_idx: growlerdb_engine::SharedSearchIndexes,
     suggest_idx: growlerdb_engine::SharedSuggestIndexes,
@@ -2835,6 +2844,18 @@ fn spawn_replica_reconcile(
     op: growlerdb_backup::Operator,
     cache: growlerdb_index::RangeCache,
     replica_root: std::path::PathBuf,
+}
+
+/// Subscribe to CP **assignment pushes** (D53) and apply each pushed snapshot: first swap the
+/// node's primary-holder **write fence** (357.12 — so a unit whose primary moved away is refused on
+/// the very next snapshot), then serve any assigned replica windows via
+/// [`reconcile_replica_windows`]. Reconnects with a short backoff if the stream drops (the CP
+/// re-sends a full snapshot on resubscribe, so nothing is lost).
+fn spawn_assignment_reconcile(
+    cp: String,
+    endpoint: String,
+    fence: growlerdb_engine::PrimaryFence,
+    replica: Option<ReplicaServing>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -2848,19 +2869,24 @@ fn spawn_replica_reconcile(
                     .into_inner();
                 // A full snapshot on subscribe + on every placement change; reconcile each.
                 while let Some(snapshot) = stream.message().await? {
-                    reconcile_replica_windows(
-                        &snapshot.units,
-                        &meta,
-                        &search_idx,
-                        &suggest_idx,
-                        &lookup_idx,
-                        &admin_idx,
-                        &store,
-                        &op,
-                        &cache,
-                        &replica_root,
-                    )
-                    .await;
+                    // Fence first: the write path must see the tightened primary set before (and
+                    // regardless of whether) any replica window is opened.
+                    fence.apply_snapshot(&snapshot.units);
+                    if let Some(r) = &replica {
+                        reconcile_replica_windows(
+                            &snapshot.units,
+                            &r.meta,
+                            &r.search_idx,
+                            &r.suggest_idx,
+                            &r.lookup_idx,
+                            &r.admin_idx,
+                            &r.store,
+                            &r.op,
+                            &r.cache,
+                            &r.replica_root,
+                        )
+                        .await;
+                    }
                 }
                 Ok::<(), anyhow::Error>(())
             }
@@ -2958,14 +2984,25 @@ async fn reconcile_replica_windows(
         };
         let handle = ShardHandle::new(Arc::new(shard));
         // Publish into the four per-index maps (the SAME Arcs the Pool read services front, so the
-        // window is queryable with no restart).
-        search_windows
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
+        // window is queryable with no restart). **Insert only if still absent** (HA-A4): the cold
+        // open above is slow, and the write path may have created this window HOT meanwhile — an
+        // unconditional insert would clobber the live hot entry with this stale cold one. The
+        // re-check under the write lock makes the hot window win; the cold shard is discarded.
+        {
+            let mut sw = search_windows.write().unwrap_or_else(|e| e.into_inner());
+            if sw.contains_key(&window) {
+                eprintln!(
+                    "serve-pool replica: {}/w{window} appeared (hot) during the cold open — \
+                     keeping the live window, discarding the stale cold replica",
+                    u.index
+                );
+                continue;
+            }
+            sw.insert(
                 window,
                 SearchService::new(handle.clone()).with_index_heavy_budget(heavy.clone()),
             );
+        }
         if let Some(m) = suggest_idx
             .read()
             .unwrap_or_else(|e| e.into_inner())
@@ -2974,7 +3011,8 @@ async fn reconcile_replica_windows(
         {
             m.write()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(window, SuggestService::new(handle.clone()));
+                .entry(window)
+                .or_insert_with(|| SuggestService::new(handle.clone()));
         }
         if let Some(m) = lookup_idx
             .read()
@@ -2982,15 +3020,17 @@ async fn reconcile_replica_windows(
             .get(&u.index)
             .cloned()
         {
-            m.write().unwrap_or_else(|e| e.into_inner()).insert(
-                window,
-                LookupService::new(
-                    handle.clone(),
-                    IcebergConfig::from_env(),
-                    table.clone(),
-                    resolved.clone(),
-                ),
-            );
+            m.write()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(window)
+                .or_insert_with(|| {
+                    LookupService::new(
+                        handle.clone(),
+                        IcebergConfig::from_env(),
+                        table.clone(),
+                        resolved.clone(),
+                    )
+                });
         }
         if let Some(m) = admin_idx
             .read()
@@ -3000,7 +3040,8 @@ async fn reconcile_replica_windows(
         {
             m.write()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(window, AdminService::new(handle.clone(), &u.index));
+                .entry(window)
+                .or_insert_with(|| AdminService::new(handle.clone(), &u.index));
         }
         served += 1;
         println!(
