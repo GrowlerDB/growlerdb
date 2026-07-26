@@ -167,6 +167,18 @@ pub struct ColdMarker {
     /// paired with `bundle_key`.
     #[serde(default)]
     pub bundle_manifest_key: Option<String>,
+    /// Object key of the parked window's `aux.redb`. The primary keeps it **local** and reads
+    /// through that; a **replica** on another node ([D53](/system/decisions/d53-unit-replication.md))
+    /// has no local copy, so it fetches this key to a scratch dir and opens the window read-through
+    /// ([`open_cold_replica`](crate::LocalIndexStore::open_cold_replica)). A parked window is
+    /// immutable, so this snapshot is frozen — no continuous re-sync. `None` on a window parked
+    /// before replica support (falls back to the local aux).
+    #[serde(default)]
+    pub aux_key: Option<String>,
+    /// Object key of the parked window's `location.arr` (the [D30](/system/decisions/d30-layered-locator.md)
+    /// locator array), the sidecar counterpart to [`aux_key`](Self::aux_key) for a replica open.
+    #[serde(default)]
+    pub location_key: Option<String>,
 }
 
 /// Cap on concurrently-open point-in-time handles per shard. Each held
@@ -457,6 +469,60 @@ impl LocalIndexStore {
             #[cfg(test)]
             commit_trace: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Open a **parked window as a cross-node replica** (D53): unlike [`open_cold_shard`], which
+    /// reads the window's `aux.redb` + `location.arr` from a **local** `aux_dir` (the primary keeps
+    /// them beside the marker), a replica on another node has no local copy — so this fetches both
+    /// sidecars from object storage (the [`aux_key`](ColdMarker::aux_key) /
+    /// [`location_key`](ColdMarker::location_key) `backup()` uploaded) into `scratch_dir`, then opens
+    /// the window read-through exactly like a cold open. The window is immutable, so the fetched
+    /// snapshot is consistent and never re-synced. Errors if the marker predates replica support
+    /// (no sidecar keys — re-park to enable it).
+    pub fn open_cold_replica(
+        &self,
+        index: &ResolvedIndex,
+        scratch_dir: &Path,
+        op: opendal::Operator,
+        marker: &ColdMarker,
+        cache: RangeCache,
+    ) -> Result<Shard> {
+        let (aux_key, location_key) = match (&marker.aux_key, &marker.location_key) {
+            (Some(a), Some(l)) => (a, l),
+            _ => return Err(StoreError::Cold(
+                "parked window has no replica sidecar keys (aux_key/location_key) — re-park it \
+                     to enable cross-node replica read-through"
+                    .into(),
+            )),
+        };
+        std::fs::create_dir_all(scratch_dir)?;
+        // Blocking operator for the two one-shot sidecar downloads (this open path is synchronous,
+        // as is `open_cold_shard`'s own sidecar reads).
+        let bop = opendal::blocking::Operator::new(op.clone())
+            .map_err(|e| StoreError::Cold(e.to_string()))?;
+        let aux = bop
+            .read(aux_key)
+            .map_err(|e| StoreError::Cold(e.to_string()))?;
+        std::fs::write(scratch_dir.join("aux.redb"), aux.to_vec())?;
+        let location = bop
+            .read(location_key)
+            .map_err(|e| StoreError::Cold(e.to_string()))?;
+        std::fs::write(scratch_dir.join(LOCATION_FILE), location.to_vec())?;
+        let bundle = marker
+            .bundle_key
+            .as_deref()
+            .zip(marker.bundle_manifest_key.as_deref());
+        // Fresh aux.redb (no live hot shard to reuse a handle from — this is a replica node).
+        self.open_cold_shard(
+            index,
+            scratch_dir,
+            op,
+            &marker.object_prefix,
+            cache,
+            marker.hotcache_key.as_deref(),
+            bundle,
+            None,
+        )
     }
 
     /// The cold-park [`ColdMarker`] for window `w` of `index`, or `None` if the window is **hot**
