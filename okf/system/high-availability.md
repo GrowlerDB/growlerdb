@@ -141,10 +141,14 @@ and **CP replica/leader loss under mutation** (assert routing + registration con
 
 ## Status
 
-**Designed, not yet built.** This concept + D51–D53 are the accepted design; implementation is staged
-in the `true-ha` backlog epic (CP backend seam → externalized store → placement pool → per-unit
-replication → cold-tier fast-bootstrap → chaos drills), landing as sub-PRs on the `feat/true-ha`
-feature branch ([D50](/system/decisions/d50-branching-model.md)). Until it lands, HA is as the
+**Built on `feat/true-ha`, under audit-driven hardening.** The D51–D53 slices have landed on the
+feature branch (CP backend seam → externalized store → placement pool → per-unit replication →
+cold-tier fast-bootstrap → chaos drills). A full adversarial audit of the branch
+([2026-07-26 audit](/quality/audits/2026-07-26-true-ha-adversarial-review.md)) found the
+steady-state plumbing sound but the topology-change paths incomplete — write fencing, failover
+error handling, CP leader handoff, connector placement refresh, and the Helm rollout/PDB
+lifecycle — tracked as fix subtasks of the `true-ha` epic and being closed on the same branch
+before the feature → `main` PR. Until that PR merges, HA on `main` is as the
 [availability](/product/non-functional/availability.md) NFR and
 [sharded HA](/system/deployment/sharded-ha.md) describe: shards spread + PDBs + PV self-heal + honest
 partial results, with the CP a single instance.
