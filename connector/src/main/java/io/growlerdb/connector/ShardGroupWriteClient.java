@@ -38,14 +38,27 @@ public final class ShardGroupWriteClient implements BatchWriter {
   private final ShardRouter router;
   private final ShardFanOut fanOut;
   private final SnapshotLineage lineage;
+  /** Index tag on every sub-batch (empty = the node's sole index); see {@link ShardedWriteClient#index}. */
+  private final String index;
+
+  /** As below, untagged (empty index — a single-index sharded deployment). */
+  public ShardGroupWriteClient(
+      List<String> endpoints, ShardRouter router, SnapshotLineage lineage, SortedSet<Integer> owned) {
+    this(endpoints, router, lineage, owned, "");
+  }
 
   /**
    * @param endpoints ALL shard endpoints in ordinal order (the full topology — the group is a
    *     subset of it); must match the router's shard count
    * @param owned the shard ordinals this worker owns ({@link ShardGroup#owned})
+   * @param index tag on every sub-batch, so a pool node can dispatch by {@code (index, shard)}
    */
   public ShardGroupWriteClient(
-      List<String> endpoints, ShardRouter router, SnapshotLineage lineage, SortedSet<Integer> owned) {
+      List<String> endpoints,
+      ShardRouter router,
+      SnapshotLineage lineage,
+      SortedSet<Integer> owned,
+      String index) {
     if (owned.isEmpty()) {
       throw new IllegalArgumentException("a shard-group writer needs at least one owned shard");
     }
@@ -60,6 +73,7 @@ public final class ShardGroupWriteClient implements BatchWriter {
     this.owned = owned;
     this.router = router;
     this.lineage = lineage;
+    this.index = index;
     this.fanOut = new ShardFanOut(owned.size());
     try {
       for (int ordinal : owned) {
@@ -88,7 +102,7 @@ public final class ShardGroupWriteClient implements BatchWriter {
       final DocBatch sub = perShard.get(shard);
       writes.add(
           () -> {
-            long snapshot = byOrdinal.get(shard).write(sub);
+            long snapshot = byOrdinal.get(shard).write(sub, index);
             ConnectorMetrics.recordShardAck(shard);
             return snapshot;
           });

@@ -2,12 +2,47 @@ package io.growlerdb.connector;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.growlerdb.proto.v1.GetIndexResponse;
 import io.growlerdb.proto.v1.RoutingStrategy;
+import io.growlerdb.proto.v1.ShardStatus;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 
 class ConnectorAppTest {
+
+  private static GetIndexResponse.Builder indexWithShards(int count) {
+    return GetIndexResponse.newBuilder().setShardCount(count).setRouting(RoutingStrategy.ROUTING_HASH);
+  }
+
+  @Test
+  void shardEndpointsFromCpAreOrdinalOrderedAndSchemeStripped() {
+    // Registry shard map delivered out of order + with a scheme prefix — the connector sorts by
+    // ordinal and dials host:port, so writes go to the same nodes reads route to.
+    GetIndexResponse entry =
+        indexWithShards(3)
+            .addShardStatus(ShardStatus.newBuilder().setOrdinal(2).setPrimary("http://n2:50051"))
+            .addShardStatus(ShardStatus.newBuilder().setOrdinal(0).setPrimary("n0:50051"))
+            .addShardStatus(ShardStatus.newBuilder().setOrdinal(1).setPrimary("https://n1:50051"))
+            .build();
+    assertEquals(
+        List.of("n0:50051", "n1:50051", "n2:50051"), ConnectorApp.shardEndpointsFromCp(entry));
+  }
+
+  @Test
+  void shardEndpointsFromCpFailsFastWhenAShardHasNoPrimaryYet() {
+    // Shard 1's serve node hasn't registered → no primary. Fail loudly rather than silently drop
+    // that shard's writes (which the min-checkpoint resume would then never advance past).
+    GetIndexResponse entry =
+        indexWithShards(2)
+            .addShardStatus(ShardStatus.newBuilder().setOrdinal(0).setPrimary("n0:50051"))
+            .addShardStatus(ShardStatus.newBuilder().setOrdinal(1).setPrimary(""))
+            .build();
+    IllegalStateException e =
+        assertThrows(IllegalStateException.class, () -> ConnectorApp.shardEndpointsFromCp(entry));
+    assertTrue(e.getMessage().contains("shard 1"), e.getMessage());
+  }
 
   @Test
   void routingFollowsPartitionFields() {

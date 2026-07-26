@@ -28,6 +28,13 @@ public final class ShardedWriteClient implements BatchWriter {
   private final ShardFanOut fanOut;
   /** Fills in sequence numbers the Nodes don't have at resume time. */
   private final SnapshotLineage lineage;
+  /**
+   * The index every sub-batch is tagged with, so a **pool node** serving many indexes over one
+   * endpoint can dispatch the write on its {@code (index, shard)} selector. Empty = the node's sole
+   * served index (a per-index sharded Node ignores it), so untagged single-index deployments are
+   * unchanged — the hash counterpart to {@link WindowedWriteClient}'s per-index tagging.
+   */
+  private final String index;
 
   /** Connect a Node per {@code host:port} endpoint, routed by {@code strategy}. */
   public ShardedWriteClient(List<String> endpoints, ShardRouter.Strategy strategy) {
@@ -39,12 +46,19 @@ public final class ShardedWriteClient implements BatchWriter {
     this(endpoints, router, SnapshotLineage.none());
   }
 
+  /** As below, untagged (empty index — a single-index sharded deployment). */
+  public ShardedWriteClient(List<String> endpoints, ShardRouter router, SnapshotLineage lineage) {
+    this(endpoints, router, lineage, "");
+  }
+
   /**
    * Connect a Node per {@code host:port} endpoint, placing writes with an explicit {@code router}
    * (a bucketed router built from the registry's vended map, so write placement matches the
-   * Gateway's read routing). The router's shard count must equal the endpoint count.
+   * Gateway's read routing) and tagging each sub-batch with {@code index}. The router's shard count
+   * must equal the endpoint count.
    */
-  public ShardedWriteClient(List<String> endpoints, ShardRouter router, SnapshotLineage lineage) {
+  public ShardedWriteClient(
+      List<String> endpoints, ShardRouter router, SnapshotLineage lineage, String index) {
     if (endpoints.isEmpty()) {
       throw new IllegalArgumentException("a ShardedWriteClient needs at least one endpoint");
     }
@@ -79,6 +93,7 @@ public final class ShardedWriteClient implements BatchWriter {
     this.router = router;
     this.fanOut = new ShardFanOut(this.shards.size());
     this.lineage = lineage;
+    this.index = index;
   }
 
   @Override
@@ -95,7 +110,7 @@ public final class ShardedWriteClient implements BatchWriter {
       // current` invariant only holds when every shard tracks the same source position.
       writes.add(
           () -> {
-            long snapshot = shards.get(shard).write(sub);
+            long snapshot = shards.get(shard).write(sub, index);
             // Per-shard ack metric: a shard whose acks stall relative to its siblings is the tell
             // for a partial-landing loss signature. Recorded on success only.
             ConnectorMetrics.recordShardAck(shard);

@@ -36,6 +36,15 @@ batches to the [nodes](/system/runtime/components/node.md)' Write gRPC services 
   all table history each trigger.
 - Apply insert/update/delete with idempotent batch ids →
   [exactly-once](/product/functional/ingestion/checkpoints-exactly-once.md) resume via `GetCheckpoint`.
+- **Route by the control plane, not static config.** With `--control-plane` set, the connector reads
+  each hash shard's owning node from the registry's shard map (`GetIndex.shard_status` — the same
+  placement the [gateway](/system/runtime/components/gateway.md) routes reads to, so writes land where
+  reads look) unless the operator pins endpoints with `--nodes`; it fails fast if a shard has no live
+  primary yet. Each sub-batch is **tagged with its index**, so a
+  [pool node](/system/decisions/d52-placement-pool.md) serving many indexes can dispatch it by
+  `(index, shard)` — the hash counterpart to the windowed writer's per-window CP resolution
+  (`ResolveUnitOwner`). (A windowed index instead resolves each window's owner live via
+  `ResolveUnitOwner`.)
 - Reconnect on a node roll (new pod IP) instead of wedging.
 - **Variant extraction** ([variant fields](/product/functional/index-management/variant.md),
   [D47](/system/decisions/d47-variant-mapping.md)/[D48](/system/decisions/d48-variant-delivery.md)):
