@@ -243,7 +243,7 @@ public final class ConnectorApp {
     } finally {
       spark.stop();
       if (cpToClose != null) {
-        cpToClose.close(); // the windowed writer borrows this CP client for ResolveWindowOwner
+        cpToClose.close(); // the windowed writer borrows this CP client for ResolveUnitOwner
       }
     }
   }
