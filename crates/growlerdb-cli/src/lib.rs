@@ -4449,7 +4449,11 @@ fn connect_node_lazy(
 /// Backoff bounds + heartbeat for control-plane registration.
 const REGISTER_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 const REGISTER_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
-const REGISTER_REANNOUNCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Derived from the control plane's own constant so the heartbeat cadence and the liveness TTL
+/// (`NODE_HEARTBEAT_TTL_MS` = 3× this) can never silently diverge again — they were once both 30 s
+/// and healthy nodes flapped out of the placement pool (HA-D5).
+const REGISTER_REANNOUNCE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(growlerdb_controlplane::NODE_REANNOUNCE_INTERVAL_MS as u64);
 
 /// Announce a served index to the control-plane registry in the background, **retrying until it
 /// succeeds** and then re-announcing on an interval. In Kubernetes all pods start
@@ -4970,6 +4974,9 @@ async fn control_plane(
     // Keep the ingestion-lag + shard-availability gauges fresh for Prometheus regardless of console
     // polling.
     svc.spawn_ingestion_metrics_sampler(15);
+    // Dead-owner sweeper (357.18/HA-D2): re-place units whose primary stopped heartbeating, even
+    // with no writes arriving — leader-only, grace-aware; the logic lives in the engine/registry.
+    svc.spawn_dead_owner_sweeper();
     let readiness = spawn_health(metrics_addr).await?;
     // In HA mode the leadership loop owns readiness — only the replica that holds the writer lock is
     // marked ready, so the Service routes to the single leader (active-passive). Otherwise (embedded

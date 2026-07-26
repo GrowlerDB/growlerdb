@@ -130,36 +130,42 @@ struct AssignmentHub {
 }
 
 impl AssignmentHub {
-    /// Subscribe `endpoint`, seeding the stream with `initial`. Reuses the node's existing watch
-    /// sender (so a later push reaches every live receiver) and refreshes it to `initial`.
+    /// Subscribe `endpoint` and seed the stream with its current snapshot. **Register-then-
+    /// compute-then-send** (HA-D4a): the receiver is created *before* the snapshot is computed, and
+    /// the hub lock is held across compute+send both here and in [`notify_all`](Self::notify_all) —
+    /// so no placement change can land in a gap and be clobbered by a stale seed, and a re-subscribe
+    /// can only re-send the *current* truth to the endpoint's other live receivers (snapshots are
+    /// idempotent). The registry read inside the lock is brief and never takes the hub lock back,
+    /// so the lock order (hub → registry read) is acyclic.
     fn subscribe(
         &self,
         endpoint: &str,
-        initial: NodeAssignments,
+        registry: &Registry,
     ) -> tokio::sync::watch::Receiver<NodeAssignments> {
         let mut map = self.senders.lock().unwrap_or_else(|e| e.into_inner());
         let tx = map
             .entry(endpoint.to_string())
-            .or_insert_with(|| tokio::sync::watch::channel(initial.clone()).0);
-        let _ = tx.send(initial); // refresh to the snapshot at (re)subscribe time
-        tx.subscribe()
+            .or_insert_with(|| tokio::sync::watch::channel(NodeAssignments::default()).0);
+        let rx = tx.subscribe();
+        let snap = node_assignments_wire(registry.node_assignments(endpoint));
+        let _ = tx.send(snap);
+        rx
     }
 
-    /// Push a fresh snapshot to every subscribed node — called after a placement change so a placed
-    /// replica starts serving. Each node's snapshot is recomputed from the registry; a node with no
-    /// live receiver is a no-op `send` (its sender is kept for a reconnect).
+    /// Push a fresh snapshot to every subscribed node — invoked by the registry's placement-change
+    /// hook after any persisted placement mutation, so every change path (resolve, announce,
+    /// drop-index, promote, remove-node, sweeper) pushes without remembering to. Senders whose
+    /// receivers have all dropped are **evicted** (HA-D4b) — a disconnected node re-subscribes and
+    /// gets a fresh full snapshot, so nothing is lost and the hub can't grow with dead endpoints.
     fn notify_all(&self, registry: &Registry) {
-        let endpoints: Vec<String> = {
-            let map = self.senders.lock().unwrap_or_else(|e| e.into_inner());
-            map.keys().cloned().collect()
-        };
-        for ep in endpoints {
-            let snap = node_assignments_wire(registry.node_assignments(&ep));
-            let map = self.senders.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(tx) = map.get(&ep) {
-                let _ = tx.send(snap);
+        let mut map = self.senders.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|ep, tx| {
+            if tx.receiver_count() == 0 {
+                return false; // every stream for this endpoint dropped — evict
             }
-        }
+            let _ = tx.send(node_assignments_wire(registry.node_assignments(ep)));
+            true
+        });
     }
 }
 
@@ -224,6 +230,21 @@ impl ControlPlaneService {
 
     /// As [`new`](Self::new), with a specific [auth hook](SharedAuth).
     pub fn with_auth(registry: Arc<Registry>, iceberg: IcebergConfig, auth: SharedAuth) -> Self {
+        let assignments = AssignmentHub::default();
+        // Placement-change hook (HA-D1): EVERY persisted placement mutation — resolve, announce
+        // re-point, drop-index, promote, remove-node, the dead-owner sweeper, a standby's
+        // reload-on-promotion — pushes each subscribed node its fresh snapshot. Wired at the
+        // registry's persist boundary so a new mutation can't forget to notify. `Weak` breaks the
+        // registry → listener → registry cycle.
+        {
+            let hub = assignments.clone();
+            let weak = Arc::downgrade(&registry);
+            registry.set_placement_listener(move || {
+                if let Some(registry) = weak.upgrade() {
+                    hub.notify_all(&registry);
+                }
+            });
+        }
         Self {
             registry,
             iceberg,
@@ -233,7 +254,7 @@ impl ControlPlaneService {
             login_throttle: Arc::new(LoginThrottle::new()),
             license: None,
             replication_factor: 1,
-            assignments: AssignmentHub::default(),
+            assignments,
         }
     }
 
@@ -575,12 +596,25 @@ fn registry_status(e: RegistryError) -> Status {
             Code::InvalidArgument,
             WireError::new("INVALID_ARGUMENT", detail),
         ),
-        RegistryError::PlacementConflict(index) => to_status(
+        RegistryError::PlacementConflict(detail) => to_status(
             Code::FailedPrecondition,
             WireError::new(
                 "PLACEMENT_CONFLICT",
+                format!("placement conflict: {detail}"),
+            ),
+        ),
+        // Scale entitlement (D38/D53): a NEW placement past the cap. RESOURCE_EXHAUSTED so callers
+        // distinguish "buy/raise the limit" from a transient failure.
+        RegistryError::EntitlementExceeded { units, entitled } => to_status(
+            Code::ResourceExhausted,
+            WireError::new(
+                "RESOURCE_EXHAUSTED",
                 format!(
-                    "placement of `{index}` changed while this operation ran — re-plan and retry"
+                    "scale limit reached: {units} entitlement units in use (distinct index × \
+                     primary-node pairs), entitlement is {entitled} (free tier is {}). Read \
+                     replicas are free; an Enterprise license raises the limit — see \
+                     COMM-LICENSE.md.",
+                    crate::license::FREE_UNIT_LIMIT,
                 ),
             ),
         ),
@@ -615,6 +649,41 @@ fn registry_status(e: RegistryError) -> Status {
             WireError::new("INTERNAL", other.to_string()),
         ),
     }
+}
+
+/// Validate a node-supplied `endpoint` (HA-D6): non-empty and shaped like `[http[s]://]host:port`
+/// with a numeric port. The pool, the shard map, and the assignment hub key on this string and the
+/// gateway dials it, so a malformed value (e.g. a field decoded from an incompatible old binary)
+/// must fail loudly at the RPC boundary instead of seeding placement with a garbage node.
+fn validate_endpoint(endpoint: &str) -> Result<(), Status> {
+    let bad = |why: &str| {
+        Status::invalid_argument(format!(
+            "invalid endpoint `{endpoint}`: {why} (expected [http[s]://]host:port)"
+        ))
+    };
+    if endpoint.is_empty() {
+        return Err(Status::invalid_argument("endpoint is required"));
+    }
+    if endpoint.chars().any(char::is_whitespace) {
+        return Err(bad("contains whitespace"));
+    }
+    let rest = endpoint
+        .strip_prefix("http://")
+        .or_else(|| endpoint.strip_prefix("https://"))
+        .unwrap_or(endpoint);
+    if rest.contains("://") || rest.contains('/') {
+        return Err(bad("unsupported scheme or path"));
+    }
+    let (host, port) = rest
+        .rsplit_once(':')
+        .ok_or_else(|| bad("missing `:port`"))?;
+    if host.is_empty() {
+        return Err(bad("empty host"));
+    }
+    if port.parse::<u16>().is_err() {
+        return Err(bad("port is not a number in 0-65535"));
+    }
+    Ok(())
 }
 
 /// The control plane's wall clock in epoch ms — the authority for windowed-node heartbeat liveness,
@@ -1367,9 +1436,7 @@ impl ControlPlane for ControlPlaneService {
     ) -> Result<Response<RegisterServedIndexResponse>, Status> {
         self.gate("RegisterServedIndex", &request)?;
         let req = request.into_inner();
-        if req.endpoint.is_empty() {
-            return Err(Status::invalid_argument("endpoint is required"));
-        }
+        validate_endpoint(&req.endpoint)?;
         // The node ships its already-resolved definition (its `index.json`), so registration is a
         // pure registry op — no source round-trip (unlike CreateIndex, which resolves YAML).
         let resolved: ResolvedIndex = serde_json::from_str(&req.definition_json)
@@ -1407,9 +1474,19 @@ impl ControlPlane for ControlPlaneService {
                     )));
                 }
             }
-            // One persist for all this node's ordinals, not one rewrite per ordinal.
+            // One persist for all this node's ordinals, not one rewrite per ordinal. The announce
+            // is guarded (HA-D3/D7): idempotent for this endpoint's own shards, a serving report for
+            // shards it replicates, a takeover for confidently-dead primaries — but a shard held by
+            // a live foreign primary is PLACEMENT_CONFLICT (first-wins, not last-write-wins), and
+            // fresh primaries are entitlement-checked (fail-closed) like any placement.
             self.registry
-                .assign_primaries(&name, &owned, req.endpoint.clone())
+                .announce_primaries(
+                    &name,
+                    &owned,
+                    &req.endpoint,
+                    now_ms(),
+                    self.entitled_units(),
+                )
                 .map_err(registry_status)?;
             // Every ordinal index is bucketed from its first announce (no long-lived legacy
             // routing): adopt a balanced map over the DECLARED total once. A later announce —
@@ -1419,23 +1496,30 @@ impl ControlPlane for ControlPlaneService {
                 .adopt_bucket_map_if_absent(&name, shard_count)
                 .map_err(registry_status)?;
         } else {
-            // Windowed: place each served window on this node and record its event-time
-            // zone-map so the gateway can prune. `windows` may be empty (an empty streaming node) —
-            // the entry still exists + activates below so placement can proceed.
-            for w in &req.windows {
-                self.registry
-                    .assign_window(&name, w.window, req.endpoint.clone())
-                    .map_err(registry_status)?;
-                if w.has_event_bounds {
-                    self.registry
-                        .set_window_bounds(&name, w.window, Some(w.event_min), Some(w.event_max))
-                        .map_err(registry_status)?;
-                }
-                // Track the window's live tier (hot/cold) so the gateway's /v1/cold reflects parking.
-                self.registry
-                    .set_window_cold(&name, w.window, w.cold)
-                    .map_err(registry_status)?;
-            }
+            // Windowed: place the served windows on this node and record their event-time zone-maps
+            // + hot/cold tier — one guarded, batched registry mutation (one persist for the whole
+            // announce). Same first-wins semantics as the ordinal path: a window primaried by a
+            // live foreign node conflicts unless this node is its listed replica (serving report).
+            // `windows` may be empty (an empty streaming node) — the entry still exists + activates
+            // below so placement can proceed.
+            let announces: Vec<growlerdb_controlplane::WindowAnnounce> = req
+                .windows
+                .iter()
+                .map(|w| growlerdb_controlplane::WindowAnnounce {
+                    window: w.window,
+                    bounds: w.has_event_bounds.then_some((w.event_min, w.event_max)),
+                    cold: w.cold,
+                })
+                .collect();
+            self.registry
+                .announce_windows(
+                    &name,
+                    &req.endpoint,
+                    &announces,
+                    now_ms(),
+                    self.entitled_units(),
+                )
+                .map_err(registry_status)?;
         }
         self.registry.activate(&name).map_err(registry_status)?;
         Ok(Response::new(RegisterServedIndexResponse { name }))
@@ -1447,9 +1531,10 @@ impl ControlPlane for ControlPlaneService {
     ) -> Result<Response<RegisterNodeResponse>, Status> {
         self.gate("RegisterNode", &request)?;
         let req = request.into_inner();
-        if req.endpoint.is_empty() {
-            return Err(Status::invalid_argument("endpoint is required"));
-        }
+        // A malformed endpoint must fail LOUDLY here, not seed the pool with a garbage entry that
+        // least-loaded placement would then prefer (HA-D6 — an old-binary heartbeat is the classic
+        // source; the proto also `reserved` the repurposed field so it can't decode as an endpoint).
+        validate_endpoint(&req.endpoint)?;
         // A liveness heartbeat into the CP placement pool; the CP stamps its own clock so a
         // skewed node clock can't fake liveness. In-memory only — no persist. The pool is
         // index-agnostic (D52): a node registers once as an interchangeable shard host.
@@ -1473,10 +1558,11 @@ impl ControlPlane for ControlPlaneService {
                 .as_ref()
                 .map(|l| l.licensee.clone())
                 .unwrap_or_default(),
-            // The proto fields keep their historical `*_nodes` names, but the accounting is now
-            // **primary-held units** (D53): replicas don't count, so HA never eats the free tier.
+            // The proto fields keep their historical `*_nodes` names, but the accounting is
+            // **entitlement units** (D38/D53): distinct live (index, primary node) pairs — replicas
+            // don't count (HA is free) and an accumulating windowed index costs a constant amount.
             max_nodes: self.entitled_units() as u32,
-            current_nodes: self.registry.count_primary_units() as u32,
+            current_nodes: self.registry.count_entitlement_units(now_ms()) as u32,
         }))
     }
 
@@ -1497,50 +1583,33 @@ impl ControlPlane for ControlPlaneService {
                 ))
             }
         };
-        // Scale-limit entitlement (D38/D53): the cap is on **primary-held units**, enforced here at
-        // placement (node registration is uncapped). A *new* unit — one with no primary yet — beyond
-        // the entitlement is refused; re-resolving an existing unit, or re-placing its dead owner,
-        // always passes (it's already counted), so a live cluster is never disrupted. Replicas are
-        // free (a replica adds no new primary unit).
-        let entitled = self.entitled_units();
-        if !self.registry.unit_has_primary(&req.index, unit)
-            && self.registry.count_primary_units() >= entitled
-        {
-            return Err(Status::resource_exhausted(format!(
-                "scale limit reached: {} primary units serving, entitlement is {entitled} (free tier \
-                 is {}). Read replicas are free; an Enterprise license raises the unit limit — see \
-                 COMM-LICENSE.md.",
-                self.registry.count_primary_units(),
-                crate::license::FREE_UNIT_LIMIT,
-            )));
-        }
         // No node has heartbeated yet (a transient bring-up state) → retryable, so the connector
         // backs off and re-asks rather than failing the ingest batch.
         let to_status = |e: RegistryError| match e {
             RegistryError::NoLiveNode { .. } => Status::unavailable(e.to_string()),
             other => registry_status(other),
         };
-        // With replication (R > 1) a resolve also places R−1 read replicas (D53) and returns the
-        // primary; at R = 1 it's the primary-only D52 path, byte-identical to before.
-        let (endpoint, created) = if self.replication_factor > 1 {
-            let holders = self
-                .registry
-                .resolve_unit_holders(&req.index, unit, self.replication_factor, now_ms())
-                .map_err(to_status)?;
-            (holders.primary, holders.changed)
-        } else {
-            self.registry
-                .resolve_unit_owner(&req.index, unit, now_ms())
-                .map_err(to_status)?
-        };
-        // Placement changed → push each subscribed node its fresh assignment set (D53), so a newly
-        // placed replica opens + serves the unit read-through.
-        if created {
-            self.assignments.notify_all(&self.registry);
-        }
+        // One placement path for every R (D53): resolve places 1 primary + R−1 read replicas.
+        // The scale entitlement (D38/D53: distinct live (index, primary node) pairs) is enforced
+        // ATOMICALLY inside the registry's placement critical section — a new pair beyond the cap is
+        // RESOURCE_EXHAUSTED; re-resolves and dead-owner re-placement always pass, so a live cluster
+        // is never disrupted, and replicas are free. Placement pushes ride the registry's
+        // placement-change hook, so every subscribed holder gets its fresh snapshot.
+        let holders = self
+            .registry
+            .resolve_unit_holders(
+                &req.index,
+                unit,
+                self.replication_factor,
+                self.entitled_units(),
+                now_ms(),
+            )
+            .map_err(to_status)?;
         Ok(Response::new(ResolveUnitOwnerResponse {
-            endpoint,
-            created,
+            endpoint: holders.primary,
+            // Proto contract: true iff this call MADE or MOVED the primary assignment — replica
+            // churn (prune/top-up/trim) alone doesn't set it (HA-D7).
+            created: holders.moved,
         }))
     }
 
@@ -1553,14 +1622,20 @@ impl ControlPlane for ControlPlaneService {
     ) -> Result<Response<Self::SubscribeAssignmentsStream>, Status> {
         self.gate("SubscribeAssignments", &request)?;
         let endpoint = request.into_inner().endpoint;
-        if endpoint.is_empty() {
-            return Err(Status::invalid_argument("endpoint is required"));
+        validate_endpoint(&endpoint)?;
+        // Identity gate (HA-D4d): the endpoint claim is only accepted for a currently-registered
+        // pool node — an ops-scoped caller can't read an arbitrary endpoint's stream by naming it.
+        // Residual trust: within the mesh, a caller could still heartbeat any endpoint first; the
+        // internal RPCs are mesh-trusted (service token) — documented on the proto.
+        if !self.registry.node_alive(&endpoint, now_ms()) {
+            return Err(Status::failed_precondition(format!(
+                "`{endpoint}` is not a registered pool node — RegisterNode first, then subscribe"
+            )));
         }
-        // Seed the stream with the node's current assignment snapshot, then hand back a watch-backed
-        // stream that yields a fresh snapshot on every placement change (`notify_all`). The node
-        // reconciles its serving set against each snapshot idempotently.
-        let snapshot = node_assignments_wire(self.registry.node_assignments(&endpoint));
-        let rx = self.assignments.subscribe(&endpoint, snapshot);
+        // Subscribe, seeded with the node's current snapshot (register-then-compute-then-send inside
+        // the hub, so no placement change can slip between the seed and the first push). The stream
+        // then yields a fresh snapshot on every placement change; the node reconciles idempotently.
+        let rx = self.assignments.subscribe(&endpoint, &self.registry);
         use tokio_stream::StreamExt;
         let stream = tokio_stream::wrappers::WatchStream::new(rx).map(Ok);
         Ok(Response::new(Box::pin(stream)))
@@ -1768,6 +1843,38 @@ impl ControlPlaneService {
                 tick.tick().await;
                 let names = svc.registry.list().into_iter().map(|s| s.name).collect();
                 let _ = svc.collect_ingestion(names).await; // side effect: sets the gauges
+            }
+        });
+    }
+
+    /// Spawn the **dead-owner sweeper** (HA-D2): every TTL/2, re-place units whose primary is
+    /// confidently dead through the same path a write-driven resolve takes
+    /// ([`Registry::sweep_dead_primaries`] — idempotent, entitlement-aware, persist + push), so
+    /// quiescent units on a dead node become available again without waiting for a write. Only the
+    /// **leader** sweeps (standbys skip each tick); the liveness grace window after boot/promotion
+    /// is respected inside the sweep itself.
+    pub fn spawn_dead_owner_sweeper(&self) {
+        use growlerdb_controlplane::NODE_HEARTBEAT_TTL_MS;
+        let registry = self.registry.clone();
+        let replication_factor = self.replication_factor;
+        let entitled = self.entitled_units();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(
+                (NODE_HEARTBEAT_TTL_MS / 2).max(1000) as u64,
+            ));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                if !registry.is_leader() {
+                    continue;
+                }
+                match registry.sweep_dead_primaries(replication_factor, entitled, now_ms()) {
+                    Ok(0) => {}
+                    Ok(moved) => {
+                        tracing::info!(moved, "dead-owner sweep re-placed unit primaries")
+                    }
+                    Err(e) => tracing::warn!(error = %e, "dead-owner sweep failed; will retry"),
+                }
             }
         });
     }
@@ -2318,13 +2425,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn entitlement_counts_primary_units_not_node_processes() {
-        // D53/D38: the scale cap is on PRIMARY-HELD UNITS, enforced at placement — node registration
-        // is uncapped, so replica nodes join freely. Free tier = FREE_UNIT_LIMIT (3) units.
+    async fn entitlement_counts_live_index_node_pairs_not_units_or_processes() {
+        // D53/D38 (updated for HA-D3c): the scale cap is on distinct live (index, primary node)
+        // PAIRS, enforced atomically at placement — node registration is uncapped, a windowed index
+        // accumulating windows on already-paired nodes costs nothing new, and only a genuinely new
+        // index×node pair past the cap is refused. (This test replaced the old per-unit-count
+        // metric test: under that metric a free-tier daily-windowed index bricked in 3 days.)
         let tmp = tempfile::tempdir().unwrap();
-        let svc = service(tmp.path()); // R=1, no license → 3-unit free tier
+        let svc = service(tmp.path()); // R=1, no license → 3-pair free tier
         svc.registry.create(resolved_windowed("logs")).unwrap();
-        // Register MORE nodes than the old node cap — registration is now uncapped.
+        // Register MORE nodes than the cap — registration is uncapped.
         for i in 0..6 {
             svc.register_node(Request::new(RegisterNodeRequest {
                 endpoint: format!("http://n{i}:50051"),
@@ -2332,41 +2442,42 @@ mod tests {
             .await
             .unwrap();
         }
-        let resolve = |w: i64| {
+        let resolve = |index: &'static str, w: i64| {
             svc.resolve_unit_owner(Request::new(ResolveUnitOwnerRequest {
-                index: "logs".into(),
+                index: index.into(),
                 unit: Some(growlerdb_proto::v1::resolve_unit_owner_request::Unit::Window(w)),
             }))
         };
-        // Three window units = three primary units → all within the free tier.
+        // Three windows spread onto three distinct nodes = three pairs → within the free tier.
         for w in [10_i64, 20, 30] {
-            assert!(
-                resolve(w).await.is_ok(),
-                "unit {w} within the 3-unit free tier"
-            );
+            assert!(resolve("logs", w).await.is_ok(), "window {w} within cap");
         }
-        // A fourth NEW unit exceeds the 3-unit entitlement.
-        assert_eq!(
-            resolve(40).await.unwrap_err().code(),
-            Code::ResourceExhausted,
-            "a 4th primary unit is over the free-tier unit limit"
-        );
-        // Re-resolving an already-placed unit still passes (it's already counted).
+        // The 4th-day scenario (lifetime-brick fix): a 4th window does NOT exhaust the entitlement —
+        // at the cap it packs onto a node already primarying this index instead of a fresh node.
+        let w40 = resolve("logs", 40).await.expect("4th window still places");
         assert!(
-            resolve(10).await.is_ok(),
-            "idempotent re-resolve isn't a new unit"
+            ["http://n0:50051", "http://n1:50051", "http://n2:50051"]
+                .contains(&w40.into_inner().endpoint.as_str()),
+            "at the cap a new window packs onto an already-paired node"
         );
-        // GetLicense reports PRIMARY UNITS (3), not the 6 registered nodes.
+        // Re-resolving an already-placed unit passes too (never a new pair).
+        assert!(resolve("logs", 10).await.is_ok(), "idempotent re-resolve");
+        // A genuinely NEW pair past the cap — a fresh index has no paired node to fall back to —
+        // is refused RESOURCE_EXHAUSTED.
+        svc.registry.create(resolved_windowed("audit")).unwrap();
+        assert_eq!(
+            resolve("audit", 10).await.unwrap_err().code(),
+            Code::ResourceExhausted,
+            "a 4th index×node pair is over the free-tier limit"
+        );
+        // GetLicense reports PAIRS (3), not units (4 windows) and not the 6 registered nodes.
         let lic = svc
             .get_license(Request::new(GetLicenseRequest {}))
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(
-            lic.current_nodes, 3,
-            "3 primary units serving (not 6 nodes)"
-        );
-        assert_eq!(lic.max_nodes, 3, "free-tier unit entitlement");
+        assert_eq!(lic.current_nodes, 3, "3 live index×node pairs serving");
+        assert_eq!(lic.max_nodes, 3, "free-tier entitlement");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2399,9 +2510,14 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
+        // Deterministic placement over n0..n3: w10 → primary n0 (+replica n1), w20 → primary n2
+        // (+replica n3), w30 → primary n0 again (all loads tied → smallest endpoint). That's 6
+        // holder slots but only TWO distinct (logs, primary-node) pairs — replicas never count,
+        // and re-using a primary node is free (updated with the HA-D3c pair metric; this test
+        // formerly asserted 3 under the per-unit count).
         assert_eq!(
-            lic.current_nodes, 3,
-            "3 primary units — the 3 read replicas don't consume the entitlement"
+            lic.current_nodes, 2,
+            "2 live index×node pairs — the 3 read replicas don't consume the entitlement"
         );
     }
 
@@ -2463,6 +2579,272 @@ mod tests {
             r.endpoint == "http://node-b:50051",
             "node-b's role matches whether it's the resolved primary"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn placement_pushes_on_every_mutation_path() {
+        // HA-D1: pushes are wired at the registry's persist boundary, so EVERY placement mutation —
+        // an announce (RegisterServedIndex), remove_node, promote_replica, drop_index — pushes the
+        // affected node a fresh snapshot, not just ResolveUnitOwner.
+        use tokio_stream::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path());
+        let b = "http://node-b:50051";
+        svc.register_node(Request::new(RegisterNodeRequest { endpoint: b.into() }))
+            .await
+            .unwrap();
+        let mut stream = svc
+            .subscribe_assignments(Request::new(SubscribeAssignmentsRequest {
+                endpoint: b.into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(stream.next().await.unwrap().unwrap().units.is_empty());
+
+        // 1. RegisterServedIndex (announce) → push with the shard this node now primaries.
+        svc.register_served_index(Request::new(RegisterServedIndexRequest {
+            definition_json: serde_json::to_string(&resolved("docs")).unwrap(),
+            endpoint: b.into(),
+            shard_count: 1,
+            shard_ordinals: vec![],
+            windows: vec![],
+        }))
+        .await
+        .unwrap();
+        let snap = stream.next().await.unwrap().unwrap();
+        assert_eq!(snap.units.len(), 1, "announce pushed the new assignment");
+        assert!(snap.units[0].primary);
+
+        // 2. remove_node (a fencing/failover mutation that never pushed before) → push without it.
+        svc.registry
+            .remove_node("docs", 0, &growlerdb_controlplane::NodeId::from(b))
+            .unwrap();
+        assert!(
+            stream.next().await.unwrap().unwrap().units.is_empty(),
+            "remove_node pushed the loss — the node stops serving what it no longer holds"
+        );
+
+        // 3. add_replica + promote_replica → each pushes; after promotion node-b is primary again.
+        svc.registry.add_replica("docs", 0, b).unwrap();
+        let snap = stream.next().await.unwrap().unwrap();
+        assert!(!snap.units[0].primary, "replica assignment pushed");
+        svc.registry.promote_replica("docs", 0).unwrap();
+        let snap = stream.next().await.unwrap().unwrap();
+        assert!(snap.units[0].primary, "promotion pushed");
+
+        // 4. drop_index → push with the unit gone.
+        svc.registry.drop_index("docs").unwrap();
+        assert!(
+            stream.next().await.unwrap().unwrap().units.is_empty(),
+            "drop_index pushed the removal"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resubscribe_seeds_fresh_and_dropped_streams_are_evicted() {
+        // HA-D4: (a/c) the seed is computed under the hub lock AFTER the receiver registers, so a
+        // re-subscribe can only re-send the CURRENT truth to an endpoint's other live receivers —
+        // never reset them to a stale seed; (b) senders whose receivers all dropped are evicted.
+        use tokio_stream::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path()).with_replication_factor(2);
+        svc.registry.create(resolved_windowed("logs")).unwrap();
+        let b = "http://node-b:50051";
+        for ep in ["http://node-a:50051", b] {
+            svc.register_node(Request::new(RegisterNodeRequest {
+                endpoint: ep.into(),
+            }))
+            .await
+            .unwrap();
+        }
+        let subscribe = || async {
+            svc.subscribe_assignments(Request::new(SubscribeAssignmentsRequest {
+                endpoint: b.into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+        };
+        let mut s1 = subscribe().await;
+        assert!(s1.next().await.unwrap().unwrap().units.is_empty());
+        // Place a unit (R=2 ⇒ node-b holds it) → s1 sees it.
+        svc.resolve_unit_owner(Request::new(ResolveUnitOwnerRequest {
+            index: "logs".into(),
+            unit: Some(growlerdb_proto::v1::resolve_unit_owner_request::Unit::Window(10)),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(s1.next().await.unwrap().unwrap().units.len(), 1);
+        // Re-subscribe: the new stream's seed carries the CURRENT assignment, and the re-seed that
+        // reaches s1 is that same fresh snapshot — not an empty stale one.
+        let mut s2 = subscribe().await;
+        assert_eq!(
+            s2.next().await.unwrap().unwrap().units.len(),
+            1,
+            "the re-subscribe seed is current"
+        );
+        assert_eq!(
+            s1.next().await.unwrap().unwrap().units.len(),
+            1,
+            "the surviving stream was not reset to a stale seed"
+        );
+        // Drop both streams; the next placement change evicts the endpoint's sender entirely.
+        drop(s1);
+        drop(s2);
+        svc.resolve_unit_owner(Request::new(ResolveUnitOwnerRequest {
+            index: "logs".into(),
+            unit: Some(growlerdb_proto::v1::resolve_unit_owner_request::Unit::Window(20)),
+        }))
+        .await
+        .unwrap();
+        assert!(
+            svc.assignments.senders.lock().unwrap().is_empty(),
+            "senders with no live receiver are evicted on the next push"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribe_rejects_an_unregistered_endpoint() {
+        // HA-D4d: the endpoint claim is only honored for a currently-registered pool node.
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path());
+        let ep = "http://ghost:50051";
+        match svc
+            .subscribe_assignments(Request::new(SubscribeAssignmentsRequest {
+                endpoint: ep.into(),
+            }))
+            .await
+        {
+            Err(err) => assert_eq!(err.code(), Code::FailedPrecondition),
+            Ok(_) => panic!("an unregistered endpoint must not subscribe"),
+        }
+        // After RegisterNode the same subscribe succeeds.
+        svc.register_node(Request::new(RegisterNodeRequest {
+            endpoint: ep.into(),
+        }))
+        .await
+        .unwrap();
+        assert!(svc
+            .subscribe_assignments(Request::new(SubscribeAssignmentsRequest {
+                endpoint: ep.into(),
+            }))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn register_node_rejects_malformed_endpoints() {
+        // HA-D6: a garbage endpoint (e.g. a field decoded from an incompatible old binary) must
+        // fail loudly, never seed the pool with an entry least-loaded placement would prefer.
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path());
+        for bad in [
+            "",
+            "logs",
+            "http://",
+            "host:notaport",
+            "http://host",
+            "ho st:1",
+            "ftp://h:1",
+        ] {
+            let err = svc
+                .register_node(Request::new(RegisterNodeRequest {
+                    endpoint: bad.into(),
+                }))
+                .await
+                .expect_err(&format!("`{bad}` must be rejected"));
+            assert_eq!(err.code(), Code::InvalidArgument, "`{bad}`");
+        }
+        for good in ["http://n1:50051", "https://n1:443", "n1:1", "[::1]:50051"] {
+            assert!(
+                svc.register_node(Request::new(RegisterNodeRequest {
+                    endpoint: good.into(),
+                }))
+                .await
+                .is_ok(),
+                "`{good}` must be accepted"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn register_served_index_conflicts_on_a_live_foreign_primary() {
+        // HA-D7: announces are first-wins. A shard primaried by a LIVE node refuses a foreign
+        // announce (PLACEMENT_CONFLICT / FAILED_PRECONDITION); once the holder is confidently dead
+        // the takeover re-points; idempotent re-announce always passes.
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path());
+        let (a, b) = ("http://node-a:50051", "http://node-b:50051");
+        let announce = |ep: &str| {
+            let def = serde_json::to_string(&resolved("docs")).unwrap();
+            let ep = ep.to_string();
+            svc.register_served_index(Request::new(RegisterServedIndexRequest {
+                definition_json: def,
+                endpoint: ep,
+                shard_count: 1,
+                shard_ordinals: vec![],
+                windows: vec![],
+            }))
+        };
+        // node-a heartbeats (tracked, live) and announces; disarm the startup grace so liveness
+        // verdicts are immediate.
+        svc.registry.register_node(a, now_ms());
+        svc.registry.set_placement_grace_anchor(
+            now_ms() - growlerdb_controlplane::NODE_HEARTBEAT_TTL_MS - 1,
+        );
+        announce(a).await.unwrap();
+        // A live foreign announce is refused — no last-write-wins re-point.
+        let err = announce(b).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(
+            svc.registry.shard_map("docs").unwrap()[&0].primary,
+            Some(growlerdb_controlplane::NodeId::from(a))
+        );
+        // Idempotent re-announce by the holder passes (the D53-blessed upsert).
+        announce(a).await.unwrap();
+        // node-a's heartbeat lapses past the TTL → node-b's announce is a takeover.
+        svc.registry.register_node(
+            a,
+            now_ms() - growlerdb_controlplane::NODE_HEARTBEAT_TTL_MS - 1,
+        );
+        announce(b).await.unwrap();
+        assert_eq!(
+            svc.registry.shard_map("docs").unwrap()[&0].primary,
+            Some(growlerdb_controlplane::NodeId::from(b))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn register_served_index_enforces_the_entitlement() {
+        // HA-D3a: RegisterServedIndex is no longer an entitlement bypass — the 4th index×node pair
+        // on the free tier is RESOURCE_EXHAUSTED, fail-closed even though nobody heartbeats.
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path()); // no license → FREE_UNIT_LIMIT (3) pairs
+        for (i, name) in ["docs", "logs", "events"].iter().enumerate() {
+            svc.register_served_index(Request::new(RegisterServedIndexRequest {
+                definition_json: serde_json::to_string(&resolved(name)).unwrap(),
+                endpoint: format!("http://n{i}:50051"),
+                shard_count: 1,
+                shard_ordinals: vec![],
+                windows: vec![],
+            }))
+            .await
+            .unwrap();
+        }
+        let err = svc
+            .register_served_index(Request::new(RegisterServedIndexRequest {
+                definition_json: serde_json::to_string(&resolved("audit")).unwrap(),
+                endpoint: "http://n3:50051".into(),
+                shard_count: 1,
+                shard_ordinals: vec![],
+                windows: vec![],
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::ResourceExhausted);
+        // The refused announce placed nothing.
+        assert!(svc.registry.shard_map("audit").unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

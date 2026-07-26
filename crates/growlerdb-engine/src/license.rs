@@ -6,9 +6,14 @@
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 
-/// The free tier: a deployment serving at most this many **primary-held units** (the D53/D52 scale
-/// metric — served data partitions, not raw node processes, so read replicas are free) needs no
-/// license. See [D38](/system/decisions/d38-scale-limit-entitlement.md).
+/// The free tier: a deployment using at most this many **entitlement units** needs no license. An
+/// entitlement unit is one distinct live **`(index, primary node)` pair** — the D38/D53 metric of
+/// *concurrent* scale, never lifetime usage: a windowed index accumulating windows on one node costs
+/// one unit forever (the per-window count bricked a free-tier daily index in 3 days), read replicas
+/// are free (never a pair's primary), and only tracked-and-heartbeat-stale nodes' pairs stop
+/// counting (unknown liveness counts — fail-closed). Enforced atomically inside registry placement
+/// (`resolve_unit_holders` / the `RegisterServedIndex` announce paths).
+/// See [D38](/system/decisions/d38-scale-limit-entitlement.md).
 pub const FREE_UNIT_LIMIT: usize = 3;
 
 /// GrowlerDB LLC's license-signing **public** key (Ed25519) — the production key. Licenses are minted
@@ -24,8 +29,9 @@ MCowBQYDK2VwAyEAyizufq7Ro4/FzX0FhQqH2945GnMat7aYVr2Vf0kzGks=\n\
 struct Claims {
     /// Who the license is issued to (shown in the console).
     licensee: String,
-    /// Maximum **primary-held units** this license entitles (the D53 scale metric — replicas are
-    /// free). The signed claim keeps the historical `max_nodes` name; its meaning is units.
+    /// Maximum **entitlement units** this license entitles (the D38/D53 metric: distinct live
+    /// `(index, primary node)` pairs — replicas free, window accumulation free). The signed claim
+    /// keeps the historical `max_nodes` name; its meaning is entitlement units.
     max_nodes: u32,
     /// Optional expiry (unix seconds). Parsed but NOT enforced yet — see task-266.
     #[serde(default)]

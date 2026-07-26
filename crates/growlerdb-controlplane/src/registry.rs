@@ -83,8 +83,26 @@ pub struct UnitHolders {
     pub primary: String,
     /// Read-replica node endpoints (never includes the primary).
     pub replicas: Vec<String>,
-    /// True iff this call changed the placement (placed, promoted, pruned, or topped up a holder).
+    /// True iff this call changed the placement (placed, promoted, pruned, trimmed, or topped up a
+    /// holder) — i.e. whether anything persisted.
     pub changed: bool,
+    /// True iff this call **made or moved the primary assignment** (fresh placement, promotion, or
+    /// dead-owner re-placement) — the proto `created` flag. Replica-only churn (prune / top-up /
+    /// trim) sets [`changed`](Self::changed) but not this.
+    pub moved: bool,
+}
+
+/// One window of a node's `RegisterServedIndex` announce, as consumed by
+/// [`Registry::announce_windows`]: the window id, its reported event-time zone-map (if any), and
+/// whether the node currently serves it cold (read-through).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowAnnounce {
+    /// Window id (epoch-ms of the window start).
+    pub window: i64,
+    /// Reported event-time `[min, max]`, or `None` when the window has no bounds yet.
+    pub bounds: Option<(i64, i64)>,
+    /// True when the node serves this window read-through from object storage (parked).
+    pub cold: bool,
 }
 
 /// Which nodes serve one shard: the **primary** (accepts writes + reads) and zero or more
@@ -162,10 +180,17 @@ pub struct IndexSummary {
     pub status: IndexStatus,
 }
 
-/// How long a windowed node's heartbeat is trusted before it drops out of the CP placement pool.
-/// Sized at ~3× a node's re-register interval (~10 s) so one missed heartbeat doesn't eject a
-/// healthy node, while a genuinely dead node's windows get re-placed within ~30 s.
-pub const NODE_HEARTBEAT_TTL_MS: i64 = 30_000;
+/// How often a node re-heartbeats into the CP placement pool ([`NODE_HEARTBEAT_TTL_MS`] must be a
+/// comfortable multiple of this). The CLI's registration loop derives its re-announce interval from
+/// this constant so the two can never silently diverge again (HA-D5: they were once both 30 s and
+/// healthy nodes flapped dead).
+pub const NODE_REANNOUNCE_INTERVAL_MS: i64 = 10_000;
+
+/// How long a node's heartbeat is trusted before it drops out of the CP placement pool.
+/// Sized at 3× the re-announce interval ([`NODE_REANNOUNCE_INTERVAL_MS`], 10 s) so a missed or
+/// jittered (±20%) heartbeat doesn't eject a healthy node, while a genuinely dead node's units get
+/// re-placed within ~30 s (the sweeper runs at TTL/2).
+pub const NODE_HEARTBEAT_TTL_MS: i64 = 3 * NODE_REANNOUNCE_INTERVAL_MS;
 
 /// A persisted API token: long-lived programmatic credential. Only the secret's hash is stored —
 /// the raw secret is shown once at creation and never persisted.
@@ -233,9 +258,12 @@ pub enum RegistryError {
     /// filesystem path component).
     #[error("invalid definition: {0}")]
     InvalidDefinition(String),
-    /// A [`set_bucket_map`](Registry::set_bucket_map) whose expected prior map no longer matches:
-    /// another placement op (reshard / bucket move) committed in between. Re-plan and retry.
-    #[error("placement of `{0}` changed while this operation ran — re-plan and retry")]
+    /// A placement compare-and-set lost: a [`set_bucket_map`](Registry::set_bucket_map) whose
+    /// expected prior map no longer matches (another reshard/bucket-move committed in between), or
+    /// a [`RegisterServedIndex` announce](Registry::announce_primaries) claiming a unit whose
+    /// primary is a different, not-confidently-dead node (first-wins — no last-write-wins
+    /// re-point). Carries a human-readable detail; maps to gRPC `FAILED_PRECONDITION`.
+    #[error("placement conflict: {0}")]
     PlacementConflict(String),
     /// An operation named an index that is not registered.
     #[error("index `{0}` not found")]
@@ -258,6 +286,13 @@ pub enum RegistryError {
     /// registers.
     #[error("no live node to place {unit} of `{index}` (none heartbeated within the TTL)")]
     NoLiveNode { index: String, unit: String },
+    /// Placing a **new** unit would grow the deployment's entitlement usage past its cap (D38: the
+    /// metric is distinct live `(index, primary node)` pairs — see
+    /// [`count_entitlement_units`](Registry::count_entitlement_units)). Existing units are never
+    /// disrupted: re-resolves and dead-owner re-placement always pass. Maps to gRPC
+    /// `RESOURCE_EXHAUSTED`.
+    #[error("scale limit reached: {units} entitlement units in use, entitlement is {entitled}")]
+    EntitlementExceeded { units: usize, entitled: usize },
     /// Another process holds the registry's exclusive lock — single-writer is enforced, so a
     /// second control plane fails fast rather than last-writer-wins clobbering.
     #[error("registry `{0}` is locked by another process")]
@@ -421,6 +456,22 @@ pub struct Registry {
     /// re-registers within a heartbeat interval, so persisting it would only add write amplification.
     /// Unit *assignments* (which node owns a shard/window) stay durable in [`IndexEntry`].
     node_pool: RwLock<BTreeMap<String, i64>>,
+    /// **Placement-change hook** (HA-D1): invoked after any successful persist/reload whose
+    /// placement fingerprint differs from the last one — the single choke point that pushes fresh
+    /// assignment snapshots to subscribed nodes. Lives at the persist boundary (not per mutation) so
+    /// a new placement mutation *cannot* forget to notify: every mutation funnels through
+    /// [`persist_snapshot`](Self::persist_snapshot). Invoked with **no** data lock held.
+    placement_listener: RwLock<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Fingerprint of the placement state (`(index, unit, primary, replicas)` tuples) at the last
+    /// listener check, so non-placement persists (tokens, aliases, …) don't fire spurious pushes.
+    last_placement_hash: std::sync::Mutex<u64>,
+    /// The **liveness grace anchor** (HA-D5): epoch-ms of the first heartbeat observed after
+    /// boot/promotion, `-1` = none yet. For one [`NODE_HEARTBEAT_TTL_MS`] after it, owner liveness
+    /// is *unknown* (laggard nodes haven't re-registered with this — possibly freshly
+    /// promoted/restarted — control plane yet), so dead-owner actions (re-placement, the sweeper,
+    /// primary re-points) are suppressed and entitlement counting fails closed. Re-armed to `-1` on
+    /// leadership promotion.
+    grace_anchor_ms: std::sync::atomic::AtomicI64,
 }
 
 impl Registry {
@@ -454,7 +505,7 @@ impl Registry {
             .iter()
             .map(|(id, t)| (t.hash.clone(), id.clone()))
             .collect();
-        Ok(Self {
+        let reg = Self {
             backend,
             indexes: RwLock::new(indexes),
             aliases: RwLock::new(aliases),
@@ -473,7 +524,14 @@ impl Registry {
             flush_lock: std::sync::Mutex::new(()),
             rollback_failed: std::sync::atomic::AtomicBool::new(false),
             node_pool: RwLock::new(BTreeMap::new()),
-        })
+            placement_listener: RwLock::new(None),
+            last_placement_hash: std::sync::Mutex::new(0),
+            grace_anchor_ms: std::sync::atomic::AtomicI64::new(-1),
+        };
+        // Seed the placement fingerprint from the loaded state so the first mutation only notifies
+        // if it actually changed placement (there's no listener yet at construction anyway).
+        *reg.last_placement_hash.lock().unwrap() = placement_hash(&reg.read_map());
+        Ok(reg)
     }
 
     /// Read the catalog under the lock, recovering from poisoning: a panic elsewhere while holding
@@ -572,6 +630,7 @@ impl Registry {
             self.restore_core()?;
             self.rollback_failed
                 .store(false, std::sync::atomic::Ordering::SeqCst);
+            self.notify_if_placement_changed();
             return Err(RegistryError::Backend(
                 "registry memory was rolled back after an earlier persist failure; retry".into(),
             ));
@@ -588,14 +647,59 @@ impl Registry {
             index_bindings: self.read_index_bindings().clone(),
         };
         match self.backend.persist_registry(snapshot) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // The single placement-notification choke point (HA-D1): every placement mutation
+                // funnels through this persist, so none can forget to push. Non-placement persists
+                // are filtered by the fingerprint. Fired off every data lock (only `flush_lock` is
+                // held, which the listener never takes).
+                self.notify_if_placement_changed();
+                Ok(())
+            }
             Err(e) => {
                 if self.restore_core().is_err() {
                     self.rollback_failed
                         .store(true, std::sync::atomic::Ordering::SeqCst);
+                } else {
+                    // The rollback may have undone a placement change some node already heard about
+                    // through an earlier push; re-notify so subscribers converge on the truth.
+                    self.notify_if_placement_changed();
                 }
                 Err(e)
             }
+        }
+    }
+
+    /// Install the **placement-change listener** (HA-D1): called (with no data lock held) whenever a
+    /// successful persist or [`reload`](Self::reload) changed which nodes hold which units. The
+    /// control-plane service points this at its assignment hub so every placement mutation — resolve,
+    /// announce re-point, drop-index, promote, remove-node, sweeper move — pushes fresh snapshots.
+    pub fn set_placement_listener(&self, listener: impl Fn() + Send + Sync + 'static) {
+        *self
+            .placement_listener
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(listener));
+    }
+
+    /// Compare the current placement fingerprint against the last notified one; on change, store it
+    /// and invoke the listener. Must be called with no data lock held (takes a brief `indexes` read).
+    fn notify_if_placement_changed(&self) {
+        let hash = placement_hash(&self.read_map());
+        {
+            let mut last = self
+                .last_placement_hash
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if *last == hash {
+                return;
+            }
+            *last = hash;
+        }
+        let listener = self
+            .placement_listener
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(f) = listener.as_ref() {
+            f();
         }
     }
 
@@ -640,6 +744,9 @@ impl Registry {
         // undo is gone, so persists are safe again.
         self.rollback_failed
             .store(false, std::sync::atomic::Ordering::SeqCst);
+        // A reload can change placement too (the leader wrote, or this standby just promoted over a
+        // dead leader's writes) — push subscribers the fresh truth.
+        self.notify_if_placement_changed();
         Ok(())
     }
 
@@ -667,6 +774,11 @@ impl Registry {
         match self.reload() {
             Ok(()) => {
                 self.backend.confirm_leadership();
+                // Re-arm the liveness grace (HA-D5): this replica's heartbeat view starts empty, so
+                // dead-owner actions stay suppressed for one TTL after the first node re-registers —
+                // early resolves can't mass-re-place laggards' units onto the first re-registrant.
+                self.grace_anchor_ms
+                    .store(-1, std::sync::atomic::Ordering::SeqCst);
                 Ok(true)
             }
             Err(e) => {
@@ -723,11 +835,16 @@ impl Registry {
     }
 
     /// Mark an index [`Active`](IndexStatus::Active) (provisioning complete). Errors if absent.
+    /// Already-active is a no-op without a persist — nodes re-announce (and re-activate) every
+    /// heartbeat, and an idempotent re-announce must not rewrite the registry.
     pub fn activate(&self, name: &str) -> Result<()> {
         let mut map = self.write_map();
         let entry = map
             .get_mut(name)
             .ok_or_else(|| RegistryError::NotFound(name.to_string()))?;
+        if entry.status == IndexStatus::Active {
+            return Ok(());
+        }
         entry.status = IndexStatus::Active;
         drop(map);
         self.persist_snapshot()
@@ -1304,6 +1421,199 @@ impl Registry {
         self.persist_snapshot()
     }
 
+    /// A node's **announce** of the ordinal shards it serves (`RegisterServedIndex`) — the guarded,
+    /// entitlement-checked form of [`assign_primaries`](Self::assign_primaries) (HA-D3/HA-D7).
+    /// Under one write-lock acquisition:
+    ///
+    /// - **Idempotent:** announcing shards this endpoint already primaries is a no-op re-point.
+    /// - **First-wins, not last-write-wins:** a shard whose current primary is a **different**
+    ///   endpoint that is *not confidently dead* refuses the whole announce with
+    ///   [`PlacementConflict`](RegistryError::PlacementConflict) (gRPC `FAILED_PRECONDITION`) —
+    ///   unless the announcer is a listed **replica** of that shard, in which case its announce is a
+    ///   serving report and the primary is left untouched. A confidently-dead primary is taken over
+    ///   (the node-restart-at-a-new-endpoint flow).
+    /// - **Entitlement (fail-closed):** taking primaries of shards that never had one is gated on
+    ///   `entitled_units` exactly like `resolve` — a new `(index, endpoint)` pair past the cap is
+    ///   [`EntitlementExceeded`](RegistryError::EntitlementExceeded) (`RESOURCE_EXHAUSTED`).
+    pub fn announce_primaries(
+        &self,
+        index: &str,
+        shards: &[u32],
+        endpoint: &str,
+        now_ms: i64,
+        entitled_units: usize,
+    ) -> Result<()> {
+        if shards.is_empty() {
+            return Ok(());
+        }
+        let node = NodeId::from(endpoint);
+        let mut map = self.write_map();
+        let entry = map
+            .get(index)
+            .ok_or_else(|| RegistryError::NotFound(index.to_string()))?;
+        // Classify each announced ordinal (no mutation yet).
+        let mut replica_report: BTreeSet<u32> = BTreeSet::new();
+        let mut any_fresh = false;
+        for &shard in shards {
+            match entry.shards.get(&shard).and_then(|sa| sa.primary.as_ref()) {
+                None => any_fresh = true,
+                Some(cur) if *cur == node => {}
+                Some(cur) => {
+                    if self.owner_confidently_dead(&cur.0, now_ms) {
+                        // Takeover of a dead primary — allowed even (especially) for a warm replica
+                        // announcing itself.
+                    } else if entry
+                        .shards
+                        .get(&shard)
+                        .is_some_and(|sa| sa.replicas.contains(&node))
+                    {
+                        replica_report.insert(shard); // holder reporting, not a primary claim
+                    } else {
+                        return Err(RegistryError::PlacementConflict(format!(
+                            "shard {shard} of `{index}` is held by `{}`",
+                            cur.0
+                        )));
+                    }
+                }
+            }
+        }
+        // Fresh primaries past the cap fail closed — checked in the same critical section.
+        if any_fresh {
+            let pairs = self.entitlement_pairs(&map, now_ms);
+            if !pairs.contains(&(index.to_string(), endpoint.to_string()))
+                && pairs.len() >= entitled_units
+            {
+                return Err(RegistryError::EntitlementExceeded {
+                    units: pairs.len(),
+                    entitled: entitled_units,
+                });
+            }
+        }
+        let entry = map.get_mut(index).expect("presence checked above");
+        let mut changed = false;
+        for &shard in shards {
+            if replica_report.contains(&shard) {
+                continue;
+            }
+            let sa = entry.shards.entry(shard).or_default();
+            if sa.primary.as_ref() != Some(&node) {
+                sa.primary = Some(node.clone());
+                changed = true;
+            }
+            let before = sa.replicas.len();
+            sa.replicas.retain(|n| n != &node); // never primary + replica at once
+            changed |= sa.replicas.len() != before;
+        }
+        drop(map);
+        if changed {
+            self.persist_snapshot()?; // an idempotent re-announce (10 s cadence) skips the rewrite
+        }
+        Ok(())
+    }
+
+    /// A windowed node's **announce** of the windows it serves (+ zone-maps and hot/cold tier) —
+    /// the guarded, entitlement-checked, **batched** counterpart of
+    /// [`assign_window`](Self::assign_window)/[`set_window_bounds`](Self::set_window_bounds)/
+    /// [`set_window_cold`](Self::set_window_cold): one lock, one persist for the whole announce.
+    /// The same first-wins semantics as [`announce_primaries`](Self::announce_primaries): a window
+    /// primaried by a live foreign node refuses the announce (`PlacementConflict`) unless the
+    /// announcer is a listed replica (serving report — bounds/tier from a replica are ignored; the
+    /// primary's report is authoritative). All fresh windows of one announce cost at most **one**
+    /// new entitlement pair (`(index, endpoint)`), so an accumulating windowed index never grows
+    /// its entitlement footprint.
+    pub fn announce_windows(
+        &self,
+        index: &str,
+        endpoint: &str,
+        windows: &[WindowAnnounce],
+        now_ms: i64,
+        entitled_units: usize,
+    ) -> Result<()> {
+        if windows.is_empty() {
+            return Ok(());
+        }
+        let node = NodeId::from(endpoint);
+        let mut map = self.write_map();
+        let entry = map
+            .get(index)
+            .ok_or_else(|| RegistryError::NotFound(index.to_string()))?;
+        let mut replica_report: BTreeSet<i64> = BTreeSet::new();
+        let mut any_fresh = false;
+        for w in windows {
+            match entry
+                .windows
+                .get(&w.window)
+                .and_then(|wa| wa.assignment.primary.as_ref())
+            {
+                None => any_fresh = true,
+                Some(cur) if *cur == node => {}
+                Some(cur) => {
+                    if self.owner_confidently_dead(&cur.0, now_ms) {
+                        // Takeover of a dead primary — allowed even for a warm replica.
+                    } else if entry
+                        .windows
+                        .get(&w.window)
+                        .is_some_and(|wa| wa.assignment.replicas.contains(&node))
+                    {
+                        replica_report.insert(w.window);
+                    } else {
+                        return Err(RegistryError::PlacementConflict(format!(
+                            "window {} of `{index}` is held by `{}`",
+                            w.window, cur.0
+                        )));
+                    }
+                }
+            }
+        }
+        if any_fresh {
+            let pairs = self.entitlement_pairs(&map, now_ms);
+            if !pairs.contains(&(index.to_string(), endpoint.to_string()))
+                && pairs.len() >= entitled_units
+            {
+                return Err(RegistryError::EntitlementExceeded {
+                    units: pairs.len(),
+                    entitled: entitled_units,
+                });
+            }
+        }
+        let entry = map.get_mut(index).expect("presence checked above");
+        let mut changed = false;
+        for w in windows {
+            if replica_report.contains(&w.window) {
+                continue; // a replica's report never re-points or overwrites the primary's metadata
+            }
+            let is_new = !entry.windows.contains_key(&w.window);
+            let wa = entry.windows.entry(w.window).or_default();
+            changed |= is_new;
+            if wa.assignment.primary.as_ref() != Some(&node) {
+                wa.assignment.primary = Some(node.clone());
+                changed = true;
+            }
+            let before = wa.assignment.replicas.len();
+            wa.assignment.replicas.retain(|n| n != &node);
+            changed |= wa.assignment.replicas.len() != before;
+            if let Some((min, max)) = w.bounds {
+                let widened = (
+                    Some(wa.event_min.map_or(min, |m| m.min(min))),
+                    Some(wa.event_max.map_or(max, |m| m.max(max))),
+                );
+                if (wa.event_min, wa.event_max) != widened {
+                    (wa.event_min, wa.event_max) = widened;
+                    changed = true;
+                }
+            }
+            if wa.cold != w.cold {
+                wa.cold = w.cold;
+                changed = true;
+            }
+        }
+        drop(map);
+        if changed {
+            self.persist_snapshot()?; // an idempotent re-announce (10 s cadence) skips the rewrite
+        }
+        Ok(())
+    }
+
     /// Add a read **replica** for `shard` of `index` (idempotent; never duplicates, and never
     /// adds the current primary as a replica). Errors if the index is unregistered.
     pub fn add_replica(&self, index: &str, shard: u32, node: impl Into<NodeId>) -> Result<()> {
@@ -1398,7 +1708,9 @@ impl Registry {
             .ok_or_else(|| RegistryError::NotFound(index.to_string()))?;
         let expected_owners = expected.map(|m| m.owners()).unwrap_or(&[]);
         if entry.bucket_owners != expected_owners {
-            return Err(RegistryError::PlacementConflict(index.to_string()));
+            return Err(RegistryError::PlacementConflict(format!(
+                "the bucket map of `{index}` changed while this operation ran — re-plan and retry"
+            )));
         }
         entry.bucket_owners = map.owners().to_vec();
         drop(indexes);
@@ -1532,6 +1844,77 @@ impl Registry {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(endpoint.to_string(), now_ms);
+        // First heartbeat since boot/promotion arms the liveness grace anchor (HA-D5): for one TTL
+        // from here, owners that haven't re-registered yet are treated live-unknown.
+        let _ = self.grace_anchor_ms.compare_exchange(
+            -1,
+            now_ms,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    /// Whether the **liveness grace window** is active at `now_ms` (HA-D5): the first
+    /// [`NODE_HEARTBEAT_TTL_MS`] after the first heartbeat this (possibly freshly started or
+    /// promoted) control plane observed. While active, an assigned owner that hasn't re-registered
+    /// yet is **live-unknown** — dead-owner re-placement, announce re-points over it, and the
+    /// [sweeper](Self::sweep_dead_primaries) are all suppressed, so laggards' units aren't
+    /// mass-re-placed onto the first re-registrant. With no heartbeat ever observed the window is
+    /// **not** active: there is no liveness tracking at all (the ordinal, non-pool deployment
+    /// shape), and empty-pool resolves already fail retryably.
+    pub fn placement_grace_active(&self, now_ms: i64) -> bool {
+        let anchor = self
+            .grace_anchor_ms
+            .load(std::sync::atomic::Ordering::SeqCst);
+        anchor >= 0 && now_ms - anchor <= NODE_HEARTBEAT_TTL_MS
+    }
+
+    /// Override the grace anchor — for tests and operational tooling that need dead-owner actions
+    /// enabled/suppressed deterministically (`-1` disarms; any epoch-ms re-anchors the window).
+    pub fn set_placement_grace_anchor(&self, anchor_ms: i64) {
+        self.grace_anchor_ms
+            .store(anchor_ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether `endpoint` has a live pool heartbeat (within [`NODE_HEARTBEAT_TTL_MS`] of `now_ms`).
+    /// Gate for `SubscribeAssignments` identity: only a currently-registered node may subscribe to
+    /// an endpoint's assignment stream.
+    pub fn node_alive(&self, endpoint: &str, now_ms: i64) -> bool {
+        self.node_pool
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(endpoint)
+            .is_some_and(|&t| now_ms - t <= NODE_HEARTBEAT_TTL_MS)
+    }
+
+    /// Whether an assigned owner `endpoint` is **confidently dead** at `now_ms`: liveness tracking
+    /// is warmed up (a first heartbeat happened over a TTL ago, so any live node has re-registered)
+    /// and this endpoint hasn't heartbeated within the TTL. `false` while liveness is unknown —
+    /// during the grace window, or on deployments that never heartbeat (ordinal announce-only),
+    /// where an untracked owner is treated as **replaceable** (`true`) since re-announce is the only
+    /// takeover mechanism there. Concretely: untracked owner ⇒ dead unless the grace window is
+    /// active; tracked owner ⇒ dead iff its heartbeat is past the TTL.
+    fn owner_confidently_dead(&self, endpoint: &str, now_ms: i64) -> bool {
+        let pool = self.node_pool.read().unwrap_or_else(|e| e.into_inner());
+        match pool.get(endpoint) {
+            Some(&t) => now_ms - t > NODE_HEARTBEAT_TTL_MS && !self.placement_grace_active(now_ms),
+            None => !self.placement_grace_active(now_ms),
+        }
+    }
+
+    /// Whether an assigned owner `endpoint` is **tracked in the pool and stale past the TTL** —
+    /// the only state in which its entitlement pairs stop counting. Stricter than
+    /// [`owner_confidently_dead`](Self::owner_confidently_dead): an owner the pool has *never*
+    /// tracked (announce-only deployments, or a pre-restart corpse) keeps **counting** — the
+    /// entitlement fails closed on unknown liveness — even though dead-owner *actions* may treat it
+    /// as replaceable (availability first; a re-placement moves the pair, never multiplies it).
+    fn owner_tracked_stale(&self, endpoint: &str, now_ms: i64) -> bool {
+        self.node_pool
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(endpoint)
+            .is_some_and(|&t| now_ms - t > NODE_HEARTBEAT_TTL_MS)
+            && !self.placement_grace_active(now_ms)
     }
 
     /// Like [`register_node`](Self::register_node), but **refuses to admit a *new* node** once
@@ -1572,31 +1955,48 @@ impl Registry {
             .count()
     }
 
-    /// The number of **units with an assigned primary** across every index (shards + windows) — the
-    /// D53 scale-limit metric. The entitlement counts *primary-held units* (the served data
-    /// partitions), **not** raw node processes, so enabling read replicas (`R > 1`, more holder nodes)
-    /// never consumes the allowance — a replica isn't a new primary of any unit. See
-    /// [D38](/system/decisions/d38-scale-limit-entitlement.md).
-    pub fn count_primary_units(&self) -> usize {
-        self.read_map()
-            .values()
-            .map(|e| {
-                e.shards.values().filter(|s| s.primary.is_some()).count()
-                    + e.windows
-                        .values()
-                        .filter(|w| w.assignment.primary.is_some())
-                        .count()
-            })
-            .sum()
+    /// The deployment's **entitlement usage** (D38/D53): the number of distinct **live
+    /// `(index, primary node)` pairs** — for each index, how many nodes currently hold primaries of
+    /// its units. This caps *concurrent scale* (indexes × the node slots that serve them), never
+    /// lifetime usage: a windowed index accumulating windows on one node costs **one** unit forever
+    /// (the fix for the free-tier "3 daily windows and the deployment bricks" failure), while an
+    /// index spread across N primary nodes costs N. Read replicas are free (they're never a pair's
+    /// primary). A pair whose node is **tracked in the pool and stale past the TTL** stops counting
+    /// (its units are about to be re-placed, which re-creates the pair elsewhere — net constant).
+    /// **Unknown liveness counts** — during the grace window, and for owners the pool has never
+    /// tracked (announce-only deployments with no heartbeats) — so the metric fails closed.
+    pub fn count_entitlement_units(&self, now_ms: i64) -> usize {
+        let map = self.read_map();
+        self.entitlement_pairs(&map, now_ms).len()
     }
 
-    /// Whether `unit` of `index` already has a primary assigned (regardless of liveness) — the CP
-    /// checks this before placement so re-resolving an existing unit, or re-placing its dead owner,
-    /// is never counted as a **new** unit against the entitlement.
-    pub fn unit_has_primary(&self, index: &str, unit: Unit) -> bool {
-        self.read_map()
-            .get(index)
-            .is_some_and(|e| unit_primary(e, unit).is_some())
+    /// The live `(index, primary endpoint)` pair set behind
+    /// [`count_entitlement_units`](Self::count_entitlement_units). Takes the already-held `indexes`
+    /// guard so placement paths can count **inside the same critical section as the mutation**
+    /// (the HA-D3 TOCTOU fix). Takes `node_pool` briefly per owner — that lock is independent and
+    /// never taken in the reverse order.
+    fn entitlement_pairs(
+        &self,
+        map: &BTreeMap<String, IndexEntry>,
+        now_ms: i64,
+    ) -> BTreeSet<(String, String)> {
+        let mut pairs = BTreeSet::new();
+        for (name, e) in map.iter() {
+            let mut add = |primary: Option<&NodeId>| {
+                if let Some(p) = primary {
+                    if !self.owner_tracked_stale(&p.0, now_ms) {
+                        pairs.insert((name.clone(), p.0.clone()));
+                    }
+                }
+            };
+            for sa in e.shards.values() {
+                add(sa.primary.as_ref());
+            }
+            for wa in e.windows.values() {
+                add(wa.assignment.primary.as_ref());
+            }
+        }
+        pairs
     }
 
     /// The endpoints of nodes whose heartbeat is within [`NODE_HEARTBEAT_TTL_MS`] of `now_ms` — the
@@ -1613,83 +2013,20 @@ impl Registry {
     }
 
     /// Resolve the node that owns a placement [`Unit`] (a shard or a window) of `index`, **placing it
-    /// on first ask** — the CP-driven universal-pool assignment (D52). The connector/writer calls this
-    /// to learn where to route a row once it has computed the row's unit (its window, or its
-    /// bucket→shard ordinal).
-    ///
-    /// - **Idempotent:** a unit already assigned to a **live** node returns that node (`created =
-    ///   false`), so repeated asks are stable.
-    /// - **Placement:** an unassigned unit — or one whose owner is **dead** (no heartbeat within the
-    ///   TTL) — is placed on the **least-loaded** live pool node and returned with `created = true`.
-    ///   Load is the node's unit count **across every index** (shards + windows), so placement
-    ///   bin-packs the whole pool — the density win that lets many small indexes share nodes. Ties
-    ///   break by endpoint (`node_pool` is a `BTreeMap`), so placement is deterministic. The
-    ///   assignment is recorded in the durable [`IndexEntry`] (`shards` or `windows`).
-    ///
-    /// Errors if the index is unregistered, or if **no live node** is available (the caller retries
-    /// once a node heartbeats). Re-placing a dead owner's unit only moves the *assignment* — the new
-    /// owner rebuilds that unit's data from source / cold tier on demand; this method is the placement
-    /// authority, not the data mover.
+    /// on first ask** — the CP-driven universal-pool assignment (D52), at `R = 1` (primary only).
+    /// The single-holder view of [`resolve_unit_holders`](Self::resolve_unit_holders) — one placement
+    /// path, so promotion of a warm replica, the liveness grace window, and the atomic entitlement
+    /// check all apply here too. Returns `(primary endpoint, moved)` where `moved` is true iff this
+    /// call made or moved the primary assignment.
     pub fn resolve_unit_owner(
         &self,
         index: &str,
         unit: Unit,
+        entitled_units: usize,
         now_ms: i64,
     ) -> Result<(String, bool)> {
-        let live = self.live_nodes(now_ms);
-        let mut map = self.write_map();
-        if !map.contains_key(index) {
-            return Err(RegistryError::NotFound(index.to_string()));
-        }
-        // A live current owner is authoritative — idempotent, no write.
-        if let Some(primary) = unit_primary(&map[index], unit) {
-            if live.iter().any(|e| e == &primary) {
-                return Ok((primary, false));
-            }
-        }
-        // Needs placement (unassigned or dead owner). Count each live node's current unit load across
-        // ALL indexes, then pick the least-loaded (BTreeMap iterates endpoints sorted, so the first
-        // minimum is the smallest endpoint — deterministic ties).
-        if live.is_empty() {
-            return Err(RegistryError::NoLiveNode {
-                index: index.to_string(),
-                unit: unit.to_string(),
-            });
-        }
-        let mut load: BTreeMap<&str, usize> = live.iter().map(|e| (e.as_str(), 0usize)).collect();
-        let tally = |load: &mut BTreeMap<&str, usize>, node: Option<&NodeId>| {
-            if let Some(p) = node {
-                if let Some(c) = load.get_mut(p.0.as_str()) {
-                    *c += 1;
-                }
-            }
-        };
-        for e in map.values() {
-            for sa in e.shards.values() {
-                tally(&mut load, sa.primary.as_ref());
-            }
-            for wa in e.windows.values() {
-                tally(&mut load, wa.assignment.primary.as_ref());
-            }
-        }
-        let chosen = load
-            .iter()
-            .min_by_key(|(_, c)| **c)
-            .map(|(ep, _)| ep.to_string())
-            .expect("live pool non-empty");
-        let entry = map.get_mut(index).expect("index presence checked above");
-        match unit {
-            Unit::Shard(ordinal) => {
-                entry.shards.entry(ordinal).or_default().primary = Some(chosen.clone().into());
-            }
-            Unit::Window(window) => {
-                entry.windows.entry(window).or_default().assignment.primary =
-                    Some(chosen.clone().into());
-            }
-        }
-        drop(map);
-        self.persist_snapshot()?;
-        Ok((chosen, true))
+        let h = self.resolve_unit_holders(index, unit, 1, entitled_units, now_ms)?;
+        Ok((h.primary, h.moved))
     }
 
     /// Resolve the owner of a **window** — the windowed special case of
@@ -1698,9 +2035,10 @@ impl Registry {
         &self,
         index: &str,
         window: i64,
+        entitled_units: usize,
         now_ms: i64,
     ) -> Result<(String, bool)> {
-        self.resolve_unit_owner(index, Unit::Window(window), now_ms)
+        self.resolve_unit_owner(index, Unit::Window(window), entitled_units, now_ms)
     }
 
     /// The units `endpoint` currently holds, as `(index, unit, is_primary)` — a node's **assignment
@@ -1741,21 +2079,40 @@ impl Registry {
     /// pass, it:
     /// 1. **prunes dead holders** (drops replicas whose node has no live heartbeat);
     /// 2. **promotes** a live replica to primary if the primary died (else places a fresh primary on
-    ///    the least-loaded live node) — so a node kill re-primaries onto a warm holder;
+    ///    the least-loaded live node **not already a replica of this unit**) — so a node kill
+    ///    re-primaries onto a warm holder and a primary is never co-located on its own replica;
     /// 3. **tops up** replicas toward `R − 1` from the least-loaded live nodes not already holding the
     ///    unit, counting each node's holder load (primary + replica) across **all** indexes so the pool
-    ///    bin-packs replicas too.
+    ///    bin-packs replicas too;
+    /// 4. **trims** excess replicas past `R − 1` (a since-lowered `R` releases its extra holders).
     ///
     /// `replication_factor` is clamped to at least 1 (`R = 1` ⇒ primary only — the D52 behavior).
-    /// Excess replicas from a since-lowered `R` are **kept** (trimming is a separate concern); it never
-    /// leaves the unit with more than the live-node count of holders. Persists once iff anything
-    /// changed. Errors if the index is unregistered or no node is live (retryable, as
-    /// [`resolve_unit_owner`](Self::resolve_unit_owner)).
+    /// Persists once iff anything changed; the returned [`moved`](UnitHolders::moved) is true iff the
+    /// **primary** assignment was made or moved (replica churn alone doesn't set it).
+    ///
+    /// **Liveness grace (HA-D5):** while [`placement_grace_active`](Self::placement_grace_active),
+    /// an assigned owner is live-unknown — the current holder set is returned untouched, so a
+    /// freshly (re)started or promoted control plane never mass-re-places laggards' units onto the
+    /// first re-registrant. Fresh (never-assigned) units still place normally.
+    ///
+    /// **Entitlement (HA-D3, atomic):** placing a **fresh** unit is checked against `entitled_units`
+    /// (distinct live `(index, primary node)` pairs — see
+    /// [`count_entitlement_units`](Self::count_entitlement_units)) inside the same write-lock
+    /// critical section as the mutation, so concurrent resolves can't race past the cap. At the cap,
+    /// placement falls back to a live node **already holding a primary of this index** (no new pair
+    /// — a windowed index keeps accumulating windows at constant entitlement cost); with no such
+    /// node it fails [`EntitlementExceeded`](RegistryError::EntitlementExceeded). Re-resolves and
+    /// dead-owner re-placement are never entitlement-gated (existing capacity, not new).
+    ///
+    /// Errors if the index is unregistered or no node is live (retryable, as before). Re-placing a
+    /// dead owner's unit only moves the *assignment* — the new owner rebuilds that unit's data from
+    /// source / cold tier on demand.
     pub fn resolve_unit_holders(
         &self,
         index: &str,
         unit: Unit,
         replication_factor: usize,
+        entitled_units: usize,
         now_ms: i64,
     ) -> Result<UnitHolders> {
         let r = replication_factor.max(1);
@@ -1764,6 +2121,19 @@ impl Registry {
         if !map.contains_key(index) {
             return Err(RegistryError::NotFound(index.to_string()));
         }
+        // Liveness grace: owners are live-unknown → an assigned unit is returned as-is, untouched.
+        if self.placement_grace_active(now_ms) {
+            if let Some(a) = unit_assignment(&map[index], unit) {
+                if let Some(p) = &a.primary {
+                    return Ok(UnitHolders {
+                        primary: p.0.clone(),
+                        replicas: a.replicas.iter().map(|n| n.0.clone()).collect(),
+                        changed: false,
+                        moved: false,
+                    });
+                }
+            }
+        }
         if live.is_empty() {
             return Err(RegistryError::NoLiveNode {
                 index: index.to_string(),
@@ -1771,6 +2141,20 @@ impl Registry {
             });
         }
         let live_set: BTreeSet<String> = live.iter().cloned().collect();
+        // Entitlement inputs, computed under the SAME write-lock acquisition as the mutation below
+        // (the HA-D3 TOCTOU fix). Only a fresh (never-assigned) unit is gated, so only then compute.
+        let fresh_unit = unit_primary(&map[index], unit).is_none();
+        let (pair_count, index_nodes): (usize, BTreeSet<String>) = if fresh_unit {
+            let pairs = self.entitlement_pairs(&map, now_ms);
+            let index_nodes = pairs
+                .iter()
+                .filter(|(i, _)| i == index)
+                .map(|(_, n)| n.clone())
+                .collect();
+            (pairs.len(), index_nodes)
+        } else {
+            (0, BTreeSet::new())
+        };
         // Holder load across ALL indexes (primary + replicas), so replica top-up bin-packs the pool.
         let mut load: BTreeMap<String, usize> = live.iter().map(|e| (e.clone(), 0usize)).collect();
         for e in map.values() {
@@ -1793,26 +2177,45 @@ impl Registry {
         let entry = map.get_mut(index).expect("index presence checked above");
         let a = unit_assignment_mut(entry, unit);
         let mut changed = false;
+        let mut moved = false;
 
         // 1. Prune dead replicas.
         let before = a.replicas.len();
         a.replicas.retain(|n| live_set.contains(&n.0));
         changed |= a.replicas.len() != before;
 
-        // 2. Dead primary → clear, then promote a live replica or place a fresh primary.
+        // 2. Dead primary → clear, then promote a live (warm) replica or place a fresh primary.
         if a.primary.as_ref().is_some_and(|p| !live_set.contains(&p.0)) {
             a.primary = None;
             changed = true;
         }
         if a.primary.is_none() {
             if !a.replicas.is_empty() {
-                a.primary = Some(a.replicas.remove(0)); // promote a warm replica
+                a.primary = Some(a.replicas.remove(0)); // promote a warm replica (already live)
             } else {
-                let pick = pick_least_loaded(&load, &BTreeSet::new()).expect("live pool non-empty");
+                // Never co-locate the primary on a node still listed as a replica of this unit.
+                let exclude: BTreeSet<String> = a.replicas.iter().map(|n| n.0.clone()).collect();
+                let mut pick = pick_least_loaded(&load, &exclude).expect("live pool non-empty");
+                // Atomic entitlement gate for a FRESH unit: at the cap, only nodes already primarying
+                // this index (no new pair) may take it.
+                if fresh_unit && pair_count >= entitled_units && !index_nodes.contains(&pick) {
+                    let allowed: BTreeMap<String, usize> = load
+                        .iter()
+                        .filter(|(ep, _)| index_nodes.contains(*ep))
+                        .map(|(ep, c)| (ep.clone(), *c))
+                        .collect();
+                    pick = pick_least_loaded(&allowed, &exclude).ok_or(
+                        RegistryError::EntitlementExceeded {
+                            units: pair_count,
+                            entitled: entitled_units,
+                        },
+                    )?;
+                }
                 *load.get_mut(&pick).expect("picked a live node") += 1;
                 a.primary = Some(pick.into());
             }
             changed = true;
+            moved = true;
         }
 
         // 3. Top up replicas toward R−1 on least-loaded live nodes not already holding the unit.
@@ -1829,16 +2232,96 @@ impl Registry {
             changed = true;
         }
 
+        // 4. Trim excess replicas past R−1 (R was lowered since they were placed).
+        if a.replicas.len() + 1 > r {
+            a.replicas.truncate(r - 1);
+            changed = true;
+        }
+
         let holders = UnitHolders {
             primary: a.primary.as_ref().expect("primary set above").0.clone(),
             replicas: a.replicas.iter().map(|n| n.0.clone()).collect(),
             changed,
+            moved,
         };
         drop(map);
         if changed {
             self.persist_snapshot()?;
         }
         Ok(holders)
+    }
+
+    /// The units whose assigned **primary is confidently dead** at `now_ms` — the sweeper's
+    /// work-list. Empty while the [grace window](Self::placement_grace_active) is active or nothing
+    /// is dead. Read-only.
+    pub fn dead_primary_units(&self, now_ms: i64) -> Vec<(String, Unit)> {
+        if self.placement_grace_active(now_ms) {
+            return Vec::new();
+        }
+        let map = self.read_map();
+        let mut out = Vec::new();
+        for (name, e) in map.iter() {
+            for (ordinal, sa) in &e.shards {
+                if sa
+                    .primary
+                    .as_ref()
+                    .is_some_and(|p| self.owner_confidently_dead(&p.0, now_ms))
+                {
+                    out.push((name.clone(), Unit::Shard(*ordinal)));
+                }
+            }
+            for (window, wa) in &e.windows {
+                if wa
+                    .assignment
+                    .primary
+                    .as_ref()
+                    .is_some_and(|p| self.owner_confidently_dead(&p.0, now_ms))
+                {
+                    out.push((name.clone(), Unit::Window(*window)));
+                }
+            }
+        }
+        out
+    }
+
+    /// **Dead-owner sweep** (HA-D2): re-place every unit whose primary is confidently dead through
+    /// the SAME path a write-driven resolve takes ([`resolve_unit_holders`](Self::resolve_unit_holders)
+    /// — idempotent, entitlement-aware, persist + notify), so quiescent units on a dead node become
+    /// available again without waiting for a write. Returns the number of primaries moved.
+    ///
+    /// Respects the [liveness grace window](Self::placement_grace_active) (no sweeping while owner
+    /// liveness is unknown) and no-ops on an empty pool. The **caller** gates on leadership (only
+    /// the leader sweeps); a demotion race is still safe — the persist boundary refuses non-leader
+    /// writes (`NotLeader`). Liveness here is the same rule resolve uses: an owner that never
+    /// heartbeats into the pool is only swept once the pool is warmed up past the grace window.
+    pub fn sweep_dead_primaries(
+        &self,
+        replication_factor: usize,
+        entitled_units: usize,
+        now_ms: i64,
+    ) -> Result<usize> {
+        if self.live_nodes(now_ms).is_empty() {
+            return Ok(0); // nowhere to re-place (also: nothing heartbeats ⇒ nothing is *dead*)
+        }
+        let mut swept = 0usize;
+        for (index, unit) in self.dead_primary_units(now_ms) {
+            match self.resolve_unit_holders(
+                &index,
+                unit,
+                replication_factor,
+                entitled_units,
+                now_ms,
+            ) {
+                Ok(h) if h.moved => swept += 1,
+                Ok(_) => {}
+                // The index was dropped, or a concurrent resolve already handled it — skip.
+                Err(RegistryError::NotFound(_)) => {}
+                // The pool emptied mid-sweep: stop, retry next tick.
+                Err(RegistryError::NoLiveNode { .. }) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(swept)
     }
 }
 
@@ -1850,6 +2333,39 @@ fn unit_assignment_mut(entry: &mut IndexEntry, unit: Unit) -> &mut ShardAssignme
         Unit::Shard(ordinal) => entry.shards.entry(ordinal).or_default(),
         Unit::Window(window) => &mut entry.windows.entry(window).or_default().assignment,
     }
+}
+
+/// The read-only [`ShardAssignment`] for a [`Unit`], if it exists — the read counterpart to
+/// [`unit_assignment_mut`].
+fn unit_assignment(entry: &IndexEntry, unit: Unit) -> Option<&ShardAssignment> {
+    match unit {
+        Unit::Shard(ordinal) => entry.shards.get(&ordinal),
+        Unit::Window(window) => entry.windows.get(&window).map(|w| &w.assignment),
+    }
+}
+
+/// A fingerprint of the catalog's **placement state** — every `(index, unit, primary, replicas)`
+/// tuple — so the [placement listener](Registry::set_placement_listener) fires exactly when holder
+/// sets change and stays quiet for non-placement persists (tokens, aliases, zone-maps, …).
+/// `BTreeMap` iteration is deterministic, so equal placements hash equal.
+fn placement_hash(map: &BTreeMap<String, IndexEntry>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for (name, e) in map.iter() {
+        for (ordinal, sa) in &e.shards {
+            (name, ordinal, &sa.primary, &sa.replicas).hash(&mut h);
+        }
+        for (window, wa) in &e.windows {
+            (
+                name,
+                window,
+                &wa.assignment.primary,
+                &wa.assignment.replicas,
+            )
+                .hash(&mut h);
+        }
+    }
+    h.finish()
 }
 
 /// The least-loaded live node not in `exclude`, or `None` when every candidate is excluded. `load` is
@@ -2427,7 +2943,7 @@ mod tests {
         // Placing 6 windows round-robins evenly across the 3 live nodes (least-loaded each step).
         let mut owners = Vec::new();
         for w in 0..6 {
-            let (ep, created) = reg.resolve_window_owner("logs", w, t0).unwrap();
+            let (ep, created) = reg.resolve_window_owner("logs", w, usize::MAX, t0).unwrap();
             assert!(created, "first ask places window {w}");
             owners.push(ep);
         }
@@ -2442,7 +2958,7 @@ mod tests {
         assert_eq!(owners[0], "node-a");
 
         // Idempotent: re-resolving an assigned window with a live owner returns it, no re-placement.
-        let (ep, created) = reg.resolve_window_owner("logs", 0, t0).unwrap();
+        let (ep, created) = reg.resolve_window_owner("logs", 0, usize::MAX, t0).unwrap();
         assert_eq!(ep, "node-a");
         assert!(!created);
     }
@@ -2456,13 +2972,13 @@ mod tests {
         reg.create(resolved("logs")).unwrap();
         let t0 = 1_000_000;
         reg.register_node("node-a", t0);
-        let (ep, _) = reg.resolve_window_owner("logs", 7, t0).unwrap();
+        let (ep, _) = reg.resolve_window_owner("logs", 7, usize::MAX, t0).unwrap();
         assert_eq!(ep, "node-a");
 
         // node-a goes silent; only node-b heartbeats, past node-a's TTL → node-a is dead.
         let t1 = t0 + NODE_HEARTBEAT_TTL_MS + 1;
         reg.register_node("node-b", t1);
-        let (ep, created) = reg.resolve_window_owner("logs", 7, t1).unwrap();
+        let (ep, created) = reg.resolve_window_owner("logs", 7, usize::MAX, t1).unwrap();
         assert_eq!(
             ep, "node-b",
             "the dead owner's window re-places on the live node"
@@ -2482,7 +2998,7 @@ mod tests {
         // Once every node is stale, resolving a fresh window errors (caller retries on next heartbeat).
         let t2 = t1 + NODE_HEARTBEAT_TTL_MS + 1;
         assert!(matches!(
-            reg.resolve_window_owner("logs", 99, t2),
+            reg.resolve_window_owner("logs", 99, usize::MAX, t2),
             Err(RegistryError::NoLiveNode { .. })
         ));
     }
@@ -2501,14 +3017,14 @@ mod tests {
 
         // R=1 ⇒ primary only (the D52 behavior), no replicas.
         let solo = reg
-            .resolve_unit_holders("idx", Unit::Shard(9), 1, t0)
+            .resolve_unit_holders("idx", Unit::Shard(9), 1, usize::MAX, t0)
             .unwrap();
         assert!(solo.changed);
         assert!(solo.replicas.is_empty());
 
         // R=3 ⇒ 1 primary + 2 replicas, all distinct live nodes.
         let h = reg
-            .resolve_unit_holders("idx", Unit::Shard(0), 3, t0)
+            .resolve_unit_holders("idx", Unit::Shard(0), 3, usize::MAX, t0)
             .unwrap();
         assert!(h.changed);
         assert_eq!(h.replicas.len(), 2);
@@ -2523,7 +3039,7 @@ mod tests {
 
         // Idempotent: with every holder live, a re-resolve changes nothing.
         let again = reg
-            .resolve_unit_holders("idx", Unit::Shard(0), 3, t0)
+            .resolve_unit_holders("idx", Unit::Shard(0), 3, usize::MAX, t0)
             .unwrap();
         assert!(!again.changed);
         assert_eq!(again.primary, h.primary);
@@ -2539,7 +3055,7 @@ mod tests {
             }
         }
         let after = reg
-            .resolve_unit_holders("idx", Unit::Shard(0), 3, t1)
+            .resolve_unit_holders("idx", Unit::Shard(0), 3, usize::MAX, t1)
             .unwrap();
         assert!(after.changed);
         assert_ne!(after.primary, dead, "the dead primary is replaced");
@@ -2576,17 +3092,17 @@ mod tests {
         // Hash-shard units of one index and window units of another go through the SAME path and land
         // on the durable `shards` / `windows` maps respectively.
         let (s0, c0) = reg
-            .resolve_unit_owner("hashidx", Unit::Shard(0), t0)
+            .resolve_unit_owner("hashidx", Unit::Shard(0), usize::MAX, t0)
             .unwrap();
         assert!(c0);
         let (s1, _) = reg
-            .resolve_unit_owner("hashidx", Unit::Shard(1), t0)
+            .resolve_unit_owner("hashidx", Unit::Shard(1), usize::MAX, t0)
             .unwrap();
         let (w0, _) = reg
-            .resolve_unit_owner("winidx", Unit::Window(100), t0)
+            .resolve_unit_owner("winidx", Unit::Window(100), usize::MAX, t0)
             .unwrap();
         let (w1, _) = reg
-            .resolve_unit_owner("winidx", Unit::Window(200), t0)
+            .resolve_unit_owner("winidx", Unit::Window(200), usize::MAX, t0)
             .unwrap();
         // Cross-index least-loaded ⇒ the 4 units spread 2/2 over the pool (each node hosts units from
         // BOTH indexes — the multi-index-per-node property that kills node-per-index).
@@ -2611,14 +3127,14 @@ mod tests {
 
         // Idempotent for a live owner, and a shard unit re-places on a dead owner just like a window.
         let (again, created) = reg
-            .resolve_unit_owner("hashidx", Unit::Shard(0), t0)
+            .resolve_unit_owner("hashidx", Unit::Shard(0), usize::MAX, t0)
             .unwrap();
         assert_eq!(again, s0);
         assert!(!created);
         let t1 = t0 + NODE_HEARTBEAT_TTL_MS + 1;
         reg.register_node("node-c", t1); // only node-c is live now; a/b are stale
         let (moved, created) = reg
-            .resolve_unit_owner("hashidx", Unit::Shard(0), t1)
+            .resolve_unit_owner("hashidx", Unit::Shard(0), usize::MAX, t1)
             .unwrap();
         assert_eq!(
             moved, "node-c",
@@ -3215,5 +3731,408 @@ mod tests {
                 format!("tok{i}")
             );
         }
+    }
+
+    #[test]
+    fn heartbeat_ttl_has_reannounce_headroom() {
+        // HA-D5: the liveness TTL must give at least 3 heartbeat opportunities (with ±20% jitter
+        // room), or healthy nodes flap out of the pool — the two constants were once both 30 s.
+        // Read through black_box so the sanity check survives constant-folding lints.
+        let (ttl, reannounce) = (
+            std::hint::black_box(NODE_HEARTBEAT_TTL_MS),
+            std::hint::black_box(NODE_REANNOUNCE_INTERVAL_MS),
+        );
+        assert!(
+            ttl >= 3 * reannounce,
+            "TTL ({ttl} ms) must be ≥ 3× the re-announce interval ({reannounce} ms)"
+        );
+    }
+
+    #[test]
+    fn sweeper_re_places_dead_owners_idempotently_and_respects_grace() {
+        // HA-D2: quiescent units on a dead node are re-placed by the sweep — no write required —
+        // through the same resolve path; idempotent; suppressed while the grace window is active;
+        // and dead-owner re-placement is never entitlement-bricked (availability first).
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
+        reg.create(resolved("logs")).unwrap();
+        let t0 = 1_000_000;
+        reg.register_node("node-a", t0);
+        for w in [1_i64, 2] {
+            let (ep, _) = reg
+                .resolve_unit_owner("logs", Unit::Window(w), usize::MAX, t0)
+                .unwrap();
+            assert_eq!(ep, "node-a");
+        }
+        // node-a dies; node-b heartbeats past its TTL. Simulate a fresh promotion: grace re-anchored.
+        let t1 = t0 + NODE_HEARTBEAT_TTL_MS + 1;
+        reg.register_node("node-b", t1);
+        reg.set_placement_grace_anchor(t1);
+        assert_eq!(
+            reg.sweep_dead_primaries(1, usize::MAX, t1).unwrap(),
+            0,
+            "no sweeping while owner liveness is unknown (grace)"
+        );
+        assert_eq!(
+            reg.window_map("logs").unwrap()[&1].assignment.primary,
+            Some(NodeId::from("node-a")),
+            "grace leaves the laggard's assignment untouched"
+        );
+        // Grace over: both units move to the live node — even at entitled=1 (a re-placement is
+        // existing capacity, never gated).
+        reg.set_placement_grace_anchor(t1 - NODE_HEARTBEAT_TTL_MS - 1);
+        assert_eq!(reg.sweep_dead_primaries(1, 1, t1).unwrap(), 2);
+        for w in [1_i64, 2] {
+            assert_eq!(
+                reg.window_map("logs").unwrap()[&w].assignment.primary,
+                Some(NodeId::from("node-b")),
+                "window {w} re-placed on the live node"
+            );
+        }
+        // Idempotent: a second sweep has nothing to move; the pair count stayed constant.
+        assert_eq!(reg.sweep_dead_primaries(1, 1, t1).unwrap(), 0);
+        assert_eq!(reg.count_entitlement_units(t1), 1);
+    }
+
+    #[test]
+    fn entitlement_check_is_atomic_under_concurrent_resolves() {
+        // HA-D3b: check+place happen under ONE write-lock acquisition, so N racing resolves of
+        // fresh units admit exactly `entitled` new pairs — never more.
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Arc::new(Registry::open(tmp.path().join("registry.json")).unwrap());
+        let t0 = 1_000_000;
+        for i in 0..8 {
+            reg.create(resolved(&format!("idx{i}"))).unwrap();
+        }
+        reg.register_node("node-a", t0);
+        let admitted = std::sync::atomic::AtomicUsize::new(0);
+        let refused = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for i in 0..8 {
+                let (reg, admitted, refused) = (&reg, &admitted, &refused);
+                s.spawn(move || {
+                    match reg.resolve_unit_owner(&format!("idx{i}"), Unit::Shard(0), 2, t0) {
+                        Ok(_) => admitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                        Err(RegistryError::EntitlementExceeded { .. }) => {
+                            refused.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        }
+                        Err(e) => panic!("unexpected error: {e}"),
+                    };
+                });
+            }
+        });
+        assert_eq!(admitted.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(refused.load(std::sync::atomic::Ordering::SeqCst), 6);
+        assert_eq!(reg.count_entitlement_units(t0), 2);
+    }
+
+    #[test]
+    fn windowed_index_costs_constant_entitlement_over_time() {
+        // The 4th-day scenario (HA-D3c): windows accumulate forever, but a single windowed index
+        // never grows past its (index, primary node) pair — at the cap, new windows pack onto the
+        // node already primarying the index instead of a fresh node.
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
+        reg.create(resolved("logs")).unwrap();
+        let t0 = 1_000_000;
+        reg.register_node("node-a", t0);
+        reg.register_node("node-b", t0);
+        for w in 0..10_i64 {
+            let (ep, created) = reg
+                .resolve_unit_owner("logs", Unit::Window(w), 1, t0)
+                .unwrap();
+            assert!(created, "window {w} placed");
+            assert_eq!(ep, "node-a", "every window packs onto the one paired node");
+        }
+        assert_eq!(
+            reg.count_entitlement_units(t0),
+            1,
+            "10 windows ⇒ still one entitlement unit"
+        );
+    }
+
+    #[test]
+    fn r1_resolve_promotes_a_warm_replica_and_trims_excess() {
+        // HA-D7: on primary death at R=1 a warm replica is PROMOTED (never a cold fresh placement
+        // that ignores it), and lowering R trims the excess replicas.
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
+        reg.create(resolved("idx")).unwrap();
+        let t0 = 1_000_000;
+        for n in ["node-a", "node-b", "node-c"] {
+            reg.register_node(n, t0);
+        }
+        // Disarm the startup grace so trims/promotions act on TTL liveness immediately.
+        reg.set_placement_grace_anchor(t0 - NODE_HEARTBEAT_TTL_MS - 1);
+        let h3 = reg
+            .resolve_unit_holders("idx", Unit::Shard(0), 3, usize::MAX, t0)
+            .unwrap();
+        assert_eq!(h3.replicas.len(), 2);
+        // R shrank to 2: the excess replica is trimmed; the primary did not move.
+        let h2 = reg
+            .resolve_unit_holders("idx", Unit::Shard(0), 2, usize::MAX, t0)
+            .unwrap();
+        assert!(h2.changed && !h2.moved);
+        assert_eq!(h2.primary, h3.primary);
+        assert_eq!(h2.replicas, h3.replicas[..1].to_vec());
+        // The primary dies; the survivors keep heartbeating. An R=1 resolve promotes the warm
+        // replica — and reports it as a moved assignment (`created` on the wire).
+        let t1 = t0 + NODE_HEARTBEAT_TTL_MS + 1;
+        for n in ["node-a", "node-b", "node-c"] {
+            if *n != h2.primary {
+                reg.register_node(n, t1);
+            }
+        }
+        let (ep, moved) = reg
+            .resolve_unit_owner("idx", Unit::Shard(0), usize::MAX, t1)
+            .unwrap();
+        assert!(moved);
+        assert_eq!(ep, h2.replicas[0], "the warm replica was promoted");
+        assert!(
+            reg.shard_map("idx").unwrap()[&0].replicas.is_empty(),
+            "R=1 holds no replicas after promotion + trim"
+        );
+    }
+
+    #[test]
+    fn grace_window_treats_assigned_owners_as_live_unknown() {
+        // HA-D5: for one TTL after (re)start/promotion, a resolve over a not-yet-re-registered
+        // owner returns it untouched instead of mass-re-placing onto the first re-registrant.
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
+        reg.create(resolved("logs")).unwrap();
+        let t0 = 1_000_000;
+        reg.register_node("node-a", t0);
+        reg.resolve_unit_owner("logs", Unit::Window(7), usize::MAX, t0)
+            .unwrap();
+        // Fresh promotion at t1: node-b re-registers first; node-a is a laggard.
+        let t1 = t0 + NODE_HEARTBEAT_TTL_MS + 1;
+        reg.register_node("node-b", t1);
+        reg.set_placement_grace_anchor(t1);
+        let (ep, created) = reg
+            .resolve_unit_owner("logs", Unit::Window(7), usize::MAX, t1)
+            .unwrap();
+        assert_eq!((ep.as_str(), created), ("node-a", false), "owner untouched");
+        // Grace over and node-a still silent → the dead owner re-places.
+        reg.set_placement_grace_anchor(t1 - NODE_HEARTBEAT_TTL_MS - 1);
+        let (ep, created) = reg
+            .resolve_unit_owner("logs", Unit::Window(7), usize::MAX, t1)
+            .unwrap();
+        assert_eq!((ep.as_str(), created), ("node-b", true));
+    }
+
+    #[test]
+    fn announce_primaries_is_first_wins_with_dead_takeover_and_replica_reports() {
+        // HA-D7: RegisterServedIndex announces are no longer last-write-wins. Legacy re-point (no
+        // liveness tracking at all) still works; a LIVE foreign primary conflicts; a listed replica's
+        // announce is a serving report; a confidently-dead primary is taken over.
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
+        reg.create(resolved("docs")).unwrap();
+        let t0 = 1_000_000;
+        // Announce-only mode (nobody heartbeats): re-pointing to a new endpoint stays allowed —
+        // the restart-at-a-new-endpoint flow the D53 idempotent upsert blesses.
+        reg.announce_primaries("docs", &[0], "node-a", t0, usize::MAX)
+            .unwrap();
+        reg.announce_primaries("docs", &[0], "node-b", t0, usize::MAX)
+            .unwrap();
+        assert_eq!(
+            reg.shard_map("docs").unwrap()[&0].primary,
+            Some(NodeId::from("node-b"))
+        );
+        // node-b heartbeats → its primaries are protected: a foreign announce now conflicts.
+        reg.register_node("node-b", t0);
+        assert!(matches!(
+            reg.announce_primaries("docs", &[0], "node-c", t0, usize::MAX),
+            Err(RegistryError::PlacementConflict(_))
+        ));
+        // An idempotent re-announce by the current primary always passes.
+        reg.announce_primaries("docs", &[0], "node-b", t0, usize::MAX)
+            .unwrap();
+        // A listed replica's announce is a serving report — accepted, primary untouched.
+        reg.add_replica("docs", 0, "node-c").unwrap();
+        reg.announce_primaries("docs", &[0], "node-c", t0, usize::MAX)
+            .unwrap();
+        assert_eq!(
+            reg.shard_map("docs").unwrap()[&0].primary,
+            Some(NodeId::from("node-b")),
+            "a replica's announce never steals the primary"
+        );
+        // Once node-b is confidently dead (tracked, stale past the TTL, out of grace) a takeover
+        // announce succeeds — and the promoted node leaves the replica list.
+        let t1 = t0 + NODE_HEARTBEAT_TTL_MS + 1;
+        reg.announce_primaries("docs", &[0], "node-c", t1, usize::MAX)
+            .unwrap();
+        let a = reg.shard_map("docs").unwrap().remove(&0).unwrap();
+        assert_eq!(a.primary, Some(NodeId::from("node-c")));
+        assert!(!a.replicas.contains(&NodeId::from("node-c")));
+    }
+
+    #[test]
+    fn announces_enforce_the_entitlement_fail_closed() {
+        // HA-D3a: RegisterServedIndex is no longer an entitlement bypass — fresh primaries an
+        // announce creates are capped exactly like resolve-placed ones, and untracked (announce-
+        // only) owners COUNT (fail-closed), so the cap can't be dodged by never heartbeating.
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
+        for name in ["docs", "logs"] {
+            reg.create(resolved(name)).unwrap();
+        }
+        let t0 = 1_000_000;
+        reg.announce_primaries("docs", &[0], "node-a", t0, 1)
+            .unwrap();
+        // A second index is a new (index, node) pair — over the cap, whichever endpoint announces.
+        assert!(matches!(
+            reg.announce_primaries("logs", &[0], "node-b", t0, 1),
+            Err(RegistryError::EntitlementExceeded { .. })
+        ));
+        assert!(matches!(
+            reg.announce_windows(
+                "logs",
+                "node-a",
+                &[WindowAnnounce {
+                    window: 10,
+                    bounds: None,
+                    cold: false
+                }],
+                t0,
+                1
+            ),
+            Err(RegistryError::EntitlementExceeded { .. })
+        ));
+        // More shards of an already-paired index are free; so is an idempotent re-announce.
+        reg.announce_primaries("docs", &[1, 2], "node-a", t0, 1)
+            .unwrap();
+        reg.announce_primaries("docs", &[0], "node-a", t0, 1)
+            .unwrap();
+        assert_eq!(reg.count_entitlement_units(t0), 1);
+    }
+
+    #[test]
+    fn announce_windows_batches_metadata_and_ignores_replica_reports() {
+        // One announce = one mutation: primaries + zone-maps + tier land together; a replica's
+        // report neither re-points nor overwrites the primary's metadata; a non-holder conflicts.
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
+        reg.create(resolved("events")).unwrap();
+        let t0 = 1_000_000;
+        reg.register_node("node-a", t0);
+        reg.register_node("node-b", t0);
+        // Disarm the startup grace so the R=2 top-up below acts immediately.
+        reg.set_placement_grace_anchor(t0 - NODE_HEARTBEAT_TTL_MS - 1);
+        reg.announce_windows(
+            "events",
+            "node-a",
+            &[
+                WindowAnnounce {
+                    window: 10,
+                    bounds: Some((5, 80)),
+                    cold: false,
+                },
+                WindowAnnounce {
+                    window: 20,
+                    bounds: None,
+                    cold: true,
+                },
+            ],
+            t0,
+            usize::MAX,
+        )
+        .unwrap();
+        let wm = reg.window_map("events").unwrap();
+        assert_eq!(wm[&10].assignment.primary, Some(NodeId::from("node-a")));
+        assert_eq!((wm[&10].event_min, wm[&10].event_max), (Some(5), Some(80)));
+        assert!(!wm[&10].cold && wm[&20].cold);
+        // node-b becomes window 10's replica (R=2 top-up), then reports serving it: accepted, but
+        // the primary and the primary-reported zone-map/tier stand.
+        reg.resolve_unit_holders("events", Unit::Window(10), 2, usize::MAX, t0)
+            .unwrap();
+        reg.announce_windows(
+            "events",
+            "node-b",
+            &[WindowAnnounce {
+                window: 10,
+                bounds: Some((0, 999)),
+                cold: true,
+            }],
+            t0,
+            usize::MAX,
+        )
+        .unwrap();
+        let wm = reg.window_map("events").unwrap();
+        assert_eq!(wm[&10].assignment.primary, Some(NodeId::from("node-a")));
+        assert_eq!((wm[&10].event_min, wm[&10].event_max), (Some(5), Some(80)));
+        assert!(!wm[&10].cold, "a replica's tier report doesn't clobber");
+        // A live non-holder claiming the window is a conflict.
+        reg.register_node("node-c", t0);
+        assert!(matches!(
+            reg.announce_windows(
+                "events",
+                "node-c",
+                &[WindowAnnounce {
+                    window: 10,
+                    bounds: None,
+                    cold: false
+                }],
+                t0,
+                usize::MAX
+            ),
+            Err(RegistryError::PlacementConflict(_))
+        ));
+    }
+
+    #[test]
+    fn entitlement_drops_tracked_stale_pairs_but_counts_untracked_owners() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
+        reg.create(resolved("logs")).unwrap();
+        let t0 = 1_000_000;
+        reg.register_node("node-a", t0);
+        reg.resolve_unit_owner("logs", Unit::Window(1), usize::MAX, t0)
+            .unwrap();
+        assert_eq!(reg.count_entitlement_units(t0), 1);
+        // Tracked and stale past the TTL (grace long over): the pair stops counting — its unit is
+        // about to be re-placed, which re-creates the pair elsewhere.
+        let t1 = t0 + NODE_HEARTBEAT_TTL_MS + 1;
+        assert_eq!(reg.count_entitlement_units(t1), 0);
+        // An owner the pool never tracked (announce-only) counts at ANY time — fail-closed.
+        reg.create(resolved("docs")).unwrap();
+        reg.announce_primaries("docs", &[0], "node-x", t1, usize::MAX)
+            .unwrap();
+        assert_eq!(reg.count_entitlement_units(t1), 1);
+    }
+
+    #[test]
+    fn placement_listener_fires_on_placement_mutations_only() {
+        // HA-D1: the notification choke point sits at the persist boundary — ANY mutation that
+        // changes holder sets fires it (resolve, announce, remove_node, promote, drop), and
+        // non-placement mutations (aliases, credentials) stay silent.
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = fired.clone();
+        reg.set_placement_listener(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let count = || fired.load(std::sync::atomic::Ordering::SeqCst);
+        reg.create(resolved("docs")).unwrap();
+        assert_eq!(count(), 0, "an index with no assignments isn't placement");
+        reg.announce_primaries("docs", &[0], "node-a", 1_000, usize::MAX)
+            .unwrap();
+        assert_eq!(count(), 1, "announce fired");
+        reg.announce_primaries("docs", &[0], "node-a", 1_000, usize::MAX)
+            .unwrap();
+        assert_eq!(count(), 1, "an idempotent re-announce changes nothing");
+        reg.add_replica("docs", 0, "node-b").unwrap();
+        assert_eq!(count(), 2, "replica add fired");
+        reg.remove_node("docs", 0, &NodeId::from("node-a")).unwrap();
+        assert_eq!(count(), 3, "remove_node fired");
+        reg.promote_replica("docs", 0).unwrap();
+        assert_eq!(count(), 4, "promotion fired");
+        reg.set_alias("d", ["docs"]).unwrap();
+        reg.set_credential("alice", "pw").unwrap();
+        assert_eq!(count(), 4, "non-placement mutations stay silent");
+        reg.drop_index("docs").unwrap();
+        assert_eq!(count(), 5, "drop_index fired");
     }
 }

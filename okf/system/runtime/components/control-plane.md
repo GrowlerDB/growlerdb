@@ -4,7 +4,7 @@ title: Control plane
 description: The cluster registry — indexes, shards, routing, tokens, roles — and the source of routing truth.
 tags: [component, control-plane, registry]
 resource: /crates/growlerdb-controlplane
-timestamp: 2026-07-04T14:22:00
+timestamp: 2026-07-26T00:00:00
 ---
 
 # Control plane
@@ -22,6 +22,32 @@ built-in credentials, session epochs, and the per-index activity log.
   data lock** (registry JSON + `.prev` fallback + sidecars for activity/sessions), so routing reads
   never block on fsync.
 - Serves auth-state lookups (O(1) token hash index) with a consistent lock order.
+
+## Placement liveness & pushes (D52/D53)
+
+- **Heartbeats & TTL** — pool nodes re-announce every **10 s** (±20% jitter;
+  `NODE_REANNOUNCE_INTERVAL_MS`, from which the CLI derives its interval so the two can't diverge);
+  liveness TTL is **3×** that (**30 s**, `NODE_HEARTBEAT_TTL_MS`), so one lost/jittered heartbeat
+  never ejects a healthy node. `RegisterNode` validates the endpoint (`[http[s]://]host:port`) —
+  a malformed value fails loudly instead of seeding placement with a garbage node.
+- **Pushes on every placement change** — `SubscribeAssignments` snapshots are pushed from a hook at
+  the registry's **persist boundary** (fingerprint-filtered), so *every* mutation path — resolve,
+  `RegisterServedIndex` re-point, drop-index, promote/remove-node, the sweeper, a promoted leader's
+  reload — notifies the affected nodes; no mutation can forget to. Subscribing requires a
+  currently-registered node endpoint; dead subscriber channels are evicted on the next push.
+- **Dead-owner sweeper** — a leader-only background task (every TTL/2) re-places units whose primary
+  is confidently dead through the same idempotent, entitlement-aware resolve path, so quiescent
+  units on a dead node recover without waiting for a write (at R=1 they'd otherwise be unavailable
+  forever).
+- **Startup/promotion grace** — for one TTL after the first post-boot/post-promotion heartbeat,
+  assigned owners are treated live-unknown: dead-owner re-placement, announce takeovers, and the
+  sweeper hold off, so a freshly (re)started CP never mass-re-places laggards' units onto the first
+  re-registrant. Fresh placements and empty-pool retryable errors behave as before.
+- **First-wins announces** — a `RegisterServedIndex` claim on a unit primaried by a live foreign
+  node is `PLACEMENT_CONFLICT` (idempotent re-announce and dead-owner takeover stay allowed; a
+  listed replica's announce is a serving report). The scale entitlement
+  ([D38](/system/decisions/d38-scale-limit-entitlement.md): distinct live index × primary-node
+  pairs) is enforced atomically inside placement on both the resolve and announce paths.
 
 ## Internal-RPC credential
 
