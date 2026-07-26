@@ -90,6 +90,14 @@ replica keeps serving — so a node loss is a **zero-gap read failover**, not th
 degradation of today. The [durability](/product/non-functional/durability.md) RPO=0 story is unchanged
 (writes still ack on the primary's durable commit); replicas are a read/availability layer.
 
+R is a **cluster-wide** setting (`GROWLERDB_REPLICATION_FACTOR`, default `1` = primary-only, the D52
+behavior). At `R > 1` a resolve places the replica holders into the durable shard map, and the gateway
+reads that holder set to route each read through a **failover node** across a unit's `[primary,
+replicas…]` (trying the primary, failing over to a live replica). A replica obtains its data by
+**reading the parked unit's frozen sidecars + segments read-through from object storage**
+(`open_cold_replica`) — no rebuild, no copy stream. (Wiring the CP→node assignment push that makes a
+placed replica start serving is in progress.)
+
 Same primitive, three wins: **multi-index density** (kills node-per-index), **read failover**
 (kills the node SPOF), and **rebalancing** (moving a unit is placing a unit).
 
