@@ -73,6 +73,20 @@ impl std::fmt::Display for Unit {
     }
 }
 
+/// The **R holders** of a placement unit (D53): the sole-writer **primary** plus its read
+/// **replicas**, as node endpoints. Returned by
+/// [`resolve_unit_holders`](Registry::resolve_unit_holders); the write path targets `primary`, and
+/// the gateway scatters reads across `primary` + `replicas`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitHolders {
+    /// The primary node endpoint (accepts writes + reads).
+    pub primary: String,
+    /// Read-replica node endpoints (never includes the primary).
+    pub replicas: Vec<String>,
+    /// True iff this call changed the placement (placed, promoted, pruned, or topped up a holder).
+    pub changed: bool,
+}
+
 /// Which nodes serve one shard: the **primary** (accepts writes + reads) and zero or more
 /// read **replicas**. The shard map is `shard ordinal → ShardAssignment`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1523,6 +1537,133 @@ impl Registry {
     ) -> Result<(String, bool)> {
         self.resolve_unit_owner(index, Unit::Window(window), now_ms)
     }
+
+    /// Resolve the **R holders** of a unit (D53): one **primary** (sole writer) + up to
+    /// `replication_factor − 1` read **replicas** over the live [placement pool](Self::node_pool).
+    ///
+    /// Idempotent when the unit already has a live primary and a full replica set; otherwise, in one
+    /// pass, it:
+    /// 1. **prunes dead holders** (drops replicas whose node has no live heartbeat);
+    /// 2. **promotes** a live replica to primary if the primary died (else places a fresh primary on
+    ///    the least-loaded live node) — so a node kill re-primaries onto a warm holder;
+    /// 3. **tops up** replicas toward `R − 1` from the least-loaded live nodes not already holding the
+    ///    unit, counting each node's holder load (primary + replica) across **all** indexes so the pool
+    ///    bin-packs replicas too.
+    ///
+    /// `replication_factor` is clamped to at least 1 (`R = 1` ⇒ primary only — the D52 behavior).
+    /// Excess replicas from a since-lowered `R` are **kept** (trimming is a separate concern); it never
+    /// leaves the unit with more than the live-node count of holders. Persists once iff anything
+    /// changed. Errors if the index is unregistered or no node is live (retryable, as
+    /// [`resolve_unit_owner`](Self::resolve_unit_owner)).
+    pub fn resolve_unit_holders(
+        &self,
+        index: &str,
+        unit: Unit,
+        replication_factor: usize,
+        now_ms: i64,
+    ) -> Result<UnitHolders> {
+        let r = replication_factor.max(1);
+        let live = self.live_nodes(now_ms);
+        let mut map = self.write_map();
+        if !map.contains_key(index) {
+            return Err(RegistryError::NotFound(index.to_string()));
+        }
+        if live.is_empty() {
+            return Err(RegistryError::NoLiveNode {
+                index: index.to_string(),
+                unit: unit.to_string(),
+            });
+        }
+        let live_set: BTreeSet<String> = live.iter().cloned().collect();
+        // Holder load across ALL indexes (primary + replicas), so replica top-up bin-packs the pool.
+        let mut load: BTreeMap<String, usize> = live.iter().map(|e| (e.clone(), 0usize)).collect();
+        for e in map.values() {
+            for sa in e.shards.values() {
+                for n in sa.nodes() {
+                    if let Some(c) = load.get_mut(&n.0) {
+                        *c += 1;
+                    }
+                }
+            }
+            for wa in e.windows.values() {
+                for n in wa.assignment.nodes() {
+                    if let Some(c) = load.get_mut(&n.0) {
+                        *c += 1;
+                    }
+                }
+            }
+        }
+
+        let entry = map.get_mut(index).expect("index presence checked above");
+        let a = unit_assignment_mut(entry, unit);
+        let mut changed = false;
+
+        // 1. Prune dead replicas.
+        let before = a.replicas.len();
+        a.replicas.retain(|n| live_set.contains(&n.0));
+        changed |= a.replicas.len() != before;
+
+        // 2. Dead primary → clear, then promote a live replica or place a fresh primary.
+        if a.primary.as_ref().is_some_and(|p| !live_set.contains(&p.0)) {
+            a.primary = None;
+            changed = true;
+        }
+        if a.primary.is_none() {
+            if !a.replicas.is_empty() {
+                a.primary = Some(a.replicas.remove(0)); // promote a warm replica
+            } else {
+                let pick = pick_least_loaded(&load, &BTreeSet::new()).expect("live pool non-empty");
+                *load.get_mut(&pick).expect("picked a live node") += 1;
+                a.primary = Some(pick.into());
+            }
+            changed = true;
+        }
+
+        // 3. Top up replicas toward R−1 on least-loaded live nodes not already holding the unit.
+        while a.replicas.len() + 1 < r {
+            let mut exclude: BTreeSet<String> = a.replicas.iter().map(|n| n.0.clone()).collect();
+            if let Some(p) = &a.primary {
+                exclude.insert(p.0.clone());
+            }
+            let Some(pick) = pick_least_loaded(&load, &exclude) else {
+                break; // fewer live nodes than R — hold what we can
+            };
+            *load.get_mut(&pick).expect("picked a live node") += 1;
+            a.replicas.push(pick.into());
+            changed = true;
+        }
+
+        let holders = UnitHolders {
+            primary: a.primary.as_ref().expect("primary set above").0.clone(),
+            replicas: a.replicas.iter().map(|n| n.0.clone()).collect(),
+            changed,
+        };
+        drop(map);
+        if changed {
+            self.persist_snapshot()?;
+        }
+        Ok(holders)
+    }
+}
+
+/// The mutable [`ShardAssignment`] for a [`Unit`] within an [`IndexEntry`], creating an empty one on
+/// first placement — the write counterpart to [`unit_primary`]. A window's assignment is nested under
+/// its [`WindowAssignment`]; a shard's is the entry directly.
+fn unit_assignment_mut(entry: &mut IndexEntry, unit: Unit) -> &mut ShardAssignment {
+    match unit {
+        Unit::Shard(ordinal) => entry.shards.entry(ordinal).or_default(),
+        Unit::Window(window) => &mut entry.windows.entry(window).or_default().assignment,
+    }
+}
+
+/// The least-loaded live node not in `exclude`, or `None` when every candidate is excluded. `load` is
+/// a `BTreeMap`, so it iterates endpoints sorted and `min_by_key` returns the first minimum — the
+/// smallest endpoint on a tie, keeping placement deterministic.
+fn pick_least_loaded(load: &BTreeMap<String, usize>, exclude: &BTreeSet<String>) -> Option<String> {
+    load.iter()
+        .filter(|(ep, _)| !exclude.contains(*ep))
+        .min_by_key(|(_, c)| **c)
+        .map(|(ep, _)| ep.clone())
 }
 
 /// The current primary owner (if any) of a [`Unit`] within an [`IndexEntry`] — the shared read both
@@ -1932,6 +2073,77 @@ mod tests {
             reg.resolve_window_owner("logs", 99, t2),
             Err(RegistryError::NoLiveNode { .. })
         ));
+    }
+
+    #[test]
+    fn resolve_unit_holders_places_promotes_and_tops_up() {
+        // D53: the CP assigns R holders per unit — one primary + R−1 replicas over the pool —
+        // idempotent, with promote-on-primary-death + replica top-up (least-loaded, distinct).
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
+        reg.create(resolved("idx")).unwrap();
+        let t0 = 1_000_000;
+        for n in ["node-a", "node-b", "node-c"] {
+            reg.register_node(n, t0);
+        }
+
+        // R=1 ⇒ primary only (the D52 behavior), no replicas.
+        let solo = reg
+            .resolve_unit_holders("idx", Unit::Shard(9), 1, t0)
+            .unwrap();
+        assert!(solo.changed);
+        assert!(solo.replicas.is_empty());
+
+        // R=3 ⇒ 1 primary + 2 replicas, all distinct live nodes.
+        let h = reg
+            .resolve_unit_holders("idx", Unit::Shard(0), 3, t0)
+            .unwrap();
+        assert!(h.changed);
+        assert_eq!(h.replicas.len(), 2);
+        let mut all = h.replicas.clone();
+        all.push(h.primary.clone());
+        all.sort();
+        assert_eq!(
+            all,
+            vec!["node-a", "node-b", "node-c"],
+            "all three nodes hold the unit"
+        );
+
+        // Idempotent: with every holder live, a re-resolve changes nothing.
+        let again = reg
+            .resolve_unit_holders("idx", Unit::Shard(0), 3, t0)
+            .unwrap();
+        assert!(!again.changed);
+        assert_eq!(again.primary, h.primary);
+        assert_eq!(again.replicas, h.replicas);
+
+        // Kill the primary: its two replicas keep heartbeating; a warm replica is promoted, the dead
+        // node drops out, and with only two live nodes the set holds 1 primary + 1 replica (< R).
+        let dead = h.primary.clone();
+        let t1 = t0 + NODE_HEARTBEAT_TTL_MS + 1;
+        for n in ["node-a", "node-b", "node-c"] {
+            if n != dead {
+                reg.register_node(n, t1);
+            }
+        }
+        let after = reg
+            .resolve_unit_holders("idx", Unit::Shard(0), 3, t1)
+            .unwrap();
+        assert!(after.changed);
+        assert_ne!(after.primary, dead, "the dead primary is replaced");
+        assert!(
+            h.replicas.contains(&after.primary),
+            "a warm replica was promoted to primary"
+        );
+        assert!(
+            !after.replicas.contains(&dead),
+            "the dead node is pruned from replicas"
+        );
+        assert_eq!(
+            after.replicas.len(),
+            1,
+            "only two live nodes ⇒ can't reach R=3"
+        );
     }
 
     #[test]
