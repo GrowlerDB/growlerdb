@@ -89,8 +89,15 @@ impl Drop for Server {
 
 async fn connect(url: &str) -> SearchClient<Channel> {
     for _ in 0..120 {
-        if let Ok(client) = SearchClient::connect(url.to_string()).await {
-            return client;
+        // A bare TCP connect can land in the bind-:0-then-release window where the port is
+        // transiently contested by a sibling test's dying server; only a gRPC-level reply
+        // (Ok or an application Status, never a transport error) proves OUR server is up.
+        if let Ok(mut client) = SearchClient::connect(url.to_string()).await {
+            match client.search(SearchRequest::default()).await {
+                Ok(_) => return client,
+                Err(status) if std::error::Error::source(&status).is_none() => return client,
+                Err(_) => {}
+            }
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
