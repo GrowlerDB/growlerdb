@@ -134,6 +134,11 @@ pub struct ControlPlaneService {
     /// Optional scale-limit [license](crate::license). `None` ⇒ the free tier
     /// ([`FREE_NODE_LIMIT`](crate::license::FREE_NODE_LIMIT)); a valid license raises the node cap.
     license: Option<crate::license::License>,
+    /// Cluster-wide **replication factor** R (D53): the number of holders the CP places per unit —
+    /// 1 primary + R−1 read replicas. `1` (the default) is primary-only, the D52 behavior — the
+    /// `ResolveUnitOwner` path is then byte-identical to before. `> 1` engages
+    /// [`resolve_unit_holders`](Registry::resolve_unit_holders) so a resolve also places replicas.
+    replication_factor: usize,
 }
 
 impl ControlPlaneService {
@@ -153,6 +158,7 @@ impl ControlPlaneService {
             session_secret: None,
             login_throttle: Arc::new(LoginThrottle::new()),
             license: None,
+            replication_factor: 1,
         }
     }
 
@@ -160,6 +166,13 @@ impl ControlPlaneService {
     /// tier. `None` keeps the free tier.
     pub fn with_license(mut self, license: Option<crate::license::License>) -> Self {
         self.license = license;
+        self
+    }
+
+    /// Set the cluster-wide **replication factor** R (D53): the CP then places 1 primary + R−1 read
+    /// replicas per unit on `ResolveUnitOwner`. Clamped to at least 1 (1 = primary-only, the default).
+    pub fn with_replication_factor(mut self, r: usize) -> Self {
+        self.replication_factor = r.max(1);
         self
     }
 
@@ -1403,15 +1416,25 @@ impl ControlPlane for ControlPlaneService {
                 ))
             }
         };
-        let (endpoint, created) = self
-            .registry
-            .resolve_unit_owner(&req.index, unit, now_ms())
-            .map_err(|e| match e {
-                // No node has heartbeated yet (a transient bring-up state) — retryable, so the
-                // connector backs off and re-asks rather than failing the ingest batch.
-                RegistryError::NoLiveNode { .. } => Status::unavailable(e.to_string()),
-                other => registry_status(other),
-            })?;
+        // No node has heartbeated yet (a transient bring-up state) → retryable, so the connector
+        // backs off and re-asks rather than failing the ingest batch.
+        let to_status = |e: RegistryError| match e {
+            RegistryError::NoLiveNode { .. } => Status::unavailable(e.to_string()),
+            other => registry_status(other),
+        };
+        // With replication (R > 1) a resolve also places R−1 read replicas (D53) and returns the
+        // primary; at R = 1 it's the primary-only D52 path, byte-identical to before.
+        let (endpoint, created) = if self.replication_factor > 1 {
+            let holders = self
+                .registry
+                .resolve_unit_holders(&req.index, unit, self.replication_factor, now_ms())
+                .map_err(to_status)?;
+            (holders.primary, holders.changed)
+        } else {
+            self.registry
+                .resolve_unit_owner(&req.index, unit, now_ms())
+                .map_err(to_status)?
+        };
         Ok(Response::new(ResolveUnitOwnerResponse {
             endpoint,
             created,
@@ -2123,6 +2146,50 @@ mod tests {
             .unwrap()
             .into_inner();
         assert!(ord.windowing.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_places_replicas_when_replication_factor_gt_1() {
+        // D53: with R=2 a resolve places a primary + one read replica per unit. ResolveUnitOwner
+        // still returns the primary (the write target); GetIndex.shard_status carries the replica,
+        // which is what the gateway reads to fail a read over to a live holder.
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path()).with_replication_factor(2);
+        svc.registry.create(resolved_windowed("logs")).unwrap();
+        for ep in ["http://node-a:50051", "http://node-b:50051"] {
+            svc.register_node(Request::new(RegisterNodeRequest {
+                endpoint: ep.into(),
+            }))
+            .await
+            .unwrap();
+        }
+
+        let r = svc
+            .resolve_unit_owner(Request::new(ResolveUnitOwnerRequest {
+                index: "logs".into(),
+                unit: Some(growlerdb_proto::v1::resolve_unit_owner_request::Unit::Window(10)),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(r.created);
+        let primary = r.endpoint;
+
+        let gi = svc
+            .get_index(Request::new(GetIndexRequest {
+                name: "logs".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let w = gi
+            .shard_status
+            .iter()
+            .find(|s| s.window == 10)
+            .expect("window 10 placed");
+        assert_eq!(w.primary, primary, "the write target is the primary");
+        assert_eq!(w.replicas.len(), 1, "R=2 ⇒ one read replica");
+        assert_ne!(w.replicas[0], primary, "the replica is a distinct node");
     }
 
     #[tokio::test(flavor = "current_thread")]

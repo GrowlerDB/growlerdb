@@ -4643,7 +4643,17 @@ async fn control_plane(
         eprintln!("control plane: WARNING authorization disabled (no --oidc-issuer / --builtin-auth); it is open");
         growlerdb_engine::ControlPlaneService::new(registry, IcebergConfig::from_env())
     };
-    let svc = svc.with_license(license);
+    let replication_factor = replication_factor_from_env();
+    if replication_factor > 1 {
+        println!(
+            "control plane: replication factor R={replication_factor} — each unit gets 1 primary + \
+             {} read replica(s) (D53)",
+            replication_factor - 1
+        );
+    }
+    let svc = svc
+        .with_license(license)
+        .with_replication_factor(replication_factor);
 
     if ha_managed {
         println!(
@@ -4779,6 +4789,16 @@ fn load_resolved(data_dir: &str, index: &str) -> anyhow::Result<growlerdb_core::
             }
         }
     }
+}
+
+/// The cluster-wide **replication factor** R from `GROWLERDB_REPLICATION_FACTOR` (D53): the CP places
+/// 1 primary + R−1 read replicas per unit. Default/invalid ⇒ `1` (primary-only, the D52 behavior).
+fn replication_factor_from_env() -> usize {
+    std::env::var("GROWLERDB_REPLICATION_FACTOR")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&r| r >= 1)
+        .unwrap_or(1)
 }
 
 /// Build the backup object-store config from the environment: the bucket from
