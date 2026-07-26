@@ -603,6 +603,13 @@ fn registry_status(e: RegistryError) -> Status {
                 format!("alias `{name}` clashes with an existing index name"),
             ),
         ),
+        // A write reached a standby (or a deposed leader): the store is healthy, this replica just
+        // may not write — FAILED_PRECONDITION, not Internal, so the caller re-resolves the leader
+        // (in k8s the Service already routes to it) and retries.
+        RegistryError::NotLeader(detail) => to_status(
+            Code::FailedPrecondition,
+            WireError::new("NOT_LEADER", format!("not the registry leader: {detail}")),
+        ),
         other => to_status(
             Code::Internal,
             WireError::new("INTERNAL", other.to_string()),

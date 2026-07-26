@@ -52,6 +52,29 @@ leader dies, Postgres releases the lock, a standby wins it within a fraction of 
 → promotion verified live), flips to ready, and joins the Service. Standbys **serving reads** directly
 (active-reads, per the D51 diagram) is a follow-up. See [high availability](/system/high-availability.md).
 
+**Leadership is verified, ordered, and store-checked** (357.16/357.17):
+
+- **Demotion** — the leader re-verifies each tick that the lock-holding store session is alive; a
+  dead session (Postgres restart, network drop, worker panic) demotes it the same tick — readiness
+  withdrawn, writership resigned — and it rejoins the standby race on a fresh connection. No deposed
+  leader ever sits READY serving a frozen catalog.
+- **Promotion order** — acquire lock → **reload from the store** → only then confirm writership and
+  mark ready; a failed reload resigns the lock and stays standby. Writes are gated on the confirmed
+  flag, so a promoted leader can never persist a stale pre-promotion snapshot over the dead leader's
+  last writes.
+- **Versioned persists** — every persist carries an expected-version guard (optimistic concurrency
+  per store row; D51's "CAS maps to the store"): a mismatch means another writer took over → the
+  persist is refused, the replica fail-stops (demote + reload), and the caller sees a retryable
+  `NOT_LEADER` (`FAILED_PRECONDITION`, never `Internal`).
+- **Rollback on persist failure** — a mutation whose persist fails is rolled back out of memory
+  (restore from the store), so a failed change can never ride out on the next successful snapshot;
+  if even the restore fails, persists latch off until a resync succeeds.
+- **Session-epoch durability** — a revocation whose persist fails is a hard error (and rolled back),
+  never a warn-and-continue; the standby version poll observes **all** store rows, so a sessions-only
+  bump reloads standbys too and a revocation survives failover.
+- Concurrent replica boots serialize their schema DDL under an advisory lock (no `CREATE TABLE IF
+  NOT EXISTS` race).
+
 ## Notes
 
 Implemented in `growlerdb-controlplane`. Its persistent state is small; durability is temp+fsync+rename.

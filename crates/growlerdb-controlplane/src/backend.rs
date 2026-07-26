@@ -90,11 +90,33 @@ pub trait RegistryBackend: Send + Sync {
         Ok(None)
     }
 
-    /// Attempt to acquire write **leadership**. `Ok(true)` if this backend now holds it. A standby
-    /// calls this to promote itself when the previous leader dies. The default is unconditionally
-    /// leader — the [`JsonFileBackend`] already took an exclusive `flock` at open.
+    /// Attempt to acquire the store's writer lock. `Ok(true)` means this backend now **holds the
+    /// lock but is not yet the writer**: the caller must first reload from the store and only then
+    /// [`confirm_leadership`](RegistryBackend::confirm_leadership) (or
+    /// [`resign_leadership`](RegistryBackend::resign_leadership) if that reload fails) — so a
+    /// promoted leader can never persist a snapshot built from a stale catalog and overwrite the
+    /// dead leader's last writes. Default: unconditionally `true` — the [`JsonFileBackend`] took its
+    /// exclusive `flock` at open and its memory has no other writer to be stale against.
     fn try_become_leader(&self) -> Result<bool> {
         Ok(true)
+    }
+
+    /// Mark this backend the active writer. Called only after
+    /// [`try_become_leader`](RegistryBackend::try_become_leader) returned `true` **and** the caller
+    /// reloaded from the store. Default no-op (the local backend is always leader).
+    fn confirm_leadership(&self) {}
+
+    /// Give up writer status, releasing the store's writer lock if the session is still alive —
+    /// after a failed promotion reload, a persist that revealed another writer, or any signal the
+    /// lock-holding store session died. Default no-op (the `flock` cannot be resigned mid-process).
+    fn resign_leadership(&self) {}
+
+    /// Cheap per-tick check that leadership is still held — i.e. the store session that owns the
+    /// writer lock is alive. `Ok(false)` = leadership lost: the caller must stop serving writes and
+    /// fall back to the standby path. Default: [`is_leader`](RegistryBackend::is_leader) (the local
+    /// `flock` cannot be lost while the process runs).
+    fn verify_leadership(&self) -> Result<bool> {
+        Ok(self.is_leader())
     }
 
     /// Whether this backend currently holds write leadership. Default `true` (see

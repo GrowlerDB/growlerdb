@@ -269,6 +269,12 @@ pub enum RegistryError {
     /// single-writer lock. Carries the store's error text.
     #[error("registry backend: {0}")]
     Backend(String),
+    /// A write reached a control plane that is not (or no longer) the registry leader — a standby
+    /// got a mis-routed write, or the store's version check showed another writer took over.
+    /// Retryable once the caller re-resolves the leader; maps to gRPC `FAILED_PRECONDITION`
+    /// (never `Internal` — the store is fine, this replica just may not write).
+    #[error("not the registry leader: {0}")]
+    NotLeader(String),
     /// Encoding/decoding the persisted registry failed.
     #[error("registry codec: {0}")]
     Codec(#[from] serde_json::Error),
@@ -393,11 +399,20 @@ pub struct Registry {
     /// role-downgrade for outstanding session JWTs. Persisted to a separate `sessions.json` sidecar
     /// (independent lock, acquired last).
     session_epochs: RwLock<BTreeMap<String, i64>>,
+    /// Serializes session-epoch sidecar writes (like `flush_lock` for the registry envelope), so two
+    /// concurrent revokes can't persist out of order and lose one bump. Taken **after** the
+    /// `session_epochs` guard is released — the persist round-trip never sits on the auth hot path.
+    sessions_flush: std::sync::Mutex<()>,
     /// Serializes registry-file writes: a mutation applies its change in memory, releases its data
     /// lock, then persists off-lock under this — so routing reads never block on the fsync, and two
     /// concurrent persists can't lose a change from the file (each snapshots the latest memory; the
     /// last write wins with the full state).
     flush_lock: std::sync::Mutex<()>,
+    /// Set when a failed persist's rollback ([`persist_snapshot`](Self::persist_snapshot)) could not
+    /// restore memory from the store either: memory may still hold an unpersisted change, so every
+    /// further persist is refused until a restore/[`reload`](Self::reload) succeeds — the failed
+    /// change must never ride out on the next successful mutation's full snapshot.
+    rollback_failed: std::sync::atomic::AtomicBool,
     /// The **placement pool** (D52): `node endpoint → last-heartbeat epoch-ms`. One flat pool of
     /// interchangeable shard hosts, **not** keyed by index — any live node can be assigned units
     /// (shards or windows) from any index, which is what lets one node process serve many indexes and
@@ -454,7 +469,9 @@ impl Registry {
             activity: RwLock::new(activity),
             activity_flush: std::sync::Mutex::new(ActivityFlush::default()),
             session_epochs: RwLock::new(session_epochs),
+            sessions_flush: std::sync::Mutex::new(()),
             flush_lock: std::sync::Mutex::new(()),
+            rollback_failed: std::sync::atomic::AtomicBool::new(false),
             node_pool: RwLock::new(BTreeMap::new()),
         })
     }
@@ -533,8 +550,32 @@ impl Registry {
     /// writes themselves (they're rare) so a concurrent pair can't lose a change from the file: each
     /// snapshot reads the latest memory, and the last write wins with the full state. Must be called
     /// with **no** registry data lock held (it re-acquires them briefly).
+    ///
+    /// **Rollback on persist failure.** A failed persist must not leave the mutation applied in
+    /// memory, or the *next* successful mutation's full snapshot silently commits it. Rollback here
+    /// restores the core maps from the store's durable state (the pre-mutation state, since persists
+    /// are serialized under `flush_lock`) — chosen over per-mutation inverse patches because every
+    /// mutation funnels through this one point, so twenty hand-rolled undo paths collapse into one.
+    /// If the restore itself fails (store unreachable), `rollback_failed` latches and every further
+    /// persist is refused until a restore succeeds — stale memory can never reach the store. On the
+    /// Postgres backend a persist failure also demotes the writer, so a concurrent mutation that
+    /// raced past the rollback is refused (`NotLeader`) rather than silently re-committing it.
     fn persist_snapshot(&self) -> Result<()> {
         let _flush = self.flush_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if self
+            .rollback_failed
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // A previous failed persist is still un-rolled-back in memory. Restore first; that also
+            // sweeps away the *current* mutation's in-memory change, so this call must fail
+            // (retryable) rather than report success for a change memory no longer holds.
+            self.restore_core()?;
+            self.rollback_failed
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            return Err(RegistryError::Backend(
+                "registry memory was rolled back after an earlier persist failure; retry".into(),
+            ));
+        }
         // Clone each map under a brief read lock; the guards are temporaries released at the end of
         // this statement, before any I/O the backend does.
         let snapshot = RegistrySnapshot {
@@ -546,7 +587,32 @@ impl Registry {
             credentials: self.read_credentials().clone(),
             index_bindings: self.read_index_bindings().clone(),
         };
-        self.backend.persist_registry(snapshot)
+        match self.backend.persist_registry(snapshot) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if self.restore_core().is_err() {
+                    self.rollback_failed
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Restore the seven core catalog maps (and the derived token index) from the backend's durable
+    /// state — the rollback path for a failed persist. The sidecars (activity, session epochs) are
+    /// left alone: they persist through their own paths with their own rollback.
+    fn restore_core(&self) -> Result<()> {
+        let s = self.backend.load()?;
+        *self.write_map() = s.indexes;
+        *self.write_aliases() = s.aliases;
+        *self.write_saved() = s.saved_queries;
+        *self.write_bindings() = s.role_bindings;
+        *self.write_tokens() = s.tokens;
+        *self.write_credentials() = s.credentials;
+        *self.write_index_bindings() = s.index_bindings;
+        self.rebuild_token_index();
+        Ok(())
     }
 
     /// Reload the whole in-memory catalog from the backend — a **standby** control plane calls this
@@ -570,6 +636,10 @@ impl Registry {
             .write()
             .unwrap_or_else(|e| e.into_inner()) = s.session_epochs;
         self.rebuild_token_index();
+        // Memory now mirrors the store exactly — any change a failed persist's rollback couldn't
+        // undo is gone, so persists are safe again.
+        self.rollback_failed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
@@ -579,10 +649,44 @@ impl Registry {
         self.backend.poll_version()
     }
 
-    /// Attempt to acquire write **leadership** over the backend — a standby promoting itself when the
-    /// previous leader dies. `Ok(true)` if this control plane is now the leader.
+    /// Attempt to acquire write **leadership** over the backend — a standby promoting itself when
+    /// the previous leader dies. `Ok(true)` if this control plane is now the leader.
+    ///
+    /// Ordering is load-bearing: acquire the writer lock → [`reload`](Self::reload) → only then
+    /// confirm writership. Writes are gated on the confirmed flag, so no write can be accepted (let
+    /// alone persisted) between lock acquisition and the reload — a promoted leader can never
+    /// overwrite the dead leader's last writes with its stale pre-promotion catalog. If the reload
+    /// fails, the lock is resigned and this replica stays a standby (retry next tick).
     pub fn try_become_leader(&self) -> Result<bool> {
-        self.backend.try_become_leader()
+        if self.backend.is_leader() {
+            return Ok(true);
+        }
+        if !self.backend.try_become_leader()? {
+            return Ok(false);
+        }
+        match self.reload() {
+            Ok(()) => {
+                self.backend.confirm_leadership();
+                Ok(true)
+            }
+            Err(e) => {
+                self.backend.resign_leadership();
+                Err(e)
+            }
+        }
+    }
+
+    /// Whether leadership is **still** held — the store session owning the writer lock is alive. A
+    /// leader's run loop calls this every tick; `Ok(false)` (or `Err`) means demoted: stop serving
+    /// writes, withdraw readiness, and fall back to the standby path.
+    pub fn verify_leadership(&self) -> Result<bool> {
+        self.backend.verify_leadership()
+    }
+
+    /// Give up write leadership (releasing the store's writer lock if possible) — the demotion path
+    /// after [`verify_leadership`](Self::verify_leadership) fails. No-op on the local JSON backend.
+    pub fn resign_leadership(&self) {
+        self.backend.resign_leadership()
     }
 
     /// Whether this control plane currently holds write leadership (always `true` on the local JSON
@@ -808,8 +912,10 @@ impl Registry {
         }
         self.persist_snapshot()?;
         // A role change must take effect immediately: invalidate outstanding sessions so the subject
-        // re-authenticates with the new roles rather than riding an old token's embedded set.
-        self.revoke_sessions(subject);
+        // re-authenticates with the new roles rather than riding an old token's embedded set. A
+        // revocation persist failure fails the call (retryable) — the binding is durable, the
+        // downgrade of outstanding sessions is not yet.
+        self.revoke_sessions(subject)?;
         Ok(())
     }
 
@@ -852,7 +958,7 @@ impl Registry {
         }
         self.persist_snapshot()?;
         // A scope change takes effect immediately: supersede outstanding sessions (like a role change).
-        self.revoke_sessions(subject);
+        self.revoke_sessions(subject)?;
         Ok(())
     }
 
@@ -942,7 +1048,7 @@ impl Registry {
         }
         self.persist_snapshot()?;
         // Deprovision: kill outstanding sessions so a removed user can't keep riding a live JWT.
-        self.revoke_sessions(subject);
+        self.revoke_sessions(subject)?;
         Ok(())
     }
 
@@ -1070,15 +1176,48 @@ impl Registry {
     /// called when the subject's roles change or its credential is removed, so a role downgrade /
     /// deprovision takes effect immediately (the next call with a stale session is rejected and must
     /// re-authenticate with the current roles).
-    pub fn revoke_sessions(&self, subject: &str) {
-        let mut epochs = self
-            .session_epochs
-            .write()
+    ///
+    /// A revocation that isn't durable isn't a revocation — it would silently un-revoke on the next
+    /// failover — so a persist failure rolls the in-memory bump back and is a **hard error** to the
+    /// caller. The persist runs off the `session_epochs` write guard (the crate's persist-off-lock
+    /// invariant: auth-path `session_epoch` reads never wait on a store round-trip), serialized
+    /// under `sessions_flush` so concurrent revokes can't persist out of order and lose a bump.
+    pub fn revoke_sessions(&self, subject: &str) -> Result<()> {
+        let bumped = now_ms();
+        let prior = {
+            let mut epochs = self
+                .session_epochs
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            epochs.insert(subject.to_string(), bumped)
+        };
+        let _flush = self
+            .sessions_flush
+            .lock()
             .unwrap_or_else(|e| e.into_inner());
-        epochs.insert(subject.to_string(), now_ms());
-        if let Err(e) = self.backend.persist_sessions(&epochs) {
-            tracing::warn!(error = %e, "failed to persist session epochs");
+        // Snapshot under the flush lock (after the bump) so each serialized persist writes the
+        // latest map — a pair of concurrent revokes can't overwrite one bump with a stale clone.
+        let snapshot = self
+            .session_epochs
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Err(e) = self.backend.persist_sessions(&snapshot) {
+            // Roll back this bump (only if no later revoke already superseded it) so memory never
+            // claims a revocation the store doesn't hold.
+            let mut epochs = self
+                .session_epochs
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            if epochs.get(subject) == Some(&bumped) {
+                match prior {
+                    Some(p) => epochs.insert(subject.to_string(), p),
+                    None => epochs.remove(subject),
+                };
+            }
+            return Err(e);
         }
+        Ok(())
     }
 
     /// `index`'s activity events, **newest first**, capped at `limit` (0 = all retained).
@@ -1899,6 +2038,222 @@ mod tests {
         // concern, not the file lock's).
         let reg3 = Registry::with_backend(Box::new(store)).unwrap();
         assert!(reg3.get("docs").is_some());
+    }
+
+    /// An [`InMemoryBackend`] with fault + leadership toggles: persist/load failures on demand and
+    /// the standby → lock → confirm promotion protocol — the shapes the HA fixes are tested against
+    /// without a real store.
+    #[derive(Clone)]
+    struct FlakyBackend(Arc<FlakyInner>);
+
+    struct FlakyInner {
+        store: InMemoryBackend,
+        fail_registry: std::sync::atomic::AtomicBool,
+        fail_sessions: std::sync::atomic::AtomicBool,
+        fail_load: std::sync::atomic::AtomicBool,
+        lock_available: std::sync::atomic::AtomicBool,
+        leader: std::sync::atomic::AtomicBool,
+    }
+
+    impl FlakyBackend {
+        fn new(store: InMemoryBackend, leader: bool) -> Self {
+            Self(Arc::new(FlakyInner {
+                store,
+                fail_registry: false.into(),
+                fail_sessions: false.into(),
+                fail_load: false.into(),
+                lock_available: false.into(),
+                leader: leader.into(),
+            }))
+        }
+        fn set(flag: &std::sync::atomic::AtomicBool, v: bool) {
+            flag.store(v, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl RegistryBackend for FlakyBackend {
+        fn load(&self) -> Result<PersistedState> {
+            if self.0.fail_load.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(RegistryError::Backend("injected load failure".into()));
+            }
+            self.0.store.load()
+        }
+        fn persist_registry(&self, snap: RegistrySnapshot) -> Result<()> {
+            if !self.is_leader() {
+                return Err(RegistryError::NotLeader("standby refuses writes".into()));
+            }
+            if self
+                .0
+                .fail_registry
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(RegistryError::Backend("injected persist failure".into()));
+            }
+            self.0.store.persist_registry(snap)
+        }
+        fn persist_activity(&self, activity: &BTreeMap<String, Vec<ActivityEvent>>) -> Result<()> {
+            self.0.store.persist_activity(activity)
+        }
+        fn persist_sessions(&self, sessions: &BTreeMap<String, i64>) -> Result<()> {
+            if self
+                .0
+                .fail_sessions
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(RegistryError::Backend("injected sessions failure".into()));
+            }
+            self.0.store.persist_sessions(sessions)
+        }
+        fn try_become_leader(&self) -> Result<bool> {
+            Ok(self
+                .0
+                .lock_available
+                .load(std::sync::atomic::Ordering::SeqCst))
+        }
+        fn confirm_leadership(&self) {
+            Self::set(&self.0.leader, true);
+        }
+        fn resign_leadership(&self) {
+            Self::set(&self.0.leader, false);
+        }
+        fn is_leader(&self) -> bool {
+            self.0.leader.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn failed_persist_rolls_back_the_in_memory_change() {
+        // HA-C3: a failed persist must not leave the mutation in memory, or the next successful
+        // mutation's full snapshot silently commits it.
+        let flaky = FlakyBackend::new(InMemoryBackend::default(), true);
+        let reg = Registry::with_backend(Box::new(flaky.clone())).unwrap();
+        reg.create(resolved("docs")).unwrap();
+
+        FlakyBackend::set(&flaky.0.fail_registry, true);
+        assert!(reg.create(resolved("logs")).is_err());
+        assert!(
+            reg.get("logs").is_none(),
+            "the failed create was rolled back from memory"
+        );
+
+        FlakyBackend::set(&flaky.0.fail_registry, false);
+        reg.create(resolved("extra")).unwrap();
+        // The store never saw the failed change ride out on the later successful snapshot.
+        let check = Registry::with_backend(Box::new(flaky.clone())).unwrap();
+        assert!(check.get("docs").is_some());
+        assert!(check.get("extra").is_some());
+        assert!(
+            check.get("logs").is_none(),
+            "the failed change must never become durable"
+        );
+    }
+
+    #[test]
+    fn unrollbackable_persist_failure_refuses_writes_until_resynced() {
+        // If the rollback restore ALSO fails (store unreachable), persists latch off: the next
+        // attempt restores first and fails retryably, rather than silently committing the stale
+        // change from memory.
+        let flaky = FlakyBackend::new(InMemoryBackend::default(), true);
+        let reg = Registry::with_backend(Box::new(flaky.clone())).unwrap();
+        reg.create(resolved("docs")).unwrap();
+
+        FlakyBackend::set(&flaky.0.fail_registry, true);
+        FlakyBackend::set(&flaky.0.fail_load, true);
+        assert!(reg.create(resolved("logs")).is_err());
+
+        // Store is healthy again: the first write is refused (it restores memory — sweeping both
+        // the stale change and its own — and reports retryable), the retry succeeds.
+        FlakyBackend::set(&flaky.0.fail_registry, false);
+        FlakyBackend::set(&flaky.0.fail_load, false);
+        assert!(reg.create(resolved("extra")).is_err());
+        assert!(
+            reg.get("logs").is_none(),
+            "stale change swept by the restore"
+        );
+        assert!(reg.get("extra").is_none(), "refused write swept too");
+        reg.create(resolved("extra")).unwrap();
+
+        let check = Registry::with_backend(Box::new(flaky.clone())).unwrap();
+        assert!(
+            check.get("logs").is_none(),
+            "the stale change never persisted"
+        );
+        assert!(check.get("extra").is_some());
+    }
+
+    #[test]
+    fn standby_refusal_is_not_leader_and_leaves_memory_clean() {
+        // HA-C6: a standby's refused write surfaces as NotLeader (FAILED_PRECONDITION at the gRPC
+        // seam, not Internal) and must not linger in the standby's memory serving stale reads.
+        let flaky = FlakyBackend::new(InMemoryBackend::default(), false);
+        let reg = Registry::with_backend(Box::new(flaky.clone())).unwrap();
+        assert!(!reg.is_leader());
+        assert!(matches!(
+            reg.create(resolved("phantom")),
+            Err(RegistryError::NotLeader(_))
+        ));
+        assert!(
+            reg.get("phantom").is_none(),
+            "the refused write was rolled back from standby memory"
+        );
+    }
+
+    #[test]
+    fn promotion_reloads_before_confirming_writership() {
+        // HA-C2: acquire lock → reload → confirm. A failed reload leaves the replica a standby;
+        // a successful promotion already sees the dead leader's last writes before any write can
+        // be accepted.
+        let store = InMemoryBackend::default();
+        let leader =
+            Registry::with_backend(Box::new(FlakyBackend::new(store.clone(), true))).unwrap();
+        leader.create(resolved("docs")).unwrap();
+
+        let flaky = FlakyBackend::new(store, false);
+        let standby = Registry::with_backend(Box::new(flaky.clone())).unwrap();
+        leader.create(resolved("late-write")).unwrap(); // after the standby's load
+
+        // Lock is winnable but the reload fails → stays standby, no writership confirmed.
+        FlakyBackend::set(&flaky.0.lock_available, true);
+        FlakyBackend::set(&flaky.0.fail_load, true);
+        assert!(standby.try_become_leader().is_err());
+        assert!(
+            !standby.is_leader(),
+            "a failed promotion reload must not confirm writership"
+        );
+
+        // Reload healthy → promoted, and the dead leader's last write is already visible.
+        FlakyBackend::set(&flaky.0.fail_load, false);
+        assert!(standby.try_become_leader().unwrap());
+        assert!(standby.is_leader());
+        assert!(
+            standby.get("late-write").is_some(),
+            "promotion reloaded before confirming writership"
+        );
+    }
+
+    #[test]
+    fn revoke_sessions_persist_failure_is_a_hard_error_and_rolls_back() {
+        // HA-C4: a revocation that isn't durable isn't a revocation — the epoch bump must not stay
+        // in memory (it would silently un-revoke on failover) and the caller must see the failure.
+        let flaky = FlakyBackend::new(InMemoryBackend::default(), true);
+        let reg = Registry::with_backend(Box::new(flaky.clone())).unwrap();
+
+        FlakyBackend::set(&flaky.0.fail_sessions, true);
+        assert!(reg.revoke_sessions("alice").is_err());
+        assert_eq!(
+            reg.session_epoch("alice"),
+            0,
+            "the failed bump was rolled back"
+        );
+        // The failure propagates through the mutations that revoke as a side effect.
+        assert!(reg.set_user_roles("alice", vec!["admin".into()]).is_err());
+
+        FlakyBackend::set(&flaky.0.fail_sessions, false);
+        reg.revoke_sessions("alice").unwrap();
+        assert!(reg.session_epoch("alice") > 0);
+        // Durable: a fresh replica over the same store sees the revocation.
+        let check = Registry::with_backend(Box::new(flaky.clone())).unwrap();
+        assert!(check.session_epoch("alice") > 0);
     }
 
     #[test]

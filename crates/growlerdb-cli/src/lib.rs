@@ -4958,14 +4958,6 @@ async fn control_plane(
 /// `--registry-postgres` is set. Runs on a dedicated OS thread because the Postgres backend is a
 /// blocking client (its calls must not park a tokio worker). Active-passive: readiness tracks
 /// leadership, so a k8s Service routes only to the single leader.
-///
-/// - **Standby** — not the leader: report not-ready (out of the Service), then `try_become_leader`.
-///   Still a standby → poll the store version and [`reload`](growlerdb_controlplane::Registry::reload)
-///   when the leader wrote, staying warm for a fast failover.
-/// - **Promotion** — `try_become_leader` succeeds (the previous leader died and Postgres released the
-///   advisory lock): reload once to catch any write since the last poll, then mark ready — this
-///   replica joins the Service as the writer.
-/// - **Leader** — keep readiness on; it writes to the store directly, so there is nothing to reload.
 #[cfg(feature = "postgres")]
 fn spawn_cp_leadership(
     registry: std::sync::Arc<growlerdb_controlplane::Registry>,
@@ -4974,43 +4966,83 @@ fn spawn_cp_leadership(
     std::thread::spawn(move || {
         // Fast enough that a standby promotes within a fraction of a second of the leader's death
         // (Postgres releases the advisory lock ~immediately on the leader's connection close), and
-        // cheap enough — one `SELECT version` — to poll continuously.
+        // cheap enough — one `SELECT version` per standby tick, one `SELECT 1` leadership probe per
+        // leader tick — to poll continuously.
         let interval = std::time::Duration::from_millis(250);
         let mut last_version: Option<i64> = None;
         loop {
-            if registry.is_leader() {
-                readiness.mark_ready();
-            } else {
-                match registry.try_become_leader() {
-                    Ok(true) => {
-                        // Promoted: resync in case the ex-leader wrote after our last poll, then serve.
-                        if let Err(e) = registry.reload() {
-                            eprintln!("control plane: reload after promotion failed: {e}");
-                        }
-                        println!("control plane: promoted to registry leader — now serving writes");
-                        readiness.mark_ready();
-                    }
-                    Ok(false) => {
-                        // Still a standby: out of the Service, but keep the in-memory catalog warm.
-                        readiness.mark_not_ready();
-                        match registry.backend_version() {
-                            Ok(v) if v != last_version => match registry.reload() {
-                                Ok(()) => last_version = v,
-                                Err(e) => eprintln!("control plane: standby reload failed: {e}"),
-                            },
-                            Ok(_) => {}
-                            Err(e) => eprintln!("control plane: version poll failed: {e}"),
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("control plane: leadership acquisition failed: {e}");
-                        readiness.mark_not_ready();
-                    }
-                }
-            }
+            cp_leadership_tick(&registry, &readiness, &mut last_version);
             std::thread::sleep(interval);
         }
     });
+}
+
+/// One tick of the HA leadership loop — factored out of the spawned thread so the
+/// promote / demote / ready transitions are unit-testable over a stub backend.
+///
+/// - **Leader** — revalidate leadership every tick: the advisory lock lives exactly as long as the
+///   store session, so a dead session (Postgres restart, network drop, worker panic) means a standby
+///   may already be leader. Verified → stay ready. Lost → **demote**: readiness off first (out of
+///   the Service before anything else), resign writership, and fall back to the standby path.
+/// - **Standby** — not-ready (out of the Service), then `try_become_leader`; still a standby → poll
+///   the store version and [`reload`](growlerdb_controlplane::Registry::reload) when it advances
+///   (the leader wrote — any row, including a sessions-only revocation bump), staying warm for a
+///   fast failover.
+/// - **Promotion** — `try_become_leader` succeeds: it reloaded from the store **before** confirming
+///   writership (so the catalog is current before any write can be accepted); mark ready — this
+///   replica joins the Service as the writer. A failed promotion reload surfaces as `Err` and the
+///   replica stays a not-ready standby, retrying next tick.
+#[cfg_attr(not(any(test, feature = "postgres")), allow(dead_code))]
+fn cp_leadership_tick(
+    registry: &growlerdb_controlplane::Registry,
+    readiness: &growlerdb_telemetry::Readiness,
+    last_version: &mut Option<i64>,
+) {
+    if registry.is_leader() {
+        match registry.verify_leadership() {
+            Ok(true) => readiness.mark_ready(),
+            verdict => {
+                readiness.mark_not_ready();
+                registry.resign_leadership();
+                match verdict {
+                    Ok(_) => eprintln!(
+                        "control plane: registry leadership lost (store session died) — demoting \
+                         to standby"
+                    ),
+                    Err(e) => eprintln!(
+                        "control plane: registry leadership could not be verified ({e}) — demoting \
+                         to standby"
+                    ),
+                }
+                // Force a resync on the next standby tick: this replica's catalog may be stale
+                // against whichever replica took over.
+                *last_version = None;
+            }
+        }
+        return;
+    }
+    match registry.try_become_leader() {
+        Ok(true) => {
+            println!("control plane: promoted to registry leader — now serving writes");
+            readiness.mark_ready();
+        }
+        Ok(false) => {
+            // Still a standby: out of the Service, but keep the in-memory catalog warm.
+            readiness.mark_not_ready();
+            match registry.backend_version() {
+                Ok(v) if v != *last_version => match registry.reload() {
+                    Ok(()) => *last_version = v,
+                    Err(e) => eprintln!("control plane: standby reload failed: {e}"),
+                },
+                Ok(_) => {}
+                Err(e) => eprintln!("control plane: version poll failed: {e}"),
+            }
+        }
+        Err(e) => {
+            eprintln!("control plane: leadership acquisition failed: {e}");
+            readiness.mark_not_ready();
+        }
+    }
 }
 
 /// Load a shard's persisted resolved definition (`<data_dir>/<index>/index.json`), falling back
@@ -5424,6 +5456,116 @@ mod tests {
             panic!("expected the control-plane subcommand");
         };
         assert_eq!(registry_postgres, None);
+    }
+
+    /// A scripted [`growlerdb_controlplane::RegistryBackend`] simulating an HA store: the writer
+    /// lock's availability and the lock-holding session's liveness are toggles, so
+    /// [`cp_leadership_tick`]'s promote / demote / ready transitions are testable without Postgres.
+    #[derive(Clone, Default)]
+    struct ScriptedBackend(std::sync::Arc<ScriptedState>);
+
+    #[derive(Default)]
+    struct ScriptedState {
+        leader: std::sync::atomic::AtomicBool,
+        lock_available: std::sync::atomic::AtomicBool,
+        session_dead: std::sync::atomic::AtomicBool,
+    }
+
+    impl growlerdb_controlplane::RegistryBackend for ScriptedBackend {
+        fn load(&self) -> growlerdb_controlplane::Result<growlerdb_controlplane::PersistedState> {
+            Ok(growlerdb_controlplane::PersistedState::default())
+        }
+        fn persist_registry(
+            &self,
+            _: growlerdb_controlplane::RegistrySnapshot,
+        ) -> growlerdb_controlplane::Result<()> {
+            Ok(())
+        }
+        fn persist_activity(
+            &self,
+            _: &std::collections::BTreeMap<String, Vec<growlerdb_controlplane::ActivityEvent>>,
+        ) -> growlerdb_controlplane::Result<()> {
+            Ok(())
+        }
+        fn persist_sessions(
+            &self,
+            _: &std::collections::BTreeMap<String, i64>,
+        ) -> growlerdb_controlplane::Result<()> {
+            Ok(())
+        }
+        fn poll_version(&self) -> growlerdb_controlplane::Result<Option<i64>> {
+            Ok(Some(1))
+        }
+        fn try_become_leader(&self) -> growlerdb_controlplane::Result<bool> {
+            use std::sync::atomic::Ordering;
+            Ok(self.0.lock_available.load(Ordering::SeqCst)
+                && !self.0.session_dead.load(Ordering::SeqCst))
+        }
+        fn confirm_leadership(&self) {
+            self.0
+                .leader
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn resign_leadership(&self) {
+            self.0
+                .leader
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn verify_leadership(&self) -> growlerdb_controlplane::Result<bool> {
+            use std::sync::atomic::Ordering;
+            if self.0.session_dead.load(Ordering::SeqCst) {
+                self.0.leader.store(false, Ordering::SeqCst);
+                return Ok(false);
+            }
+            Ok(self.0.leader.load(Ordering::SeqCst))
+        }
+        fn is_leader(&self) -> bool {
+            self.0.leader.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// The HA leadership tick: a standby stays not-ready, promotes (ready) once the writer lock is
+    /// winnable, **demotes within one tick** when the lock-holding session dies (readiness off, out
+    /// of the Service — the HA-C1 fix: no eternal two-ready split), and re-promotes on recovery.
+    #[test]
+    fn cp_leadership_tick_promotes_demotes_and_repromotes() {
+        use std::sync::atomic::Ordering;
+        let backend = ScriptedBackend::default();
+        let registry = Registry::with_backend(Box::new(backend.clone())).unwrap();
+        let readiness = growlerdb_telemetry::Readiness::new();
+        let mut last_version = None;
+
+        // Standby: the lock is held elsewhere → not ready.
+        cp_leadership_tick(&registry, &readiness, &mut last_version);
+        assert!(!readiness.is_ready());
+        assert!(!registry.is_leader());
+
+        // Lock released (old leader died) → promoted and ready in one tick.
+        backend.0.lock_available.store(true, Ordering::SeqCst);
+        cp_leadership_tick(&registry, &readiness, &mut last_version);
+        assert!(registry.is_leader());
+        assert!(readiness.is_ready());
+
+        // Steady state: leadership re-verified each tick, stays ready.
+        cp_leadership_tick(&registry, &readiness, &mut last_version);
+        assert!(readiness.is_ready());
+
+        // The lock-holding session dies → demoted the same tick: readiness withdrawn, writership
+        // resigned — the old leader can never sit READY serving a frozen catalog.
+        backend.0.session_dead.store(true, Ordering::SeqCst);
+        cp_leadership_tick(&registry, &readiness, &mut last_version);
+        assert!(!readiness.is_ready());
+        assert!(!registry.is_leader());
+
+        // While the session is dead the standby can't re-acquire; still not ready.
+        cp_leadership_tick(&registry, &readiness, &mut last_version);
+        assert!(!readiness.is_ready());
+
+        // Session revived and the lock still free → re-promotes.
+        backend.0.session_dead.store(false, Ordering::SeqCst);
+        cp_leadership_tick(&registry, &readiness, &mut last_version);
+        assert!(registry.is_leader());
+        assert!(readiness.is_ready());
     }
 
     #[test]

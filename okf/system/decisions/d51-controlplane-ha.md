@@ -52,5 +52,15 @@ external store is owned in-repo (the store is an implementation detail, not a us
 [chaos](/quality/reliability.md) suite: a CP replica kill and a leader/store failover under live
 mutation must assert routing + registration continuity.
 
+The 2026-07-26 [adversarial audit](/quality/audits/2026-07-26-true-ha-adversarial-review.md)
+(HA-C1..C7) hardened the implemented leader/standby protocol: leadership is **re-verified every
+tick** (a dead lock-holding session demotes the leader immediately — readiness off, writership
+resigned, standby race rejoined on a fresh connection); promotion is **lock → reload → confirm**, so
+a new leader can never persist a stale snapshot; every persist carries an **expected-version guard**
+— the store-level CAS this decision promised — refusing (retryable `NOT_LEADER`,
+`FAILED_PRECONDITION`) and fail-stopping a replica whose leadership lapsed; a failed persist **rolls
+the mutation back out of memory**; session-epoch revocations are **hard-fail durable** and the
+standby poll observes all store rows so they survive failover.
+
 **Status.** Accepted (design). Implementation staged in the `true-ha` epic; not yet built. Extends the
 control-plane component and refines the availability posture in [high availability](/system/high-availability.md).
