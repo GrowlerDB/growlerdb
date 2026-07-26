@@ -404,6 +404,90 @@ async fn cold_park_evicts_bulk_keeps_aux_and_serves_read_through() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_cold_replica_serves_a_parked_window_from_a_bare_node() {
+    // D53 replica read-through: a replica on ANOTHER node has no local copy of the window. It opens
+    // the parked window by fetching the aux.redb + location.arr sidecars from shared object storage
+    // (the keys the park recorded), then reads the index through the object store — no rebuild from
+    // source, no primary→replica copy stream. This is what makes a re-placed/replica holder answer
+    // in seconds instead of rebuilding.
+    let idx = docs_index();
+    let w: i64 = 1_700_000_000_000;
+    let id = ShardId::window("docs", w);
+
+    // --- Primary node: build + cold-park a window to shared object storage. ---
+    let primary_root = tempfile::tempdir().unwrap();
+    let primary = LocalIndexStore::open(primary_root.path()).unwrap();
+    let shard = primary.create_shard(&id, &idx).unwrap();
+    IndexWriter::write(
+        &shard,
+        &CommitBatch::from_upserts(
+            vec![doc("doc-1", "alpha"), doc("doc-2", "beta alpha")],
+            SourceCheckpoint::iceberg(7),
+            "b1",
+        ),
+    )
+    .unwrap();
+    shard.set_event_bounds(Some(10), Some(99)).unwrap();
+    let window_dir = primary.shard_path(&id);
+    let backup_root = tempfile::tempdir().unwrap();
+    let store = fs_store(backup_root.path()).unwrap();
+    let staging = primary_root.path().join(".cold-staging");
+    let prefix = "cold/docs/w1700000000000";
+    let marker = cold_park(
+        shard,
+        "docs",
+        w,
+        &window_dir,
+        &staging,
+        &store,
+        prefix,
+        Some(serde_json::to_string(&idx).unwrap()),
+    )
+    .await
+    .unwrap();
+    // The park recorded the sidecar keys a replica fetches.
+    assert_eq!(
+        marker.aux_key.as_deref(),
+        Some("cold/docs/w1700000000000/data/aux.redb")
+    );
+    assert_eq!(
+        marker.location_key.as_deref(),
+        Some("cold/docs/w1700000000000/data/location.arr")
+    );
+
+    // --- Replica node: a DIFFERENT store root with NO local window data. ---
+    let replica_root = tempfile::tempdir().unwrap();
+    let replica = LocalIndexStore::open(replica_root.path()).unwrap();
+    let scratch = replica_root.path().join("replica-scratch/docs/w");
+    let cache = RangeCache::new(8 * 1024 * 1024);
+    let (store2, marker2, idx2) = (store.clone(), marker.clone(), idx.clone());
+    let hits = tokio::task::spawn_blocking(move || {
+        let cold = replica
+            .open_cold_replica(&idx2, &scratch, store2, &marker2, cache)
+            .unwrap();
+        // Read-through search works with no local index data...
+        let hits = cold
+            .search_all(&Query::parse("body:alpha").unwrap(), 10)
+            .unwrap()
+            .len();
+        // ...and the layered locator resolves a key: postings read-through, the slot from the
+        // fetched location array.
+        let key = CompositeKey::new(vec![], vec![("id".into(), Value::from("doc-1"))]);
+        assert!(
+            cold.locate(&key).unwrap().is_some(),
+            "the replica locates a key via the fetched location array"
+        );
+        hits
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        hits, 2,
+        "the replica serves both docs read-through from object storage, with no local copy"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backup_gc_prunes_superseded_splits() {
     // Backup GC: after the primary compacts (fusing many segments into one), a re-backup
     // to the same prefix must remove the now-orphaned old segment objects from the store, not just

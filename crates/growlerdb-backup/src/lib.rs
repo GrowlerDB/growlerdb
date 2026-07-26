@@ -438,6 +438,10 @@ async fn cold_park_to_store(
             Err(_) => (None, None),
         }
     };
+    // The aux sidecars `backup()` already uploaded to `{base}/data/` (they survive the index-only
+    // bundling above and the manifest keeps them): recorded here so a **replica** on another node can
+    // fetch them and open the window read-through (D53). A parked window is immutable, so this is a
+    // one-time, frozen snapshot — no continuous re-sync.
     let marker = ColdMarker {
         object_prefix,
         event_min: zone.map(|(lo, _)| lo),
@@ -446,6 +450,8 @@ async fn cold_park_to_store(
         hotcache_key,
         bundle_key,
         bundle_manifest_key,
+        aux_key: Some(format!("{base}/data/aux.redb")),
+        location_key: Some(format!("{base}/data/location.arr")),
     };
     std::fs::write(
         window_dir.join(growlerdb_index::COLD_MARKER),
