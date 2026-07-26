@@ -73,16 +73,35 @@ public final class WriteClient implements BatchWriter {
 
   private final ManagedChannel channel;
   private final WriteGrpc.WriteBlockingStub stub;
+  /**
+   * The index every call through the untagged {@link BatchWriter}-shaped methods carries
+   * ({@link #write(DocBatch)}, {@link #checkpoint()}, {@link #drainedTo}) — so a <b>pool node</b>
+   * serving many indexes over one endpoint can dispatch on it. Empty = the node's sole served
+   * index; a per-index Node ignores it. Callers that tag per call ({@code write(batch, index)})
+   * bypass this default.
+   */
+  private final String index;
+
   private final int deadlineSeconds;
   private final int maxAttempts;
   private final long initialBackoffMs;
   private final long maxBackoffMs;
 
-  /** Connect to a GrowlerDB Node at {@code host:port} (plaintext; TLS/auth are future work). */
+  /** Connect to a GrowlerDB Node at {@code host:port} (plaintext; TLS/auth are future work), untagged. */
   public WriteClient(String host, int port) {
+    this(host, port, "");
+  }
+
+  /**
+   * As above, tagged: every untagged-shaped call carries {@code index}, so the resume path
+   * ({@code GetCheckpoint}) hits the same {@code (index, shard)} the writes land on — a pool node
+   * with several indexes rejects an empty selector as ambiguous.
+   */
+  public WriteClient(String host, int port, String index) {
     this(
         host,
         port,
+        index,
         deadlineSecondsFromEnv(),
         DEFAULT_MAX_ATTEMPTS,
         DEFAULT_INITIAL_BACKOFF_MS,
@@ -109,6 +128,18 @@ public final class WriteClient implements BatchWriter {
   WriteClient(
       String host,
       int port,
+      int deadlineSeconds,
+      int maxAttempts,
+      long initialBackoffMs,
+      long maxBackoffMs) {
+    this(host, port, "", deadlineSeconds, maxAttempts, initialBackoffMs, maxBackoffMs);
+  }
+
+  /** The full constructor: index tag + deadline/retry tunables. */
+  WriteClient(
+      String host,
+      int port,
+      String index,
       int deadlineSeconds,
       int maxAttempts,
       long initialBackoffMs,
@@ -148,15 +179,16 @@ public final class WriteClient implements BatchWriter {
       s = s.withInterceptors(interceptor);
     }
     this.stub = s;
+    this.index = index;
     this.deadlineSeconds = deadlineSeconds;
     this.maxAttempts = maxAttempts;
     this.initialBackoffMs = initialBackoffMs;
     this.maxBackoffMs = maxBackoffMs;
   }
 
-  /** Commit a batch; returns the committed index snapshot. */
+  /** Commit a batch tagged with this client's default index; returns the committed index snapshot. */
   public long write(DocBatch batch) {
-    return write(batch, "");
+    return write(batch, index);
   }
 
   /**
@@ -196,9 +228,11 @@ public final class WriteClient implements BatchWriter {
   /**
    * The checkpoint for a specific time {@code window} on a windowed node — the connector
    * resumes each window independently. {@code window == 0} reads the node's single (ordinal) shard.
+   * Carries this client's default index tag, so resume asks the same {@code (index, shard)} the
+   * writes land on.
    */
   public ShardCheckpoint checkpoint(long window) {
-    return checkpoint(window, "");
+    return checkpoint(window, index);
   }
 
   /**

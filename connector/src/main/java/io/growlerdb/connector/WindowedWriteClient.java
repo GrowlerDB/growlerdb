@@ -4,6 +4,8 @@ import io.growlerdb.proto.v1.DocBatch;
 import io.growlerdb.proto.v1.DocOp;
 import io.growlerdb.proto.v1.Value;
 import io.growlerdb.proto.v1.WindowingConfig;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.SortedMap;
@@ -29,6 +31,14 @@ import java.util.concurrent.ConcurrentMap;
  * each window prunes its idempotency records instead of growing them without bound. Deletes carry
  * no window value, so they broadcast to every touched/known window (the owner re-broadcasts to its
  * own windows); append-mostly sources rarely delete.
+ *
+ * <p><b>Placement staleness.</b> The window → owner pin is a cache, not a lease: the CP can re-place
+ * a window (its node died, or was deposed) while this process runs. When a window's write fails
+ * transport-style past the write client's own retry budget, the pin is <b>invalidated</b> and the
+ * owner re-resolved from the CP — once in place (the sub-batch retries onto the new owner; the
+ * idempotent {@code batch_id} makes a replay of an already-committed write a no-op), and again on
+ * the next batch if that also fails. Without this, a re-placed window's writes would hammer the old
+ * endpoint for the process lifetime.
  */
 public final class WindowedWriteClient implements BatchWriter {
 
@@ -36,6 +46,8 @@ public final class WindowedWriteClient implements BatchWriter {
   private final ControlPlaneClient controlPlane;
   private final WindowRouter windowRouter;
   private final SnapshotLineage lineage;
+  /** Endpoint → write client; injectable so tests can dial with tight deadlines/retries. */
+  private final java.util.function.Function<String, WriteClient> dialer;
   /** window → the write client for its owning node (resolved from the CP, cached). */
   private final ConcurrentMap<Long, WriteClient> windowClient = new ConcurrentHashMap<>();
   /** node endpoint → write client (one channel per node, shared across its windows). */
@@ -43,21 +55,67 @@ public final class WindowedWriteClient implements BatchWriter {
 
   public WindowedWriteClient(
       String index, ControlPlaneClient controlPlane, WindowingConfig windowing, SnapshotLineage lineage) {
+    this(index, controlPlane, windowing, lineage, e -> connect(e, index));
+  }
+
+  /** As above with an explicit {@code dialer} — used by tests to tighten the write retry budget. */
+  WindowedWriteClient(
+      String index,
+      ControlPlaneClient controlPlane,
+      WindowingConfig windowing,
+      SnapshotLineage lineage,
+      java.util.function.Function<String, WriteClient> dialer) {
     this.index = index;
     this.controlPlane = controlPlane;
     this.windowRouter = new WindowRouter(windowing);
     this.lineage = lineage;
+    this.dialer = dialer;
   }
 
   @Override
   public long write(DocBatch batch) {
     long maxSnapshot = 0L;
     for (var entry : partition(batch, windowRouter, windowClient.keySet()).entrySet()) {
-      // Tag each sub-batch with this index, so a pool node serving many indexes dispatches it.
-      maxSnapshot =
-          Math.max(maxSnapshot, clientForWindow(entry.getKey()).write(entry.getValue(), index));
+      maxSnapshot = Math.max(maxSnapshot, writeWindow(entry.getKey(), entry.getValue()));
     }
     return maxSnapshot;
+  }
+
+  /**
+   * Commit one window's sub-batch to its owning node (tagged with this index, so a pool node
+   * serving many indexes dispatches it). A transport-class failure — the pinned owner unreachable
+   * past {@link WriteClient}'s own in-place retry budget — invalidates the window's pin and
+   * re-resolves the owner from the CP once: if the CP re-placed the window, the retry lands on the
+   * new owner (the idempotent {@code batch_id} dedups a replay); if not, the second failure
+   * propagates with the pin dropped, so the NEXT batch re-resolves too instead of staying wedged.
+   */
+  private long writeWindow(long window, DocBatch sub) {
+    try {
+      return clientForWindow(window).write(sub, index);
+    } catch (StatusRuntimeException e) {
+      if (!isPlacementSuspect(e.getStatus().getCode())) {
+        throw e; // an application error — re-resolving placement can't help
+      }
+      windowClient.remove(window);
+      try {
+        return clientForWindow(window).write(sub, index);
+      } catch (StatusRuntimeException again) {
+        if (isPlacementSuspect(again.getStatus().getCode())) {
+          windowClient.remove(window);
+        }
+        throw again;
+      }
+    }
+  }
+
+  /**
+   * Transport-class failures that may mean "this window's pinned owner is gone" (as opposed to an
+   * application rejection, where the placement is fine and a re-resolve is noise).
+   */
+  private static boolean isPlacementSuspect(Status.Code code) {
+    return code == Status.Code.UNAVAILABLE
+        || code == Status.Code.DEADLINE_EXCEEDED
+        || code == Status.Code.CANCELLED;
   }
 
   /**
@@ -117,7 +175,7 @@ public final class WindowedWriteClient implements BatchWriter {
         window,
         w -> {
           String endpoint = controlPlane.resolveWindowOwner(index, w).getEndpoint();
-          return byEndpoint.computeIfAbsent(endpoint, WindowedWriteClient::connect);
+          return byEndpoint.computeIfAbsent(endpoint, dialer);
         });
   }
 
@@ -151,7 +209,7 @@ public final class WindowedWriteClient implements BatchWriter {
       if (s.getWindow() == 0 || s.getPrimary().isEmpty()) {
         continue;
       }
-      WriteClient client = byEndpoint.computeIfAbsent(s.getPrimary(), WindowedWriteClient::connect);
+      WriteClient client = byEndpoint.computeIfAbsent(s.getPrimary(), dialer);
       WriteClient.ShardCheckpoint cp = client.checkpoint(s.getWindow(), index);
       if (cp != null) {
         out.add(cp); // an un-committed (just-placed) window doesn't constrain resume
@@ -161,13 +219,13 @@ public final class WindowedWriteClient implements BatchWriter {
   }
 
   /** Parse a routable {@code [scheme://]host:port} endpoint into a {@link WriteClient}. */
-  private static WriteClient connect(String endpoint) {
+  private static WriteClient connect(String endpoint, String index) {
     String bare = endpoint.replaceFirst("^https?://", "");
     String[] hp = bare.split(":", 2);
     if (hp.length != 2) {
       throw new IllegalArgumentException("window owner endpoint must be host:port, got `" + endpoint + "`");
     }
-    return new WriteClient(hp[0].trim(), Integer.parseInt(hp[1].trim()));
+    return new WriteClient(hp[0].trim(), Integer.parseInt(hp[1].trim()), index);
   }
 
   @Override

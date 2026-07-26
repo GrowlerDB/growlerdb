@@ -45,6 +45,23 @@ class ConnectorAppTest {
   }
 
   @Test
+  void shardEndpointsFromCpRejectsADuplicateOrdinal() {
+    // One ShardStatus per ordinal is the registry contract; two entries claiming shard 1 makes the
+    // owner of its writes ambiguous. Silent last-wins would pick one arbitrarily — writes could land
+    // where reads never look — so it must fail loudly instead.
+    GetIndexResponse entry =
+        indexWithShards(2)
+            .addShardStatus(ShardStatus.newBuilder().setOrdinal(0).setPrimary("n0:50051"))
+            .addShardStatus(ShardStatus.newBuilder().setOrdinal(1).setPrimary("n1:50051"))
+            .addShardStatus(ShardStatus.newBuilder().setOrdinal(1).setPrimary("n9:50051"))
+            .build();
+    IllegalStateException e =
+        assertThrows(IllegalStateException.class, () -> ConnectorApp.shardEndpointsFromCp(entry));
+    assertTrue(e.getMessage().contains("shard 1"), e.getMessage());
+    assertTrue(e.getMessage().contains("n1:50051") && e.getMessage().contains("n9:50051"), e.getMessage());
+  }
+
+  @Test
   void routingFollowsPartitionFields() {
     // Partitioned key → partition routing; unpartitioned → hash. Matches the Gateway's
     // ResolvedIndex::routing_strategy so writes land where reads look.

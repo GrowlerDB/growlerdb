@@ -29,10 +29,11 @@ public final class ShardedWriteClient implements BatchWriter {
   /** Fills in sequence numbers the Nodes don't have at resume time. */
   private final SnapshotLineage lineage;
   /**
-   * The index every sub-batch is tagged with, so a **pool node** serving many indexes over one
-   * endpoint can dispatch the write on its {@code (index, shard)} selector. Empty = the node's sole
-   * served index (a per-index sharded Node ignores it), so untagged single-index deployments are
-   * unchanged — the hash counterpart to {@link WindowedWriteClient}'s per-index tagging.
+   * The index every sub-batch AND checkpoint call is tagged with, so a **pool node** serving many
+   * indexes over one endpoint can dispatch on its {@code (index, shard)} selector — resume asks the
+   * same selector the writes land on. Empty = the node's sole served index (a per-index sharded
+   * Node ignores it), so untagged single-index deployments are unchanged — the hash counterpart to
+   * {@link WindowedWriteClient}'s per-index tagging.
    */
   private final String index;
 
@@ -85,9 +86,12 @@ public final class ShardedWriteClient implements BatchWriter {
       }
       parsed.add(new HostPort(hp[0].trim(), port));
     }
+    // Tag each shard client with the index so EVERY call — writes and the resume/drain
+    // checkpoints alike — carries the (index, shard) selector: a pool node serving several indexes
+    // rejects an untagged GetCheckpoint as ambiguous, which would crash-loop resume.
     List<WriteClient> clients = new ArrayList<>(parsed.size());
     for (HostPort hp : parsed) {
-      clients.add(new WriteClient(hp.host(), hp.port()));
+      clients.add(new WriteClient(hp.host(), hp.port(), index));
     }
     this.shards = List.copyOf(clients);
     this.router = router;
