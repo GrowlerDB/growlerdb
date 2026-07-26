@@ -23,16 +23,19 @@ use growlerdb_proto::v1::{
     BackupIndexResponse, BackupStatusRequest, BackupStatusResponse, ClosePitRequest,
     ClosePitResponse, CompactIndexRequest, CompactIndexResponse, DescribeIndexRequest,
     DescribeIndexResponse, ExplainRequest, ExplainResponse, ExportRequest, GetByKeyRequest,
-    GetByKeyResponse, OpenPitRequest, OpenPitResponse, ReconcileIndexRequest,
-    ReconcileIndexResponse, ReindexIndexRequest, ReindexIndexResponse, SearchRequest,
-    SearchResponse, SemanticSearchRequest, SuggestRequest, SuggestResponse,
+    GetByKeyResponse, GetCheckpointRequest, GetCheckpointResponse, OpenPitRequest, OpenPitResponse,
+    ReconcileIndexRequest, ReconcileIndexResponse, ReindexIndexRequest, ReindexIndexResponse,
+    SearchRequest, SearchResponse, SemanticSearchRequest, SuggestRequest, SuggestResponse,
+    WriteRequest, WriteResponse,
 };
 use growlerdb_proto::{
-    Admin, AdminServer, Lookup, LookupServer, Search, SearchServer, Suggest, SuggestServer,
+    Admin, AdminServer, Lookup, LookupServer, Search, SearchServer, Suggest, SuggestServer, Write,
+    WriteServer,
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
+use crate::windowed_ingest::{WindowedWriteService, MAX_WRITE_MESSAGE_BYTES};
 use crate::windowed_routing::{
     SharedAdminWindows, SharedLookupWindows, SharedSearchWindows, SharedSuggestWindows,
     WindowedAdminService, WindowedLookupService, WindowedSearchService, WindowedSuggestService,
@@ -49,6 +52,12 @@ pub type SharedSuggestIndexes = Arc<RwLock<BTreeMap<String, SharedSuggestWindows
 pub type SharedLookupIndexes = Arc<RwLock<BTreeMap<String, SharedLookupWindows>>>;
 /// The admin (DescribeIndex) counterpart to [`SharedSearchIndexes`].
 pub type SharedAdminIndexes = Arc<RwLock<BTreeMap<String, SharedAdminWindows>>>;
+/// A pool node's live `index → WindowedWriteService` map: the write counterpart to
+/// [`SharedSearchIndexes`]. Each entry is a full single-index windowed writer (it owns that index's
+/// windows and creates them on first write); the [`PoolWriteService`] routes each `Write` on its
+/// `index` selector to the right one. Behind a lock so a dynamically-assigned index's writer can be
+/// inserted without a restart (the read maps grow the same way, one level down at the window).
+pub type SharedWriteIndexes = Arc<RwLock<BTreeMap<String, WindowedWriteService>>>;
 
 /// Route an index selector to its per-index shared map `T` (one of the `SharedX` window maps), or an
 /// `InvalidArgument` when this node doesn't serve it. An **empty** selector resolves to the sole
@@ -310,6 +319,53 @@ impl Admin for PoolAdminService {
     }
 }
 
+/// The **index-dispatch** `Write` service for a pool node (D52): routes each `Write` / `GetCheckpoint`
+/// on its `index` selector to that index's [`WindowedWriteService`], which then routes on the window
+/// (creating the window shard on first write and publishing it to the query paths). The write
+/// counterpart to [`PoolSearchService`]; the same empty-selector-defaults-to-sole-index rule holds, so
+/// a single-index pool node is writable by a connector that doesn't stamp the index.
+pub struct PoolWriteService {
+    by_index: SharedWriteIndexes,
+}
+
+impl PoolWriteService {
+    /// A write multiplexer over the shared `index → writer` map.
+    pub fn new(by_index: SharedWriteIndexes) -> Self {
+        Self { by_index }
+    }
+
+    /// Wrap as a mountable tonic [`WriteServer`] with the large-commit decode cap (a catch-up batch
+    /// spanning many windows can be large — matching the single-index windowed writer).
+    pub fn into_server(self) -> WriteServer<Self> {
+        WriteServer::new(self).max_decoding_message_size(MAX_WRITE_MESSAGE_BYTES)
+    }
+
+    /// The single-index windowed writer for `index`, or `InvalidArgument` if unserved (an empty
+    /// selector resolves to the sole served index when there is exactly one).
+    fn writer(&self, index: &str) -> Result<WindowedWriteService, Status> {
+        route_index(&self.by_index, index)
+    }
+}
+
+#[tonic::async_trait]
+impl Write for PoolWriteService {
+    async fn write(
+        &self,
+        request: Request<WriteRequest>,
+    ) -> Result<Response<WriteResponse>, Status> {
+        let svc = self.writer(&request.get_ref().index)?;
+        Write::write(&svc, request).await
+    }
+
+    async fn get_checkpoint(
+        &self,
+        request: Request<GetCheckpointRequest>,
+    ) -> Result<Response<GetCheckpointResponse>, Status> {
+        let svc = self.writer(&request.get_ref().index)?;
+        Write::get_checkpoint(&svc, request).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,6 +444,189 @@ mod tests {
                 .collect()),
             Err(s) => Err(s.code()),
         }
+    }
+
+    /// A windowed index def (`id` KEYWORD + a `ts` Long window field), for the pool write path.
+    fn windowed_resolved(index: &str) -> growlerdb_core::ResolvedIndex {
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("ts", SourceType::Long),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        IndexDefinition::from_yaml(&format!(
+            "name: {index}\nsource: {{ iceberg: {{ catalog: g, table: g.{index} }} }}\nwindowing: {{ field: ts, granularity: daily }}\nmapping: {{ selection: EXPLICIT, fields: [ {{ path: id, type: KEYWORD, fast: true }}, {{ path: ts, format: epoch_us, fast: true }} ] }}\n",
+        ))
+        .unwrap()
+        .resolve(&src)
+        .unwrap()
+    }
+
+    /// A single-index [`WindowedWriteService`] for `index` sharing `search` (so a written doc is
+    /// queryable through the same map a [`PoolSearchService`] reads) — the per-index writer a pool
+    /// node holds. Returns the writer and its tempdir (kept alive by the caller).
+    fn writer_for(
+        index: &str,
+        search: SharedSearchWindows,
+    ) -> (WindowedWriteService, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalIndexStore::open(tmp.path()).unwrap();
+        let resolved = windowed_resolved(index);
+        let windowing = resolved.windowing.clone().unwrap();
+        let suggest: SharedSuggestWindows = Arc::new(RwLock::new(BTreeMap::new()));
+        let lookup: SharedLookupWindows = Arc::new(RwLock::new(BTreeMap::new()));
+        let admin: SharedAdminWindows = Arc::new(RwLock::new(BTreeMap::new()));
+        let gw = Arc::new(crate::Gateway::windowed(vec![], windowing, vec![]));
+        let svc = WindowedWriteService::new(
+            store,
+            resolved,
+            format!("g.{index}"),
+            growlerdb_source::IcebergConfig::local(),
+            BTreeMap::new(),
+            search,
+            suggest,
+            lookup,
+            admin,
+            gw,
+            Arc::new(|_w, _h| {}),
+        )
+        .unwrap();
+        (svc, tmp)
+    }
+
+    /// An upsert of `id` into daily window `day` (canonical micros).
+    fn win_upsert(id: &str, day: i64) -> growlerdb_core::DocOp {
+        const DAY: i64 = 86_400_000_000;
+        let ts = day * DAY + 5;
+        let mut f = BTreeMap::new();
+        f.insert("id".to_string(), Value::from(id));
+        f.insert("ts".to_string(), Value::Int(ts));
+        growlerdb_core::DocOp::Upsert(LocatedDoc {
+            doc: Document::new(
+                CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]),
+                f,
+            ),
+            iceberg_file: "f".into(),
+            row_position: 0,
+        })
+    }
+
+    async fn pool_write(
+        mux: &PoolWriteService,
+        index: &str,
+        batch: CommitBatch,
+    ) -> Result<u64, tonic::Code> {
+        let req = WriteRequest {
+            batch: Some(batch.into()),
+            index: index.into(),
+        };
+        match Write::write(mux, Request::new(req)).await {
+            Ok(resp) => Ok(resp.into_inner().snapshot),
+            Err(s) => Err(s.code()),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pool_write_dispatches_by_index_and_creates_windows_lazily() {
+        const DAY: i64 = 86_400_000_000;
+        // The read-side maps shared with the writers: a write into an index's window must be
+        // queryable through the same map a PoolSearchService fronts.
+        let search_a: SharedSearchWindows = Arc::new(RwLock::new(BTreeMap::new()));
+        let search_b: SharedSearchWindows = Arc::new(RwLock::new(BTreeMap::new()));
+        let (wa, _ta) = writer_for("alpha", search_a.clone());
+        let (wb, _tb) = writer_for("beta", search_b.clone());
+
+        // One pool writer fronting BOTH indexes' writers — the multi-index-per-node write path.
+        let writes = PoolWriteService::new(Arc::new(RwLock::new(BTreeMap::from([
+            ("alpha".to_string(), wa),
+            ("beta".to_string(), wb),
+        ]))));
+        // ...and a pool reader over the same shared window maps.
+        let reads = PoolSearchService::new(Arc::new(RwLock::new(BTreeMap::from([
+            ("alpha".to_string(), search_a),
+            ("beta".to_string(), search_b),
+        ]))));
+
+        // Each write is dispatched to its index's writer, which lazily creates the day-10 window.
+        assert!(
+            pool_write(
+                &writes,
+                "alpha",
+                CommitBatch::new(
+                    vec![win_upsert("a", 10)],
+                    SourceCheckpoint::iceberg(1),
+                    "b1"
+                )
+            )
+            .await
+            .unwrap()
+                > 0
+        );
+        assert!(
+            pool_write(
+                &writes,
+                "beta",
+                CommitBatch::new(
+                    vec![win_upsert("b", 10)],
+                    SourceCheckpoint::iceberg(1),
+                    "b1"
+                )
+            )
+            .await
+            .unwrap()
+                > 0
+        );
+
+        // The doc landed in the CORRECT index's window (dispatch went to the right writer).
+        assert_eq!(hit_ids(&reads, "alpha", 10 * DAY).await.unwrap(), vec!["a"]);
+        assert_eq!(hit_ids(&reads, "beta", 10 * DAY).await.unwrap(), vec!["b"]);
+        assert!(hit_ids(&reads, "alpha", 10 * DAY).await.unwrap() != vec!["b".to_string()]);
+
+        // GetCheckpoint dispatches by index too: alpha's day-10 window resumes from its checkpoint.
+        let cp = Write::get_checkpoint(
+            &writes,
+            Request::new(GetCheckpointRequest {
+                window: 10 * DAY,
+                index: "alpha".into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(cp.snapshot, 1);
+
+        // An index this node doesn't serve is a loud InvalidArgument (as on the read path).
+        assert_eq!(
+            pool_write(
+                &writes,
+                "gamma",
+                CommitBatch::new(
+                    vec![win_upsert("c", 10)],
+                    SourceCheckpoint::iceberg(1),
+                    "b1"
+                )
+            )
+            .await
+            .unwrap_err(),
+            tonic::Code::InvalidArgument
+        );
+        // An empty selector with >1 index served is ambiguous → InvalidArgument.
+        assert_eq!(
+            pool_write(
+                &writes,
+                "",
+                CommitBatch::new(
+                    vec![win_upsert("d", 10)],
+                    SourceCheckpoint::iceberg(1),
+                    "b1"
+                )
+            )
+            .await
+            .unwrap_err(),
+            tonic::Code::InvalidArgument
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

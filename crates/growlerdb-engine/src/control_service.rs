@@ -1678,8 +1678,12 @@ async fn shard_checkpoint(endpoint: &str, window: i64) -> Result<(i64, u64), &'s
     let mut client = WriteClient::with_interceptor(channel, stamp);
     let resp = client
         // `window` selects the time-window shard on a windowed node; 0 on an ordinal node,
-        // which ignores it.
-        .get_checkpoint(GetCheckpointRequest { window })
+        // which ignores it. `index` stays empty: this probe targets single-index nodes (each ignores
+        // it / defaults to its sole index); pool-node ingestion status threads a real index later.
+        .get_checkpoint(GetCheckpointRequest {
+            window,
+            index: String::new(),
+        })
         .await
         // A node serving a stale index over a recreated source refuses the checkpoint with
         // FAILED_PRECONDITION — surface that as a distinct `source_recreated` state, not
