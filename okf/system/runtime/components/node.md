@@ -69,9 +69,16 @@ each `Write` / `GetCheckpoint` on the `(index, window)` selector (`WriteRequest`
 node) to that index's windowed writer, which creates the window shard on first write and publishes it
 into the same live maps the read multiplexers front — so a just-ingested window is queryable and
 re-announced with no restart. The connector stamps the index on each sub-batch, so it streams ingest
-to a pool node exactly as to a single-index windowed node. Still to come: **dynamic assignment** (a
-node being *assigned* units to load on demand rather than serving a static `--index` list), cold
-read-through in pool mode, and per-unit replication.
+to a pool node exactly as to a single-index windowed node.
+
+**Replica serving** ([D53](/system/decisions/d53-unit-replication.md)): a pool node registered into the
+pool also **subscribes to CP assignment pushes** (`SubscribeAssignments`) and, for each **replica**
+window the CP assigns it, fetches the parked window's cold marker from object storage and opens it
+**read-through** (`open_cold_replica`) into the same per-index maps the read multiplexers front — so a
+placed replica starts serving with no rebuild and no copy stream, and the gateway's failover routes
+reach it. Needs the object store (`GROWLERDB_BACKUP_BUCKET`); cold/parked windows today. Still to come:
+**dynamic assignment** (a node loading a primary unit it wasn't started with), hot-window replica
+shipping, and hash-shard replica serving.
 
 ## Notes
 

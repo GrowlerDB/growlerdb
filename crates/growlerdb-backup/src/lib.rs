@@ -457,7 +457,30 @@ async fn cold_park_to_store(
         window_dir.join(growlerdb_index::COLD_MARKER),
         serde_json::to_vec_pretty(&marker)?,
     )?;
+    // Also publish the marker to object storage (`{prefix}/cold.json`) so a **replica** on another
+    // node — which has no local window dir — can fetch it and open the window read-through (D53,
+    // [`fetch_cold_marker`] → [`open_cold_replica`](growlerdb_index::LocalIndexStore::open_cold_replica)).
+    store
+        .write(
+            &format!("{base}/{}", growlerdb_index::COLD_MARKER),
+            serde_json::to_vec(&marker)?,
+        )
+        .await?;
     Ok(marker)
+}
+
+/// Fetch a parked window's [`ColdMarker`] from object storage — the `{prefix}/cold.json` that
+/// [`cold_park`]/[`cold_park_in_place`] published — so a **replica** node can open the window
+/// read-through without a local copy (D53). `prefix` is the window's park prefix
+/// (`cold/{index}/w{window}`). `Ok(None)` if the window isn't parked (no marker object).
+pub async fn fetch_cold_marker(store: &Operator, prefix: &str) -> Result<Option<ColdMarker>> {
+    let base = prefix.trim_end_matches('/');
+    let key = format!("{base}/{}", growlerdb_index::COLD_MARKER);
+    match store.read(&key).await {
+        Ok(buf) => Ok(Some(serde_json::from_slice(&buf.to_vec())?)),
+        Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// **Cold-park** a window shard for *read-through* serving: back its bulk up to `store`
