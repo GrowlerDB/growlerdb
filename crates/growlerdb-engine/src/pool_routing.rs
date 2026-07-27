@@ -39,8 +39,7 @@ use tonic::{Request, Response, Status};
 use crate::windowed_ingest::{WindowedWriteService, MAX_WRITE_MESSAGE_BYTES};
 use crate::windowed_routing::{
     unit_not_served, SharedAdminWindows, SharedLookupWindows, SharedSearchWindows,
-    SharedSuggestWindows, WindowedAdminService, WindowedLookupService, WindowedSearchService,
-    WindowedSuggestService,
+    SharedSuggestWindows,
 };
 
 /// A pool node's live `index → SharedSearchWindows` map behind a shared lock: an index this node is
@@ -60,6 +59,66 @@ pub type SharedAdminIndexes = Arc<RwLock<BTreeMap<String, SharedAdminWindows>>>;
 /// `index` selector to the right one. Behind a lock so a dynamically-assigned index's writer can be
 /// inserted without a restart (the read maps grow the same way, one level down at the window).
 pub type SharedWriteIndexes = Arc<RwLock<BTreeMap<String, WindowedWriteService>>>;
+
+/// A pool node's live `index → is-hash?` map (D52): `true` when the index is **hash/partition-sharded**
+/// (its units are ordinal shards, routed on the request's `shard` selector), `false`/absent for a
+/// **windowed** index (units are windows, routed on `window`). The pool read services consult this to
+/// pick the unit selector per index, so one endpoint serves both kinds. Behind a lock so a
+/// dynamically-assigned index registers its kind without a restart.
+pub type SharedIndexKinds = Arc<RwLock<BTreeMap<String, bool>>>;
+
+/// The generic shape shared by the four `SharedX Indexes` read maps: `index → (unit → leaf service)`,
+/// both levels behind locks. Lets [`route_unit`] be generic over the leaf service `T`.
+type SharedIndexUnits<T> = Arc<RwLock<BTreeMap<String, Arc<RwLock<BTreeMap<i64, T>>>>>>;
+
+/// Whether `index` is hash-sharded on this pool node (route units on `shard`, not `window`). An empty
+/// selector on a node serving exactly one index resolves to that index's kind — the sole-index
+/// drop-in, matching [`route_index`].
+fn index_is_hash(kinds: &SharedIndexKinds, index: &str) -> bool {
+    let k = kinds.read().unwrap_or_else(|e| e.into_inner());
+    if index.is_empty() {
+        return k.len() == 1 && *k.values().next().expect("len == 1");
+    }
+    k.get(index).copied().unwrap_or(false)
+}
+
+/// Resolve `(index, unit)` to its leaf service on a pool node: route the index to its per-unit map,
+/// then the unit to its service — the unit is the request's **`shard`** ordinal for a hash index or its
+/// **`window`** for a windowed one (per [`index_is_hash`]). The maps are `i64`-keyed either way
+/// (ordinals stored as `ordinal as i64`), so both kinds share one storage type; a hash index routes on
+/// `shard` directly (ordinal 0 is valid — unlike a windowed node, where `window == 0` means "no
+/// selector"). An unserved index or unit is the structured [`unit_not_served`] refusal.
+fn route_unit<T: Clone>(
+    by_index: &SharedIndexUnits<T>,
+    kinds: &SharedIndexKinds,
+    index: &str,
+    window: i64,
+    shard: u32,
+) -> Result<T, Status> {
+    let units = route_index(by_index, index)?;
+    let hash = index_is_hash(kinds, index);
+    let key = if hash {
+        shard as i64
+    } else if window == 0 {
+        return Err(Status::invalid_argument(
+            "a windowed node requires a window selector",
+        ));
+    } else {
+        window
+    };
+    let found = units
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned();
+    found.ok_or_else(|| {
+        unit_not_served(if hash {
+            format!("shard {key} is not served by this node")
+        } else {
+            format!("window {key} is not served by this node")
+        })
+    })
+}
 
 /// Route an index selector to its per-index shared map `T` (one of the `SharedX` window maps), or
 /// the structured [`unit_not_served`] refusal when this node doesn't serve it (a stale route —
@@ -91,25 +150,19 @@ fn route_index<T: Clone>(
 /// [`SearchService`](crate::SearchService) runs the (auth'd) query once the unit is resolved.
 pub struct PoolSearchService {
     by_index: SharedSearchIndexes,
+    kinds: SharedIndexKinds,
 }
 
 impl PoolSearchService {
-    /// A multiplexer over the shared `index → windows` map.
-    pub fn new(by_index: SharedSearchIndexes) -> Self {
-        Self { by_index }
+    /// A multiplexer over the shared `index → units` map, routing each index's units on `window`
+    /// (windowed) or `shard` (hash) per `kinds`.
+    pub fn new(by_index: SharedSearchIndexes, kinds: SharedIndexKinds) -> Self {
+        Self { by_index, kinds }
     }
 
     /// Wrap as a mountable tonic [`SearchServer`].
     pub fn into_server(self) -> SearchServer<Self> {
         SearchServer::new(self)
-    }
-
-    /// The inner windowed mux for `index`, or [`unit_not_served`] if unserved.
-    fn windowed(&self, index: &str) -> Result<WindowedSearchService, Status> {
-        Ok(WindowedSearchService::new(route_index(
-            &self.by_index,
-            index,
-        )?))
     }
 }
 
@@ -119,7 +172,8 @@ impl Search for PoolSearchService {
         &self,
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
-        let svc = self.windowed(&request.get_ref().index)?;
+        let r = request.get_ref();
+        let svc = route_unit(&self.by_index, &self.kinds, &r.index, r.window, r.shard)?;
         Search::search(&svc, request).await
     }
 
@@ -127,7 +181,8 @@ impl Search for PoolSearchService {
         &self,
         request: Request<SemanticSearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
-        let svc = self.windowed(&request.get_ref().index)?;
+        let r = request.get_ref();
+        let svc = route_unit(&self.by_index, &self.kinds, &r.index, r.window, r.shard)?;
         Search::semantic_search(&svc, request).await
     }
 
@@ -135,7 +190,8 @@ impl Search for PoolSearchService {
         &self,
         request: Request<AggregateRequest>,
     ) -> Result<Response<AggregateResponse>, Status> {
-        let svc = self.windowed(&request.get_ref().index)?;
+        let r = request.get_ref();
+        let svc = route_unit(&self.by_index, &self.kinds, &r.index, r.window, r.shard)?;
         Search::aggregate(&svc, request).await
     }
 
@@ -182,12 +238,13 @@ impl Search for PoolSearchService {
 /// a [`WindowedSuggestService`].
 pub struct PoolSuggestService {
     by_index: SharedSuggestIndexes,
+    kinds: SharedIndexKinds,
 }
 
 impl PoolSuggestService {
-    /// A multiplexer over the shared `index → windows` map.
-    pub fn new(by_index: SharedSuggestIndexes) -> Self {
-        Self { by_index }
+    /// A multiplexer over the shared `index → units` map (window- or shard-routed per `kinds`).
+    pub fn new(by_index: SharedSuggestIndexes, kinds: SharedIndexKinds) -> Self {
+        Self { by_index, kinds }
     }
 
     /// Wrap as a mountable tonic [`SuggestServer`].
@@ -202,8 +259,8 @@ impl Suggest for PoolSuggestService {
         &self,
         request: Request<SuggestRequest>,
     ) -> Result<Response<SuggestResponse>, Status> {
-        let svc =
-            WindowedSuggestService::new(route_index(&self.by_index, &request.get_ref().index)?);
+        let r = request.get_ref();
+        let svc = route_unit(&self.by_index, &self.kinds, &r.index, r.window, r.shard)?;
         Suggest::suggest(&svc, request).await
     }
 }
@@ -212,12 +269,13 @@ impl Suggest for PoolSuggestService {
 /// then delegates to a [`WindowedLookupService`].
 pub struct PoolLookupService {
     by_index: SharedLookupIndexes,
+    kinds: SharedIndexKinds,
 }
 
 impl PoolLookupService {
-    /// A multiplexer over the shared `index → windows` map.
-    pub fn new(by_index: SharedLookupIndexes) -> Self {
-        Self { by_index }
+    /// A multiplexer over the shared `index → units` map (window- or shard-routed per `kinds`).
+    pub fn new(by_index: SharedLookupIndexes, kinds: SharedIndexKinds) -> Self {
+        Self { by_index, kinds }
     }
 
     /// Wrap as a mountable tonic [`LookupServer`].
@@ -232,8 +290,8 @@ impl Lookup for PoolLookupService {
         &self,
         request: Request<GetByKeyRequest>,
     ) -> Result<Response<GetByKeyResponse>, Status> {
-        let svc =
-            WindowedLookupService::new(route_index(&self.by_index, &request.get_ref().index)?);
+        let r = request.get_ref();
+        let svc = route_unit(&self.by_index, &self.kinds, &r.index, r.window, r.shard)?;
         Lookup::get_by_key(&svc, request).await
     }
 }
@@ -244,12 +302,13 @@ impl Lookup for PoolLookupService {
 /// mux it wraps.
 pub struct PoolAdminService {
     by_index: SharedAdminIndexes,
+    kinds: SharedIndexKinds,
 }
 
 impl PoolAdminService {
-    /// A multiplexer over the shared `index → windows` map.
-    pub fn new(by_index: SharedAdminIndexes) -> Self {
-        Self { by_index }
+    /// A multiplexer over the shared `index → units` map (window- or shard-routed per `kinds`).
+    pub fn new(by_index: SharedAdminIndexes, kinds: SharedIndexKinds) -> Self {
+        Self { by_index, kinds }
     }
 
     /// Wrap as a mountable tonic [`AdminServer`].
@@ -264,7 +323,8 @@ impl Admin for PoolAdminService {
         &self,
         request: Request<DescribeIndexRequest>,
     ) -> Result<Response<DescribeIndexResponse>, Status> {
-        let svc = WindowedAdminService::new(route_index(&self.by_index, &request.get_ref().index)?);
+        let r = request.get_ref();
+        let svc = route_unit(&self.by_index, &self.kinds, &r.index, r.window, r.shard)?;
         Admin::describe_index(&svc, request).await
     }
 
@@ -429,13 +489,42 @@ mod tests {
         index: &str,
         window: i64,
     ) -> Result<Vec<String>, tonic::Code> {
-        let req = SearchRequest {
-            query: "*".into(),
-            limit: 10,
-            index: index.into(),
-            window,
-            ..Default::default()
-        };
+        hit_ids_req(
+            mux,
+            SearchRequest {
+                query: "*".into(),
+                limit: 10,
+                index: index.into(),
+                window,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// As [`hit_ids`] but routing on the **`shard`** (ordinal) selector — a hash index's unit.
+    async fn hit_ids_shard(
+        mux: &PoolSearchService,
+        index: &str,
+        shard: u32,
+    ) -> Result<Vec<String>, tonic::Code> {
+        hit_ids_req(
+            mux,
+            SearchRequest {
+                query: "*".into(),
+                limit: 10,
+                index: index.into(),
+                shard,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    async fn hit_ids_req(
+        mux: &PoolSearchService,
+        req: SearchRequest,
+    ) -> Result<Vec<String>, tonic::Code> {
         match Search::search(mux, Request::new(req)).await {
             Ok(resp) => Ok(resp
                 .into_inner()
@@ -548,10 +637,13 @@ mod tests {
             ("beta".to_string(), wb),
         ]))));
         // ...and a pool reader over the same shared window maps.
-        let reads = PoolSearchService::new(Arc::new(RwLock::new(BTreeMap::from([
-            ("alpha".to_string(), search_a),
-            ("beta".to_string(), search_b),
-        ]))));
+        let reads = PoolSearchService::new(
+            Arc::new(RwLock::new(BTreeMap::from([
+                ("alpha".to_string(), search_a),
+                ("beta".to_string(), search_b),
+            ]))),
+            Default::default(), // all windowed (route on window)
+        );
 
         // Each write is dispatched to its index's writer, which lazily creates the day-10 window.
         assert!(
@@ -639,16 +731,19 @@ mod tests {
         let ta = tempfile::tempdir().unwrap();
         let tb = tempfile::tempdir().unwrap();
         // One node, TWO indexes — the multi-index-per-node property (kills node-per-index).
-        let mux = PoolSearchService::new(Arc::new(RwLock::new(BTreeMap::from([
-            (
-                "alpha".to_string(),
-                windows_for(ta.path(), "alpha", "alphadoc"),
-            ),
-            (
-                "beta".to_string(),
-                windows_for(tb.path(), "beta", "betadoc"),
-            ),
-        ]))));
+        let mux = PoolSearchService::new(
+            Arc::new(RwLock::new(BTreeMap::from([
+                (
+                    "alpha".to_string(),
+                    windows_for(ta.path(), "alpha", "alphadoc"),
+                ),
+                (
+                    "beta".to_string(),
+                    windows_for(tb.path(), "beta", "betadoc"),
+                ),
+            ]))),
+            Default::default(),
+        );
 
         // Each (index, window) reaches exactly its own shard...
         assert_eq!(hit_ids(&mux, "alpha", 10).await.unwrap(), vec!["alphadoc"]);
@@ -671,16 +766,19 @@ mod tests {
         let tb = tempfile::tempdir().unwrap();
 
         // Two indexes served ⇒ an empty selector is ambiguous → InvalidArgument.
-        let two = PoolSearchService::new(Arc::new(RwLock::new(BTreeMap::from([
-            (
-                "alpha".to_string(),
-                windows_for(ta.path(), "alpha", "alphadoc"),
-            ),
-            (
-                "beta".to_string(),
-                windows_for(tb.path(), "beta", "betadoc"),
-            ),
-        ]))));
+        let two = PoolSearchService::new(
+            Arc::new(RwLock::new(BTreeMap::from([
+                (
+                    "alpha".to_string(),
+                    windows_for(ta.path(), "alpha", "alphadoc"),
+                ),
+                (
+                    "beta".to_string(),
+                    windows_for(tb.path(), "beta", "betadoc"),
+                ),
+            ]))),
+            Default::default(),
+        );
         assert_eq!(
             hit_ids(&two, "", 10).await.unwrap_err(),
             tonic::Code::InvalidArgument
@@ -688,10 +786,50 @@ mod tests {
 
         // Exactly one served ⇒ an empty selector defaults to it (drop-in for a single-index node).
         let tc = tempfile::tempdir().unwrap();
-        let one = PoolSearchService::new(Arc::new(RwLock::new(BTreeMap::from([(
-            "solo".to_string(),
-            windows_for(tc.path(), "solo", "solodoc"),
-        )]))));
+        let one = PoolSearchService::new(
+            Arc::new(RwLock::new(BTreeMap::from([(
+                "solo".to_string(),
+                windows_for(tc.path(), "solo", "solodoc"),
+            )]))),
+            Default::default(),
+        );
         assert_eq!(hit_ids(&one, "", 10).await.unwrap(), vec!["solodoc"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pool_routes_a_hash_index_on_the_shard_selector() {
+        // A HASH index's units are ordinal shards (keyed by ordinal-as-i64); with the index marked
+        // hash in `kinds`, the pool routes each read on the request's `shard` selector, not `window`.
+        let t0 = tempfile::tempdir().unwrap();
+        let t1 = tempfile::tempdir().unwrap();
+        let ordinals: SharedSearchWindows = Arc::new(RwLock::new(BTreeMap::from([
+            (
+                0_i64,
+                SearchService::new(one_doc_shard(t0.path(), "h", "ord0")),
+            ),
+            (
+                1_i64,
+                SearchService::new(one_doc_shard(t1.path(), "h", "ord1")),
+            ),
+        ])));
+        let kinds: SharedIndexKinds =
+            Arc::new(RwLock::new(BTreeMap::from([("h".to_string(), true)])));
+        let mux = PoolSearchService::new(
+            Arc::new(RwLock::new(BTreeMap::from([("h".to_string(), ordinals)]))),
+            kinds,
+        );
+
+        // Route on `shard`: ordinal 0 → its doc, ordinal 1 → its doc.
+        assert_eq!(hit_ids_shard(&mux, "h", 0).await.unwrap(), vec!["ord0"]);
+        assert_eq!(hit_ids_shard(&mux, "h", 1).await.unwrap(), vec!["ord1"]);
+        // An unserved ordinal is the structured UNIT_NOT_SERVED refusal (FailedPrecondition — a
+        // stale-route signal the gateway fails past), not a silent empty result.
+        assert_eq!(
+            hit_ids_shard(&mux, "h", 9).await.unwrap_err(),
+            tonic::Code::FailedPrecondition
+        );
+        // A hash index ignores the `window` selector — routing keys off `shard`, so window=1 with
+        // shard unset (0) reaches ordinal 0, not window 1.
+        assert_eq!(hit_ids(&mux, "h", 1).await.unwrap(), vec!["ord0"]);
     }
 }

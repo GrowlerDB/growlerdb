@@ -2564,6 +2564,11 @@ async fn serve_pool(
     let lookup_idx: growlerdb_engine::SharedLookupIndexes = Arc::new(RwLock::new(BTreeMap::new()));
     let admin_idx: growlerdb_engine::SharedAdminIndexes = Arc::new(RwLock::new(BTreeMap::new()));
     let write_idx: growlerdb_engine::SharedWriteIndexes = Arc::new(RwLock::new(BTreeMap::new()));
+    // Per-index unit kind for the Pool read services: `serve-pool` serves **windowed** indexes today,
+    // so every served index routes on `window` (`false`). Hash-shard serving registers `true` here.
+    let kinds: growlerdb_engine::SharedIndexKinds = Arc::new(RwLock::new(
+        indexes.iter().map(|i| (i.clone(), false)).collect(),
+    ));
 
     // The node-side write fence (357.12): when this node runs from CP assignments (`--register` +
     // `--advertise-addr`), every per-index writer refuses writes/checkpoints for `(index, window)`
@@ -2851,10 +2856,10 @@ async fn serve_pool(
     }
     builder
         .layer(growlerdb_engine::service_token_layer(service_token))
-        .add_service(PoolSearchService::new(search_idx).into_server())
-        .add_service(PoolSuggestService::new(suggest_idx).into_server())
-        .add_service(PoolLookupService::new(lookup_idx).into_server())
-        .add_service(PoolAdminService::new(admin_idx).into_server())
+        .add_service(PoolSearchService::new(search_idx, kinds.clone()).into_server())
+        .add_service(PoolSuggestService::new(suggest_idx, kinds.clone()).into_server())
+        .add_service(PoolLookupService::new(lookup_idx, kinds.clone()).into_server())
+        .add_service(PoolAdminService::new(admin_idx, kinds).into_server())
         .add_service(PoolWriteService::new(write_idx).into_server())
         .add_service(SystemServer::new(SystemService::new(VERSION)))
         // SIGINT *or* SIGTERM (HA-G4): plain Kubernetes stops a pod with SIGTERM (the Helm preStop
@@ -6293,7 +6298,10 @@ mod tests {
         assert_eq!(served, 1, "the assigned replica window is opened + served");
 
         // Queryable through the pool read path — read-through, with no local copy.
-        let mux = growlerdb_engine::PoolSearchService::new(search_idx.clone());
+        let mux = growlerdb_engine::PoolSearchService::new(
+            search_idx.clone(),
+            std::sync::Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::new())),
+        );
         let resp = growlerdb_proto::Search::search(
             &mux,
             tonic::Request::new(growlerdb_proto::v1::SearchRequest {

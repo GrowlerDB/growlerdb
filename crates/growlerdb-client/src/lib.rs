@@ -120,6 +120,7 @@ impl Client {
             .lookup
             .clone()
             .get_by_key(GetByKeyRequest {
+                shard: 0,
                 keys,
                 columns,
                 window: 0,
@@ -165,6 +166,7 @@ impl Client {
             .suggest
             .clone()
             .suggest(SuggestRequest {
+                shard: 0,
                 field: field.into(),
                 text: text.into(),
                 limit,
@@ -188,6 +190,7 @@ impl Client {
             .admin
             .clone()
             .describe_index(proto::DescribeIndexRequest {
+                shard: 0,
                 index: index.into(),
                 window: 0,
             })
@@ -307,6 +310,7 @@ impl SearchQuery {
 impl From<SearchQuery> for SearchRequest {
     fn from(q: SearchQuery) -> Self {
         SearchRequest {
+            shard: 0,
             query: q.query,
             limit: q.limit,
             offset: q.offset,

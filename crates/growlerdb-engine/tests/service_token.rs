@@ -194,6 +194,7 @@ async fn describe(
     node.expect("node never came up")
         .describe_index(tonic::Request::new(
             growlerdb_proto::v1::DescribeIndexRequest {
+                shard: 0,
                 index: "docs".into(),
                 window: 0,
             },

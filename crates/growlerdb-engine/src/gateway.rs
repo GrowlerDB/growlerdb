@@ -1405,6 +1405,7 @@ impl Gateway {
             meta.clone(),
             Extensions::default(),
             SemanticSearchRequest {
+                shard: 0,
                 index: body.index.clone(),
                 vector_field: body.vector_field.clone(),
                 query_text: body.query_text.clone(),
@@ -1541,6 +1542,7 @@ impl Gateway {
             meta,
             Extensions::default(),
             GetByKeyRequest {
+                shard: 0,
                 keys,
                 columns,
                 window: 0,
@@ -1689,6 +1691,7 @@ impl Gateway {
                     meta.clone(),
                     Extensions::default(),
                     GetByKeyRequest {
+                        shard: 0,
                         keys: body.keys.clone(),
                         columns: body.columns.clone(),
                         index: String::new(), // already routed to this index's shard
@@ -1753,6 +1756,7 @@ impl Gateway {
                 meta.clone(),
                 Extensions::default(),
                 GetByKeyRequest {
+                    shard: 0,
                     keys,
                     columns: body.columns.clone(),
                     index: String::new(), // already routed to this index's shard
@@ -1820,6 +1824,7 @@ impl Gateway {
             meta,
             Extensions::default(),
             GetByKeyRequest {
+                shard: 0,
                 keys: vec![coord],
                 columns: Vec::new(),
                 window: 0,
@@ -1902,6 +1907,7 @@ impl Gateway {
                 meta.clone(),
                 Extensions::default(),
                 AggregateRequest {
+                    shard: 0,
                     query: body.query.clone(),
                     aggs: body.aggs.clone(),
                     index: String::new(), // already routed to this index's shard
@@ -2532,6 +2538,7 @@ mod tests {
 
         let resp = gw
             .describe_index(Request::new(DescribeIndexRequest {
+                shard: 0,
                 window: 0,
                 index: "docs".into(),
             }))
@@ -2626,6 +2633,7 @@ mod tests {
         // Describe aggregates num_docs across shards.
         let stats = gw
             .describe_index(Request::new(DescribeIndexRequest {
+                shard: 0,
                 window: 0,
                 index: String::new(),
             }))
@@ -3079,6 +3087,7 @@ mod tests {
 
         let keys: Vec<Coordinates> = ids.iter().map(|id| (&key(id)).into()).collect();
         gw.get_by_key(Request::new(GetByKeyRequest {
+            shard: 0,
             window: 0,
             keys,
             columns: Vec::new(),
@@ -3474,6 +3483,7 @@ mod tests {
 
         let resp = gw
             .aggregate(Request::new(AggregateRequest {
+                shard: 0,
                 query: "cat:x OR cat:y OR cat:z".into(),
                 aggs: r#"{"by_cat": {"Terms": {"field": "cat", "size": 10}}}"#.into(),
                 partial: false,
@@ -4021,6 +4031,7 @@ mod tests {
         let gw = Gateway::sharded(vec![healthy, failing]);
         let resp = gw
             .describe_index(Request::new(DescribeIndexRequest {
+                shard: 0,
                 window: 0,
                 index: String::new(),
             }))
@@ -4046,6 +4057,7 @@ mod tests {
         let gw = Gateway::sharded(vec![a, b]);
         let resp = gw
             .describe_index(Request::new(DescribeIndexRequest {
+                shard: 0,
                 window: 0,
                 index: String::new(),
             }))
@@ -4144,6 +4156,7 @@ mod tests {
         let keys: Vec<Coordinates> = (0..20).map(|i| (&key(&format!("k{i}"))).into()).collect();
         let resp = gw
             .get_by_key(Request::new(GetByKeyRequest {
+                shard: 0,
                 window: 0,
                 keys,
                 columns: Vec::new(),
@@ -4169,6 +4182,7 @@ mod tests {
         };
         let err = gw
             .get_by_key(Request::new(GetByKeyRequest {
+                shard: 0,
                 window: 0,
                 keys: vec![bad],
                 columns: Vec::new(),
@@ -4188,6 +4202,7 @@ mod tests {
         ]);
         let resp = gw
             .aggregate(Request::new(AggregateRequest {
+                shard: 0,
                 query: "cat:x OR cat:y".into(),
                 aggs: r#"{"by_cat": {"Terms": {"field": "cat", "size": 10}}}"#.into(),
                 partial: false,
@@ -4411,6 +4426,7 @@ mod tests {
         forged_principal: Option<&str>,
     ) -> Request<DescribeIndexRequest> {
         let mut req = Request::new(DescribeIndexRequest {
+            shard: 0,
             window: 0,
             index: "docs".into(),
         });
@@ -4838,6 +4854,7 @@ mod tests {
 
     fn describe(index: &str) -> Request<DescribeIndexRequest> {
         Request::new(DescribeIndexRequest {
+            shard: 0,
             window: 0,
             index: index.into(),
         })

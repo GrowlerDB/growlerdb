@@ -1094,6 +1094,7 @@ mod tests {
         let svc = service(tmp.path());
         let stats = svc
             .describe_index(Request::new(DescribeIndexRequest {
+                shard: 0,
                 window: 0,
                 index: String::new(),
             }))
@@ -1120,6 +1121,7 @@ mod tests {
         // Naming the served index explicitly also works.
         assert!(svc
             .describe_index(Request::new(DescribeIndexRequest {
+                shard: 0,
                 window: 0,
                 index: "docs".into(),
             }))
@@ -1153,6 +1155,7 @@ mod tests {
         let svc = AdminService::new(std::sync::Arc::new(shard), "docs");
         let stats = svc
             .describe_index(Request::new(DescribeIndexRequest {
+                shard: 0,
                 window: 0,
                 index: String::new(),
             }))
@@ -1193,6 +1196,7 @@ mod tests {
         let svc = AdminService::new(std::sync::Arc::new(shard), "docs");
         let stats = svc
             .describe_index(Request::new(DescribeIndexRequest {
+                shard: 0,
                 window: 0,
                 index: String::new(),
             }))
@@ -1215,6 +1219,7 @@ mod tests {
         let svc = service(tmp.path());
         let err = svc
             .describe_index(Request::new(DescribeIndexRequest {
+                shard: 0,
                 window: 0,
                 index: "other".into(),
             }))
@@ -1237,6 +1242,7 @@ mod tests {
         let svc = AdminService::with_auth(base.shard.clone(), "docs", Arc::new(DenyAll));
         let err = svc
             .describe_index(Request::new(DescribeIndexRequest {
+                shard: 0,
                 window: 0,
                 index: String::new(),
             }))

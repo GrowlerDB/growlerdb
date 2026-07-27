@@ -562,6 +562,7 @@ async fn run_search(
 
     let req = grpc_request(
         SearchRequest {
+            shard: 0,
             query,
             limit: body.size.unwrap_or(10),
             offset: body.from.unwrap_or(0),

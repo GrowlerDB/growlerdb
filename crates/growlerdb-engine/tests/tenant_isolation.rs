@@ -212,6 +212,7 @@ fn get_req(ids: &[&str], api_key: &str, forged_tenant: Option<&str>) -> Request<
         .map(|id| (&CompositeKey::new(vec![], vec![("id".into(), Value::from(*id))])).into())
         .collect();
     let mut r = Request::new(GetByKeyRequest {
+        shard: 0,
         keys,
         columns: vec![],
         index: String::new(),

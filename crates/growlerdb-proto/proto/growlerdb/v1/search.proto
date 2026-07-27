@@ -69,6 +69,11 @@ message SearchRequest {
   // scattered shard (see WindowNode); 0 = not windowed / single shard, ignored by a
   // single-shard SearchService. Clients never set this.
   int64 window = 9;
+  // Ordinal-shard selector for distributed **hash-shard** routing on a pool node (D52) — the hash
+  // counterpart to `window`: the gateway's ShardNode stamps the `(index, ordinal)` unit here so the
+  // pool node dispatches to that ordinal's shard. 0 = not hash / single shard, ignored by the leaf
+  // SearchService. Clients never set this.
+  uint32 shard = 16;
   // Query-string grammar. Default LUCENE; KQL parses the same `query` with the KQL
   // grammar. Only the search path honors it today (aggregate/export stay Lucene).
   QuerySyntax syntax = 10;
@@ -222,6 +227,8 @@ message AggregateRequest {
   // SearchRequest.window: gateway-set per scattered window; 0 = not windowed,
   // ignored by a single-shard node. Clients never set this.
   int64 window = 4;
+  // Ordinal-shard selector for hash-shard pool routing, mirroring SearchRequest.shard. 0 = not hash.
+  uint32 shard = 6;
   // Target index name: scope the aggregation to one named index on
   // a multi-index Gateway. Empty = the endpoint's default/only index (back-compat). Mirrors
   // SearchRequest.index; an unknown index on a serving Gateway answers NOT_FOUND.
@@ -252,6 +259,8 @@ message SemanticSearchRequest {
   // Time-window selector for distributed windowed routing, mirroring SearchRequest.window:
   // gateway-set per scattered window; 0 = not windowed, ignored by a single-shard node.
   int64 window = 7;
+  // Ordinal-shard selector for hash-shard pool routing, mirroring SearchRequest.shard. 0 = not hash.
+  uint32 shard = 13;
   // Opt-in **reranking** (D21): when true the Node reorders the retrieved top-K by a
   // cross-encoder over (query_text, each hit's cached source-field text) before returning.
   // Off by default (retrieval-first) — reranking is an extra per-hit model pass.
@@ -375,6 +384,10 @@ message GetByKeyRequest {
   // hydration to every window (a key can live in any of them) and each WindowNode stamps its id here,
   // so the receiving multiplexer dispatches to the right shard. 0 (unset) on a single-shard/ordinal node.
   int64 window = 3;
+  // Ordinal-shard selector for hash-shard pool routing, mirroring SearchRequest.shard. The Gateway
+  // broadcasts a hydration to a hash index's ordinals and each ShardNode stamps its ordinal here.
+  // 0 = not hash / single shard.
+  uint32 shard = 5;
   // Target index name: scope the hydration to one named index on a
   // multi-index Gateway. Empty = the endpoint's default/only index (back-compat). Mirrors
   // SearchRequest.index; an unknown index on a serving Gateway answers NOT_FOUND.
@@ -417,6 +430,8 @@ message SuggestRequest {
   // SearchRequest.window: gateway-set per scattered window; 0 = not windowed,
   // ignored by a single-shard SuggestService. Clients never set this.
   int64 window = 6;
+  // Ordinal-shard selector for hash-shard pool routing, mirroring SearchRequest.shard. 0 = not hash.
+  uint32 shard = 8;
   // Target index name: scope the suggestion to one named index on a
   // multi-index Gateway. Empty = the endpoint's default/only index (back-compat). Mirrors
   // SearchRequest.index; an unknown index on a serving Gateway answers NOT_FOUND.
