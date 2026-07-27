@@ -85,6 +85,7 @@ async fn write_batch_round_trips_over_grpc() {
         .write(WriteRequest {
             batch: Some(wire),
             index: String::new(),
+            shard: 0,
         })
         .await
         .expect("write rpc")
@@ -105,6 +106,7 @@ async fn write_batch_round_trips_over_grpc() {
         .write(WriteRequest {
             batch: Some(batch().into()),
             index: String::new(),
+            shard: 0,
         })
         .await
         .expect("re-write")

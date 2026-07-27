@@ -1962,6 +1962,7 @@ async fn shard_checkpoint(endpoint: &str, window: i64) -> Result<(i64, u64), &'s
         .get_checkpoint(GetCheckpointRequest {
             window,
             index: String::new(),
+            shard: 0,
         })
         .await
         // A node serving a stale index over a recreated source refuses the checkpoint with

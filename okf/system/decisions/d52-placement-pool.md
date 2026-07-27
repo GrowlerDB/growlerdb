@@ -60,5 +60,9 @@ deployments. Connector routing already resolves owners via the CP, so it follows
 placement with no protocol change. Extends **D33** (windowed placement → universal), depends on
 **D35** (per-index gateway routing) and **D51** (an HA CP to hold the larger, hotter placement map).
 
-**Status.** Accepted (design). Implementation staged in the `true-ha` epic; not yet built. See
-[high availability](/system/high-availability.md).
+**Status.** Accepted; implementing on `feat/true-ha`. The pool now serves **both** unit kinds from one
+process — windowed indexes (routed on `window`) and hash-sharded indexes (routed on the `shard`
+ordinal), each index declaring its kind via `SharedIndexKinds` so the read/write multiplexers pick the
+selector — with per-unit replication/failover ([D53](/system/decisions/d53-unit-replication.md)) built
+for windowed units and following the same path for hash ordinals. See
+[node](/system/runtime/components/node.md) and [high availability](/system/high-availability.md).

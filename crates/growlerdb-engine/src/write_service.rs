@@ -327,6 +327,7 @@ mod tests {
         svc.write(Request::new(WriteRequest {
             batch: Some(batch.into()),
             index: String::new(),
+            shard: 0,
         }))
         .await
         .unwrap();
@@ -366,6 +367,7 @@ mod tests {
                     CommitBatch::from_upserts(vec![doc], SourceCheckpoint::iceberg(1), "b1").into(),
                 ),
                 index: String::new(),
+                shard: 0,
             }
         };
 
@@ -406,6 +408,7 @@ mod tests {
                     CommitBatch::from_upserts(vec![doc], SourceCheckpoint::iceberg(1), "b1").into(),
                 ),
                 index: String::new(),
+                shard: 0,
             }
         };
 
@@ -441,6 +444,7 @@ mod tests {
                         .into(),
                 ),
                 index: String::new(),
+                shard: 0,
             }
         };
 
@@ -500,6 +504,7 @@ mod tests {
                 CommitBatch::from_upserts(vec![doc], SourceCheckpoint::iceberg(1), "b1").into(),
             ),
             index: String::new(),
+            shard: 0,
         }))
         .await
         .unwrap();
@@ -513,6 +518,7 @@ mod tests {
                     .into(),
             ),
             index: String::new(),
+            shard: 0,
         }))
         .await
         .unwrap();
@@ -536,6 +542,7 @@ mod tests {
                     .into(),
             ),
             index: String::new(),
+            shard: 0,
         }))
         .await
         .unwrap();

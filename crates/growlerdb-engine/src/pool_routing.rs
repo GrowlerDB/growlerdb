@@ -41,6 +41,7 @@ use crate::windowed_routing::{
     unit_not_served, SharedAdminWindows, SharedLookupWindows, SharedSearchWindows,
     SharedSuggestWindows,
 };
+use crate::write_service::WriteService;
 
 /// A pool node's live `index → SharedSearchWindows` map behind a shared lock: an index this node is
 /// assigned units for is inserted with its window map; the multiplexer reads it, so a freshly-assigned
@@ -59,6 +60,18 @@ pub type SharedAdminIndexes = Arc<RwLock<BTreeMap<String, SharedAdminWindows>>>;
 /// `index` selector to the right one. Behind a lock so a dynamically-assigned index's writer can be
 /// inserted without a restart (the read maps grow the same way, one level down at the window).
 pub type SharedWriteIndexes = Arc<RwLock<BTreeMap<String, WindowedWriteService>>>;
+
+/// A pool node's live `index → (ordinal → WriteService)` map for **hash-sharded** indexes: the
+/// write counterpart to a hash index's ordinal read maps (D52). Each ordinal is a single-shard
+/// [`WriteService`] over that ordinal's shard — hash writes are ordinal-routed by the connector
+/// (not window-partitioned like a [`WindowedWriteService`]), so the [`PoolWriteService`] routes each
+/// `Write` on its `(index, shard)` selector straight to the ordinal's writer. Ordinals are keyed as
+/// `ordinal as i64` to share the pool's generic `(index, unit)` routing. Both levels behind locks so a
+/// dynamically-assigned ordinal registers without a restart.
+pub type SharedHashWriteUnits = Arc<RwLock<BTreeMap<i64, WriteService>>>;
+/// The `index → ordinal writers` map behind the hash half of [`PoolWriteService`] — see
+/// [`SharedHashWriteUnits`].
+pub type SharedHashWriteIndexes = Arc<RwLock<BTreeMap<String, SharedHashWriteUnits>>>;
 
 /// A pool node's live `index → is-hash?` map (D52): `true` when the index is **hash/partition-sharded**
 /// (its units are ordinal shards, routed on the request's `shard` selector), `false`/absent for a
@@ -384,18 +397,32 @@ impl Admin for PoolAdminService {
 }
 
 /// The **index-dispatch** `Write` service for a pool node (D52): routes each `Write` / `GetCheckpoint`
-/// on its `index` selector to that index's [`WindowedWriteService`], which then routes on the window
-/// (creating the window shard on first write and publishing it to the query paths). The write
-/// counterpart to [`PoolSearchService`]; the same empty-selector-defaults-to-sole-index rule holds, so
-/// a single-index pool node is writable by a connector that doesn't stamp the index.
+/// on its `index` selector to that index's writer. A **windowed** index dispatches to its
+/// [`WindowedWriteService`], which then routes on the window (creating the window shard on first write
+/// and publishing it to the query paths). A **hash-sharded** index (per [`kinds`](SharedIndexKinds))
+/// dispatches on the request's `shard` ordinal to that ordinal's [`WriteService`] — hash writes are
+/// ordinal-routed by the connector, not window-partitioned. The write counterpart to
+/// [`PoolSearchService`]; the same empty-selector-defaults-to-sole-index rule holds, so a single-index
+/// pool node is writable by a connector that doesn't stamp the index.
 pub struct PoolWriteService {
-    by_index: SharedWriteIndexes,
+    windowed: SharedWriteIndexes,
+    hash: SharedHashWriteIndexes,
+    kinds: SharedIndexKinds,
 }
 
 impl PoolWriteService {
-    /// A write multiplexer over the shared `index → writer` map.
-    pub fn new(by_index: SharedWriteIndexes) -> Self {
-        Self { by_index }
+    /// A write multiplexer over the shared windowed `index → writer` map and the hash
+    /// `index → ordinal → writer` map, picking the unit selector per index via `kinds`.
+    pub fn new(
+        windowed: SharedWriteIndexes,
+        hash: SharedHashWriteIndexes,
+        kinds: SharedIndexKinds,
+    ) -> Self {
+        Self {
+            windowed,
+            hash,
+            kinds,
+        }
     }
 
     /// Wrap as a mountable tonic [`WriteServer`] with the large-commit decode cap (a catch-up batch
@@ -407,7 +434,13 @@ impl PoolWriteService {
     /// The single-index windowed writer for `index`, or [`unit_not_served`] if unserved (an empty
     /// selector resolves to the sole served index when there is exactly one).
     fn writer(&self, index: &str) -> Result<WindowedWriteService, Status> {
-        route_index(&self.by_index, index)
+        route_index(&self.windowed, index)
+    }
+
+    /// The hash ordinal writer for `(index, shard)`, or [`unit_not_served`] if the node holds no such
+    /// ordinal (a stale route — the connector re-resolves the ordinal's owner).
+    fn hash_writer(&self, index: &str, shard: u32) -> Result<WriteService, Status> {
+        route_unit(&self.hash, &self.kinds, index, 0, shard)
     }
 }
 
@@ -417,7 +450,12 @@ impl Write for PoolWriteService {
         &self,
         request: Request<WriteRequest>,
     ) -> Result<Response<WriteResponse>, Status> {
-        let svc = self.writer(&request.get_ref().index)?;
+        let r = request.get_ref();
+        if index_is_hash(&self.kinds, &r.index) {
+            let svc = self.hash_writer(&r.index, r.shard)?;
+            return Write::write(&svc, request).await;
+        }
+        let svc = self.writer(&r.index)?;
         Write::write(&svc, request).await
     }
 
@@ -425,7 +463,12 @@ impl Write for PoolWriteService {
         &self,
         request: Request<GetCheckpointRequest>,
     ) -> Result<Response<GetCheckpointResponse>, Status> {
-        let svc = self.writer(&request.get_ref().index)?;
+        let r = request.get_ref();
+        if index_is_hash(&self.kinds, &r.index) {
+            let svc = self.hash_writer(&r.index, r.shard)?;
+            return Write::get_checkpoint(&svc, request).await;
+        }
+        let svc = self.writer(&r.index)?;
         Write::get_checkpoint(&svc, request).await
     }
 }
@@ -614,6 +657,7 @@ mod tests {
         let req = WriteRequest {
             batch: Some(batch.into()),
             index: index.into(),
+            shard: 0,
         };
         match Write::write(mux, Request::new(req)).await {
             Ok(resp) => Ok(resp.into_inner().snapshot),
@@ -632,10 +676,14 @@ mod tests {
         let (wb, _tb) = writer_for("beta", search_b.clone());
 
         // One pool writer fronting BOTH indexes' writers — the multi-index-per-node write path.
-        let writes = PoolWriteService::new(Arc::new(RwLock::new(BTreeMap::from([
-            ("alpha".to_string(), wa),
-            ("beta".to_string(), wb),
-        ]))));
+        let writes = PoolWriteService::new(
+            Arc::new(RwLock::new(BTreeMap::from([
+                ("alpha".to_string(), wa),
+                ("beta".to_string(), wb),
+            ]))),
+            Default::default(),
+            Default::default(), // all windowed
+        );
         // ...and a pool reader over the same shared window maps.
         let reads = PoolSearchService::new(
             Arc::new(RwLock::new(BTreeMap::from([
@@ -686,6 +734,7 @@ mod tests {
             Request::new(GetCheckpointRequest {
                 window: 10 * DAY,
                 index: "alpha".into(),
+                shard: 0,
             }),
         )
         .await
@@ -831,5 +880,126 @@ mod tests {
         // A hash index ignores the `window` selector — routing keys off `shard`, so window=1 with
         // shard unset (0) reaches ordinal 0, not window 1.
         assert_eq!(hit_ids(&mux, "h", 1).await.unwrap(), vec!["ord0"]);
+    }
+
+    /// A fresh **empty** single-shard for `index` (KEYWORD `id`), writable through a [`WriteService`].
+    fn empty_shard(root: &std::path::Path, index: &str) -> Arc<Shard> {
+        let src = SourceSchema::new(
+            vec![SourceField::new("id", SourceType::String)],
+            vec![],
+            vec!["id".into()],
+        );
+        let idx = IndexDefinition::from_yaml(&format!(
+            "name: {index}\nsource: {{ iceberg: {{ catalog: g, table: g.{index} }} }}\nmapping: {{ selection: EXPLICIT, fields: [ {{ path: id, type: KEYWORD, fast: true }} ] }}\n",
+        ))
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+        Arc::new(
+            LocalIndexStore::open(root)
+                .unwrap()
+                .create_shard(&ShardId::single(index), &idx)
+                .unwrap(),
+        )
+    }
+
+    /// A single-doc upsert batch for the KEYWORD `id` field (a hash write is one flat batch — no
+    /// window bucketing).
+    fn id_upsert(id: &str, n: i64) -> CommitBatch {
+        let mut f = BTreeMap::new();
+        f.insert("id".to_string(), Value::from(id));
+        CommitBatch::from_upserts(
+            vec![LocatedDoc {
+                doc: Document::new(
+                    CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]),
+                    f,
+                ),
+                iceberg_file: "f".into(),
+                row_position: 0,
+            }],
+            SourceCheckpoint::iceberg(n),
+            "b1",
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pool_hash_write_dispatches_by_ordinal_and_is_queryable() {
+        use crate::shard_handle::ShardHandle;
+        use crate::write_service::WriteService;
+
+        let t0 = tempfile::tempdir().unwrap();
+        let t1 = tempfile::tempdir().unwrap();
+        // Two ordinal shards of one hash index `h`; each ordinal's read services and its per-ordinal
+        // WriteService share ONE handle, so a written doc is queryable through the same map.
+        let h0 = ShardHandle::new(empty_shard(t0.path(), "h"));
+        let h1 = ShardHandle::new(empty_shard(t1.path(), "h"));
+        let reads_ord: SharedSearchWindows = Arc::new(RwLock::new(BTreeMap::from([
+            (0_i64, SearchService::new(h0.clone())),
+            (1_i64, SearchService::new(h1.clone())),
+        ])));
+        let writes_ord: SharedHashWriteUnits = Arc::new(RwLock::new(BTreeMap::from([
+            (0_i64, WriteService::new(h0.clone(), "h", 4)),
+            (1_i64, WriteService::new(h1.clone(), "h", 4)),
+        ])));
+        let kinds: SharedIndexKinds =
+            Arc::new(RwLock::new(BTreeMap::from([("h".to_string(), true)])));
+
+        let reads = PoolSearchService::new(
+            Arc::new(RwLock::new(BTreeMap::from([("h".to_string(), reads_ord)]))),
+            kinds.clone(),
+        );
+        let writes = PoolWriteService::new(
+            Default::default(), // no windowed indexes on this node
+            Arc::new(RwLock::new(BTreeMap::from([("h".to_string(), writes_ord)]))),
+            kinds,
+        );
+
+        // A write tagged to ordinal 1 dispatches to ordinal 1's shard.
+        let req = WriteRequest {
+            batch: Some(id_upsert("x", 1).into()),
+            index: "h".into(),
+            shard: 1,
+        };
+        assert!(
+            Write::write(&writes, Request::new(req))
+                .await
+                .unwrap()
+                .into_inner()
+                .snapshot
+                > 0
+        );
+        // Ordinal 1 has the doc; ordinal 0 stayed empty (dispatch went to the RIGHT ordinal, not
+        // window-partitioned across both).
+        assert_eq!(hit_ids_shard(&reads, "h", 1).await.unwrap(), vec!["x"]);
+        assert!(hit_ids_shard(&reads, "h", 0).await.unwrap().is_empty());
+
+        // GetCheckpoint dispatches by ordinal too: ordinal 1 resumes from its committed checkpoint.
+        let cp = Write::get_checkpoint(
+            &writes,
+            Request::new(GetCheckpointRequest {
+                window: 0,
+                index: "h".into(),
+                shard: 1,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(cp.snapshot, 1);
+
+        // An ordinal this node doesn't hold is the structured not-served refusal (a stale route —
+        // FailedPrecondition, not a malformed request), so the connector re-resolves the owner.
+        let req9 = WriteRequest {
+            batch: Some(id_upsert("y", 2).into()),
+            index: "h".into(),
+            shard: 9,
+        };
+        assert_eq!(
+            Write::write(&writes, Request::new(req9))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
     }
 }

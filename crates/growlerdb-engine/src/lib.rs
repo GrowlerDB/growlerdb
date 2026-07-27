@@ -73,8 +73,8 @@ pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
 
 pub use pool_routing::{
     PoolAdminService, PoolLookupService, PoolSearchService, PoolSuggestService, PoolWriteService,
-    SharedAdminIndexes, SharedIndexKinds, SharedLookupIndexes, SharedSearchIndexes,
-    SharedSuggestIndexes, SharedWriteIndexes,
+    SharedAdminIndexes, SharedHashWriteIndexes, SharedHashWriteUnits, SharedIndexKinds,
+    SharedLookupIndexes, SharedSearchIndexes, SharedSuggestIndexes, SharedWriteIndexes,
 };
 pub use service_auth::{
     intercept as intercept_service_token, layer as service_token_layer, ServiceTokenAuth,

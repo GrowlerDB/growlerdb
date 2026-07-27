@@ -99,6 +99,7 @@ async fn growlerdb_serve_hosts_write_grpc() {
         .write(WriteRequest {
             batch: Some(wire),
             index: String::new(),
+            shard: 0,
         })
         .await
         .expect("write rpc")
@@ -111,6 +112,7 @@ async fn growlerdb_serve_hosts_write_grpc() {
         .write(WriteRequest {
             batch: Some(batch().into()),
             index: String::new(),
+            shard: 0,
         })
         .await
         .expect("re-write")
@@ -273,6 +275,7 @@ async fn growlerdb_serve_exposes_health_and_metrics() {
         .write(WriteRequest {
             batch: Some(batch().into()),
             index: String::new(),
+            shard: 0,
         })
         .await
         .expect("write to record an SLI");
