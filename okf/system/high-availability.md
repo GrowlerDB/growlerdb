@@ -102,10 +102,14 @@ by subscribing to a CP push** (`SubscribeAssignments` — the CP streams each no
 its holder set on every placement change) and obtains its data by **reading the parked unit's frozen
 sidecars + segments read-through from object storage** (`open_cold_replica`) — no rebuild, no copy
 stream. So placing a replica → the node opens it read-through → the gateway fails reads over to it,
-end to end. (Cold/parked windows today — a **hot** window's tail exists only on its primary until
-the window parks, so a hot-window node loss degrades honestly until re-placement + revive; see the
-[known limitation](/quality/known-limitations/windowed-replica-gap.md). Continuous hot-window
-shipping is a later step, and hash-shard replica serving follows the pool hash path.)
+end to end. This holds for **both** unit kinds: a windowed index's parked **windows** and a hash
+index's **ordinal shards** (a frozen `backup_replica_snapshot` the primary publishes to object
+storage, opened read-through by the replica exactly as a parked window is). (Immutable-first: a **hot**
+window's tail exists only on its primary until the window parks, and a hash ordinal's replica serves
+the last published snapshot until the next backup — so either way a not-yet-shipped write degrades
+honestly until re-placement + revive/re-publish; see the
+[known limitation](/quality/known-limitations/windowed-replica-gap.md). Continuous hot shipping — for
+both windows and ordinals — is a later step.)
 
 Same primitive, three wins: **multi-index density** (kills node-per-index), **read failover**
 (kills the node SPOF), and **rebalancing** (moving a unit is placing a unit).
@@ -137,7 +141,8 @@ segment-shipped copies), so a replica never needs its own local rebuild.
 - **Connector** — unchanged; the single-connector *ingest* SPOF is documented and the connector-set
   ([D32](/system/decisions/d32-parallel-ingest.md)) is the HA ingest path.
 - **Node** — replicated units + cold-tier-fast re-placement ⇒ a node loss is a zero-gap read
-  failover for replica-served (parked/cold) units — the hot tail is the
+  failover for replica-served units of **either kind** — a windowed index's parked windows and a hash
+  index's published ordinal shards; the un-shipped hot tail is the
   [remaining gap](/quality/known-limitations/windowed-replica-gap.md); many indexes share one pool.
 - **Control plane** — N stateless replicas over a replicated store ⇒ no SPOF; a replica loss is a
   reconnect, a leader loss is a store failover.

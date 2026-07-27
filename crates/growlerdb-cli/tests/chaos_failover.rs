@@ -19,7 +19,7 @@ use growlerdb_core::{
     SourceCheckpoint, SourceField, SourceSchema, SourceType, TimeWindowing, Value,
     WindowGranularity,
 };
-use growlerdb_engine::{FailoverNode, Gateway, Node, RemoteNode, WindowNode};
+use growlerdb_engine::{FailoverNode, Gateway, Node, RemoteNode, ShardNode, WindowNode};
 use growlerdb_index::{LocalIndexStore, ShardId};
 use growlerdb_proto::v1::control_plane_client::ControlPlaneClient;
 use growlerdb_proto::v1::write_client::WriteClient;
@@ -173,18 +173,23 @@ async fn wait_until_ready(metrics_addr: &str) {
 /// every window). A transport error *or* an honest `partial` is an `Err` — for this drill a
 /// degraded page with a live replica available is exactly as much a failure as no page at all.
 async fn search_ids(gw: &Gateway) -> Result<Vec<String>, String> {
+    search_ids_idx(gw, IDX).await
+}
+
+/// As [`search_ids`] but for `index` — the hash drill fronts a different index than the windowed one.
+async fn search_ids_idx(gw: &Gateway, index: &str) -> Result<Vec<String>, String> {
     let resp = gw
         .search(Request::new(SearchRequest {
             query: "*".into(),
             limit: 10,
-            index: IDX.into(),
+            index: index.into(),
             ..Default::default()
         }))
         .await
         .map_err(|s| format!("{:?}: {}", s.code(), s.message()))?
         .into_inner();
     if resp.partial {
-        return Err("partial response (a window degraded instead of failing over)".into());
+        return Err("partial response (a unit degraded instead of failing over)".into());
     }
     let mut ids: Vec<String> = resp
         .hits
@@ -740,4 +745,305 @@ async fn a_write_to_a_replica_held_window_is_fenced_and_the_parked_data_survives
     // After all refusals, BOTH holders still serve the parked doc — the mux entries are intact.
     wait_until_serving(&primary_ep, WD, DOC1).await;
     wait_until_serving(&replica_ep, WD, DOC1).await;
+}
+
+// ── Hash-shard failover (D53 parity) ──────────────────────────────────────────────────────────────
+// The windowed drill above proves zero-gap read failover for a windowed index. This one proves the
+// same for a **hash-sharded** index: a TWO-ordinal index whose shards live frozen in the shared
+// object store (published by `backup_replica_snapshot`), placed at R=2 so both pool nodes open each
+// ordinal read-through. Two ordinals put every `*` search on the scatter path (where `partial` is
+// reachable), so asserting its absence across a primary kill means something — the hash counterpart
+// of the two-window setup.
+
+const HASH_IDX: &str = "docs";
+const ORD0_DOC: &str = "ord0doc";
+const ORD1_DOC: &str = "ord1doc";
+
+/// A minimal **hash** index (`id` KEYWORD, no windowing) sharded into two ordinals.
+fn hash_index() -> ResolvedIndex {
+    let src = SourceSchema::new(
+        vec![SourceField::new("id", SourceType::String)],
+        vec![],
+        vec!["id".into()],
+    );
+    IndexDefinition::from_yaml(
+        "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nshard_count: 2\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD, fast: true } ] }\n",
+    )
+    .unwrap()
+    .resolve(&src)
+    .unwrap()
+}
+
+/// Write `{data_dir}/docs/index.json` (the definition only, no ordinal shards) — a node started here
+/// serves the ordinals read-through from the object store, not from local data.
+fn define_hash_index(data_dir: &std::path::Path) {
+    std::fs::create_dir_all(data_dir.join(HASH_IDX)).unwrap();
+    std::fs::write(
+        data_dir.join(HASH_IDX).join("index.json"),
+        serde_json::to_vec(&hash_index()).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Publish ordinal `ordinal` (holding one doc `id`) to the shared object store as a frozen replica
+/// snapshot — the hash counterpart to [`park_window`]. Built in a throwaway dir; the marker lands at
+/// `cold/docs/{ordinal}` for a replica to open read-through.
+async fn seed_ordinal(store_dir: &std::path::Path, ordinal: u32, id: &str) {
+    let build = tempfile::tempdir().unwrap();
+    let store = LocalIndexStore::open(build.path()).unwrap();
+    let resolved = hash_index();
+    let shard_id = ShardId::shard(HASH_IDX, ordinal);
+    let shard = store.create_shard(&shard_id, &resolved).unwrap();
+    let key = CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]);
+    let mut f = BTreeMap::new();
+    f.insert("id".to_string(), Value::from(id));
+    IndexWriter::write(
+        &shard,
+        &CommitBatch::from_upserts(
+            vec![LocatedDoc {
+                doc: Document::new(key, f),
+                iceberg_file: "f".into(),
+                row_position: 0,
+            }],
+            SourceCheckpoint::iceberg(1),
+            "b1",
+        ),
+    )
+    .unwrap();
+    let op = growlerdb_backup::fs_store(store_dir).unwrap();
+    growlerdb_backup::backup_replica_snapshot(
+        &shard,
+        HASH_IDX,
+        &ordinal.to_string(),
+        &build.path().join(".stg"),
+        &op,
+        &format!("cold/{HASH_IDX}/{ordinal}"),
+        Some(serde_json::to_string(&resolved).unwrap()),
+    )
+    .await
+    .unwrap();
+}
+
+/// A **sharded** gateway over `units` (`(ordinal, primary endpoint, replica endpoint)`, in ordinal
+/// order), each behind a `FailoverNode` over `[ShardNode(primary), ShardNode(replica)]` — the D53 hash
+/// read path the cluster gateway builds from the CP's holder set. Lazy connect, as the real gateway.
+fn sharded_failover_gateway(units: &[(u32, String, String)]) -> Gateway {
+    let holder = |ep: &str, o: u32| {
+        let remote = RemoteNode::connect_lazy(ep.to_string(), None).unwrap();
+        ShardNode::new(Arc::new(remote), HASH_IDX, o).shared() as Arc<dyn Node>
+    };
+    let mut nodes: Vec<Arc<dyn Node>> = Vec::with_capacity(units.len());
+    for (o, primary_ep, replica_ep) in units {
+        nodes
+            .push(FailoverNode::new(holder(primary_ep, *o), vec![holder(replica_ep, *o)]).shared());
+    }
+    Gateway::sharded(nodes)
+}
+
+/// Poll `endpoint` (a lone `ShardNode` over `(HASH_IDX, ordinal)`) until it serves the ordinal's doc —
+/// i.e. the node picked up the CP assignment and opened it read-through. Generous budget: parallel
+/// tests contend for CPU/IO during the register → subscribe → push → cold-open convergence.
+async fn wait_until_serving_shard(endpoint: &str, ordinal: u32, doc: &str) {
+    for _ in 0..600 {
+        if let Ok(remote) = RemoteNode::connect(endpoint.to_string(), None).await {
+            let node: Arc<dyn Node> = ShardNode::new(Arc::new(remote), HASH_IDX, ordinal).shared();
+            let gw = Gateway::new(node);
+            if let Ok(ids) = search_ids_idx(&gw, HASH_IDX).await {
+                if ids == vec![doc.to_string()] {
+                    return;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("{endpoint} never served ordinal {ordinal} read-through");
+}
+
+/// Resolve ordinal `ordinal`'s primary endpoint from the CP, retrying until the index is registered
+/// (the nodes have announced) and a live holder is placed.
+async fn resolve_shard_primary(cp: &mut ControlPlaneClient<Channel>, ordinal: u32) -> String {
+    loop {
+        match cp
+            .resolve_unit_owner(Request::new(ResolveUnitOwnerRequest {
+                index: HASH_IDX.into(),
+                unit: Some(resolve_unit_owner_request::Unit::Shard(ordinal)),
+            }))
+            .await
+        {
+            Ok(r) => return r.into_inner().endpoint,
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+}
+
+/// D53 hash-shard parity: killing a hash ordinal's PRIMARY node under sustained query fails reads over
+/// to the replica with a bounded gap and no `partial` — the ordinal counterpart of the windowed drill.
+#[tokio::test]
+async fn killing_a_hash_ordinals_primary_fails_reads_over_to_the_replica() {
+    let store_dir = tempfile::tempdir().unwrap();
+
+    // 1. Publish TWO ordinals (one doc each) to the shared object store — every drill query then
+    //    scatters across both shards, the path where `partial` is reachable.
+    seed_ordinal(store_dir.path(), 0, ORD0_DOC).await;
+    seed_ordinal(store_dir.path(), 1, ORD1_DOC).await;
+
+    // 2. Two node data dirs with the definition only (they serve the ordinals read-through).
+    let a_dir = tempfile::tempdir().unwrap();
+    let b_dir = tempfile::tempdir().unwrap();
+    define_hash_index(a_dir.path());
+    define_hash_index(b_dir.path());
+
+    let addrs = free_addrs(5);
+    let (cp_addr, a_addr, b_addr) = (addrs[0].clone(), addrs[1].clone(), addrs[2].clone());
+    let (a_health, b_health) = (addrs[3].clone(), addrs[4].clone());
+
+    // 3. Control plane at R=2.
+    let cp_dir = tempfile::tempdir().unwrap();
+    let _cp = Proc(
+        Command::new(env!("CARGO_BIN_EXE_growlerdb"))
+            .args([
+                "--data-dir",
+                cp_dir.path().to_str().unwrap(),
+                "control-plane",
+                "--addr",
+                &cp_addr,
+            ])
+            .env("GROWLERDB_REPLICATION_FACTOR", "2")
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn control-plane"),
+    );
+    let cp_ep = format!("http://{cp_addr}");
+
+    // 4. Two pool nodes reading the ordinals through the shared store.
+    let a_ep = format!("http://{a_addr}");
+    let b_ep = format!("http://{b_addr}");
+    let spawn_node = |dir: &std::path::Path, addr: &str, ep: &str, health: &str| {
+        Proc(
+            Command::new(env!("CARGO_BIN_EXE_growlerdb"))
+                .args([
+                    "--data-dir",
+                    dir.to_str().unwrap(),
+                    "--metrics-addr",
+                    health,
+                    "serve-pool",
+                    "--index",
+                    HASH_IDX,
+                    "--addr",
+                    addr,
+                    "--register",
+                    &cp_ep,
+                    "--advertise-addr",
+                    ep,
+                ])
+                .env("GROWLERDB_OBJECT_STORE_FS", store_dir.path())
+                .stdout(Stdio::null())
+                .spawn()
+                .expect("spawn serve-pool"),
+        )
+    };
+    let mut node_a = spawn_node(a_dir.path(), &a_addr, &a_ep, &a_health);
+    let mut node_b = spawn_node(b_dir.path(), &b_addr, &b_ep, &b_health);
+    wait_for_grpc(&a_ep).await;
+    wait_for_grpc(&b_ep).await;
+    wait_until_ready(&a_health).await;
+    wait_until_ready(&b_health).await;
+
+    // 5. Place both ordinals (R=2 → primary + replica each; with two nodes, both hold both).
+    let mut cp = {
+        let mut client = None;
+        for _ in 0..200 {
+            if let Ok(c) = ControlPlaneClient::connect(cp_ep.clone()).await {
+                client = Some(c);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        client.expect("connect control plane")
+    };
+    let other = |primary: &str| {
+        if primary == a_ep {
+            b_ep.clone()
+        } else {
+            a_ep.clone()
+        }
+    };
+    let o0_primary = resolve_shard_primary(&mut cp, 0).await;
+    let o1_primary = resolve_shard_primary(&mut cp, 1).await;
+    assert!(o0_primary == a_ep || o0_primary == b_ep);
+    // Ordinal order (Gateway::sharded indexes nodes by ordinal): [ordinal 0, ordinal 1].
+    let units = vec![
+        (0u32, o0_primary.clone(), other(&o0_primary)),
+        (1u32, o1_primary.clone(), other(&o1_primary)),
+    ];
+
+    // 6. Every holder serves both ordinals read-through once the CP push reaches them.
+    for ep in [&a_ep, &b_ep] {
+        wait_until_serving_shard(ep, 0, ORD0_DOC).await;
+        wait_until_serving_shard(ep, 1, ORD1_DOC).await;
+    }
+
+    // 7. The drill gateway is built BEFORE the kill and used across it. Sustain queries pre-kill:
+    //    both ordinals answer, never partial.
+    let gw = sharded_failover_gateway(&units);
+    let both = vec![ORD0_DOC.to_string(), ORD1_DOC.to_string()];
+    for _ in 0..10 {
+        assert_eq!(
+            search_ids_idx(&gw, HASH_IDX).await.expect("pre-kill query"),
+            both,
+            "both ordinals answer before the kill"
+        );
+    }
+
+    // 8. Kill ordinal 0's PRIMARY node under the ongoing query stream.
+    let killed_at = Instant::now();
+    if o0_primary == a_ep {
+        node_a.kill();
+    } else {
+        node_b.kill();
+    }
+
+    // 9. Sustained queries across the kill on the SAME gateway: a bounded gap, then 40 consecutive
+    //    answers covering both ordinals with no partial — the replica absorbed the loss.
+    const GRACE: Duration = Duration::from_millis(1000);
+    let mut successes = 0u32;
+    let mut gap_failures = 0u32;
+    for _ in 0..400 {
+        match search_ids_idx(&gw, HASH_IDX).await {
+            Ok(ids) => {
+                assert_eq!(
+                    ids, both,
+                    "a failover answer must still cover both ordinals"
+                );
+                successes += 1;
+                if successes >= 40 {
+                    break;
+                }
+            }
+            Err(e) => {
+                assert!(
+                    killed_at.elapsed() <= GRACE,
+                    "read failed {:?} after the kill (past the {GRACE:?} failover grace, \
+                     {successes} successes so far): {e}",
+                    killed_at.elapsed()
+                );
+                successes = 0;
+                gap_failures += 1;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        successes >= 40,
+        "no sustained recovery after the primary kill ({gap_failures} failures in the gap)"
+    );
+
+    // 10. A FRESH gateway (new channels dialing the dead primary) also answers — cold-dial failover.
+    assert_eq!(
+        search_ids_idx(&sharded_failover_gateway(&units), HASH_IDX)
+            .await
+            .expect("fresh-gateway query after the kill"),
+        both,
+        "a fresh gateway fails over past the dead primary too"
+    );
 }

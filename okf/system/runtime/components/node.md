@@ -99,16 +99,24 @@ create-on-first-write is unchanged.
 **Replica serving & capability** ([D53](/system/decisions/d53-unit-replication.md)): a pool node
 registered into the pool also **subscribes to CP assignment pushes** (`SubscribeAssignments`; first
 subscribe waits for the first successful registration, reconnects with jittered exponential backoff)
-and, for each **replica** window the CP assigns it, fetches the parked window's cold marker from
-object storage and opens it **read-through** (`open_cold_replica`) into the same per-index maps the
-read multiplexers front — so a placed replica starts serving with no rebuild and no copy stream, and
-the gateway's failover routes reach it. Serving replicas needs the object store
-(`GROWLERDB_BACKUP_BUCKET` / `GROWLERDB_OBJECT_STORE_FS`), so the node's pool heartbeat carries a
+and, for each **replica** unit the CP assigns it, fetches the unit's cold marker from object storage
+and opens it **read-through** (`open_cold_replica`) into the same per-index maps the read multiplexers
+front — so a placed replica starts serving with no rebuild and no copy stream, and the gateway's
+failover routes reach it. This covers **both** unit kinds: a windowed index's parked **windows**
+(marker at `cold/{index}/w{window}`) and a hash index's **ordinal shards** (`cold/{index}/{ordinal}`,
+a frozen `backup_replica_snapshot` of the shard — hash ordinals never park, so the primary publishes a
+point-in-time snapshot the replica serves read-through). The reconcile keys both by the same
+`i64`-indexed maps (an index is all one kind), for either role (a parked window / a published shard is
+served read-through whether this node is its primary or a replica). Serving replicas needs the object
+store (`GROWLERDB_BACKUP_BUCKET` / `GROWLERDB_OBJECT_STORE_FS`), so the node's pool heartbeat carries a
 **`replica_capable`** declaration — true only when one is configured — and the CP **places replica
 units only on capable nodes** (an old binary or a store-less `--register` never silently absorbs
-replicas it could not serve; primaries are placed by load alone). Cold/parked windows today. Still to
-come: **dynamic assignment** (a node loading a primary unit it wasn't started with), hot-window
-replica shipping, and hash-shard replica serving.
+replicas it could not serve; primaries are placed by load alone). A pool node registers its ordinals
+**`pool_managed`** (the CP places them via `ResolveUnitOwner`, an empty announced set claiming nothing)
+so co-serving replicas don't each grab every shard as primary. Still to come: **dynamic assignment** (a
+node loading a primary unit it wasn't started with), and **continuous hot shipping** — a hash ordinal's
+replica serves the last published snapshot, so it trails the primary's newer writes until the next
+backup (immutable-first, the same gap a hot window has before it parks).
 
 **Unit unload** (HA-G1): assignment reconcile is a two-way sync. Each pushed snapshot's de-assigned
 set — units a *previous* snapshot assigned to this node (either role) that the new one doesn't — is

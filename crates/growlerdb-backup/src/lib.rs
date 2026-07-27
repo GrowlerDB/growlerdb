@@ -487,10 +487,65 @@ async fn cold_park_to_store(
     Ok(marker)
 }
 
+/// Back up a **hot, writable** shard to `store` under `prefix` and publish a replica-ready
+/// [`ColdMarker`] to `{prefix}/cold.json` — **without evicting the local copy**, so a cross-node
+/// replica can open the shard read-through ([`open_cold_replica`](growlerdb_index::LocalIndexStore::open_cold_replica))
+/// while the primary keeps serving and writing it (D53 hash-shard parity).
+///
+/// Unlike [`cold_park`] — which parks an *aged, immutable* window (evict → read-through) — a **hash
+/// ordinal** never parks: it stays hot and writable on its primary. So this is a **frozen snapshot** of
+/// a live shard, and it trails the primary's later writes until the next backup (immutable-first;
+/// continuous hot-shard shipping is deferred). It carries no event zone-map (ordinals aren't time
+/// windows) and skips the hotcache/bundle sidecars (open falls back to plain per-file read-through).
+/// Returns the published marker.
+pub async fn backup_replica_snapshot(
+    shard: &Shard,
+    index: &str,
+    shard_id: &str,
+    staging: &Path,
+    store: &Operator,
+    prefix: &str,
+    definition_json: Option<String>,
+) -> Result<ColdMarker> {
+    let manifest = backup(
+        shard,
+        index,
+        shard_id,
+        staging,
+        store,
+        prefix,
+        definition_json,
+    )
+    .await?;
+    let base = prefix.trim_end_matches('/');
+    // The aux + location sidecars `backup()` uploaded to `{base}/data/` (in the manifest's file set),
+    // recorded so a replica fetches them and opens the shard read-through — the same keys the windowed
+    // park marker records.
+    let marker = ColdMarker {
+        object_prefix: format!("{base}/data/index"),
+        event_min: None,
+        event_max: None,
+        snapshot: manifest.snapshot,
+        hotcache_key: None,
+        bundle_key: None,
+        bundle_manifest_key: None,
+        aux_key: Some(format!("{base}/data/aux.redb")),
+        location_key: Some(format!("{base}/data/location.arr")),
+    };
+    store
+        .write(
+            &format!("{base}/{}", growlerdb_index::COLD_MARKER),
+            serde_json::to_vec(&marker)?,
+        )
+        .await?;
+    Ok(marker)
+}
+
 /// Fetch a parked window's [`ColdMarker`] from object storage — the `{prefix}/cold.json` that
-/// [`cold_park`]/[`cold_park_in_place`] published — so a **replica** node can open the window
-/// read-through without a local copy (D53). `prefix` is the window's park prefix
-/// (`cold/{index}/w{window}`). `Ok(None)` if the window isn't parked (no marker object).
+/// [`cold_park`]/[`cold_park_in_place`] (or [`backup_replica_snapshot`]) published — so a **replica**
+/// node can open the unit read-through without a local copy (D53). `prefix` is the unit's park prefix
+/// (`cold/{index}/w{window}` for a window, `cold/{index}/{ordinal}` for a hash shard). `Ok(None)` if
+/// the unit isn't published (no marker object).
 pub async fn fetch_cold_marker(store: &Operator, prefix: &str) -> Result<Option<ColdMarker>> {
     let base = prefix.trim_end_matches('/');
     let key = format!("{base}/{}", growlerdb_index::COLD_MARKER);
