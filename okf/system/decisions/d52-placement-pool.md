@@ -64,5 +64,10 @@ placement with no protocol change. Extends **D33** (windowed placement → unive
 process — windowed indexes (routed on `window`) and hash-sharded indexes (routed on the `shard`
 ordinal), each index declaring its kind via `SharedIndexKinds` so the read/write multiplexers pick the
 selector — with per-unit replication/failover ([D53](/system/decisions/d53-unit-replication.md)) built
-for windowed units and following the same path for hash ordinals. See
+for windowed units and following the same path for hash ordinals. The pool now **self-organizes**: a
+leader-only placement sweep distributes hash primaries round-robin, and a node the CP assigns a primary
+it doesn't hold **builds it on assignment** from source (single-shard today) — so the operator points N
+interchangeable nodes at the pool with a **uniform config** and the CP designates who owns what, no
+per-node build/primary designation. Live-verified end to end (define-only nodes → round-robin
+placement → build-on-assignment → replica read-through → zero-gap failover on a primary kill). See
 [node](/system/runtime/components/node.md) and [high availability](/system/high-availability.md).

@@ -113,10 +113,25 @@ store (`GROWLERDB_BACKUP_BUCKET` / `GROWLERDB_OBJECT_STORE_FS`), so the node's p
 units only on capable nodes** (an old binary or a store-less `--register` never silently absorbs
 replicas it could not serve; primaries are placed by load alone). A pool node registers its ordinals
 **`pool_managed`** (the CP places them via `ResolveUnitOwner`, an empty announced set claiming nothing)
-so co-serving replicas don't each grab every shard as primary. Still to come: **dynamic assignment** (a
-node loading a primary unit it wasn't started with), and **continuous hot shipping** — a hash ordinal's
-replica serves the last published snapshot, so it trails the primary's newer writes until the next
-backup (immutable-first, the same gap a hot window has before it parks).
+so co-serving replicas don't each grab every shard as primary.
+
+**Build-on-assignment** (D52 dynamic assignment): a pool node the CP assigns **primary** of a hash
+ordinal it doesn't hold **cold-builds it from source** on assignment (`Engine::index_shard_resolved`,
+using the def it persisted at `--define-only` boot) and serves it hot + starts its publish loop — so a
+node need not have been started with the ordinal's data. This is what makes the pool **self-organizing**: the operator points N interchangeable
+nodes at the pool with a **uniform config** (`serve-pool --index A --index B …` on every node), and the
+CP's placement sweep distributes primaries round-robin while each node builds the ordinals it's given.
+The build runs off the reconcile loop (it reads the source, can be slow), guarded so a repeated
+snapshot doesn't double-build; a **variant** index (connector-fed, D49) skips the build and the
+connector fills it. Between placement pushes a periodic **retry** re-attempts assigned units that
+weren't serveable at the push — chiefly a replica whose primary hadn't yet published its marker — so a
+replica opens as soon as the marker appears rather than waiting for the next unrelated placement change.
+Single-shard today (the build writes to `ShardId::single`); a multi-ordinal build is a follow-up.
+
+Still to come: **continuous hot shipping** — a hash ordinal's replica serves the last published
+snapshot, so it trails the primary's newer writes until the next backup (immutable-first, the same gap
+a hot window has before it parks), and a written index's re-publish prunes superseded segments, so a
+replica refreshes to the new snapshot on the next retry rather than holding the old one indefinitely.
 
 **Unit unload** (HA-G1): assignment reconcile is a two-way sync. Each pushed snapshot's de-assigned
 set — units a *previous* snapshot assigned to this node (either role) that the new one doesn't — is
