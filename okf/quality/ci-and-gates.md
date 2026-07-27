@@ -20,7 +20,8 @@ The automated gates a change passes before merge — the quality process encoded
   reload, promotion) actually run instead of silently skipping. Local mirror: `just test-postgres`
   (throwaway dockerized Postgres).
 - **Lint** — typos, shellcheck, actionlint, yamllint, markdownlint (repo-wide); the console adds
-  eslint + prettier + `svelte-check`.
+  eslint + prettier + `svelte-check`. Locally these run inside `just check` (via `lint-all`), so
+  the local gate really does mirror this job.
 - **UI** — eslint, prettier, svelte-check, unit tests (all four also in local `just check` via
   `ui-check`), plus build + mocked Playwright E2E (CI-only: they need the browser toolchain).
 - **E2E** — the walking-skeleton (index → search → hydrate) against the real Compose stack.

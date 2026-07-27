@@ -59,8 +59,8 @@ okf-check:
 # every lint gate: Rust clippy + the non-Rust linters
 lint-all: lint lint-extra
 
-# everything CI runs (Rust + UI)
-check: fmt-check lint test ui-check
+# everything CI runs (Rust + non-Rust lint gates + UI)
+check: fmt-check lint-all test ui-check
 
 # Keep `target/` bounded the predictable way: if it exceeds CAP_GB (default 5), do a full
 # `cargo clean`; otherwise leave it. Cargo never garbage-collects target/, and there is no SAFE
