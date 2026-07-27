@@ -2554,7 +2554,7 @@ async fn open_pool_hash_index(
     lookup_idx: &growlerdb_engine::SharedLookupIndexes,
     admin_idx: &growlerdb_engine::SharedAdminIndexes,
     write_hash_idx: &growlerdb_engine::SharedHashWriteIndexes,
-) -> anyhow::Result<Vec<u32>> {
+) -> anyhow::Result<Vec<(u32, growlerdb_engine::ShardHandle)>> {
     use growlerdb_engine::{
         AdminService, LookupService, SearchService, ShardHandle, SuggestService, WriteService,
     };
@@ -2568,7 +2568,7 @@ async fn open_pool_hash_index(
 
     let index = resolved.name.clone();
     let ordinals = store.ordinal_shards(&index)?;
-    let (search_o, suggest_o, lookup_o, admin_o, write_o, handles, held) = {
+    let (search_o, suggest_o, lookup_o, admin_o, write_o, handles) = {
         let (store, resolved, index_s, table, ordinals, index_heavy) = (
             store.clone(),
             resolved.clone(),
@@ -2584,7 +2584,6 @@ async fn open_pool_hash_index(
             let mut admin_o = BTreeMap::new();
             let mut write_o = BTreeMap::new();
             let mut handles: Vec<(u32, ShardHandle)> = Vec::new();
-            let mut held = Vec::with_capacity(ordinals.len());
             for &o in &ordinals {
                 // Quarantine, don't crash (HA-G4): one corrupt ordinal must not take down the whole
                 // multi-index pool process — log it, skip it, serve the rest.
@@ -2625,9 +2624,8 @@ async fn open_pool_hash_index(
                         .with_embedding(resolved.clone()),
                 );
                 handles.push((o, handle));
-                held.push(o);
             }
-            Ok((search_o, suggest_o, lookup_o, admin_o, write_o, handles, held))
+            Ok((search_o, suggest_o, lookup_o, admin_o, write_o, handles))
         })
         .await??
     };
@@ -2654,10 +2652,109 @@ async fn open_pool_hash_index(
         .write()
         .unwrap_or_else(|e| e.into_inner())
         .insert(index.clone(), Arc::new(RwLock::new(write_o)));
-    for (o, handle) in handles {
-        spawn_auto_compaction(handle, format!("{index} s{o}"), compact_interval_secs);
+    for (o, handle) in &handles {
+        spawn_auto_compaction(
+            handle.clone(),
+            format!("{index} s{o}"),
+            compact_interval_secs,
+        );
     }
-    Ok(held)
+    Ok(handles)
+}
+
+/// Seconds between a primary pool node's hash-ordinal snapshot publishes
+/// (`GROWLERDB_REPLICATE_INTERVAL_SECS`, default 30; `0` disables). Coarse by design: re-publishing a
+/// writable shard re-uploads it wholesale (immutable-first — incremental hot shipping is deferred), so
+/// a replica trails the primary by at most one interval plus the upload.
+fn pool_replicate_interval_secs() -> u64 {
+    std::env::var("GROWLERDB_REPLICATE_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(30)
+}
+
+/// Background **publish** loop for one HOT hash ordinal on its primary (D53): on boot and every
+/// `interval_secs`, snapshot the shard and publish it to object storage
+/// ([`backup_replica_snapshot`](growlerdb_backup::backup_replica_snapshot)) under `cold/{index}/{ordinal}`,
+/// so a cross-node replica opens it read-through and a primary-node loss is a zero-gap read failover.
+/// Only a node holding the ordinal HOT locally runs this (the sole publisher — a read-through replica
+/// has no writable shard to snapshot). Same discipline as the [park loop](spawn_park): transient
+/// failures are logged + counted and retried next tick; the loop never dies. A no-op when
+/// `interval_secs == 0`.
+fn spawn_shard_replicate(
+    handle: growlerdb_engine::ShardHandle,
+    store: growlerdb_index::LocalIndexStore,
+    object_store: growlerdb_backup::Operator,
+    resolved: growlerdb_core::ResolvedIndex,
+    ordinal: u32,
+    interval_secs: u64,
+) {
+    if interval_secs == 0 {
+        return;
+    }
+    let index = resolved.name.clone();
+    // Serialize the definition once for the marker; a failure here is deterministic, so log + disable
+    // rather than retry it every tick (serving is unaffected — only replica feeding stops).
+    let def_json = match serde_json::to_string(&resolved) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "serve-pool replicate `{index}/{ordinal}`: cannot serialize definition ({e}) — \
+                 publish disabled"
+            );
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        let staging = store
+            .shard_path(&growlerdb_index::ShardId::shard(&index, ordinal))
+            .join(".replicate-stg");
+        let prefix = format!("cold/{index}/{ordinal}");
+        // The first tick fires immediately → publish on boot, then every interval.
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        // Skip a re-upload when the shard hasn't committed anything since the last publish — a static
+        // (or idle) index publishes once and then no-ops, so the coarse re-upload cost is paid only
+        // when there's actually new data for a replica to catch up on.
+        let mut last_published: Option<u64> = None;
+        loop {
+            tick.tick().await;
+            let shard = handle.current();
+            if let Ok(cur) = shard.current_snapshot() {
+                if last_published == Some(cur) {
+                    growlerdb_telemetry::sli::background_success("shard-replicate");
+                    continue;
+                }
+            }
+            match growlerdb_backup::backup_replica_snapshot(
+                &shard,
+                &index,
+                &ordinal.to_string(),
+                &staging,
+                &object_store,
+                &prefix,
+                Some(def_json.clone()),
+            )
+            .await
+            {
+                Ok(m) => {
+                    last_published = Some(m.snapshot);
+                    growlerdb_telemetry::sli::background_success("shard-replicate");
+                    eprintln!(
+                        "serve-pool replicate `{index}/{ordinal}`: published snapshot {} for \
+                         read-through replicas",
+                        m.snapshot
+                    );
+                }
+                Err(e) => {
+                    growlerdb_telemetry::sli::background_failure("shard-replicate");
+                    eprintln!(
+                        "serve-pool replicate `{index}/{ordinal}`: publish failed ({e}) — retrying \
+                         next interval"
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// Serve a **placement pool** node (D52): host CP-assigned units from many indexes over one gRPC
@@ -2723,6 +2820,15 @@ async fn serve_pool(
     // hash index reports its served ordinals, not windows, so the cluster gateway can place a ShardNode
     // per ordinal (task 2). The held-ordinal set is fixed at boot (no create-on-first-write here).
     let mut hash_announcements: Vec<(growlerdb_core::ResolvedIndex, u32, Vec<u32>)> = Vec::new();
+    // Per hash index, the (def, held hot ordinal handles) this node serves locally — the primary of
+    // each such ordinal periodically publishes a frozen snapshot to object storage so replicas can
+    // open it read-through (D53). Populated in the loop; the publish loops spawn once the object store
+    // is known (below).
+    #[allow(clippy::type_complexity)]
+    let mut hash_hot_ordinals: Vec<(
+        growlerdb_core::ResolvedIndex,
+        Vec<(u32, growlerdb_engine::ShardHandle)>,
+    )> = Vec::new();
     // Per-index (def, source table, heavy budget) the D53 replica reconcile needs to open an
     // assigned replica window read-through and publish it into this index's maps.
     let mut replica_meta: ReplicaIndexMeta = std::collections::HashMap::new();
@@ -2751,7 +2857,7 @@ async fn serve_pool(
         // services route on `shard`, and skip the windowed wiring below. Hash writes are ordinal-routed
         // by the connector, so there is no window partitioning / in-process gateway swap here.
         if resolved.windowing.is_none() {
-            let held = open_pool_hash_index(
+            let handles = open_pool_hash_index(
                 &store,
                 &resolved,
                 &table,
@@ -2764,7 +2870,7 @@ async fn serve_pool(
                 &write_hash_idx,
             )
             .await?;
-            total_ordinals += held.len();
+            total_ordinals += handles.len();
             kinds
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
@@ -2773,7 +2879,13 @@ async fn serve_pool(
             // held-ordinal set — a node serving ordinals purely read-through (a D53 replica with no
             // local shards) still announces the index's true shard count, so the CP can place every
             // ordinal and the gateway builds the full router.
+            let held: Vec<u32> = handles.iter().map(|(o, _)| *o).collect();
             hash_announcements.push((resolved.clone(), resolved.shard_count, held));
+            // Each ordinal this node holds HOT (built/serves locally, i.e. its primary): schedule a
+            // periodic publish of a frozen snapshot to object storage (below, once the store is known),
+            // so a cross-node replica can open it read-through and a node loss is a zero-gap read
+            // failover (D53). A read-through-only node holds none here, so it never double-publishes.
+            hash_hot_ordinals.push((resolved.clone(), handles));
             // The D53 reconcile needs the def/table/budget to open an assigned replica ordinal
             // read-through and publish it into this index's maps.
             replica_meta.insert(index.clone(), (resolved, table, index_heavy));
@@ -2954,9 +3066,13 @@ async fn serve_pool(
     // Absent the object store, the node still fences writes but serves only its local/primary
     // windows (no replica failover).
     let mut replica_capable = false;
+    // The backup object store (S3 or local fs), shared by the replica read-through path AND the
+    // primary's hash-ordinal publish loops below. `Err` when neither `GROWLERDB_BACKUP_BUCKET` nor
+    // `GROWLERDB_OBJECT_STORE_FS` is set.
+    let object_store = object_store_from_env();
     if let (Some(cp), Some(endpoint)) = (register, advertise_addr) {
         let replica_root = std::path::PathBuf::from(data_dir).join(".replica");
-        let replica = match object_store_from_env() {
+        let replica = match &object_store {
             Ok(op) => Some(ReplicaServing {
                 meta: replica_meta,
                 search_idx: search_idx.clone(),
@@ -2964,7 +3080,7 @@ async fn serve_pool(
                 lookup_idx: lookup_idx.clone(),
                 admin_idx: admin_idx.clone(),
                 store: store.clone(),
-                op,
+                op: op.clone(),
                 cache: growlerdb_index::RangeCache::new(cold_cache_bytes()),
                 replica_root: replica_root.clone(),
                 live_indexes: live_indexes.clone(),
@@ -2973,7 +3089,7 @@ async fn serve_pool(
                 eprintln!(
                     "serve-pool: replica failover disabled — no object store ({e}); the node \
                      registers as NOT replica-capable, so the control plane will not assign \
-                     replica windows to it. Set GROWLERDB_BACKUP_BUCKET (S3) or \
+                     replica units to it. Set GROWLERDB_BACKUP_BUCKET (S3) or \
                      GROWLERDB_OBJECT_STORE_FS (local dir) to enable D53 replica serving (write \
                      fencing stays active)"
                 );
@@ -2983,6 +3099,26 @@ async fn serve_pool(
         // The heartbeat's replica-capability declaration (HA-G2) mirrors whether the replica
         // serving path above is actually wired.
         replica_capable = replica.is_some();
+        // The **primary side** of D53 hash replication: for each hash ordinal this node holds HOT
+        // locally, publish a frozen snapshot to object storage on an interval, so a replica can open
+        // it read-through and a node loss is a zero-gap read failover. Only with an object store (else
+        // there is nothing to feed a replica); a read-through-only node holds no hot ordinals here, so
+        // there is exactly one publisher per ordinal.
+        if let Ok(op) = &object_store {
+            let interval = pool_replicate_interval_secs();
+            for (resolved, handles) in &hash_hot_ordinals {
+                for (ordinal, handle) in handles {
+                    spawn_shard_replicate(
+                        handle.clone(),
+                        store.clone(),
+                        op.clone(),
+                        resolved.clone(),
+                        *ordinal,
+                        interval,
+                    );
+                }
+            }
+        }
         spawn_assignment_reconcile(
             cp.to_string(),
             endpoint.to_string(),
@@ -5538,6 +5674,10 @@ async fn control_plane(
     // Dead-owner sweeper (357.18/HA-D2): re-place units whose primary stopped heartbeating, even
     // with no writes arriving — leader-only, grace-aware; the logic lives in the engine/registry.
     svc.spawn_dead_owner_sweeper();
+    // Replica top-up sweeper (357.26/HA-D8): fill every placed unit to R live holders even with no
+    // writes arriving, so a batch-built read-served index gets its replicas and a node join/loss
+    // self-heals the replica set — leader-only, grace-aware, a no-op at R=1.
+    svc.spawn_replica_topup_sweeper();
     let readiness = spawn_health(metrics_addr).await?;
     // In HA mode the leadership loop owns readiness — only the replica that holds the writer lock is
     // marked ready, so the Service routes to the single leader (active-passive). Otherwise (embedded

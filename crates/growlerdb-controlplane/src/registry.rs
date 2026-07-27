@@ -2384,6 +2384,84 @@ impl Registry {
         }
         Ok(swept)
     }
+
+    /// The **placed** units with **fewer than `replication_factor` live holders** at `now_ms` — the
+    /// replica top-up sweeper's work-list (HA-D8 / 357.26). A unit is under-replicated when it has an
+    /// assigned primary but its live-holder count (primary + replicas whose node is still
+    /// heartbeating) is below `R`: either it was never topped up (a primary announced without a
+    /// write-driven resolve — a batch-built, read-served index) or a replica's node died. Unplaced
+    /// units (no primary) are skipped — they are placed on demand, not proactively. Empty while the
+    /// [grace window](Self::placement_grace_active) is active. Read-only.
+    pub fn units_below_replication(
+        &self,
+        replication_factor: usize,
+        now_ms: i64,
+    ) -> Vec<(String, Unit)> {
+        let r = replication_factor.max(1);
+        if r == 1 || self.placement_grace_active(now_ms) {
+            return Vec::new(); // R=1 is primary-only — nothing to top up
+        }
+        let live: std::collections::BTreeSet<String> =
+            self.live_nodes(now_ms).into_iter().collect();
+        let live_holders =
+            |sa: &ShardAssignment| sa.nodes().iter().filter(|n| live.contains(&n.0)).count();
+        let map = self.read_map();
+        let mut out = Vec::new();
+        for (name, e) in map.iter() {
+            for (ordinal, sa) in &e.shards {
+                if sa.primary.is_some() && live_holders(sa) < r {
+                    out.push((name.clone(), Unit::Shard(*ordinal)));
+                }
+            }
+            for (window, wa) in &e.windows {
+                if wa.assignment.primary.is_some() && live_holders(&wa.assignment) < r {
+                    out.push((name.clone(), Unit::Window(*window)));
+                }
+            }
+        }
+        out
+    }
+
+    /// **Replica top-up sweep** (HA-D8 / 357.26): bring every under-replicated placed unit back up to
+    /// `replication_factor` live holders through the SAME idempotent path a write-driven resolve takes
+    /// ([`resolve_unit_holders`](Self::resolve_unit_holders) — entitlement-aware, prunes dead replicas,
+    /// persist + push). This is what makes read HA **not depend on write activity**: a batch-built,
+    /// read-served index (no connector) still gets its replicas placed, and a node join/loss self-heals
+    /// the replica set. Returns the number of units whose holder set changed.
+    ///
+    /// The counterpart to [`sweep_dead_primaries`](Self::sweep_dead_primaries) (which promotes on a
+    /// dead *primary*); this fills *replicas*. Respects the grace window and no-ops on an empty pool or
+    /// at `R = 1`. The **caller** gates on leadership (only the leader sweeps); the persist boundary
+    /// refuses a non-leader write (`NotLeader`), so a demotion race is safe.
+    pub fn topup_replicas(
+        &self,
+        replication_factor: usize,
+        entitled_units: usize,
+        now_ms: i64,
+    ) -> Result<usize> {
+        if replication_factor.max(1) == 1 || self.live_nodes(now_ms).is_empty() {
+            return Ok(0);
+        }
+        let mut topped = 0usize;
+        for (index, unit) in self.units_below_replication(replication_factor, now_ms) {
+            match self.resolve_unit_holders(
+                &index,
+                unit,
+                replication_factor,
+                entitled_units,
+                now_ms,
+            ) {
+                Ok(h) if h.changed => topped += 1,
+                Ok(_) => {}
+                // The index was dropped, or a concurrent resolve already handled it — skip.
+                Err(RegistryError::NotFound(_)) => {}
+                // The pool emptied mid-sweep: stop, retry next tick.
+                Err(RegistryError::NoLiveNode { .. }) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(topped)
+    }
 }
 
 /// The mutable [`ShardAssignment`] for a [`Unit`] within an [`IndexEntry`], creating an empty one on
@@ -3133,6 +3211,58 @@ mod tests {
             1,
             "only two live nodes ⇒ can't reach R=3"
         );
+    }
+
+    #[test]
+    fn topup_replicas_fills_a_read_served_index_without_writes() {
+        // HA-D8 / 357.26: a placed PRIMARY with no write-driven resolve — a batch-built, read-served
+        // index (no connector) — is topped up to R live holders by the sweep, so read HA does not
+        // depend on write activity.
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
+        reg.create(resolved("idx")).unwrap();
+        let t = 1_000_000;
+        for n in ["node-a", "node-b"] {
+            reg.register_node(n, t);
+        }
+        // Disarm the liveness grace so the sweep acts deterministically (the first heartbeat armed it).
+        reg.set_placement_grace_anchor(-1);
+
+        // Announce ONLY a primary for ordinal 0 (as register_served_index's announce_primaries does
+        // for a pool node holding the ordinal hot) — no replicas yet.
+        reg.announce_primaries("idx", &[0], "node-a", t, usize::MAX)
+            .unwrap();
+        // Under-replicated at R=2: primary node-a + 0 replicas = 1 live holder < 2.
+        assert_eq!(
+            reg.units_below_replication(2, t),
+            vec![("idx".to_string(), Unit::Shard(0))]
+        );
+
+        // The sweep tops it up to 2 holders (node-b becomes the replica) via the idempotent resolve.
+        assert_eq!(reg.topup_replicas(2, usize::MAX, t).unwrap(), 1);
+        let h = reg
+            .resolve_unit_holders("idx", Unit::Shard(0), 2, usize::MAX, t)
+            .unwrap();
+        assert_eq!(h.primary, "node-a");
+        assert_eq!(h.replicas, vec!["node-b".to_string()]);
+
+        // Idempotent: fully replicated → empty work-list, the sweep no-ops.
+        assert!(reg.units_below_replication(2, t).is_empty());
+        assert_eq!(reg.topup_replicas(2, usize::MAX, t).unwrap(), 0);
+
+        // A dead replica re-opens the work-list: node-b stops heartbeating; only node-a is live, so
+        // ordinal 0 is under-replicated again (and there's no spare node to top up onto).
+        let t1 = t + NODE_HEARTBEAT_TTL_MS + 1;
+        reg.register_node("node-a", t1); // node-b left to die
+        reg.set_placement_grace_anchor(-1); // the re-register re-armed grace; disarm for determinism
+        assert_eq!(
+            reg.units_below_replication(2, t1),
+            vec![("idx".to_string(), Unit::Shard(0))]
+        );
+
+        // R=1 is primary-only → never any top-up work.
+        assert!(reg.units_below_replication(1, t1).is_empty());
+        assert_eq!(reg.topup_replicas(1, usize::MAX, t1).unwrap(), 0);
     }
 
     #[test]
