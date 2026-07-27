@@ -4536,7 +4536,7 @@ fn spawn_control_plane_reloader(
 /// (HA-B6): swapping every tick would replace warm node channels with fresh lazy ones and reset the
 /// [`FailoverNode`](growlerdb_engine::FailoverNode) holder-health state for no topology gain. When
 /// the routing does change, the endpoint → connection cache reuses the channels of every endpoint
-/// that persists across the change (a tonic `Channel` is a cheap clonable handle), so only genuinely
+/// that persists across the change (a tonic `Channel` is a cheap cloneable handle), so only genuinely
 /// new endpoints dial.
 fn spawn_windowed_control_plane_reloader(
     gateway: std::sync::Arc<growlerdb_engine::Gateway>,
