@@ -230,6 +230,7 @@ function defaults(): Required<Overrides> {
             shard_count: 2,
             source_snapshot_id: 99,
             source_timestamp_ms: 1700000000000,
+            source_probeable: true,
             shards: [
               {
                 ordinal: 0,

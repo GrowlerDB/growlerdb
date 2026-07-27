@@ -36,7 +36,12 @@ node `LookupService` onto the Trino lane. Ingest is the connector (`--variant-sp
 against the running stack: creating `events` over the live v3 table resolves its schema + shapes via
 Trino, and `TrinoHydrator` hydrates keys returning `payload` as JSON. Still scoped-out (interim,
 D45-loud where hit): source **stats**/**snapshot-poll**/**reconcile** and **alter**/**describe_source**
-on a variant table (no def to fork `describe_source`; raw-REST metadata reads are the follow-up). The
+on a variant table (no def to fork `describe_source`; raw-REST metadata reads are the follow-up).
+Because the ingestion-status source-head probe is native-only, a variant index reports
+`source_probeable = false` in its ingestion status; the console **health roll-up excludes it** — a null
+source head + `unknown` lag is *expected* for a variant source (read via the connector's Trino lane),
+not a cluster outage, so a healthy variant index no longer flags the header Down (only its structural
+failures — `no_primary` / `unreachable` — still degrade). The
 native path (TASK-353) collapses every "Trino / scoped-out" cell back to native once iceberg-rust
 ships variant, leaving Trino only as the permanent slow lane (D48).
 
