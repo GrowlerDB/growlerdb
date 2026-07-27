@@ -172,6 +172,7 @@ async fn write_checkpoint(endpoint: &str, token: Option<&str>) -> Result<(), ton
         .get_checkpoint(growlerdb_proto::v1::GetCheckpointRequest {
             window: 0,
             index: String::new(),
+            shard: 0,
         })
         .await
         .map(|_| ())

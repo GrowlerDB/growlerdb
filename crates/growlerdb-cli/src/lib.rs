@@ -2531,6 +2531,137 @@ async fn serve_windowed(
 /// window gets its own auto-compaction loop (boot windows now, runtime-created windows via
 /// `on_new_window`). CP-driven **dynamic assignment** (loading a unit on demand rather than from the
 /// static `--index` list) and cold read-through in pool mode remain follow-ons.
+/// Open the on-disk **ordinal shards** of a hash/partition-sharded `index` for pool serving (D52):
+/// build a per-ordinal read surface (Search / Suggest / Lookup / Admin) + a single-shard
+/// [`WriteService`](growlerdb_engine::WriteService), publish them into the shared per-index maps keyed
+/// by **ordinal-as-i64** (the same maps a windowed index keys by window), and start a per-ordinal
+/// auto-compaction loop. Returns the ordinals this node holds.
+///
+/// A corrupt ordinal is **quarantined** (HA-G4) like a corrupt window: logged, skipped, and the
+/// remaining ordinals served — the CP sees the unit unserved and re-places it. The held set is fixed
+/// at boot (no create-on-first-write: a hash ordinal is built offline by `growlerdb index --shards`
+/// and placed by the CP). The writer runs the D46 embed stage for a VECTOR index, so a connector-fed
+/// hash index still gets its LOCAL embeddings — as the single-index `serve` path does.
+#[allow(clippy::too_many_arguments)]
+async fn open_pool_hash_index(
+    store: &growlerdb_index::LocalIndexStore,
+    resolved: &growlerdb_core::ResolvedIndex,
+    table: &str,
+    index_heavy: std::sync::Arc<growlerdb_engine::IndexHeavyShare>,
+    compact_interval_secs: u64,
+    search_idx: &growlerdb_engine::SharedSearchIndexes,
+    suggest_idx: &growlerdb_engine::SharedSuggestIndexes,
+    lookup_idx: &growlerdb_engine::SharedLookupIndexes,
+    admin_idx: &growlerdb_engine::SharedAdminIndexes,
+    write_hash_idx: &growlerdb_engine::SharedHashWriteIndexes,
+) -> anyhow::Result<Vec<u32>> {
+    use growlerdb_engine::{
+        AdminService, LookupService, SearchService, ShardHandle, SuggestService, WriteService,
+    };
+    use growlerdb_index::ShardId;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, RwLock};
+
+    // Admission ceiling per ordinal writer (matching `serve`'s default): refuse rather than queue
+    // unboundedly when a connector out-runs one ordinal's commit path.
+    const POOL_HASH_MAX_INFLIGHT: usize = 32;
+
+    let index = resolved.name.clone();
+    let ordinals = store.ordinal_shards(&index)?;
+    let (search_o, suggest_o, lookup_o, admin_o, write_o, handles, held) = {
+        let (store, resolved, index_s, table, ordinals, index_heavy) = (
+            store.clone(),
+            resolved.clone(),
+            index.clone(),
+            table.to_string(),
+            ordinals.clone(),
+            index_heavy.clone(),
+        );
+        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let mut search_o = BTreeMap::new();
+            let mut suggest_o = BTreeMap::new();
+            let mut lookup_o = BTreeMap::new();
+            let mut admin_o = BTreeMap::new();
+            let mut write_o = BTreeMap::new();
+            let mut handles: Vec<(u32, ShardHandle)> = Vec::new();
+            let mut held = Vec::with_capacity(ordinals.len());
+            for &o in &ordinals {
+                // Quarantine, don't crash (HA-G4): one corrupt ordinal must not take down the whole
+                // multi-index pool process — log it, skip it, serve the rest.
+                let opened = store
+                    .open_shard(&ShardId::shard(&index_s, o), &resolved)
+                    .map(Arc::new);
+                let shard = match opened {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!(
+                            "serve-pool: QUARANTINED {index_s}/{o} — ordinal shard failed to open \
+                             ({e}); serving the remaining ordinals (repair or delete the shard dir; a \
+                             registered pool's control plane will re-place the unit)"
+                        );
+                        continue;
+                    }
+                };
+                let handle = ShardHandle::new(shard);
+                let key = o as i64;
+                search_o.insert(
+                    key,
+                    SearchService::new(handle.clone()).with_index_heavy_share(index_heavy.clone()),
+                );
+                suggest_o.insert(key, SuggestService::new(handle.clone()));
+                lookup_o.insert(
+                    key,
+                    LookupService::new(
+                        handle.clone(),
+                        IcebergConfig::from_env(),
+                        table.clone(),
+                        resolved.clone(),
+                    ),
+                );
+                admin_o.insert(key, AdminService::new(handle.clone(), &index_s));
+                write_o.insert(
+                    key,
+                    WriteService::new(handle.clone(), index_s.clone(), POOL_HASH_MAX_INFLIGHT)
+                        .with_embedding(resolved.clone()),
+                );
+                handles.push((o, handle));
+                held.push(o);
+            }
+            Ok((search_o, suggest_o, lookup_o, admin_o, write_o, handles, held))
+        })
+        .await??
+    };
+
+    // Publish the read maps + the writer map so the Pool services dispatch to this index's ordinals,
+    // then start a per-ordinal auto-compaction loop (as each served window gets one).
+    search_idx
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(index.clone(), Arc::new(RwLock::new(search_o)));
+    suggest_idx
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(index.clone(), Arc::new(RwLock::new(suggest_o)));
+    lookup_idx
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(index.clone(), Arc::new(RwLock::new(lookup_o)));
+    admin_idx
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(index.clone(), Arc::new(RwLock::new(admin_o)));
+    write_hash_idx
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(index.clone(), Arc::new(RwLock::new(write_o)));
+    for (o, handle) in handles {
+        spawn_auto_compaction(handle, format!("{index} s{o}"), compact_interval_secs);
+    }
+    Ok(held)
+}
+
+/// Serve a **placement pool** node (D52): host CP-assigned units from many indexes over one gRPC
+/// endpoint.
 #[allow(clippy::too_many_arguments)]
 async fn serve_pool(
     data_dir: &str,
@@ -2564,8 +2695,13 @@ async fn serve_pool(
     let lookup_idx: growlerdb_engine::SharedLookupIndexes = Arc::new(RwLock::new(BTreeMap::new()));
     let admin_idx: growlerdb_engine::SharedAdminIndexes = Arc::new(RwLock::new(BTreeMap::new()));
     let write_idx: growlerdb_engine::SharedWriteIndexes = Arc::new(RwLock::new(BTreeMap::new()));
-    // Per-index unit kind for the Pool read services: `serve-pool` serves **windowed** indexes today,
-    // so every served index routes on `window` (`false`). Hash-shard serving registers `true` here.
+    // The per-index `ordinal → WriteService` map behind the hash half of the Pool write multiplexer
+    // (D52): a hash-sharded index's writes are ordinal-routed, not window-partitioned.
+    let write_hash_idx: growlerdb_engine::SharedHashWriteIndexes =
+        Arc::new(RwLock::new(BTreeMap::new()));
+    // Per-index unit kind for the Pool read/write services: a **windowed** index routes on `window`
+    // (`false`); a **hash-sharded** index routes on the `shard` ordinal (`true`). Seeded `false` and
+    // overwritten to `true` per index as its kind is resolved from the definition below.
     let kinds: growlerdb_engine::SharedIndexKinds = Arc::new(RwLock::new(
         indexes.iter().map(|i| (i.clone(), false)).collect(),
     ));
@@ -2583,6 +2719,10 @@ async fn serve_pool(
     // Per-index (resolved def, writer) for the CP announce when `--register` is set: the writer's
     // live `served_windows()` is read each re-announce, so a window created since boot is advertised.
     let mut announcements: Vec<(growlerdb_core::ResolvedIndex, WindowedWriteService)> = Vec::new();
+    // Per **hash** index (def, total shard count, ordinals this node holds) for the CP announce: a
+    // hash index reports its served ordinals, not windows, so the cluster gateway can place a ShardNode
+    // per ordinal (task 2). The held-ordinal set is fixed at boot (no create-on-first-write here).
+    let mut hash_announcements: Vec<(growlerdb_core::ResolvedIndex, u32, Vec<u32>)> = Vec::new();
     // Per-index (def, source table, heavy budget) the D53 replica reconcile needs to open an
     // assigned replica window read-through and publish it into this index's maps.
     let mut replica_meta: ReplicaIndexMeta = std::collections::HashMap::new();
@@ -2594,24 +2734,60 @@ async fn serve_pool(
     // (D53) rather than freezing at boot.
     let live_indexes = Arc::new(std::sync::atomic::AtomicUsize::new(indexes.len().max(1)));
     let mut total_windows = 0usize;
+    let mut total_ordinals = 0usize;
     for index in indexes {
         let resolved = load_resolved(data_dir, index)?;
-        let windowing = resolved.windowing.clone().ok_or_else(|| {
-            anyhow::anyhow!("serve-pool serves windowed indexes; `{index}` is not windowed")
-        })?;
         let table = match &resolved.source {
             growlerdb_core::Source::Iceberg(s) => s.table.clone(),
         };
+        // One shared per-index heavy-read share across all of this index's unit services.
+        let index_heavy = growlerdb_engine::IndexHeavyShare::new(
+            growlerdb_engine::heavy_reads_cap(),
+            live_indexes.clone(),
+        );
+        // A HASH/partition-sharded index (no `windowing`): its units are **ordinal shards**, not time
+        // windows. Open the ordinals this node holds into the per-index read maps (keyed by
+        // ordinal-as-i64) + a per-ordinal writer, register the index as hash in `kinds` so the Pool
+        // services route on `shard`, and skip the windowed wiring below. Hash writes are ordinal-routed
+        // by the connector, so there is no window partitioning / in-process gateway swap here.
+        if resolved.windowing.is_none() {
+            let held = open_pool_hash_index(
+                &store,
+                &resolved,
+                &table,
+                index_heavy.clone(),
+                compact_interval_secs,
+                &search_idx,
+                &suggest_idx,
+                &lookup_idx,
+                &admin_idx,
+                &write_hash_idx,
+            )
+            .await?;
+            total_ordinals += held.len();
+            kinds
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(index.clone(), true);
+            // The advertised total shard count: the highest held ordinal + 1 (correct when this node
+            // holds the top ordinal — always so for the single-shard demo case, ordinal 0 ⇒ count 1).
+            // Multi-node hash placement threads the cluster-wide count through the CP (task 3).
+            let shard_count = held.iter().copied().max().map(|m| m + 1).unwrap_or(0);
+            hash_announcements.push((resolved.clone(), shard_count, held));
+            // The D53 reconcile needs the def/table/budget to open an assigned replica ordinal
+            // read-through (hash replica serving is task 3; recorded now so the map is complete).
+            replica_meta.insert(index.clone(), (resolved, table, index_heavy));
+            continue;
+        }
+        let windowing = resolved
+            .windowing
+            .clone()
+            .expect("windowing present (checked above)");
         // Open each of this index's window shards into the per-window read services + an in-process
         // node (backing the write service's gateway swap), keyed as the writer's boot seed. Cold
         // read-through windows are not yet handled in pool mode (a follow-on) — pool serving targets
         // hot windows.
         let windows = store.window_shards(index)?;
-        // One shared per-index heavy-read share across all of this index's window services.
-        let index_heavy = growlerdb_engine::IndexHeavyShare::new(
-            growlerdb_engine::heavy_reads_cap(),
-            live_indexes.clone(),
-        );
         let (search_w, suggest_w, lookup_w, admin_w, seed, served) = {
             let (store, resolved, index_s, table, windows, index_heavy) = (
                 store.clone(),
@@ -2823,7 +2999,8 @@ async fn serve_pool(
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid --addr `{addr}`: {e}"))?;
     println!(
-        "growlerdb serve-pool: {} index(es) [{}], {total_windows} window(s) total, on {socket}",
+        "growlerdb serve-pool: {} index(es) [{}], {total_windows} window(s) + {total_ordinals} \
+         ordinal shard(s) total, on {socket}",
         indexes.len(),
         indexes.join(", ")
     );
@@ -2842,6 +3019,7 @@ async fn serve_pool(
             cp.to_string(),
             endpoint.to_string(),
             announcements,
+            hash_announcements,
             replica_capable,
             readiness.clone(),
             label,
@@ -2859,8 +3037,8 @@ async fn serve_pool(
         .add_service(PoolSearchService::new(search_idx, kinds.clone()).into_server())
         .add_service(PoolSuggestService::new(suggest_idx, kinds.clone()).into_server())
         .add_service(PoolLookupService::new(lookup_idx, kinds.clone()).into_server())
-        .add_service(PoolAdminService::new(admin_idx, kinds).into_server())
-        .add_service(PoolWriteService::new(write_idx).into_server())
+        .add_service(PoolAdminService::new(admin_idx, kinds.clone()).into_server())
+        .add_service(PoolWriteService::new(write_idx, write_hash_idx, kinds).into_server())
         .add_service(SystemServer::new(SystemService::new(VERSION)))
         // SIGINT *or* SIGTERM (HA-G4): plain Kubernetes stops a pod with SIGTERM (the Helm preStop
         // sends SIGINT, but not every deployment runs the chart) — both must drain gracefully, not
@@ -4964,6 +5142,7 @@ fn spawn_pool_registration(
         growlerdb_core::ResolvedIndex,
         growlerdb_engine::WindowedWriteService,
     )>,
+    hash_announcements: Vec<(growlerdb_core::ResolvedIndex, u32, Vec<u32>)>,
     replica_capable: bool,
     readiness: growlerdb_telemetry::Readiness,
     label: String,
@@ -4974,6 +5153,7 @@ fn spawn_pool_registration(
                 let control_plane = control_plane.clone();
                 let endpoint = endpoint.clone();
                 let announcements = announcements.clone();
+                let hash_announcements = hash_announcements.clone();
                 async move {
                     // Heartbeat into the pool first, then announce each served index's windows —
                     // read fresh from the writer each tick, so a window created since boot (or
@@ -4990,6 +5170,20 @@ fn spawn_pool_registration(
                             1,
                             vec![],
                             writer.served_windows(),
+                        )
+                        .await?;
+                    }
+                    // A hash index announces its served **ordinals** + the total shard count (no
+                    // windows): the cluster gateway places a ShardNode per ordinal so it routes hash
+                    // reads/writes to their holder (task 2). The held set is fixed at boot.
+                    for (resolved, shard_count, ordinals) in &hash_announcements {
+                        register_served_index(
+                            &control_plane,
+                            &endpoint,
+                            resolved,
+                            *shard_count,
+                            ordinals.clone(),
+                            vec![],
                         )
                         .await?;
                     }

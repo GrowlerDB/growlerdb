@@ -78,6 +78,89 @@ fn define_windowed_index(data_dir: &std::path::Path, index: &str) {
     .unwrap();
 }
 
+/// A minimal **hash** (non-windowed) index (`id` KEYWORD) named `index` — its units are ordinal
+/// shards, not time windows.
+fn hash_index(index: &str) -> ResolvedIndex {
+    let src = SourceSchema::new(
+        vec![SourceField::new("id", SourceType::String)],
+        vec![],
+        vec!["id".into()],
+    );
+    IndexDefinition::from_yaml(&format!(
+        "name: {index}\nsource: {{ iceberg: {{ catalog: g, table: g.{index} }} }}\nmapping: {{ selection: EXPLICIT, fields: [ {{ path: id, type: KEYWORD, fast: true }} ] }}\n",
+    ))
+    .unwrap()
+    .resolve(&src)
+    .unwrap()
+}
+
+/// Define hash `index` on disk and build one **empty** ordinal shard per entry in `ordinals`
+/// (`{index}/{ordinal}`) — the pre-placed ordinals a pool node serves and the connector streams into.
+fn build_hash_ordinals(data_dir: &std::path::Path, index: &str, ordinals: &[u32]) {
+    let resolved = hash_index(index);
+    std::fs::create_dir_all(data_dir.join(index)).unwrap();
+    std::fs::write(
+        data_dir.join(index).join("index.json"),
+        serde_json::to_vec(&resolved).unwrap(),
+    )
+    .unwrap();
+    let store = LocalIndexStore::open(data_dir).unwrap();
+    for &o in ordinals {
+        store
+            .create_shard(&ShardId::shard(index, o), &resolved)
+            .unwrap();
+    }
+}
+
+/// A one-doc changelog batch for a hash index: upsert `id` (no window field), as a wire `DocBatch`.
+fn hash_doc_batch(id: &str, batch_id: &str) -> DocBatch {
+    let key = CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]);
+    let mut fields = BTreeMap::new();
+    fields.insert("id".to_string(), Value::from(id));
+    CommitBatch::from_upserts(
+        vec![LocatedDoc {
+            doc: Document::new(key, fields),
+            iceberg_file: "f0".into(),
+            row_position: 0,
+        }],
+        SourceCheckpoint::iceberg(1),
+        batch_id,
+    )
+    .into()
+}
+
+/// Search hash `(index, ordinal)` and return the matched `id`s — routes on the `shard` selector.
+async fn search_ids_shard(
+    client: &mut SearchClient<Channel>,
+    index: &str,
+    shard: u32,
+) -> Vec<String> {
+    let resp = client
+        .search(SearchRequest {
+            query: "*".into(),
+            limit: 10,
+            index: index.into(),
+            shard,
+            ..Default::default()
+        })
+        .await
+        .expect("search rpc")
+        .into_inner();
+    resp.hits
+        .iter()
+        .filter_map(|h| {
+            h.coordinates
+                .as_ref()
+                .and_then(|c| c.identifier.iter().find(|f| f.name == "id"))
+                .and_then(|f| f.value.clone())
+                .and_then(|v| match v.kind {
+                    Some(growlerdb_proto::v1::value::Kind::Str(s)) => Some(s),
+                    _ => None,
+                })
+        })
+        .collect()
+}
+
 /// A spawned `growlerdb` process that is killed on drop.
 struct Server(Child);
 impl Drop for Server {
@@ -403,6 +486,7 @@ async fn serve_pool_dispatches_writes_across_two_indexes_and_creates_windows_laz
         .write(WriteRequest {
             batch: Some(one_doc_batch("alphadoc", 10 * DAY_MS, "a1")),
             index: "alpha".into(),
+            shard: 0,
         })
         .await
         .expect("write to alpha");
@@ -410,6 +494,7 @@ async fn serve_pool_dispatches_writes_across_two_indexes_and_creates_windows_laz
         .write(WriteRequest {
             batch: Some(one_doc_batch("betadoc", 10 * DAY_MS, "b1")),
             index: "beta".into(),
+            shard: 0,
         })
         .await
         .expect("write to beta");
@@ -434,11 +519,85 @@ async fn serve_pool_dispatches_writes_across_two_indexes_and_creates_windows_laz
         .write(WriteRequest {
             batch: Some(one_doc_batch("gammadoc", 10 * DAY_MS, "g1")),
             index: "gamma".into(),
+            shard: 0,
         })
         .await;
     assert_eq!(
         unserved.unwrap_err().code(),
         tonic::Code::FailedPrecondition,
         "a write to an unserved index is rejected"
+    );
+}
+
+/// A pool node serves a **hash** index (D52): it opens the on-disk ordinal shards, routes reads AND
+/// writes on the `shard` ordinal selector (not `window`), and a write to an ordinal it doesn't hold is
+/// the structured not-served refusal — the hash counterpart to the windowed dispatch above.
+#[tokio::test]
+async fn serve_pool_serves_a_hash_index_by_ordinal() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A hash index `docs` with two ordinal shards pre-built empty (as `growlerdb index --shards`
+    // would place them); the connector then streams docs to their ordinal.
+    build_hash_ordinals(tmp.path(), "docs", &[0, 1]);
+
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let addr = format!("127.0.0.1:{port}");
+    let _server = Server(
+        Command::new(env!("CARGO_BIN_EXE_growlerdb"))
+            .args([
+                "--data-dir",
+                tmp.path().to_str().unwrap(),
+                "serve-pool",
+                "--index",
+                "docs",
+                "--addr",
+                &addr,
+            ])
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn growlerdb serve-pool"),
+    );
+
+    let url = format!("http://{addr}");
+    let mut writer = connect_write(&url).await;
+
+    // A write tagged to ordinal 1 dispatches to ordinal 1's shard (ordinal-routed, not partitioned).
+    writer
+        .write(WriteRequest {
+            batch: Some(hash_doc_batch("d1", "b1")),
+            index: "docs".into(),
+            shard: 1,
+        })
+        .await
+        .expect("write to ordinal 1");
+
+    // Queryable on ordinal 1 with no restart; ordinal 0 stayed empty (the write reached the RIGHT
+    // ordinal). The pool routes the read on `shard`, not `window`.
+    let mut client = connect(&url).await;
+    assert_eq!(
+        search_ids_shard(&mut client, "docs", 1).await,
+        vec!["d1"],
+        "ordinal-1 write → ordinal 1's shard"
+    );
+    assert!(
+        search_ids_shard(&mut client, "docs", 0).await.is_empty(),
+        "ordinal 0 stayed empty"
+    );
+
+    // A write to an ordinal this node doesn't hold is the structured not-served refusal (a stale
+    // route the connector re-resolves), exactly as an unserved index/window is.
+    let unserved = writer
+        .write(WriteRequest {
+            batch: Some(hash_doc_batch("d9", "b9")),
+            index: "docs".into(),
+            shard: 9,
+        })
+        .await;
+    assert_eq!(
+        unserved.unwrap_err().code(),
+        tonic::Code::FailedPrecondition,
+        "a write to an unheld ordinal is rejected"
     );
 }

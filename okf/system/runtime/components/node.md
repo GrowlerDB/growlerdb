@@ -58,21 +58,28 @@ per unit** — one primary writer + read replicas that hydrate read-through from
 ([D53](/system/decisions/d53-unit-replication.md), zero-gap failover). See
 [high availability](/system/high-availability.md).
 
-**Landing incrementally.** `growlerdb serve-pool --index A --index B …` already serves the windows of
-**many windowed indexes from one process** over one gRPC endpoint — reads dispatch per `(index,
-window)` through the pool multiplexers, so the node-per-index wall is gone for pre-built windowed
-indexes. A request addressed to a unit the node doesn't serve is refused with the structured
-`UNIT_NOT_SERVED` detail (`FAILED_PRECONDITION`) — a stale-route signal, not a client error, that the
-gateway's read failover matches to try the unit's next holder (a missing selector stays
-`INVALID_ARGUMENT`: no holder could satisfy it). With `--register` it heartbeats into the **index-agnostic placement pool** (`RegisterNode`
-now carries only the endpoint) and announces every served index's windows, so a cluster gateway can
-route to it. **Writes** land the same way: `serve-pool` mounts a `PoolWriteService` that dispatches
-each `Write` / `GetCheckpoint` on the `(index, window)` selector (`WriteRequest` /
-`GetCheckpointRequest` carry an `index`; empty = the sole served index, a drop-in for a single-index
-node) to that index's windowed writer, which creates the window shard on first write and publishes it
-into the same live maps the read multiplexers front — so a just-ingested window is queryable and
-re-announced with no restart. The connector stamps the index on each sub-batch, so it streams ingest
-to a pool node exactly as to a single-index windowed node.
+**Landing incrementally.** `growlerdb serve-pool --index A --index B …` already serves **many indexes
+from one process** over one gRPC endpoint — both **windowed** indexes (units are time windows, routed
+on `window`) and **hash-sharded** indexes (units are ordinal shards, routed on the `shard` ordinal) —
+so the node-per-index wall is gone for pre-built indexes of either kind. Each served index registers
+its **unit kind** (`SharedIndexKinds`), and the pool read/write multiplexers pick the selector per
+index accordingly; the maps are `i64`-keyed either way (a window id or an `ordinal as i64`), so one
+endpoint fronts both. A request addressed to a unit the node doesn't serve is refused with the
+structured `UNIT_NOT_SERVED` detail (`FAILED_PRECONDITION`) — a stale-route signal, not a client
+error, that the gateway's read failover matches to try the unit's next holder (a missing selector
+stays `INVALID_ARGUMENT`: no holder could satisfy it). With `--register` it heartbeats into the
+**index-agnostic placement pool** (`RegisterNode` now carries only the endpoint) and announces each
+served index's units — a windowed index its windows, a hash index its held ordinals + total shard
+count — so a cluster gateway can route to it. **Writes** land the same way: `serve-pool` mounts a
+`PoolWriteService` that dispatches each `Write` / `GetCheckpoint` on the `index` selector, then routes
+within the index on `window` (windowed) or the `shard` ordinal (hash) — `WriteRequest` /
+`GetCheckpointRequest` carry both `index` (empty = the sole served index, a drop-in for a single-index
+node) and `shard`. A windowed write goes to that index's windowed writer, which creates the window
+shard on first write; a hash write goes straight to the ordinal's single-shard writer (the ordinal set
+is fixed at boot — a hash ordinal is built offline and CP-placed, not created on first write). Both
+publish into the same live maps the read multiplexers front, so a just-ingested unit is queryable with
+no restart. The connector stamps the index — and, for a hash index, the ordinal — on each sub-batch,
+so it streams ingest to a pool node exactly as to a single-index node.
 
 **Write fencing** ([D53](/system/decisions/d53-unit-replication.md)'s one-writer-per-unit, node
 side): when the node runs from CP assignments (`--register`), every pushed assignment snapshot

@@ -693,6 +693,7 @@ async fn a_write_to_a_replica_held_window_is_fenced_and_the_parked_data_survives
         .write(WriteRequest {
             batch: Some(batch()),
             index: IDX.into(),
+            shard: 0,
         })
         .await
         .expect_err("a write to a replica-held window must be refused");
@@ -708,6 +709,7 @@ async fn a_write_to_a_replica_held_window_is_fenced_and_the_parked_data_survives
         .get_checkpoint(GetCheckpointRequest {
             window: WD,
             index: IDX.into(),
+            shard: 0,
         })
         .await
         .expect_err("a checkpoint read on a replica-held window must be refused");
@@ -723,6 +725,7 @@ async fn a_write_to_a_replica_held_window_is_fenced_and_the_parked_data_survives
         .write(WriteRequest {
             batch: Some(batch()),
             index: IDX.into(),
+            shard: 0,
         })
         .await
         .expect_err("a write into the primary's parked window must be refused");

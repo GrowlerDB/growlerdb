@@ -853,6 +853,7 @@ mod tests {
         svc.write(Request::new(WriteRequest {
             batch: Some(batch.into()),
             index: String::new(),
+            shard: 0,
         }))
         .await
         .unwrap();
@@ -879,6 +880,7 @@ mod tests {
         svc.write(Request::new(WriteRequest {
             batch: Some(batch2.into()),
             index: String::new(),
+            shard: 0,
         }))
         .await
         .unwrap();
@@ -902,6 +904,7 @@ mod tests {
                 .into(),
             ),
             index: String::new(),
+            shard: 0,
         }))
         .await
         .unwrap();
@@ -911,6 +914,7 @@ mod tests {
             .get_checkpoint(Request::new(GetCheckpointRequest {
                 window: day(10),
                 index: String::new(),
+                shard: 0,
             }))
             .await
             .unwrap()
@@ -926,6 +930,7 @@ mod tests {
             .get_checkpoint(Request::new(GetCheckpointRequest {
                 window: day(99),
                 index: String::new(),
+                shard: 0,
             }))
             .await
             .unwrap()
@@ -950,6 +955,7 @@ mod tests {
                 .into(),
             ),
             index: String::new(),
+            shard: 0,
         }))
         .await
         .unwrap();
@@ -968,6 +974,7 @@ mod tests {
                 .into(),
             ),
             index: String::new(),
+            shard: 0,
         }))
         .await
         .expect("a delete broadcast must not fail on a parked window");
@@ -994,6 +1001,7 @@ mod tests {
                 .into(),
             ),
             index: String::new(),
+            shard: 0,
         }))
         .await
         .unwrap();
@@ -1012,6 +1020,7 @@ mod tests {
                     .into(),
                 ),
                 index: String::new(),
+                shard: 0,
             }))
             .await
             .expect_err("a write into a parked window must be refused");
@@ -1045,6 +1054,7 @@ mod tests {
         svc.write(Request::new(WriteRequest {
             batch: Some(batch.into()),
             index: String::new(),
+            shard: 0,
         }))
         .await
         .map(|r| r.into_inner().snapshot)
@@ -1113,6 +1123,7 @@ mod tests {
             .get_checkpoint(Request::new(GetCheckpointRequest {
                 window: day(11),
                 index: String::new(),
+                shard: 0,
             }))
             .await
             .expect_err("a checkpoint read on a non-primary window must be refused");
@@ -1126,6 +1137,7 @@ mod tests {
             .get_checkpoint(Request::new(GetCheckpointRequest {
                 window: day(10),
                 index: String::new(),
+                shard: 0,
             }))
             .await
             .unwrap()
@@ -1185,6 +1197,7 @@ mod tests {
             .get_checkpoint(Request::new(GetCheckpointRequest {
                 window: day(10),
                 index: String::new(),
+                shard: 0,
             }))
             .await
             .expect_err("a checkpoint read on a replica-published window must be refused");
