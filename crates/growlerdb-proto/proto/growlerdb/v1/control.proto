@@ -406,6 +406,11 @@ message IndexIngestion {
   int64 source_snapshot_id = 6;    // the source table's current Iceberg snapshot (0 = none)
   int64 source_timestamp_ms = 7;   // commit time of that snapshot (epoch ms)
   bool source_readable = 8;        // false if the source couldn't be read (lag is then "unknown")
+  // Whether the control plane can **natively probe** this index's Iceberg source head. False for a
+  // **variant** index (D49: iceberg-rust can't plan a v3 variant schema) — its source is read via the
+  // connector's Trino lane, so a null source head + "unknown" lag is expected, not an outage. The
+  // console uses this so a variant index never rolls the cluster health up as a source failure.
+  bool source_probeable = 10;
   repeated ShardIngestion shards = 9;
 }
 
