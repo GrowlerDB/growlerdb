@@ -2385,21 +2385,29 @@ impl Registry {
         Ok(swept)
     }
 
-    /// The **placed** units with **fewer than `replication_factor` live holders** at `now_ms` — the
-    /// replica top-up sweeper's work-list (HA-D8 / 357.26). A unit is under-replicated when it has an
-    /// assigned primary but its live-holder count (primary + replicas whose node is still
-    /// heartbeating) is below `R`: either it was never topped up (a primary announced without a
-    /// write-driven resolve — a batch-built, read-served index) or a replica's node died. Unplaced
-    /// units (no primary) are skipped — they are placed on demand, not proactively. Empty while the
-    /// [grace window](Self::placement_grace_active) is active. Read-only.
-    pub fn units_below_replication(
+    /// The units that need placement work at `now_ms` — the **placement sweeper's** work-list (HA-D8 /
+    /// 357.26). This is what makes the pool **self-organize**: the operator points N interchangeable
+    /// nodes at the pool (uniform config, no per-node build/primary designation) and the CP distributes
+    /// primaries + replicas over each index's declared units. A unit needs work when:
+    ///
+    /// - **Hash index** — for every ordinal `0..shard_count` (the declared, bounded unit set): it has
+    ///   no primary yet (**place one**, round-robin least-loaded, so a node need not have pre-built it),
+    ///   or it's placed but has fewer than `R` live holders (**top up replicas** / replace a dead one).
+    /// - **Windowed index** — windows are created on demand (unbounded, time-based; the connector's
+    ///   write-driven resolve places each), so this only **tops up replicas** for windows *already*
+    ///   placed — it never proactively creates a window.
+    ///
+    /// Live-holder count is the primary + replicas whose node still heartbeats. Empty while the
+    /// [grace window](Self::placement_grace_active) is active (so a freshly-(re)started CP lets nodes
+    /// re-announce before it proactively places). Read-only.
+    pub fn units_needing_placement(
         &self,
         replication_factor: usize,
         now_ms: i64,
     ) -> Vec<(String, Unit)> {
         let r = replication_factor.max(1);
-        if r == 1 || self.placement_grace_active(now_ms) {
-            return Vec::new(); // R=1 is primary-only — nothing to top up
+        if self.placement_grace_active(now_ms) {
+            return Vec::new();
         }
         let live: std::collections::BTreeSet<String> =
             self.live_nodes(now_ms).into_iter().collect();
@@ -2408,42 +2416,55 @@ impl Registry {
         let map = self.read_map();
         let mut out = Vec::new();
         for (name, e) in map.iter() {
-            for (ordinal, sa) in &e.shards {
-                if sa.primary.is_some() && live_holders(sa) < r {
-                    out.push((name.clone(), Unit::Shard(*ordinal)));
+            if e.definition.windowing.is_none() {
+                // Hash: proactively place + replicate every declared ordinal.
+                for ordinal in 0..e.definition.shard_count {
+                    let needs = match e.shards.get(&ordinal) {
+                        None => true, // never placed → needs a primary
+                        Some(sa) if sa.primary.is_none() => true,
+                        Some(sa) => live_holders(sa) < r, // placed → under-replicated?
+                    };
+                    if needs {
+                        out.push((name.clone(), Unit::Shard(ordinal)));
+                    }
                 }
-            }
-            for (window, wa) in &e.windows {
-                if wa.assignment.primary.is_some() && live_holders(&wa.assignment) < r {
-                    out.push((name.clone(), Unit::Window(*window)));
+            } else {
+                // Windowed: only top up replicas for windows the connector already placed.
+                for (window, wa) in &e.windows {
+                    if wa.assignment.primary.is_some() && live_holders(&wa.assignment) < r {
+                        out.push((name.clone(), Unit::Window(*window)));
+                    }
                 }
             }
         }
         out
     }
 
-    /// **Replica top-up sweep** (HA-D8 / 357.26): bring every under-replicated placed unit back up to
-    /// `replication_factor` live holders through the SAME idempotent path a write-driven resolve takes
-    /// ([`resolve_unit_holders`](Self::resolve_unit_holders) — entitlement-aware, prunes dead replicas,
-    /// persist + push). This is what makes read HA **not depend on write activity**: a batch-built,
-    /// read-served index (no connector) still gets its replicas placed, and a node join/loss self-heals
-    /// the replica set. Returns the number of units whose holder set changed.
+    /// **Placement sweep** (HA-D8 / 357.26): drive every unit in
+    /// [`units_needing_placement`](Self::units_needing_placement) to `R` live holders through the SAME
+    /// idempotent path a write-driven resolve takes ([`resolve_unit_holders`](Self::resolve_unit_holders)
+    /// — entitlement-aware, least-loaded, prunes dead replicas, persist + push). This is the pool's
+    /// **self-organization**: it **places a primary** for each declared hash ordinal that has none
+    /// (round-robin across the pool, so a node need not have pre-built it — it builds/loads on
+    /// assignment) and **fills replicas** for placed units, so read HA does not depend on write
+    /// activity and the operator never designates which node owns what. Returns the number of units
+    /// whose holder set changed.
     ///
     /// The counterpart to [`sweep_dead_primaries`](Self::sweep_dead_primaries) (which promotes on a
-    /// dead *primary*); this fills *replicas*. Respects the grace window and no-ops on an empty pool or
-    /// at `R = 1`. The **caller** gates on leadership (only the leader sweeps); the persist boundary
+    /// dead *primary*); this places primaries + fills replicas. Respects the grace window and no-ops on
+    /// an empty pool. The **caller** gates on leadership (only the leader sweeps); the persist boundary
     /// refuses a non-leader write (`NotLeader`), so a demotion race is safe.
-    pub fn topup_replicas(
+    pub fn ensure_placement(
         &self,
         replication_factor: usize,
         entitled_units: usize,
         now_ms: i64,
     ) -> Result<usize> {
-        if replication_factor.max(1) == 1 || self.live_nodes(now_ms).is_empty() {
+        if self.live_nodes(now_ms).is_empty() {
             return Ok(0);
         }
         let mut topped = 0usize;
-        for (index, unit) in self.units_below_replication(replication_factor, now_ms) {
+        for (index, unit) in self.units_needing_placement(replication_factor, now_ms) {
             match self.resolve_unit_holders(
                 &index,
                 unit,
@@ -3214,7 +3235,7 @@ mod tests {
     }
 
     #[test]
-    fn topup_replicas_fills_a_read_served_index_without_writes() {
+    fn ensure_placement_tops_up_replicas_of_a_read_served_index() {
         // HA-D8 / 357.26: a placed PRIMARY with no write-driven resolve — a batch-built, read-served
         // index (no connector) — is topped up to R live holders by the sweep, so read HA does not
         // depend on write activity.
@@ -3234,12 +3255,12 @@ mod tests {
             .unwrap();
         // Under-replicated at R=2: primary node-a + 0 replicas = 1 live holder < 2.
         assert_eq!(
-            reg.units_below_replication(2, t),
+            reg.units_needing_placement(2, t),
             vec![("idx".to_string(), Unit::Shard(0))]
         );
 
         // The sweep tops it up to 2 holders (node-b becomes the replica) via the idempotent resolve.
-        assert_eq!(reg.topup_replicas(2, usize::MAX, t).unwrap(), 1);
+        assert_eq!(reg.ensure_placement(2, usize::MAX, t).unwrap(), 1);
         let h = reg
             .resolve_unit_holders("idx", Unit::Shard(0), 2, usize::MAX, t)
             .unwrap();
@@ -3247,8 +3268,8 @@ mod tests {
         assert_eq!(h.replicas, vec!["node-b".to_string()]);
 
         // Idempotent: fully replicated → empty work-list, the sweep no-ops.
-        assert!(reg.units_below_replication(2, t).is_empty());
-        assert_eq!(reg.topup_replicas(2, usize::MAX, t).unwrap(), 0);
+        assert!(reg.units_needing_placement(2, t).is_empty());
+        assert_eq!(reg.ensure_placement(2, usize::MAX, t).unwrap(), 0);
 
         // A dead replica re-opens the work-list: node-b stops heartbeating; only node-a is live, so
         // ordinal 0 is under-replicated again (and there's no spare node to top up onto).
@@ -3256,13 +3277,56 @@ mod tests {
         reg.register_node("node-a", t1); // node-b left to die
         reg.set_placement_grace_anchor(-1); // the re-register re-armed grace; disarm for determinism
         assert_eq!(
-            reg.units_below_replication(2, t1),
+            reg.units_needing_placement(2, t1),
             vec![("idx".to_string(), Unit::Shard(0))]
         );
+    }
 
-        // R=1 is primary-only → never any top-up work.
-        assert!(reg.units_below_replication(1, t1).is_empty());
-        assert_eq!(reg.topup_replicas(1, usize::MAX, t1).unwrap(), 0);
+    #[test]
+    fn ensure_placement_proactively_places_primaries_round_robin_over_declared_ordinals() {
+        // The self-organizing pool: an index is registered with its DEFINITION (shard_count) but NO
+        // node announces holding any ordinal (nodes start empty — build/load on assignment). The sweep
+        // places a primary for every declared ordinal round-robin across the pool, with no per-node
+        // designation and no write ever arriving.
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
+        let mut def = resolved("idx");
+        def.shard_count = 4; // a 4-ordinal hash index
+        reg.create(def).unwrap();
+        let t = 1_000_000;
+        for n in ["node-a", "node-b"] {
+            reg.register_node(n, t);
+        }
+        reg.set_placement_grace_anchor(-1);
+
+        // Nothing announced → all 4 ordinals are unplaced and need a primary.
+        assert_eq!(
+            reg.units_needing_placement(1, t),
+            (0..4)
+                .map(|o| ("idx".to_string(), Unit::Shard(o)))
+                .collect::<Vec<_>>()
+        );
+
+        // The sweep places all four primaries (R=1); least-loaded ⇒ they spread 2/2 across the pool.
+        assert_eq!(reg.ensure_placement(1, usize::MAX, t).unwrap(), 4);
+        let owners: Vec<String> = (0..4)
+            .map(|o| {
+                reg.resolve_unit_holders("idx", Unit::Shard(o), 1, usize::MAX, t)
+                    .unwrap()
+                    .primary
+            })
+            .collect();
+        let a = owners.iter().filter(|p| *p == "node-a").count();
+        let b = owners.iter().filter(|p| *p == "node-b").count();
+        assert_eq!(
+            (a, b),
+            (2, 2),
+            "primaries balance round-robin across the pool"
+        );
+
+        // Idempotent once every ordinal is placed at R=1.
+        assert!(reg.units_needing_placement(1, t).is_empty());
+        assert_eq!(reg.ensure_placement(1, usize::MAX, t).unwrap(), 0);
     }
 
     #[test]
