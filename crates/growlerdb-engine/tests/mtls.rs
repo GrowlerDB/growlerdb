@@ -101,6 +101,7 @@ async fn try_describe(endpoint: &str, tls: ClientTlsConfig) -> Result<(), String
                 let gw = growlerdb_engine::Gateway::new(Arc::new(node));
                 return gw
                     .describe_index(Request::new(DescribeIndexRequest {
+                        shard: 0,
                         window: 0,
                         index: String::new(),
                     }))

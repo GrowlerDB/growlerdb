@@ -73,8 +73,8 @@ pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
 
 pub use pool_routing::{
     PoolAdminService, PoolLookupService, PoolSearchService, PoolSuggestService, PoolWriteService,
-    SharedAdminIndexes, SharedLookupIndexes, SharedSearchIndexes, SharedSuggestIndexes,
-    SharedWriteIndexes,
+    SharedAdminIndexes, SharedIndexKinds, SharedLookupIndexes, SharedSearchIndexes,
+    SharedSuggestIndexes, SharedWriteIndexes,
 };
 pub use service_auth::{
     intercept as intercept_service_token, layer as service_token_layer, ServiceTokenAuth,
@@ -84,8 +84,8 @@ pub use suggest_service::SuggestService;
 pub use topology::{shard_primaries, ShardTopologyError};
 pub use windowed_ingest::{OnNewWindow, PrimaryFence, WindowSeed, WindowedWriteService};
 pub use windowed_routing::{
-    is_not_primary, is_unit_not_served, not_primary, unit_not_served, SharedAdminWindows,
-    SharedLookupWindows, SharedSearchWindows, SharedSuggestWindows, WindowNode,
+    is_not_primary, is_unit_not_served, not_primary, unit_not_served, ShardNode,
+    SharedAdminWindows, SharedLookupWindows, SharedSearchWindows, SharedSuggestWindows, WindowNode,
     WindowedAdminService, WindowedLookupService, WindowedSearchService, WindowedSuggestService,
     NOT_PRIMARY, UNIT_NOT_SERVED,
 };

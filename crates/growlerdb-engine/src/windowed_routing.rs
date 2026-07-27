@@ -484,6 +484,90 @@ impl Node for WindowNode {
     }
 }
 
+/// The **client** half of distributed **hash-shard** routing (D52) — the hash counterpart to
+/// [`WindowNode`]: a [`Node`] wrapping the remote node that holds an **ordinal shard**, stamping the
+/// `(index, ordinal)` unit onto every request's `index` + `shard` selectors before delegating. A pool
+/// node fronting many indexes' ordinals over one endpoint then dispatches to the right ordinal
+/// ([`PoolSearchService`](crate::pool_routing::PoolSearchService) routes a hash index on `shard`). The
+/// Gateway holds one per ordinal (often several over one endpoint) and scatters to them exactly as it
+/// would plain shards; a single-shard node ignores the selectors, so stamping is harmless there.
+pub struct ShardNode {
+    inner: Arc<dyn Node>,
+    index: String,
+    ordinal: u32,
+}
+
+impl ShardNode {
+    /// Front `inner` (a `RemoteNode` to the unit's serving endpoint) as the node for `(index,
+    /// ordinal)`.
+    pub fn new(inner: Arc<dyn Node>, index: impl Into<String>, ordinal: u32) -> Self {
+        Self {
+            inner,
+            index: index.into(),
+            ordinal,
+        }
+    }
+
+    /// Erase to a shared `dyn Node` for the [Gateway](crate::gateway::Gateway).
+    pub fn shared(self) -> Arc<dyn Node> {
+        Arc::new(self)
+    }
+
+    /// Stamp this node's `(index, ordinal)` unit onto a request selector pair.
+    fn stamp(&self, index: &mut String, shard: &mut u32) {
+        index.clone_from(&self.index);
+        *shard = self.ordinal;
+    }
+}
+
+#[tonic::async_trait]
+impl Node for ShardNode {
+    async fn search(
+        &self,
+        mut req: Request<SearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        let r = req.get_mut();
+        self.stamp(&mut r.index, &mut r.shard);
+        self.inner.search(req).await
+    }
+
+    async fn suggest(
+        &self,
+        mut req: Request<SuggestRequest>,
+    ) -> Result<Response<SuggestResponse>, Status> {
+        let r = req.get_mut();
+        self.stamp(&mut r.index, &mut r.shard);
+        self.inner.suggest(req).await
+    }
+
+    async fn get_by_key(
+        &self,
+        mut req: Request<GetByKeyRequest>,
+    ) -> Result<Response<GetByKeyResponse>, Status> {
+        let r = req.get_mut();
+        self.stamp(&mut r.index, &mut r.shard);
+        self.inner.get_by_key(req).await
+    }
+
+    async fn describe_index(
+        &self,
+        mut req: Request<DescribeIndexRequest>,
+    ) -> Result<Response<DescribeIndexResponse>, Status> {
+        let r = req.get_mut();
+        self.stamp(&mut r.index, &mut r.shard);
+        self.inner.describe_index(req).await
+    }
+
+    async fn aggregate(
+        &self,
+        mut req: Request<AggregateRequest>,
+    ) -> Result<Response<AggregateResponse>, Status> {
+        let r = req.get_mut();
+        self.stamp(&mut r.index, &mut r.shard);
+        self.inner.aggregate(req).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

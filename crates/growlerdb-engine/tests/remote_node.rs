@@ -158,6 +158,7 @@ async fn gateway_routes_search_suggest_describe_over_the_wire() {
     // Describe: stats routed back from the Node.
     let stats = gw
         .describe_index(Request::new(DescribeIndexRequest {
+            shard: 0,
             window: 0,
             index: String::new(),
         }))
@@ -178,6 +179,7 @@ async fn gateway_propagates_node_errors_over_the_wire() {
     // Describing another index → NotFound, surfaced verbatim through the channel.
     let err = gw
         .describe_index(Request::new(DescribeIndexRequest {
+            shard: 0,
             window: 0,
             index: "nope".into(),
         }))
@@ -188,6 +190,7 @@ async fn gateway_propagates_node_errors_over_the_wire() {
     // GetByKey for an unindexed key → NotFound (resolved before any Iceberg connect),
     // proving the lookup route + error mapping hold over the wire.
     let missing = GetByKeyRequest {
+        shard: 0,
         window: 0,
         keys: vec![Coordinates {
             partition: vec![],

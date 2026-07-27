@@ -1909,6 +1909,7 @@ mod tests {
 
         let resp = svc
             .aggregate(Request::new(AggregateRequest {
+                shard: 0,
                 query: "rank:[0 TO 100]".into(),
                 aggs: r#"{"rank_stats": {"Stats": {"field": "rank"}}}"#.into(),
                 partial: false,
@@ -1934,6 +1935,7 @@ mod tests {
         let svc = ranked_service(tmp.path());
         let err = svc
             .aggregate(Request::new(AggregateRequest {
+                shard: 0,
                 query: "rank:[0 TO 100]".into(),
                 aggs: "{not valid".into(),
                 partial: false,
