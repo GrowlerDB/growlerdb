@@ -129,6 +129,22 @@ public final class ControlPlaneClient implements AutoCloseable {
                     ResolveUnitOwnerRequest.newBuilder().setIndex(index).setWindow(window).build()));
   }
 
+  /**
+   * Resolve the node that owns ordinal {@code shard} of a hash/partition-sharded {@code index},
+   * placing it on the least-loaded live node on first ask — the hash counterpart to {@link
+   * #resolveWindowOwner}. In the placement pool (D52) a hash index's ordinals are CP-placed (not
+   * pinned to a per-ordinal StatefulSet), so the connector resolves each owned ordinal's current
+   * pool node this way. Idempotent for an already-placed shard (returns its existing primary).
+   */
+  public ResolveUnitOwnerResponse resolveShardOwner(String index, int shard) {
+    return callWithRetry(
+        "resolveShardOwner",
+        () ->
+            deadlined()
+                .resolveUnitOwner(
+                    ResolveUnitOwnerRequest.newBuilder().setIndex(index).setShard(shard).build()));
+  }
+
   /** A fresh stub bearing this attempt's deadline (deadlines are absolute, so set per attempt). */
   private ControlPlaneGrpc.ControlPlaneBlockingStub deadlined() {
     return stub.withDeadlineAfter(deadlineSeconds, TimeUnit.SECONDS);

@@ -82,9 +82,10 @@ public final class ShardGroupWriteClient implements BatchWriter {
         if (hp.length != 2) {
           throw new IllegalArgumentException("endpoint must be host:port, got `" + endpoint + "`");
         }
-        // Tagged with the index so resume/drain checkpoints ask the same (index, shard)
-        // selector the writes land on — see ShardedWriteClient.
-        byOrdinal.put(ordinal, new WriteClient(hp[0].trim(), Integer.parseInt(hp[1].trim()), index));
+        // Tagged with the index AND this ordinal so writes + resume/drain checkpoints carry the
+        // full (index, shard) selector a hash pool node dispatches on — see ShardedWriteClient.
+        byOrdinal.put(
+            ordinal, new WriteClient(hp[0].trim(), Integer.parseInt(hp[1].trim()), index, ordinal));
       }
     } catch (RuntimeException e) {
       // Don't leak channels of clients already opened when a later endpoint is malformed.

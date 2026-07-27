@@ -41,12 +41,16 @@ batches to the [nodes](/system/runtime/components/node.md)' Write gRPC services 
   placement the [gateway](/system/runtime/components/gateway.md) routes reads to, so writes land where
   reads look) unless the operator pins endpoints with `--nodes`; it fails fast if a shard has no live
   primary yet, and on a shard map that lists an ordinal twice (ambiguous placement — never a silent
-  last-wins). Each sub-batch **and each resume/drain `GetCheckpoint`** is **tagged with its index**,
-  on every path including the single-endpoint one, so a
-  [pool node](/system/decisions/d52-placement-pool.md) serving many indexes can dispatch it by
-  `(index, shard)` — an untagged checkpoint against a multi-index node is a non-retryable
-  `InvalidArgument` crash-loop. (A windowed index instead resolves each window's owner live via
-  `ResolveUnitOwner`.)
+  last-wins). Each sub-batch **and each resume/drain `GetCheckpoint`** is **tagged with its index and
+  its ordinal shard** — the connector builds one writer per ordinal, each stamping `(index, shard)` on
+  every write and checkpoint — on every path including the single-endpoint one, so a
+  [pool node](/system/decisions/d52-placement-pool.md) holding several ordinals of one index over one
+  endpoint dispatches each to the right ordinal (the hash counterpart to the window selector, and what
+  the gateway's `ShardNode` stamps on the read side). An untagged checkpoint against a multi-index node
+  is a non-retryable `InvalidArgument` crash-loop; the ordinal defaults to 0 for a windowed or
+  single-shard node, which ignore it. (A windowed index instead resolves each window's owner live via
+  `ResolveUnitOwner`; the hash counterpart `resolveShardOwner` places an ordinal on the pool the same
+  way for CP-driven placement.)
 - **Follow a re-placement, don't pin the startup snapshot.** CP-driven placement is re-resolved,
   not resolved once per process: every in-process stream restart rebuilds the writer from a fresh
   `GetIndex` shard map (hash) — falling back to the current writer if the CP is unreachable

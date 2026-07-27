@@ -4131,15 +4131,50 @@ fn connect_sharded_from_get_index(
     node_tls: Option<tonic::transport::ClientTlsConfig>,
 ) -> anyhow::Result<CpShardRouting> {
     use std::sync::Arc;
+    // Validate topology (contiguous ordinals, every primary assigned) + resolve strategy/bucket map;
+    // `endpoints` are the per-ordinal primaries in ordinal order (the routing fingerprint).
     let (endpoints, strategy, bucket_owners) = routing_plan_from_get_index(index, resp)?;
     let shard_count = endpoints.len() as u32;
-    let mut nodes: Vec<Arc<dyn growlerdb_engine::Node>> = Vec::with_capacity(endpoints.len());
-    for (ord, endpoint) in endpoints.iter().enumerate() {
-        // Lazy connect: never fail the build on an unreachable shard, and re-resolve DNS
-        // on reconnect so a returned-at-new-IP shard recovers and a still-down one fails fast → partial.
-        let node = connect_node_lazy(endpoint, node_tls.clone())
-            .map_err(|e| anyhow::anyhow!("shard {ord} primary `{endpoint}`: {e}"))?;
-        nodes.push(Arc::new(node));
+    // The ordinal shards, sorted (routing_plan already asserted a contiguous 0..shard_count).
+    let mut shards: Vec<&growlerdb_proto::v1::ShardStatus> = resp.shard_status.iter().collect();
+    shards.sort_by_key(|s| s.ordinal);
+    // Endpoint → warm `RemoteNode`: a **pool node** hosts several ordinals of one index on ONE
+    // endpoint (and a primary/replica can share one), so dedupe the channel — a tonic `Channel` is a
+    // cheap handle, and each ordinal still gets its own `ShardNode` wrapping the shared connection.
+    let mut conns: std::collections::HashMap<String, growlerdb_engine::RemoteNode> =
+        std::collections::HashMap::new();
+    let mut nodes: Vec<Arc<dyn growlerdb_engine::Node>> = Vec::with_capacity(shards.len());
+    for s in &shards {
+        // This ordinal's **holders** (D53): the primary first, then its read replicas — deduped,
+        // blanks dropped. Each connects **lazily** (a down holder fails fast at query time, not at
+        // build) and is wrapped in a `ShardNode` that stamps `(index, ordinal)` so a pool endpoint
+        // dispatches to the right ordinal; a `FailoverNode` then fails a dead primary over to a live
+        // replica with no gap (R=1 today ⇒ a single holder, the plain-shard behavior).
+        let mut holder_eps: Vec<String> = vec![s.primary.clone()];
+        for r in &s.replicas {
+            if !r.is_empty() && !holder_eps.contains(r) {
+                holder_eps.push(r.clone());
+            }
+        }
+        let mut holders: Vec<Arc<dyn growlerdb_engine::Node>> =
+            Vec::with_capacity(holder_eps.len());
+        for ep in &holder_eps {
+            let remote = match conns.get(ep) {
+                Some(r) => r.clone(),
+                None => {
+                    let r = connect_node_lazy(ep, node_tls.clone())
+                        .map_err(|e| anyhow::anyhow!("shard {} holder `{ep}`: {e}", s.ordinal))?;
+                    conns.insert(ep.clone(), r.clone());
+                    r
+                }
+            };
+            holders.push(
+                growlerdb_engine::ShardNode::new(Arc::new(remote), index, s.ordinal).shared(),
+            );
+        }
+        let mut holders = holders.into_iter();
+        let primary = holders.next().expect("holder_eps starts with the primary");
+        nodes.push(growlerdb_engine::FailoverNode::new(primary, holders.collect()).shared());
     }
     let router = growlerdb_core::ShardRouter::from_registry(strategy, &bucket_owners, shard_count)
         .map_err(|e| anyhow::anyhow!("index `{index}` bucket map: {e}"))?;
@@ -6290,6 +6325,44 @@ mod tests {
         let (_eps, strategy, owners) = routing_plan_from_get_index("events", &resp).unwrap();
         assert_eq!(strategy, RoutingStrategy::Partition);
         assert_eq!(owners.len(), 8);
+    }
+
+    /// A pool node hosts SEVERAL ordinals of one hash index over ONE endpoint, each replicated on a
+    /// second pool node (D52). `connect_sharded_from_get_index` must wrap every ordinal in a
+    /// `ShardNode` (stamping `(index, ordinal)`) over a `FailoverNode` across its holders, deduping
+    /// the shared endpoint's channel — so it yields one routable node per ordinal, not one per
+    /// endpoint. Lazy connects (nothing dials), so this runs with no live nodes.
+    #[tokio::test]
+    async fn cp_sharded_routing_wraps_pool_ordinals_sharing_one_endpoint() {
+        use growlerdb_proto::v1::{GetIndexResponse, ShardStatus};
+        let ordinal = |o: u32| ShardStatus {
+            ordinal: o,
+            window: 0,
+            primary: "http://pool-a:50051".into(),
+            replicas: vec!["http://pool-b:50051".into()],
+            state: "active".into(),
+            ..Default::default()
+        };
+        let resp = GetIndexResponse {
+            name: "docs".into(),
+            status: "active".into(),
+            shard_count: 2,
+            routing: 0, // hash
+            shard_status: vec![ordinal(0), ordinal(1)],
+            ..Default::default()
+        };
+        let (nodes, router, fp) = connect_sharded_from_get_index("docs", &resp, None).unwrap();
+        // One routable node PER ORDINAL (not per endpoint), and the router spans both ordinals.
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(router.shards(), 2);
+        // The fingerprint is the per-ordinal primaries in ordinal order (both on the pool node).
+        assert_eq!(
+            fp.0,
+            vec![
+                "http://pool-a:50051".to_string(),
+                "http://pool-a:50051".to_string()
+            ]
+        );
     }
 
     #[test]
