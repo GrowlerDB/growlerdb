@@ -5674,10 +5674,12 @@ async fn control_plane(
     // Dead-owner sweeper (357.18/HA-D2): re-place units whose primary stopped heartbeating, even
     // with no writes arriving — leader-only, grace-aware; the logic lives in the engine/registry.
     svc.spawn_dead_owner_sweeper();
-    // Replica top-up sweeper (357.26/HA-D8): fill every placed unit to R live holders even with no
-    // writes arriving, so a batch-built read-served index gets its replicas and a node join/loss
-    // self-heals the replica set — leader-only, grace-aware, a no-op at R=1.
-    svc.spawn_replica_topup_sweeper();
+    // Placement sweeper (357.26/HA-D8): self-organize the pool — proactively place a primary for each
+    // declared hash ordinal (round-robin, so nodes need no per-node designation; they build/load on
+    // assignment) and fill replicas to R, even with no writes arriving. So a batch-built, read-served
+    // index gets its primaries + replicas placed with no connector, and a node join/loss self-heals —
+    // leader-only, grace-aware.
+    svc.spawn_placement_sweeper();
     let readiness = spawn_health(metrics_addr).await?;
     // In HA mode the leadership loop owns readiness — only the replica that holds the writer lock is
     // marked ready, so the Service routes to the single leader (active-passive). Otherwise (embedded

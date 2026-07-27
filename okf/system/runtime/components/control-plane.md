@@ -39,12 +39,17 @@ built-in credentials, session epochs, and the per-index activity log.
   is confidently dead through the same idempotent, entitlement-aware resolve path, so quiescent
   units on a dead node recover without waiting for a write (at R=1 they'd otherwise be unavailable
   forever).
-- **Replica top-up sweeper** — the counterpart at `R > 1` (also leader-only, every TTL/2): it brings
-  every **placed** unit back up to `R` live holders through the same resolve path, so **read HA does
-  not depend on write activity**. A batch-built, read-served index (no connector to drive a
-  write-time resolve) still gets its replicas placed, and a node join or loss self-heals the replica
-  set — the piece that makes "delete a pod and reads keep answering" hold for a quiescent index.
-  Grace-aware, and a no-op at `R = 1`.
+- **Placement sweeper** — the self-organization pass (also leader-only, every TTL/2): it drives every
+  unit to `R` live holders through the same resolve path. For a **hash** index it walks the declared
+  ordinals `0..shard_count` and **places a primary** for any that has none — round-robin (least-loaded)
+  across the pool, so a node need not have pre-built the ordinal — then **fills replicas**; for a
+  **windowed** index it only tops up replicas of already-placed windows (windows are created on demand
+  by the connector). So the operator points N interchangeable nodes at the pool with a **uniform
+  config** — no per-node build/primary designation — and the CP distributes primaries + replicas
+  itself, with no write ever arriving. This is what makes "delete a pod and reads keep answering" hold
+  for a quiescent, read-served index. Grace-aware (it lets nodes re-announce before proactively
+  placing). The assigned primary then **builds/loads the unit on assignment** (see
+  [node](/system/runtime/components/node.md)).
 - **Startup/promotion grace** — for one TTL after the first post-boot/post-promotion heartbeat,
   assigned owners are treated live-unknown: dead-owner re-placement, announce takeovers, and the
   sweeper hold off, so a freshly (re)started CP never mass-re-places laggards' units onto the first

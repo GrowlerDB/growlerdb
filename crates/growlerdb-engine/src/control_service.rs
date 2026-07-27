@@ -1897,14 +1897,16 @@ impl ControlPlaneService {
         });
     }
 
-    /// Spawn the **replica top-up sweeper** (HA-D8 / 357.26): every TTL/2, bring every under-replicated
-    /// placed unit back to `replication_factor` live holders via the idempotent resolve path
-    /// ([`Registry::topup_replicas`]), so read HA **doesn't depend on write activity** — a batch-built,
-    /// read-served index gets its replicas placed with no connector, and a node join/loss self-heals the
-    /// replica set. The counterpart to [`spawn_dead_owner_sweeper`](Self::spawn_dead_owner_sweeper)
-    /// (which promotes on a dead primary). Only the **leader** sweeps; the grace window and `R = 1`
-    /// no-op are honored inside the sweep. A no-op at `R = 1` (primary-only).
-    pub fn spawn_replica_topup_sweeper(&self) {
+    /// Spawn the **placement sweeper** (HA-D8 / 357.26): every TTL/2, drive every unit to
+    /// `replication_factor` live holders via the idempotent resolve path
+    /// ([`Registry::ensure_placement`]) — **place a primary** for each declared hash ordinal that has
+    /// none (round-robin across the pool, so nodes need no per-node build/primary designation — they
+    /// build/load on assignment) and **fill replicas** for placed units. This is what makes the pool
+    /// self-organize and read HA independent of write activity: a batch-built, read-served index gets
+    /// its primaries + replicas placed with no connector, and a node join/loss self-heals the set. The
+    /// counterpart to [`spawn_dead_owner_sweeper`](Self::spawn_dead_owner_sweeper) (which promotes on a
+    /// dead primary). Only the **leader** sweeps; the grace window is honored inside the sweep.
+    pub fn spawn_placement_sweeper(&self) {
         use growlerdb_controlplane::NODE_HEARTBEAT_TTL_MS;
         let registry = self.registry.clone();
         let replication_factor = self.replication_factor;
@@ -1919,10 +1921,12 @@ impl ControlPlaneService {
                 if !registry.is_leader() {
                     continue;
                 }
-                match registry.topup_replicas(replication_factor, entitled, now_ms()) {
+                match registry.ensure_placement(replication_factor, entitled, now_ms()) {
                     Ok(0) => {}
-                    Ok(topped) => tracing::info!(topped, "replica top-up sweep placed replicas"),
-                    Err(e) => tracing::warn!(error = %e, "replica top-up sweep failed; will retry"),
+                    Ok(n) => {
+                        tracing::info!(placed = n, "placement sweep placed primaries/replicas")
+                    }
+                    Err(e) => tracing::warn!(error = %e, "placement sweep failed; will retry"),
                 }
             }
         });

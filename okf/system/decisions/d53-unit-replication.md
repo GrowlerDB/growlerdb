@@ -75,9 +75,11 @@ and the same path now covers **hash ordinal shards** — a primary **periodicall
 `backup_replica_snapshot` per held ordinal to object storage (a background loop, skip-if-unchanged) and
 a replica opens it read-through (`open_cold_replica`), keyed by ordinal in the pool maps, so a
 primary-node kill is a zero-gap read failover for a hash index too (chaos-drilled). Ordinals register
-`pool_managed` so co-serving replicas don't each claim every shard, and a leader-only **replica top-up
-sweep** fills every placed unit to `R` live holders **without any write** — so a batch-built,
-read-served index gets its replicas and a node join/loss self-heals the set. Remaining: **continuous
+`pool_managed` so co-serving replicas don't each claim every shard, and a leader-only **placement
+sweep** self-organizes the pool: it **places a primary** round-robin for every declared hash ordinal
+that has none (a node need not have pre-built it) and **fills replicas** to `R` — all **without any
+write** — so the operator points N interchangeable nodes at the pool with a uniform config and the CP
+distributes primaries + replicas, and a batch-built read-served index or a node join/loss self-heals. Remaining: **continuous
 hot shipping** (a hash ordinal's replica trails the primary's newer writes until the next publish — the
 immutable-first gap, same as a hot window before it parks) and **dynamic primary assignment**. Supersedes **D14** as the replica model, resolves the
 [windowed replica gap](/quality/known-limitations/windowed-replica-gap.md), depends on **D52** (the
