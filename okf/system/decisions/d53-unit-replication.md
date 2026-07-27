@@ -69,7 +69,14 @@ every unit it ever held (HA-G1). New
 [chaos](/quality/reliability.md) drills assert zero-gap failover (kill a unit's primary
 under sustained query, assert no `partial` and continued answers with a live replica).
 
-**Status.** Accepted (design). Implementation staged in the `true-ha` epic; not yet built. Supersedes
-**D14** as the replica model, resolves the [windowed replica gap](/quality/known-limitations/windowed-replica-gap.md),
-depends on **D52** (the pool) and **D51** (an HA control plane). See
-[high availability](/system/high-availability.md).
+**Status.** Accepted; implementing on `feat/true-ha`. Per-unit R-holder placement, primary write
+fencing, read failover, and cold-tier read-through replica serving are built for **windowed** units,
+and the same path now covers **hash ordinal shards** — a primary publishes a frozen
+`backup_replica_snapshot` per ordinal to object storage and a replica opens it read-through
+(`open_cold_replica`), keyed by ordinal in the pool maps, so a primary-node kill is a zero-gap read
+failover for a hash index too (chaos-drilled). Ordinals register `pool_managed` so co-serving replicas
+don't each claim every shard. Remaining: **continuous hot shipping** (a hash ordinal's replica trails
+the primary's newer writes until the next backup — the immutable-first gap, same as a hot window before
+it parks) and **dynamic primary assignment**. Supersedes **D14** as the replica model, resolves the
+[windowed replica gap](/quality/known-limitations/windowed-replica-gap.md), depends on **D52** (the
+pool) and **D51** (an HA control plane). See [high availability](/system/high-availability.md).

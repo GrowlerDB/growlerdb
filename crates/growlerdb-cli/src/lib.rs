@@ -2769,13 +2769,13 @@ async fn serve_pool(
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(index.clone(), true);
-            // The advertised total shard count: the highest held ordinal + 1 (correct when this node
-            // holds the top ordinal — always so for the single-shard demo case, ordinal 0 ⇒ count 1).
-            // Multi-node hash placement threads the cluster-wide count through the CP (task 3).
-            let shard_count = held.iter().copied().max().map(|m| m + 1).unwrap_or(0);
-            hash_announcements.push((resolved.clone(), shard_count, held));
+            // The advertised total shard count comes from the **definition** (authoritative), not the
+            // held-ordinal set — a node serving ordinals purely read-through (a D53 replica with no
+            // local shards) still announces the index's true shard count, so the CP can place every
+            // ordinal and the gateway builds the full router.
+            hash_announcements.push((resolved.clone(), resolved.shard_count, held));
             // The D53 reconcile needs the def/table/budget to open an assigned replica ordinal
-            // read-through (hash replica serving is task 3; recorded now so the map is complete).
+            // read-through and publish it into this index's maps.
             replica_meta.insert(index.clone(), (resolved, table, index_heavy));
             continue;
         }
@@ -3140,7 +3140,7 @@ const SCRATCH_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(
 /// served *because of a previous snapshot* that the new snapshot no longer assigns to it, in either
 /// role: drop their mux entries + writer state and delete their `.replica` scratch after a short
 /// drain; boot windows the CP never assigned are left alone), and finally serve any newly-assigned
-/// replica windows via [`reconcile_replica_windows`]. The first snapshot also sweeps `.replica`
+/// replica windows via [`reconcile_replica_units`]. The first snapshot also sweeps `.replica`
 /// scratch orphaned by previous runs. Reconnects with jittered exponential backoff if the stream
 /// drops (the CP re-sends a full snapshot on resubscribe, so nothing is lost).
 fn spawn_assignment_reconcile(
@@ -3214,7 +3214,7 @@ fn spawn_assignment_reconcile(
                     }
                     assignment_seen = current;
                     if let Some(r) = &replica {
-                        reconcile_replica_windows(
+                        reconcile_replica_units(
                             &snapshot.units,
                             &r.meta,
                             &r.search_idx,
@@ -3314,15 +3314,18 @@ fn sweep_orphan_replica_scratch(
     }
 }
 
-/// Reconcile one pushed assignment snapshot (D53): for each **replica window** assigned to this node
-/// that it isn't already serving, fetch the window's [`ColdMarker`](growlerdb_index::ColdMarker) from
+/// Reconcile one pushed assignment snapshot (D53): for each **replica unit** assigned to this node
+/// that it isn't already serving, fetch the unit's [`ColdMarker`](growlerdb_index::ColdMarker) from
 /// object storage and open it **read-through** ([`open_cold_replica`](growlerdb_index::LocalIndexStore::open_cold_replica)),
-/// publishing it into the same per-index window maps the Pool read services front — so the gateway's
-/// failover routing reaches it. Snapshots are idempotent: an already-served or de-assigned window is
-/// skipped (dropping a de-assigned window is a follow-on; an over-served window is harmless). Returns
-/// the number of windows newly served.
+/// publishing it into the same per-index unit maps the Pool read services front — so the gateway's
+/// failover routing reaches it. Handles **both** unit kinds: a windowed index's cold **windows** (park
+/// prefix `cold/{index}/w{window}`) and a hash index's **ordinal shards** (`cold/{index}/{ordinal}`,
+/// published by [`backup_replica_snapshot`](growlerdb_backup::backup_replica_snapshot)) — the maps are
+/// `i64`-keyed either way, and an index is all one kind, so the open/publish path is shared. Snapshots
+/// are idempotent: an already-served or not-yet-published unit is skipped (an over-served unit is
+/// harmless — the CP just won't route to it). Returns the number of units newly served.
 #[allow(clippy::too_many_arguments)]
-async fn reconcile_replica_windows(
+async fn reconcile_replica_units(
     units: &[growlerdb_proto::v1::UnitAssignment],
     meta: &ReplicaIndexMeta,
     search_idx: &growlerdb_engine::SharedSearchIndexes,
@@ -3341,18 +3344,33 @@ async fn reconcile_replica_windows(
     use std::sync::Arc;
     let mut served = 0usize;
     for u in units {
-        // Serve any assigned **cold** (parked) window read-through, for either role — a parked window
-        // is read-only, so a primary holder serves it exactly like a replica (late writes to a parked
-        // window are refused regardless). A HOT window has no cold marker below and is skipped here —
-        // it's served by the boot / local-write path. Hash-shard units are a follow-on (windowed only).
-        let Some(WireUnit::Window(window)) = u.unit else {
-            continue;
+        // The unit's map key + object-store park prefix + `.replica` scratch subdir + human label.
+        // A windowed index's units are cold (parked, read-only) **windows**; a hash index's are
+        // **ordinal shards** — a frozen `backup_replica_snapshot` of a live shard. Both are served
+        // read-through here, for either role (a parked window is read-only, so a primary holder serves
+        // it like a replica; a hash primary serves its ordinal HOT from the boot/local path and so is
+        // "already serving" below, skipped). A HOT window / an unpublished shard has no marker and is
+        // skipped, retried on the next snapshot.
+        let (key, prefix, scratch_sub, label) = match u.unit {
+            Some(WireUnit::Window(w)) => (
+                w,
+                format!("cold/{}/w{}", u.index, w),
+                format!("w{w}"),
+                format!("w{w}"),
+            ),
+            Some(WireUnit::Shard(o)) => (
+                o as i64,
+                format!("cold/{}/{}", u.index, o),
+                o.to_string(),
+                format!("s{o}"),
+            ),
+            None => continue,
         };
         // This node must have been started with `--index {u.index}` (so it holds the def + maps).
         let Some((resolved, table, heavy)) = meta.get(&u.index) else {
             continue;
         };
-        let Some(search_windows) = search_idx
+        let Some(search_units) = search_idx
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get(&u.index)
@@ -3360,24 +3378,23 @@ async fn reconcile_replica_windows(
         else {
             continue;
         };
-        if search_windows
+        if search_units
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .contains_key(&window)
+            .contains_key(&key)
         {
-            continue; // already serving this window
+            continue; // already serving this unit
         }
-        // Fetch the marker + open the window read-through (blocking → off the async runtime).
-        let prefix = format!("cold/{}/w{}", u.index, window);
+        // Fetch the marker + open the unit read-through (blocking → off the async runtime).
         let marker = match growlerdb_backup::fetch_cold_marker(op, &prefix).await {
             Ok(Some(m)) => m,
-            Ok(None) => continue, // not parked yet — retry on the next snapshot
+            Ok(None) => continue, // not published yet — retry on the next snapshot
             Err(e) => {
                 eprintln!("serve-pool replica: marker fetch {prefix}: {e}");
                 continue;
             }
         };
-        let scratch = replica_root.join(&u.index).join(format!("w{window}"));
+        let scratch = replica_root.join(&u.index).join(&scratch_sub);
         let (store2, resolved2, op2, cache2) =
             (store.clone(), resolved.clone(), op.clone(), cache.clone());
         let opened = tokio::task::spawn_blocking(move || {
@@ -3387,32 +3404,32 @@ async fn reconcile_replica_windows(
         let shard = match opened {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                eprintln!("serve-pool replica: open {}/w{window}: {e}", u.index);
+                eprintln!("serve-pool replica: open {}/{label}: {e}", u.index);
                 continue;
             }
             Err(e) => {
-                eprintln!("serve-pool replica: open task {}/w{window}: {e}", u.index);
+                eprintln!("serve-pool replica: open task {}/{label}: {e}", u.index);
                 continue;
             }
         };
         let handle = ShardHandle::new(Arc::new(shard));
         // Publish into the four per-index maps (the SAME Arcs the Pool read services front, so the
-        // window is queryable with no restart). **Insert only if still absent** (HA-A4): the cold
-        // open above is slow, and the write path may have created this window HOT meanwhile — an
+        // unit is queryable with no restart). **Insert only if still absent** (HA-A4): the cold open
+        // above is slow, and the write path may have created this unit HOT meanwhile — an
         // unconditional insert would clobber the live hot entry with this stale cold one. The
-        // re-check under the write lock makes the hot window win; the cold shard is discarded.
+        // re-check under the write lock makes the hot unit win; the cold shard is discarded.
         {
-            let mut sw = search_windows.write().unwrap_or_else(|e| e.into_inner());
-            if sw.contains_key(&window) {
+            let mut sw = search_units.write().unwrap_or_else(|e| e.into_inner());
+            if sw.contains_key(&key) {
                 eprintln!(
-                    "serve-pool replica: {}/w{window} appeared (hot) during the cold open — \
-                     keeping the live window, discarding the stale cold replica",
+                    "serve-pool replica: {}/{label} appeared (hot) during the cold open — \
+                     keeping the live unit, discarding the stale cold replica",
                     u.index
                 );
                 continue;
             }
             sw.insert(
-                window,
+                key,
                 SearchService::new(handle.clone()).with_index_heavy_share(heavy.clone()),
             );
         }
@@ -3424,7 +3441,7 @@ async fn reconcile_replica_windows(
         {
             m.write()
                 .unwrap_or_else(|e| e.into_inner())
-                .entry(window)
+                .entry(key)
                 .or_insert_with(|| SuggestService::new(handle.clone()));
         }
         if let Some(m) = lookup_idx
@@ -3435,7 +3452,7 @@ async fn reconcile_replica_windows(
         {
             m.write()
                 .unwrap_or_else(|e| e.into_inner())
-                .entry(window)
+                .entry(key)
                 .or_insert_with(|| {
                     LookupService::new(
                         handle.clone(),
@@ -3453,12 +3470,12 @@ async fn reconcile_replica_windows(
         {
             m.write()
                 .unwrap_or_else(|e| e.into_inner())
-                .entry(window)
+                .entry(key)
                 .or_insert_with(|| AdminService::new(handle.clone(), &u.index));
         }
         served += 1;
         println!(
-            "serve-pool replica: serving {}/w{window} read-through (D53)",
+            "serve-pool replica: serving {}/{label} read-through (D53)",
             u.index
         );
     }
@@ -5001,6 +5018,7 @@ fn spawn_registration(
                         shard_count,
                         shard_ordinals,
                         windows,
+                        false, // classic sharded serve — empty ordinals ⇒ single node claims all
                     )
                     .await
                 }
@@ -5076,6 +5094,7 @@ async fn registration_loop<F, Fut>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn register_served_index(
     control_plane: &str,
     endpoint: &str,
@@ -5083,6 +5102,7 @@ async fn register_served_index(
     shard_count: u32,
     shard_ordinals: Vec<u32>,
     windows: Vec<growlerdb_proto::v1::ServedWindow>,
+    pool_managed: bool,
 ) -> anyhow::Result<()> {
     let definition_json = serde_json::to_string(resolved)?;
     let mut client = connect_cp(control_plane, false).await?;
@@ -5093,6 +5113,7 @@ async fn register_served_index(
             shard_count, // ignored when `windows` is set (a windowed index reports windows)
             shard_ordinals,
             windows,
+            pool_managed,
         })
         .await
         .map_err(|e| anyhow::anyhow!("registering with control plane: {e}"))?;
@@ -5151,6 +5172,7 @@ fn spawn_windowed_registration(
                         1,
                         vec![],
                         write_service.served_windows(),
+                        false, // single-index windowed serve (not a pool node)
                     )
                     .await
                 }
@@ -5205,6 +5227,7 @@ fn spawn_pool_registration(
                             1,
                             vec![],
                             writer.served_windows(),
+                            true, // pool node
                         )
                         .await?;
                     }
@@ -5219,6 +5242,7 @@ fn spawn_pool_registration(
                             *shard_count,
                             ordinals.clone(),
                             vec![],
+                            true, // pool node — CP places ordinals; empty list claims none
                         )
                         .await?;
                     }
@@ -6549,7 +6573,7 @@ mod tests {
             primary: false,
         }];
 
-        let served = reconcile_replica_windows(
+        let served = reconcile_replica_units(
             &replica_units,
             &meta,
             &search_idx,
@@ -6590,7 +6614,7 @@ mod tests {
 
         // Idempotent: a second reconcile serves nothing new.
         assert_eq!(
-            reconcile_replica_windows(
+            reconcile_replica_units(
                 &replica_units,
                 &meta,
                 &search_idx,
@@ -6615,7 +6639,7 @@ mod tests {
             primary: true,
         }];
         assert_eq!(
-            reconcile_replica_windows(
+            reconcile_replica_units(
                 &primary_units,
                 &meta,
                 &search_idx,
@@ -6630,6 +6654,162 @@ mod tests {
             .await,
             0,
             "an already-served window isn't re-opened, whatever the role"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_serves_an_assigned_replica_hash_ordinal_read_through() {
+        // D53 hash-shard parity (node side): a pushed REPLICA assignment for an ORDINAL shard makes
+        // the node fetch the shard's `backup_replica_snapshot` marker + open it read-through, keyed by
+        // ordinal-as-i64 in the same pool maps — no local copy, no rebuild. The hash counterpart to
+        // `reconcile_serves_an_assigned_replica_window_read_through`.
+        use growlerdb_core::{
+            CommitBatch, CompositeKey, Document, IndexDefinition, IndexWriter, LocatedDoc,
+            SourceCheckpoint, SourceField, SourceSchema, SourceType, Value,
+        };
+        use growlerdb_index::{LocalIndexStore, ShardId};
+        use growlerdb_proto::v1::unit_assignment::Unit as WireUnit;
+        use growlerdb_proto::v1::UnitAssignment;
+        use std::collections::{BTreeMap, HashMap};
+        use std::sync::{Arc, RwLock};
+
+        let src = SourceSchema::new(
+            vec![SourceField::new("id", SourceType::String)],
+            vec![],
+            vec!["id".into()],
+        );
+        let resolved = IndexDefinition::from_yaml(
+            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nshard_count: 2\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD, fast: true } ] }\n",
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+        let ordinal: u32 = 1;
+        let id = ShardId::shard("docs", ordinal);
+
+        // --- primary node: build ordinal 1 + publish its frozen replica snapshot to object storage ---
+        let primary_root = tempfile::tempdir().unwrap();
+        let primary = LocalIndexStore::open(primary_root.path()).unwrap();
+        let shard = primary.create_shard(&id, &resolved).unwrap();
+        let key = CompositeKey::new(vec![], vec![("id".into(), Value::from("doc-1"))]);
+        let mut f = BTreeMap::new();
+        f.insert("id".to_string(), Value::from("doc-1"));
+        IndexWriter::write(
+            &shard,
+            &CommitBatch::from_upserts(
+                vec![LocatedDoc {
+                    doc: Document::new(key, f),
+                    iceberg_file: "f".into(),
+                    row_position: 0,
+                }],
+                SourceCheckpoint::iceberg(1),
+                "b1",
+            ),
+        )
+        .unwrap();
+        let backup_root = tempfile::tempdir().unwrap();
+        let op = growlerdb_backup::fs_store(backup_root.path()).unwrap();
+        growlerdb_backup::backup_replica_snapshot(
+            &shard,
+            "docs",
+            &ordinal.to_string(),
+            &primary_root.path().join(".stg"),
+            &op,
+            &format!("cold/docs/{ordinal}"),
+            Some(serde_json::to_string(&resolved).unwrap()),
+        )
+        .await
+        .unwrap();
+
+        // --- replica node: empty pool maps + meta; reconcile a replica Shard assignment ---
+        let replica_root = tempfile::tempdir().unwrap();
+        let replica_store = LocalIndexStore::open(replica_root.path()).unwrap();
+        // One served index ("docs", hash) with an empty ordinal map behind each Pool multiplexer.
+        let search_idx: growlerdb_engine::SharedSearchIndexes = Arc::new(RwLock::new(
+            BTreeMap::from([("docs".to_string(), Arc::new(RwLock::new(BTreeMap::new())))]),
+        ));
+        let suggest_idx: growlerdb_engine::SharedSuggestIndexes = Arc::new(RwLock::new(
+            BTreeMap::from([("docs".to_string(), Arc::new(RwLock::new(BTreeMap::new())))]),
+        ));
+        let lookup_idx: growlerdb_engine::SharedLookupIndexes = Arc::new(RwLock::new(
+            BTreeMap::from([("docs".to_string(), Arc::new(RwLock::new(BTreeMap::new())))]),
+        ));
+        let admin_idx: growlerdb_engine::SharedAdminIndexes = Arc::new(RwLock::new(
+            BTreeMap::from([("docs".to_string(), Arc::new(RwLock::new(BTreeMap::new())))]),
+        ));
+        let mut meta: ReplicaIndexMeta = HashMap::new();
+        meta.insert(
+            "docs".to_string(),
+            (
+                resolved.clone(),
+                "g.docs".to_string(),
+                growlerdb_engine::IndexHeavyShare::new(
+                    4,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+                ),
+            ),
+        );
+        let cache = growlerdb_index::RangeCache::new(8 * 1024 * 1024);
+        let units = vec![UnitAssignment {
+            index: "docs".into(),
+            unit: Some(WireUnit::Shard(ordinal)),
+            primary: false,
+        }];
+        let served = reconcile_replica_units(
+            &units,
+            &meta,
+            &search_idx,
+            &suggest_idx,
+            &lookup_idx,
+            &admin_idx,
+            &replica_store,
+            &op,
+            &cache,
+            replica_root.path(),
+        )
+        .await;
+        assert_eq!(served, 1, "the assigned replica ordinal is opened + served");
+
+        // Queryable through the pool read path — routed on the `shard` selector (kinds: docs is hash).
+        let kinds: growlerdb_engine::SharedIndexKinds =
+            Arc::new(RwLock::new(BTreeMap::from([("docs".to_string(), true)])));
+        let mux = growlerdb_engine::PoolSearchService::new(search_idx.clone(), kinds);
+        let resp = growlerdb_proto::Search::search(
+            &mux,
+            tonic::Request::new(growlerdb_proto::v1::SearchRequest {
+                query: "*".into(),
+                limit: 10,
+                index: "docs".into(),
+                shard: ordinal,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            resp.hits.len(),
+            1,
+            "the replica serves the ordinal's doc read-through via the pool"
+        );
+
+        // Idempotent: a second reconcile serves nothing new.
+        assert_eq!(
+            reconcile_replica_units(
+                &units,
+                &meta,
+                &search_idx,
+                &suggest_idx,
+                &lookup_idx,
+                &admin_idx,
+                &replica_store,
+                &op,
+                &cache,
+                replica_root.path(),
+            )
+            .await,
+            0,
+            "an already-served ordinal isn't re-opened"
         );
     }
 

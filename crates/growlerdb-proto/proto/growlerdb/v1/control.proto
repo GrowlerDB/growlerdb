@@ -338,8 +338,15 @@ message RegisterServedIndexRequest {
   repeated ServedWindow windows = 4;  // for a windowed index: the windows this node serves (+ zone-maps)
   // The ordinal shard(s) **this node** serves. Non-empty ⇒ assign
   // only these ordinals to this endpoint, so node k can own only shard k of a `shard_count`-shard
-  // index. **Empty ⇒ this node serves all of `0..shard_count`** (the single-node default).
+  // index. **Empty ⇒ this node serves all of `0..shard_count`** (the single-node default) UNLESS
+  // `pool_managed` is set.
   repeated uint32 shard_ordinals = 5;
+  // Set by a **placement-pool** node (D52): its ordinals are CP-placed via `ResolveUnitOwner`, not
+  // claimed by announcement — so `shard_ordinals` lists **exactly** what it holds locally, and an
+  // empty list claims **nothing** (a replica-only / not-yet-assigned node registers the index entry
+  // + bucket map without grabbing every shard as primary — which would conflict with every peer). A
+  // classic single-node `serve` leaves this false, keeping the empty-⇒-all default.
+  bool pool_managed = 6;
 }
 
 message RegisterServedIndexResponse {

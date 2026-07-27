@@ -1460,9 +1460,14 @@ impl ControlPlane for ControlPlaneService {
             }
         }
         if !is_windowed {
-            // Ordinal shard map. A node serving specific ordinals
-            // claims only those; otherwise (single-node default) it claims all 0..count.
-            let owned: Vec<u32> = if req.shard_ordinals.is_empty() {
+            // Ordinal shard map. A node serving specific ordinals claims only those. An empty list
+            // means "claim all 0..count" for a classic single node, but "claim none" for a
+            // **placement-pool** node (D52) — its ordinals are placed by `ResolveUnitOwner`, so a
+            // replica-only node registers the entry + bucket map below without grabbing every shard
+            // as primary (which would conflict with every peer serving the same index read-through).
+            let owned: Vec<u32> = if req.pool_managed {
+                req.shard_ordinals.clone()
+            } else if req.shard_ordinals.is_empty() {
                 (0..shard_count).collect()
             } else {
                 req.shard_ordinals.clone()
@@ -2687,6 +2692,7 @@ mod tests {
             shard_count: 1,
             shard_ordinals: vec![],
             windows: vec![],
+            pool_managed: false,
         }))
         .await
         .unwrap();
@@ -2867,6 +2873,7 @@ mod tests {
                 shard_count: 1,
                 shard_ordinals: vec![],
                 windows: vec![],
+                pool_managed: false,
             }))
         };
         // node-a heartbeats (tracked, live) and announces; disarm the startup grace so liveness
@@ -2910,6 +2917,7 @@ mod tests {
                 shard_count: 1,
                 shard_ordinals: vec![],
                 windows: vec![],
+                pool_managed: false,
             }))
             .await
             .unwrap();
@@ -2921,6 +2929,7 @@ mod tests {
                 shard_count: 1,
                 shard_ordinals: vec![],
                 windows: vec![],
+                pool_managed: false,
             }))
             .await
             .unwrap_err();
@@ -3189,6 +3198,7 @@ mod tests {
                 shard_count: 2,
                 shard_ordinals: vec![ord],
                 windows: vec![],
+                pool_managed: false,
             }))
             .await
             .unwrap();
@@ -3213,6 +3223,7 @@ mod tests {
                 shard_count: 2,
                 shard_ordinals: vec![5],
                 windows: vec![],
+                pool_managed: false,
             }))
             .await
             .unwrap_err();
@@ -3233,6 +3244,7 @@ mod tests {
                 shard_count: 1,
                 shard_ordinals: vec![],
                 windows: vec![],
+                pool_managed: false,
             }))
             .await
             .unwrap()
@@ -3254,6 +3266,7 @@ mod tests {
             shard_count: 1,
             shard_ordinals: vec![],
             windows: vec![],
+            pool_managed: false,
         }))
         .await
         .unwrap();
@@ -3271,6 +3284,7 @@ mod tests {
                 shard_count: 1,
                 shard_ordinals: vec![],
                 windows: vec![],
+                pool_managed: false,
             }))
             .await
             .unwrap_err();
@@ -3305,6 +3319,7 @@ mod tests {
                     cold: true, // parked
                 },
             ],
+            pool_managed: false,
         }))
         .await
         .unwrap();
@@ -3579,6 +3594,7 @@ mod tests {
             shard_count: total,
             shard_ordinals: vec![ord],
             windows: vec![],
+            pool_managed: false,
         }))
         .await
         .unwrap();
