@@ -28,8 +28,13 @@ without forking — the [extension seam](/system/decisions/d37-extension-seams.m
   `(index, window)` **unit** to its holder and stamps that unit on the request, so the gateway fronts a
   **pool node** serving many indexes' windows over one endpoint unchanged
   ([D52](/system/decisions/d52-placement-pool.md)): the per-window `WindowNode` stamps the index too,
-  and the node dispatches on it. Each window resolves to **all its holders** — primary + read replicas
-  ([D53](/system/decisions/d53-unit-replication.md)) — behind a `FailoverNode`: a read tries the
+  and the node dispatches on it. **Hash-sharded** routing works the same way, one level over: each
+  `(index, ordinal)` unit resolves to its holders and a `ShardNode` (the hash counterpart to
+  `WindowNode`) stamps `(index, ordinal)` on every request, so a pool node holding several ordinals of
+  one index over one endpoint dispatches each to the right ordinal — with ordinals that share a pool
+  endpoint deduping onto one warm channel. Each window **or ordinal** resolves to **all its holders** —
+  primary + read replicas ([D53](/system/decisions/d53-unit-replication.md)) — behind a `FailoverNode`:
+  a read tries the
   primary and, on a transport-shaped error (down/unreachable/hung — HTTP/2 keepalive on every node
   channel detects a blackholed peer) or a node's structured `UNIT_NOT_SERVED` refusal (a stale route /
   not-yet-warmed replica), **fails over** to a live replica (no gap, no forced `partial`), preserving

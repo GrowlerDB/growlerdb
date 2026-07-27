@@ -90,8 +90,11 @@ public final class ShardedWriteClient implements BatchWriter {
     // checkpoints alike — carries the (index, shard) selector: a pool node serving several indexes
     // rejects an untagged GetCheckpoint as ambiguous, which would crash-loop resume.
     List<WriteClient> clients = new ArrayList<>(parsed.size());
-    for (HostPort hp : parsed) {
-      clients.add(new WriteClient(hp.host(), hp.port(), index));
+    for (int ordinal = 0; ordinal < parsed.size(); ordinal++) {
+      HostPort hp = parsed.get(ordinal);
+      // Tag each client with its ordinal so a hash pool node dispatches its writes/checkpoints to
+      // the right ordinal shard (endpoints are in ordinal order — the router indexes them the same).
+      clients.add(new WriteClient(hp.host(), hp.port(), index, ordinal));
     }
     this.shards = List.copyOf(clients);
     this.router = router;

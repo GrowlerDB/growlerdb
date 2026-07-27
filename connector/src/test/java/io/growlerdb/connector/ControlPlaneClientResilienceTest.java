@@ -65,6 +65,24 @@ class ControlPlaneClientResilienceTest {
     }
   }
 
+  /** A hash-shard resolve carries the ordinal on the {@code shard} selector (not {@code window}). */
+  @Test
+  void resolveShardOwnerSendsTheOrdinalShardSelector() throws IOException {
+    CapturingControlPlane handler = new CapturingControlPlane();
+    Server server = ServerBuilder.forPort(0).addService(handler).build().start();
+    try {
+      ControlPlaneClient client =
+          new ControlPlaneClient("127.0.0.1", server.getPort(), 5, 4, 20, 40);
+      assertEquals("n7:50051", client.resolveShardOwner("docs", 3).getEndpoint());
+      assertEquals("docs", handler.last.getIndex());
+      assertEquals(ResolveUnitOwnerRequest.UnitCase.SHARD, handler.last.getUnitCase());
+      assertEquals(3, handler.last.getShard());
+      closeQuietly(client);
+    } finally {
+      server.shutdownNow();
+    }
+  }
+
   /** An application error (unknown index) propagates immediately — retrying can't help. */
   @Test
   void getIndexDoesNotRetryAnApplicationError() throws IOException {
@@ -116,6 +134,19 @@ class ControlPlaneClientResilienceTest {
         return;
       }
       obs.onNext(ResolveUnitOwnerResponse.newBuilder().setEndpoint("n1:50051").build());
+      obs.onCompleted();
+    }
+  }
+
+  /** Records the last resolve request, echoing a fixed owner — for asserting the unit selector. */
+  private static final class CapturingControlPlane extends ControlPlaneGrpc.ControlPlaneImplBase {
+    volatile ResolveUnitOwnerRequest last;
+
+    @Override
+    public void resolveUnitOwner(
+        ResolveUnitOwnerRequest request, StreamObserver<ResolveUnitOwnerResponse> obs) {
+      last = request;
+      obs.onNext(ResolveUnitOwnerResponse.newBuilder().setEndpoint("n7:50051").build());
       obs.onCompleted();
     }
   }

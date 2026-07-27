@@ -82,6 +82,16 @@ public final class WriteClient implements BatchWriter {
    */
   private final String index;
 
+  /**
+   * The ordinal shard this writer targets on a <b>hash/partition-sharded</b> index (D52), stamped on
+   * every {@code Write} / {@code GetCheckpoint} so a pool node holding several ordinals of the index
+   * over one endpoint dispatches on {@code (index, shard)}. {@code 0} for a windowed node (routes on
+   * {@code window}) or a single-shard node (holds one shard and ignores it) — so the default is a
+   * no-op everywhere except a multi-ordinal hash pool. The connector builds one writer per ordinal
+   * ({@link ShardedWriteClient} / {@link ShardGroupWriteClient}), each tagged with its ordinal here.
+   */
+  private final int shard;
+
   private final int deadlineSeconds;
   private final int maxAttempts;
   private final long initialBackoffMs;
@@ -98,10 +108,20 @@ public final class WriteClient implements BatchWriter {
    * with several indexes rejects an empty selector as ambiguous.
    */
   public WriteClient(String host, int port, String index) {
+    this(host, port, index, 0);
+  }
+
+  /**
+   * As above, tagged with the ordinal {@code shard} this writer targets — so a hash pool node
+   * dispatches its writes/checkpoints to the right ordinal. {@code shard == 0} for a windowed or
+   * single-shard node.
+   */
+  public WriteClient(String host, int port, String index, int shard) {
     this(
         host,
         port,
         index,
+        shard,
         deadlineSecondsFromEnv(),
         DEFAULT_MAX_ATTEMPTS,
         DEFAULT_INITIAL_BACKOFF_MS,
@@ -132,14 +152,15 @@ public final class WriteClient implements BatchWriter {
       int maxAttempts,
       long initialBackoffMs,
       long maxBackoffMs) {
-    this(host, port, "", deadlineSeconds, maxAttempts, initialBackoffMs, maxBackoffMs);
+    this(host, port, "", 0, deadlineSeconds, maxAttempts, initialBackoffMs, maxBackoffMs);
   }
 
-  /** The full constructor: index tag + deadline/retry tunables. */
+  /** The full constructor: index + ordinal-shard tags + deadline/retry tunables. */
   WriteClient(
       String host,
       int port,
       String index,
+      int shard,
       int deadlineSeconds,
       int maxAttempts,
       long initialBackoffMs,
@@ -180,6 +201,7 @@ public final class WriteClient implements BatchWriter {
     }
     this.stub = s;
     this.index = index;
+    this.shard = shard;
     this.deadlineSeconds = deadlineSeconds;
     this.maxAttempts = maxAttempts;
     this.initialBackoffMs = initialBackoffMs;
@@ -197,7 +219,8 @@ public final class WriteClient implements BatchWriter {
    * served index (a single-index node ignores it). Returns the committed index snapshot.
    */
   public long write(DocBatch batch, String index) {
-    WriteRequest request = WriteRequest.newBuilder().setBatch(batch).setIndex(index).build();
+    WriteRequest request =
+        WriteRequest.newBuilder().setBatch(batch).setIndex(index).setShard(shard).build();
     WriteResponse response = callWithRetry("write", () -> deadlined().write(request));
     return response.getSnapshot();
   }
@@ -249,6 +272,7 @@ public final class WriteClient implements BatchWriter {
                         GetCheckpointRequest.newBuilder()
                             .setWindow(window)
                             .setIndex(index)
+                            .setShard(shard)
                             .build()));
     if (!response.hasCheckpoint()) {
       return null;

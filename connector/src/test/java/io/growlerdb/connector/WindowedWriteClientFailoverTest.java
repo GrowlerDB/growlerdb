@@ -75,7 +75,8 @@ class WindowedWriteClientFailoverTest {
         SnapshotLineage.none(),
         endpoint -> {
           String[] hp = endpoint.replaceFirst("^https?://", "").split(":", 2);
-          return new WriteClient(hp[0].trim(), Integer.parseInt(hp[1].trim()), INDEX, 2, 1, 10, 10);
+          return new WriteClient(
+              hp[0].trim(), Integer.parseInt(hp[1].trim()), INDEX, 0, 2, 1, 10, 10);
         });
   }
 
