@@ -74,7 +74,12 @@ describe('componentsFromUp', () => {
   });
 });
 
-function ingest(name: string, sourceSnap: number | null, shardState: string): IndexIngestion {
+function ingest(
+  name: string,
+  sourceSnap: number | null,
+  shardState: string,
+  probeable = true,
+): IndexIngestion {
   return {
     name,
     status: 'active',
@@ -83,6 +88,7 @@ function ingest(name: string, sourceSnap: number | null, shardState: string): In
     shard_count: 1,
     source_snapshot_id: sourceSnap,
     source_timestamp_ms: sourceSnap ? 1 : null,
+    source_probeable: probeable,
     shards: [
       {
         ordinal: 0,
@@ -116,6 +122,26 @@ describe('componentsFromIngestion', () => {
   it('flags a source_recreated index as degraded (warn) — impaired, not down', () => {
     const cs = componentsFromIngestion([ingest('docs', 5, 'source_recreated')]);
     expect(cs.find((c) => c.name === 'Ingestion: docs')!.health).toBe('warn');
+  });
+  it('does not flag a variant index down: its source is unprobeable (D49) and it is serving', () => {
+    // A variant index has a null head + "unknown" lag by design — that must not roll up as down.
+    const cs = componentsFromIngestion([ingest('events', null, 'unknown', false)]);
+    // No source component: there is nothing probeable to assess.
+    expect(cs.find((c) => c.name === 'Iceberg source')).toBeUndefined();
+    expect(cs.find((c) => c.name === 'Ingestion: events')!.health).toBe('ok');
+  });
+  it('still flags a variant index down on a structural failure (no_primary)', () => {
+    const cs = componentsFromIngestion([ingest('events', null, 'no_primary', false)]);
+    expect(cs.find((c) => c.name === 'Ingestion: events')!.health).toBe('down');
+  });
+  it('assesses only probeable sources, ignoring a variant one in a mixed cluster', () => {
+    const cs = componentsFromIngestion([
+      ingest('docs', 5, 'in_sync', true),
+      ingest('events', null, 'unknown', false),
+    ]);
+    // Only `docs` (probeable, readable) counts → source ok; the variant `events` is ignored.
+    expect(cs.find((c) => c.name === 'Iceberg source')!.health).toBe('ok');
+    expect(cs.find((c) => c.name === 'Ingestion: events')!.health).toBe('ok');
   });
 });
 

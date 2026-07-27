@@ -1689,13 +1689,20 @@ impl ControlPlaneService {
                 growlerdb_core::RoutingStrategy::Partition => WireRouting::RoutingPartition,
             };
 
-            // Source head (the position ingestion is racing to catch up to).
+            // A **variant** index's source head can't be probed natively: released iceberg-rust can't
+            // plan a v3 variant schema (D49), so the connector reads it via the Trino lane instead.
+            // `source_probeable` tells the console this null head + "unknown" lag is expected — not an
+            // outage — so a healthy variant index never rolls the cluster health up as a source failure.
+            let source_probeable = !entry.definition.has_variant_field();
+
+            // Source head (the position ingestion is racing to catch up to). Skipped (no native read)
+            // for a non-probeable variant source.
             let (source_snapshot_id, source_timestamp_ms, source_readable) = match &reader {
-                Some(r) => match r.current_snapshot(&source_table).await {
+                Some(r) if source_probeable => match r.current_snapshot(&source_table).await {
                     Ok((id, ts)) => (id, ts, true),
                     Err(_) => (0, 0, false),
                 },
-                None => (0, 0, false),
+                _ => (0, 0, false),
             };
             // Snapshot id → commit-timestamp, to measure how far behind each shard's committed
             // checkpoint is in wall-clock terms. Best-effort: empty map ⇒ lag unknown.
@@ -1829,6 +1836,7 @@ impl ControlPlaneService {
                 source_snapshot_id,
                 source_timestamp_ms,
                 source_readable,
+                source_probeable,
                 shards,
             });
         }

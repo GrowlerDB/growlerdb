@@ -97,8 +97,12 @@ const STATE_HEALTH: Record<string, Health> = {
 /** Components from ingestion: the Iceberg source (readable?) + each index's ingestion sync. */
 export function componentsFromIngestion(items: IndexIngestion[]): Component[] {
   const out: Component[] = [];
-  if (items.length > 0) {
-    const unreadable = items.filter((i) => i.source_snapshot_id === null).length;
+  // Only **probeable** sources count toward the Iceberg-source health: a variant index's head can't
+  // be read natively (D49, `source_probeable = false`), so its null head is expected — not an outage
+  // — and must not turn the source component (or the cluster) Down.
+  const probeable = items.filter((i) => i.source_probeable);
+  if (probeable.length > 0) {
+    const unreadable = probeable.filter((i) => i.source_snapshot_id === null).length;
     out.push({
       name: 'Iceberg source',
       group: 'Dependencies',
@@ -106,17 +110,22 @@ export function componentsFromIngestion(items: IndexIngestion[]): Component[] {
       detail:
         unreadable === 0
           ? 'all source tables readable'
-          : `${unreadable} of ${items.length} source table(s) unreadable`,
+          : `${unreadable} of ${probeable.length} source table(s) unreadable`,
     });
   }
   for (const i of items) {
     const st = worstState(i.shards);
-    out.push({
-      name: `Ingestion: ${i.name}`,
-      group: 'Ingestion',
-      health: STATE_HEALTH[st] ?? 'unknown',
-      detail: `${i.shard_count} shard(s) — ${st.replace(/_/g, ' ')}`,
-    });
+    let health = STATE_HEALTH[st] ?? 'unknown';
+    let detail = `${i.shard_count} shard(s) — ${st.replace(/_/g, ' ')}`;
+    // A variant index reports "unknown" lag by design — its source head isn't natively probeable
+    // (D49), so lag can't be measured — but it's still ingesting + serving. That's not a degradation:
+    // treat an "unknown"-only variant index as ok. Structural failures (no_primary / unreachable)
+    // still degrade, variant or not.
+    if (!i.source_probeable && st === 'unknown') {
+      health = 'ok';
+      detail = `${i.shard_count} shard(s) — serving (variant source: lag not natively measured, D49)`;
+    }
+    out.push({ name: `Ingestion: ${i.name}`, group: 'Ingestion', health, detail });
   }
   return out;
 }

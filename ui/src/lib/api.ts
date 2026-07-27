@@ -763,6 +763,10 @@ export interface IndexIngestion {
   source_snapshot_id: number | null;
   /** Commit time of that snapshot (epoch ms); `null` when unreadable/none. */
   source_timestamp_ms: number | null;
+  /** Whether the control plane can natively probe this index's source head. `false` for a variant
+   *  index (D49): its null head + "unknown" lag is expected, not a source outage, so the health
+   *  roll-up excludes it. */
+  source_probeable: boolean;
   shards: ShardIngestion[];
 }
 

@@ -1157,6 +1157,10 @@ struct IndexIngestionDto {
     source_snapshot_id: Option<i64>,
     /// Commit time of that snapshot (epoch ms); `null` when unreadable/none.
     source_timestamp_ms: Option<i64>,
+    /// Whether the control plane can natively probe this index's source head. `false` for a variant
+    /// index (D49) — its null head + "unknown" lag is expected, so the console must not roll it up as
+    /// a source outage.
+    source_probeable: bool,
     shards: Vec<ShardIngestionDto>,
 }
 
@@ -1197,6 +1201,7 @@ impl From<v1::IndexIngestion> for IndexIngestionDto {
             // Collapse the source-readable flag to nullable fields: the UI shows "—" for null.
             source_snapshot_id: i.source_readable.then_some(i.source_snapshot_id),
             source_timestamp_ms: i.source_readable.then_some(i.source_timestamp_ms),
+            source_probeable: i.source_probeable,
             shards: i
                 .shards
                 .into_iter()
