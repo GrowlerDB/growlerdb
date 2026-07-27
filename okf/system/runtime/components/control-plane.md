@@ -39,6 +39,12 @@ built-in credentials, session epochs, and the per-index activity log.
   is confidently dead through the same idempotent, entitlement-aware resolve path, so quiescent
   units on a dead node recover without waiting for a write (at R=1 they'd otherwise be unavailable
   forever).
+- **Replica top-up sweeper** — the counterpart at `R > 1` (also leader-only, every TTL/2): it brings
+  every **placed** unit back up to `R` live holders through the same resolve path, so **read HA does
+  not depend on write activity**. A batch-built, read-served index (no connector to drive a
+  write-time resolve) still gets its replicas placed, and a node join or loss self-heals the replica
+  set — the piece that makes "delete a pod and reads keep answering" hold for a quiescent index.
+  Grace-aware, and a no-op at `R = 1`.
 - **Startup/promotion grace** — for one TTL after the first post-boot/post-promotion heartbeat,
   assigned owners are treated live-unknown: dead-owner re-placement, announce takeovers, and the
   sweeper hold off, so a freshly (re)started CP never mass-re-places laggards' units onto the first
