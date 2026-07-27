@@ -333,6 +333,18 @@ impl ShardId {
         }
     }
 
+    /// An **ordinal-shard** id for a hash/partition-sharded `index` (D52 pool): ordinal `ordinal`
+    /// lives at its own path `{index}/{ordinal}`, so one pool node can hold several ordinals of the
+    /// same index without collision. Ordinal 0 is the single-shard path — `shard(index, 0)` and
+    /// [`single`](Self::single) are the same id.
+    pub fn shard(index: impl Into<String>, ordinal: u32) -> Self {
+        Self {
+            index: index.into(),
+            shard: ordinal,
+            window: None,
+        }
+    }
+
     /// Relative on-disk path segment: `{index}/{shard}`, or `{index}/w{window}` when windowed.
     fn rel_path(&self) -> PathBuf {
         let seg = match self.window {
@@ -573,6 +585,30 @@ impl LocalIndexStore {
         }
         windows.sort_unstable();
         Ok(windows)
+    }
+
+    /// The **ordinal shards** of a hash/partition-sharded `index` present on disk — the numeric
+    /// `{index}/{ordinal}` dirs (D52 pool). A pool node opens exactly these ordinals it holds. Windowed
+    /// dirs (`w{window}`) are skipped, so a mixed store never confuses the two. Ascending by ordinal.
+    pub fn ordinal_shards(&self, index: &str) -> Result<Vec<u32>> {
+        let dir = self.root.join(index);
+        let mut ordinals = Vec::new();
+        if dir.exists() {
+            for entry in std::fs::read_dir(&dir)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    if let Some(o) = entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|n| n.parse::<u32>().ok())
+                    {
+                        ordinals.push(o);
+                    }
+                }
+            }
+        }
+        ordinals.sort_unstable();
+        Ok(ordinals)
     }
 
     /// Apply a [`CommitBatch`] to a **windowed** index: route upserts to per-window
@@ -7684,6 +7720,49 @@ mod window_store_tests {
             .unwrap();
         assert_eq!(w11.num_docs().unwrap(), 1);
         assert_eq!(w11.event_bounds().unwrap(), Some((day(11), day(11))));
+    }
+
+    #[test]
+    fn ordinal_shards_enumerate_pool_ordinals_at_distinct_paths() {
+        // D52 pool: one node can hold several ORDINAL shards of a hash index, each at its own path.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalIndexStore::open(tmp.path()).unwrap();
+        let src = SourceSchema::new(
+            vec![SourceField::new("id", SourceType::String)],
+            vec![],
+            vec!["id".into()],
+        );
+        let idx = IndexDefinition::from_yaml(
+            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD } ] }\n",
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+        store
+            .create_shard(&ShardId::shard("docs", 0), &idx)
+            .unwrap();
+        store
+            .create_shard(&ShardId::shard("docs", 2), &idx)
+            .unwrap();
+        // Ordinal 0 is the single-shard path; distinct ordinals get distinct dirs (no collision).
+        assert_eq!(
+            store.shard_path(&ShardId::shard("docs", 0)),
+            store.shard_path(&ShardId::single("docs"))
+        );
+        assert_ne!(
+            store.shard_path(&ShardId::shard("docs", 0)),
+            store.shard_path(&ShardId::shard("docs", 2))
+        );
+        assert_eq!(store.ordinal_shards("docs").unwrap(), vec![0, 2]);
+        // A window dir (`w{...}`) is not mistaken for an ordinal shard.
+        store
+            .create_shard(&ShardId::window("docs", 999), &idx)
+            .unwrap();
+        assert_eq!(
+            store.ordinal_shards("docs").unwrap(),
+            vec![0, 2],
+            "window dirs are excluded from ordinal enumeration"
+        );
     }
 
     #[test]
