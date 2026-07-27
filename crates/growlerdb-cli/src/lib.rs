@@ -2562,10 +2562,6 @@ async fn open_pool_hash_index(
     use std::collections::BTreeMap;
     use std::sync::{Arc, RwLock};
 
-    // Admission ceiling per ordinal writer (matching `serve`'s default): refuse rather than queue
-    // unboundedly when a connector out-runs one ordinal's commit path.
-    const POOL_HASH_MAX_INFLIGHT: usize = 32;
-
     let index = resolved.name.clone();
     let ordinals = store.ordinal_shards(&index)?;
     let (search_o, suggest_o, lookup_o, admin_o, write_o, handles) = {
@@ -2755,6 +2751,120 @@ fn spawn_shard_replicate(
             }
         }
     });
+}
+
+/// Admission ceiling per ordinal writer on a pool node (matching `serve`'s default): refuse rather
+/// than queue unboundedly when a connector out-runs one ordinal's commit path.
+const POOL_HASH_MAX_INFLIGHT: usize = 32;
+
+/// Open ONE already-built hash ordinal shard (`{index}/{ordinal}`) into the **already-published**
+/// per-index pool maps + the writer map, keyed by ordinal-as-i64, and start its auto-compaction. The
+/// per-index maps must already exist (the index was opened — possibly empty — at boot). This is how
+/// **build-on-assignment** publishes a freshly cold-built primary ordinal, and it mirrors one
+/// iteration of [`open_pool_hash_index`]. Returns the shard handle so the caller can start the publish
+/// loop. Inserts only if the ordinal isn't already served (idempotent under a racing reconcile).
+#[allow(clippy::too_many_arguments)]
+async fn open_and_publish_ordinal(
+    store: &growlerdb_index::LocalIndexStore,
+    resolved: &growlerdb_core::ResolvedIndex,
+    table: &str,
+    ordinal: u32,
+    index_heavy: std::sync::Arc<growlerdb_engine::IndexHeavyShare>,
+    compact_interval_secs: u64,
+    search_idx: &growlerdb_engine::SharedSearchIndexes,
+    suggest_idx: &growlerdb_engine::SharedSuggestIndexes,
+    lookup_idx: &growlerdb_engine::SharedLookupIndexes,
+    admin_idx: &growlerdb_engine::SharedAdminIndexes,
+    write_hash_idx: &growlerdb_engine::SharedHashWriteIndexes,
+) -> anyhow::Result<growlerdb_engine::ShardHandle> {
+    use growlerdb_engine::{
+        AdminService, LookupService, SearchService, ShardHandle, SuggestService, WriteService,
+    };
+    use growlerdb_index::ShardId;
+    use std::sync::Arc;
+
+    let index = resolved.name.clone();
+    let (store2, resolved2, index2) = (store.clone(), resolved.clone(), index.clone());
+    let handle = tokio::task::spawn_blocking(move || -> anyhow::Result<ShardHandle> {
+        let shard = store2.open_shard(&ShardId::shard(&index2, ordinal), &resolved2)?;
+        Ok(ShardHandle::new(Arc::new(shard)))
+    })
+    .await??;
+    let key = ordinal as i64;
+    // Publish into each per-index map (the SAME Arcs the Pool services front), only if still absent.
+    if let Some(m) = search_idx
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&index)
+        .cloned()
+    {
+        m.write()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key)
+            .or_insert_with(|| {
+                SearchService::new(handle.clone()).with_index_heavy_share(index_heavy.clone())
+            });
+    }
+    if let Some(m) = suggest_idx
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&index)
+        .cloned()
+    {
+        m.write()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key)
+            .or_insert_with(|| SuggestService::new(handle.clone()));
+    }
+    if let Some(m) = lookup_idx
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&index)
+        .cloned()
+    {
+        m.write()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key)
+            .or_insert_with(|| {
+                LookupService::new(
+                    handle.clone(),
+                    IcebergConfig::from_env(),
+                    table.to_string(),
+                    resolved.clone(),
+                )
+            });
+    }
+    if let Some(m) = admin_idx
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&index)
+        .cloned()
+    {
+        m.write()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key)
+            .or_insert_with(|| AdminService::new(handle.clone(), &index));
+    }
+    if let Some(m) = write_hash_idx
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&index)
+        .cloned()
+    {
+        m.write()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key)
+            .or_insert_with(|| {
+                WriteService::new(handle.clone(), index.clone(), POOL_HASH_MAX_INFLIGHT)
+                    .with_embedding(resolved.clone())
+            });
+    }
+    spawn_auto_compaction(
+        handle.clone(),
+        format!("{index} s{ordinal}"),
+        compact_interval_secs,
+    );
+    Ok(handle)
 }
 
 /// Serve a **placement pool** node (D52): host CP-assigned units from many indexes over one gRPC
@@ -3074,7 +3184,7 @@ async fn serve_pool(
         let replica_root = std::path::PathBuf::from(data_dir).join(".replica");
         let replica = match &object_store {
             Ok(op) => Some(ReplicaServing {
-                meta: replica_meta,
+                meta: replica_meta.clone(),
                 search_idx: search_idx.clone(),
                 suggest_idx: suggest_idx.clone(),
                 lookup_idx: lookup_idx.clone(),
@@ -3119,6 +3229,36 @@ async fn serve_pool(
                 }
             }
         }
+        // Build-on-assignment (D52 dynamic assignment): a node the CP assigns primary of a hash
+        // ordinal it doesn't hold cold-builds it from source and serves it hot — so the operator points
+        // N interchangeable nodes at the pool with a uniform config and each builds the ordinals the CP
+        // gives it. Enabled whenever registered (it has an Iceberg source to build from).
+        let building = match growlerdb_engine::Engine::open(data_dir, IcebergConfig::from_env()) {
+            Ok(engine) => Some(PrimaryBuilding {
+                engine,
+                store: store.clone(),
+                meta: replica_meta,
+                kinds: kinds.clone(),
+                search_idx: search_idx.clone(),
+                suggest_idx: suggest_idx.clone(),
+                lookup_idx: lookup_idx.clone(),
+                admin_idx: admin_idx.clone(),
+                write_hash_idx: write_hash_idx.clone(),
+                object_store: object_store.as_ref().ok().cloned(),
+                compact_interval_secs,
+                replicate_interval_secs: pool_replicate_interval_secs(),
+                building: std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::HashSet::new(),
+                )),
+            }),
+            Err(e) => {
+                eprintln!(
+                    "serve-pool: build-on-assignment disabled — engine open failed ({e}); the node \
+                     serves only ordinals it holds locally"
+                );
+                None
+            }
+        };
         spawn_assignment_reconcile(
             cp.to_string(),
             endpoint.to_string(),
@@ -3128,6 +3268,7 @@ async fn serve_pool(
                 replica_root,
             },
             replica,
+            building,
         );
     }
 
@@ -3260,6 +3401,33 @@ struct AssignmentUnload {
     replica_root: std::path::PathBuf,
 }
 
+/// What the assignment loop needs to **build a hash unit on assignment** (D52 dynamic assignment): a
+/// pool node the CP assigns **primary** of a hash ordinal it doesn't hold cold-builds that ordinal
+/// from source and serves it hot — so the operator points N interchangeable nodes at the pool with a
+/// uniform config (no per-node build/primary designation) and each builds the ordinals the CP gives
+/// it. `None` when the node has no Iceberg source configured to build from.
+struct PrimaryBuilding {
+    /// Builds one ordinal from source ([`Engine::index_shard_resolved`](growlerdb_engine::Engine::index_shard_resolved)).
+    engine: growlerdb_engine::Engine,
+    store: growlerdb_index::LocalIndexStore,
+    /// Per served index: (resolved def, source table, heavy-read share) — the build + open inputs.
+    meta: ReplicaIndexMeta,
+    kinds: growlerdb_engine::SharedIndexKinds,
+    search_idx: growlerdb_engine::SharedSearchIndexes,
+    suggest_idx: growlerdb_engine::SharedSuggestIndexes,
+    lookup_idx: growlerdb_engine::SharedLookupIndexes,
+    admin_idx: growlerdb_engine::SharedAdminIndexes,
+    write_hash_idx: growlerdb_engine::SharedHashWriteIndexes,
+    /// The object store the built ordinal's publish loop ships snapshots to (so replicas can
+    /// read-through). `None` disables publishing (no replicas can be fed).
+    object_store: Option<growlerdb_backup::Operator>,
+    compact_interval_secs: u64,
+    replicate_interval_secs: u64,
+    /// Ordinals a build task is in-flight for — so a repeated snapshot doesn't launch a second build
+    /// of the same unit. Cleared when the build task finishes (success or failure).
+    building: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<(String, u32)>>>,
+}
+
 /// Reconnect backoff for the assignment stream (HA-G4): jittered exponential, so a CP restart
 /// doesn't re-subscribe the whole fleet in 3-second lockstep. Reset on every received snapshot.
 const ASSIGN_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
@@ -3269,6 +3437,52 @@ const ASSIGN_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(3
 /// under any read that was already mid-flight when the unit unloaded. A re-assignment later simply
 /// re-downloads the sidecars (`open_cold_replica` recreates the scratch dir).
 const SCRATCH_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+/// How often the assignment loop **re-attempts** building/opening assigned units the last snapshot
+/// couldn't complete — a replica whose primary hadn't yet published its cold marker at the push, or a
+/// build that failed. The CP pushes only on placement *changes*, so without this a unit that becomes
+/// serveable *after* its push (the primary builds + publishes async) would wait for the next unrelated
+/// placement change. The re-attempt is idempotent (already-served units are skipped).
+const RECONCILE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Serve the units this node is assigned in `units`: build any hash **primary** ordinal it doesn't
+/// hold ([`reconcile_primary_builds`], D52), open any assigned **replica** unit read-through
+/// ([`reconcile_replica_units`], D53), and refresh the heavy-read share denominator. Idempotent — an
+/// already-built/served unit is skipped — so it runs both on each pushed snapshot **and** on the
+/// periodic [`RECONCILE_RETRY_INTERVAL`] retry.
+async fn serve_assigned_units(
+    units: &[growlerdb_proto::v1::UnitAssignment],
+    building: &Option<PrimaryBuilding>,
+    replica: &Option<ReplicaServing>,
+) {
+    if let Some(pb) = building {
+        reconcile_primary_builds(units, pb);
+    }
+    if let Some(r) = replica {
+        reconcile_replica_units(
+            units,
+            &r.meta,
+            &r.search_idx,
+            &r.suggest_idx,
+            &r.lookup_idx,
+            &r.admin_idx,
+            &r.store,
+            &r.op,
+            &r.cache,
+            &r.replica_root,
+        )
+        .await;
+        // Refresh the heavy-read share denominator to the LIVE served index set (357.25): the dispatch
+        // map is what actually serves reads, so per-index fair shares track it as assignments change.
+        let live = r
+            .search_idx
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+            .max(1);
+        r.live_indexes
+            .store(live, std::sync::atomic::Ordering::Release);
+    }
+}
 
 /// Subscribe to CP **assignment pushes** (D53) and apply each pushed snapshot: first swap the
 /// node's primary-holder **write fence** (357.12 — so a unit whose primary moved away is refused on
@@ -3285,6 +3499,7 @@ fn spawn_assignment_reconcile(
     fence: growlerdb_engine::PrimaryFence,
     unload: AssignmentUnload,
     replica: Option<ReplicaServing>,
+    building: Option<PrimaryBuilding>,
 ) {
     let replica_capable = replica.is_some();
     tokio::spawn(async move {
@@ -3316,64 +3531,59 @@ fn spawn_assignment_reconcile(
                     })
                     .await?
                     .into_inner();
-                // A full snapshot on subscribe + on every placement change; reconcile each.
-                while let Some(snapshot) = stream.message().await? {
-                    backoff = ASSIGN_INITIAL_BACKOFF; // a live stream re-arms the reconnect backoff
-                                                      // Fence first: the write path must see the tightened primary set before (and
-                                                      // regardless of whether) any replica window is opened or unloaded.
-                    fence.apply_snapshot(&snapshot.units);
-                    // This node's current window-unit set (either role) from the snapshot.
-                    use growlerdb_proto::v1::unit_assignment::Unit as WireUnit;
-                    let current: std::collections::HashSet<(String, i64)> = snapshot
-                        .units
-                        .iter()
-                        .filter_map(|u| match u.unit {
-                            Some(WireUnit::Window(w)) => Some((u.index.clone(), w)),
-                            _ => None,
-                        })
-                        .collect();
-                    // HA-G1: unload units a previous snapshot assigned here that this one doesn't.
-                    for (index, window) in assignment_seen.iter().filter(|u| !current.contains(u)) {
-                        unload_unit(&unload, index, *window);
-                    }
-                    // The first snapshot is also the authority on which `.replica` scratch dirs
-                    // from PREVIOUS runs are still assigned — sweep the rest (a blind sweep at
-                    // startup would race the subscription and delete still-assigned scratch).
-                    if !orphans_swept {
-                        orphans_swept = true;
-                        let root = unload.replica_root.clone();
-                        let keep = current.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            sweep_orphan_replica_scratch(&root, &keep)
-                        })
-                        .await;
-                    }
-                    assignment_seen = current;
-                    if let Some(r) = &replica {
-                        reconcile_replica_units(
-                            &snapshot.units,
-                            &r.meta,
-                            &r.search_idx,
-                            &r.suggest_idx,
-                            &r.lookup_idx,
-                            &r.admin_idx,
-                            &r.store,
-                            &r.op,
-                            &r.cache,
-                            &r.replica_root,
-                        )
-                        .await;
-                        // Refresh the heavy-read share denominator to the LIVE served index set
-                        // (357.25): the dispatch map is what actually serves reads, so per-index
-                        // fair shares track it as assignments change, not the boot-time count.
-                        let live = r
-                            .search_idx
-                            .read()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .len()
-                            .max(1);
-                        r.live_indexes
-                            .store(live, std::sync::atomic::Ordering::Release);
+                // A full snapshot on subscribe + on every placement change; reconcile each. Between
+                // pushes, a retry tick re-attempts assigned units that weren't serveable yet (a replica
+                // waiting on its primary's not-yet-published marker, a build that failed) — the CP
+                // pushes only on placement *changes*, so a unit that becomes serveable after its push
+                // must be retried locally.
+                let mut last_units: Vec<growlerdb_proto::v1::UnitAssignment> = Vec::new();
+                let mut retry = tokio::time::interval(RECONCILE_RETRY_INTERVAL);
+                retry.tick().await; // consume the immediate first tick
+                loop {
+                    tokio::select! {
+                        msg = stream.message() => {
+                            let Some(snapshot) = msg? else { break };
+                            backoff = ASSIGN_INITIAL_BACKOFF; // a live stream re-arms the reconnect backoff
+                            // Fence first: the write path must see the tightened primary set before (and
+                            // regardless of whether) any replica unit is opened or unloaded.
+                            fence.apply_snapshot(&snapshot.units);
+                            // This node's current window-unit set (either role) from the snapshot.
+                            use growlerdb_proto::v1::unit_assignment::Unit as WireUnit;
+                            let current: std::collections::HashSet<(String, i64)> = snapshot
+                                .units
+                                .iter()
+                                .filter_map(|u| match u.unit {
+                                    Some(WireUnit::Window(w)) => Some((u.index.clone(), w)),
+                                    _ => None,
+                                })
+                                .collect();
+                            // HA-G1: unload units a previous snapshot assigned here that this one doesn't.
+                            for (index, window) in assignment_seen.iter().filter(|u| !current.contains(u)) {
+                                unload_unit(&unload, index, *window);
+                            }
+                            // The first snapshot is also the authority on which `.replica` scratch dirs
+                            // from PREVIOUS runs are still assigned — sweep the rest (a blind sweep at
+                            // startup would race the subscription and delete still-assigned scratch).
+                            if !orphans_swept {
+                                orphans_swept = true;
+                                let root = unload.replica_root.clone();
+                                let keep = current.clone();
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    sweep_orphan_replica_scratch(&root, &keep)
+                                })
+                                .await;
+                            }
+                            assignment_seen = current;
+                            serve_assigned_units(&snapshot.units, &building, &replica).await;
+                            last_units = snapshot.units;
+                        }
+                        _ = retry.tick() => {
+                            // Retry not-yet-served assigned units (idempotent). No-op until the first
+                            // snapshot arrives, and cheap once everything is served (all skipped).
+                            if !last_units.is_empty() {
+                                serve_assigned_units(&last_units, &building, &replica).await;
+                            }
+                        }
                     }
                 }
                 Ok::<(), anyhow::Error>(())
@@ -3616,6 +3826,129 @@ async fn reconcile_replica_units(
         );
     }
     served
+}
+
+/// Reconcile one pushed snapshot's **primary** assignments by **building on assignment** (D52 dynamic
+/// assignment): for each hash ordinal the CP assigns **this node as primary** that it doesn't already
+/// hold, spawn a task that cold-builds the ordinal from source
+/// ([`Engine::index_shard_resolved`](growlerdb_engine::Engine::index_shard_resolved)), publishes it
+/// into the pool maps + writer ([`open_and_publish_ordinal`]), and starts its snapshot publish loop so
+/// replicas can read-through. The build runs off the reconcile loop (it reads the source and can be
+/// slow); an in-flight guard ([`PrimaryBuilding::building`]) stops a repeated snapshot from
+/// double-building. **Single-shard only** today (`shard_count == 1`, ordinal 0 — the demo case), since
+/// the cold build writes to `ShardId::single`; a multi-ordinal build is a follow-up.
+fn reconcile_primary_builds(units: &[growlerdb_proto::v1::UnitAssignment], pb: &PrimaryBuilding) {
+    use growlerdb_proto::v1::unit_assignment::Unit as WireUnit;
+    for u in units {
+        // Only units the CP assigns THIS node as PRIMARY, and only hash ordinals.
+        if !u.primary {
+            continue;
+        }
+        let Some(WireUnit::Shard(ordinal)) = u.unit else {
+            continue;
+        };
+        // The node must serve this index as a hash index (started with `--index`).
+        let is_hash = pb
+            .kinds
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&u.index)
+            .copied()
+            .unwrap_or(false);
+        if !is_hash {
+            continue;
+        }
+        let Some((resolved, table, heavy)) = pb.meta.get(&u.index) else {
+            continue;
+        };
+        // Single-shard build-on-assignment only (see the doc): ordinal 0 of a 1-shard index.
+        if resolved.shard_count != 1 || ordinal != 0 {
+            continue;
+        }
+        // Already serving this ordinal (built earlier, or opened at boot from local data)? Skip.
+        let already_served = pb
+            .search_idx
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&u.index)
+            .is_some_and(|m| {
+                m.read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(&(ordinal as i64))
+            });
+        if already_served {
+            continue;
+        }
+        // In-flight guard: mark this ordinal building; if already marked, another task has it.
+        {
+            let mut b = pb.building.lock().unwrap_or_else(|e| e.into_inner());
+            if !b.insert((u.index.clone(), ordinal)) {
+                continue;
+            }
+        }
+        // Build off the reconcile loop (source read; can be slow), then publish + start replication.
+        let engine = pb.engine.clone();
+        let store = pb.store.clone();
+        let resolved = resolved.clone();
+        let table = table.clone();
+        let heavy = heavy.clone();
+        let (search_idx, suggest_idx, lookup_idx, admin_idx, write_hash_idx) = (
+            pb.search_idx.clone(),
+            pb.suggest_idx.clone(),
+            pb.lookup_idx.clone(),
+            pb.admin_idx.clone(),
+            pb.write_hash_idx.clone(),
+        );
+        let object_store = pb.object_store.clone();
+        let (compact, replicate) = (pb.compact_interval_secs, pb.replicate_interval_secs);
+        let building = pb.building.clone();
+        let index = u.index.clone();
+        tokio::spawn(async move {
+            let key = (index.clone(), ordinal);
+            let result = async {
+                let outcome = engine.index_shard_resolved(&resolved, &table).await?;
+                println!(
+                    "serve-pool: built {index}/s{ordinal} on assignment ({} doc(s), snapshot {}) — \
+                     now serving as primary",
+                    outcome.doc_count, outcome.snapshot.0
+                );
+                let handle = open_and_publish_ordinal(
+                    &store,
+                    &resolved,
+                    &table,
+                    ordinal,
+                    heavy,
+                    compact,
+                    &search_idx,
+                    &suggest_idx,
+                    &lookup_idx,
+                    &admin_idx,
+                    &write_hash_idx,
+                )
+                .await?;
+                // Publish snapshots so replicas can open this ordinal read-through (D53).
+                if let Some(op) = object_store {
+                    spawn_shard_replicate(
+                        handle,
+                        store.clone(),
+                        op,
+                        resolved.clone(),
+                        ordinal,
+                        replicate,
+                    );
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            if let Err(e) = result {
+                eprintln!("serve-pool: build-on-assignment {index}/s{ordinal} failed ({e}); will retry on the next snapshot");
+            }
+            building
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+        });
+    }
 }
 
 /// Everything [`gateway`] needs, bundled into one struct instead of many positional
