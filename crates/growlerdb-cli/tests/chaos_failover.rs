@@ -24,8 +24,8 @@ use growlerdb_index::{LocalIndexStore, ShardId};
 use growlerdb_proto::v1::control_plane_client::ControlPlaneClient;
 use growlerdb_proto::v1::write_client::WriteClient;
 use growlerdb_proto::v1::{
-    resolve_unit_owner_request, GetCheckpointRequest, ResolveUnitOwnerRequest, SearchRequest,
-    WriteRequest,
+    resolve_unit_owner_request, GetCheckpointRequest, ListIndexesRequest, ResolveUnitOwnerRequest,
+    SearchRequest, WriteRequest,
 };
 use tonic::transport::Channel;
 use tonic::Request;
@@ -143,6 +143,36 @@ async fn wait_for_grpc(endpoint: &str) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("process did not come up at {endpoint}");
+}
+
+/// Serialize the port-reservation → process-bind window across this file's concurrent tests.
+/// [`free_addrs`] reserves ports by binding `:0` and releasing them; a sibling test that spawns in
+/// that release window can grab the same port, and this test would then connect to a *sibling's*
+/// control plane (seen as `resolve` returning a foreign node's endpoint). `cargo test` runs test
+/// binaries serially, so the only contention is among this file's own parallel tests — each holds
+/// this guard for its duration.
+static STARTUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A gRPC-level control-plane readiness gate. A bare TCP/HTTP2 connect can succeed before the CP is
+/// answering, so nodes spawned right after would spin their `--register` on transport errors and,
+/// under load, miss the CP's post-boot liveness grace (leaving a unit's holder set frozen at one
+/// node). Gate the CP with this BEFORE spawning nodes: only a gRPC reply — `Ok`, or an application
+/// `Status` with no transport source — proves the CP is actually serving.
+async fn wait_for_cp_ready(cp_ep: &str) {
+    for _ in 0..600 {
+        if let Ok(mut c) = ControlPlaneClient::connect(cp_ep.to_string()).await {
+            match c
+                .list_indexes(Request::new(ListIndexesRequest::default()))
+                .await
+            {
+                Ok(_) => return,
+                Err(status) if std::error::Error::source(&status).is_none() => return,
+                Err(_) => {}
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("control plane did not become ready at {cp_ep}");
 }
 
 /// Poll a node's `/readyz` (its `--metrics-addr`) until it reports ready — i.e. the node's first
@@ -278,6 +308,8 @@ async fn resolve_primary(cp: &mut ControlPlaneClient<Channel>, window: i64) -> S
 
 #[tokio::test]
 async fn killing_a_units_primary_fails_reads_over_to_the_replica() {
+    // Serialize the port-reservation/process-bind window against this file's other tests.
+    let _startup = STARTUP.lock().await;
     // A shared local-fs object store both nodes read the parked windows through — no S3/MinIO.
     let store_dir = tempfile::tempdir().unwrap();
 
@@ -315,6 +347,8 @@ async fn killing_a_units_primary_fails_reads_over_to_the_replica() {
             .expect("spawn control-plane"),
     );
     let cp_ep = format!("http://{cp_addr}");
+    // The CP must be serving before the nodes spawn, so their `--register` lands cleanly.
+    wait_for_cp_ready(&cp_ep).await;
 
     // 4. Two pool nodes: registered into the pool, reading the parked windows through the shared store.
     let a_ep = format!("http://{a_addr}");
@@ -456,6 +490,8 @@ async fn killing_a_units_primary_fails_reads_over_to_the_replica() {
 /// de-assignment driver: the CP's next pushed snapshot simply no longer contains the unit.
 #[tokio::test]
 async fn a_deassigned_unit_is_unloaded_and_its_replica_scratch_cleaned() {
+    // Serialize the port-reservation/process-bind window against this file's other tests.
+    let _startup = STARTUP.lock().await;
     use growlerdb_proto::v1::search_client::SearchClient;
     use growlerdb_proto::v1::DropIndexRequest;
 
@@ -482,6 +518,8 @@ async fn a_deassigned_unit_is_unloaded_and_its_replica_scratch_cleaned() {
             .expect("spawn control-plane"),
     );
     let cp_ep = format!("http://{cp_addr}");
+    // The CP must be serving before the nodes spawn, so their `--register` lands cleanly.
+    wait_for_cp_ready(&cp_ep).await;
     let a_ep = format!("http://{a_addr}");
     let _node = Proc(
         Command::new(env!("CARGO_BIN_EXE_growlerdb"))
@@ -580,6 +618,8 @@ async fn a_deassigned_unit_is_unloaded_and_its_replica_scratch_cleaned() {
 /// after both refusals, both holders still serve the parked doc read-through — nothing was clobbered.
 #[tokio::test]
 async fn a_write_to_a_replica_held_window_is_fenced_and_the_parked_data_survives() {
+    // Serialize the port-reservation/process-bind window against this file's other tests.
+    let _startup = STARTUP.lock().await;
     // A window id on a real daily boundary, so a written doc's `ts` routes to exactly this window.
     const DAY_US: i64 = 86_400_000_000;
     const DAY_MS: i64 = 86_400_000;
@@ -613,6 +653,8 @@ async fn a_write_to_a_replica_held_window_is_fenced_and_the_parked_data_survives
             .expect("spawn control-plane"),
     );
     let cp_ep = format!("http://{cp_addr}");
+    // The CP must be serving before the nodes spawn, so their `--register` lands cleanly.
+    wait_for_cp_ready(&cp_ep).await;
 
     let a_ep = format!("http://{a_addr}");
     let b_ep = format!("http://{b_addr}");
@@ -880,6 +922,8 @@ async fn resolve_shard_primary(cp: &mut ControlPlaneClient<Channel>, ordinal: u3
 /// to the replica with a bounded gap and no `partial` — the ordinal counterpart of the windowed drill.
 #[tokio::test]
 async fn killing_a_hash_ordinals_primary_fails_reads_over_to_the_replica() {
+    // Serialize the port-reservation/process-bind window against this file's other tests.
+    let _startup = STARTUP.lock().await;
     let store_dir = tempfile::tempdir().unwrap();
 
     // 1. Publish TWO ordinals (one doc each) to the shared object store — every drill query then
@@ -914,6 +958,8 @@ async fn killing_a_hash_ordinals_primary_fails_reads_over_to_the_replica() {
             .expect("spawn control-plane"),
     );
     let cp_ep = format!("http://{cp_addr}");
+    // The CP must be serving before the nodes spawn, so their `--register` lands cleanly.
+    wait_for_cp_ready(&cp_ep).await;
 
     // 4. Two pool nodes reading the ordinals through the shared store.
     let a_ep = format!("http://{a_addr}");
