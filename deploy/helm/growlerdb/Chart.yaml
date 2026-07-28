@@ -6,7 +6,7 @@ description: |
   local PVs, and a gateway that fronts the cluster and serves the console UI.
 type: application
 # Chart version — bump on chart changes (SemVer). appVersion tracks the GrowlerDB image.
-version: 0.3.0
+version: 0.4.0
 appVersion: "0.0.0"
 keywords:
   - search

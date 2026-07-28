@@ -6,6 +6,8 @@ All notable changes to GrowlerDB are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-28
+
 The **true high-availability** release — HA reaches every index type, not just windowed streams. The
 control plane runs as replicas, and serving moves to a self-organizing **placement pool** of
 interchangeable nodes where each index's units are replicated, so losing a node is a zero-gap read
@@ -105,6 +107,35 @@ things need attention: (1) upgrade the control plane, serving nodes, and the Spa
   (keeping the sweeper off it) while keeping it **out** of the placement-eligible pool, so pool units
   are still never assigned to a node that can't build/serve them (a pool primary landing on the
   classic node would otherwise have broken failover).
+
+- **The cluster no longer reports itself "Down" while the placement pool serves every query.** Two
+  pool-blind health paths were fixed: the control plane's per-shard ingestion checkpoint probe sent an
+  **empty index selector**, which a multi-index pool node can't route — so every pool-served shard read
+  back `unreachable` and `growlerdb_shards_up` dropped to 0; it now threads the target index (+ shard
+  ordinal), which single-index nodes ignore. And the bundled otel-collector still scraped the pre-pool
+  `node`/`node-catalog` hostnames (permanently `up=0`); it now scrapes the pool
+  (`pool-a`/`pool-b`/`node-events`). Together these restore the Ingestion panel's per-index state, the
+  "shards up" gauge, and the header cluster-health pill on a healthy pool.
+
+- **`GET /v1/cold` no longer resets the connection on a multi-index gateway.** The handler panicked a
+  Gateway worker (it assumed a single static route); it now returns **404** ("not a windowed index —
+  no cold tier") on a gateway that fronts no single windowed index, matching the documented behavior.
+
+- **`POST /v1/explain` works on the placement pool.** The pool node's per-index Search service left
+  `explain` unimplemented, so every pool index returned `501` (the console's per-hit "Explain"
+  included); it now delegates to the resolved unit for a hash (non-windowed) index. A distributed
+  **windowed** explain — which can't pick a window from a coordinate without a scatter — stays
+  unimplemented with an accurate message.
+
+- **`just stack` converges promptly and no longer trips a spurious `HighQueryErrorRate` on boot.** The
+  startup readiness probe hit `/v1/search` without a bearer on the auth-required demo stack, so it
+  never observed readiness (waiting out its full timeout every boot) and its `401` burst tripped the
+  query-error SLI alert. The probe now authenticates.
+
+- **The console Indexes screen no longer errors for a non-admin session.** It eagerly called the
+  Admin-scoped `backup-status` per index, so a `reader`/`operator` (the demo `demo`/`demo`) saw a
+  `403` per index; the backup column is now fetched only where the caller could be authorized (open
+  mode or an admin session) and otherwise renders "Off".
 
 ## [0.6.0] - 2026-07-25
 
@@ -507,7 +538,8 @@ The initial public (Beta) surface.
   into the image, chart `appVersion`, binaries, and CLI `--version` while the tree stays `0.0.0`;
   the image gets an immutable `X.Y.Z` plus moving `X.Y`/`X`/`latest`. See [RELEASING.md](RELEASING.md).
 
-[Unreleased]: https://github.com/GrowlerDB/growlerdb/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/GrowlerDB/growlerdb/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/GrowlerDB/growlerdb/compare/v0.4.0...v0.4.1
