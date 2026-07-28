@@ -87,6 +87,16 @@ things need attention: (1) upgrade the control plane, serving nodes, and the Spa
   `node-movies-data` volumes) — replaced by the `pool-a`/`pool-b` placement pool; the `node` service
   is now used only by the streaming `pipeline` profile.
 
+### Fixed
+
+- **A classic `serve --index X` node's index is no longer stolen by the dead-owner sweeper.** Such a
+  node announces only via `RegisterServedIndex` (never the `RegisterNode` heartbeat), so the control
+  plane saw its owner as dead and re-placed the index onto a pool node — which then rejected reads
+  for it. The CP now heartbeats a served-index owner into the **liveness** pool on every announce
+  (keeping the sweeper off it) while keeping it **out** of the placement-eligible pool, so pool units
+  are still never assigned to a node that can't build/serve them (a pool primary landing on the
+  classic node would otherwise have broken failover).
+
 ## [0.6.0] - 2026-07-25
 
 The **Iceberg v3 variant** release — GrowlerDB reaches inside semi-structured `variant` columns and

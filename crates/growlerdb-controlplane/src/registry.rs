@@ -473,6 +473,14 @@ pub struct Registry {
     /// on every heartbeat, so a node that loses its object store stops attracting new replicas
     /// within one re-announce.
     replica_capable: RwLock<BTreeSet<String>>,
+    /// The endpoints admitted as **placement-eligible pool nodes** (D52): those that registered via
+    /// `RegisterNode` (a `serve-pool` node the control plane may assign units to). A classic
+    /// fixed-endpoint node (`serve --index X`, seen only through `RegisterServedIndex`) is
+    /// deliberately ABSENT — its liveness is kept in [`node_pool`](Self::node_pool) so the dead-owner
+    /// sweeper leaves its self-declared units alone, but the CP never *places* a pool unit onto it
+    /// (it could not build or serve one). Placement draws targets from
+    /// [`placement_nodes`](Self::placement_nodes) = live ∩ this set. In-memory beside `node_pool`.
+    pool_eligible: RwLock<BTreeSet<String>>,
     /// **Placement-change hook** (HA-D1): invoked after any successful persist/reload whose
     /// placement fingerprint differs from the last one — the single choke point that pushes fresh
     /// assignment snapshots to subscribed nodes. Lives at the persist boundary (not per mutation) so
@@ -542,6 +550,7 @@ impl Registry {
             rollback_failed: std::sync::atomic::AtomicBool::new(false),
             node_pool: RwLock::new(BTreeMap::new()),
             replica_capable: RwLock::new(BTreeSet::new()),
+            pool_eligible: RwLock::new(BTreeSet::new()),
             placement_listener: RwLock::new(None),
             last_placement_hash: std::sync::Mutex::new(0),
             grace_anchor_ms: std::sync::atomic::AtomicI64::new(-1),
@@ -1478,9 +1487,14 @@ impl Registry {
                 None => any_fresh = true,
                 Some(cur) if *cur == node => {}
                 Some(cur) => {
-                    if self.owner_confidently_dead(&cur.0, now_ms) {
-                        // Takeover of a dead primary — allowed even (especially) for a warm replica
-                        // announcing itself.
+                    if self.owner_confidently_dead(&cur.0, now_ms) || !self.is_pool_eligible(&cur.0)
+                    {
+                        // Takeover of a dead primary (allowed even — especially — for a warm replica
+                        // announcing itself), OR of a **classic** (non-pool-eligible) owner: a classic
+                        // index has a single self-declared owner, so a fresh announce (e.g. a restart
+                        // at a new endpoint) re-points it — last-write-wins. A CP-assigned **pool**
+                        // primary stays first-wins (needs its owner confidently dead) so a node can't
+                        // steal an assigned unit.
                     } else if entry
                         .shards
                         .get(&shard)
@@ -1565,8 +1579,11 @@ impl Registry {
                 None => any_fresh = true,
                 Some(cur) if *cur == node => {}
                 Some(cur) => {
-                    if self.owner_confidently_dead(&cur.0, now_ms) {
-                        // Takeover of a dead primary — allowed even for a warm replica.
+                    if self.owner_confidently_dead(&cur.0, now_ms) || !self.is_pool_eligible(&cur.0)
+                    {
+                        // Takeover of a dead primary (allowed even for a warm replica), or of a
+                        // classic (non-pool-eligible) owner re-pointing — last-write-wins; a
+                        // CP-assigned pool primary stays first-wins. See the hash path above.
                     } else if entry
                         .windows
                         .get(&w.window)
@@ -1890,8 +1907,36 @@ impl Registry {
                 cap.remove(endpoint);
             }
         }
+        // A `RegisterNode` heartbeat admits the node to the placement-eligible pool: the CP may now
+        // assign it units. (A classic served-index owner never lands here — see `touch_node_liveness`.)
+        self.pool_eligible
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(endpoint.to_string());
         // First heartbeat since boot/promotion arms the liveness grace anchor (HA-D5): for one TTL
         // from here, owners that haven't re-registered yet are treated live-unknown.
+        let _ = self.grace_anchor_ms.compare_exchange(
+            -1,
+            now_ms,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    /// Refresh a **served-index owner's liveness** WITHOUT admitting it to the placement pool — the
+    /// [`RegisterServedIndex`] counterpart to [`register_node`](Self::register_node). A classic
+    /// fixed-endpoint node (`serve --index X`) heartbeats here on every announce; it never calls
+    /// `RegisterNode`, so before this the dead-owner sweeper saw its owner as dead and *stole* its
+    /// self-declared units onto a pool node (which then rejected reads for that index). Tracking its
+    /// liveness in [`node_pool`](Self::node_pool) fixes that. Crucially it is NOT added to
+    /// [`pool_eligible`](Self::pool_eligible), so the CP never *places* a pool unit onto it (it could
+    /// not build/serve one) — see [`placement_nodes`](Self::placement_nodes). Arms the liveness grace
+    /// like any heartbeat.
+    pub fn touch_node_liveness(&self, endpoint: &str, now_ms: i64) {
+        self.node_pool
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(endpoint.to_string(), now_ms);
         let _ = self.grace_anchor_ms.compare_exchange(
             -1,
             now_ms,
@@ -1959,6 +2004,16 @@ impl Registry {
             Some(&t) => now_ms - t > NODE_HEARTBEAT_TTL_MS && !self.placement_grace_active(now_ms),
             None => !self.placement_grace_active(now_ms),
         }
+    }
+
+    /// Whether `endpoint` is a **placement-eligible pool node** (registered via `RegisterNode`), as
+    /// opposed to a classic served-index owner tracked only for liveness
+    /// ([`touch_node_liveness`](Self::touch_node_liveness) / [`pool_eligible`](Self::pool_eligible)).
+    fn is_pool_eligible(&self, endpoint: &str) -> bool {
+        self.pool_eligible
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(endpoint)
     }
 
     /// Whether an assigned owner `endpoint` is **tracked in the pool and stale past the TTL** —
@@ -2067,15 +2122,31 @@ impl Registry {
         nodes
     }
 
-    /// The endpoints of nodes whose heartbeat is within [`NODE_HEARTBEAT_TTL_MS`] of `now_ms` — the
-    /// **live** placement pool (sorted, since `node_pool` is a `BTreeMap`, so tie-breaks are
-    /// deterministic).
+    /// Every endpoint whose heartbeat is within [`NODE_HEARTBEAT_TTL_MS`] of `now_ms` — pool nodes
+    /// **and** classic served-index owners (sorted, since `node_pool` is a `BTreeMap`). This is the
+    /// **liveness** view (used by the dead-owner sweeper + entitlement); for *placement targets* use
+    /// [`placement_nodes`](Self::placement_nodes), which is this ∩ [`pool_eligible`](Self::pool_eligible).
     pub fn live_nodes(&self, now_ms: i64) -> Vec<String> {
         self.node_pool
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter(|(_, &t)| now_ms - t <= NODE_HEARTBEAT_TTL_MS)
+            .map(|(ep, _)| ep.clone())
+            .collect()
+    }
+
+    /// The **placement-eligible** live pool: [`live_nodes`](Self::live_nodes) ∩
+    /// [`pool_eligible`](Self::pool_eligible) — the nodes the control plane may assign units to. It
+    /// excludes classic fixed-endpoint owners (which are live for the sweeper but must never receive
+    /// a pool unit they can't build/serve). Placement (`resolve_unit_holders`) picks targets here.
+    pub fn placement_nodes(&self, now_ms: i64) -> Vec<String> {
+        let eligible = self.pool_eligible.read().unwrap_or_else(|e| e.into_inner());
+        self.node_pool
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(ep, &t)| now_ms - t <= NODE_HEARTBEAT_TTL_MS && eligible.contains(*ep))
             .map(|(ep, _)| ep.clone())
             .collect()
     }
@@ -2219,8 +2290,12 @@ impl Registry {
         } else {
             (0, BTreeSet::new())
         };
-        // Holder load across ALL indexes (primary + replicas), so replica top-up bin-packs the pool.
-        let mut load: BTreeMap<String, usize> = live.iter().map(|e| (e.clone(), 0usize)).collect();
+        // Placement targets are the **pool-eligible** live nodes only — a classic served-index owner
+        // is live (so the sweeper leaves its units alone) but must never be assigned a pool unit it
+        // can't build/serve. Holder load counts across ALL indexes so top-up bin-packs the pool.
+        let placement = self.placement_nodes(now_ms);
+        let mut load: BTreeMap<String, usize> =
+            placement.iter().map(|e| (e.clone(), 0usize)).collect();
         for e in map.values() {
             for sa in e.shards.values() {
                 for n in sa.nodes() {
@@ -2259,7 +2334,15 @@ impl Registry {
             } else {
                 // Never co-locate the primary on a node still listed as a replica of this unit.
                 let exclude: BTreeSet<String> = a.replicas.iter().map(|n| n.0.clone()).collect();
-                let mut pick = pick_least_loaded(&load, &exclude).expect("live pool non-empty");
+                // `load` is now the pool-eligible nodes only, which can be empty (e.g. all pool
+                // nodes down but a classic owner still live) — so this is a retryable NoLiveNode,
+                // not a panic.
+                let mut pick = pick_least_loaded(&load, &exclude).ok_or_else(|| {
+                    RegistryError::NoLiveNode {
+                        index: index.to_string(),
+                        unit: unit.to_string(),
+                    }
+                })?;
                 // Atomic entitlement gate for a FRESH unit: at the cap, only nodes already holding a
                 // primary of any index (no new node counted) may take it.
                 if fresh_unit && node_count >= entitled_nodes && !primary_nodes.contains(&pick) {
@@ -3418,6 +3501,58 @@ mod tests {
             2,
             "both units want a replica once the grace clears"
         );
+    }
+
+    #[test]
+    fn classic_owner_is_live_for_the_sweeper_but_never_a_placement_target() {
+        // A classic `serve --index events` node heartbeats via RegisterServedIndex only
+        // (`touch_node_liveness`) — it never calls RegisterNode. It must (a) stay live so the
+        // dead-owner sweeper doesn't steal its self-declared unit, yet (b) never be a target for
+        // pool units it can't build/serve.
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
+        reg.create(resolved("docs")).unwrap(); // a pool (CP-placed) index
+        reg.create(resolved("events")).unwrap(); // classic-served
+        let cap = usize::MAX;
+        let t0 = 1_000_000;
+        reg.register_node("pool-a", t0); // serve-pool → placement-eligible
+        reg.register_node("pool-b", t0);
+        reg.touch_node_liveness("node-events", t0); // classic owner → liveness only
+        reg.announce_primaries("events", &[0], "node-events", t0, cap)
+            .unwrap();
+        reg.set_placement_grace_anchor(-1); // deterministic placement
+
+        // (b) The classic owner is LIVE but NOT placement-eligible, so a pool primary never lands on it.
+        assert!(reg.live_nodes(t0).contains(&"node-events".to_string()));
+        assert_eq!(reg.placement_nodes(t0), vec!["pool-a", "pool-b"]);
+        let docs = reg
+            .resolve_unit_owner("docs", Unit::Shard(0), cap, t0)
+            .unwrap()
+            .0;
+        assert!(docs == "pool-a" || docs == "pool-b");
+        assert_ne!(
+            docs, "node-events",
+            "a pool primary never lands on a classic node"
+        );
+
+        // (a) While it keeps heartbeating (past the grace), its unit is NOT swept.
+        let t1 = t0 + NODE_HEARTBEAT_TTL_MS + 1;
+        for n in ["pool-a", "pool-b"] {
+            reg.register_node(n, t1);
+        }
+        reg.touch_node_liveness("node-events", t1);
+        reg.set_placement_grace_anchor(-1);
+        assert_eq!(
+            reg.resolve_unit_owner("events", Unit::Shard(0), cap, t1)
+                .unwrap()
+                .0,
+            "node-events",
+            "the live classic owner keeps its unit — not stolen by the sweeper"
+        );
+
+        // Liveness, not a permanent exemption: once it truly goes silent past the TTL, it drops out.
+        let t2 = t1 + NODE_HEARTBEAT_TTL_MS + 1;
+        assert!(!reg.live_nodes(t2).contains(&"node-events".to_string()));
     }
 
     #[test]
