@@ -1765,12 +1765,15 @@ impl ControlPlaneService {
                     let window = *window;
                     let node = wa.assignment.primary.as_ref().map(|n| n.0.clone());
                     let sem = sem.clone();
+                    let index = name.clone();
                     set.spawn(async move {
                         let Some(endpoint) = node else {
                             return (0u32, window, String::new(), Err("no_primary"));
                         };
                         let _permit = sem.acquire_owned().await;
-                        let res = shard_checkpoint(&endpoint, window).await;
+                        // Windowed unit: routed by `window`; ordinal is 0. Thread the index so a
+                        // multi-index pool node can resolve which index's window to probe.
+                        let res = shard_checkpoint(&endpoint, &index, 0, window).await;
                         (0u32, window, endpoint, res)
                     });
                 }
@@ -1780,12 +1783,15 @@ impl ControlPlaneService {
                     // `node` is the primary endpoint, or "" when the shard has no primary yet.
                     let node = assignment.primary.as_ref().map(|n| n.0.clone());
                     let sem = sem.clone();
+                    let index = name.clone();
                     set.spawn(async move {
                         let Some(endpoint) = node else {
                             return (ordinal, 0i64, String::new(), Err("no_primary"));
                         };
                         let _permit = sem.acquire_owned().await;
-                        let res = shard_checkpoint(&endpoint, 0).await;
+                        // Hash unit: routed by `shard` ordinal; window is 0. Thread the index so a
+                        // multi-index pool node can resolve which index's shard to probe.
+                        let res = shard_checkpoint(&endpoint, &index, ordinal, 0).await;
                         (ordinal, 0i64, endpoint, res)
                     });
                 }
@@ -2003,19 +2009,26 @@ fn ingestion_state(
 /// Read one shard's committed checkpoint (the source snapshot it reflects) + its index snapshot
 /// from the shard primary's `Write.GetCheckpoint`. A fresh connect per call — the Ingestion view
 /// polls at human cadence, so a pooled client isn't worth the bookkeeping.
-async fn shard_checkpoint(endpoint: &str, window: i64) -> Result<(i64, u64), &'static str> {
+async fn shard_checkpoint(
+    endpoint: &str,
+    index: &str,
+    shard: u32,
+    window: i64,
+) -> Result<(i64, u64), &'static str> {
     let (channel, stamp) = growlerdb_proto::service_token::node_channel(endpoint.to_string())
         .await
         .map_err(|_| "unreachable")?;
     let mut client = WriteClient::with_interceptor(channel, stamp);
     let resp = client
-        // `window` selects the time-window shard on a windowed node; 0 on an ordinal node,
-        // which ignores it. `index` stays empty: this probe targets single-index nodes (each ignores
-        // it / defaults to its sole index); pool-node ingestion status threads a real index later.
+        // `window` selects the time-window shard on a windowed node; `shard` the ordinal on a hash
+        // node. `index` names the unit: a single-index node ignores all three (it has one shard and
+        // defaults to its sole index), but a MULTI-index pool node REQUIRES the index (+ ordinal) to
+        // route the probe — without them it can't disambiguate and answers InvalidArgument, which the
+        // caller reads back as `unreachable` and reports every pool-served shard as DOWN.
         .get_checkpoint(GetCheckpointRequest {
             window,
-            index: String::new(),
-            shard: 0,
+            index: index.to_string(),
+            shard,
         })
         .await
         // A node serving a stale index over a recreated source refuses the checkpoint with

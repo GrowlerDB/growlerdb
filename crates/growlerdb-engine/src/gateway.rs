@@ -815,6 +815,10 @@ impl Gateway {
     /// Cold-tier status: each window's hot/cold tier + event zone-map, plus the shared
     /// read-through cache's hit/miss/byte stats. `None` on a non-windowed Gateway.
     pub fn cold_status(&self) -> Option<ColdStatus> {
+        // A multi-index gateway (e.g. the HA placement pool) has no single static route, so there's
+        // no windowed cold tier to report — return None (→ 404) instead of panicking in `single()`.
+        // Guard on `self.single` first so the `routing()` call below can't hit that `.expect()`.
+        self.single.as_ref()?;
         let rs = self.routing();
         let wr = rs.window_routing.as_ref()?;
         // The per-window tier comes from the routing descriptors — for the in-process node gateway
@@ -4886,6 +4890,15 @@ mod tests {
         let resolved = calls.lock().unwrap().clone();
         assert_eq!(resolved.iter().filter(|n| *n == "a").count(), 1);
         assert_eq!(resolved.iter().filter(|n| *n == "b").count(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_index_cold_status_is_none_not_panic() {
+        // Regression: a multi-index gateway (the HA placement pool) has no single static route, so
+        // `cold_status()` must return None (→ REST 404 "not a windowed index"), never panic in
+        // `single()` — which previously reset the connection on every `GET /v1/cold`.
+        let (gw, _) = multi_gw();
+        assert!(gw.cold_status().is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]

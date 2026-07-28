@@ -3,6 +3,8 @@
   // policy/mapping/shards/maintenance/activity. Maintenance wires reindex/drop/alias against
   // current APIs; Mapping, Shards and Activity are scaffolds, and Compact/Backup render as PLANNED.
   import { onMount } from 'svelte';
+  import { get } from 'svelte/store';
+  import { canAdminister } from '../lib/identity';
   import { t } from '../lib/i18n';
   import {
     getIndex,
@@ -132,10 +134,15 @@
 
   onMount(async () => {
     await load();
-    try {
-      bstatus = await backupStatus(name);
-    } catch {
-      bstatus = { configured: false, present: false };
+    // `BackupStatus` is Admin-scoped — only fetch it where the caller could be authorized (open mode
+    // or an admin session); a closed-mode reader/operator would get a 403 on every detail open and
+    // sees the "Off" default instead.
+    if (get(canAdminister)) {
+      try {
+        bstatus = await backupStatus(name);
+      } catch {
+        bstatus = { configured: false, present: false };
+      }
     }
     activity = await listActivity(name);
   });
