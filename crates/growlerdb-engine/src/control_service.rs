@@ -1909,13 +1909,17 @@ impl ControlPlaneService {
     /// counterpart to [`spawn_dead_owner_sweeper`](Self::spawn_dead_owner_sweeper) (which promotes on a
     /// dead primary). Only the **leader** sweeps; the grace window is honored inside the sweep.
     pub fn spawn_placement_sweeper(&self) {
-        use growlerdb_controlplane::NODE_HEARTBEAT_TTL_MS;
+        use growlerdb_controlplane::NODE_REANNOUNCE_INTERVAL_MS;
         let registry = self.registry.clone();
         let replication_factor = self.replication_factor;
         let entitled = self.entitled_nodes();
         tokio::spawn(async move {
+            // Sweep several times per heartbeat interval so the cold-start pool self-organizes within
+            // a few seconds of the initial settle (build-on-assignment then serves), instead of on a
+            // coarse TTL/2 tick. A no-op sweep is a cheap read, so a tight cadence is fine; dead-owner
+            // re-placement still keys off the TTL, not this interval.
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(
-                (NODE_HEARTBEAT_TTL_MS / 2).max(1000) as u64,
+                (NODE_REANNOUNCE_INTERVAL_MS / 4).max(1000) as u64,
             ));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
