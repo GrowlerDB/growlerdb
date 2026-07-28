@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { get } from 'svelte/store';
+  import { isAdmin } from '../lib/identity';
   import { t } from '../lib/i18n';
   import {
     listIndexes,
@@ -94,18 +96,22 @@
       enriched = Object.fromEntries(entries);
       now = Date.now();
       // Backup column: last-backup status per index (best-effort — a node without a
-      // backup target reports `configured: false`, rendered as "Off").
-      backupMap = Object.fromEntries(
-        await Promise.all(
-          indexes.map(async (ix): Promise<[string, BackupStatus]> => {
-            try {
-              return [ix.name, await backupStatus(ix.name)];
-            } catch {
-              return [ix.name, { configured: false, present: false }];
-            }
-          }),
-        ),
-      );
+      // backup target reports `configured: false`, rendered as "Off"). `BackupStatus` is Admin-scoped,
+      // so only fetch it for an admin session; a reader/operator would get a 403 per index (console
+      // spam) — the column renders "Off" for them.
+      backupMap = get(isAdmin)
+        ? Object.fromEntries(
+            await Promise.all(
+              indexes.map(async (ix): Promise<[string, BackupStatus]> => {
+                try {
+                  return [ix.name, await backupStatus(ix.name)];
+                } catch {
+                  return [ix.name, { configured: false, present: false }];
+                }
+              }),
+            ),
+          )
+        : {};
       // Lag column: snapshots the worst-behind shard trails the source head, from ingestion.
       try {
         const lag: Record<string, number | null> = {};

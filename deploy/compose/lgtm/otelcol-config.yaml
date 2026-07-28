@@ -20,10 +20,14 @@ receivers:
             - targets: ["127.0.0.1:8888"]
         # GrowlerDB services expose Prometheus `/metrics` on their --metrics-addr ports.
         # The collector (in the lgtm container) resolves these by compose-network DNS.
+        # `stack`/`stack-dev` serve docs/catalog/movies from the HA placement POOL (pool-a:9102,
+        # pool-b:9104) plus the variant `events` node (node-events:9107) — NOT the pre-pool
+        # `node`/`node-catalog` single-index nodes. Scraping absent hosts leaves them permanently
+        # `up == 0`, which the console health roll-up (lib/health.ts) reports as cluster "Down".
         - job_name: "growlerdb"
           scrape_interval: 5s
           static_configs:
-            - targets: ["controlplane:9101", "node:9102", "node-catalog:9104", "gateway:9103"]
+            - targets: ["controlplane:9101", "pool-a:9102", "pool-b:9104", "node-events:9107", "gateway:9103"]
         # Host CPU/mem/disk for the Observability "Runtime" panels.
         - job_name: "node-exporter"
           scrape_interval: 5s

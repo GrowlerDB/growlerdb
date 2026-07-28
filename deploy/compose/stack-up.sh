@@ -54,9 +54,22 @@ dc --profile stack --profile pool up -d --quiet-pull
 # replicas open read-through. Wait until `docs` is actually queryable through the gateway before
 # declaring ready, so the console isn't hit mid-build.
 printf '    converging (build-on-assignment; the pool self-organizes in a few seconds)'
+# The demo stack runs auth-required, so the readiness probe must send a bearer: an unauthenticated
+# /v1/search 401s forever (never observing readiness, so this loop would always burn its full timeout)
+# and the 401 burst trips the HighQueryErrorRate SLI alert on a fresh boot. Mint a demo token lazily
+# (retried until /v1/login is up) and probe with it.
+token=""
 for _ in $(seq 1 40); do
-  if curl -fsS -m 5 http://localhost:8081/v1/search \
-       -H 'content-type: application/json' -d '{"index":"docs","query":"*","limit":1}' 2>/dev/null \
+  # Mint lazily — `/v1/login` isn't up on the first iterations. The `|| true` keeps a failed connect
+  # (curl exit 7) from aborting the script under `set -e`/`pipefail`; the loop just retries.
+  if [ -z "$token" ]; then
+    token=$(curl -fsS -m 5 http://localhost:8081/v1/login \
+      -H 'content-type: application/json' -d '{"username":"demo","password":"demo"}' 2>/dev/null \
+      | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p') || true
+  fi
+  if [ -n "$token" ] && curl -fsS -m 5 http://localhost:8081/v1/search \
+       -H 'content-type: application/json' -H "authorization: Bearer $token" \
+       -d '{"index":"docs","query":"*","limit":1}' 2>/dev/null \
        | grep -q '"total"'; then printf ' ready\n'; break; fi
   printf '.'; sleep 3
 done

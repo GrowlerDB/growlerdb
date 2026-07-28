@@ -228,11 +228,22 @@ impl Search for PoolSearchService {
 
     async fn explain(
         &self,
-        _request: Request<ExplainRequest>,
+        request: Request<ExplainRequest>,
     ) -> Result<Response<ExplainResponse>, Status> {
-        Err(Status::unimplemented(
-            "explain is not yet supported over a distributed windowed index",
-        ))
+        // Explain names a doc by coordinate, not a window/shard selector (ExplainRequest carries
+        // neither). For a HASH (non-windowed) index the gateway already routed to the owner node, so
+        // delegate to that index's unit — shard 0, the sole unit in the common single-shard case —
+        // exactly as `search`/`semantic`/`aggregate` route to the resolved leaf `SearchService`.
+        // A distributed WINDOWED index still can't pick the window from a coordinate without a
+        // scatter, so it stays unimplemented.
+        let r = request.get_ref();
+        if !index_is_hash(&self.kinds, &r.index) {
+            return Err(Status::unimplemented(
+                "explain is not yet supported over a distributed windowed index",
+            ));
+        }
+        let svc = route_unit(&self.by_index, &self.kinds, &r.index, 0, 0)?;
+        Search::explain(&svc, request).await
     }
 
     type ExportStream = ReceiverStream<Result<SearchResponse, Status>>;
@@ -580,6 +591,51 @@ mod tests {
                 .collect()),
             Err(s) => Err(s.code()),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pool_explain_delegates_for_hash_index_and_refuses_windowed() {
+        use growlerdb_proto::v1::Coordinates;
+        let tmp = tempfile::tempdir().unwrap();
+        // A hash (non-windowed) index `docs` with one doc `d1`; its unit is keyed on shard ordinal 0.
+        let unit = SearchService::new(one_doc_shard(tmp.path(), "docs", "d1"));
+        let by_index: SharedSearchIndexes = Arc::new(RwLock::new(BTreeMap::from([(
+            "docs".to_string(),
+            Arc::new(RwLock::new(BTreeMap::from([(0i64, unit)]))),
+        )])));
+        let kinds: SharedIndexKinds =
+            Arc::new(RwLock::new(BTreeMap::from([("docs".to_string(), true)])));
+        let mux = PoolSearchService::new(by_index, kinds);
+
+        let key = CompositeKey::new(vec![], vec![("id".into(), Value::from("d1"))]);
+        let req = ExplainRequest {
+            query: "id:d1".into(),
+            coordinates: Some(Coordinates::from(&key)),
+            index: "docs".into(),
+            ..Default::default()
+        };
+        // Regression: a hash pool index delegates to the unit's SearchService::explain (was 501).
+        let resp = Search::explain(&mux, Request::new(req)).await;
+        assert!(
+            resp.is_ok(),
+            "hash-index explain should delegate, got {:?}",
+            resp.err().map(|s| s.code())
+        );
+
+        // A distributed WINDOWED index still can't pick the window from a coordinate → Unimplemented.
+        let kinds_w: SharedIndexKinds =
+            Arc::new(RwLock::new(BTreeMap::from([("evt".to_string(), false)])));
+        let mux_w = PoolSearchService::new(Arc::new(RwLock::new(BTreeMap::new())), kinds_w);
+        let req_w = ExplainRequest {
+            query: "*".into(),
+            coordinates: Some(Coordinates::from(&key)),
+            index: "evt".into(),
+            ..Default::default()
+        };
+        let err = Search::explain(&mux_w, Request::new(req_w))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
     }
 
     /// A windowed index def (`id` KEYWORD + a `ts` Long window field), for the pool write path.

@@ -16,7 +16,9 @@ instead of local disk — so long retention is cheap without giving up searchabi
 - A cold window is read through a byte-bounded range-cached object directory: **queries always
   complete**, cold is just slower, and window pruning means most queries never touch cold at all.
 - A small hot cache keeps a cold window's structural bytes warm; a cold-cache hit-rate SLI is exposed.
-- `/v1/cold` + the console Storage-tiers panel show what's parked.
+- `/v1/cold` + the console Storage-tiers panel show what's parked. On a non-windowed index — or a
+  multi-index gateway (the HA pool) that fronts no single windowed route — there is no cold tier to
+  report, so `/v1/cold` answers **404**, never an error.
 - **Automatic, in both directions.** Each node parks its own windows past the `hot_windows` policy on
   a background timer, and a cold window that gets hot traffic again **pre-warms** itself back to local
   NVMe. Parking is node-local (the data lives on the node's own volume), opt-in per deployment, and
