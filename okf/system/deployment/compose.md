@@ -22,8 +22,9 @@ prints numbered step headers rather than echoing the orchestration line by line.
 
 ## Notes
 
-Profiles: `seed` (sample tables), `stack` (GrowlerDB + LGTM), `catalog` (the second `node-catalog`),
-`pipeline` (the streaming demo with Redpanda). Long-running services carry `restart:` policies
+Profiles: `seed` (sample tables), `stack` (control plane + gateway + LGTM), `pool` (the two
+interchangeable placement-pool nodes serving docs/catalog/movies at R=2), `demo-data` (the movies
+source loader), `pipeline` (the streaming demo with Redpanda). Long-running services carry `restart:` policies
 (self-heal); chaos drills exercise recovery ([reliability](/quality/reliability.md)).
 
 The GrowlerDB services default to the **latest published release image** (`GROWLERDB_IMAGE`
@@ -39,14 +40,24 @@ external Iceberg REST catalog + S3 store — no bundled MinIO/Polaris/seed. It's
 the demo; see the [getting-started site](/product/interfaces/website.md) *Connecting your own Iceberg
 table* page for the walkthrough and limitations (REST-only catalog, static S3 keys, forced path-style).
 
-**Two demo indexes:** the `seed` profile writes `growlerdb.docs` (3 rows, the minimal
-E2E table) *and* the richer `growlerdb.catalog` (10 rows — one field of every type). Each is served from
-its own node (`node` → `docs`, `node-catalog` → `catalog`, built from `catalog.yaml`), and the single
+**Demo indexes on an HA placement pool.** The `seed` profile writes `growlerdb.docs` (3 rows, the
+minimal E2E table) *and* the richer `growlerdb.catalog` (10 rows — one field of every type); a
+`demo-data` one-shot loads `growlerdb.movies`. All three are served **not per-index but on a
+[placement pool](/system/decisions/d52-placement-pool.md)** ([D52](/system/decisions/d52-placement-pool.md)/[D53](/system/decisions/d53-unit-replication.md)):
+**two interchangeable pool nodes** (`pool-a`/`pool-b`) with an **identical** config run
+`serve-pool --index docs --index catalog --index movies` at **`GROWLERDB_REPLICATION_FACTOR=2`**, so the
+demo is shaped like a production deploy. Neither node is designated anything — each `--define-only`s the
+three indexes (schema only), and the control plane's placement sweep distributes each index's **primary
+round-robin** across the pool while the other node opens it **read-through** from the shared cold store
+(MinIO `growlerdb-cold`); a node made primary **builds that index from source on assignment**
+(build-on-assignment). So killing either pool node is a **zero-gap read failover** — HA is "run two
+nodes, the control plane does the rest", no per-node build/primary designation. The single
 `--all-indexes` [gateway](/system/runtime/components/gateway.md) routes each request to its named index
-([D35 multi-index routing](/system/decisions/d35-multi-index-routing.md)). `node-catalog` lives in its
-own `catalog` profile — `just stack` co-activates `stack`+`catalog`, but the streaming demo
-(`just pipeline`, `stack`+`pipeline`) deliberately excludes it (no seeded `growlerdb.catalog` source
-there), and the gateway resolves indexes lazily rather than hard-depending on it.
+([D35 multi-index routing](/system/decisions/d35-multi-index-routing.md)) and resolves lazily. The pool
+lives in the `pool` profile — `just stack` co-activates `stack`+`pool`, but the streaming demo
+(`just pipeline`, `stack`+`pipeline`) deliberately excludes it (it serves a single windowed
+`telemetry_stream` node instead). The pool self-organizes after the ~30s placement grace, so `just
+stack` waits for the first index to be queryable before reporting ready.
 The [getting-started](/product/interfaces/website.md) **query playground** exercises the `catalog`
 index through the gateway — every Lucene/KQL operator (term, phrase, keyword, set, numeric/float/date
 range, CIDR, wildcard, prefix, fuzzy, boost, bool, `NOT`, match-all, regex) against known rows. With
@@ -63,19 +74,21 @@ parquet (`demo-data/local/movies-300.parquet` — no download, ~1s embed at buil
 default index, so all of that works out of the box. **`just demo-data` upgrades it to the full
 corpus:** a loader one-shot downloads the pre-sliced parquet (a GitHub release asset;
 `DEMO_DATA_URL`/`DEMO_DATA_FILE` overridable, `DEMO_DATA_SIZE` caps rows — default 5000) and writes
-`growlerdb.movies` into Iceberg **first**; then `node-movies` builds + serves the vector-enabled index
+`growlerdb.movies` into Iceberg **first** (before the pool boots — its `--define-only` step blocks
+until each source table resolves); the **pool** then builds + serves the vector-enabled index
 (`movies.yaml` — `plot_vec` embedded locally from a short **synopsis** to keep embedding fast; full
-`plot`/`title` **cached** so agents answer from `search` alone) and registers, so the `--all-indexes`
+`plot`/`title` **cached** so agents answer from `search` alone) on assignment, so the `--all-indexes`
 gateway routes to it and the demo token (allowlist `docs,catalog,movies`) may query it. The slicer
 (`demo-data/build_movies_slice.py`) regenerates the asset.
 
-**Vector indexes cold-rebuild on (re)load.** `node-catalog` and `node-movies` **wipe their index dir
-and rebuild from scratch** on start, and `just stack` / `just demo-data` **force-recreate** them after
-re-seeding their tables. Why: a running `serve` that background-syncs a reloaded source refreshes the
-**lexical** segments but **not** the vector sidecars (sync/reindex re-embed is TASK-326), so on a re-run
-the ANN sidecars would go stale and **semantic hits fail to hydrate** ("row not found") while lexical
-still works. The index dir is a derived, rebuildable store (the authoritative data is Iceberg), so
-wiping it is safe. This is a demo workaround for the engine gap; a durable fix is TASK-326.
+**Vector indexes cold-rebuild on (re)load.** `just demo-data` reloads `growlerdb.movies` to the full
+corpus and then **wipes the pool's local data and recreates the two pool nodes**, so build-on-assignment
+rebuilds all three indexes from source (movies now full). Why not an in-place refresh: a running node
+that background-syncs a reloaded source refreshes the **lexical** segments but **not** the vector
+sidecars (sync/reindex re-embed is TASK-326), so the ANN sidecars would go stale and **semantic hits
+fail to hydrate** ("row not found") while lexical still works. The pool data volumes are a derived,
+rebuildable store (the authoritative data is Iceberg), so wiping them is safe. This is a demo workaround
+for the engine gap; a durable fix is TASK-326.
 
 **Local-embeddings vector demo:** the `catalog` index carries a `body_vec`
 [VECTOR field](/product/functional/search/vector.md) over its `body`, embedded at ingest with the local
@@ -83,8 +96,8 @@ wiping it is safe. This is a demo workaround for the engine gap; a durable fix i
 Search screen's Semantic/Hybrid modes) and the [MCP server](/product/interfaces/mcp-server.md) against
 real data, **keyless** (no API key, no egress). The model is provisioned **once per machine** by a `model-fetch` one-shot into a
 host-bind-mounted `${GROWLERDB_MODEL_DIR:-~/.cache/growlerdb/models}` (idempotent — skipped when already
-present, and shared with local `cargo`/eval runs), mounted on `node` + `node-catalog` (which embed at
-ingest and query time; the gateway does not — [D43](/system/decisions/d43-node-local-query-embedding.md)).
+present, and shared with local `cargo`/eval runs), mounted on both **pool nodes** (which embed at
+build/query time when they hold a VECTOR index; the gateway does not — [D43](/system/decisions/d43-node-local-query-embedding.md)).
 The published image stays lean — the model is **not** baked in. Per [D42](/system/decisions/d42-retrieval-first.md)
 the demo is retrieval-only: it returns governed coordinates + citations and never calls an LLM.
 

@@ -28,28 +28,37 @@ dc --profile seed run --rm --build seed
 
 # ---------------------------------------------------------------------------------------------------
 step 2 6 "GrowlerDB image (pull released, or build your checkout)"
-# control-plane / node / gateway share one image: pull the latest official release once so the stack
-# starts in a pull, not a ~10-minute source build. Falls back to building from your checkout when the
-# image can't be pulled (developing GrowlerDB itself, or GROWLERDB_IMAGE=growlerdb-local:dev).
-dc --profile stack pull -q node || dc build node
+# control-plane / pool nodes / gateway share one image: pull the latest official release once so the
+# stack starts in a pull, not a ~10-minute source build. Falls back to building from your checkout when
+# the image can't be pulled (developing GrowlerDB itself, or GROWLERDB_IMAGE=growlerdb-local:dev).
+dc --profile stack pull -q controlplane || dc build controlplane
 
 # ---------------------------------------------------------------------------------------------------
-step 3 6 "Core services + catalog index"
-dc --profile stack --profile catalog up -d --quiet-pull
-# Force-recreate the VECTOR index node for a clean COLD rebuild against the freshly re-seeded `catalog`
-# table. On a re-run `serve` background-syncs the new snapshot into the LEXICAL segments but not the
-# vector sidecars (TASK-326), so without a rebuild semantic hits go stale ("row not found").
-dc --profile stack --profile catalog up -d --force-recreate node-catalog
-
-# ---------------------------------------------------------------------------------------------------
-step 4 6 "Movies demo index (semantic + hybrid out of the box)"
-# A SMALL 300-row Wikipedia movie-plots slice (CC-BY-SA) from the COMMITTED local parquet — no download,
-# ~1s embed at build — so semantic/hybrid work immediately and the console lands here
-# (GROWLERDB_DEFAULT_INDEX=movies). `just demo-data` upgrades it to the full corpus.
+step 3 6 "Load the demo source tables (movies) before the pool"
+# The HA pool serves docs/catalog/movies — it BUILDS each on assignment, so every source table must
+# exist before the pool boots (its `--define-only` step blocks until each table resolves). `docs` +
+# `catalog` were seeded in step 1; load `movies` (a SMALL 300-row Wikipedia movie-plots slice from the
+# committed parquet — no download) here. `just demo-data` upgrades it to the full corpus.
 DEMO_DATA_SIZE=300 \
-  dc --profile stack --profile demo-data run --rm --build demo-data
-# `--force-recreate`: the run above re-seeds `movies`, so cold-rebuild the node against the current table.
-dc --profile stack --profile demo-data up -d --force-recreate node-movies
+  dc --profile demo-data run --rm --build demo-data
+
+# ---------------------------------------------------------------------------------------------------
+step 4 6 "HA placement pool (docs + catalog + movies at R=2)"
+# Two interchangeable pool nodes with an IDENTICAL config, plus the control plane + gateway. Neither is
+# designated anything: the CP places each index's primary round-robin across the pool and each node
+# BUILDS the indexes it's made primary of from source (build-on-assignment); the other opens them
+# read-through from the shared cold store. So kill either pool node and reads keep answering.
+dc --profile stack --profile pool up -d --quiet-pull
+# Convergence: the pool self-organizes after the control plane's placement grace (one heartbeat TTL,
+# ~30s) — the primaries then build + register and the replicas open read-through. Wait until `docs` is
+# actually queryable through the gateway before declaring ready, so the console isn't hit mid-build.
+printf '    converging (build-on-assignment after the ~30s placement grace)'
+for _ in $(seq 1 40); do
+  if curl -fsS -m 5 http://localhost:8081/v1/search \
+       -H 'content-type: application/json' -d '{"index":"docs","query":"*","limit":1}' 2>/dev/null \
+       | grep -q '"total"'; then printf ' ready\n'; break; fi
+  printf '.'; sleep 3
+done
 
 # ---------------------------------------------------------------------------------------------------
 step 5 6 "Variant index 'events' (Iceberg v3 — Spark-seeded, connector-fed, Trino-hydrated)"
@@ -60,7 +69,7 @@ step 5 6 "Variant index 'events' (Iceberg v3 — Spark-seeded, connector-fed, Tr
 # commands run with the full profile set active so node-events' cross-profile deps resolve.
 ( cd connector && mise exec -- mvn -q -DskipTests package )
 dc --profile trino up -d --quiet-pull trino
-VARIANT_PROFILES=(--profile stack --profile catalog --profile demo-data --profile trino --profile variant)
+VARIANT_PROFILES=(--profile stack --profile pool --profile trino --profile variant)
 dc "${VARIANT_PROFILES[@]}" run --rm seed-events
 dc "${VARIANT_PROFILES[@]}" up -d --force-recreate node-events
 dc "${VARIANT_PROFILES[@]}" run --rm connector-events

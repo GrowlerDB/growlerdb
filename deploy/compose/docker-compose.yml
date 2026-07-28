@@ -28,6 +28,12 @@ x-growlerdb-env: &growlerdb-env
   GROWLERDB_WAREHOUSE: growlerdb
   GROWLERDB_CATALOG_CREDENTIAL: root:s3cr3t
   GROWLERDB_S3_ENDPOINT: http://minio:9000
+  # Static S3 creds for the pool's COLD object store (D53 replica read-through): the placement pool
+  # publishes each hash ordinal's frozen snapshot to GROWLERDB_BACKUP_BUCKET and replicas read it
+  # through. Distinct from Iceberg source reads (Polaris credential-vends those). DEMO values.
+  GROWLERDB_S3_ACCESS_KEY: minioadmin
+  GROWLERDB_S3_SECRET_KEY: minioadmin
+  GROWLERDB_BACKUP_BUCKET: growlerdb-cold
   # Export traces (OTLP/HTTP) to the LGTM collector.
   GROWLERDB_OTLP_ENDPOINT: http://lgtm:4318
   # Built-in authN for the demo: the control-plane mints HS256 session JWTs via
@@ -46,6 +52,25 @@ x-growlerdb-env: &growlerdb-env
   # provisions bge-small-en-v1.5 there once per machine), so ingest embeds the VECTOR field locally —
   # no API key. Gateway/control-plane don't embed and ignore it.
   GROWLERDB_MODEL_DIR: /models
+
+# Shared config for the two interchangeable placement-pool nodes (`pool-a`/`pool-b`): profile, image,
+# env, and the deps every pool node waits on. Only the name/command/ports/volume differ per node.
+x-pool-node: &pool-node
+  profiles: ["pool"]
+  <<: *growlerdb-image
+  entrypoint: ["/bin/sh", "-c"]
+  environment:
+    <<: *growlerdb-env
+  depends_on:
+    polaris:
+      condition: service_started
+    controlplane:
+      condition: service_healthy
+    createbuckets:
+      condition: service_completed_successfully
+    # catalog + movies have VECTOR fields, so build-on-assignment embeds locally — wait for the model.
+    model-fetch:
+      condition: service_completed_successfully
 
 services:
   minio:
@@ -75,6 +100,7 @@ services:
       /bin/sh -c "
       mc alias set local http://minio:9000 minioadmin minioadmin &&
       mc mb -p local/growlerdb-warehouse &&
+      mc mb -p local/growlerdb-cold &&
       echo 'buckets ready'
       "
 
@@ -275,6 +301,10 @@ services:
     command: ["control-plane", "--addr", "0.0.0.0:50071", "--metrics-addr", "0.0.0.0:9101", "--login-secret"]
     environment:
       <<: *growlerdb-env
+      # Replication factor R=2 (D53): 1 primary + 1 read replica per unit, so a pool node loss is a
+      # zero-gap read failover. The leader-only placement sweep distributes primaries round-robin over
+      # the pool and self-heals the replica set — no per-node designation.
+      GROWLERDB_REPLICATION_FACTOR: "2"
       # Demo login: a well-known baked-in credential, scoped to exactly the two demo indexes
       # so per-index RBAC is EXERCISED, not bypassed. Seeded on first boot only.
       #   user `demo` / password `demo`, roles [reader, operator], indexes [docs, catalog,
@@ -303,21 +333,19 @@ services:
       timeout: 3s
       retries: 30
 
-  # Node: build the `docs` index from the seeded Iceberg table, then serve it (gRPC :50051,
-  # REST :8080), health/metrics on :9102. The `just stack` recipe seeds the table first.
-  # `--register` announces the served index to the control-plane registry (at its routable
-  # `--advertise-addr`), so it shows up in the Indexes + Ingestion screens.
+  # Node (STREAMING demo only): the single windowed serve target the pipeline demo uses. `just stack`
+  # serves docs/catalog/movies through the HA placement **pool** (`pool-a`/`pool-b`, below), so this
+  # per-index `serve` node is now scoped to the **`pipeline`** profile, where `pipeline.override.yml`
+  # replaces its command to `serve telemetry_stream` (a windowed streaming index — see that file). Its
+  # base command below is a placeholder, always overridden in the pipeline demo.
   node:
-    profiles: ["stack"]
+    profiles: ["pipeline"]
     <<: *growlerdb-image
     entrypoint: ["/bin/sh", "-c"]
-    # Serves the seeded `docs` table. The streaming demo (`just pipeline`) layers
-    # pipeline.override.yml on top to serve `telemetry_stream` instead — see that file.
     command:
       - >
-        growlerdb index growlerdb.docs --name docs &&
-        growlerdb serve docs --addr 0.0.0.0:50051 --rest-addr 0.0.0.0:8080 --metrics-addr 0.0.0.0:9102
-        --register http://controlplane:50071 --advertise-addr http://node:50051
+        growlerdb serve --help >/dev/null &&
+        echo "node: waiting for pipeline.override.yml to supply the streaming command" && sleep infinity
     environment:
       <<: *growlerdb-env
     depends_on:
@@ -342,54 +370,69 @@ services:
       timeout: 3s
       retries: 60
 
-  # Node (catalog): a SECOND index alongside `docs` — builds the richer `growlerdb.catalog`
-  # table with catalog.yaml and serves+registers it (gRPC :50052, REST :8083, metrics :9104). The
-  # `--all-indexes` gateway routes `{"index":"catalog", ...}` requests here automatically — no gateway
-  # change needed. Demonstrates multi-index routing end to end and backs the getting-started
-  # "query playground". Seed creates the table first (the `just stack` recipe seeds before this profile).
-  # In its OWN `catalog` profile (not `stack`): `just stack` activates both, but the streaming demo
-  # (`just pipeline`, which activates `stack`+`pipeline`) must NOT pull it in — there is no seeded
-  # `growlerdb.catalog` source there, so it could never build and would block the gateway forever.
-  node-catalog:
-    profiles: ["catalog"]
-    <<: *growlerdb-image
-    entrypoint: ["/bin/sh", "-c"]
-    # Wipe the index dir first so this is a clean COLD build — which re-embeds the `body_vec` VECTOR
-    # field. Why it matters: a running `serve` that background-syncs a re-seeded source refreshes the
-    # lexical segments but NOT the vector sidecars (embedding on sync/reindex is TASK-326), so the ANN
-    # sidecars go stale and semantic hits fail to hydrate ("row not found") while lexical still works.
-    # `just stack` force-recreates this service after re-seeding, so the rebuild runs against the
-    # current table. (The /data volume is rebuildable from Iceberg — the authoritative source.)
+  # ---- Placement pool (D52/D53): the demo's HIGH-AVAILABILITY serving tier -------------------------
+  # Two INTERCHANGEABLE pool nodes with an IDENTICAL config serve docs + catalog + movies over the
+  # control plane at R=2 (1 primary + 1 read replica per unit — `GROWLERDB_REPLICATION_FACTOR=2` on the
+  # control plane). Neither node is designated anything: each `--define-only`s the three indexes (writes
+  # index.json, builds nothing), then `serve-pool`s them. The control plane's placement sweep
+  # distributes each index's PRIMARY round-robin across the pool, and the node made primary **builds
+  # that index from its Iceberg source on assignment**; the other node opens it **read-through** from
+  # the shared cold store (MinIO `growlerdb-cold`). So HA is "run two nodes, the CP does the rest" —
+  # kill either pool node and reads keep answering via the survivor (zero-gap read failover). In the
+  # `pool` profile (NOT `stack`) so the streaming demo (`just pipeline`, which activates `stack`) never
+  # pulls it in. Shared YAML for the two nodes; only the name/advertise-addr/ports/volume differ.
+  pool-a:
+    <<: *pool-node
+    # `--define-only` writes each index.json (schema only, no shards). `until` retries it until the
+    # source table exists — `growlerdb.movies` is loaded by the `demo-data` one-shot, which can land
+    # after this boots — so the pool tolerates any seed order. `serve-pool` then registers all three;
+    # the CP places primaries round-robin and build-on-assignment fills the ordinals this node is made
+    # primary of, retrying until each table has data.
     command:
       - >
-        rm -rf /data/* 2>/dev/null;
-        growlerdb index growlerdb.catalog --def /catalog.yaml --name catalog &&
-        growlerdb serve catalog --addr 0.0.0.0:50052 --rest-addr 0.0.0.0:8083 --metrics-addr 0.0.0.0:9104
-        --register http://controlplane:50071 --advertise-addr http://node-catalog:50052
-    environment:
-      <<: *growlerdb-env
-    depends_on:
-      polaris:
-        condition: service_started
-      controlplane:
-        condition: service_healthy
-      # The `catalog` index has a `body_vec` VECTOR field, so its build embeds `body` locally — wait
-      # for the model to be provisioned before building.
-      model-fetch:
-        condition: service_completed_successfully
+        until growlerdb index growlerdb.docs --name docs --define-only; do echo "pool-a: waiting for growlerdb.docs..."; sleep 3; done &&
+        until growlerdb index growlerdb.catalog --def /catalog.yaml --name catalog --define-only; do echo "pool-a: waiting for growlerdb.catalog..."; sleep 3; done &&
+        until growlerdb index growlerdb.movies --def /movies.yaml --name movies --define-only; do echo "pool-a: waiting for growlerdb.movies..."; sleep 3; done &&
+        growlerdb serve-pool --index docs --index catalog --index movies
+        --addr 0.0.0.0:50051 --metrics-addr 0.0.0.0:9102
+        --register http://controlplane:50071 --advertise-addr http://pool-a:50051
+    ports:
+      - "50051:50051"
+      - "9102:9102"
+    volumes:
+      - pool-a-data:/data
+      - ./catalog.yaml:/catalog.yaml:ro
+      - ./movies.yaml:/movies.yaml:ro
+      - ${MODEL_HOST_DIR:-./model-cache}:/models
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9102/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 90
+
+  pool-b:
+    <<: *pool-node
+    command:
+      - >
+        until growlerdb index growlerdb.docs --name docs --define-only; do echo "pool-b: waiting for growlerdb.docs..."; sleep 3; done &&
+        until growlerdb index growlerdb.catalog --def /catalog.yaml --name catalog --define-only; do echo "pool-b: waiting for growlerdb.catalog..."; sleep 3; done &&
+        until growlerdb index growlerdb.movies --def /movies.yaml --name movies --define-only; do echo "pool-b: waiting for growlerdb.movies..."; sleep 3; done &&
+        growlerdb serve-pool --index docs --index catalog --index movies
+        --addr 0.0.0.0:50052 --metrics-addr 0.0.0.0:9104
+        --register http://controlplane:50071 --advertise-addr http://pool-b:50052
     ports:
       - "50052:50052"
       - "9104:9104"
     volumes:
-      - node-catalog-data:/data
+      - pool-b-data:/data
       - ./catalog.yaml:/catalog.yaml:ro
-      # The local embedding model (bge-small-en-v1.5) at /models; GROWLERDB_MODEL_DIR points here.
+      - ./movies.yaml:/movies.yaml:ro
       - ${MODEL_HOST_DIR:-./model-cache}:/models
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9104/readyz"]
       interval: 5s
       timeout: 3s
-      retries: 60
+      retries: 90
 
   # ---- Opt-in demo corpus (profile `demo-data`, run via `just demo-data`) ----------
   # A slice of Wikipedia movie plots (CC-BY-SA-4.0): the loader writes the parquet into Iceberg
@@ -420,47 +463,9 @@ services:
     volumes:
       - ./demo-data/local:/local
 
-  # Builds + serves the `movies` index (VECTOR plot_vec — embeds locally at build, so it
-  # waits on model-fetch like node-catalog). Registers with the control plane; the
-  # `--all-indexes` gateway then routes `{"index":"movies"}` requests here automatically.
-  node-movies:
-    profiles: ["demo-data"]
-    <<: *growlerdb-image
-    entrypoint: ["/bin/sh", "-c"]
-    # Wipe the index dir first so this is a clean COLD build — which re-embeds the `plot_vec` VECTOR
-    # field. A running `serve` that background-syncs a reloaded source refreshes the lexical segments
-    # but NOT the vector sidecars (sync/reindex re-embed is TASK-326), so without this the ANN sidecars
-    # go stale after a reload and semantic hits fail to hydrate ("row not found") while lexical works.
-    # `just stack` / `just demo-data` force-recreate this service after (re)loading `movies`, so the
-    # rebuild runs against the current table. (/data is rebuildable from Iceberg — the source of truth.)
-    command:
-      - >
-        rm -rf /data/* 2>/dev/null;
-        growlerdb index growlerdb.movies --def /movies.yaml --name movies &&
-        growlerdb serve movies --addr 0.0.0.0:50053 --rest-addr 0.0.0.0:8084 --metrics-addr 0.0.0.0:9106
-        --register http://controlplane:50071 --advertise-addr http://node-movies:50053
-    environment:
-      <<: *growlerdb-env
-    depends_on:
-      polaris:
-        condition: service_started
-      controlplane:
-        condition: service_healthy
-      model-fetch:
-        condition: service_completed_successfully
-    ports:
-      - "50053:50053"
-      - "9106:9106"
-    volumes:
-      - node-movies-data:/data
-      - ./movies.yaml:/movies.yaml:ro
-      # The local embedding model (bge-small-en-v1.5) at /models; GROWLERDB_MODEL_DIR points here.
-      - ${MODEL_HOST_DIR:-./model-cache}:/models
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9106/readyz"]
-      interval: 5s
-      timeout: 3s
-      retries: 60
+  # (The `movies` index is served by the HA placement pool above — `pool-a`/`pool-b` build it on
+  # assignment from `growlerdb.movies`, which the `demo-data` one-shot loads. There is no separate
+  # per-index movies node any more; it's just another index the CP places across the pool.)
 
   # Gateway: the public Engine API (gRPC :50061 + REST :8080→host 8081), fronting the node.
   # health/metrics on :9103. This is the address clients hit.
@@ -500,13 +505,11 @@ services:
       # streaming demo, which never loads it), so this is safe to set unconditionally.
       GROWLERDB_DEFAULT_INDEX: movies
     depends_on:
-      node:
-        condition: service_healthy
-      # NOTE: no hard dependency on `node-catalog` — the `--all-indexes` gateway resolves each index
-      # lazily from the control plane and hot-reloads per index, so `catalog` becomes queryable as
-      # soon as node-catalog registers (a second or two after bring-up). A hard `depends_on` here
-      # would also drag node-catalog into the streaming demo (`depends_on` ignores profiles), where
-      # it has no source table and would block the gateway — see node-catalog's `catalog` profile.
+      # No hard dependency on the pool nodes — the `--all-indexes` gateway resolves each index lazily
+      # from the control plane and hot-reloads per index, so docs/catalog/movies become queryable as
+      # the pool builds + registers them (a moment after bring-up). A hard `depends_on` on a pool node
+      # would also drag it into the streaming demo (`depends_on` ignores profiles), where the pool is
+      # not active. So the gateway depends only on the control plane and resolves everything live.
       controlplane:
         condition: service_healthy
     ports:
@@ -643,6 +646,11 @@ services:
       - id
       - --fields
       - id,ts,device_id,site,subsystem,metric,status,reading,message
+      # `telemetry_stream` is PARTITION-routed on `site` (see pipeline/telemetry-stream.yaml);
+      # the connector needs the partition field(s) to build composite keys and to match the
+      # registry's routing strategy (a bare invocation derives HASH and is rejected).
+      - --partition
+      - site
       - --node
       - node:50051
       - --control-plane
@@ -842,8 +850,8 @@ volumes:
   minio-data:
   cp-data:
   node-data:
-  node-catalog-data:
-  node-movies-data:
+  pool-a-data:
+  pool-b-data:
   node-events-data:
   polaris-db:
   spark-ivy:
