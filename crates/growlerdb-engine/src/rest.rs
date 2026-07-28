@@ -338,8 +338,8 @@ async fn list_indexes_handler(
 }
 
 /// Scale-limit license status for the console settings page (proxied to the control plane). The
-/// `*_nodes` fields keep their names but the accounting is **primary-held units** (D53) — replicas
-/// are free.
+/// `*_nodes` fields are literal (D38 Option A): they count distinct **primary-holding nodes** —
+/// replicas are free.
 #[derive(serde::Serialize)]
 struct LicenseDto {
     licensed: bool,
