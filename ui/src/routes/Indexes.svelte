@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { get } from 'svelte/store';
-  import { isAdmin } from '../lib/identity';
+  import { canAdminister } from '../lib/identity';
   import { t } from '../lib/i18n';
   import {
     listIndexes,
@@ -97,9 +97,9 @@
       now = Date.now();
       // Backup column: last-backup status per index (best-effort — a node without a
       // backup target reports `configured: false`, rendered as "Off"). `BackupStatus` is Admin-scoped,
-      // so only fetch it for an admin session; a reader/operator would get a 403 per index (console
-      // spam) — the column renders "Off" for them.
-      backupMap = get(isAdmin)
+      // so only fetch it where the caller could be authorized (open mode or an admin session); a
+      // closed-mode reader/operator would get a 403 per index (console spam) — they see "Off".
+      backupMap = get(canAdminister)
         ? Object.fromEntries(
             await Promise.all(
               indexes.map(async (ix): Promise<[string, BackupStatus]> => {

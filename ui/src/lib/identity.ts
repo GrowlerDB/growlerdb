@@ -7,12 +7,21 @@ import { me as fetchMe, type Me } from './api';
 export const identity = writable<Me | null>(null);
 
 /** Roles that grant the server's `admin` scope (mirrors rbac.rs: admin + the index-admin/service
- * aliases). Admin-scoped reads/actions — backup status, backup, compact, reindex — are gated to these
- * in the UI so a `reader`/`operator` session doesn't fire calls the gateway answers 403. */
+ * aliases). */
 const ADMIN_ROLES = new Set(['admin', 'index-admin', 'service']);
 
 /** Whether the signed-in user holds a role granting the Admin scope. */
 export const isAdmin = derived(identity, ($id) => !!$id?.roles?.some((r) => ADMIN_ROLES.has(r)));
+
+/** Whether the UI should surface Admin-scoped reads/actions (backup status, backup, compact, …).
+ * True in **open mode** — an unauthenticated identity means the gateway isn't enforcing RBAC, so
+ * everything is permitted — or when a signed-in user holds an admin-granting role. This keeps a
+ * closed-mode `reader`/`operator` session from firing calls the gateway answers 403, without hiding
+ * the controls on an open (or admin) deployment. */
+export const canAdminister = derived(
+  identity,
+  ($id) => !$id?.authenticated || !!$id?.roles?.some((r) => ADMIN_ROLES.has(r)),
+);
 
 /** (Re)load `/v1/me` into the store. Never throws — a failure resolves to `null` (anonymous). */
 export async function refreshIdentity(): Promise<void> {
