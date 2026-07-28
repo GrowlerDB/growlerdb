@@ -13,6 +13,7 @@ How GrowlerDB is implemented — the "how" behind the [product](/product/index.m
 * [Runtime](/system/runtime/) - the running components and their dependencies
 * [Storage](/system/storage/) - the index store, data model, cold bundles, backup format, catalog metadata
 * [Distribution](/system/distribution.md) - sharding, bucket routing, scatter-gather, elasticity
+* [High availability](/system/high-availability.md) - the design for no-SPOF, graceful-failover HA: replicated control plane + a placement pool of interchangeable, multi-index, replicated nodes
 * [Query execution](/system/query-execution.md) - planning, pruning, PIT, cursors, cost guards
 * [Observability](/system/observability.md) - OpenTelemetry instrumentation and SLIs
 

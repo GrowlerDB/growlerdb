@@ -6,6 +6,83 @@ All notable changes to GrowlerDB are documented here. The format is based on
 
 ## [Unreleased]
 
+The **true high-availability** release — HA reaches every index type, not just windowed streams. The
+control plane runs as replicas, and serving moves to a self-organizing **placement pool** of
+interchangeable nodes where each index's units are replicated, so losing a node is a zero-gap read
+failover. You point N identical nodes at the pool and the control plane does the placement; there is
+no per-node designation.
+
+**Upgrading:** no index rebuild and no data loss — the on-disk index format is unchanged, embedded
+control-plane state (index defs, tokens, RBAC) survives an in-place upgrade, and the replicated
+control plane, placement pool, and replication are all **opt-in** (defaults are unchanged). Two
+things need attention: (1) upgrade the control plane, serving nodes, and the Spark connector
+**together** — one RPC was generalized (below), so old↔new across that boundary won't talk; and
+(2) the free-tier scale limit now counts **units, not processes** and is now enforced at registration
+— re-check the console's Enterprise-license panel (below). Compose users adopt the new topology.
+
+### Added
+
+- **Replicated control plane (D51).** The control plane can run as **N stateless replicas over an
+  externalized Postgres registry** with leader/standby failover, so the cluster's registry is no
+  longer a single point of failure. It stays an **optional deployment mode** — the default remains
+  the embedded single-node file backend (no new hard dependency); Helm gains a `controlPlane` HA
+  deploy mode (N replicas + PodDisruptionBudget). (ADR [D51](okf/system/decisions/d51-controlplane-ha.md))
+- **Self-organizing placement pool (D52).** Interchangeable **`serve-pool`** nodes serve CP-assigned
+  units from many indexes over a single endpoint. The control plane's placement sweep distributes
+  each index's **primaries round-robin** across the pool (least-loaded, liveness-grace-aware), and a
+  node assigned a primary it doesn't hold **builds that index from its Iceberg source on assignment**
+  (build-on-assignment). HA becomes "run N identical nodes"; no per-node build/primary designation,
+  and the classic per-index `serve` remains supported. (ADR [D52](okf/system/decisions/d52-placement-pool.md))
+- **Per-unit replication + read failover (D53).** A cluster-wide **replication factor R** places
+  R holders per unit (one primary + R−1 read replicas); the gateway **fails reads over** to a live
+  replica when a holder is down, replicas serve **read-through from the shared cold store** (object
+  storage), and the pool **self-heals** — primaries publish hot snapshots on a loop and the control
+  plane tops up replicas after the liveness grace. Node-side **primary fencing** refuses
+  writes/checkpoints on non-primary units. Verified with a zero-gap failover chaos drill. (ADR
+  [D53](okf/system/decisions/d53-unit-replication.md))
+- **The demo runs on HA.** `just stack` now serves `docs` + `catalog` + `movies` on a **two-node
+  placement pool at `GROWLERDB_REPLICATION_FACTOR=2`**, shaped like a production deploy — stop either
+  pool node and reads keep answering via the survivor.
+
+### Changed
+
+- **The free-tier scale limit now counts units, not node processes — and is enforced at
+  registration.** The AGPL free tier (3) now counts distinct live **`(index, primary node)`** units
+  rather than node processes, and `RegisterServedIndex` **enforces** the cap (it was previously
+  fail-open). A deploy that registered past the limit before can now be refused with
+  `RESOURCE_EXHAUSTED`; conversely, read replicas and additional windows on an already-counted index
+  are **free**. **Migration:** after upgrading, confirm your served-index count against the new
+  metric in the console's **Settings → Enterprise license** panel. (ADR [D38](okf/system/decisions/d38-scale-limit-entitlement.md))
+- **Coordinated upgrade required across the control-plane wire.** All gRPC changes are additive
+  **except** the `ResolveWindowOwner`→`ResolveUnitOwner` generalization (see Removed). **Migration:**
+  upgrade the control plane, serving nodes, and the Spark connector in one step — a mixed old/new
+  cluster across that RPC returns `UNIMPLEMENTED`.
+- **The connector now requires `--partition <fields>` for a partition/window-routed index.** With
+  hash routing added, the connector cross-checks its routing against the registry: for a
+  PARTITION-routed index it needs the partition field(s) both to build composite keys and to match
+  the index definition, and a bare invocation (no `--partition`) now derives HASH and aborts with
+  *"routing strategy mismatch"*. **Migration:** pass `--partition <fields>` matching the index's
+  `partition_fields` (e.g. `--partition site` for the streaming demo's `telemetry_stream`).
+- **Compose stack rebuilt around the pool.** The demo now brings up `pool-a`/`pool-b` (`serve-pool`)
+  instead of per-index node services, and adds required env for replica serving:
+  `GROWLERDB_REPLICATION_FACTOR`, `GROWLERDB_BACKUP_BUCKET` (a new `growlerdb-cold` MinIO bucket), and
+  `GROWLERDB_S3_ACCESS_KEY`/`GROWLERDB_S3_SECRET_KEY`. **Migration:** adopt the new
+  `deploy/compose` files; a `serve-pool` node with no cold store logs "replica failover disabled" and
+  the control plane won't place replicas on it.
+- **Helm chart → 0.3.0.** Enabling the external-Postgres registry boots an **empty** registry (no
+  automated migration) and changes the control-plane Service type. **Migration:** adopt the HA mode
+  on a fresh install and let nodes re-register / re-create indexes + tokens, rather than toggling it
+  in place.
+
+### Removed
+
+- **`ResolveWindowOwner` RPC** (and its request/response messages) — generalized to the unit-general
+  **`ResolveUnitOwner`** (`window` moved under a `oneof unit`). Old and new are not wire-compatible;
+  see the coordinated-upgrade note above. (ADR [D52](okf/system/decisions/d52-placement-pool.md))
+- **`node-catalog` / `node-movies` compose services** (and their `node-catalog-data` /
+  `node-movies-data` volumes) — replaced by the `pool-a`/`pool-b` placement pool; the `node` service
+  is now used only by the streaming `pipeline` profile.
+
 ## [0.6.0] - 2026-07-25
 
 The **Iceberg v3 variant** release — GrowlerDB reaches inside semi-structured `variant` columns and

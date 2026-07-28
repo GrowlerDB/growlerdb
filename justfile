@@ -18,6 +18,21 @@ build:
 test:
     cargo test --workspace
 
+# The env-gated Postgres registry tests (control-plane HA, D51: leader lock / standby reload /
+# promotion) against a throwaway dockerized Postgres — the local mirror of CI's postgres:16
+# service container in build-test. Without GROWLERDB_TEST_POSTGRES_URL these tests skip, so a
+# plain `just test` never runs them.
+test-postgres:
+    #!/usr/bin/env sh
+    set -eu
+    docker rm -f growlerdb-test-postgres >/dev/null 2>&1 || true
+    docker run -d --name growlerdb-test-postgres -e POSTGRES_PASSWORD=postgres \
+      -p 55432:5432 postgres:16 >/dev/null
+    trap 'docker rm -f growlerdb-test-postgres >/dev/null' EXIT
+    until docker exec growlerdb-test-postgres pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
+    GROWLERDB_TEST_POSTGRES_URL=postgres://postgres:postgres@127.0.0.1:55432/postgres \
+      cargo test -p growlerdb-controlplane --features postgres
+
 fmt:
     cargo fmt --all
 
@@ -44,8 +59,8 @@ okf-check:
 # every lint gate: Rust clippy + the non-Rust linters
 lint-all: lint lint-extra
 
-# everything CI runs (Rust + UI)
-check: fmt-check lint test ui-check
+# everything CI runs (Rust + non-Rust lint gates + UI)
+check: fmt-check lint-all test ui-check
 
 # Keep `target/` bounded the predictable way: if it exceeds CAP_GB (default 5), do a full
 # `cargo clean`; otherwise leave it. Cargo never garbage-collects target/, and there is no SAFE
@@ -101,7 +116,7 @@ up:
 # Build the GrowlerDB container image once (lean `dist` profile, cached). Reused by stack/pipeline,
 # so the heavy Rust build happens once — `up` below reuses it. Re-run this after changing Rust code.
 build-image:
-    docker compose -f deploy/compose/docker-compose.yml build node
+    docker compose -f deploy/compose/docker-compose.yml build controlplane
 
 # Safe UI-only reload: rebuild the image and hot-swap ONLY the gateway (which serves the SPA via
 # `--ui-dir`). `--no-deps` means it never recreates `node` or bounces Polaris — recreating the node
@@ -109,7 +124,7 @@ build-image:
 # source table and orphan the persisted index (stale keys → hydration "row not found").
 # Use this after editing UI code instead of a blanket `up`.
 ui-reload:
-    docker compose -f deploy/compose/docker-compose.yml build node
+    docker compose -f deploy/compose/docker-compose.yml build controlplane
     docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/pipeline.override.yml \
       --profile stack --profile pipeline up -d --no-deps --force-recreate gateway
 
@@ -180,18 +195,19 @@ mcp-connect:
 # be up first (`just stack`); the index build embeds plot synopses locally with ONNX BGE
 # (~500 docs/s in-container; 5000 films ≈ ~45s including build + serve).
 demo-data:
-    # `--profile stack` rides along on every invocation: node-movies depends on control-plane +
-    # model-fetch (stack profile), and compose validates depends_on across the ACTIVE profile set.
-    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data build demo-data
-    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data run --rm demo-data
-    # `--force-recreate`: this reloads `movies` to the full corpus, so cold-rebuild the node against the
-    # new table — a plain restart-less `serve` sync refreshes lexical but not the vector sidecars
-    # (TASK-326), leaving semantic hits stale. See the node-movies command note.
-    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data up -d --force-recreate node-movies
+    docker compose -f deploy/compose/docker-compose.yml --profile demo-data build demo-data
+    docker compose -f deploy/compose/docker-compose.yml --profile demo-data run --rm demo-data
+    # Reloading the `movies` TABLE to the full corpus doesn't itself rebuild the pool's movies index
+    # (the pool built it from the previous table). Wipe the pool's local data + recreate the two nodes
+    # so build-on-assignment rebuilds all three indexes from source — `movies` now the full corpus. The
+    # pool data volumes are rebuildable from Iceberg, so this is a clean cold rebuild, not data loss.
+    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile pool rm -sf pool-a pool-b
+    docker volume rm -f growlerdb-dev_pool-a-data growlerdb-dev_pool-b-data 2>/dev/null || true
+    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile pool up -d pool-a pool-b
     @echo ""
-    @echo "movies index building (local embedding; watch with:"
-    @echo "  docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data logs -f node-movies)"
-    @echo "Then search it — console index selector 'movies', or ask your MCP-connected agent."
+    @echo "pool rebuilding all indexes (movies now the full corpus; ~30s placement grace + build):"
+    @echo "  docker compose -f deploy/compose/docker-compose.yml --profile pool logs -f pool-a pool-b"
+    @echo "Then search 'movies' — console index selector, or ask your MCP-connected agent."
 
 # bring up Trino to explore the Iceberg source with SQL and compare with GrowlerDB
 # Then: `docker compose -f deploy/compose/docker-compose.yml exec trino trino`
@@ -201,7 +217,7 @@ trino:
 
 # tear the full stack (and volumes) down
 stack-down:
-    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile catalog --profile seed --profile trino --profile variant down -v
+    docker compose -f deploy/compose/docker-compose.yml --profile stack --profile pool --profile demo-data --profile seed --profile trino --profile variant down -v
 
 # chaos drill: crash a core service on the running stack, assert it self-heals.
 # SERVICE defaults to `node`; e.g. `just chaos gateway`. Requires `just stack` up first.

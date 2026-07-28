@@ -83,6 +83,24 @@ jobs:
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_CACHE_SIZE: "12G"
+      # Points the env-gated Postgres registry tests (control-plane HA, D51) at the service
+      # container below; without it those tests skip silently. `just test-postgres` is the local
+      # mirror (throwaway dockerized Postgres).
+      GROWLERDB_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
+    # Throwaway Postgres for the HA registry backend tests (leader lock / standby reload /
+    # promotion) — the only real database the workspace tests need.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Installs protoc + node (and, where it works, rust) per mise.toml.
@@ -119,6 +137,12 @@ jobs:
         run: cargo test --workspace --locked --no-run
       - name: Test
         run: cargo test --workspace --locked
+      # The externalized-registry backend is behind the off-by-default `postgres` feature, so the
+      # workspace run above never compiles it. Run it here against the service container — this is
+      # the lane that actually exercises `postgres_backend_ha_lifecycle` (GROWLERDB_TEST_POSTGRES_URL
+      # is set job-wide; unset, the test would skip and this step would green-wash).
+      - name: Test (Postgres HA registry backend)
+        run: cargo test -p growlerdb-controlplane --features postgres --locked
       - name: sccache stats
         if: always()
         run: sccache --show-stats || true

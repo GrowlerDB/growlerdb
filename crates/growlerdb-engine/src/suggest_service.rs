@@ -217,6 +217,7 @@ mod tests {
         let svc = service(tmp.path());
         let resp = svc
             .suggest(Request::new(SuggestRequest {
+                shard: 0,
                 field: "city".into(),
                 text: "ber".into(),
                 limit: 10,
@@ -241,6 +242,7 @@ mod tests {
         // "bostom" → boston (distance 1); excludes the input; berlin/bern are farther.
         let resp = svc
             .suggest(Request::new(SuggestRequest {
+                shard: 0,
                 field: "city".into(),
                 text: "bostom".into(),
                 limit: 10,
@@ -260,6 +262,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let svc = service(tmp.path());
         let req = |field: &str, text: &str| SuggestRequest {
+            shard: 0,
             field: field.into(),
             text: text.into(),
             limit: 0,

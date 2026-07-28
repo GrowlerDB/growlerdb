@@ -1,6 +1,9 @@
 package io.growlerdb.connector;
 
+import io.growlerdb.proto.v1.GetIndexResponse;
+import io.growlerdb.proto.v1.ShardStatus;
 import io.growlerdb.proto.v1.WindowingConfig;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
@@ -85,6 +88,12 @@ public final class ConnectorApp {
 
     // Target one Node (`--node host:port`) or a sharded cluster (`--nodes h1:p1,h2:p2,…`).
     List<String> nodes = csv(opts.getOrDefault("nodes", opts.getOrDefault("node", "127.0.0.1:50051")));
+    // Did the operator pin endpoints explicitly? If not, a hash index with `--control-plane` sources
+    // each shard's owning node from the registry (below) instead of this default.
+    boolean explicitNodes = opts.containsKey("nodes") || opts.containsKey("node");
+    // Tag every sharded sub-batch with the index, so a pool node serving many indexes can dispatch it
+    // by `(index, shard)`; empty (no `--index`) ⇒ the node's sole served index ignores it.
+    String indexTag = opts.getOrDefault("index", "");
 
     // Routing source of truth: when a `--control-plane host:port` (+ `--index`) is given, fetch the
     // shard count and strategy from the registry — the same source the Gateway reads — and fail fast
@@ -96,10 +105,13 @@ public final class ConnectorApp {
     // `fnv % shards`.
     int[] bucketOwners = null;
     // Windowed index: when the registry reports windowing, the connector routes each row to its time
-    // window's owning node (resolved live from the control plane) rather than by key-hash, so it keeps
-    // a long-lived CP client for the run instead of closing it after GetIndex.
+    // window's owning node (resolved live from the control plane) rather than by key-hash.
     WindowingConfig windowing = null;
-    ControlPlaneClient windowedCp = null;
+    // The long-lived CP client — kept open for the whole run whenever placement is CP-driven
+    // (windowed per-window resolution, or a hash index whose shard→node map came from the registry),
+    // so a stream restart can RE-resolve placement instead of pinning the startup snapshot for the
+    // process lifetime. Null when placement is static (`--nodes`/no `--control-plane`).
+    ControlPlaneClient placementCp = null;
     String controlPlane = opts.getOrDefault("control-plane", "");
     if (!controlPlane.isEmpty()) {
       String index = require(opts, "index");
@@ -113,20 +125,35 @@ public final class ConnectorApp {
         var entry = cp.getIndex(index);
         if (entry.hasWindowing()) {
           windowing = entry.getWindowing();
-          windowedCp = cp;
+          placementCp = cp;
           keepCp = true;
           routing = ShardRouter.Strategy.HASH; // unused for windowed (routes by window, not key)
           System.out.printf(
               "windowed index %s: window field=%s granularity=%s%n",
               index, windowing.getField(), windowing.getGranularity());
         } else {
-          routing = resolveRouting(entry.getShardCount(), strategyOf(entry.getRouting()), nodes.size(), partition);
           if (entry.getBucketOwnersCount() > 0) {
             bucketOwners = entry.getBucketOwnersList().stream().mapToInt(Integer::intValue).toArray();
           }
+          // CP-driven placement: unless the operator pinned endpoints with `--nodes`, source each
+          // shard's owning node from the registry's shard map — the same placement the Gateway reads
+          // for routing — so writes follow the control plane instead of static config and can't drift
+          // from where reads look. A per-index sharded Node's ordinal is pinned, so its live owner
+          // comes from the shard map (re-read from the CP on every stream restart — see the writer
+          // factory below), not a least-loaded re-placement.
+          if (!explicitNodes) {
+            nodes = shardEndpointsFromCp(entry);
+            placementCp = cp;
+            keepCp = true;
+          }
+          routing = resolveRouting(entry.getShardCount(), strategyOf(entry.getRouting()), nodes.size(), partition);
           System.out.printf(
-              "routing from registry: index=%s shards=%d strategy=%s buckets=%s%n",
-              index, entry.getShardCount(), routing, bucketOwners != null ? "yes" : "no");
+              "routing from registry: index=%s shards=%d strategy=%s buckets=%s endpoints=%s%n",
+              index,
+              entry.getShardCount(),
+              routing,
+              bucketOwners != null ? "yes" : "no",
+              explicitNodes ? "static" : "control-plane");
         }
       } finally {
         if (!keepCp) {
@@ -191,60 +218,149 @@ public final class ConnectorApp {
             .getOrCreate();
 
     SnapshotLineage lineage = SnapshotLineage.forTable(spark, catalog + "." + table);
-    final ControlPlaneClient cpToClose = windowedCp;
-    try (BatchWriter client =
-        windowing != null
-            ? new WindowedWriteClient(require(opts, "index"), windowedCp, windowing, lineage)
-            : owned != null
-                ? new ShardGroupWriteClient(nodes, router, lineage, owned)
-                : writerFor(nodes, routing, bucketOwners, lineage)) {
-      // Resume exactly-once: unless an explicit --start override is given, pick up
-      // from the checkpoint the Node has durably committed. null = the shard is
-      // empty, so read the changelog from the beginning.
-      Long resumeFrom = (start != null) ? start : client.checkpointSnapshotId();
-      System.out.printf(
-          "resuming from %s%n", resumeFrom == null ? "the start (no checkpoint)" : resumeFrom);
-      if (stream) {
-        // A write that exhausts its retry budget (e.g. ALL Node pods mid-roll, dialing stale IPs)
-        // fails the micro-batch → the streaming query fails. Restart it IN-PROCESS — resuming from
-        // the Node's durable checkpoint (exactly-once rests there, not on Spark's offset) — rather
-        // than letting awaitTermination() throw → JVM exit(1) → CrashLoopBackOff. So a full node roll
-        // drains lag and recovers with the connector staying up (RESTARTS flat).
-        int restarts = 0;
-        while (true) {
-          try {
-            runStream(spark, job, client, resumeFrom).awaitTermination();
-            break; // graceful stop (SIGTERM) — the query completed, exit the loop
-          } catch (StreamingQueryException e) {
-            restarts++;
-            ConnectorMetrics.recordStreamRestart(); // survives log rotation
-            System.err.printf(
-                "connector: stream failed (%s); restart #%d in %ds — resuming from the Node checkpoint%n",
-                e.getMessage(), restarts, STREAM_RESTART_BACKOFF_SECS);
-            Thread.sleep(STREAM_RESTART_BACKOFF_SECS * 1000L);
+    // The writer FACTORY, not a writer: every stream restart re-invokes it, so a CP-driven run
+    // re-resolves the CURRENT shard→node placement each time instead of pinning the startup
+    // snapshot. Without this, a CP re-placement leaves restarts hammering the deposed endpoint
+    // forever (ingest halts) — or worse, silently committing to an alive-but-deposed node reads no
+    // longer look at. Static (--nodes / no --control-plane) placement rebuilds to the same
+    // endpoints — just fresh channels.
+    final ControlPlaneClient cp = placementCp;
+    final WindowingConfig windowCfg = windowing;
+    final List<String> staticNodes = nodes;
+    final ShardRouter.Strategy strategy = routing;
+    final int[] buckets = bucketOwners;
+    final ShardRouter groupRouter = router;
+    final java.util.SortedSet<Integer> ownedShards = owned;
+    java.util.function.Supplier<BatchWriter> writerFactory;
+    if (windowCfg != null) {
+      // A fresh windowed writer also starts with an EMPTY window→owner cache — the in-write
+      // invalidation (WindowedWriteClient) already heals a single stale window in place.
+      writerFactory = () -> new WindowedWriteClient(indexTag, cp, windowCfg, lineage);
+    } else if (cp != null) {
+      writerFactory =
+          cpResolvedWriterFactory(cp, indexTag, strategy, buckets, lineage, groupRouter, ownedShards);
+    } else {
+      writerFactory =
+          () ->
+              ownedShards != null
+                  ? new ShardGroupWriteClient(staticNodes, groupRouter, lineage, ownedShards, indexTag)
+                  : writerFor(staticNodes, strategy, buckets, lineage, indexTag);
+    }
+
+    try {
+      // Manual writer lifecycle (not try-with-resources): the restart loop below REPLACES the
+      // writer after a re-resolution, so the variable can't be a resource binding — the inner
+      // finally closes whichever writer is CURRENT when the run ends.
+      BatchWriter client = writerFactory.get();
+      try {
+        // Resume exactly-once: unless an explicit --start override is given, pick up
+        // from the checkpoint the Node has durably committed. null = the shard is
+        // empty, so read the changelog from the beginning.
+        Long resumeFrom = (start != null) ? start : client.checkpointSnapshotId();
+        System.out.printf(
+            "resuming from %s%n", resumeFrom == null ? "the start (no checkpoint)" : resumeFrom);
+        if (stream) {
+          // A write that exhausts its retry budget (e.g. ALL Node pods mid-roll, dialing stale IPs)
+          // fails the micro-batch → the streaming query fails. Restart it IN-PROCESS — resuming from
+          // the Node's durable checkpoint (exactly-once rests there, not on Spark's offset) — rather
+          // than letting awaitTermination() throw → JVM exit(1) → CrashLoopBackOff. So a full node roll
+          // drains lag and recovers with the connector staying up (RESTARTS flat).
+          int restarts = 0;
+          while (true) {
             try {
-              resumeFrom = client.checkpointSnapshotId(); // latest committed; retries the Node
-            } catch (RuntimeException stillDown) {
-              // Nodes still unreachable — keep the last resume; the changelog replay is idempotent
-              // (the Node dedups by committed checkpoint), so re-reading from it is a safe no-op.
+              runStream(spark, job, client, resumeFrom).awaitTermination();
+              break; // graceful stop (SIGTERM) — the query completed, exit the loop
+            } catch (StreamingQueryException e) {
+              restarts++;
+              ConnectorMetrics.recordStreamRestart(); // survives log rotation
+              System.err.printf(
+                  "connector: stream failed (%s); restart #%d in %ds — resuming from the Node checkpoint%n",
+                  e.getMessage(), restarts, STREAM_RESTART_BACKOFF_SECS);
+              Thread.sleep(STREAM_RESTART_BACKOFF_SECS * 1000L);
+              // Re-resolve placement BEFORE resuming: the failure may be a CP re-placement (the old
+              // primary deposed or dead), and only a rebuilt writer follows the move. Exactly-once is
+              // preserved: the new writer re-reads its resume point from the Nodes' durable
+              // checkpoints below, and idempotent batch ids dedup any boundary replay.
+              client = rebuildWriter(client, writerFactory);
+              try {
+                resumeFrom = client.checkpointSnapshotId(); // latest committed; retries the Node
+              } catch (RuntimeException stillDown) {
+                // Nodes still unreachable — keep the last resume; the changelog replay is idempotent
+                // (the Node dedups by committed checkpoint), so re-reading from it is a safe no-op.
+              }
             }
           }
-        }
-      } else {
-        ConnectorJob.Result r = job.runOnce(spark, resumeFrom, client);
-        if (r.wrote) {
-          System.out.printf(
-              "committed %d op(s) → index snapshot %d; checkpoint=%d%n",
-              r.opCount, r.committedSnapshot, r.checkpointSnapshotId);
         } else {
-          System.out.println("nothing to commit (table unborn or already caught up)");
+          ConnectorJob.Result r = job.runOnce(spark, resumeFrom, client);
+          if (r.wrote) {
+            System.out.printf(
+                "committed %d op(s) → index snapshot %d; checkpoint=%d%n",
+                r.opCount, r.committedSnapshot, r.checkpointSnapshotId);
+          } else {
+            System.out.println("nothing to commit (table unborn or already caught up)");
+          }
         }
+      } finally {
+        client.close();
       }
     } finally {
       spark.stop();
-      if (cpToClose != null) {
-        cpToClose.close(); // the windowed writer borrows this CP client for ResolveWindowOwner
+      if (cp != null) {
+        cp.close(); // the CP-driven writer factory borrows this client across restarts
       }
+    }
+  }
+
+  /**
+   * A writer factory over <b>CP-resolved hash placement</b>: each call re-reads the index's
+   * CURRENT shard→node map from the control plane ({@link #shardEndpointsFromCp}) and connects a
+   * fresh writer to it — so the restart loop follows a re-placement instead of retrying the
+   * startup endpoints forever. Routing (strategy, bucket map, shard-group ownership) stays fixed
+   * for the process: a re-placement moves a shard's <i>node</i>, never its ordinal; a topology
+   * change (reshard) still requires a connector restart.
+   */
+  static java.util.function.Supplier<BatchWriter> cpResolvedWriterFactory(
+      ControlPlaneClient cp,
+      String index,
+      ShardRouter.Strategy strategy,
+      int[] bucketOwners,
+      SnapshotLineage lineage,
+      ShardRouter groupRouter,
+      java.util.SortedSet<Integer> owned) {
+    return () -> {
+      List<String> endpoints = shardEndpointsFromCp(cp.getIndex(index));
+      return owned != null
+          ? new ShardGroupWriteClient(endpoints, groupRouter, lineage, owned, index)
+          : writerFor(endpoints, strategy, bucketOwners, lineage, index);
+    };
+  }
+
+  /**
+   * Swap {@code current} for a freshly-built writer (closing the old one), or <b>keep it</b> when
+   * the rebuild itself fails — e.g. the CP is unreachable mid-failover — so the restart loop
+   * degrades to the old retry-in-place behavior and re-resolves again on the next restart.
+   */
+  static BatchWriter rebuildWriter(
+      BatchWriter current, java.util.function.Supplier<BatchWriter> factory) {
+    BatchWriter fresh;
+    try {
+      fresh = factory.get();
+    } catch (RuntimeException resolveDown) {
+      System.err.printf(
+          "connector: placement re-resolution failed (%s) — keeping the current writer; the next"
+              + " restart re-resolves%n",
+          resolveDown.getMessage());
+      return current;
+    }
+    closeQuietly(current);
+    return fresh;
+  }
+
+  private static void closeQuietly(BatchWriter writer) {
+    try {
+      writer.close();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
     }
   }
 
@@ -355,6 +471,56 @@ public final class ConnectorApp {
   }
 
   /**
+   * The per-ordinal owning-node endpoints of a hash-sharded index, read from the registry's shard map
+   * ({@code GetIndex.shard_status}) — the same placement the Gateway routes reads to, so CP-driven
+   * writes land where reads look. Returned in ordinal order ({@code [0, shard_count)}); each `scheme://`
+   * is stripped to the {@code host:port} the write clients dial. Fails fast if a shard has no live
+   * primary yet (the serve node hasn't registered) rather than silently dropping its writes — the
+   * operator brings all shard nodes up before starting the connector, as the read path already needs.
+   */
+  static List<String> shardEndpointsFromCp(GetIndexResponse entry) {
+    int count = entry.getShardCount();
+    String[] byOrdinal = new String[count];
+    for (ShardStatus s : entry.getShardStatusList()) {
+      if (s.getWindow() != 0) {
+        continue; // ordinal shards only (a windowed index never reaches here)
+      }
+      int ordinal = s.getOrdinal();
+      if (ordinal >= 0 && ordinal < count && !s.getPrimary().isEmpty()) {
+        String endpoint = s.getPrimary().replaceFirst("^https?://", "");
+        // One ShardStatus per ordinal is the registry contract; a duplicate means the shard map is
+        // ambiguous about who owns the shard's writes. Fail loudly rather than silently letting the
+        // LAST entry win — guessing wrong writes where reads never look.
+        if (byOrdinal[ordinal] != null) {
+          throw new IllegalStateException(
+              "registry shard map lists shard "
+                  + ordinal
+                  + " more than once (`"
+                  + byOrdinal[ordinal]
+                  + "` and `"
+                  + endpoint
+                  + "`) — ambiguous placement; refusing to pick a primary");
+        }
+        byOrdinal[ordinal] = endpoint;
+      }
+    }
+    List<String> endpoints = new ArrayList<>(count);
+    for (int ordinal = 0; ordinal < count; ordinal++) {
+      if (byOrdinal[ordinal] == null) {
+        throw new IllegalStateException(
+            "index has no live primary for shard "
+                + ordinal
+                + " of "
+                + count
+                + " yet — ensure every shard's serve node is registered with the control plane before"
+                + " starting the connector (or pass --nodes to pin endpoints)");
+      }
+      endpoints.add(byOrdinal[ordinal]);
+    }
+    return endpoints;
+  }
+
+  /**
    * One Node → a direct {@link WriteClient}; several → a {@link ShardedWriteClient}. When
    * {@code bucketOwners} is non-empty, the sharded writer routes through that bucket map
    * (matching the Gateway); otherwise {@code fnv % shards}. A single node always routes to
@@ -364,20 +530,33 @@ public final class ConnectorApp {
     return writerFor(nodes, routing, bucketOwners, SnapshotLineage.none());
   }
 
-  /**
-   * As above, with the source table's {@link SnapshotLineage} so the sharded resume-min orders
-   * diverged shard checkpoints by sequence number instead of the random snapshot id.
-   */
+  /** As below, untagged (empty index — a single-index sharded deployment). */
   static BatchWriter writerFor(
       List<String> nodes, ShardRouter.Strategy routing, int[] bucketOwners, SnapshotLineage lineage) {
+    return writerFor(nodes, routing, bucketOwners, lineage, "");
+  }
+
+  /**
+   * As above, with the source table's {@link SnapshotLineage} so the sharded resume-min orders
+   * diverged shard checkpoints by sequence number instead of the random snapshot id, and an
+   * {@code index} tag on each sub-batch so a pool node can dispatch by {@code (index, shard)}.
+   */
+  static BatchWriter writerFor(
+      List<String> nodes,
+      ShardRouter.Strategy routing,
+      int[] bucketOwners,
+      SnapshotLineage lineage,
+      String index) {
     if (nodes.size() == 1) {
+      // Carry the index tag on the single-endpoint path too: a one-shard index can still live on a
+      // pool node serving many indexes, where an untagged write/checkpoint selector is ambiguous.
       String[] hp = nodes.get(0).split(":", 2);
-      return new WriteClient(hp[0].trim(), Integer.parseInt(hp[1].trim()));
+      return new WriteClient(hp[0].trim(), Integer.parseInt(hp[1].trim()), index);
     }
     if (bucketOwners != null && bucketOwners.length > 0) {
-      return new ShardedWriteClient(nodes, ShardRouter.bucketed(routing, bucketOwners), lineage);
+      return new ShardedWriteClient(nodes, ShardRouter.bucketed(routing, bucketOwners), lineage, index);
     }
-    return new ShardedWriteClient(nodes, new ShardRouter(nodes.size(), routing), lineage);
+    return new ShardedWriteClient(nodes, new ShardRouter(nodes.size(), routing), lineage, index);
   }
 
   /**

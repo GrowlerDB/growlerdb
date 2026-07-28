@@ -164,6 +164,7 @@ async fn grpc_front_routes_query_and_describe_through_the_gateway() {
     let mut admin = AdminClient::connect(url.clone()).await.unwrap();
     let stats = admin
         .describe_index(DescribeIndexRequest {
+            shard: 0,
             window: 0,
             index: String::new(),
         })

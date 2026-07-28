@@ -12,4 +12,5 @@ How GrowlerDB maintains quality and handles issues — process and methods, not 
 * [CI & gates](/quality/ci-and-gates.md) - the automated gates every change passes
 * [Release readiness](/quality/release-readiness.md) - GA criteria, versioning, the release process
 * [How issues are handled](/quality/issues.md) - the tracker and triage conventions
+* [Audits](/quality/audits/) - point-in-time adversarial reviews, findings mapped to fix tasks
 * [Known limitations](/quality/known-limitations/) - durable caveats and gaps

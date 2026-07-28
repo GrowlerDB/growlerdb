@@ -12,7 +12,8 @@ timestamp: 2026-07-04T14:22:00
 interchangeable nodes** that serve **control-plane-assigned time windows**, not fixed hash ordinals.
 The control plane keeps a per-index **node inventory** (nodes heartbeat via `RegisterNode`;
 in-memory, TTL'd — liveness is ephemeral, not durable topology) and **places each window on the
-least-loaded live node on first ask** (`ResolveWindowOwner`, idempotent, dead-owner re-placement). It
+least-loaded live node on first ask** (`ResolveUnitOwner` — D52 generalized the original
+`ResolveWindowOwner` to a `(index, shard|window)` unit — idempotent, dead-owner re-placement). It
 is **streaming-first**: windowed nodes start **empty**, and the node creates a window's shard on the
 **first write** the connector streams to it (`WindowedWriteService`, mirroring the batch
 `write_windowed`), publishing it live — the search/suggest multiplexers read a shared, mutable window

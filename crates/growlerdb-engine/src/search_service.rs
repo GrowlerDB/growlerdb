@@ -5,6 +5,7 @@
 //!
 //! [Design 01]: ../../../okf/product/interfaces/grpc.md
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use growlerdb_core::{Agg, CompositeKey, Highlight, Query, SearchAfter, Sort, SortOrder};
@@ -41,29 +42,135 @@ pub(crate) const MAX_NODE_FETCH: usize = 10_000;
 pub struct SearchService {
     shard: ShardHandle,
     auth: SharedAuth,
-    /// Admission for the HEAVY read ops (`export`, `aggregate` — full scans on the blocking
-    /// pool). Defaults to the process-wide semaphore ([`heavy_reads`]) so every service on this
-    /// node shares ONE budget; saturation load-sheds with `RESOURCE_EXHAUSTED` rather than
-    /// queueing unbounded blocking work.
+    /// Node-wide admission for the HEAVY read ops (`export`, `aggregate` — full scans on the blocking
+    /// pool). Defaults to the process-wide semaphore ([`heavy_reads`]) so every service on this node
+    /// shares ONE budget; saturation load-sheds with `RESOURCE_EXHAUSTED` rather than queueing
+    /// unbounded blocking work.
     heavy: Arc<tokio::sync::Semaphore>,
+    /// Per-**index** soft heavy-read share, checked *after* the global permit is acquired. On a
+    /// universal-pool node co-resident indexes share one process (D52), so this keeps a flood of
+    /// exports/aggregations on one index from starving a co-tenant's — while staying
+    /// **work-conserving**: an index may exceed its share into globally free capacity (see
+    /// [`IndexHeavyShare`]). Default is a non-binding solo share (a lone index is bounded by
+    /// [`heavy`](Self::heavy) alone — no behavior change); the pool builder
+    /// ([`with_index_heavy_share`](Self::with_index_heavy_share)) gives every service of one index
+    /// the same shared [`IndexHeavyShare`].
+    heavy_index: Arc<IndexHeavyShare>,
 }
 
-/// The node-wide heavy-read budget: at most `GROWLERDB_MAX_HEAVY_READS` (default 8, `0` treated
-/// as 1) concurrent exports/aggregations across ALL served shards/windows — these run full scans
-/// on the blocking pool, so an unbounded flood starves every other query's blocking work. Sized
-/// once at first use from the env.
+/// A **work-conserving** per-index share of the node-wide heavy-read budget (D52 pool fairness,
+/// 357.25). One instance is shared by every service of one index on a pool node; it tracks that
+/// index's in-flight heavy reads and admits by a **soft** fair share:
+///
+/// - **Below its share** (`node_cap / live_indexes`, ≥1) an index always admits — a co-tenant's
+///   overflow can never hold it out, because overflow (below) leaves a reserve free.
+/// - **Above its share** it may still admit — overflow into *globally free* capacity — but only
+///   while the acquisition leaves at least one free global permit per *other* live index
+///   (`live_indexes - 1`). So a single index alone on the node uses the full node budget, an idle
+///   co-tenant's unused slice isn't withheld from a busy index (a multi-window aggregate's
+///   per-window sub-requests no longer self-shed on an idle node), and under contention the
+///   flooding index is shed above-share as permits free, letting a below-share index climb to its
+///   share.
+///
+/// The share denominator is the **live** served index set — an [`AtomicUsize`] owned by the pool
+/// dispatch layer and updated as assignments change (D53) — not a boot-time constant.
+/// Hard capacity stays the node-wide semaphore; this share never admits beyond it.
+#[derive(Debug)]
+pub struct IndexHeavyShare {
+    /// The node-wide heavy-read cap the shares divide (must match the global semaphore's size).
+    node_cap: usize,
+    /// Live count of indexes served by this process — the share denominator, updated by the pool
+    /// dispatch/reconcile layer as the served index set changes.
+    live_indexes: Arc<AtomicUsize>,
+    /// This index's heavy reads currently in flight (admitted through this share).
+    in_flight: AtomicUsize,
+}
+
+impl IndexHeavyShare {
+    /// A share of a node budget of `node_cap`, with the live served-index count `live_indexes`
+    /// (shared with the dispatch layer that updates it; a stored `0` is read as 1).
+    pub fn new(node_cap: usize, live_indexes: Arc<AtomicUsize>) -> Arc<Self> {
+        Arc::new(Self {
+            node_cap,
+            live_indexes,
+            in_flight: AtomicUsize::new(0),
+        })
+    }
+
+    /// Try to admit one heavy read for this index. `global_free_after` is the number of global
+    /// permits still free *after* the caller acquired its own — the overflow headroom check.
+    /// Returns a guard that decrements the in-flight count on drop, or `None` to shed: the index
+    /// is at/above its fair share AND admitting would eat into the reserve kept for other indexes.
+    fn try_admit(self: &Arc<Self>, global_free_after: usize) -> Option<IndexShareGuard> {
+        let live = self.live_indexes.load(Ordering::Acquire).max(1);
+        let share = (self.node_cap / live).max(1);
+        // Overflow reserve: above its share, an index may only take permits that leave one free
+        // for every OTHER live index — so overflow can't hold a below-share co-tenant out.
+        let reserve = live - 1;
+        let mut cur = self.in_flight.load(Ordering::Acquire);
+        loop {
+            if cur >= share && global_free_after < reserve {
+                return None;
+            }
+            match self.in_flight.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(IndexShareGuard {
+                        share: self.clone(),
+                    })
+                }
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// This index's heavy reads currently in flight (test/observability hook).
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+}
+
+/// RAII half of one admitted heavy read's per-index accounting: decrements the index's in-flight
+/// count on drop, mirroring the global permit's release.
+#[derive(Debug)]
+struct IndexShareGuard {
+    share: Arc<IndexHeavyShare>,
+}
+
+impl Drop for IndexShareGuard {
+    fn drop(&mut self) {
+        self.share.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// The configured node-wide heavy-read cap: `GROWLERDB_MAX_HEAVY_READS` (default 8, `0` treated as
+/// 1). The pool divides this into per-index shares.
+pub fn heavy_reads_cap() -> usize {
+    std::env::var("GROWLERDB_MAX_HEAVY_READS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(8)
+        .max(1)
+}
+
+/// The node-wide heavy-read budget: at most [`heavy_reads_cap`] concurrent exports/aggregations
+/// across ALL served shards/windows — these run full scans on the blocking pool, so an unbounded
+/// flood starves every other query's blocking work. Sized once at first use from the env.
 fn heavy_reads() -> Arc<tokio::sync::Semaphore> {
     static GLOBAL: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     GLOBAL
-        .get_or_init(|| {
-            let n = std::env::var("GROWLERDB_MAX_HEAVY_READS")
-                .ok()
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or(8)
-                .max(1);
-            Arc::new(tokio::sync::Semaphore::new(n))
-        })
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(heavy_reads_cap())))
         .clone()
+}
+
+/// A non-binding per-index share (the default): a solo share with an effectively unlimited cap, so
+/// a service that isn't on a shared pool node is bounded only by the node-wide [`heavy_reads`].
+fn unbounded_index_share() -> Arc<IndexHeavyShare> {
+    IndexHeavyShare::new(usize::MAX, Arc::new(AtomicUsize::new(1)))
 }
 
 impl SearchService {
@@ -81,19 +188,78 @@ impl SearchService {
         self
     }
 
+    /// Give this service a shared **per-index** heavy-read share (D52 pool fairness): every service
+    /// of one index on a pool node passes the same [`IndexHeavyShare`], so that index is held to its
+    /// soft fair share of the node budget — it can't starve a co-resident index, yet may overflow
+    /// into globally free capacity (work-conserving). See [`heavy_index`](Self::heavy_index).
+    pub fn with_index_heavy_share(mut self, index_share: Arc<IndexHeavyShare>) -> Self {
+        self.heavy_index = index_share;
+        self
+    }
+
+    /// Share an explicit node-wide heavy-read budget across services (the general form of
+    /// [`with_heavy_limit`](Self::with_heavy_limit), which mints a fresh one). Production defaults to
+    /// the process-wide [`heavy_reads`] semaphore, so all services on a node already share one budget.
+    pub fn with_shared_heavy_budget(mut self, budget: Arc<tokio::sync::Semaphore>) -> Self {
+        self.heavy = budget;
+        self
+    }
+
     /// A Search service over `shard` with a specific [auth hook](SharedAuth).
     pub fn with_auth(shard: impl Into<ShardHandle>, auth: SharedAuth) -> Self {
         Self {
             shard: shard.into(),
             auth,
             heavy: heavy_reads(),
+            heavy_index: unbounded_index_share(),
         }
+    }
+
+    /// Admit one heavy read (export/aggregate): take a node-wide permit — the hard capacity —
+    /// then check the per-**index** soft share ([`IndexHeavyShare`]): below its share an index
+    /// always admits; above it, only into globally free capacity beyond the reserve for other
+    /// indexes. A soft-share shed drops the just-acquired global permit (RAII — no leak). Both
+    /// halves are held together for the op's lifetime; dropping the returned [`HeavyPermit`]
+    /// releases both. Load-sheds with `RESOURCE_EXHAUSTED`.
+    fn admit_heavy(&self) -> Result<HeavyPermit, Status> {
+        let global = self
+            .heavy
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| heavy_shed())?;
+        let index = self
+            .heavy_index
+            .try_admit(self.heavy.available_permits())
+            .ok_or_else(heavy_shed)?;
+        Ok(HeavyPermit {
+            _index: index,
+            _global: global,
+        })
     }
 
     /// Wrap as a mountable tonic [`SearchServer`].
     pub fn into_server(self) -> SearchServer<Self> {
         SearchServer::new(self)
     }
+}
+
+/// Both halves of one admitted heavy read: the per-index share accounting and the node-wide global
+/// permit. Held together for the op's lifetime; dropping releases both.
+#[derive(Debug)]
+struct HeavyPermit {
+    _index: IndexShareGuard,
+    _global: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// The load-shed status when a heavy read hits either the per-index or node-wide cap.
+fn heavy_shed() -> Status {
+    to_status(
+        Code::ResourceExhausted,
+        WireError::new(
+            "RESOURCE_EXHAUSTED",
+            "node at its concurrent heavy-read limit (exports/aggregations) — retry with backoff (GROWLERDB_MAX_HEAVY_READS tunes this)",
+        ),
+    )
 }
 
 #[tonic::async_trait]
@@ -480,17 +646,9 @@ impl Search for SearchService {
         let given_pit = req.pit_id;
 
         // Admission: an export is a full scan holding a PIT + blocking-pool time for its whole
-        // stream — take a node-wide heavy-read permit (held until the stream finishes) or
-        // load-shed now with an honest retry signal.
-        let permit = self.heavy.clone().try_acquire_owned().map_err(|_| {
-            to_status(
-                Code::ResourceExhausted,
-                WireError::new(
-                    "RESOURCE_EXHAUSTED",
-                    "node at its concurrent heavy-read limit (exports/aggregations) — retry                      with backoff (GROWLERDB_MAX_HEAVY_READS tunes this)",
-                ),
-            )
-        })?;
+        // stream — take a heavy-read permit (per-index share + node-wide, held until the stream
+        // finishes) or load-shed now with an honest retry signal.
+        let permit = self.admit_heavy()?;
         // Stream pages from a blocking task over a bounded channel (backpressure: the
         // producer parks on `blocking_send` until the client drains).
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<SearchResponse, Status>>(4);
@@ -584,16 +742,8 @@ impl Search for SearchService {
         growlerdb_core::validate_aggs(&aggs).map_err(invalid)?;
 
         // Admission: an aggregation scans every matching doc's fast fields on the blocking
-        // pool — same node-wide heavy-read budget as export (permit held through the run).
-        let _permit = self.heavy.clone().try_acquire_owned().map_err(|_| {
-            to_status(
-                Code::ResourceExhausted,
-                WireError::new(
-                    "RESOURCE_EXHAUSTED",
-                    "node at its concurrent heavy-read limit (exports/aggregations) — retry                      with backoff (GROWLERDB_MAX_HEAVY_READS tunes this)",
-                ),
-            )
-        })?;
+        // pool — same heavy-read budget as export (per-index share + node-wide, held through the run).
+        let _permit = self.admit_heavy()?;
         let shard = self.shard.current();
         // Tenant scoping: aggregations over another tenant's rows would leak counts/
         // sums, so the same mandatory filter applies before the agg runs.
@@ -1456,6 +1606,246 @@ mod tests {
         assert!(ok, "the heavy budget frees once the export finishes");
     }
 
+    /// D52 pool fairness: two co-resident indexes share the node-wide heavy budget, but each has its
+    /// own per-index share. A flood of heavy reads on index A exhausts A's share (and sheds further A
+    /// reads once no overflow headroom remains) yet index B still admits — one index cannot starve
+    /// another on a shared pool node.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn per_index_share_keeps_a_flood_from_starving_a_co_tenant() {
+        use tokio_stream::StreamExt;
+        let ta = tempfile::tempdir().unwrap();
+        let tb = tempfile::tempdir().unwrap();
+        // One shared node budget (2) split across 2 live indexes → a share of 1 each, with an
+        // overflow reserve of 1 — so a single index at its share can't take the last free permit.
+        let global = Arc::new(tokio::sync::Semaphore::new(2));
+        let live = Arc::new(AtomicUsize::new(2));
+        let (svc_a, _sa) = service_and_shard(ta.path());
+        let (svc_b, _sb) = service_and_shard(tb.path());
+        let svc_a = svc_a
+            .with_shared_heavy_budget(global.clone())
+            .with_index_heavy_share(IndexHeavyShare::new(2, live.clone()));
+        let svc_b = svc_b
+            .with_shared_heavy_budget(global.clone())
+            .with_index_heavy_share(IndexHeavyShare::new(2, live.clone()));
+
+        // Index A floods: an undrained export holds A's per-index permit (+ one node permit).
+        let mut a_stream = svc_a
+            .export(Request::new(ExportRequest {
+                query: "rank:[0 TO 1000]".into(),
+                page_size: 1,
+                sort: rank_asc(),
+                pit_id: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // A second heavy read on A is shed — A can't exceed its per-index share.
+        let a_again = svc_a
+            .aggregate(Request::new(AggregateRequest {
+                query: "rank:[0 TO 1000]".into(),
+                aggs: r#"{"r": {"Stats": {"field": "rank"}}}"#.into(),
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(
+            a_again.unwrap_err().code(),
+            Code::ResourceExhausted,
+            "index A is capped at its own share"
+        );
+
+        // ...but index B still admits — its own share is free and a node permit remains.
+        svc_b
+            .aggregate(Request::new(AggregateRequest {
+                query: "rank:[0 TO 1000]".into(),
+                aggs: r#"{"r": {"Stats": {"field": "rank"}}}"#.into(),
+                ..Default::default()
+            }))
+            .await
+            .expect("B is not starved by A's flood");
+
+        // Drain A so the test tears down cleanly.
+        while let Some(page) = a_stream.next().await {
+            page.unwrap();
+        }
+    }
+
+    /// Work-conserving invariant 1 (357.25): a single index alone on the node (live count 1) uses
+    /// the FULL node budget — the soft share never withholds capacity when there's no co-tenant.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_lone_index_uses_the_full_node_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (svc, _shard) = service_and_shard(tmp.path());
+        let global = Arc::new(tokio::sync::Semaphore::new(4));
+        let share = IndexHeavyShare::new(4, Arc::new(AtomicUsize::new(1)));
+        let svc = svc
+            .with_shared_heavy_budget(global.clone())
+            .with_index_heavy_share(share.clone());
+
+        let held: Vec<_> = (0..4).map(|_| svc.admit_heavy().unwrap()).collect();
+        assert_eq!(
+            share.in_flight(),
+            4,
+            "all 4 node permits go to the lone index"
+        );
+        // The 5th sheds at the hard node cap, not the share.
+        assert_eq!(
+            svc.admit_heavy().unwrap_err().code(),
+            Code::ResourceExhausted
+        );
+        drop(held);
+        assert_eq!(global.available_permits(), 4, "global permits all released");
+        assert_eq!(share.in_flight(), 0, "in-flight accounting drains to zero");
+    }
+
+    /// Work-conserving overflow (357.25, HA-G3): with an idle co-tenant, a busy index runs past its
+    /// fair share into globally free capacity — e.g. one multi-window aggregate's 7 per-window
+    /// sub-requests all admit on an idle node (cap 8, share 4) instead of self-shedding at the old
+    /// hard share — while the overflow reserve still leaves the idle index able to admit at once.
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_co_tenant_capacity_overflows_to_the_busy_index() {
+        let ta = tempfile::tempdir().unwrap();
+        let tb = tempfile::tempdir().unwrap();
+        let global = Arc::new(tokio::sync::Semaphore::new(8));
+        let live = Arc::new(AtomicUsize::new(2)); // share 4, overflow reserve 1
+        let (svc_a, _sa) = service_and_shard(ta.path());
+        let (svc_b, _sb) = service_and_shard(tb.path());
+        let share_a = IndexHeavyShare::new(8, live.clone());
+        let svc_a = svc_a
+            .with_shared_heavy_budget(global.clone())
+            .with_index_heavy_share(share_a.clone());
+        let svc_b = svc_b
+            .with_shared_heavy_budget(global.clone())
+            .with_index_heavy_share(IndexHeavyShare::new(8, live.clone()));
+
+        // 7 concurrent heavy reads on A (3 above its share of 4) all admit — B is idle, permits
+        // are free, and each acquisition leaves the 1-permit reserve for B intact.
+        let a_held: Vec<_> = (0..7).map(|_| svc_a.admit_heavy().unwrap()).collect();
+        assert_eq!(share_a.in_flight(), 7);
+        // The 8th would take B's reserved last permit while A is above share → shed.
+        assert_eq!(
+            svc_a.admit_heavy().unwrap_err().code(),
+            Code::ResourceExhausted,
+            "overflow stops at the reserve for the co-tenant"
+        );
+        // Idle B admits immediately — A's overflow never held it out.
+        let _b = svc_b.admit_heavy().expect("B admits despite A's overflow");
+        drop(a_held);
+    }
+
+    /// Contention fairness (357.25): once the node budget is full, permits freed by the
+    /// above-share flooder go to the below-share index — the flooder is shed above its share while
+    /// the co-tenant climbs toward its own share.
+    #[tokio::test(flavor = "current_thread")]
+    async fn above_share_flood_is_shed_while_a_below_share_index_climbs() {
+        let ta = tempfile::tempdir().unwrap();
+        let tb = tempfile::tempdir().unwrap();
+        let global = Arc::new(tokio::sync::Semaphore::new(4));
+        let live = Arc::new(AtomicUsize::new(2)); // share 2, overflow reserve 1
+        let (svc_a, _sa) = service_and_shard(ta.path());
+        let (svc_b, _sb) = service_and_shard(tb.path());
+        let share_a = IndexHeavyShare::new(4, live.clone());
+        let share_b = IndexHeavyShare::new(4, live.clone());
+        let svc_a = svc_a
+            .with_shared_heavy_budget(global.clone())
+            .with_index_heavy_share(share_a.clone());
+        let svc_b = svc_b
+            .with_shared_heavy_budget(global.clone())
+            .with_index_heavy_share(share_b.clone());
+
+        // A floods: 3 admit (share 2 + 1 overflow; a 4th would eat B's reserve).
+        let mut a_held: Vec<_> = (0..3).map(|_| svc_a.admit_heavy().unwrap()).collect();
+        // B (below share) takes the last node permit — the reserve did its job.
+        let _b1 = svc_b.admit_heavy().expect("below-share B admits");
+        // Node budget is now exhausted for everyone.
+        assert_eq!(
+            svc_a.admit_heavy().unwrap_err().code(),
+            Code::ResourceExhausted
+        );
+        // One of A's reads finishes → the freed permit is NOT reclaimable by above-share A...
+        a_held.pop();
+        assert_eq!(
+            svc_a.admit_heavy().unwrap_err().code(),
+            Code::ResourceExhausted,
+            "A above share can't take the freed permit"
+        );
+        // ...but below-share B admits it, reaching its fair share promptly under A's flood.
+        let _b2 = svc_b
+            .admit_heavy()
+            .expect("freed capacity goes to below-share B");
+        assert_eq!(share_a.in_flight(), 2);
+        assert_eq!(share_b.in_flight(), 2);
+    }
+
+    /// Leak-freedom of the two-phase admit (357.25): a soft-share shed AFTER the global permit was
+    /// acquired returns that permit (RAII), and dropping an admitted permit releases both halves.
+    #[tokio::test(flavor = "current_thread")]
+    async fn soft_share_shed_returns_the_global_permit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (svc, _shard) = service_and_shard(tmp.path());
+        let global = Arc::new(tokio::sync::Semaphore::new(4));
+        // 4 live indexes → share 1, overflow reserve 3.
+        let share = IndexHeavyShare::new(4, Arc::new(AtomicUsize::new(4)));
+        let svc = svc
+            .with_shared_heavy_budget(global.clone())
+            .with_index_heavy_share(share.clone());
+
+        let first = svc.admit_heavy().unwrap();
+        assert_eq!(global.available_permits(), 3);
+        // 2nd: the global permit is briefly acquired, then the soft share sheds (above share 1,
+        // taking it would leave 2 < the reserve of 3) — the permit must come back.
+        assert_eq!(
+            svc.admit_heavy().unwrap_err().code(),
+            Code::ResourceExhausted
+        );
+        assert_eq!(
+            global.available_permits(),
+            3,
+            "the shed admit returned its global permit"
+        );
+        assert_eq!(
+            share.in_flight(),
+            1,
+            "the shed admit isn't counted in-flight"
+        );
+        drop(first);
+        assert_eq!(global.available_permits(), 4);
+        assert_eq!(share.in_flight(), 0);
+    }
+
+    /// The share denominator is LIVE (357.25): resizing the served-index count immediately changes
+    /// the fair share — no boot-time freeze.
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_index_count_resizes_the_share() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (svc, _shard) = service_and_shard(tmp.path());
+        let global = Arc::new(tokio::sync::Semaphore::new(4));
+        let live = Arc::new(AtomicUsize::new(2)); // share 2, reserve 1
+        let svc = svc
+            .with_shared_heavy_budget(global.clone())
+            .with_index_heavy_share(IndexHeavyShare::new(4, live.clone()));
+
+        let held: Vec<_> = (0..3).map(|_| svc.admit_heavy().unwrap()).collect();
+        assert_eq!(
+            svc.admit_heavy().unwrap_err().code(),
+            Code::ResourceExhausted,
+            "2 live indexes: share 2 + overflow to 3, the 4th is reserved"
+        );
+        drop(held);
+        // The co-tenant is de-assigned → live drops to 1 → the full budget opens up.
+        live.store(1, Ordering::Release);
+        let held: Vec<_> = (0..4).map(|_| svc.admit_heavy().unwrap()).collect();
+        drop(held);
+        // Two more indexes are assigned → live 4 → share 1, reserve 3: one admit, then shed.
+        live.store(4, Ordering::Release);
+        let _one = svc.admit_heavy().unwrap();
+        assert_eq!(
+            svc.admit_heavy().unwrap_err().code(),
+            Code::ResourceExhausted,
+            "4 live indexes: above share 1 with only 2 free < reserve 3"
+        );
+    }
+
     /// `page_size` is clamped to [`MAX_NODE_FETCH`] like every other paged endpoint: a
     /// `u32::MAX` request must stream the full result set in bounded pages, not build a
     /// ~4-billion-entry top-k in one page (OOM).
@@ -1519,6 +1909,7 @@ mod tests {
 
         let resp = svc
             .aggregate(Request::new(AggregateRequest {
+                shard: 0,
                 query: "rank:[0 TO 100]".into(),
                 aggs: r#"{"rank_stats": {"Stats": {"field": "rank"}}}"#.into(),
                 partial: false,
@@ -1544,6 +1935,7 @@ mod tests {
         let svc = ranked_service(tmp.path());
         let err = svc
             .aggregate(Request::new(AggregateRequest {
+                shard: 0,
                 query: "rank:[0 TO 100]".into(),
                 aggs: "{not valid".into(),
                 partial: false,

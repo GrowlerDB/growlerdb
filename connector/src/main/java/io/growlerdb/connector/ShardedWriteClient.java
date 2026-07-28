@@ -28,6 +28,14 @@ public final class ShardedWriteClient implements BatchWriter {
   private final ShardFanOut fanOut;
   /** Fills in sequence numbers the Nodes don't have at resume time. */
   private final SnapshotLineage lineage;
+  /**
+   * The index every sub-batch AND checkpoint call is tagged with, so a **pool node** serving many
+   * indexes over one endpoint can dispatch on its {@code (index, shard)} selector — resume asks the
+   * same selector the writes land on. Empty = the node's sole served index (a per-index sharded
+   * Node ignores it), so untagged single-index deployments are unchanged — the hash counterpart to
+   * {@link WindowedWriteClient}'s per-index tagging.
+   */
+  private final String index;
 
   /** Connect a Node per {@code host:port} endpoint, routed by {@code strategy}. */
   public ShardedWriteClient(List<String> endpoints, ShardRouter.Strategy strategy) {
@@ -39,12 +47,19 @@ public final class ShardedWriteClient implements BatchWriter {
     this(endpoints, router, SnapshotLineage.none());
   }
 
+  /** As below, untagged (empty index — a single-index sharded deployment). */
+  public ShardedWriteClient(List<String> endpoints, ShardRouter router, SnapshotLineage lineage) {
+    this(endpoints, router, lineage, "");
+  }
+
   /**
    * Connect a Node per {@code host:port} endpoint, placing writes with an explicit {@code router}
    * (a bucketed router built from the registry's vended map, so write placement matches the
-   * Gateway's read routing). The router's shard count must equal the endpoint count.
+   * Gateway's read routing) and tagging each sub-batch with {@code index}. The router's shard count
+   * must equal the endpoint count.
    */
-  public ShardedWriteClient(List<String> endpoints, ShardRouter router, SnapshotLineage lineage) {
+  public ShardedWriteClient(
+      List<String> endpoints, ShardRouter router, SnapshotLineage lineage, String index) {
     if (endpoints.isEmpty()) {
       throw new IllegalArgumentException("a ShardedWriteClient needs at least one endpoint");
     }
@@ -71,14 +86,21 @@ public final class ShardedWriteClient implements BatchWriter {
       }
       parsed.add(new HostPort(hp[0].trim(), port));
     }
+    // Tag each shard client with the index so EVERY call — writes and the resume/drain
+    // checkpoints alike — carries the (index, shard) selector: a pool node serving several indexes
+    // rejects an untagged GetCheckpoint as ambiguous, which would crash-loop resume.
     List<WriteClient> clients = new ArrayList<>(parsed.size());
-    for (HostPort hp : parsed) {
-      clients.add(new WriteClient(hp.host(), hp.port()));
+    for (int ordinal = 0; ordinal < parsed.size(); ordinal++) {
+      HostPort hp = parsed.get(ordinal);
+      // Tag each client with its ordinal so a hash pool node dispatches its writes/checkpoints to
+      // the right ordinal shard (endpoints are in ordinal order — the router indexes them the same).
+      clients.add(new WriteClient(hp.host(), hp.port(), index, ordinal));
     }
     this.shards = List.copyOf(clients);
     this.router = router;
     this.fanOut = new ShardFanOut(this.shards.size());
     this.lineage = lineage;
+    this.index = index;
   }
 
   @Override
@@ -95,7 +117,7 @@ public final class ShardedWriteClient implements BatchWriter {
       // current` invariant only holds when every shard tracks the same source position.
       writes.add(
           () -> {
-            long snapshot = shards.get(shard).write(sub);
+            long snapshot = shards.get(shard).write(sub, index);
             // Per-shard ack metric: a shard whose acks stall relative to its siblings is the tell
             // for a partial-landing loss signature. Recorded on success only.
             ConnectorMetrics.recordShardAck(shard);

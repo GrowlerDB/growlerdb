@@ -57,6 +57,11 @@ credentials:
   # free tier (3). Empty = free tier. Mint one with the `mint_license` example — see COMM-LICENSE.md.
   # An invalid token warns and falls back to the free tier rather than failing startup.
   license: ""
+  # HA registry DSN (GROWLERDB_REGISTRY_POSTGRES) for the externalized control-plane store (D51),
+  # e.g. "postgresql://user:pw@pg-host:5432/growlerdb_registry". Read only by the control plane, and
+  # only when `controlPlane.externalRegistry.enabled`. Sensitive (carries a password) — set it here
+  # for dev or, preferably, put it in your `existingSecret` under the same `registryPostgresDsn` key.
+  registryPostgresDsn: ""
 
 # ---- The index the nodes build + serve -------------------------------------------------------
 # The index is partitioned into `shards` ordinals (virtual-bucket sharding). The node StatefulSet
@@ -147,14 +152,42 @@ metrics:
 
 # ---- Control plane: the cluster index registry (gRPC) ----------------------------------------
 controlPlane:
-  replicas: 1 # the registry is single-writer; HA is a later milestone
+  # Replicas. Embedded mode is single-writer (keep at 1). With externalRegistry.enabled the CP is
+  # stateless over the shared store, so raise this to run HA (leader-writer + warm standbys).
+  replicas: 1
   grpcPort: 50071
   metricsPort: 9101
+  # HA (D51): back the registry with an external Postgres so the control plane runs as N stateless
+  # replicas instead of the embedded single-writer JSON store. Each replica is a warm standby; exactly
+  # one holds the single-writer advisory lock (the leader) and is the only pod that reports ready, so
+  # the Service routes all traffic to it (active-passive). Standbys reload on the leader's writes and
+  # promote on its death. Set the DSN in `credentials.registryPostgresDsn` (or your existingSecret's
+  # `registryPostgresDsn` key) and raise `replicas`. When false (default): embedded JSON on a PV.
+  #
+  # ⚠ Do NOT toggle this on an EXISTING release. (1) The CP Service changes between headless
+  # (embedded/StatefulSet) and ClusterIP (HA) and `clusterIP` is immutable — the chart fails the
+  # upgrade with a clear message rather than letting the apply break halfway. (2) Nothing migrates
+  # registry data between the embedded registry.json and Postgres — a forced switch boots an EMPTY
+  # registry (no indexes, no tokens). There is no automated migration path yet: to switch modes,
+  # capture the registry contents first (embedded: the `registry.json` envelope on the CP PV;
+  # Postgres: the `cp_state` table's `registry` row — the same JSON envelope), uninstall, reinstall
+  # in the new mode, and restore that envelope into the new store (or re-create indexes/tokens and
+  # let nodes re-register). `growlerdb backup`/`restore` cover INDEX data, not the registry.
+  externalRegistry:
+    enabled: false
   persistence:
+    # Only used in embedded mode; externalRegistry.enabled makes the CP stateless (no PV).
     enabled: true
     storageClass: ""
     size: 1Gi
     accessModes: ["ReadWriteOnce"]
+  # NOTE: the control plane deliberately has NO PodDisruptionBudget in HA mode. Only the leader is
+  # ever Ready (leader-only readiness), so any budget requiring ≥1 healthy pod pins
+  # disruptionsAllowed to 0 and wedges `kubectl drain` on the leader's host forever. Evicting the
+  # leader is safe: it releases the advisory lock on exit and a warm standby promotes within ~250ms.
+  # Spread HA replicas across cluster nodes so losing one host can't take out both the leader and its
+  # warm standbys. Ignored when `affinity` is set. Embedded (single-replica) mode ignores it.
+  spreadReplicas: true
   resources:
     requests: { cpu: 50m, memory: 64Mi }
     limits: { cpu: "1", memory: 256Mi }

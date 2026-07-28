@@ -16,6 +16,10 @@ message DescribeIndexRequest {
   // every window and each WindowNode stamps its id here, so the receiving multiplexer dispatches to
   // that window's shard and the Gateway sums the per-window stats. 0 (unset) on a single-shard node.
   int64 window = 2;
+  // Ordinal-shard selector for hash-shard pool routing (D52), mirroring SearchRequest.shard: the
+  // Gateway fans a describe to a hash index's ordinals and each ShardNode stamps its ordinal here, so
+  // the pool node dispatches to that ordinal and the Gateway sums per-ordinal stats. 0 = not hash.
+  uint32 shard = 3;
 }
 
 // Status + stats of an index.

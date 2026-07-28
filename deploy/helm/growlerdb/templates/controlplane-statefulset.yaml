@@ -1,3 +1,6 @@
+{{- if not .Values.controlPlane.externalRegistry.enabled }}
+# Embedded mode: the single-writer JSON registry on a PV. HA mode (externalRegistry.enabled) renders a
+# stateless Deployment instead — see controlplane-deployment.yaml.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -72,3 +75,4 @@ spec:
           requests:
             storage: {{ .Values.controlPlane.persistence.size | quote }}
   {{- end }}
+{{- end }}

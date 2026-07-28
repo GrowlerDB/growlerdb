@@ -24,7 +24,27 @@ without forking — the [extension seam](/system/decisions/d37-extension-seams.m
   A gateway fronts **one index** (`--index`) *or* **every registered index** (`--all-indexes`), routing
   each request to its named index's shard-set — resolved lazily from the control plane on first use and
   hot-reloaded per index ([D35](/system/decisions/d35-multi-index-routing.md)). An empty `index`
-  resolves to the endpoint's default/sole index, else is rejected.
+  resolves to the endpoint's default/sole index, else is rejected. Windowed routing resolves each
+  `(index, window)` **unit** to its holder and stamps that unit on the request, so the gateway fronts a
+  **pool node** serving many indexes' windows over one endpoint unchanged
+  ([D52](/system/decisions/d52-placement-pool.md)): the per-window `WindowNode` stamps the index too,
+  and the node dispatches on it. **Hash-sharded** routing works the same way, one level over: each
+  `(index, ordinal)` unit resolves to its holders and a `ShardNode` (the hash counterpart to
+  `WindowNode`) stamps `(index, ordinal)` on every request, so a pool node holding several ordinals of
+  one index over one endpoint dispatches each to the right ordinal — with ordinals that share a pool
+  endpoint deduping onto one warm channel. Each window **or ordinal** resolves to **all its holders** —
+  primary + read replicas ([D53](/system/decisions/d53-unit-replication.md)) — behind a `FailoverNode`:
+  a read tries the
+  primary and, on a transport-shaped error (down/unreachable/hung — HTTP/2 keepalive on every node
+  channel detects a blackholed peer) or a node's structured `UNIT_NOT_SERVED` refusal (a stale route /
+  not-yet-warmed replica), **fails over** to a live replica (no gap, no forced `partial`), preserving
+  the request's auth/tenant metadata on every attempt; each attempt gets an equal slice of the
+  per-request budget so a hung primary can't exhaust the scatter deadline before a replica is tried,
+  and exhausting every holder surfaces `UNAVAILABLE`. Mutations still pin to the primary, and so do
+  `require_complete` reads (a replica may trail the sole writer — D53). Holders connect **lazily**, so
+  a down holder never blanks resolution — a window with no live holder fails fast to a `partial`, and
+  the routing fingerprint tracks the full holder set so a re-placement or re-replication hot-reloads
+  the route.
 - **Scatter-gather** — fans Search/Suggest out to the target shards, merges top-K, **dedupes** by
   composite key (safe mid-reshard), and surfaces an honest `partial` flag; enforces **per-shard
   deadlines** and a **page-fetch ceiling**.

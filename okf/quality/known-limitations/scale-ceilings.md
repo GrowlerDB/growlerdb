@@ -60,6 +60,25 @@ advanced, the delete pass is skipped that cycle (`deletes_skipped`) — the alwa
 still runs — and the next reconcile retries once the shard is quiescent. See the TOCTOU guard in
 [D9](/system/decisions/d09-sync-model.md).
 
+## Shared-process fairness (D52)
+
+The [universal placement pool](/system/decisions/d52-placement-pool.md) packs units from **many
+indexes into one node process**, so the node's resource budgets became **cross-index** — a
+noisy-neighbor risk where a flood on one index could starve a co-resident one. The node-wide
+**heavy-read** budget (`GROWLERDB_MAX_HEAVY_READS`, exports/aggregations on the blocking pool)
+carries a **work-conserving per-index soft share** on a pool node: below its fair share
+(`cap / live indexes`, ≥1) an index always admits, and above it it may still **overflow into
+globally free capacity** — but only while the acquisition leaves one free node permit per *other*
+live index, so overflow can never hold a below-share co-tenant out. A lone index uses the full node
+budget; an idle co-tenant's slice isn't withheld from a busy one (a multi-window aggregate's
+per-window fan-out no longer self-sheds on an idle node); under contention the flooder is shed
+above-share as permits free, so a co-tenant promptly climbs to its share. The share **denominator is
+the live served index set** (refreshed as D53 assignments change the dispatch map), not a boot-time
+constant. The **write** in-flight cap is per-index by construction (one write service per served
+index). Residual: shares are equal (not weighted by load or priority), and CPU/heap aren't yet
+partitioned — a pathological aggregation still competes for blocking-pool threads within its share.
+Per-tenant weighting is a later refinement.
+
 ## Cheap, high-leverage wins
 
 Small, mostly pure-GrowlerDB changes that raise headroom well before the structural work:

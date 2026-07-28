@@ -98,22 +98,26 @@ just stack-down
 
 ## How it works
 
-![GrowlerDB architecture — your data lands in Apache Iceberg (the system of record); the Spark Structured Streaming connector reads the Iceberg changelog and streams batches to index nodes that build Tantivy segments; a client query hits the gateway, which scatter-gathers across shard nodes and hydrates the ranked keys back to authoritative Iceberg rows](docs/img/architecture.png)
+![GrowlerDB architecture — your data lands in Apache Iceberg (the system of record); the Spark Structured Streaming connector reads the Iceberg changelog and streams batches to a high-availability pool of interchangeable nodes that build Tantivy segments, each unit replicated (R=2); a client query hits the gateway, which scatter-gathers across the pool — failing reads over to a replica if a node is down — and hydrates the ranked keys back to authoritative Iceberg rows. The control plane and gateway run replicated too.](docs/img/architecture.png)
 
 GrowlerDB sits between your **Apache Iceberg** tables and your users. Iceberg stays the **system of
 record**; GrowlerDB maintains a fast, derived index and resolves matches back to the authoritative
 rows over two paths:
 
 - **Ingest** — the **Connector** (Spark Structured Streaming) reads the Iceberg changelog and streams
-  document batches over gRPC to **index nodes**, which build local **Tantivy** segments with a **redb**
-  locator (key → file + row position).
+  document batches over gRPC to the **pool**, whose nodes build local **Tantivy** segments with a
+  **redb** locator (key → file + row position).
 - **Query** — a client (Console, SDK, or the OpenSearch `_search` adapter) calls the **Gateway**,
-  which scatter-gathers across shard nodes, merges the top-K into ranked **coordinates** (primary
-  keys), and **hydrates** them back to authoritative rows from Iceberg.
+  which scatter-gathers across the pool, merges the top-K into ranked **coordinates** (primary keys),
+  and **hydrates** them back to authoritative rows from Iceberg.
 
-A **Control Plane** is the routing source of truth (nodes register; the Gateway resolves shards), and
-every service emits **OpenTelemetry** to the bundled **LGTM** stack (Grafana · Prometheus · Loki ·
-Tempo).
+**Highly available by default.** Serving runs on a **placement pool** of interchangeable nodes: the
+**Control Plane** distributes each index's units across the pool with a **replication factor** (one
+primary + read replicas), so a node loss is a **zero-gap read failover** — the gateway routes reads to
+a live replica and the pool self-heals. You point N identical nodes at the pool and the control plane
+does the placement; there is no per-node designation. The control plane itself runs as **N replicas**
+and the gateway is **stateless and replicated**, so no component is a single point of failure. Every
+service emits **OpenTelemetry** to the bundled **LGTM** stack (Grafana · Prometheus · Loki · Tempo).
 
 Full walkthrough: **[system architecture](okf/system/architecture.md)** · [deployment topologies](https://docs.growlerdb.com/deployment)
 

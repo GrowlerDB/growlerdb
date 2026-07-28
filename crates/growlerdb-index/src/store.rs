@@ -167,6 +167,18 @@ pub struct ColdMarker {
     /// paired with `bundle_key`.
     #[serde(default)]
     pub bundle_manifest_key: Option<String>,
+    /// Object key of the parked window's `aux.redb`. The primary keeps it **local** and reads
+    /// through that; a **replica** on another node ([D53](/system/decisions/d53-unit-replication.md))
+    /// has no local copy, so it fetches this key to a scratch dir and opens the window read-through
+    /// ([`open_cold_replica`](crate::LocalIndexStore::open_cold_replica)). A parked window is
+    /// immutable, so this snapshot is frozen — no continuous re-sync. `None` on a window parked
+    /// before replica support (falls back to the local aux).
+    #[serde(default)]
+    pub aux_key: Option<String>,
+    /// Object key of the parked window's `location.arr` (the [D30](/system/decisions/d30-layered-locator.md)
+    /// locator array), the sidecar counterpart to [`aux_key`](Self::aux_key) for a replica open.
+    #[serde(default)]
+    pub location_key: Option<String>,
 }
 
 /// Cap on concurrently-open point-in-time handles per shard. Each held
@@ -321,6 +333,18 @@ impl ShardId {
         }
     }
 
+    /// An **ordinal-shard** id for a hash/partition-sharded `index` (D52 pool): ordinal `ordinal`
+    /// lives at its own path `{index}/{ordinal}`, so one pool node can hold several ordinals of the
+    /// same index without collision. Ordinal 0 is the single-shard path — `shard(index, 0)` and
+    /// [`single`](Self::single) are the same id.
+    pub fn shard(index: impl Into<String>, ordinal: u32) -> Self {
+        Self {
+            index: index.into(),
+            shard: ordinal,
+            window: None,
+        }
+    }
+
     /// Relative on-disk path segment: `{index}/{shard}`, or `{index}/w{window}` when windowed.
     fn rel_path(&self) -> PathBuf {
         let seg = match self.window {
@@ -459,6 +483,60 @@ impl LocalIndexStore {
         })
     }
 
+    /// Open a **parked window as a cross-node replica** (D53): unlike [`open_cold_shard`], which
+    /// reads the window's `aux.redb` + `location.arr` from a **local** `aux_dir` (the primary keeps
+    /// them beside the marker), a replica on another node has no local copy — so this fetches both
+    /// sidecars from object storage (the [`aux_key`](ColdMarker::aux_key) /
+    /// [`location_key`](ColdMarker::location_key) `backup()` uploaded) into `scratch_dir`, then opens
+    /// the window read-through exactly like a cold open. The window is immutable, so the fetched
+    /// snapshot is consistent and never re-synced. Errors if the marker predates replica support
+    /// (no sidecar keys — re-park to enable it).
+    pub fn open_cold_replica(
+        &self,
+        index: &ResolvedIndex,
+        scratch_dir: &Path,
+        op: opendal::Operator,
+        marker: &ColdMarker,
+        cache: RangeCache,
+    ) -> Result<Shard> {
+        let (aux_key, location_key) = match (&marker.aux_key, &marker.location_key) {
+            (Some(a), Some(l)) => (a, l),
+            _ => return Err(StoreError::Cold(
+                "parked window has no replica sidecar keys (aux_key/location_key) — re-park it \
+                     to enable cross-node replica read-through"
+                    .into(),
+            )),
+        };
+        std::fs::create_dir_all(scratch_dir)?;
+        // Blocking operator for the two one-shot sidecar downloads (this open path is synchronous,
+        // as is `open_cold_shard`'s own sidecar reads).
+        let bop = opendal::blocking::Operator::new(op.clone())
+            .map_err(|e| StoreError::Cold(e.to_string()))?;
+        let aux = bop
+            .read(aux_key)
+            .map_err(|e| StoreError::Cold(e.to_string()))?;
+        std::fs::write(scratch_dir.join("aux.redb"), aux.to_vec())?;
+        let location = bop
+            .read(location_key)
+            .map_err(|e| StoreError::Cold(e.to_string()))?;
+        std::fs::write(scratch_dir.join(LOCATION_FILE), location.to_vec())?;
+        let bundle = marker
+            .bundle_key
+            .as_deref()
+            .zip(marker.bundle_manifest_key.as_deref());
+        // Fresh aux.redb (no live hot shard to reuse a handle from — this is a replica node).
+        self.open_cold_shard(
+            index,
+            scratch_dir,
+            op,
+            &marker.object_prefix,
+            cache,
+            marker.hotcache_key.as_deref(),
+            bundle,
+            None,
+        )
+    }
+
     /// The cold-park [`ColdMarker`] for window `w` of `index`, or `None` if the window is **hot**
     /// (still local) or absent. Discovery uses this to tell hot windows (local `index/`)
     /// from cold ones (parked: this marker + its event zone-map for pruning).
@@ -507,6 +585,30 @@ impl LocalIndexStore {
         }
         windows.sort_unstable();
         Ok(windows)
+    }
+
+    /// The **ordinal shards** of a hash/partition-sharded `index` present on disk — the numeric
+    /// `{index}/{ordinal}` dirs (D52 pool). A pool node opens exactly these ordinals it holds. Windowed
+    /// dirs (`w{window}`) are skipped, so a mixed store never confuses the two. Ascending by ordinal.
+    pub fn ordinal_shards(&self, index: &str) -> Result<Vec<u32>> {
+        let dir = self.root.join(index);
+        let mut ordinals = Vec::new();
+        if dir.exists() {
+            for entry in std::fs::read_dir(&dir)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    if let Some(o) = entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|n| n.parse::<u32>().ok())
+                    {
+                        ordinals.push(o);
+                    }
+                }
+            }
+        }
+        ordinals.sort_unstable();
+        Ok(ordinals)
     }
 
     /// Apply a [`CommitBatch`] to a **windowed** index: route upserts to per-window
@@ -7618,6 +7720,49 @@ mod window_store_tests {
             .unwrap();
         assert_eq!(w11.num_docs().unwrap(), 1);
         assert_eq!(w11.event_bounds().unwrap(), Some((day(11), day(11))));
+    }
+
+    #[test]
+    fn ordinal_shards_enumerate_pool_ordinals_at_distinct_paths() {
+        // D52 pool: one node can hold several ORDINAL shards of a hash index, each at its own path.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalIndexStore::open(tmp.path()).unwrap();
+        let src = SourceSchema::new(
+            vec![SourceField::new("id", SourceType::String)],
+            vec![],
+            vec!["id".into()],
+        );
+        let idx = IndexDefinition::from_yaml(
+            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD } ] }\n",
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+        store
+            .create_shard(&ShardId::shard("docs", 0), &idx)
+            .unwrap();
+        store
+            .create_shard(&ShardId::shard("docs", 2), &idx)
+            .unwrap();
+        // Ordinal 0 is the single-shard path; distinct ordinals get distinct dirs (no collision).
+        assert_eq!(
+            store.shard_path(&ShardId::shard("docs", 0)),
+            store.shard_path(&ShardId::single("docs"))
+        );
+        assert_ne!(
+            store.shard_path(&ShardId::shard("docs", 0)),
+            store.shard_path(&ShardId::shard("docs", 2))
+        );
+        assert_eq!(store.ordinal_shards("docs").unwrap(), vec![0, 2]);
+        // A window dir (`w{...}`) is not mistaken for an ordinal shard.
+        store
+            .create_shard(&ShardId::window("docs", 999), &idx)
+            .unwrap();
+        assert_eq!(
+            store.ordinal_shards("docs").unwrap(),
+            vec![0, 2],
+            "window dirs are excluded from ordinal enumeration"
+        );
     }
 
     #[test]

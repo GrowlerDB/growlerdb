@@ -72,14 +72,15 @@ pub fn scope_for_method(method: &str) -> Option<Scope> {
         | "SetUserRoles" | "CreateToken" | "ListTokens" | "RevokeToken" | "ListUsers" => {
             Scope::Admin
         }
-        // Cluster operations: reshard/bucket moves + node self-registration + CP-driven windowed
-        // placement (node heartbeat + window-owner resolution).
+        // Cluster operations: reshard/bucket moves + node self-registration + CP-driven pool
+        // placement (node heartbeat + unit-owner resolution).
         "PlanReshard"
         | "ApplyReshard"
         | "MoveBucket"
         | "RegisterServedIndex"
         | "RegisterNode"
-        | "ResolveWindowOwner" => Scope::Ops,
+        | "ResolveUnitOwner"
+        | "SubscribeAssignments" => Scope::Ops,
         _ => return None,
     })
 }

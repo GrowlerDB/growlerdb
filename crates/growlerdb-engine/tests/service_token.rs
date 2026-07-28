@@ -169,7 +169,11 @@ async fn write_checkpoint(endpoint: &str, token: Option<&str>) -> Result<(), ton
     }
     client
         .expect("node never came up")
-        .get_checkpoint(growlerdb_proto::v1::GetCheckpointRequest { window: 0 })
+        .get_checkpoint(growlerdb_proto::v1::GetCheckpointRequest {
+            window: 0,
+            index: String::new(),
+            shard: 0,
+        })
         .await
         .map(|_| ())
 }
@@ -191,6 +195,7 @@ async fn describe(
     node.expect("node never came up")
         .describe_index(tonic::Request::new(
             growlerdb_proto::v1::DescribeIndexRequest {
+                shard: 0,
                 index: "docs".into(),
                 window: 0,
             },

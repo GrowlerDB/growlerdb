@@ -35,10 +35,15 @@ final class FakeShardNode extends WriteGrpc.WriteImplBase {
   /** Last-write-wins doc state by identifier string ("" body = deleted marker removed). */
   final Map<String, DocOp> applied = new ConcurrentHashMap<>();
   final List<DocBatch> received = new CopyOnWriteArrayList<>();
+  /** Full wire requests, so tests can assert the (index, shard/window) selectors are set. */
+  final List<WriteRequest> writeRequests = new CopyOnWriteArrayList<>();
+
+  final List<GetCheckpointRequest> checkpointRequests = new CopyOnWriteArrayList<>();
   final AtomicInteger gaps = new AtomicInteger();
 
   @Override
   public synchronized void write(WriteRequest request, StreamObserver<WriteResponse> obs) {
+    writeRequests.add(request);
     DocBatch batch = request.getBatch();
     received.add(batch);
     if (batchKeys.containsKey(batch.getBatchId())) {
@@ -90,6 +95,7 @@ final class FakeShardNode extends WriteGrpc.WriteImplBase {
   @Override
   public synchronized void getCheckpoint(
       GetCheckpointRequest request, StreamObserver<GetCheckpointResponse> obs) {
+    checkpointRequests.add(request);
     GetCheckpointResponse.Builder response = GetCheckpointResponse.newBuilder().setSnapshot(snapshot);
     if (current != null) {
       SourceCheckpoint.Builder cp = SourceCheckpoint.newBuilder().setIcebergSnapshot(current.id());

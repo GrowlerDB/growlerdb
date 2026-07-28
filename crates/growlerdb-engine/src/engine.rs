@@ -165,6 +165,7 @@ pub struct SearchOutcome {
 
 /// The embedded engine: a local index store under `root`, plus the Iceberg
 /// connection settings used for indexing and hydration.
+#[derive(Clone)]
 pub struct Engine {
     store: LocalIndexStore,
     root: PathBuf,
@@ -260,6 +261,40 @@ impl Engine {
             .await?;
         Ok(IndexOutcome {
             name: index_name,
+            snapshot,
+            doc_count,
+        })
+    }
+
+    /// Cold-build a **single-shard** index from `table` using an **already-resolved** definition —
+    /// how a pool node **builds a unit on assignment** (D52): the control plane assigns it primary of
+    /// an ordinal it doesn't hold, and it builds that shard from source using the definition it already
+    /// persisted (its `index.json`), rather than re-introspecting + re-resolving from YAML. A
+    /// **variant** index is connector-fed (D49 — iceberg-rust can't scan it), so this returns an empty
+    /// outcome and the connector fills it on first write.
+    ///
+    /// **Single-shard only** (the demo case): [`build_from_source`](Self::build_from_source) writes to
+    /// `ShardId::single` today, so a multi-ordinal build (targeting `ShardId::shard(index, ordinal)`)
+    /// is a follow-up. The caller (serve-pool) only invokes this for a non-windowed, `shard_count == 1`
+    /// index.
+    pub async fn index_shard_resolved(
+        &self,
+        resolved: &ResolvedIndex,
+        table: &str,
+    ) -> Result<IndexOutcome, EngineError> {
+        if resolved.has_variant_field() {
+            return Ok(IndexOutcome {
+                name: resolved.name.clone(),
+                snapshot: Snapshot(0),
+                doc_count: 0,
+            });
+        }
+        let reader = IcebergReader::connect(&self.iceberg).await?;
+        let (snapshot, doc_count) = self
+            .build_from_source(&reader, table, resolved, None)
+            .await?;
+        Ok(IndexOutcome {
+            name: resolved.name.clone(),
             snapshot,
             doc_count,
         })

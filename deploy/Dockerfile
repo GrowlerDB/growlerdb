@@ -19,12 +19,15 @@ ARG GROWLERDB_VERSION
 # We build the lean `dist` profile (release minus thin-LTO, stripped): a fraction of the disk +
 # wall-time of a full release build, which is what overflowed small dev VMs. The caches still live
 # in Docker's (VM) storage — reclaim with `docker builder prune` if space gets tight.
+# `--features postgres` compiles in the externalized-registry backend (D51) so the one image can run
+# the HA control plane (`--registry-postgres`); it's a pure-Rust client (no libpq/C dep) and inert
+# unless that flag/env is set, so the default JSON path is unchanged.
 # target/ is a cache mount (not part of the image), so copy the binary out within the same RUN.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
     RUSTFLAGS="-C link-arg=-lstdc++" \
-    GROWLERDB_VERSION="${GROWLERDB_VERSION}" cargo build --profile dist -p growlerdb-cli \
+    GROWLERDB_VERSION="${GROWLERDB_VERSION}" cargo build --profile dist -p growlerdb-cli --features postgres \
     && cp target/dist/growlerdb /usr/local/bin/growlerdb
 
 # Build the UI SPA — the gateway serves it via --ui-dir.

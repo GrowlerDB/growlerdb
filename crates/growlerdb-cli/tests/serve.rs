@@ -96,7 +96,11 @@ async fn growlerdb_serve_hosts_write_grpc() {
     let mut client = connect(&format!("http://{addr}")).await;
     let wire: DocBatch = batch().into();
     let snapshot = client
-        .write(WriteRequest { batch: Some(wire) })
+        .write(WriteRequest {
+            batch: Some(wire),
+            index: String::new(),
+            shard: 0,
+        })
         .await
         .expect("write rpc")
         .into_inner()
@@ -107,6 +111,8 @@ async fn growlerdb_serve_hosts_write_grpc() {
     let again = client
         .write(WriteRequest {
             batch: Some(batch().into()),
+            index: String::new(),
+            shard: 0,
         })
         .await
         .expect("re-write")
@@ -268,6 +274,8 @@ async fn growlerdb_serve_exposes_health_and_metrics() {
     client
         .write(WriteRequest {
             batch: Some(batch().into()),
+            index: String::new(),
+            shard: 0,
         })
         .await
         .expect("write to record an SLI");

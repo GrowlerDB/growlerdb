@@ -1,3 +1,18 @@
+{{- /* Guard the embedded ↔ HA mode toggle on a LIVE release: embedded renders `clusterIP: None`
+(headless — the StatefulSet's serviceName needs it) while HA renders a normal ClusterIP VIP, and
+clusterIP is immutable, so a helm upgrade that flips `controlPlane.externalRegistry.enabled` would
+fail mid-apply with an opaque server error. Worse, nothing migrates registry data between the
+embedded registry.json and Postgres — a forced switch boots an EMPTY registry. `lookup` returns
+nothing under `helm template`/`lint` (no cluster) and on a fresh install (no existing Service), so
+this only trips on a real in-cluster upgrade that would actually break. */ -}}
+{{- $svc := lookup "v1" "Service" .Release.Namespace (include "growlerdb.controlplane.fullname" .) }}
+{{- if $svc }}
+{{- $isHeadless := eq (default "" $svc.spec.clusterIP) "None" }}
+{{- $wantHeadless := not .Values.controlPlane.externalRegistry.enabled }}
+{{- if ne $isHeadless $wantHeadless }}
+{{- fail (printf "toggling controlPlane.externalRegistry.enabled on an existing release is not supported: the control-plane Service %q would change between headless and ClusterIP, and clusterIP is immutable. Registry data is NOT migrated between the embedded registry.json and Postgres either. To switch modes: back up/export the registry contents, uninstall and reinstall the release (or delete the Service and the old CP workload first), then restore the registry. See the controlPlane.externalRegistry notes in values.yaml." (include "growlerdb.controlplane.fullname" .)) }}
+{{- end }}
+{{- end }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -6,8 +21,13 @@ metadata:
     {{- include "growlerdb.labels" . | nindent 4 }}
     app.kubernetes.io/component: control-plane
 spec:
-  # Headless: stable DNS for the (single-writer) registry; doubles as the StatefulSet serviceName.
+  {{- if not .Values.controlPlane.externalRegistry.enabled }}
+  # Embedded mode: headless for stable DNS to the single-writer registry; doubles as the StatefulSet
+  # serviceName. HA mode uses a normal ClusterIP so kube-proxy routes the VIP to the single ready
+  # (leader) endpoint and shifts to the promoted standby on failover — active-passive with no
+  # client-side re-resolution.
   clusterIP: None
+  {{- end }}
   selector:
     {{- include "growlerdb.selectorLabels" . | nindent 4 }}
     app.kubernetes.io/component: control-plane

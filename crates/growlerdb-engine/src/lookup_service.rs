@@ -369,6 +369,7 @@ mod tests {
         let svc = service(tmp.path(), Arc::new(DenyAll));
         let err = svc
             .get_by_key(Request::new(GetByKeyRequest {
+                shard: 0,
                 window: 0,
                 keys: vec![coord("present")],
                 columns: vec![],
@@ -387,6 +388,7 @@ mod tests {
         // reaching the (absent) Iceberg catalog.
         let err = svc
             .get_by_key(Request::new(GetByKeyRequest {
+                shard: 0,
                 window: 0,
                 keys: vec![coord("missing")],
                 columns: vec![],
@@ -411,6 +413,7 @@ mod tests {
         };
         let err = svc
             .get_by_key(Request::new(GetByKeyRequest {
+                shard: 0,
                 window: 0,
                 keys: vec![bad],
                 columns: vec![],
@@ -429,6 +432,7 @@ mod tests {
         let keys = (0..=MAX_KEYS).map(|i| coord(&i.to_string())).collect();
         let err = svc
             .get_by_key(Request::new(GetByKeyRequest {
+                shard: 0,
                 window: 0,
                 keys,
                 columns: vec![],
@@ -534,6 +538,7 @@ mod tests {
         let svc = predicate_service(tmp.path());
         let err = svc
             .get_by_key(Request::new(GetByKeyRequest {
+                shard: 0,
                 window: 0,
                 keys: vec![coord("missing")],
                 columns: vec![],
@@ -563,6 +568,7 @@ mod tests {
         // resolving locators or reaching the (absent) catalog.
         let err = svc
             .get_by_key(Request::new(GetByKeyRequest {
+                shard: 0,
                 window: 0,
                 keys: vec![coord("present")],
                 columns: vec![],

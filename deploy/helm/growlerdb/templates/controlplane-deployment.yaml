@@ -1,0 +1,117 @@
+{{- if .Values.controlPlane.externalRegistry.enabled }}
+# HA mode (D51): N stateless control-plane replicas over the externalized Postgres registry. Each
+# replica is a warm standby that serves reads; exactly one holds the single-writer advisory lock (the
+# leader) and is the only pod that reports /readyz 200, so the Service routes to it (active-passive).
+# Standbys reload on the leader's writes and promote on its death. No PV — durable state lives in
+# Postgres. Embedded (single-writer JSON) mode renders a StatefulSet instead; see
+# controlplane-statefulset.yaml.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "growlerdb.controlplane.fullname" . }}
+  labels:
+    {{- include "growlerdb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+spec:
+  replicas: {{ .Values.controlPlane.replicas }}
+  # Leader-only readiness means at most ONE pod is ever Ready, so the default rolling-update
+  # constraints (25% surge / 25%→0 maxUnavailable for small N) wedge every update permanently: the
+  # surged standby never becomes Ready, the old ReplicaSet never scales down, and the old leader
+  # never releases the advisory lock. `maxUnavailable: 100%` (minAvailable 0) is the only setting
+  # that lets the controller delete the old LEADER — any smaller value blocks on
+  # available(1) ≤ minAvailable(N-1). `maxSurge: 1` starts a new-version standby alongside first so
+  # promotion is immediate once the old pods go. Expect a brief control-plane write gap (a few
+  # seconds) during a rollout; the data plane (gateway/nodes) keeps serving throughout.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 100%
+  # availableReplicas tops out at 1 by design, so with replicas > 1 the Deployment never reports
+  # "complete" and the default 600s progress deadline would mark a healthy rollout as failed.
+  # Effectively disable it (max int32); watch for ONE Ready pod instead (see NOTES.txt).
+  progressDeadlineSeconds: 2147483647
+  selector:
+    matchLabels:
+      {{- include "growlerdb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: control-plane
+  template:
+    metadata:
+      # Roll the pods when the chart-managed credentials Secret changes (registry DSN /
+      # service-token rotation would otherwise never reach running pods). A constant no-op with
+      # `credentials.existingSecret` (secret.yaml renders empty) — rotate out-of-band, then
+      # `kubectl rollout restart` this Deployment.
+      annotations:
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+      labels:
+        {{- include "growlerdb.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: control-plane
+    spec:
+      serviceAccountName: {{ include "growlerdb.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      # Prompt leader handoff on pod deletion. The binary runs as the container's PID 1 and installs
+      # a handler only for SIGINT (tokio ctrl_c), and PID 1 IGNORES unhandled signals — so the
+      # SIGTERM Kubernetes sends does nothing, and without help a terminating leader would sit on
+      # the advisory lock until the SIGKILL at grace expiry. The preStop hook converts termination
+      # into SIGINT: the process exits cleanly, its Postgres session closes, Postgres releases the
+      # advisory lock, and a standby promotes within its 250ms poll. The short grace period bounds
+      # the worst case (SIGKILL also closes the session, releasing the lock).
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: control-plane
+          image: {{ include "growlerdb.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "kill -INT 1"]
+          args:
+            - control-plane
+            - --addr
+            - 0.0.0.0:{{ .Values.controlPlane.grpcPort }}
+            - --metrics-addr
+            - 0.0.0.0:{{ .Values.controlPlane.metricsPort }}
+          # HA is selected by GROWLERDB_REGISTRY_POSTGRES (the --registry-postgres env fallback), set
+          # from the credentials Secret below.
+          env:
+            {{- include "growlerdb.registryPostgresEnv" . | nindent 12 }}
+            {{- include "growlerdb.icebergEnv" . | nindent 12 }}
+            {{- include "growlerdb.serviceTokenEnv" . | nindent 12 }}
+            {{- include "growlerdb.licenseEnv" . | nindent 12 }}
+            {{- include "growlerdb.observabilityEnv" . | nindent 12 }}
+          ports:
+            - { name: grpc, containerPort: {{ .Values.controlPlane.grpcPort }} }
+            - { name: metrics, containerPort: {{ .Values.controlPlane.metricsPort }} }
+          {{- include "growlerdb.probes" . | nindent 10 }}
+          resources: {{- toYaml .Values.controlPlane.resources | nindent 12 }}
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      {{- with .Values.controlPlane.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controlPlane.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.controlPlane.affinity }}
+      affinity: {{- toYaml .Values.controlPlane.affinity | nindent 8 }}
+      {{- else if .Values.controlPlane.spreadReplicas }}
+      # Spread replicas across cluster nodes so one host loss can't take the leader + its standbys.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "growlerdb.selectorLabels" . | nindent 20 }}
+                    app.kubernetes.io/component: control-plane
+      {{- end }}
+      # Stateless: durable registry state is in Postgres, so /data is a scratch dir, not a PV.
+      volumes:
+        - { name: data, emptyDir: {} }
+{{- end }}

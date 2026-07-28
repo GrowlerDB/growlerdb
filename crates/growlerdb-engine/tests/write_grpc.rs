@@ -82,7 +82,11 @@ async fn write_batch_round_trips_over_grpc() {
     // Client → wire: a CommitBatch becomes a DocBatch.
     let wire: DocBatch = batch().into();
     let resp = client
-        .write(WriteRequest { batch: Some(wire) })
+        .write(WriteRequest {
+            batch: Some(wire),
+            index: String::new(),
+            shard: 0,
+        })
         .await
         .expect("write rpc")
         .into_inner();
@@ -101,6 +105,8 @@ async fn write_batch_round_trips_over_grpc() {
     let again = client
         .write(WriteRequest {
             batch: Some(batch().into()),
+            index: String::new(),
+            shard: 0,
         })
         .await
         .expect("re-write")

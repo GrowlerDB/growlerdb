@@ -74,6 +74,16 @@ message DocBatch {
 
 message WriteRequest {
   DocBatch batch = 1;
+  // Which index this batch targets. A **pool node** (D52) serves units from many indexes over one
+  // endpoint, so it dispatches the write on this selector; empty defaults to the sole served index
+  // (a drop-in for a single-index node). The single-index Write service ignores it.
+  string index = 2;
+  // Ordinal-shard selector for a **hash-sharded** index on a pool node (D52), mirroring
+  // SearchRequest.shard: the connector routes each hash write to the pool node holding that ordinal
+  // (via ControlPlaneClient.resolveShardOwner) and tags it here, so the pool node dispatches the
+  // write to that ordinal's shard. 0 = not hash / single shard; ignored by a windowed or single-shard
+  // Write service (which route on `window` / hold one shard).
+  uint32 shard = 3;
 }
 
 message WriteResponse {
@@ -85,6 +95,13 @@ message GetCheckpointRequest {
   // resumes each window independently. 0 (unset) means the node's single shard (the ordinal path);
   // a windowed node given a window it doesn't serve returns an empty checkpoint (start from scratch).
   int64 window = 1;
+  // Which index the window belongs to, for a **pool node** serving many indexes (as WriteRequest.index):
+  // empty defaults to the sole served index. The single-index Write service ignores it.
+  string index = 2;
+  // Ordinal-shard selector for a **hash-sharded** index on a pool node (D52), mirroring
+  // WriteRequest.shard: the connector reads each ordinal's checkpoint from the node holding it, so it
+  // resumes each ordinal independently. 0 = not hash / single shard.
+  uint32 shard = 3;
 }
 
 message GetCheckpointResponse {

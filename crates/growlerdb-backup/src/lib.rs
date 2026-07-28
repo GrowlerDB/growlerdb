@@ -146,12 +146,30 @@ pub fn s3_store(cfg: &S3Config) -> Result<Operator> {
     Ok(with_retry(Operator::new(b)?.finish()))
 }
 
+/// Hidden directory (under the fs store root) where [`fs_store`] stages writes before the atomic
+/// rename into place. Never collides with GrowlerDB object keys — every store listing/deletion is
+/// prefix-scoped (`backups/…`, `cold/…`), never the bare root.
+pub const FS_ATOMIC_WRITE_DIR: &str = ".atomic-writes";
+
 /// An [`Operator`] over a local directory — a filesystem backup target (mounted volume / NFS),
 /// and the backend the tests use. Retries transient failures (NFS can blip too).
+///
+/// **Writes are atomic** (HA-G4): opendal's fs service writes in place by default, so a concurrent
+/// reader — a replica fetching `cold.json` / `manifest.json` while a re-park overwrites it — could
+/// observe a torn object. `atomic_write_dir` makes every write land in a tempfile under
+/// [`FS_ATOMIC_WRITE_DIR`] and **rename** into place on close; POSIX rename is atomic on one
+/// filesystem, which holds because the staging dir lives under the same root. S3-style backends
+/// need none of this (a PUT is already all-or-nothing) and are untouched. A crash mid-write can
+/// leave a stale tempfile behind — harmless, bounded by write frequency, and outside every listed
+/// prefix.
 pub fn fs_store(root: impl AsRef<Path>) -> Result<Operator> {
     let root = root.as_ref();
     std::fs::create_dir_all(root)?;
-    let b = opendal::services::Fs::default().root(&root.to_string_lossy());
+    let atomic = root.join(FS_ATOMIC_WRITE_DIR);
+    std::fs::create_dir_all(&atomic)?;
+    let b = opendal::services::Fs::default()
+        .root(&root.to_string_lossy())
+        .atomic_write_dir(&atomic.to_string_lossy());
     Ok(with_retry(Operator::new(b)?.finish()))
 }
 
@@ -438,6 +456,10 @@ async fn cold_park_to_store(
             Err(_) => (None, None),
         }
     };
+    // The aux sidecars `backup()` already uploaded to `{base}/data/` (they survive the index-only
+    // bundling above and the manifest keeps them): recorded here so a **replica** on another node can
+    // fetch them and open the window read-through (D53). A parked window is immutable, so this is a
+    // one-time, frozen snapshot — no continuous re-sync.
     let marker = ColdMarker {
         object_prefix,
         event_min: zone.map(|(lo, _)| lo),
@@ -446,12 +468,92 @@ async fn cold_park_to_store(
         hotcache_key,
         bundle_key,
         bundle_manifest_key,
+        aux_key: Some(format!("{base}/data/aux.redb")),
+        location_key: Some(format!("{base}/data/location.arr")),
     };
     std::fs::write(
         window_dir.join(growlerdb_index::COLD_MARKER),
         serde_json::to_vec_pretty(&marker)?,
     )?;
+    // Also publish the marker to object storage (`{prefix}/cold.json`) so a **replica** on another
+    // node — which has no local window dir — can fetch it and open the window read-through (D53,
+    // [`fetch_cold_marker`] → [`open_cold_replica`](growlerdb_index::LocalIndexStore::open_cold_replica)).
+    store
+        .write(
+            &format!("{base}/{}", growlerdb_index::COLD_MARKER),
+            serde_json::to_vec(&marker)?,
+        )
+        .await?;
     Ok(marker)
+}
+
+/// Back up a **hot, writable** shard to `store` under `prefix` and publish a replica-ready
+/// [`ColdMarker`] to `{prefix}/cold.json` — **without evicting the local copy**, so a cross-node
+/// replica can open the shard read-through ([`open_cold_replica`](growlerdb_index::LocalIndexStore::open_cold_replica))
+/// while the primary keeps serving and writing it (D53 hash-shard parity).
+///
+/// Unlike [`cold_park`] — which parks an *aged, immutable* window (evict → read-through) — a **hash
+/// ordinal** never parks: it stays hot and writable on its primary. So this is a **frozen snapshot** of
+/// a live shard, and it trails the primary's later writes until the next backup (immutable-first;
+/// continuous hot-shard shipping is deferred). It carries no event zone-map (ordinals aren't time
+/// windows) and skips the hotcache/bundle sidecars (open falls back to plain per-file read-through).
+/// Returns the published marker.
+pub async fn backup_replica_snapshot(
+    shard: &Shard,
+    index: &str,
+    shard_id: &str,
+    staging: &Path,
+    store: &Operator,
+    prefix: &str,
+    definition_json: Option<String>,
+) -> Result<ColdMarker> {
+    let manifest = backup(
+        shard,
+        index,
+        shard_id,
+        staging,
+        store,
+        prefix,
+        definition_json,
+    )
+    .await?;
+    let base = prefix.trim_end_matches('/');
+    // The aux + location sidecars `backup()` uploaded to `{base}/data/` (in the manifest's file set),
+    // recorded so a replica fetches them and opens the shard read-through — the same keys the windowed
+    // park marker records.
+    let marker = ColdMarker {
+        object_prefix: format!("{base}/data/index"),
+        event_min: None,
+        event_max: None,
+        snapshot: manifest.snapshot,
+        hotcache_key: None,
+        bundle_key: None,
+        bundle_manifest_key: None,
+        aux_key: Some(format!("{base}/data/aux.redb")),
+        location_key: Some(format!("{base}/data/location.arr")),
+    };
+    store
+        .write(
+            &format!("{base}/{}", growlerdb_index::COLD_MARKER),
+            serde_json::to_vec(&marker)?,
+        )
+        .await?;
+    Ok(marker)
+}
+
+/// Fetch a parked window's [`ColdMarker`] from object storage — the `{prefix}/cold.json` that
+/// [`cold_park`]/[`cold_park_in_place`] (or [`backup_replica_snapshot`]) published — so a **replica**
+/// node can open the unit read-through without a local copy (D53). `prefix` is the unit's park prefix
+/// (`cold/{index}/w{window}` for a window, `cold/{index}/{ordinal}` for a hash shard). `Ok(None)` if
+/// the unit isn't published (no marker object).
+pub async fn fetch_cold_marker(store: &Operator, prefix: &str) -> Result<Option<ColdMarker>> {
+    let base = prefix.trim_end_matches('/');
+    let key = format!("{base}/{}", growlerdb_index::COLD_MARKER);
+    match store.read(&key).await {
+        Ok(buf) => Ok(Some(serde_json::from_slice(&buf.to_vec())?)),
+        Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// **Cold-park** a window shard for *read-through* serving: back its bulk up to `store`
@@ -818,6 +920,55 @@ mod tests {
             iceberg_file: "f".into(),
             row_position: 0,
         }
+    }
+
+    /// HA-G4: the local-fs object store must never overwrite an object **in place** — a replica
+    /// reading `cold.json`/`manifest.json` while a re-park rewrites it would see a torn object.
+    /// [`fs_store`] stages every write in the hidden [`FS_ATOMIC_WRITE_DIR`] and renames it into
+    /// place: proven here by the object's **inode changing** across an overwrite (an in-place write
+    /// keeps the inode; a rename swaps in a new file), with no tempfile leak and no staging-dir
+    /// pollution of prefix-scoped listings.
+    #[tokio::test]
+    async fn fs_store_overwrites_are_atomic_renames_not_in_place_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let op = fs_store(tmp.path()).unwrap();
+        let key = "cold/logs/w1/cold.json";
+        op.write(key, vec![b'a'; 4096]).await.unwrap();
+        let on_disk = tmp.path().join(key);
+        #[cfg(unix)]
+        let ino_before = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&on_disk).unwrap().ino()
+        };
+        op.write(key, vec![b'b'; 8192]).await.unwrap();
+        assert_eq!(
+            op.read(key).await.unwrap().to_vec(),
+            vec![b'b'; 8192],
+            "the overwrite is fully visible"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_ne!(
+                ino_before,
+                std::fs::metadata(&on_disk).unwrap().ino(),
+                "an overwrite must REPLACE the object via rename (new inode), never patch the \
+                 bytes a concurrent reader may hold open"
+            );
+        }
+        // Completed writes drain their tempfiles, and the staging dir stays invisible to the
+        // prefix-scoped listings every consumer uses.
+        let staging = tmp.path().join(FS_ATOMIC_WRITE_DIR);
+        assert!(staging.is_dir());
+        assert_eq!(
+            std::fs::read_dir(&staging).unwrap().count(),
+            0,
+            "no tempfile leaks after completed writes"
+        );
+        assert_eq!(
+            list_object_keys(&op, "cold/").await.unwrap(),
+            vec![key.to_string()]
+        );
     }
 
     /// The torn-refresh hazard and its guard. A refresh pass fetches the mutable objects

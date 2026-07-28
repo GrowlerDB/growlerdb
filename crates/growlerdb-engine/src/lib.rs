@@ -20,6 +20,7 @@ pub mod lookup_service;
 pub mod mcp_http;
 pub mod node;
 pub mod opensearch;
+pub mod pool_routing;
 pub mod rbac;
 pub mod remap;
 pub mod rest;
@@ -48,14 +49,14 @@ pub use error::EngineError;
 pub use fence::{ReindexFence, ReindexGuard};
 pub use gateway::{Gateway, GatewayLimits, IndexRoute, RouteResolver, WindowRouting};
 pub use hydrate::{apply_live_file_bitmap, get_by_key, resolve_locators};
-pub use license::{License, LicenseError, FREE_NODE_LIMIT};
+pub use license::{License, LicenseError, FREE_UNIT_LIMIT};
 pub use lookup_service::LookupService;
 pub use mcp_http::mcp_router;
-pub use node::{LocalNode, Node, RemoteNode};
+pub use node::{FailoverNode, LocalNode, Node, RemoteNode};
 pub use opensearch::opensearch_router;
 pub use rbac::{scope_for_method, RbacPolicy, Scope};
 pub use remap::{remap_shard, remap_tick, RemapOutcome, RemapState};
-pub use search_service::SearchService;
+pub use search_service::{heavy_reads_cap, IndexHeavyShare, SearchService};
 /// Serialize every test that mutates a process-global env var (`GROWLERDB_*_API_KEY`, ...).
 /// `set_var`/`remove_var` are process-wide, so env-touching tests across modules race under
 /// `cargo test`'s parallelism unless they share ONE crate-level lock (the same lesson the embed
@@ -70,16 +71,23 @@ pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|p| p.into_inner())
 }
 
+pub use pool_routing::{
+    PoolAdminService, PoolLookupService, PoolSearchService, PoolSuggestService, PoolWriteService,
+    SharedAdminIndexes, SharedHashWriteIndexes, SharedHashWriteUnits, SharedIndexKinds,
+    SharedLookupIndexes, SharedSearchIndexes, SharedSuggestIndexes, SharedWriteIndexes,
+};
 pub use service_auth::{
     intercept as intercept_service_token, layer as service_token_layer, ServiceTokenAuth,
 };
 pub use shard_handle::ShardHandle;
 pub use suggest_service::SuggestService;
 pub use topology::{shard_primaries, ShardTopologyError};
-pub use windowed_ingest::{OnNewWindow, WindowSeed, WindowedWriteService};
+pub use windowed_ingest::{OnNewWindow, PrimaryFence, WindowSeed, WindowedWriteService};
 pub use windowed_routing::{
+    is_not_primary, is_unit_not_served, not_primary, unit_not_served, ShardNode,
     SharedAdminWindows, SharedLookupWindows, SharedSearchWindows, SharedSuggestWindows, WindowNode,
     WindowedAdminService, WindowedLookupService, WindowedSearchService, WindowedSuggestService,
+    NOT_PRIMARY, UNIT_NOT_SERVED,
 };
 pub use write_service::WriteService;
 

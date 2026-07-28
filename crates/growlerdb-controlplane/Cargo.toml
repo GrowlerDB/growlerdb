@@ -14,6 +14,14 @@ serde_json.workspace = true
 thiserror.workspace = true
 fs2 = "0.4"
 argon2 = { version = "0.5", features = ["std"] }
+# OPTIONAL: the externalized (Postgres) registry backend for control-plane HA (D51). Behind the
+# `postgres` feature so the default build / single-binary path compile none of it — the embedded
+# JSON store stays the only backend unless a deployment opts in.
+postgres = { workspace = true, optional = true, features = ["with-serde_json-1"] }
+
+[features]
+# Compile the externalized Postgres registry backend (`PostgresBackend`). Off by default.
+postgres = ["dep:postgres"]
 
 [dev-dependencies]
 tempfile.workspace = true

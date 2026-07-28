@@ -337,7 +337,9 @@ async fn list_indexes_handler(
     Ok(Json(IndexListDto::from(resp.into_inner())))
 }
 
-/// Scale-limit license status for the console settings page (proxied to the control plane).
+/// Scale-limit license status for the console settings page (proxied to the control plane). The
+/// `*_nodes` fields keep their names but the accounting is **primary-held units** (D53) — replicas
+/// are free.
 #[derive(serde::Serialize)]
 struct LicenseDto {
     licensed: bool,
@@ -1382,6 +1384,7 @@ async fn facets_handler(
         .to_string();
         let req = grpc_request(
             AggregateRequest {
+                shard: 0,
                 query: dto.query.clone(),
                 aggs,
                 partial: false,
@@ -1449,6 +1452,7 @@ async fn describe_handler(
 ) -> Result<Json<IndexStatsDto>, ApiError> {
     let req = grpc_request(
         v1::DescribeIndexRequest {
+            shard: 0,
             index: dto.index,
             window: 0,
         },
@@ -1836,6 +1840,7 @@ const DEFAULT_PAGE_SIZE: u32 = 10;
 impl SearchDto {
     fn into_proto(self) -> SearchRequest {
         SearchRequest {
+            shard: 0,
             query: self.query,
             // A REST search with no `limit` gets a bounded page, not the entire result set.
             limit: if self.limit == 0 {
@@ -1938,6 +1943,7 @@ struct SemanticSearchDto {
 impl SemanticSearchDto {
     fn into_proto(self) -> v1::SemanticSearchRequest {
         v1::SemanticSearchRequest {
+            shard: 0,
             index: self.index,
             vector_field: self.vector_field,
             query_text: self.query_text,
@@ -2144,6 +2150,7 @@ struct SuggestDto {
 impl SuggestDto {
     fn into_proto(self) -> SuggestRequest {
         SuggestRequest {
+            shard: 0,
             field: self.field,
             text: self.text,
             limit: self.limit,
@@ -2355,6 +2362,7 @@ impl GetByKeyDto {
             .map(dto_to_coords)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(GetByKeyRequest {
+            shard: 0,
             keys,
             columns: self.columns,
             window: 0,

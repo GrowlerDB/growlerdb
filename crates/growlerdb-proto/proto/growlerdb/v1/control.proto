@@ -338,36 +338,95 @@ message RegisterServedIndexRequest {
   repeated ServedWindow windows = 4;  // for a windowed index: the windows this node serves (+ zone-maps)
   // The ordinal shard(s) **this node** serves. Non-empty ⇒ assign
   // only these ordinals to this endpoint, so node k can own only shard k of a `shard_count`-shard
-  // index. **Empty ⇒ this node serves all of `0..shard_count`** (the single-node default).
+  // index. **Empty ⇒ this node serves all of `0..shard_count`** (the single-node default) UNLESS
+  // `pool_managed` is set.
   repeated uint32 shard_ordinals = 5;
+  // Set by a **placement-pool** node (D52): its ordinals are CP-placed via `ResolveUnitOwner`, not
+  // claimed by announcement — so `shard_ordinals` lists **exactly** what it holds locally, and an
+  // empty list claims **nothing** (a replica-only / not-yet-assigned node registers the index entry
+  // + bucket map without grabbing every shard as primary — which would conflict with every peer). A
+  // classic single-node `serve` leaves this false, keeping the empty-⇒-all default.
+  bool pool_managed = 6;
 }
 
 message RegisterServedIndexResponse {
   string name = 1;  // the registered index name
 }
 
-// A windowed node announces itself to the control-plane placement pool — a liveness
-// heartbeat sent on startup and on an interval. The CP places each new time window on a live node
-// (fewest-loaded); a node that stops heartbeating past the TTL drops out of the pool and its windows
-// are re-placed on the next ResolveWindowOwner. This is the inverse of RegisterServedIndex: the CP
-// decides placement, rather than the node announcing what it already serves.
+// A node announces itself to the control-plane placement pool — a liveness heartbeat sent on
+// startup and on an interval. The pool is **index-agnostic** (D52): a node registers once as an
+// interchangeable shard host, and the CP places units (shards/windows) from any index on the
+// least-loaded live node; a node that stops heartbeating past the TTL drops out and its units are
+// re-placed on the next resolve. This is the inverse of RegisterServedIndex: the CP decides
+// placement, rather than the node announcing what it already serves.
 message RegisterNodeRequest {
-  string index = 1;     // the windowed index this node can serve windows for
-  string endpoint = 2;  // the node's routable gRPC endpoint, e.g. "http://node:50051"
+  // Field 1 was `string index` in the window-scoped predecessor of this message; the D52 rewrite
+  // made the pool index-agnostic. It is RESERVED (never reused) so an old binary's heartbeat can
+  // never decode its index name into a differently-meaning field — `endpoint` deliberately keeps
+  // tag 2, the tag it had in the old message, so old and new binaries agree on its meaning.
+  reserved 1;
+  reserved "index";
+  // The node's routable gRPC endpoint, e.g. "http://node:50051". Validated at RegisterNode
+  // (non-empty, `[http[s]://]host:port`) — a malformed endpoint is INVALID_ARGUMENT, never a pool
+  // entry that placement could prefer.
+  string endpoint = 2;
+  // Whether this node can serve **read replicas** (D53): replica windows are opened read-through
+  // from the shared object store, so only a node with an object store configured can serve them.
+  // The CP places replica units ONLY on nodes that declared this on their latest heartbeat —
+  // absent/false (including every pre-capability binary) means replicas never land here, instead of
+  // being silently assigned to a node that can never serve them (HA-G2). Primaries are unaffected:
+  // a primary writes its own local shard and needs no object store to serve it.
+  bool replica_capable = 3;
 }
 message RegisterNodeResponse {}
 
-// Resolve (assigning on first ask) the node that owns a time `window` of a windowed index:
-// the connector calls this with a row's computed window id to learn where to route the write.
-// Idempotent for a window already placed on a live node; an unassigned window — or one whose owner is
-// dead — is placed on the least-loaded live node and recorded.
-message ResolveWindowOwnerRequest {
+// Resolve (assigning on first ask) the node that owns a placement **unit** of an index — an ordinal
+// `shard` of a hash/partition-sharded index or a time `window` of a windowed one (D52). The connector
+// calls this with a row's computed unit to learn where to route the write. Idempotent for a unit
+// already placed on a live node; an unassigned unit — or one whose owner is dead — is placed on the
+// least-loaded live node and recorded. Generalizes the former window-only ResolveWindowOwner so hash
+// and windowed indexes share one placement path.
+message ResolveUnitOwnerRequest {
   string index = 1;
-  int64 window = 2;   // window id (epoch-ms of the window start)
+  // The unit to resolve. Required — an unset `unit` is an INVALID_ARGUMENT.
+  oneof unit {
+    uint32 shard = 2;   // ordinal shard of a hash/partition-sharded index
+    int64 window = 3;   // window id (epoch-ms of the window start) of a windowed index
+  }
 }
-message ResolveWindowOwnerResponse {
-  string endpoint = 1;  // the node that owns (or was just assigned) this window
-  bool created = 2;     // true iff this call made or moved the assignment
+message ResolveUnitOwnerResponse {
+  string endpoint = 1;  // the node that owns (or was just assigned) this unit
+  bool created = 2;     // true iff this call made or moved the PRIMARY assignment (fresh placement,
+                        // promotion, or dead-owner re-placement); replica-only churn (prune/top-up/
+                        // trim at R>1) does NOT set it
+}
+
+// D53 assignment push: a node subscribes with its endpoint and the control plane streams the set of
+// units it currently holds — a full SNAPSHOT on subscribe and again on EVERY placement change (the
+// push is wired at the registry's persist boundary, so every mutation path — resolve, announce,
+// drop-index, promote, remove-node, the dead-owner sweeper — pushes) — so the node reconciles its
+// serving set idempotently (open newly-assigned units, drop de-assigned ones) rather than tracking
+// deltas.
+message SubscribeAssignmentsRequest {
+  // The subscribing node's routable endpoint (its holder identity). Must name a CURRENTLY
+  // REGISTERED pool node (RegisterNode first) or the subscribe is FAILED_PRECONDITION. Trust model:
+  // this is still a claim, not an authenticated identity — the internal RPCs are mesh-trusted
+  // (ops scope + the shared service token); within the mesh a caller could heartbeat and subscribe
+  // as any endpoint. Assignment snapshots carry placement metadata only (no data-plane secrets).
+  string endpoint = 1;
+}
+// One unit this node holds, and in what role.
+message UnitAssignment {
+  string index = 1;
+  oneof unit {
+    uint32 shard = 2;   // ordinal shard of a hash-sharded index
+    int64 window = 3;   // window id of a windowed index
+  }
+  bool primary = 4;     // true = the primary (sole writer); false = a read replica (served read-through)
+}
+// The node's full current assignment set (a snapshot).
+message NodeAssignments {
+  repeated UnitAssignment units = 1;
 }
 
 // Ingestion (sync) status for one or all indexes — what the Ingestion screen renders. GrowlerDB
@@ -424,9 +483,14 @@ message GetLicenseResponse {
   bool licensed = 1;
   // Who the license is issued to (empty on the free tier).
   string licensee = 2;
-  // The entitled node cap (free-tier limit, or the license's max_nodes).
+  // The entitled scale cap, in **entitlement units** (D38/D53): distinct live
+  // (index, primary node) pairs — the free-tier limit or the license's entitlement. The field keeps
+  // its historical `max_nodes` name; its meaning has changed twice on this pre-release line (node
+  // processes → primary-held units → live index×primary-node pairs). Read replicas are free, and a
+  // windowed index accumulating windows on the same node costs a constant amount.
   uint32 max_nodes = 3;
-  // Distinct live index nodes currently registered.
+  // Entitlement units currently in use (the billable scale metric — distinct live
+  // (index, primary node) pairs; replicas excluded, dead nodes' pairs excluded).
   uint32 current_nodes = 4;
 }
 
@@ -454,11 +518,14 @@ service ControlPlane {
   rpc DescribeSource(DescribeSourceRequest) returns (DescribeSourceResponse);
   // A serving node self-registers its locally-built index + shard assignment.
   rpc RegisterServedIndex(RegisterServedIndexRequest) returns (RegisterServedIndexResponse);
-  // CP-driven windowed placement: a windowed node heartbeats into the placement pool
-  // (RegisterNode); the connector resolves each window's owning node (ResolveWindowOwner, placing on
-  // first ask).
+  // CP-driven pool placement: a node heartbeats into the placement pool (RegisterNode, index-agnostic);
+  // the connector resolves each unit's owning node (ResolveUnitOwner — a `(index, shard|window)` unit,
+  // placing on first ask).
   rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
-  rpc ResolveWindowOwner(ResolveWindowOwnerRequest) returns (ResolveWindowOwnerResponse);
+  rpc ResolveUnitOwner(ResolveUnitOwnerRequest) returns (ResolveUnitOwnerResponse);
+  // D53 assignment push: a node subscribes and the CP streams its current holder assignments (a
+  // snapshot on subscribe and on every placement change), so a placed replica starts serving.
+  rpc SubscribeAssignments(SubscribeAssignmentsRequest) returns (stream NodeAssignments);
   // Ingestion (sync) status: source head vs. each shard's committed checkpoint.
   rpc IngestionStatus(IngestionStatusRequest) returns (IngestionStatusResponse);
   // Scale-limit license status: the entitlement + current node usage, for the console.
