@@ -17,7 +17,7 @@ control-plane state (index defs, tokens, RBAC) survives an in-place upgrade, and
 control plane, placement pool, and replication are all **opt-in** (defaults are unchanged). Two
 things need attention: (1) upgrade the control plane, serving nodes, and the Spark connector
 **together** — one RPC was generalized (below), so old↔new across that boundary won't talk; and
-(2) the free-tier scale limit now counts **units, not processes** and is now enforced at registration
+(2) the free-tier scale limit now counts **nodes holding a primary** and is now enforced at registration
 — re-check the console's Enterprise-license panel (below). Compose users adopt the new topology.
 
 ### Added
@@ -46,13 +46,14 @@ things need attention: (1) upgrade the control plane, serving nodes, and the Spa
 
 ### Changed
 
-- **The free-tier scale limit now counts units, not node processes — and is enforced at
-  registration.** The AGPL free tier (3) now counts distinct live **`(index, primary node)`** units
-  rather than node processes, and `RegisterServedIndex` **enforces** the cap (it was previously
-  fail-open). A deploy that registered past the limit before can now be refused with
-  `RESOURCE_EXHAUSTED`; conversely, read replicas and additional windows on an already-counted index
-  are **free**. **Migration:** after upgrading, confirm your served-index count against the new
-  metric in the console's **Settings → Enterprise license** panel. (ADR [D38](okf/system/decisions/d38-scale-limit-entitlement.md))
+- **The free-tier scale limit now counts nodes holding a primary — and is enforced at
+  registration.** The AGPL free tier (3) counts distinct live **nodes that hold a primary of any
+  index**; read replicas, additional indexes, and windows whose primaries co-locate on an
+  already-counted node are **free** — so enforcement matches the marketed 3-node free tier. The cap is
+  still **enforced** at `RegisterServedIndex` (it was previously fail-open), so a deploy that lit up a
+  4th primary-holding node can be refused with `RESOURCE_EXHAUSTED`. **Migration:** after upgrading,
+  confirm your primary-holding node count against the metric in the console's **Settings → Enterprise
+  license** panel. (ADR [D38](okf/system/decisions/d38-scale-limit-entitlement.md))
 - **Coordinated upgrade required across the control-plane wire.** All gRPC changes are additive
   **except** the `ResolveWindowOwner`→`ResolveUnitOwner` generalization (see Removed). **Migration:**
   upgrade the control plane, serving nodes, and the Spark connector in one step — a mixed old/new

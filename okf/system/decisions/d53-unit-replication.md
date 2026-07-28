@@ -54,8 +54,8 @@ first queries, bounded by the pre-warm path ([D39](/system/decisions/d39-automat
 **Placement map grows** (R× entries, hotter re-placement traffic) — another reason the CP must be HA
 first ([D51](/system/decisions/d51-controlplane-ha.md)). **Entitlement**: replicas are additional
 running nodes, so the scale-limit entitlement ([D38](/system/decisions/d38-scale-limit-entitlement.md))
-must count *units*/primaries rather than raw node processes, or HA would eat the free tier — a policy
-follow-up. **One-writer enforcement is node-side too**: a holder running from CP assignments keeps an
+counts distinct **primary-holding nodes** — a node is free until it holds a primary — rather than raw
+node processes, or HA would eat the free tier. **One-writer enforcement is node-side too**: a holder running from CP assignments keeps an
 atomically-swapped primary-holder view and refuses `Write`/`GetCheckpoint` for units it does not hold
 as primary (structured `NOT_PRIMARY`; a replica-held read-through window is never overwritten by a
 misrouted write) — so a stale or split-brain connector cannot commit to, or fabricate a resume
