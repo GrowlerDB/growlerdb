@@ -68,6 +68,12 @@ for windowed units and following the same path for hash ordinals. The pool now *
 leader-only placement sweep distributes hash primaries round-robin, and a node the CP assigns a primary
 it doesn't hold **builds it on assignment** from source (single-shard today) — so the operator points N
 interchangeable nodes at the pool with a **uniform config** and the CP designates who owns what, no
-per-node build/primary designation. Live-verified end to end (define-only nodes → round-robin
-placement → build-on-assignment → replica read-through → zero-gap failover on a primary kill). See
+per-node build/primary designation. **Cold-start fast path:** a *never-placed* primary is placed as
+soon as a brief initial settle clears (`INITIAL_PLACEMENT_SETTLE_MS`, a few seconds — long enough for
+co-booting nodes to register so primaries round-robin balanced), rather than waiting out the full
+liveness grace ([`NODE_HEARTBEAT_TTL_MS`](/system/decisions/d53-unit-replication.md), ~30 s, which
+still gates *re-placement* of already-held units for anti-flap); the sweep ticks several times per
+heartbeat interval so a fresh pool converges in seconds. Live-verified end to end (define-only nodes →
+round-robin placement → build-on-assignment → replica read-through → zero-gap failover on a primary
+kill). See
 [node](/system/runtime/components/node.md) and [high availability](/system/high-availability.md).

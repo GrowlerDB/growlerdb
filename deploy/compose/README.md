@@ -59,8 +59,9 @@ a production deploy. Neither node is designated anything: each `--define-only`s 
 pool while the other node opens it **read-through** from the shared cold store (MinIO `growlerdb-cold`);
 a node made primary **builds that index from its Iceberg source on assignment**. So **kill either pool
 node and reads keep answering** via the survivor (`docker compose … stop pool-a` and query the gateway).
-The pool self-organizes after the control plane's ~30s placement grace, so `just stack` waits for the
-first index to become queryable before printing "ready". `just stack` activates the `stack` (control
+The pool self-organizes within a few seconds of both nodes registering (the control plane places each
+primary after a brief settle so they round-robin balanced), so `just stack` waits for the first index
+to become queryable before printing "ready". `just stack` activates the `stack` (control
 plane, gateway, LGTM) and `pool` (the two pool nodes) profiles, plus `demo-data`/`trino`/`variant` for
 the movies + events sources. The streaming demo (`just pipeline`) activates `stack` + `pipeline` and
 deliberately leaves `pool` out — it serves a single windowed `telemetry_stream` node instead.

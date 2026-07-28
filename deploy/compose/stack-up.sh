@@ -49,10 +49,11 @@ step 4 6 "HA placement pool (docs + catalog + movies at R=2)"
 # BUILDS the indexes it's made primary of from source (build-on-assignment); the other opens them
 # read-through from the shared cold store. So kill either pool node and reads keep answering.
 dc --profile stack --profile pool up -d --quiet-pull
-# Convergence: the pool self-organizes after the control plane's placement grace (one heartbeat TTL,
-# ~30s) — the primaries then build + register and the replicas open read-through. Wait until `docs` is
-# actually queryable through the gateway before declaring ready, so the console isn't hit mid-build.
-printf '    converging (build-on-assignment after the ~30s placement grace)'
+# Convergence: once both pool nodes register, the control plane places each index's primary (after a
+# brief settle so placement round-robins balanced) — the primaries then build + register and the
+# replicas open read-through. Wait until `docs` is actually queryable through the gateway before
+# declaring ready, so the console isn't hit mid-build.
+printf '    converging (build-on-assignment; the pool self-organizes in a few seconds)'
 for _ in $(seq 1 40); do
   if curl -fsS -m 5 http://localhost:8081/v1/search \
        -H 'content-type: application/json' -d '{"index":"docs","query":"*","limit":1}' 2>/dev/null \

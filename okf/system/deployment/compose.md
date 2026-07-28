@@ -56,8 +56,10 @@ nodes, the control plane does the rest", no per-node build/primary designation. 
 ([D35 multi-index routing](/system/decisions/d35-multi-index-routing.md)) and resolves lazily. The pool
 lives in the `pool` profile — `just stack` co-activates `stack`+`pool`, but the streaming demo
 (`just pipeline`, `stack`+`pipeline`) deliberately excludes it (it serves a single windowed
-`telemetry_stream` node instead). The pool self-organizes after the ~30s placement grace, so `just
-stack` waits for the first index to be queryable before reporting ready.
+`telemetry_stream` node instead). The pool self-organizes within a few seconds of both nodes
+registering (the control plane places never-placed primaries as soon as a brief settle clears, rather
+than waiting out the full liveness grace), so `just stack` waits for the first index to be queryable
+before reporting ready.
 The [getting-started](/product/interfaces/website.md) **query playground** exercises the `catalog`
 index through the gateway — every Lucene/KQL operator (term, phrase, keyword, set, numeric/float/date
 range, CIDR, wildcard, prefix, fuzzy, boost, bool, `NOT`, match-all, regex) against known rows. With

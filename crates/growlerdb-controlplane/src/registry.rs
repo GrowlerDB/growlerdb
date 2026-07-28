@@ -192,6 +192,13 @@ pub const NODE_REANNOUNCE_INTERVAL_MS: i64 = 10_000;
 /// re-placed within ~30 s (the sweeper runs at TTL/2).
 pub const NODE_HEARTBEAT_TTL_MS: i64 = 3 * NODE_REANNOUNCE_INTERVAL_MS;
 
+/// A brief settle window after the placement-grace anchor during which even **initial** placement
+/// holds off — much shorter than the full liveness grace ([`NODE_HEARTBEAT_TTL_MS`]). It gives
+/// co-booting pool nodes a moment to register so the first primaries round-robin **balanced** across
+/// the pool, instead of all landing on whichever node registered first. Never-placed units then
+/// place as soon as this clears (a few seconds), rather than waiting a full grace window.
+pub const INITIAL_PLACEMENT_SETTLE_MS: i64 = NODE_REANNOUNCE_INTERVAL_MS / 2;
+
 /// A persisted API token: long-lived programmatic credential. Only the secret's hash is stored —
 /// the raw secret is shown once at creation and never persisted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1916,6 +1923,19 @@ impl Registry {
             .store(anchor_ms, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Whether the brief **initial-placement settle** ([`INITIAL_PLACEMENT_SETTLE_MS`]) is still
+    /// active — the first few seconds after the grace anchor, during which even a *never-placed*
+    /// unit is held back so co-booting nodes can register and the first primaries place **balanced**.
+    /// Strictly shorter than [`placement_grace_active`](Self::placement_grace_active), which
+    /// additionally suppresses *re-placement* of already-held units for a full
+    /// [`NODE_HEARTBEAT_TTL_MS`].
+    pub fn initial_placement_settling(&self, now_ms: i64) -> bool {
+        let anchor = self
+            .grace_anchor_ms
+            .load(std::sync::atomic::Ordering::SeqCst);
+        anchor >= 0 && now_ms - anchor < INITIAL_PLACEMENT_SETTLE_MS
+    }
+
     /// Whether `endpoint` has a live pool heartbeat (within [`NODE_HEARTBEAT_TTL_MS`] of `now_ms`).
     /// Gate for `SubscribeAssignments` identity: only a currently-registered node may subscribe to
     /// an endpoint's assignment stream.
@@ -2397,18 +2417,26 @@ impl Registry {
     ///   write-driven resolve places each), so this only **tops up replicas** for windows *already*
     ///   placed — it never proactively creates a window.
     ///
-    /// Live-holder count is the primary + replicas whose node still heartbeats. Empty while the
-    /// [grace window](Self::placement_grace_active) is active (so a freshly-(re)started CP lets nodes
-    /// re-announce before it proactively places). Read-only.
+    /// Live-holder count is the primary + replicas whose node still heartbeats. **Cold-start fast
+    /// path:** a *never-placed* unit is placed as soon as the brief
+    /// [initial settle](Self::initial_placement_settling) clears (a few seconds — matching the
+    /// on-demand [`resolve_unit_holders`](Self::resolve_unit_holders), which already places fresh
+    /// units during grace); only *re-placement* / replica top-up of an already-held unit waits out
+    /// the full [grace window](Self::placement_grace_active) (HA-D5 anti-flap). Empty during the
+    /// initial settle (so co-booting nodes register first and primaries place balanced). Read-only.
     pub fn units_needing_placement(
         &self,
         replication_factor: usize,
         now_ms: i64,
     ) -> Vec<(String, Unit)> {
         let r = replication_factor.max(1);
-        if self.placement_grace_active(now_ms) {
+        // Hold everything for the brief initial settle so co-booting nodes register first.
+        if self.initial_placement_settling(now_ms) {
             return Vec::new();
         }
+        // Past the settle: place never-placed primaries even inside the grace window; only
+        // re-placement / replica top-up of an already-held unit still waits the full grace.
+        let grace = self.placement_grace_active(now_ms);
         let live: std::collections::BTreeSet<String> =
             self.live_nodes(now_ms).into_iter().collect();
         let live_holders =
@@ -2420,18 +2448,20 @@ impl Registry {
                 // Hash: proactively place + replicate every declared ordinal.
                 for ordinal in 0..e.definition.shard_count {
                     let needs = match e.shards.get(&ordinal) {
-                        None => true, // never placed → needs a primary
-                        Some(sa) if sa.primary.is_none() => true,
-                        Some(sa) => live_holders(sa) < r, // placed → under-replicated?
+                        None => true,                               // never placed → needs a primary
+                        Some(sa) if sa.primary.is_none() => true,   // no primary → place one
+                        Some(sa) => !grace && live_holders(sa) < r, // under-replicated → not during grace
                     };
                     if needs {
                         out.push((name.clone(), Unit::Shard(ordinal)));
                     }
                 }
             } else {
-                // Windowed: only top up replicas for windows the connector already placed.
+                // Windowed: only top up replicas for windows the connector already placed (never
+                // proactively created), and not while the grace window suppresses re-placement.
                 for (window, wa) in &e.windows {
-                    if wa.assignment.primary.is_some() && live_holders(&wa.assignment) < r {
+                    if !grace && wa.assignment.primary.is_some() && live_holders(&wa.assignment) < r
+                    {
                         out.push((name.clone(), Unit::Window(*window)));
                     }
                 }
@@ -2451,8 +2481,10 @@ impl Registry {
     /// whose holder set changed.
     ///
     /// The counterpart to [`sweep_dead_primaries`](Self::sweep_dead_primaries) (which promotes on a
-    /// dead *primary*); this places primaries + fills replicas. Respects the grace window and no-ops on
-    /// an empty pool. The **caller** gates on leadership (only the leader sweeps); the persist boundary
+    /// dead *primary*); this places primaries + fills replicas. Places never-placed primaries once the
+    /// brief initial settle clears, but respects the full grace window for *re-placement*
+    /// ([`units_needing_placement`](Self::units_needing_placement)) and no-ops on an empty pool. The
+    /// **caller** gates on leadership (only the leader sweeps); the persist boundary
     /// refuses a non-leader write (`NotLeader`), so a demotion race is safe.
     pub fn ensure_placement(
         &self,
@@ -3327,6 +3359,67 @@ mod tests {
         // Idempotent once every ordinal is placed at R=1.
         assert!(reg.units_needing_placement(1, t).is_empty());
         assert_eq!(reg.ensure_placement(1, usize::MAX, t).unwrap(), 0);
+    }
+
+    #[test]
+    fn cold_start_places_never_placed_primaries_after_the_settle_but_topup_waits_the_grace() {
+        // Cold-start fast path: a fresh CP places never-placed primaries as soon as the brief
+        // initial settle clears (a few seconds), NOT after the full ~30 s liveness grace — while
+        // replica top-up of an already-held unit still waits the grace out (HA-D5 anti-flap).
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
+        let mut def = resolved("idx");
+        def.shard_count = 2;
+        reg.create(def).unwrap();
+        let t0 = 1_000_000;
+        for n in ["node-a", "node-b"] {
+            reg.register_node(n, t0);
+        }
+        reg.set_placement_grace_anchor(t0); // a fresh CP arms the grace at its first heartbeat
+
+        // (1) During the initial settle: place nothing, so co-booting nodes register first.
+        assert!(reg.initial_placement_settling(t0));
+        assert!(
+            reg.units_needing_placement(1, t0).is_empty(),
+            "no placement during the initial settle"
+        );
+
+        // (2) Settle cleared but STILL inside the grace window: never-placed primaries place now.
+        let t1 = t0 + INITIAL_PLACEMENT_SETTLE_MS;
+        assert!(!reg.initial_placement_settling(t1));
+        assert!(
+            reg.placement_grace_active(t1),
+            "still within the grace window"
+        );
+        assert_eq!(
+            reg.units_needing_placement(1, t1),
+            vec![
+                ("idx".to_string(), Unit::Shard(0)),
+                ("idx".to_string(), Unit::Shard(1)),
+            ],
+            "never-placed primaries place during grace, once settled"
+        );
+        assert_eq!(reg.ensure_placement(1, usize::MAX, t1).unwrap(), 2);
+
+        // (3) Now placed at R=1; asking R=2 makes them under-replicated — but replica top-up must
+        //     NOT fire during the grace window.
+        assert!(reg.placement_grace_active(t1));
+        assert!(
+            reg.units_needing_placement(2, t1).is_empty(),
+            "replica top-up of a held unit waits out the grace"
+        );
+
+        // (4) Once the grace clears (nodes still heartbeating), top-up resumes.
+        let t2 = t0 + NODE_HEARTBEAT_TTL_MS + 1;
+        for n in ["node-a", "node-b"] {
+            reg.register_node(n, t2); // re-heartbeat; does not re-arm the (already-armed) anchor
+        }
+        assert!(!reg.placement_grace_active(t2));
+        assert_eq!(
+            reg.units_needing_placement(2, t2).len(),
+            2,
+            "both units want a replica once the grace clears"
+        );
     }
 
     #[test]

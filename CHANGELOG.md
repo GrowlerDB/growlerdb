@@ -32,7 +32,10 @@ things need attention: (1) upgrade the control plane, serving nodes, and the Spa
   each index's **primaries round-robin** across the pool (least-loaded, liveness-grace-aware), and a
   node assigned a primary it doesn't hold **builds that index from its Iceberg source on assignment**
   (build-on-assignment). HA becomes "run N identical nodes"; no per-node build/primary designation,
-  and the classic per-index `serve` remains supported. (ADR [D52](okf/system/decisions/d52-placement-pool.md))
+  and the classic per-index `serve` remains supported. A **cold-start fast path** places never-placed
+  primaries as soon as a brief settle clears (a few seconds) instead of waiting out the full liveness
+  grace, so a fresh pool (e.g. `just stack`) converges in seconds while re-placement of already-held
+  units keeps the full grace for anti-flap. (ADR [D52](okf/system/decisions/d52-placement-pool.md))
 - **Per-unit replication + read failover (D53).** A cluster-wide **replication factor R** places
   R holders per unit (one primary + R−1 read replicas); the gateway **fails reads over** to a live
   replica when a holder is down, replicas serve **read-through from the shared cold store** (object
