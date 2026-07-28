@@ -89,6 +89,15 @@ things need attention: (1) upgrade the control plane, serving nodes, and the Spa
 
 ### Fixed
 
+- **Semantic and hybrid search no longer fail with `501 Unimplemented` on placement-pool
+  deployments.** The Gateway's `ShardNode`/`WindowNode` routing wrappers overrode only the original
+  read methods, so `semantic_search` (and thus hybrid search's vector arm) fell through to the `Node`
+  trait's `Unimplemented` default instead of being stamped with the shard/window selector and
+  forwarded to the serving node. The wrappers now delegate every `Node` method — `semantic_search`,
+  `explain`, and the index-mutation methods (`reindex_index`, `alter_index`, `compact_index`,
+  `backup_index`, `backup_status`) — to their inner node, so an admin op that a pool node doesn't
+  support now surfaces that node's own precise error rather than a generic `Unimplemented`.
+
 - **A classic `serve --index X` node's index is no longer stolen by the dead-owner sweeper.** Such a
   node announces only via `RegisterServedIndex` (never the `RegisterNode` heartbeat), so the control
   plane saw its owner as dead and re-placed the index onto a pool node — which then rejected reads

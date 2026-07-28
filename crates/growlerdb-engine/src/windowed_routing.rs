@@ -447,6 +447,15 @@ impl Node for WindowNode {
         self.inner.search(req).await
     }
 
+    async fn semantic_search(
+        &self,
+        mut req: Request<SemanticSearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        let r = req.get_mut();
+        self.stamp(&mut r.index, &mut r.window);
+        self.inner.semantic_search(req).await
+    }
+
     async fn suggest(
         &self,
         mut req: Request<SuggestRequest>,
@@ -481,6 +490,60 @@ impl Node for WindowNode {
         let r = req.get_mut();
         self.stamp(&mut r.index, &mut r.window);
         self.inner.aggregate(req).await
+    }
+
+    async fn explain(
+        &self,
+        mut req: Request<ExplainRequest>,
+    ) -> Result<Response<ExplainResponse>, Status> {
+        let r = req.get_mut();
+        r.index.clone_from(&self.index);
+        self.inner.explain(req).await
+    }
+
+    async fn reindex_index(
+        &self,
+        mut req: Request<ReindexIndexRequest>,
+    ) -> Result<Response<ReindexIndexResponse>, Status> {
+        let r = req.get_mut();
+        r.index.clone_from(&self.index);
+        self.inner.reindex_index(req).await
+    }
+
+    async fn alter_index(
+        &self,
+        mut req: Request<AlterIndexRequest>,
+    ) -> Result<Response<AlterIndexResponse>, Status> {
+        let r = req.get_mut();
+        r.index.clone_from(&self.index);
+        self.inner.alter_index(req).await
+    }
+
+    async fn compact_index(
+        &self,
+        mut req: Request<CompactIndexRequest>,
+    ) -> Result<Response<CompactIndexResponse>, Status> {
+        let r = req.get_mut();
+        r.index.clone_from(&self.index);
+        self.inner.compact_index(req).await
+    }
+
+    async fn backup_index(
+        &self,
+        mut req: Request<BackupIndexRequest>,
+    ) -> Result<Response<BackupIndexResponse>, Status> {
+        let r = req.get_mut();
+        r.index.clone_from(&self.index);
+        self.inner.backup_index(req).await
+    }
+
+    async fn backup_status(
+        &self,
+        mut req: Request<BackupStatusRequest>,
+    ) -> Result<Response<BackupStatusResponse>, Status> {
+        let r = req.get_mut();
+        r.index.clone_from(&self.index);
+        self.inner.backup_status(req).await
     }
 }
 
@@ -531,6 +594,15 @@ impl Node for ShardNode {
         self.inner.search(req).await
     }
 
+    async fn semantic_search(
+        &self,
+        mut req: Request<SemanticSearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        let r = req.get_mut();
+        self.stamp(&mut r.index, &mut r.shard);
+        self.inner.semantic_search(req).await
+    }
+
     async fn suggest(
         &self,
         mut req: Request<SuggestRequest>,
@@ -565,6 +637,60 @@ impl Node for ShardNode {
         let r = req.get_mut();
         self.stamp(&mut r.index, &mut r.shard);
         self.inner.aggregate(req).await
+    }
+
+    async fn explain(
+        &self,
+        mut req: Request<ExplainRequest>,
+    ) -> Result<Response<ExplainResponse>, Status> {
+        let r = req.get_mut();
+        r.index.clone_from(&self.index);
+        self.inner.explain(req).await
+    }
+
+    async fn reindex_index(
+        &self,
+        mut req: Request<ReindexIndexRequest>,
+    ) -> Result<Response<ReindexIndexResponse>, Status> {
+        let r = req.get_mut();
+        r.index.clone_from(&self.index);
+        self.inner.reindex_index(req).await
+    }
+
+    async fn alter_index(
+        &self,
+        mut req: Request<AlterIndexRequest>,
+    ) -> Result<Response<AlterIndexResponse>, Status> {
+        let r = req.get_mut();
+        r.index.clone_from(&self.index);
+        self.inner.alter_index(req).await
+    }
+
+    async fn compact_index(
+        &self,
+        mut req: Request<CompactIndexRequest>,
+    ) -> Result<Response<CompactIndexResponse>, Status> {
+        let r = req.get_mut();
+        r.index.clone_from(&self.index);
+        self.inner.compact_index(req).await
+    }
+
+    async fn backup_index(
+        &self,
+        mut req: Request<BackupIndexRequest>,
+    ) -> Result<Response<BackupIndexResponse>, Status> {
+        let r = req.get_mut();
+        r.index.clone_from(&self.index);
+        self.inner.backup_index(req).await
+    }
+
+    async fn backup_status(
+        &self,
+        mut req: Request<BackupStatusRequest>,
+    ) -> Result<Response<BackupStatusResponse>, Status> {
+        let r = req.get_mut();
+        r.index.clone_from(&self.index);
+        self.inner.backup_status(req).await
     }
 }
 
@@ -720,6 +846,13 @@ mod tests {
             self.record(&req.get_ref().index, req.get_ref().window);
             Ok(Response::new(SearchResponse::default()))
         }
+        async fn semantic_search(
+            &self,
+            req: Request<SemanticSearchRequest>,
+        ) -> Result<Response<SearchResponse>, Status> {
+            self.record(&req.get_ref().index, req.get_ref().window);
+            Ok(Response::new(SearchResponse::default()))
+        }
         async fn suggest(
             &self,
             req: Request<SuggestRequest>,
@@ -756,6 +889,83 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rec.seen(), ("logs".to_string(), 7));
+    }
+
+    #[tokio::test]
+    async fn window_node_stamps_the_unit_onto_semantic_search() {
+        let rec = Arc::new(RecordingNode(Mutex::new((String::new(), -1))));
+        let node = WindowNode::new(rec.clone(), "logs", 7);
+        // Regression guard: before this override existed, semantic_search fell through to the Node
+        // trait's `Unimplemented` default (the 501 that broke semantic/hybrid search on pool nodes).
+        // It must now stamp the (index, window) unit and forward, exactly like `search`.
+        node.semantic_search(Request::new(SemanticSearchRequest {
+            query_text: "hello".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        assert_eq!(rec.seen(), ("logs".to_string(), 7));
+    }
+
+    /// A [`Node`] that records the `(index, shard)` selector of the last request it received — the
+    /// hash-shard counterpart to [`RecordingNode`], for asserting [`ShardNode`] stamping.
+    struct ShardRecordingNode(Mutex<(String, u32)>);
+
+    impl ShardRecordingNode {
+        fn seen(&self) -> (String, u32) {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    #[tonic::async_trait]
+    impl Node for ShardRecordingNode {
+        async fn search(
+            &self,
+            req: Request<SearchRequest>,
+        ) -> Result<Response<SearchResponse>, Status> {
+            *self.0.lock().unwrap() = (req.get_ref().index.clone(), req.get_ref().shard);
+            Ok(Response::new(SearchResponse::default()))
+        }
+        async fn semantic_search(
+            &self,
+            req: Request<SemanticSearchRequest>,
+        ) -> Result<Response<SearchResponse>, Status> {
+            *self.0.lock().unwrap() = (req.get_ref().index.clone(), req.get_ref().shard);
+            Ok(Response::new(SearchResponse::default()))
+        }
+        async fn suggest(
+            &self,
+            _req: Request<SuggestRequest>,
+        ) -> Result<Response<SuggestResponse>, Status> {
+            Ok(Response::new(SuggestResponse::default()))
+        }
+        async fn get_by_key(
+            &self,
+            _req: Request<GetByKeyRequest>,
+        ) -> Result<Response<GetByKeyResponse>, Status> {
+            Ok(Response::new(GetByKeyResponse::default()))
+        }
+        async fn describe_index(
+            &self,
+            _req: Request<DescribeIndexRequest>,
+        ) -> Result<Response<DescribeIndexResponse>, Status> {
+            Ok(Response::new(DescribeIndexResponse::default()))
+        }
+    }
+
+    #[tokio::test]
+    async fn shard_node_stamps_the_unit_onto_semantic_search() {
+        let rec = Arc::new(ShardRecordingNode(Mutex::new((String::new(), u32::MAX))));
+        let node = ShardNode::new(rec.clone(), "catalog", 3);
+        // Same regression guard for the hash-shard wrapper: semantic_search must stamp the
+        // (index, ordinal) unit onto `index` + `shard` and forward, not 501 on the trait default.
+        node.semantic_search(Request::new(SemanticSearchRequest {
+            query_text: "hello".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        assert_eq!(rec.seen(), ("catalog".to_string(), 3));
     }
 
     async fn suggest_texts(
