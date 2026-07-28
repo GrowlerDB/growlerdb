@@ -483,14 +483,13 @@ message GetLicenseResponse {
   bool licensed = 1;
   // Who the license is issued to (empty on the free tier).
   string licensee = 2;
-  // The entitled scale cap, in **entitlement units** (D38/D53): distinct live
-  // (index, primary node) pairs — the free-tier limit or the license's entitlement. The field keeps
-  // its historical `max_nodes` name; its meaning has changed twice on this pre-release line (node
-  // processes → primary-held units → live index×primary-node pairs). Read replicas are free, and a
-  // windowed index accumulating windows on the same node costs a constant amount.
+  // The entitled scale cap, as a count of distinct **primary-holding nodes** (D38/D53, Option A):
+  // the free-tier limit or the license's entitlement. The name is literal — it counts nodes that
+  // hold a primary of any index. Read replicas are free, and additional indexes (or windows) whose
+  // primaries co-locate on an already-counted node cost nothing.
   uint32 max_nodes = 3;
-  // Entitlement units currently in use (the billable scale metric — distinct live
-  // (index, primary node) pairs; replicas excluded, dead nodes' pairs excluded).
+  // Distinct primary-holding nodes currently in use (the scale metric — replicas excluded, and
+  // nodes tracked stale past their heartbeat TTL excluded).
   uint32 current_nodes = 4;
 }
 

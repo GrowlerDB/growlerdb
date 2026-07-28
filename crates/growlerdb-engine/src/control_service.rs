@@ -272,13 +272,13 @@ impl ControlPlaneService {
         self
     }
 
-    /// The entitled cap in **primary-held units** (D53): the license's `max_nodes` claim (whose
-    /// meaning is now units — replicas are free), or [`FREE_UNIT_LIMIT`](crate::license::FREE_UNIT_LIMIT).
-    fn entitled_units(&self) -> usize {
+    /// The entitled cap in **distinct primary-holding nodes** (D38/D53, Option A): the license's
+    /// `max_nodes` claim (replicas are free), or [`FREE_NODE_LIMIT`](crate::license::FREE_NODE_LIMIT).
+    fn entitled_nodes(&self) -> usize {
         self.license
             .as_ref()
             .map(|l| l.max_nodes as usize)
-            .unwrap_or(crate::license::FREE_UNIT_LIMIT)
+            .unwrap_or(crate::license::FREE_NODE_LIMIT)
     }
 
     /// Install an [authenticator](crate::authn) so the control plane validates the bearer itself —
@@ -605,16 +605,16 @@ fn registry_status(e: RegistryError) -> Status {
         ),
         // Scale entitlement (D38/D53): a NEW placement past the cap. RESOURCE_EXHAUSTED so callers
         // distinguish "buy/raise the limit" from a transient failure.
-        RegistryError::EntitlementExceeded { units, entitled } => to_status(
+        RegistryError::EntitlementExceeded { nodes, entitled } => to_status(
             Code::ResourceExhausted,
             WireError::new(
                 "RESOURCE_EXHAUSTED",
                 format!(
-                    "scale limit reached: {units} entitlement units in use (distinct index × \
-                     primary-node pairs), entitlement is {entitled} (free tier is {}). Read \
-                     replicas are free; an Enterprise license raises the limit — see \
-                     COMM-LICENSE.md.",
-                    crate::license::FREE_UNIT_LIMIT,
+                    "scale limit reached: {nodes} primary-serving nodes in use, entitlement is \
+                     {entitled} (free tier is {}). Read replicas and additional indexes co-located \
+                     on already-counted nodes are free; an Enterprise license raises the limit — \
+                     see COMM-LICENSE.md.",
+                    crate::license::FREE_NODE_LIMIT,
                 ),
             ),
         ),
@@ -1490,7 +1490,7 @@ impl ControlPlane for ControlPlaneService {
                     &owned,
                     &req.endpoint,
                     now_ms(),
-                    self.entitled_units(),
+                    self.entitled_nodes(),
                 )
                 .map_err(registry_status)?;
             // Every ordinal index is bucketed from its first announce (no long-lived legacy
@@ -1522,7 +1522,7 @@ impl ControlPlane for ControlPlaneService {
                     &req.endpoint,
                     &announces,
                     now_ms(),
-                    self.entitled_units(),
+                    self.entitled_nodes(),
                 )
                 .map_err(registry_status)?;
         }
@@ -1544,9 +1544,10 @@ impl ControlPlane for ControlPlaneService {
         // skewed node clock can't fake liveness. In-memory only — no persist. The pool is
         // index-agnostic (D52): a node registers once as an interchangeable shard host.
         //
-        // Node registration is **uncapped** (D53): the scale entitlement counts *primary-held units*,
-        // not node processes, so a read-replica node adds capacity for free and never trips a node
-        // limit — the cap is enforced at unit placement (`ResolveUnitOwner`) instead.
+        // Node registration is **uncapped** (D53/D38 Option A): the scale entitlement counts distinct
+        // *primary-holding nodes*, so registering a node (or a read-replica node) adds capacity for
+        // free and never trips the limit — the cap is enforced at unit placement (`ResolveUnitOwner` /
+        // the `RegisterServedIndex` announce) instead.
         //
         // The node's replica-capability declaration rides the heartbeat (HA-G2): only a node with
         // an object store can serve replica windows read-through, so replica placement filters on
@@ -1568,11 +1569,11 @@ impl ControlPlane for ControlPlaneService {
                 .as_ref()
                 .map(|l| l.licensee.clone())
                 .unwrap_or_default(),
-            // The proto fields keep their historical `*_nodes` names, but the accounting is
-            // **entitlement units** (D38/D53): distinct live (index, primary node) pairs — replicas
-            // don't count (HA is free) and an accumulating windowed index costs a constant amount.
-            max_nodes: self.entitled_units() as u32,
-            current_nodes: self.registry.count_entitlement_units(now_ms()) as u32,
+            // The `*_nodes` fields mean literal distinct **primary-holding nodes** (D38/D53, Option
+            // A): `max_nodes` is the entitlement cap, `current_nodes` the current usage — replicas
+            // don't count (HA is free), and packing many indexes' primaries on one node counts once.
+            max_nodes: self.entitled_nodes() as u32,
+            current_nodes: self.registry.count_entitlement_nodes(now_ms()) as u32,
         }))
     }
 
@@ -1600,18 +1601,19 @@ impl ControlPlane for ControlPlaneService {
             other => registry_status(other),
         };
         // One placement path for every R (D53): resolve places 1 primary + R−1 read replicas.
-        // The scale entitlement (D38/D53: distinct live (index, primary node) pairs) is enforced
-        // ATOMICALLY inside the registry's placement critical section — a new pair beyond the cap is
-        // RESOURCE_EXHAUSTED; re-resolves and dead-owner re-placement always pass, so a live cluster
-        // is never disrupted, and replicas are free. Placement pushes ride the registry's
-        // placement-change hook, so every subscribed holder gets its fresh snapshot.
+        // The scale entitlement (D38/D53: distinct live primary-holding nodes) is enforced
+        // ATOMICALLY inside the registry's placement critical section — lighting up a node beyond the
+        // cap is RESOURCE_EXHAUSTED (at the cap a fresh unit packs onto an already-primary node);
+        // re-resolves and dead-owner re-placement always pass, so a live cluster is never disrupted,
+        // and replicas are free. Placement pushes ride the registry's placement-change hook, so every
+        // subscribed holder gets its fresh snapshot.
         let holders = self
             .registry
             .resolve_unit_holders(
                 &req.index,
                 unit,
                 self.replication_factor,
-                self.entitled_units(),
+                self.entitled_nodes(),
                 now_ms(),
             )
             .map_err(to_status)?;
@@ -1875,7 +1877,7 @@ impl ControlPlaneService {
         use growlerdb_controlplane::NODE_HEARTBEAT_TTL_MS;
         let registry = self.registry.clone();
         let replication_factor = self.replication_factor;
-        let entitled = self.entitled_units();
+        let entitled = self.entitled_nodes();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(
                 (NODE_HEARTBEAT_TTL_MS / 2).max(1000) as u64,
@@ -1910,7 +1912,7 @@ impl ControlPlaneService {
         use growlerdb_controlplane::NODE_REANNOUNCE_INTERVAL_MS;
         let registry = self.registry.clone();
         let replication_factor = self.replication_factor;
-        let entitled = self.entitled_units();
+        let entitled = self.entitled_nodes();
         tokio::spawn(async move {
             // Sweep several times per heartbeat interval so the cold-start pool self-organizes within
             // a few seconds of the initial settle (build-on-assignment then serves), instead of on a
@@ -2541,14 +2543,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn entitlement_counts_live_index_node_pairs_not_units_or_processes() {
-        // D53/D38 (updated for HA-D3c): the scale cap is on distinct live (index, primary node)
-        // PAIRS, enforced atomically at placement — node registration is uncapped, a windowed index
-        // accumulating windows on already-paired nodes costs nothing new, and only a genuinely new
-        // index×node pair past the cap is refused. (This test replaced the old per-unit-count
-        // metric test: under that metric a free-tier daily-windowed index bricked in 3 days.)
+    async fn entitlement_counts_distinct_primary_nodes_not_units_or_processes() {
+        // D53/D38 (Option A): the scale cap is on distinct live **primary-holding nodes**, enforced
+        // atomically at placement — node registration is uncapped, a windowed index accumulating
+        // windows on already-primary nodes costs nothing new, and at the cap a fresh unit (of the
+        // same OR a different index) packs onto an already-primary node rather than bricking. (The
+        // per-unit count this replaced bricked a free-tier daily-windowed index in 3 days.)
         let tmp = tempfile::tempdir().unwrap();
-        let svc = service(tmp.path()); // R=1, no license → 3-pair free tier
+        let svc = service(tmp.path()); // R=1, no license → 3-node free tier
         svc.registry.create(resolved_windowed("logs")).unwrap();
         // Register MORE nodes than the cap — registration is uncapped.
         for i in 0..6 {
@@ -2565,40 +2567,46 @@ mod tests {
                 unit: Some(growlerdb_proto::v1::resolve_unit_owner_request::Unit::Window(w)),
             }))
         };
-        // Three windows spread onto three distinct nodes = three pairs → within the free tier.
+        let counted = ["http://n0:50051", "http://n1:50051", "http://n2:50051"];
+        // Three windows spread onto three distinct nodes → the free-tier cap of 3 nodes.
         for w in [10_i64, 20, 30] {
             assert!(resolve("logs", w).await.is_ok(), "window {w} within cap");
         }
-        // The 4th-day scenario (lifetime-brick fix): a 4th window does NOT exhaust the entitlement —
-        // at the cap it packs onto a node already primarying this index instead of a fresh node.
+        // The 4th-day scenario (lifetime-brick fix): a 4th window does NOT light up a new node —
+        // at the cap it packs onto a node already holding a primary instead of a fresh node.
         let w40 = resolve("logs", 40).await.expect("4th window still places");
         assert!(
-            ["http://n0:50051", "http://n1:50051", "http://n2:50051"]
-                .contains(&w40.into_inner().endpoint.as_str()),
-            "at the cap a new window packs onto an already-paired node"
+            counted.contains(&w40.into_inner().endpoint.as_str()),
+            "at the cap a new window packs onto an already-primary node"
         );
-        // Re-resolving an already-placed unit passes too (never a new pair).
+        // Re-resolving an already-placed unit passes too (never a new node).
         assert!(resolve("logs", 10).await.is_ok(), "idempotent re-resolve");
-        // A genuinely NEW pair past the cap — a fresh index has no paired node to fall back to —
-        // is refused RESOURCE_EXHAUSTED.
+        // A FRESH index at the cap also packs onto an already-primary node (node semantics: a new
+        // index co-located on a counted node is free — this is the resolve path's soft-pack, not a
+        // brick). The hard refusal lives on the fixed-endpoint announce path (its own test).
         svc.registry.create(resolved_windowed("audit")).unwrap();
-        assert_eq!(
-            resolve("audit", 10).await.unwrap_err().code(),
-            Code::ResourceExhausted,
-            "a 4th index×node pair is over the free-tier limit"
+        let a10 = resolve("audit", 10)
+            .await
+            .expect("fresh index packs at cap");
+        assert!(
+            counted.contains(&a10.into_inner().endpoint.as_str()),
+            "a fresh index at the cap co-locates on an already-counted node"
         );
-        // GetLicense reports PAIRS (3), not units (4 windows) and not the 6 registered nodes.
+        // GetLicense reports NODES (3), not units (5 windows) and not the 6 registered nodes.
         let lic = svc
             .get_license(Request::new(GetLicenseRequest {}))
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(lic.current_nodes, 3, "3 live index×node pairs serving");
+        assert_eq!(
+            lic.current_nodes, 3,
+            "3 distinct primary-holding nodes serving"
+        );
         assert_eq!(lic.max_nodes, 3, "free-tier entitlement");
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn replicas_are_free_against_the_unit_entitlement() {
+    async fn replicas_are_free_against_the_node_entitlement() {
         // AC#1: enabling replication (R>1) doesn't reduce the allowance — a replica is no new primary.
         let tmp = tempfile::tempdir().unwrap();
         let svc = service(tmp.path()).with_replication_factor(2);
@@ -2611,7 +2619,8 @@ mod tests {
             .await
             .unwrap();
         }
-        // 3 units at R=2 = 3 primaries + 3 replicas = 6 holder slots, but only 3 PRIMARY units.
+        // 3 units at R=2 = 3 primaries + 3 replicas = 6 holder slots, but the primaries land on only
+        // 2 distinct nodes (see below).
         for w in [10_i64, 20, 30] {
             assert!(
                 svc.resolve_unit_owner(Request::new(ResolveUnitOwnerRequest {
@@ -2630,12 +2639,11 @@ mod tests {
             .into_inner();
         // Deterministic placement over n0..n3: w10 → primary n0 (+replica n1), w20 → primary n2
         // (+replica n3), w30 → primary n0 again (all loads tied → smallest endpoint). That's 6
-        // holder slots but only TWO distinct (logs, primary-node) pairs — replicas never count,
-        // and re-using a primary node is free (updated with the HA-D3c pair metric; this test
-        // formerly asserted 3 under the per-unit count).
+        // holder slots but only TWO distinct primary-holding nodes — replicas never count, and
+        // re-using a primary node is free.
         assert_eq!(
             lic.current_nodes, 2,
-            "2 live index×node pairs — the 3 read replicas don't consume the entitlement"
+            "2 distinct primary-holding nodes — the 3 read replicas don't consume the entitlement"
         );
     }
 
@@ -2945,10 +2953,11 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn register_served_index_enforces_the_entitlement() {
-        // HA-D3a: RegisterServedIndex is no longer an entitlement bypass — the 4th index×node pair
-        // on the free tier is RESOURCE_EXHAUSTED, fail-closed even though nobody heartbeats.
+        // HA-D3a: RegisterServedIndex is no longer an entitlement bypass — a primary on the 4th
+        // distinct node on the free tier is RESOURCE_EXHAUSTED, fail-closed even though nobody
+        // heartbeats.
         let tmp = tempfile::tempdir().unwrap();
-        let svc = service(tmp.path()); // no license → FREE_UNIT_LIMIT (3) pairs
+        let svc = service(tmp.path()); // no license → FREE_NODE_LIMIT (3) nodes
         for (i, name) in ["docs", "logs", "events"].iter().enumerate() {
             svc.register_served_index(Request::new(RegisterServedIndexRequest {
                 definition_json: serde_json::to_string(&resolved(name)).unwrap(),

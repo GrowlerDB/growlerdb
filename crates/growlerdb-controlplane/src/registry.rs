@@ -294,12 +294,14 @@ pub enum RegistryError {
     #[error("no live node to place {unit} of `{index}` (none heartbeated within the TTL)")]
     NoLiveNode { index: String, unit: String },
     /// Placing a **new** unit would grow the deployment's entitlement usage past its cap (D38: the
-    /// metric is distinct live `(index, primary node)` pairs — see
-    /// [`count_entitlement_units`](Registry::count_entitlement_units)). Existing units are never
+    /// metric is distinct live nodes holding a primary of any index — see
+    /// [`count_entitlement_nodes`](Registry::count_entitlement_nodes)). Existing units are never
     /// disrupted: re-resolves and dead-owner re-placement always pass. Maps to gRPC
     /// `RESOURCE_EXHAUSTED`.
-    #[error("scale limit reached: {units} entitlement units in use, entitlement is {entitled}")]
-    EntitlementExceeded { units: usize, entitled: usize },
+    #[error(
+        "scale limit reached: {nodes} primary-serving nodes in use, entitlement is {entitled}"
+    )]
+    EntitlementExceeded { nodes: usize, entitled: usize },
     /// Another process holds the registry's exclusive lock — single-writer is enforced, so a
     /// second control plane fails fast rather than last-writer-wins clobbering.
     #[error("registry `{0}` is locked by another process")]
@@ -1449,7 +1451,8 @@ impl Registry {
     ///   serving report and the primary is left untouched. A confidently-dead primary is taken over
     ///   (the node-restart-at-a-new-endpoint flow).
     /// - **Entitlement (fail-closed):** taking primaries of shards that never had one is gated on
-    ///   `entitled_units` exactly like `resolve` — a new `(index, endpoint)` pair past the cap is
+    ///   `entitled_nodes` exactly like `resolve` — admitting a primary on a node that is not already
+    ///   primary-holding, once the cap is reached, is
     ///   [`EntitlementExceeded`](RegistryError::EntitlementExceeded) (`RESOURCE_EXHAUSTED`).
     pub fn announce_primaries(
         &self,
@@ -1457,7 +1460,7 @@ impl Registry {
         shards: &[u32],
         endpoint: &str,
         now_ms: i64,
-        entitled_units: usize,
+        entitled_nodes: usize,
     ) -> Result<()> {
         if shards.is_empty() {
             return Ok(());
@@ -1495,13 +1498,11 @@ impl Registry {
         }
         // Fresh primaries past the cap fail closed — checked in the same critical section.
         if any_fresh {
-            let pairs = self.entitlement_pairs(&map, now_ms);
-            if !pairs.contains(&(index.to_string(), endpoint.to_string()))
-                && pairs.len() >= entitled_units
-            {
+            let nodes = self.entitlement_nodes(&map, now_ms);
+            if !nodes.contains(endpoint) && nodes.len() >= entitled_nodes {
                 return Err(RegistryError::EntitlementExceeded {
-                    units: pairs.len(),
-                    entitled: entitled_units,
+                    nodes: nodes.len(),
+                    entitled: entitled_nodes,
                 });
             }
         }
@@ -1535,15 +1536,15 @@ impl Registry {
     /// primaried by a live foreign node refuses the announce (`PlacementConflict`) unless the
     /// announcer is a listed replica (serving report — bounds/tier from a replica are ignored; the
     /// primary's report is authoritative). All fresh windows of one announce cost at most **one**
-    /// new entitlement pair (`(index, endpoint)`), so an accumulating windowed index never grows
-    /// its entitlement footprint.
+    /// new primary-holding node (`endpoint`), and none at all when the endpoint already holds a
+    /// primary, so an accumulating windowed index never grows its entitlement footprint.
     pub fn announce_windows(
         &self,
         index: &str,
         endpoint: &str,
         windows: &[WindowAnnounce],
         now_ms: i64,
-        entitled_units: usize,
+        entitled_nodes: usize,
     ) -> Result<()> {
         if windows.is_empty() {
             return Ok(());
@@ -1582,13 +1583,11 @@ impl Registry {
             }
         }
         if any_fresh {
-            let pairs = self.entitlement_pairs(&map, now_ms);
-            if !pairs.contains(&(index.to_string(), endpoint.to_string()))
-                && pairs.len() >= entitled_units
-            {
+            let nodes = self.entitlement_nodes(&map, now_ms);
+            if !nodes.contains(endpoint) && nodes.len() >= entitled_nodes {
                 return Err(RegistryError::EntitlementExceeded {
-                    units: pairs.len(),
-                    entitled: entitled_units,
+                    nodes: nodes.len(),
+                    entitled: entitled_nodes,
                 });
             }
         }
@@ -1963,11 +1962,11 @@ impl Registry {
     }
 
     /// Whether an assigned owner `endpoint` is **tracked in the pool and stale past the TTL** —
-    /// the only state in which its entitlement pairs stop counting. Stricter than
+    /// the only state in which its node stops counting toward entitlement. Stricter than
     /// [`owner_confidently_dead`](Self::owner_confidently_dead): an owner the pool has *never*
     /// tracked (announce-only deployments, or a pre-restart corpse) keeps **counting** — the
     /// entitlement fails closed on unknown liveness — even though dead-owner *actions* may treat it
-    /// as replaceable (availability first; a re-placement moves the pair, never multiplies it).
+    /// as replaceable (availability first; a re-placement moves the primary, never multiplies nodes).
     fn owner_tracked_stale(&self, endpoint: &str, now_ms: i64) -> bool {
         self.node_pool
             .read()
@@ -2021,37 +2020,40 @@ impl Registry {
             .count()
     }
 
-    /// The deployment's **entitlement usage** (D38/D53): the number of distinct **live
-    /// `(index, primary node)` pairs** — for each index, how many nodes currently hold primaries of
-    /// its units. This caps *concurrent scale* (indexes × the node slots that serve them), never
-    /// lifetime usage: a windowed index accumulating windows on one node costs **one** unit forever
-    /// (the fix for the free-tier "3 daily windows and the deployment bricks" failure), while an
-    /// index spread across N primary nodes costs N. Read replicas are free (they're never a pair's
-    /// primary). A pair whose node is **tracked in the pool and stale past the TTL** stops counting
-    /// (its units are about to be re-placed, which re-creates the pair elsewhere — net constant).
-    /// **Unknown liveness counts** — during the grace window, and for owners the pool has never
-    /// tracked (announce-only deployments with no heartbeats) — so the metric fails closed.
-    pub fn count_entitlement_units(&self, now_ms: i64) -> usize {
+    /// The deployment's **entitlement usage** (D38/D53, Option A): the number of distinct **live
+    /// nodes that hold ≥1 primary of any index**. This caps *concurrent scale* by node — the scale
+    /// lever that matches the marketed "3 nodes" free tier — never lifetime usage: a windowed index
+    /// accumulating windows on one node costs **one** node forever (the fix for the free-tier "3
+    /// daily windows and the deployment bricks" failure), and packing primaries of many indexes onto
+    /// one node still costs **one**. Read replicas are free (they're never a primary). A node
+    /// **tracked in the pool and stale past the TTL** stops counting (its primaries are about to be
+    /// re-placed, which lands them on a live node — net constant). **Unknown liveness counts** —
+    /// during the grace window, and for owners the pool has never tracked (announce-only deployments
+    /// with no heartbeats) — so the metric fails closed.
+    pub fn count_entitlement_nodes(&self, now_ms: i64) -> usize {
         let map = self.read_map();
-        self.entitlement_pairs(&map, now_ms).len()
+        self.entitlement_nodes(&map, now_ms).len()
     }
 
-    /// The live `(index, primary endpoint)` pair set behind
-    /// [`count_entitlement_units`](Self::count_entitlement_units). Takes the already-held `indexes`
-    /// guard so placement paths can count **inside the same critical section as the mutation**
-    /// (the HA-D3 TOCTOU fix). Takes `node_pool` briefly per owner — that lock is independent and
-    /// never taken in the reverse order.
-    fn entitlement_pairs(
+    /// The set of distinct live **primary-holding node endpoints** behind
+    /// [`count_entitlement_nodes`](Self::count_entitlement_nodes): every node that holds a primary of
+    /// any index, deduped across indexes. A node holding primaries of several indexes counts once;
+    /// replicas never appear; a node tracked in the pool and stale past its TTL drops out, while
+    /// unknown-liveness / grace-window owners are kept (fails closed). Takes the already-held
+    /// `indexes` guard so placement paths can count **inside the same critical section as the
+    /// mutation** (the HA-D3 TOCTOU fix). Takes `node_pool` briefly per owner — that lock is
+    /// independent and never taken in the reverse order.
+    fn entitlement_nodes(
         &self,
         map: &BTreeMap<String, IndexEntry>,
         now_ms: i64,
-    ) -> BTreeSet<(String, String)> {
-        let mut pairs = BTreeSet::new();
-        for (name, e) in map.iter() {
+    ) -> BTreeSet<String> {
+        let mut nodes = BTreeSet::new();
+        for e in map.values() {
             let mut add = |primary: Option<&NodeId>| {
                 if let Some(p) = primary {
                     if !self.owner_tracked_stale(&p.0, now_ms) {
-                        pairs.insert((name.clone(), p.0.clone()));
+                        nodes.insert(p.0.clone());
                     }
                 }
             };
@@ -2062,7 +2064,7 @@ impl Registry {
                 add(wa.assignment.primary.as_ref());
             }
         }
-        pairs
+        nodes
     }
 
     /// The endpoints of nodes whose heartbeat is within [`NODE_HEARTBEAT_TTL_MS`] of `now_ms` — the
@@ -2088,10 +2090,10 @@ impl Registry {
         &self,
         index: &str,
         unit: Unit,
-        entitled_units: usize,
+        entitled_nodes: usize,
         now_ms: i64,
     ) -> Result<(String, bool)> {
-        let h = self.resolve_unit_holders(index, unit, 1, entitled_units, now_ms)?;
+        let h = self.resolve_unit_holders(index, unit, 1, entitled_nodes, now_ms)?;
         Ok((h.primary, h.moved))
     }
 
@@ -2101,10 +2103,10 @@ impl Registry {
         &self,
         index: &str,
         window: i64,
-        entitled_units: usize,
+        entitled_nodes: usize,
         now_ms: i64,
     ) -> Result<(String, bool)> {
-        self.resolve_unit_owner(index, Unit::Window(window), entitled_units, now_ms)
+        self.resolve_unit_owner(index, Unit::Window(window), entitled_nodes, now_ms)
     }
 
     /// The units `endpoint` currently holds, as `(index, unit, is_primary)` — a node's **assignment
@@ -2161,14 +2163,15 @@ impl Registry {
     /// freshly (re)started or promoted control plane never mass-re-places laggards' units onto the
     /// first re-registrant. Fresh (never-assigned) units still place normally.
     ///
-    /// **Entitlement (HA-D3, atomic):** placing a **fresh** unit is checked against `entitled_units`
-    /// (distinct live `(index, primary node)` pairs — see
-    /// [`count_entitlement_units`](Self::count_entitlement_units)) inside the same write-lock
+    /// **Entitlement (HA-D3, atomic):** placing a **fresh** unit is checked against `entitled_nodes`
+    /// (distinct live primary-holding nodes — see
+    /// [`count_entitlement_nodes`](Self::count_entitlement_nodes)) inside the same write-lock
     /// critical section as the mutation, so concurrent resolves can't race past the cap. At the cap,
-    /// placement falls back to a live node **already holding a primary of this index** (no new pair
-    /// — a windowed index keeps accumulating windows at constant entitlement cost); with no such
-    /// node it fails [`EntitlementExceeded`](RegistryError::EntitlementExceeded). Re-resolves and
-    /// dead-owner re-placement are never entitlement-gated (existing capacity, not new).
+    /// placement falls back to a live node **already holding a primary of any index** (no new node
+    /// counted — a windowed index keeps accumulating windows, and a new index co-locates, at constant
+    /// entitlement cost); with no such node it fails
+    /// [`EntitlementExceeded`](RegistryError::EntitlementExceeded). Re-resolves and dead-owner
+    /// re-placement are never entitlement-gated (existing capacity, not new).
     ///
     /// Errors if the index is unregistered or no node is live (retryable, as before). Re-placing a
     /// dead owner's unit only moves the *assignment* — the new owner rebuilds that unit's data from
@@ -2178,7 +2181,7 @@ impl Registry {
         index: &str,
         unit: Unit,
         replication_factor: usize,
-        entitled_units: usize,
+        entitled_nodes: usize,
         now_ms: i64,
     ) -> Result<UnitHolders> {
         let r = replication_factor.max(1);
@@ -2210,14 +2213,9 @@ impl Registry {
         // Entitlement inputs, computed under the SAME write-lock acquisition as the mutation below
         // (the HA-D3 TOCTOU fix). Only a fresh (never-assigned) unit is gated, so only then compute.
         let fresh_unit = unit_primary(&map[index], unit).is_none();
-        let (pair_count, index_nodes): (usize, BTreeSet<String>) = if fresh_unit {
-            let pairs = self.entitlement_pairs(&map, now_ms);
-            let index_nodes = pairs
-                .iter()
-                .filter(|(i, _)| i == index)
-                .map(|(_, n)| n.clone())
-                .collect();
-            (pairs.len(), index_nodes)
+        let (node_count, primary_nodes): (usize, BTreeSet<String>) = if fresh_unit {
+            let n = self.entitlement_nodes(&map, now_ms);
+            (n.len(), n)
         } else {
             (0, BTreeSet::new())
         };
@@ -2262,18 +2260,18 @@ impl Registry {
                 // Never co-locate the primary on a node still listed as a replica of this unit.
                 let exclude: BTreeSet<String> = a.replicas.iter().map(|n| n.0.clone()).collect();
                 let mut pick = pick_least_loaded(&load, &exclude).expect("live pool non-empty");
-                // Atomic entitlement gate for a FRESH unit: at the cap, only nodes already primarying
-                // this index (no new pair) may take it.
-                if fresh_unit && pair_count >= entitled_units && !index_nodes.contains(&pick) {
+                // Atomic entitlement gate for a FRESH unit: at the cap, only nodes already holding a
+                // primary of any index (no new node counted) may take it.
+                if fresh_unit && node_count >= entitled_nodes && !primary_nodes.contains(&pick) {
                     let allowed: BTreeMap<String, usize> = load
                         .iter()
-                        .filter(|(ep, _)| index_nodes.contains(*ep))
+                        .filter(|(ep, _)| primary_nodes.contains(*ep))
                         .map(|(ep, c)| (ep.clone(), *c))
                         .collect();
                     pick = pick_least_loaded(&allowed, &exclude).ok_or(
                         RegistryError::EntitlementExceeded {
-                            units: pair_count,
-                            entitled: entitled_units,
+                            nodes: node_count,
+                            entitled: entitled_nodes,
                         },
                     )?;
                 }
@@ -2378,7 +2376,7 @@ impl Registry {
     pub fn sweep_dead_primaries(
         &self,
         replication_factor: usize,
-        entitled_units: usize,
+        entitled_nodes: usize,
         now_ms: i64,
     ) -> Result<usize> {
         if self.live_nodes(now_ms).is_empty() {
@@ -2390,7 +2388,7 @@ impl Registry {
                 &index,
                 unit,
                 replication_factor,
-                entitled_units,
+                entitled_nodes,
                 now_ms,
             ) {
                 Ok(h) if h.moved => swept += 1,
@@ -2489,7 +2487,7 @@ impl Registry {
     pub fn ensure_placement(
         &self,
         replication_factor: usize,
-        entitled_units: usize,
+        entitled_nodes: usize,
         now_ms: i64,
     ) -> Result<usize> {
         if self.live_nodes(now_ms).is_empty() {
@@ -2501,7 +2499,7 @@ impl Registry {
                 &index,
                 unit,
                 replication_factor,
-                entitled_units,
+                entitled_nodes,
                 now_ms,
             ) {
                 Ok(h) if h.changed => topped += 1,
@@ -4137,48 +4135,50 @@ mod tests {
                 "window {w} re-placed on the live node"
             );
         }
-        // Idempotent: a second sweep has nothing to move; the pair count stayed constant.
+        // Idempotent: a second sweep has nothing to move; the node count stayed constant.
         assert_eq!(reg.sweep_dead_primaries(1, 1, t1).unwrap(), 0);
-        assert_eq!(reg.count_entitlement_units(t1), 1);
+        assert_eq!(reg.count_entitlement_nodes(t1), 1);
     }
 
     #[test]
     fn entitlement_check_is_atomic_under_concurrent_resolves() {
         // HA-D3b: check+place happen under ONE write-lock acquisition, so N racing resolves of
-        // fresh units admit exactly `entitled` new pairs — never more.
+        // fresh units never spread primaries over more than `entitled` distinct nodes — past the
+        // cap they pack onto already-primary-holding nodes. Without the atomic check two resolves
+        // could each see "1 node used" and each light up a fresh node, blowing the cap.
         let tmp = tempfile::tempdir().unwrap();
         let reg = Arc::new(Registry::open(tmp.path().join("registry.json")).unwrap());
         let t0 = 1_000_000;
         for i in 0..8 {
             reg.create(resolved(&format!("idx{i}"))).unwrap();
         }
-        reg.register_node("node-a", t0);
+        // A pool wide enough that, unchecked, the race could scatter primaries over 8 nodes.
+        for i in 0..8 {
+            reg.register_node(&format!("node-{i}"), t0);
+        }
         let admitted = std::sync::atomic::AtomicUsize::new(0);
-        let refused = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|s| {
             for i in 0..8 {
-                let (reg, admitted, refused) = (&reg, &admitted, &refused);
+                let (reg, admitted) = (&reg, &admitted);
                 s.spawn(move || {
                     match reg.resolve_unit_owner(&format!("idx{i}"), Unit::Shard(0), 2, t0) {
                         Ok(_) => admitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
-                        Err(RegistryError::EntitlementExceeded { .. }) => {
-                            refused.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                        }
                         Err(e) => panic!("unexpected error: {e}"),
                     };
                 });
             }
         });
-        assert_eq!(admitted.load(std::sync::atomic::Ordering::SeqCst), 2);
-        assert_eq!(refused.load(std::sync::atomic::Ordering::SeqCst), 6);
-        assert_eq!(reg.count_entitlement_units(t0), 2);
+        // Every resolve succeeds (packing never bricks), but only `entitled` = 2 distinct nodes
+        // ever hold a primary despite the 8-way race.
+        assert_eq!(admitted.load(std::sync::atomic::Ordering::SeqCst), 8);
+        assert_eq!(reg.count_entitlement_nodes(t0), 2);
     }
 
     #[test]
     fn windowed_index_costs_constant_entitlement_over_time() {
-        // The 4th-day scenario (HA-D3c): windows accumulate forever, but a single windowed index
-        // never grows past its (index, primary node) pair — at the cap, new windows pack onto the
-        // node already primarying the index instead of a fresh node.
+        // The 4th-day scenario (HA-D3c): windows accumulate forever, but a windowed index never
+        // lights up a second node — at the cap, new windows pack onto the node already primarying
+        // the index instead of a fresh node.
         let tmp = tempfile::tempdir().unwrap();
         let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
         reg.create(resolved("logs")).unwrap();
@@ -4190,13 +4190,40 @@ mod tests {
                 .resolve_unit_owner("logs", Unit::Window(w), 1, t0)
                 .unwrap();
             assert!(created, "window {w} placed");
-            assert_eq!(ep, "node-a", "every window packs onto the one paired node");
+            assert_eq!(ep, "node-a", "every window packs onto the one primary node");
         }
         assert_eq!(
-            reg.count_entitlement_units(t0),
+            reg.count_entitlement_nodes(t0),
             1,
-            "10 windows ⇒ still one entitlement unit"
+            "10 windows ⇒ still one primary-holding node"
         );
+    }
+
+    #[test]
+    fn fresh_index_at_cap_packs_onto_an_already_primary_node() {
+        // Option A (b): at the node cap, a *fresh index's* primary lands on a node that already
+        // holds a primary (of any index) rather than lighting up an unused live node.
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
+        reg.create(resolved("docs")).unwrap();
+        reg.create(resolved("logs")).unwrap();
+        let t0 = 1_000_000;
+        reg.register_node("node-a", t0);
+        reg.register_node("node-b", t0);
+        // docs' primary lights up node-a — the one node the cap of 1 allows.
+        let (ep, _) = reg
+            .resolve_unit_owner("docs", Unit::Shard(0), 1, t0)
+            .unwrap();
+        assert_eq!(ep, "node-a");
+        // A *different* index at the cap must co-locate on node-a, never take the idle node-b.
+        let (ep, _) = reg
+            .resolve_unit_owner("logs", Unit::Shard(0), 1, t0)
+            .unwrap();
+        assert_eq!(
+            ep, "node-a",
+            "fresh index packs onto the already-primary node"
+        );
+        assert_eq!(reg.count_entitlement_nodes(t0), 1, "still one node");
     }
 
     #[test]
@@ -4403,9 +4430,10 @@ mod tests {
 
     #[test]
     fn announces_enforce_the_entitlement_fail_closed() {
-        // HA-D3a: RegisterServedIndex is no longer an entitlement bypass — fresh primaries an
-        // announce creates are capped exactly like resolve-placed ones, and untracked (announce-
-        // only) owners COUNT (fail-closed), so the cap can't be dodged by never heartbeating.
+        // HA-D3a: RegisterServedIndex is no longer an entitlement bypass — a fresh primary an
+        // announce creates on a *new* node is capped exactly like resolve-placed ones, and
+        // untracked (announce-only) owners COUNT (fail-closed), so the cap can't be dodged by never
+        // heartbeating. Co-locating on an already-primary node is free (node semantics, Option A).
         let tmp = tempfile::tempdir().unwrap();
         let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
         for name in ["docs", "logs"] {
@@ -4414,7 +4442,7 @@ mod tests {
         let t0 = 1_000_000;
         reg.announce_primaries("docs", &[0], "node-a", t0, 1)
             .unwrap();
-        // A second index is a new (index, node) pair — over the cap, whichever endpoint announces.
+        // A second index on a *different* node is a new primary-holding node — over the cap of 1.
         assert!(matches!(
             reg.announce_primaries("logs", &[0], "node-b", t0, 1),
             Err(RegistryError::EntitlementExceeded { .. })
@@ -4422,7 +4450,7 @@ mod tests {
         assert!(matches!(
             reg.announce_windows(
                 "logs",
-                "node-a",
+                "node-b",
                 &[WindowAnnounce {
                     window: 10,
                     bounds: None,
@@ -4433,12 +4461,54 @@ mod tests {
             ),
             Err(RegistryError::EntitlementExceeded { .. })
         ));
-        // More shards of an already-paired index are free; so is an idempotent re-announce.
+        // But a *different index* whose primary co-locates on the already-counted node-a is free —
+        // node count, not (index, node) pairs, is the metric.
+        reg.announce_primaries("logs", &[0], "node-a", t0, 1)
+            .unwrap();
+        // More shards of an already-primary node are free; so is an idempotent re-announce.
         reg.announce_primaries("docs", &[1, 2], "node-a", t0, 1)
             .unwrap();
         reg.announce_primaries("docs", &[0], "node-a", t0, 1)
             .unwrap();
-        assert_eq!(reg.count_entitlement_units(t0), 1);
+        assert_eq!(reg.count_entitlement_nodes(t0), 1);
+    }
+
+    #[test]
+    fn entitlement_node_cap_allows_demo_shape_and_refuses_a_fourth_node() {
+        // Option A (c)+(d): the free tier is 3 *nodes*. The 4-index demo shape (docs, catalog,
+        // movies on the pool + events on its own node = 3 primary-holding nodes) fits under 3, and a
+        // primary landing on a 4th distinct node is refused — while co-locating a 5th index on an
+        // already-counted node stays free.
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
+        for name in ["docs", "catalog", "movies", "events", "extra"] {
+            reg.create(resolved(name)).unwrap();
+        }
+        let t0 = 1_000_000;
+        let cap = 3;
+        // Three distinct primary-holding nodes across four indexes — the marketed demo, allowed.
+        reg.announce_primaries("docs", &[0], "node-pool-a", t0, cap)
+            .unwrap();
+        reg.announce_primaries("catalog", &[0], "node-pool-a", t0, cap)
+            .unwrap(); // co-located on pool-a — free
+        reg.announce_primaries("movies", &[0], "node-pool-b", t0, cap)
+            .unwrap();
+        reg.announce_primaries("events", &[0], "node-events", t0, cap)
+            .unwrap();
+        assert_eq!(
+            reg.count_entitlement_nodes(t0),
+            3,
+            "4 indexes over 3 nodes fits the free tier"
+        );
+        // A primary on a 4th distinct node is refused.
+        assert!(matches!(
+            reg.announce_primaries("extra", &[0], "node-four", t0, cap),
+            Err(RegistryError::EntitlementExceeded { .. })
+        ));
+        // But co-locating that 5th index on an already-counted node is free.
+        reg.announce_primaries("extra", &[0], "node-pool-b", t0, cap)
+            .unwrap();
+        assert_eq!(reg.count_entitlement_nodes(t0), 3);
     }
 
     #[test]
@@ -4515,7 +4585,7 @@ mod tests {
     }
 
     #[test]
-    fn entitlement_drops_tracked_stale_pairs_but_counts_untracked_owners() {
+    fn entitlement_drops_tracked_stale_nodes_but_counts_untracked_owners() {
         let tmp = tempfile::tempdir().unwrap();
         let reg = Registry::open(tmp.path().join("registry.json")).unwrap();
         reg.create(resolved("logs")).unwrap();
@@ -4523,16 +4593,16 @@ mod tests {
         reg.register_node("node-a", t0);
         reg.resolve_unit_owner("logs", Unit::Window(1), usize::MAX, t0)
             .unwrap();
-        assert_eq!(reg.count_entitlement_units(t0), 1);
-        // Tracked and stale past the TTL (grace long over): the pair stops counting — its unit is
-        // about to be re-placed, which re-creates the pair elsewhere.
+        assert_eq!(reg.count_entitlement_nodes(t0), 1);
+        // Tracked and stale past the TTL (grace long over): the node stops counting — its primary is
+        // about to be re-placed, which lands it on a live node.
         let t1 = t0 + NODE_HEARTBEAT_TTL_MS + 1;
-        assert_eq!(reg.count_entitlement_units(t1), 0);
+        assert_eq!(reg.count_entitlement_nodes(t1), 0);
         // An owner the pool never tracked (announce-only) counts at ANY time — fail-closed.
         reg.create(resolved("docs")).unwrap();
         reg.announce_primaries("docs", &[0], "node-x", t1, usize::MAX)
             .unwrap();
-        assert_eq!(reg.count_entitlement_units(t1), 1);
+        assert_eq!(reg.count_entitlement_nodes(t1), 1);
     }
 
     #[test]

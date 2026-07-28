@@ -57,8 +57,8 @@ built-in credentials, session epochs, and the per-index activity log.
 - **First-wins announces** — a `RegisterServedIndex` claim on a unit primaried by a live foreign
   node is `PLACEMENT_CONFLICT` (idempotent re-announce and dead-owner takeover stay allowed; a
   listed replica's announce is a serving report). The scale entitlement
-  ([D38](/system/decisions/d38-scale-limit-entitlement.md): distinct live index × primary-node
-  pairs) is enforced atomically inside placement on both the resolve and announce paths.
+  ([D38](/system/decisions/d38-scale-limit-entitlement.md): distinct live primary-holding nodes) is
+  enforced atomically inside placement on both the resolve and announce paths.
 
 ## Internal-RPC credential
 

@@ -6,20 +6,20 @@
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 
-/// The free tier: a deployment using at most this many **entitlement units** needs no license. An
-/// entitlement unit is one distinct live **`(index, primary node)` pair** — the D38/D53 metric of
-/// *concurrent* scale, never lifetime usage: a windowed index accumulating windows on one node costs
-/// one unit forever (the per-window count bricked a free-tier daily index in 3 days), read replicas
-/// are free (never a pair's primary), and only tracked-and-heartbeat-stale nodes' pairs stop
-/// counting (unknown liveness counts — fail-closed). Enforced atomically inside registry placement
-/// (`resolve_unit_holders` / the `RegisterServedIndex` announce paths).
-/// See [D38](/system/decisions/d38-scale-limit-entitlement.md).
-pub const FREE_UNIT_LIMIT: usize = 3;
+/// The free tier: a deployment using at most this many **nodes** needs no license. The metric is the
+/// number of distinct live **nodes that hold a primary of any index** (D38/D53, Option A) — the
+/// metric of *concurrent* scale, never lifetime usage: a windowed index accumulating windows on one
+/// node costs one node forever (the per-window count bricked a free-tier daily index in 3 days),
+/// packing primaries of many indexes onto one node still costs one, read replicas are free (never a
+/// primary), and only tracked-and-heartbeat-stale nodes stop counting (unknown liveness counts —
+/// fail-closed). Enforced atomically inside registry placement (`resolve_unit_holders` / the
+/// `RegisterServedIndex` announce paths). See [D38](/system/decisions/d38-scale-limit-entitlement.md).
+pub const FREE_NODE_LIMIT: usize = 3;
 
 /// GrowlerDB LLC's license-signing **public** key (Ed25519) — the production key. Licenses are minted
 /// offline with the matching **private** key, which is held privately by GrowlerDB LLC and never lives
 /// in this repository; only this public half ships, to verify tokens at startup. The free tier works
-/// without any license — a valid license is only needed to exceed [`FREE_UNIT_LIMIT`]. Rotating the key
+/// without any license — a valid license is only needed to exceed [`FREE_NODE_LIMIT`]. Rotating the key
 /// means minting against a new keypair and shipping its public half here.
 const LICENSE_PUBLIC_KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
 MCowBQYDK2VwAyEAyizufq7Ro4/FzX0FhQqH2945GnMat7aYVr2Vf0kzGks=\n\
@@ -29,9 +29,9 @@ MCowBQYDK2VwAyEAyizufq7Ro4/FzX0FhQqH2945GnMat7aYVr2Vf0kzGks=\n\
 struct Claims {
     /// Who the license is issued to (shown in the console).
     licensee: String,
-    /// Maximum **entitlement units** this license entitles (the D38/D53 metric: distinct live
-    /// `(index, primary node)` pairs — replicas free, window accumulation free). The signed claim
-    /// keeps the historical `max_nodes` name; its meaning is entitlement units.
+    /// Maximum **distinct primary-holding nodes** this license entitles (the D38/D53 Option-A
+    /// metric — replicas free, window accumulation free, many indexes co-located on one node free).
+    /// The signed claim's `max_nodes` name is now literal: it counts nodes.
     max_nodes: u32,
     /// Optional expiry (unix seconds). Parsed but NOT enforced yet — see task-266.
     #[serde(default)]
