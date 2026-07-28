@@ -1437,6 +1437,13 @@ impl ControlPlane for ControlPlaneService {
         self.gate("RegisterServedIndex", &request)?;
         let req = request.into_inner();
         validate_endpoint(&req.endpoint)?;
+        // Heartbeat the owner into the liveness pool: a classic `serve --index X` node only ever
+        // announces via RegisterServedIndex (never RegisterNode), so without this the dead-owner
+        // sweeper would see its owner as dead and steal its self-declared units onto a pool node
+        // (which then rejects reads for that index). This records LIVENESS ONLY — the endpoint is not
+        // made placement-eligible, so the CP still never assigns POOL units to it (Registry::
+        // touch_node_liveness / placement_nodes).
+        self.registry.touch_node_liveness(&req.endpoint, now_ms());
         // The node ships its already-resolved definition (its `index.json`), so registration is a
         // pure registry op — no source round-trip (unlike CreateIndex, which resolves YAML).
         let resolved: ResolvedIndex = serde_json::from_str(&req.definition_json)

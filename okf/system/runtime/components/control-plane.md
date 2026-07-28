@@ -30,6 +30,11 @@ built-in credentials, session epochs, and the per-index activity log.
   liveness TTL is **3×** that (**30 s**, `NODE_HEARTBEAT_TTL_MS`), so one lost/jittered heartbeat
   never ejects a healthy node. `RegisterNode` validates the endpoint (`[http[s]://]host:port`) —
   a malformed value fails loudly instead of seeding placement with a garbage node.
+- **Liveness vs. placement-eligibility** — a classic `serve --index X` node only ever calls
+  `RegisterServedIndex` (never `RegisterNode`), so the CP heartbeats it into the **liveness** pool on
+  every announce, keeping the dead-owner sweeper from stealing its self-declared units — but it is
+  **not** placement-eligible, so the CP never assigns it a pool unit it couldn't build or serve. Only
+  `RegisterNode` (a `serve-pool` node) is a placement target; placement draws from `live ∩ pool-eligible`.
 - **Pushes on every placement change** — `SubscribeAssignments` snapshots are pushed from a hook at
   the registry's **persist boundary** (fingerprint-filtered), so *every* mutation path — resolve,
   `RegisterServedIndex` re-point, drop-index, promote/remove-node, the sweeper, a promoted leader's
@@ -54,9 +59,12 @@ built-in credentials, session epochs, and the per-index activity log.
   assigned owners are treated live-unknown: dead-owner re-placement, announce takeovers, and the
   sweeper hold off, so a freshly (re)started CP never mass-re-places laggards' units onto the first
   re-registrant. Fresh placements and empty-pool retryable errors behave as before.
-- **First-wins announces** — a `RegisterServedIndex` claim on a unit primaried by a live foreign
-  node is `PLACEMENT_CONFLICT` (idempotent re-announce and dead-owner takeover stay allowed; a
-  listed replica's announce is a serving report). The scale entitlement
+- **First-wins announces (pool) / last-write-wins (classic)** — a `RegisterServedIndex` claim on a
+  unit primaried by a live foreign **pool-eligible** node is `PLACEMENT_CONFLICT` (a CP-assigned pool
+  primary can't be stolen; idempotent re-announce, dead-owner takeover, and a listed replica's serving
+  report stay allowed). A **classic** owner (non-pool-eligible, tracked only for liveness) is instead
+  **taken over** by a fresh announce — a classic index has a single self-declared owner, so a restart
+  at a new endpoint re-points it. The scale entitlement
   ([D38](/system/decisions/d38-scale-limit-entitlement.md): distinct live primary-holding nodes) is
   enforced atomically inside placement on both the resolve and announce paths.
 
