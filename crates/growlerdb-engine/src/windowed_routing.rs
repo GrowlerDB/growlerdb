@@ -447,6 +447,15 @@ impl Node for WindowNode {
         self.inner.search(req).await
     }
 
+    async fn semantic_search(
+        &self,
+        mut req: Request<SemanticSearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        let r = req.get_mut();
+        self.stamp(&mut r.index, &mut r.window);
+        self.inner.semantic_search(req).await
+    }
+
     async fn suggest(
         &self,
         mut req: Request<SuggestRequest>,
@@ -481,6 +490,60 @@ impl Node for WindowNode {
         let r = req.get_mut();
         self.stamp(&mut r.index, &mut r.window);
         self.inner.aggregate(req).await
+    }
+
+    async fn explain(
+        &self,
+        mut req: Request<ExplainRequest>,
+    ) -> Result<Response<ExplainResponse>, Status> {
+        let r = req.get_mut();
+        r.index.clone_from(&self.index);
+        self.inner.explain(req).await
+    }
+
+    async fn reindex_index(
+        &self,
+        mut req: Request<ReindexIndexRequest>,
+    ) -> Result<Response<ReindexIndexResponse>, Status> {
+        let r = req.get_mut();
+        r.index.clone_from(&self.index);
+        self.inner.reindex_index(req).await
+    }
+
+    async fn alter_index(
+        &self,
+        mut req: Request<AlterIndexRequest>,
+    ) -> Result<Response<AlterIndexResponse>, Status> {
+        let r = req.get_mut();
+        r.index.clone_from(&self.index);
+        self.inner.alter_index(req).await
+    }
+
+    async fn compact_index(
+        &self,
+        mut req: Request<CompactIndexRequest>,
+    ) -> Result<Response<CompactIndexResponse>, Status> {
+        let r = req.get_mut();
+        r.index.clone_from(&self.index);
+        self.inner.compact_index(req).await
+    }
+
+    async fn backup_index(
+        &self,
+        mut req: Request<BackupIndexRequest>,
+    ) -> Result<Response<BackupIndexResponse>, Status> {
+        let r = req.get_mut();
+        r.index.clone_from(&self.index);
+        self.inner.backup_index(req).await
+    }
+
+    async fn backup_status(
+        &self,
+        mut req: Request<BackupStatusRequest>,
+    ) -> Result<Response<BackupStatusResponse>, Status> {
+        let r = req.get_mut();
+        r.index.clone_from(&self.index);
+        self.inner.backup_status(req).await
     }
 }
 
@@ -531,6 +594,15 @@ impl Node for ShardNode {
         self.inner.search(req).await
     }
 
+    async fn semantic_search(
+        &self,
+        mut req: Request<SemanticSearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        let r = req.get_mut();
+        self.stamp(&mut r.index, &mut r.shard);
+        self.inner.semantic_search(req).await
+    }
+
     async fn suggest(
         &self,
         mut req: Request<SuggestRequest>,
@@ -565,6 +637,60 @@ impl Node for ShardNode {
         let r = req.get_mut();
         self.stamp(&mut r.index, &mut r.shard);
         self.inner.aggregate(req).await
+    }
+
+    async fn explain(
+        &self,
+        mut req: Request<ExplainRequest>,
+    ) -> Result<Response<ExplainResponse>, Status> {
+        let r = req.get_mut();
+        r.index.clone_from(&self.index);
+        self.inner.explain(req).await
+    }
+
+    async fn reindex_index(
+        &self,
+        mut req: Request<ReindexIndexRequest>,
+    ) -> Result<Response<ReindexIndexResponse>, Status> {
+        let r = req.get_mut();
+        r.index.clone_from(&self.index);
+        self.inner.reindex_index(req).await
+    }
+
+    async fn alter_index(
+        &self,
+        mut req: Request<AlterIndexRequest>,
+    ) -> Result<Response<AlterIndexResponse>, Status> {
+        let r = req.get_mut();
+        r.index.clone_from(&self.index);
+        self.inner.alter_index(req).await
+    }
+
+    async fn compact_index(
+        &self,
+        mut req: Request<CompactIndexRequest>,
+    ) -> Result<Response<CompactIndexResponse>, Status> {
+        let r = req.get_mut();
+        r.index.clone_from(&self.index);
+        self.inner.compact_index(req).await
+    }
+
+    async fn backup_index(
+        &self,
+        mut req: Request<BackupIndexRequest>,
+    ) -> Result<Response<BackupIndexResponse>, Status> {
+        let r = req.get_mut();
+        r.index.clone_from(&self.index);
+        self.inner.backup_index(req).await
+    }
+
+    async fn backup_status(
+        &self,
+        mut req: Request<BackupStatusRequest>,
+    ) -> Result<Response<BackupStatusResponse>, Status> {
+        let r = req.get_mut();
+        r.index.clone_from(&self.index);
+        self.inner.backup_status(req).await
     }
 }
 
