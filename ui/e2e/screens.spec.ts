@@ -10,10 +10,12 @@ test.describe('Observability', () => {
     await page.goto('/observability');
 
     await expect(page.getByRole('heading', { name: 'Observability' })).toBeVisible();
-    // Search is the default sub-tab: its hero chart + one card per SLI.
+    // Search is the default sub-tab: its hero chart + one card per SLI (query rate/errors, the
+    // retrieval + hydrate latency split, hydrate rate, stale/drift, cold-cache, query-status).
     await expect(page.getByText('Query latency', { exact: false })).toBeVisible();
-    await expect(page.locator('.dc-metric')).toHaveCount(8);
+    await expect(page.locator('.dc-metric')).toHaveCount(9);
     await expect(page.getByText('Query rate', { exact: true })).toBeVisible();
+    await expect(page.getByText('Retrieval latency p95')).toBeVisible();
     await expect(page.getByText('Cold cache hit rate')).toBeVisible();
     // Alerts strip: server rules answered (empty) ⇒ the "Server rules" badge + nothing firing.
     await expect(page.getByText('Server rules')).toBeVisible();
