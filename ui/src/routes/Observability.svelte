@@ -706,6 +706,9 @@
   function fmtNum(n: number): { value: string; unit: string } {
     if (n >= 1_000_000) return { value: (n / 1_000_000).toFixed(1), unit: 'M' };
     if (n >= 1000) return { value: (n / 1000).toFixed(1), unit: 'k' };
+    // Sub-unit values (e.g. a 0.29/s query rate) must keep decimals — otherwise Math.round collapses
+    // every small value and axis tick to "0", so a low-rate graph reads all "0/s".
+    if (n > 0 && n < 1) return { value: n < 0.01 ? n.toFixed(3) : n.toFixed(2), unit: '' };
     return { value: Math.round(n).toString(), unit: '' };
   }
 
