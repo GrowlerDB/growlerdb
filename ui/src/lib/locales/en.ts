@@ -100,8 +100,9 @@ export default {
   'search.modeHybrid': 'Hybrid',
   'search.vectorField': 'Vector field',
   'search.vectorFieldHint': 'The VECTOR field to embed the query against (semantic + hybrid).',
-  'search.k': 'Results (k)',
-  'search.kHint': 'Number of nearest neighbors returned (semantic + hybrid). Default 10.',
+  'search.k': 'Results',
+  'search.kHint':
+    'How many results to return — the k nearest neighbors (semantic + hybrid). Default 10.',
   'search.rrfK': 'RRF k',
   'search.rrfKHint': 'Reciprocal-Rank-Fusion constant — how sharply top ranks dominate the blend.',
   'search.moreLikeThis': 'More like this',

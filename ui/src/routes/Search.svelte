@@ -986,7 +986,9 @@
               <span class="muted">{t('search.shownOf', { shown: hits.length, total })}</span>
             </nav>
           {/if}
-        {:else if total > PAGE_SIZE}
+        {:else if mode === 'lexical' && total > PAGE_SIZE}
+          <!-- Offset pager is lexical-only. Semantic/hybrid return a single top-K page (no offset/
+               keyset paging), so all k hits are already shown — a pager there is misleading. -->
           <nav class="pager" aria-label={t('search.pager')}>
             <button type="button" onclick={() => page(-1)} disabled={offset === 0}>
               {t('search.prev')}
