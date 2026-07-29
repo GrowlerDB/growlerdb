@@ -71,7 +71,7 @@ describe('RRF presets', () => {
 describe('K presets', () => {
   it('offers the documented presets including the default', () => {
     expect(K_PRESETS).toContain(DEFAULT_K);
-    expect([...K_PRESETS]).toEqual([10, 25, 50, 100]);
+    expect([...K_PRESETS]).toEqual([10, 30, 60, 100]);
   });
 
   it('default k matches the engine fallback so it is sent as an omitted k', () => {
