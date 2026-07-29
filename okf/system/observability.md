@@ -22,7 +22,9 @@ dashboards don't depend on console polling.
 
 The **query** and **hydration** SLIs are labelled `{index}` — `growlerdb_query_{total,errors_total,duration_seconds}{index}`
 (the gateway labels with the *resolved* target index, so a default-index request attributes to its real
-index, not a blank; recorded on the lexical search path) and
+index, not a blank; recorded on the **lexical** path in `search_unadmitted` and the **semantic** path
+in the admitted `semantic_search` — a hybrid query records once via its lexical arm, so the two
+`_unadmitted` forms the hybrid arms reuse don't double-count) and
 `growlerdb_hydration_*{index}` / `growlerdb_stale_locators_total{index}` (the node labels with the served
 index). This makes the console's **Search** tab per-index under the scope selector. Labelling the two
 latency histograms multiplies their bucket series by the index count — bounded and acceptable for a small

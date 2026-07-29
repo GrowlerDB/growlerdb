@@ -1279,7 +1279,19 @@ impl Gateway {
         let hydrate_columns = std::mem::take(&mut req.get_mut().hydrate_columns);
         self.check_hydrate_page(hydrate, req.get_ref().k)?;
         let hydration = hydrate.then(|| (req.metadata().clone(), req.get_ref().index.clone()));
-        let mut resp = self.semantic_search_unadmitted(req).await?;
+        // Per-index query SLI for the semantic path: record the retrieval (excl. hydration, mirroring
+        // the lexical path's `search_unadmitted`). Recorded HERE at the admitted entry — NOT in
+        // `semantic_search_unadmitted`, which the hybrid semantic arm reuses — so a hybrid query is
+        // not double-counted (it already records once via its lexical arm's `search_unadmitted`).
+        let index_label = self.label_index(&req.get_ref().index);
+        let start = std::time::Instant::now();
+        let result = self.semantic_search_unadmitted(req).await;
+        growlerdb_telemetry::sli::query(
+            &index_label,
+            start.elapsed().as_secs_f64(),
+            result.is_err(),
+        );
+        let mut resp = result?;
         if let Some((meta, index)) = hydration {
             self.hydrate_hits(resp.get_mut(), meta, index, hydrate_columns)
                 .await;
