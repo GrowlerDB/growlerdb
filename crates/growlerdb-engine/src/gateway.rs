@@ -925,25 +925,61 @@ impl Gateway {
         let hydrate_columns = std::mem::take(&mut req.get_mut().hydrate_columns);
         self.check_hydrate_page(hydrate, req.get_ref().limit)?;
         let hydration = hydrate.then(|| (req.metadata().clone(), req.get_ref().index.clone()));
-        let mut resp = self.search_unadmitted(req).await?;
-        if let Some((meta, index)) = hydration {
-            self.hydrate_hits(resp.get_mut(), meta, index, hydrate_columns)
-                .await;
-        }
-        Ok(resp)
+        // Query SLIs, once per request at this public entry (covers REST + gRPC): the retrieval
+        // layer, then the FULL blackbox round-trip (incl. hydration) — the primary latency SLI.
+        let index = self.label_index(&req.get_ref().index);
+        let start = std::time::Instant::now();
+        let retrieved = self.search_unadmitted(req).await;
+        growlerdb_telemetry::sli::query_retrieval(&index, start.elapsed().as_secs_f64());
+        let result = match retrieved {
+            Err(e) => Err(e),
+            Ok(mut resp) => {
+                if let Some((meta, idx)) = hydration {
+                    self.hydrate_hits(resp.get_mut(), meta, idx, hydrate_columns)
+                        .await;
+                }
+                Ok(resp)
+            }
+        };
+        growlerdb_telemetry::sli::query(
+            &index,
+            "lexical",
+            hydrate,
+            start.elapsed().as_secs_f64(),
+            result.is_err(),
+        );
+        result
     }
 
-    /// [`search`](Self::search) minus the admission permit — the internal form composite
-    /// queries call, so one admitted query never charges multiple permits (or sheds its own
-    /// sub-queries at the cap).
+    /// The resolved index name used to **label** the query SLIs, mirroring the empty-index rule in
+    /// [`resolve_route`](Self::resolve_route): a non-empty request names its target; an empty one
+    /// falls back to the configured default (the served index name in single-index mode), or the sole
+    /// route, else `""`. Label-only — the authoritative resolve + authorization still happens in the
+    /// search path, so this must not error or take auth decisions.
+    fn label_index(&self, raw: &str) -> String {
+        let want = raw.trim();
+        if !want.is_empty() {
+            return want.to_string();
+        }
+        if let Some(def) = &self.default_index {
+            return def.clone();
+        }
+        let routes = self.routes.read().expect("routes lock not poisoned");
+        if routes.len() == 1 {
+            return routes.keys().next().cloned().unwrap_or_default();
+        }
+        String::new()
+    }
+
+    /// [`search`](Self::search) minus the admission permit — the internal form composite queries
+    /// call, so one admitted query never charges multiple permits (or sheds its own sub-queries at the
+    /// cap). Query SLIs are recorded by the caller (the admitted [`search`](Self::search) / the hybrid
+    /// wrapper), NOT here, so one user query counts exactly once.
     async fn search_unadmitted(
         &self,
         req: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
-        let start = std::time::Instant::now();
-        let result = self.search_inner(req).await;
-        growlerdb_telemetry::sli::query(start.elapsed().as_secs_f64(), result.is_err());
-        result
+        self.search_inner(req).await
     }
 
     #[tracing::instrument(skip_all, fields(shards = self.shard_count()), err)]
@@ -1256,12 +1292,31 @@ impl Gateway {
         let hydrate_columns = std::mem::take(&mut req.get_mut().hydrate_columns);
         self.check_hydrate_page(hydrate, req.get_ref().k)?;
         let hydration = hydrate.then(|| (req.metadata().clone(), req.get_ref().index.clone()));
-        let mut resp = self.semantic_search_unadmitted(req).await?;
-        if let Some((meta, index)) = hydration {
-            self.hydrate_hits(resp.get_mut(), meta, index, hydrate_columns)
-                .await;
-        }
-        Ok(resp)
+        // Query SLIs, once per request at this admitted entry — NOT in `semantic_search_unadmitted`,
+        // which the hybrid semantic arm reuses (so hybrid isn't double-counted; it records once via
+        // its own wrapper). Retrieval layer, then the full blackbox round-trip incl. hydration.
+        let index = self.label_index(&req.get_ref().index);
+        let start = std::time::Instant::now();
+        let retrieved = self.semantic_search_unadmitted(req).await;
+        growlerdb_telemetry::sli::query_retrieval(&index, start.elapsed().as_secs_f64());
+        let result = match retrieved {
+            Err(e) => Err(e),
+            Ok(mut resp) => {
+                if let Some((meta, idx)) = hydration {
+                    self.hydrate_hits(resp.get_mut(), meta, idx, hydrate_columns)
+                        .await;
+                }
+                Ok(resp)
+            }
+        };
+        growlerdb_telemetry::sli::query(
+            &index,
+            "semantic",
+            hydrate,
+            start.elapsed().as_secs_f64(),
+            result.is_err(),
+        );
+        result
     }
 
     /// [`semantic_search`](Self::semantic_search) minus the admission permit — the internal form composite
@@ -1351,6 +1406,31 @@ impl Gateway {
         req: Request<HybridSearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         let _permit = self.admit()?;
+        // One query SLI for the whole fused query, once at this public entry (covers REST + gRPC).
+        // The arms reuse the `_unadmitted` forms, which don't record, so this doesn't double-count.
+        let index = self.label_index(&req.get_ref().index);
+        let hydrated = req.get_ref().hydrate;
+        let start = std::time::Instant::now();
+        let result = self.hybrid_search_impl(req, &index, start).await;
+        growlerdb_telemetry::sli::query(
+            &index,
+            "hybrid",
+            hydrated,
+            start.elapsed().as_secs_f64(),
+            result.is_err(),
+        );
+        result
+    }
+
+    /// The body of [`hybrid_search`](Self::hybrid_search) minus admission + SLI recording (done by the
+    /// wrapper). `start` is the wrapper's timer, so the retrieval-layer SLI (recorded after fusion,
+    /// before hydration) shares the full metric's origin.
+    async fn hybrid_search_impl(
+        &self,
+        req: Request<HybridSearchRequest>,
+        index: &str,
+        start: std::time::Instant,
+    ) -> Result<Response<SearchResponse>, Status> {
         let (meta, _ext, mut body) = req.into_parts();
         // Inline hydration: consumed here, after the fusion; the arm requests below are
         // built field-by-field, so neither arm re-hydrates.
@@ -1484,6 +1564,8 @@ impl Gateway {
             .max(lexical.as_ref().map(|r| r.shards_total).unwrap_or(0));
 
         let fused = rrf_fuse_hits(&[lex_hits, semantic.hits.as_slice()], rrf_k, k);
+        // Retrieval layer done (both arms + fusion); hydration, if any, follows below.
+        growlerdb_telemetry::sli::query_retrieval(index, start.elapsed().as_secs_f64());
         // `total`: the lexical arm's true corpus-wide match count when that arm succeeded (KNN
         // has no match count — it is a top-k retrieval), else honestly just the fused page size.
         let total = lexical

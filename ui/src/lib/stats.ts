@@ -40,6 +40,47 @@ export function latestOf(series: Series[]): number | null {
   return pts && pts.length > 0 ? pts[pts.length - 1][1] : null;
 }
 
+/** Inject an `index` label matcher into every `growlerdb_*` selector in a PromQL string, turning a
+ *  cluster-aggregate query into one scoped to a single index. `index === ''` is a no-op (the fleet /
+ *  "all indexes" view). Only `growlerdb_*` metrics are rewritten — `up`, `node_*`, and PromQL
+ *  functions/keywords are left untouched. A single pass over the ORIGINAL string (the replacer never
+ *  re-scans injected text), handling both the bare `metric` and `metric{labels}` forms.
+ *
+ *  Two label schemes coexist and both must match: most SLIs carry the plain index name
+ *  (`index="movies"`), but the per-shard index-store gauges (`growlerdb_index_bytes`, `…_component`,
+ *  `growlerdb_segments_live`) carry `index="movies s0"` (name + shard ordinal). An anchored regex
+ *  matcher — Prometheus label matchers are fully anchored — matches the bare name OR the name plus a
+ *  ` s<ordinal>` suffix, without leaking a prefix-sharing index (`movies` won't match `movies2`).
+ *
+ *  Caller responsibility: metrics that carry no `{index}` label (e.g. the route-labelled
+ *  `growlerdb_http_requests_total`) must be excluded from scoping — scoping them would match nothing. */
+export function scopeQuery(query: string, index: string): string {
+  if (!index) return query;
+  const esc = index.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const sel = `index=~"${esc}( s[0-9]+)?"`;
+  return query.replace(/\b(growlerdb_\w+)(\s*\{)?/g, (_m, name, brace) =>
+    brace ? `${name}{${sel},` : `${name}{${sel}}`,
+  );
+}
+
+/** Keep the `n` series with the largest latest value and roll the rest into a single `other` series
+ *  (summed pointwise over the union of their timestamps). Keeps per-index stacked charts legible on
+ *  many-index clusters. Returns the input unchanged when it already has `≤ n` series. */
+export function topNSeries(series: Series[], n: number, otherLabel = 'other'): Series[] {
+  if (series.length <= n) return series;
+  const ranked = [...series].sort((a, b) => (latestOf([b]) ?? 0) - (latestOf([a]) ?? 0));
+  const top = ranked.slice(0, n);
+  const byTs = new Map<number, number>();
+  for (const s of ranked.slice(n)) {
+    for (const [ts, v] of s.points) byTs.set(ts, (byTs.get(ts) ?? 0) + v);
+  }
+  const other: Series = {
+    name: otherLabel,
+    points: [...byTs.entries()].sort((a, b) => a[0] - b[0]),
+  };
+  return other.points.length ? [...top, other] : top;
+}
+
 /** Run a Prometheus range query through the Engine proxy. `label` names the series when the
  *  result has no distinguishing labels (an aggregated query). */
 export async function queryRange(
