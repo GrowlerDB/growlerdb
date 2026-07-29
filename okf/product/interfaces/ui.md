@@ -18,8 +18,9 @@ The **GrowlerDB console** — a Svelte single-page app (in `ui/`) served by the
 
 - **Search / Explore** — query, facets, sort/paging, highlighted results, hydrate a hit, export.
   **Semantic and hybrid retrieval live here, inline** — a **Lexical / Semantic / Hybrid** mode toggle
-  (shown when the index has a [vector field](/product/functional/search/vector.md); hybrid exposes the
-  RRF `k`), a natural-language placeholder in the vector modes, a one-time **"Try semantic"** invitation
+  (shown when the index has a [vector field](/product/functional/search/vector.md); the vector modes
+  expose a **results `k`** preset — 10/25/50/100, default 10 — and hybrid also exposes the RRF `k`),
+  a natural-language placeholder in the vector modes, a one-time **"Try semantic"** invitation
   on a vector-capable index, a **"more like this"** action on a hit, and a **"vectorize a field"** step
   in create-index. There is **one search box that gets smarter**, not a separate retrieval screen.
 - **The console's front door** is the deployment's default index (`GROWLERDB_DEFAULT_INDEX` →

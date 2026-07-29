@@ -11,6 +11,12 @@ export const RRF_PRESETS = [10, 30, 60, 100] as const;
 /** Default RRF-k — matches the engine's fallback (standard Reciprocal-Rank-Fusion constant). */
 export const DEFAULT_RRF_K = 60;
 
+/** Top-K presets offered by the console's semantic/hybrid control (number of results). 10 is the
+ *  engine's own fallback when `k` is omitted, so the default rides that and sends nothing. */
+export const K_PRESETS = [10, 25, 50, 100] as const;
+/** Default top-K — matches the engine's bounded default page, so it's sent as an omitted `k`. */
+export const DEFAULT_K = 10;
+
 /** Shared options for a semantic (KNN) request over a VECTOR field. */
 export interface SemanticOpts {
   /** The VECTOR field path to embed + search (required). */

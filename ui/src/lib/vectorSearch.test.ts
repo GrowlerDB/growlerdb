@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { semanticBody, hybridBody, RRF_PRESETS, DEFAULT_RRF_K } from './vectorSearch';
+import {
+  semanticBody,
+  hybridBody,
+  RRF_PRESETS,
+  DEFAULT_RRF_K,
+  K_PRESETS,
+  DEFAULT_K,
+} from './vectorSearch';
 
 describe('semanticBody', () => {
   it('always carries vector_field + query_text, omitting unset options', () => {
@@ -58,5 +65,17 @@ describe('RRF presets', () => {
   it('offers the documented presets including the default', () => {
     expect(RRF_PRESETS).toContain(DEFAULT_RRF_K);
     expect([...RRF_PRESETS]).toEqual([10, 30, 60, 100]);
+  });
+});
+
+describe('K presets', () => {
+  it('offers the documented presets including the default', () => {
+    expect(K_PRESETS).toContain(DEFAULT_K);
+    expect([...K_PRESETS]).toEqual([10, 25, 50, 100]);
+  });
+
+  it('default k matches the engine fallback so it is sent as an omitted k', () => {
+    expect(DEFAULT_K).toBe(10);
+    expect(semanticBody('cats', { vectorField: 'v', k: 0 })).not.toHaveProperty('k');
   });
 });
