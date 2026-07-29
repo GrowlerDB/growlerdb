@@ -926,15 +926,15 @@
     return out;
   }
 
-  /** Run a card's per-index breakdown as an instant query, sorted for display (biggest/smallest first). */
-  async function loadBreakdown(bd: Breakdown, acc: LoadAcc): Promise<InstantSample[]> {
-    acc.attempted++;
+  /** Run a card's per-index breakdown as an instant query, sorted for display (biggest/smallest first).
+   *  Secondary enrichment: a failure just hides the annotation, so it stays OUT of the proxy-health
+   *  accounting (`acc`) that drives the "metrics unavailable" banner — a working breakdown must not
+   *  mask a wholly-down range-query proxy, nor a broken one trip the banner on its own. */
+  async function loadBreakdown(bd: Breakdown): Promise<InstantSample[]> {
     try {
       const got = await queryInstant(bd.q);
       return [...got].sort((a, b) => (bd.order === 'asc' ? a.value - b.value : b.value - a.value));
-    } catch (err) {
-      acc.failed++;
-      acc.lastError = String(err);
+    } catch {
       return [];
     }
   }
@@ -971,8 +971,7 @@
           acc,
         );
         // Per-index breakdown only in the fleet view; drop stale samples once an index is scoped.
-        if (fleet && card.breakdown)
-          breakdowns[card.key] = await loadBreakdown(card.breakdown, acc);
+        if (fleet && card.breakdown) breakdowns[card.key] = await loadBreakdown(card.breakdown);
         else if (card.key in breakdowns) delete breakdowns[card.key];
       }
     }
