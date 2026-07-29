@@ -8,14 +8,19 @@
   import { t } from '../lib/i18n';
   import {
     queryRange,
+    queryInstant,
     latestOf,
+    scopeQuery,
+    topNSeries,
     evaluateAlerts,
     fetchAlerts,
     serverAlertToDisplay,
     type Series,
+    type InstantSample,
     type Alert,
   } from '../lib/stats';
-  import { serverConfig, getIngestion, type IndexIngestion } from '../lib/api';
+  import { serverConfig, getIngestion, listIndexes, type IndexIngestion } from '../lib/api';
+  import { read, persist } from '../lib/prefs';
   import { worstState, badgeLevel, worstLagMs, formatDuration, formatAge } from '../lib/ingestion';
   import MetricCard from '../lib/components/MetricCard.svelte';
   import Sparkline from '../lib/components/Sparkline.svelte';
@@ -23,6 +28,7 @@
   import Tabs from '../lib/components/Tabs.svelte';
   import InfoDot from '../lib/components/InfoDot.svelte';
   import EChart from '../lib/components/EChart.svelte';
+  import Dropdown from '../lib/components/Dropdown.svelte';
 
   const REFRESH_MS = 15000;
 
@@ -31,6 +37,17 @@
   type SectionId = 'search' | 'runtime' | 'access' | 'data' | 'ingestion' | 'source';
   type Fmt = 'rate' | 'ms' | 'lagms' | 'pct' | 'num' | 'bytes' | 'ratio';
   type Bad = 'nonzero' | 'lag' | 'lowpct' | 'highpct';
+
+  /** A per-index breakdown for a "collapse" card: an instant query returning one sample per index
+   *  (a `topk`/`bottomk … by (index)`), shown as a "worst/top: X" annotation and a click-to-scope
+   *  top-N list in the detail modal. Only used in the fleet (all-indexes) view. */
+  interface Breakdown {
+    q: string;
+    /** Display sort of the samples: `desc` = biggest first (worst/top), `asc` = smallest first. */
+    order: 'desc' | 'asc';
+    /** i18n key for the lead-in word ('obs.worst' | 'obs.top' | 'obs.smallest'). */
+    caption: string;
+  }
 
   interface Card {
     key: string;
@@ -47,6 +64,12 @@
      *  deployment runs. When its query returns nothing, show a "needs the metrics stack" state
      *  instead of a misleading 0. */
     external?: boolean;
+    /** Opt out of index scoping even on an index-scoped tab — for cards whose metric carries no
+     *  `{index}` label (e.g. route-labelled `growlerdb_http_requests_total`), which would match
+     *  nothing once scoped. */
+    scopable?: boolean;
+    /** Per-index breakdown surfaced in the fleet view (annotation + modal top-N). */
+    breakdown?: Breakdown;
   }
 
   interface Hero {
@@ -58,6 +81,12 @@
     /** Which series render as a filled area vs. a plain line. */
     area?: string[];
     stack?: boolean;
+    /** In the fleet (all-indexes) view, render this hero as the per-index series stacked (top-N +
+     *  "other"), with an optional cluster total overlaid as a line. */
+    fleetStack?: {
+      byIndexQ: string;
+      overlay?: { label: string; q: string };
+    };
   }
 
   const SEARCH_HERO: Hero = {
@@ -91,6 +120,12 @@
       { label: 'GrowlerDB index', q: 'sum(rate(growlerdb_ingested_docs_total[5m]))' },
     ],
     area: ['Iceberg append'],
+    // Fleet view: stack the GrowlerDB index rate per index (top-N + other), append line overlaid —
+    // so one index falling behind shows as its own diverging band, not smeared into a cluster line.
+    fleetStack: {
+      byIndexQ: 'sum by (index) (rate(growlerdb_ingested_docs_total[5m]))',
+      overlay: { label: 'Iceberg append', q: 'sum(deriv(growlerdb_source_records[5m]))' },
+    },
   };
 
   const DATA_HERO: Hero = {
@@ -139,10 +174,18 @@
     source: SOURCE_HERO,
   };
 
-  const SECTIONS: { id: SectionId; label: string; cards: Card[] }[] = [
+  const SECTIONS: {
+    id: SectionId;
+    label: string;
+    /** Whether the index-scope selector applies here. Runtime (node/API) and Access (logins) have no
+     *  `{index}` dimension, so they stay cluster/node-wide regardless of the selection. */
+    indexScoped: boolean;
+    cards: Card[];
+  }[] = [
     {
       id: 'search',
       label: 'Search',
+      indexScoped: true,
       cards: [
         {
           key: 'qps',
@@ -228,6 +271,9 @@
           fmt: 'rate',
           headline: '5xx',
           bad: 'nonzero',
+          // Route-labelled (growlerdb_http_requests_total{route=…}) — no {index} label, so it can't
+          // be scoped to one index; stays cluster-wide even when an index is selected.
+          scopable: false,
           queries: [
             {
               label: '2xx',
@@ -249,6 +295,7 @@
     {
       id: 'runtime',
       label: 'Runtime',
+      indexScoped: false,
       cards: [
         {
           key: 'procs',
@@ -353,6 +400,7 @@
     {
       id: 'data',
       label: 'Data',
+      indexScoped: true,
       cards: [
         {
           key: 'total-size',
@@ -403,6 +451,7 @@
     {
       id: 'ingestion',
       label: 'Ingestion',
+      indexScoped: true,
       cards: [
         {
           key: 'throughput',
@@ -411,6 +460,11 @@
           headline: 'v',
           queries: [{ label: 'v', q: 'sum(rate(growlerdb_ingested_docs_total[5m]))' }],
           help: 'Documents GrowlerDB indexed per second across the cluster.',
+          breakdown: {
+            q: 'topk(6, sum by (index) (rate(growlerdb_ingested_docs_total[5m])))',
+            order: 'desc',
+            caption: 'obs.top',
+          },
         },
         {
           key: 'lag',
@@ -421,6 +475,11 @@
           queries: [{ label: 'v', q: 'max(growlerdb_ingest_lag_ms)' }],
           help: 'The worst shard’s wall-clock staleness behind the source head.',
           hint: 'Above ~1s and climbing means ingest is falling behind — check the connector and nodes.',
+          breakdown: {
+            q: 'topk(6, max by (index) (growlerdb_ingest_lag_ms))',
+            order: 'desc',
+            caption: 'obs.worst',
+          },
         },
         {
           key: 'shards',
@@ -438,6 +497,7 @@
     {
       id: 'source',
       label: 'Source',
+      indexScoped: true,
       cards: [
         {
           key: 'src-rows',
@@ -446,6 +506,11 @@
           headline: 'v',
           queries: [{ label: 'v', q: 'sum(growlerdb_source_records)' }],
           help: 'Rows in the source table’s current snapshot.',
+          breakdown: {
+            q: 'topk(6, sum by (index) (growlerdb_source_records))',
+            order: 'desc',
+            caption: 'obs.top',
+          },
         },
         {
           key: 'src-bytes',
@@ -472,6 +537,11 @@
           queries: [{ label: 'v', q: 'avg(growlerdb_source_avg_file_bytes)' }],
           help: 'Mean source data-file size — the small-file signal.',
           hint: 'Low or falling means many small files; the source wants Iceberg compaction (rewrite_data_files).',
+          breakdown: {
+            q: 'bottomk(6, avg by (index) (growlerdb_source_avg_file_bytes))',
+            order: 'asc',
+            caption: 'obs.smallest',
+          },
         },
         {
           key: 'src-deletes',
@@ -513,6 +583,7 @@
     {
       id: 'access',
       label: 'Access',
+      indexScoped: false,
       cards: [
         {
           key: 'logins',
@@ -538,9 +609,20 @@
 
   // ---- state -----------------------------------------------------------------------------------
 
+  const REFRESH_TOPN = 6; // top-N indexes kept in fleet stacks / breakdowns before an "other" roll-up
+
   let active = $state<SectionId>('search');
   let cardSeries = $state<Record<string, Series[]>>({});
   let heroSeries = $state<Record<string, Series[]>>({});
+  // Per-index breakdown samples for the fleet view, keyed by card.key (absent when an index is scoped).
+  let breakdowns = $state<Record<string, InstantSample[]>>({});
+
+  // Index scope: '' = all indexes (the fleet/aggregate view); a name scopes every index-dimensioned
+  // panel to that index. Restored from prefs (validated against the live index list on mount).
+  const OBS_INDEX_KEY = 'growlerdb.obsIndex';
+  let indexOptions = $state<string[]>([]);
+  let scopeIndex = $state(read(OBS_INDEX_KEY) ?? '');
+
   let ingestion = $state<IndexIngestion[]>([]);
   let ingestionError = $state('');
   let expanded = $state<string | null>(null);
@@ -552,6 +634,36 @@
   let grafanaUrl = $state('');
   let timer: ReturnType<typeof setInterval> | undefined;
   let now = $state(Date.now());
+
+  // ---- index scope -----------------------------------------------------------------------------
+
+  /** True when no specific index is selected — the fleet (all-indexes) view where breakdowns show. */
+  const fleet = $derived(scopeIndex === '');
+  const indexScopeOptions = $derived([
+    { value: '', label: t('obs.allIndexes') },
+    ...indexOptions.map((ix) => ({ value: ix, label: ix })),
+  ]);
+  // Ingestion drill-down list, filtered to the selected index (all indexes in the fleet view).
+  const visibleIngestion = $derived(
+    scopeIndex ? ingestion.filter((i) => i.name === scopeIndex) : ingestion,
+  );
+
+  /** Scope a card/hero query when the active tab is index-dimensioned and the panel opts in.
+   *  `scopeQuery` is itself a no-op for the empty (fleet) scope, so this is safe to call always. */
+  function scopedQueries(
+    indexScoped: boolean,
+    scopable: boolean | undefined,
+    queries: { label: string; q: string }[],
+  ): { label: string; q: string }[] {
+    if (!indexScoped || scopable === false || !scopeIndex) return queries;
+    return queries.map((x) => ({ label: x.label, q: scopeQuery(x.q, scopeIndex) }));
+  }
+
+  function onScopeChange(v: string) {
+    scopeIndex = v;
+    persist(OBS_INDEX_KEY, v);
+    refresh();
+  }
 
   // ---- formatting ------------------------------------------------------------------------------
 
@@ -614,6 +726,16 @@
       return total == null ? '' : `of ${Math.round(total)} shards`;
     }
     return '';
+  }
+
+  /** Fleet-view annotation naming the worst/top indexes for a breakdown card (e.g. "worst: catalog
+   *  1.2 s · movies 340 ms"). Empty unless in the fleet view with breakdown samples loaded. */
+  function breakdownText(card: Card): string {
+    const samples = breakdowns[card.key];
+    if (!fleet || !card.breakdown || !samples || samples.length === 0) return '';
+    const fmt = cardFormat(card);
+    const parts = samples.slice(0, 3).map((s) => `${s.metric.index ?? '?'} ${fmt(s.value)}`);
+    return `${t(card.breakdown.caption)}: ${parts.join(' · ')}`;
   }
 
   function toneOf(card: Card): 'default' | 'ok' | 'warn' {
@@ -682,20 +804,40 @@
   function heroOption(hero: Hero): any {
     const loaded = heroSeries[hero.key] ?? [];
     const bytes = hero.unit === 'bytes';
-    const series = hero.queries.map((q) => {
-      const s = loaded.find((x) => x.name === q.label);
-      const isArea = hero.area?.includes(q.label);
-      return {
-        name: q.label,
-        type: 'line',
-        smooth: true,
-        showSymbol: false,
-        stack: hero.stack ? 'total' : undefined,
-        areaStyle: isArea ? { opacity: hero.stack ? 0.55 : 0.14 } : undefined,
-        lineStyle: { width: 2 },
-        data: (s?.points ?? []).map((p) => [p[0], p[1]]),
-      };
-    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let series: any[];
+    if (fleet && hero.fleetStack) {
+      // Per-index bands stacked, cluster total (append) overlaid as a dashed line.
+      const overlayLabel = hero.fleetStack.overlay?.label;
+      series = loaded.map((s) => {
+        const isOverlay = s.name === overlayLabel;
+        return {
+          name: s.name,
+          type: 'line',
+          smooth: true,
+          showSymbol: false,
+          stack: isOverlay ? undefined : 'idx',
+          areaStyle: isOverlay ? undefined : { opacity: 0.5 },
+          lineStyle: { width: isOverlay ? 2 : 1, type: isOverlay ? 'dashed' : 'solid' },
+          data: s.points.map((p) => [p[0], p[1]]),
+        };
+      });
+    } else {
+      series = hero.queries.map((q) => {
+        const s = loaded.find((x) => x.name === q.label);
+        const isArea = hero.area?.includes(q.label);
+        return {
+          name: q.label,
+          type: 'line',
+          smooth: true,
+          showSymbol: false,
+          stack: hero.stack ? 'total' : undefined,
+          areaStyle: isArea ? { opacity: hero.stack ? 0.55 : 0.14 } : undefined,
+          lineStyle: { width: 2 },
+          data: (s?.points ?? []).map((p) => [p[0], p[1]]),
+        };
+      });
+    }
     return {
       legend: {},
       tooltip: {
@@ -784,20 +926,66 @@
     return out;
   }
 
+  /** Run a card's per-index breakdown as an instant query, sorted for display (biggest/smallest first). */
+  async function loadBreakdown(bd: Breakdown, acc: LoadAcc): Promise<InstantSample[]> {
+    acc.attempted++;
+    try {
+      const got = await queryInstant(bd.q);
+      return [...got].sort((a, b) => (bd.order === 'asc' ? a.value - b.value : b.value - a.value));
+    } catch (err) {
+      acc.failed++;
+      acc.lastError = String(err);
+      return [];
+    }
+  }
+
+  /** Fleet-view hero: the per-index series (top-N + "other") plus an optional cluster-total overlay. */
+  async function loadFleetStack(hero: Hero, acc: LoadAcc): Promise<Series[]> {
+    const fs = hero.fleetStack!;
+    const out: Series[] = [];
+    acc.attempted++;
+    try {
+      const byIndex = await queryRange(fs.byIndexQ, 1800, 30);
+      // `sum by (index)(…)` names each series `index=<name>`; strip the label prefix for the legend.
+      const named = byIndex.map((s) => ({
+        name: s.name.replace(/^index=/, '') || s.name,
+        points: s.points,
+      }));
+      out.push(...topNSeries(named, REFRESH_TOPN));
+    } catch (err) {
+      acc.failed++;
+      acc.lastError = String(err);
+    }
+    if (fs.overlay) out.push(...(await loadSeries([fs.overlay], acc)));
+    return out;
+  }
+
   async function refresh() {
     now = Date.now();
     const acc: LoadAcc = { attempted: 0, failed: 0, lastError: '' };
     for (const section of SECTIONS) {
       for (const card of section.cards) {
         if (card.planned || card.queries.length === 0) continue;
-        cardSeries[card.key] = await loadSeries(card.queries, acc);
+        cardSeries[card.key] = await loadSeries(
+          scopedQueries(section.indexScoped, card.scopable, card.queries),
+          acc,
+        );
+        // Per-index breakdown only in the fleet view; drop stale samples once an index is scoped.
+        if (fleet && card.breakdown)
+          breakdowns[card.key] = await loadBreakdown(card.breakdown, acc);
+        else if (card.key in breakdowns) delete breakdowns[card.key];
       }
     }
     for (const hero of Object.values(HEROES)) {
-      if (hero) heroSeries[hero.key] = await loadSeries(hero.queries, acc);
+      if (!hero) continue;
+      heroSeries[hero.key] =
+        fleet && hero.fleetStack
+          ? await loadFleetStack(hero, acc)
+          : await loadSeries(scopedQueries(true, undefined, hero.queries), acc);
     }
     cardSeries = { ...cardSeries };
     heroSeries = { ...heroSeries };
+    breakdowns = { ...breakdowns };
     // Banner only when the proxy is wholly down (every query failed) — partial failures render.
     error = acc.attempted > 0 && acc.failed === acc.attempted ? acc.lastError : '';
 
@@ -836,6 +1024,18 @@
     serverConfig()
       .then((c) => (grafanaUrl = safeHttpUrl(c.grafana_url)))
       .catch(() => (grafanaUrl = ''));
+    // Populate the scope selector; hide it (empty options) when no control plane is fronted. A
+    // restored-but-since-deleted index falls back to the fleet view.
+    listIndexes()
+      .then((ix) => {
+        indexOptions = ix.map((i) => i.name);
+        if (scopeIndex && !indexOptions.includes(scopeIndex)) {
+          scopeIndex = '';
+          persist(OBS_INDEX_KEY, '');
+          refresh();
+        }
+      })
+      .catch(() => (indexOptions = []));
     refresh();
     timer = setInterval(refresh, REFRESH_MS);
   });
@@ -853,6 +1053,16 @@
   <div class="screen-toolbar">
     <p class="sub">{t('obs.subline')}</p>
     <div class="actions">
+      {#if indexOptions.length > 0}
+        <Dropdown
+          value={scopeIndex}
+          options={indexScopeOptions}
+          label={t('obs.index')}
+          ariaLabel={t('obs.index')}
+          width={200}
+          onchange={onScopeChange}
+        />
+      {/if}
       {#if grafanaUrl}
         <a class="grafana-link" href={grafanaUrl} target="_blank" rel="noreferrer noopener">
           {t('obs.openGrafana')} ↗
@@ -899,6 +1109,10 @@
     <Tabs {tabs} bind:active />
   </div>
 
+  {#if scopeIndex && !activeSection.indexScoped}
+    <p class="scope-note">{t('obs.clusterWide')}</p>
+  {/if}
+
   {#if activeHero}
     <div class="hero">
       <div class="hero-head">
@@ -913,7 +1127,13 @@
     {#each activeSection.cards as card (card.key)}
       {@const d = display(card)}
       {@const tn = toneOf(card)}
-      <MetricCard label={card.label} value={d.value} unit={d.unit} sub={sub(card)} tone={tn}>
+      <MetricCard
+        label={card.label}
+        value={d.value}
+        unit={d.unit}
+        sub={breakdownText(card) || sub(card)}
+        tone={tn}
+      >
         {#snippet info()}
           <div class="card-actions">
             {#if !card.planned}
@@ -964,11 +1184,11 @@
       <div class="gb-panel-head">Per-index ingestion</div>
       {#if ingestionError}
         <p role="alert" class="error drill-empty">{t('ingestion.error')}: {ingestionError}</p>
-      {:else if ingestion.length === 0}
+      {:else if visibleIngestion.length === 0}
         <p class="muted drill-empty">{t('ingestion.empty')}</p>
       {:else}
         <ul class="idx-list">
-          {#each ingestion as idx (idx.name)}
+          {#each visibleIngestion as idx (idx.name)}
             {@const state = worstState(idx.shards)}
             {@const lvl = badgeLevel(state)}
             {@const lag = worstLagMs(idx.shards)}
@@ -1039,6 +1259,35 @@
         aria-label={t('common.close')}>×</button
       >
     </div>
+    {#if fleet && detailCard.breakdown && breakdowns[detailCard.key]?.length}
+      {@const rows = breakdowns[detailCard.key]}
+      {@const maxVal = Math.max(...rows.map((r) => r.value), 1e-9)}
+      {@const bfmt = cardFormat(detailCard)}
+      <div class="idx-breakdown">
+        <div class="idx-breakdown-head">{t('obs.byIndex')}</div>
+        <ul class="idx-bd-list">
+          {#each rows as r (r.metric.index)}
+            <li>
+              <button
+                type="button"
+                class="idx-bd-row"
+                onclick={() => {
+                  onScopeChange(r.metric.index ?? '');
+                  detailCard = null;
+                }}
+                title={t('obs.scopeTo', { index: r.metric.index ?? '' })}
+              >
+                <span class="idx-bd-name mono">{r.metric.index ?? '?'}</span>
+                <span class="idx-bd-bar"
+                  ><span class="idx-bd-fill" style="width:{(r.value / maxVal) * 100}%"></span></span
+                >
+                <span class="idx-bd-val mono">{bfmt(r.value)}</span>
+              </button>
+            </li>
+          {/each}
+        </ul>
+      </div>
+    {/if}
     <EChart option={cardDetailOption(detailCard)} height={380} ariaLabel={detailCard.label} />
   </div>
 {/if}
@@ -1334,5 +1583,73 @@
     padding: 4px 8px;
     border-bottom: 1px solid var(--line);
     color: var(--text-2);
+  }
+
+  /* "Runtime/Access are cluster-wide" note shown when an index is selected but the tab has no index dimension. */
+  .scope-note {
+    margin: 0 0 12px;
+    font-size: 0.85em;
+    color: var(--text-2);
+  }
+
+  /* Per-index top-N breakdown in a card's detail modal — each row scopes the whole screen on click. */
+  .idx-breakdown {
+    margin-bottom: 16px;
+  }
+  .idx-breakdown-head {
+    font-size: 0.78em;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-2);
+    margin-bottom: 6px;
+  }
+  .idx-bd-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .idx-bd-row {
+    display: grid;
+    grid-template-columns: minmax(80px, 22%) 1fr auto;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 5px 8px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: none;
+    color: var(--text);
+    cursor: pointer;
+    text-align: left;
+  }
+  .idx-bd-row:hover {
+    border-color: var(--accent);
+    background: var(--field);
+  }
+  .idx-bd-name {
+    font-size: 0.9em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .idx-bd-bar {
+    height: 8px;
+    border-radius: 4px;
+    background: var(--line);
+    overflow: hidden;
+  }
+  .idx-bd-fill {
+    display: block;
+    height: 100%;
+    border-radius: 4px;
+    background: var(--accent);
+  }
+  .idx-bd-val {
+    font-size: 0.85em;
+    color: var(--text-2);
+    justify-self: end;
   }
 </style>

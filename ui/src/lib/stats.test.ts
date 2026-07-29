@@ -1,5 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import { parsePromMatrix, latestOf, evaluateAlerts, serverAlertToDisplay } from './stats';
+import {
+  parsePromMatrix,
+  latestOf,
+  evaluateAlerts,
+  serverAlertToDisplay,
+  scopeQuery,
+  topNSeries,
+  type Series,
+} from './stats';
 
 describe('parsePromMatrix', () => {
   it('parses a matrix result into ms-timestamped series', () => {
@@ -81,5 +89,75 @@ describe('serverAlertToDisplay', () => {
     });
     expect(d.level).toBe('warning');
     expect(d.detail).toBe('p99 1.8s (pending)');
+  });
+});
+
+describe('scopeQuery', () => {
+  it('is a no-op for the empty (all-indexes) scope', () => {
+    const q = 'sum(rate(growlerdb_query_total[1m]))';
+    expect(scopeQuery(q, '')).toBe(q);
+  });
+
+  it('injects an anchored regex matcher into a bare growlerdb_* selector', () => {
+    // The matcher accepts the plain name or the name + " s<ordinal>" (the per-shard label scheme).
+    expect(scopeQuery('sum(rate(growlerdb_query_total[1m]))', 'movies')).toBe(
+      'sum(rate(growlerdb_query_total{index=~"movies( s[0-9]+)?"}[1m]))',
+    );
+  });
+
+  it('merges the matcher into an existing label set', () => {
+    expect(scopeQuery('sum(growlerdb_index_bytes_component{component="term"})', 'docs')).toBe(
+      'sum(growlerdb_index_bytes_component{index=~"docs( s[0-9]+)?",component="term"})',
+    );
+  });
+
+  it('scopes every growlerdb_* selector in the expression', () => {
+    expect(
+      scopeQuery(
+        'max(max by (index) (growlerdb_index_bytes) / avg by (index) (growlerdb_index_bytes))',
+        'catalog',
+      ),
+    ).toBe(
+      'max(max by (index) (growlerdb_index_bytes{index=~"catalog( s[0-9]+)?"}) / avg by (index) (growlerdb_index_bytes{index=~"catalog( s[0-9]+)?"}))',
+    );
+  });
+
+  it('escapes regex metacharacters in the index name', () => {
+    expect(scopeQuery('sum(growlerdb_index_bytes)', 'a.b')).toBe(
+      'sum(growlerdb_index_bytes{index=~"a\\.b( s[0-9]+)?"})',
+    );
+  });
+
+  it('leaves non-growlerdb metrics (up, node_*) untouched', () => {
+    expect(scopeQuery('sum(up)', 'movies')).toBe('sum(up)');
+    expect(scopeQuery('max(node_memory_MemAvailable_bytes)', 'movies')).toBe(
+      'max(node_memory_MemAvailable_bytes)',
+    );
+  });
+});
+
+describe('topNSeries', () => {
+  const mk = (name: string, last: number): Series => ({
+    name,
+    points: [
+      [1000, last],
+      [2000, last],
+    ],
+  });
+
+  it('returns the input unchanged when it already has ≤ n series', () => {
+    const s = [mk('a', 3), mk('b', 1)];
+    expect(topNSeries(s, 6)).toBe(s);
+  });
+
+  it('keeps the top-n by latest value and rolls the rest into "other"', () => {
+    const s = [mk('a', 10), mk('b', 5), mk('c', 3), mk('d', 1)];
+    const out = topNSeries(s, 2);
+    expect(out.map((x) => x.name)).toEqual(['a', 'b', 'other']);
+    // "other" is c + d summed pointwise (3+1 at each timestamp).
+    expect(out[2].points).toEqual([
+      [1000, 4],
+      [2000, 4],
+    ]);
   });
 });
