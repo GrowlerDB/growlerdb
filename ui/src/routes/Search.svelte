@@ -21,7 +21,7 @@
     type VectorFieldInfo,
   } from '../lib/api';
   import { pickDefaultIndex } from '../lib/defaultIndex';
-  import { RRF_PRESETS, DEFAULT_RRF_K } from '../lib/vectorSearch';
+  import { RRF_PRESETS, DEFAULT_RRF_K, K_PRESETS, DEFAULT_K } from '../lib/vectorSearch';
   import { currentFieldToken, withCompletion } from '../lib/autocomplete';
   import { queryTermsByField, fieldTerms, type ScopedTerms } from '../lib/highlight';
   import { formatEpochMicros } from '../lib/results';
@@ -61,6 +61,9 @@
   let vectorFields = $state<VectorFieldInfo[]>([]);
   let vectorField = $state(''); // '' = none selected (index has no vector field)
   let rrfK = $state(DEFAULT_RRF_K);
+  // Top-K for semantic/hybrid (number of neighbors returned). DEFAULT_K rides the engine's own
+  // fallback, so it's sent as an omitted `k`; other presets are sent explicitly.
+  let topK = $state(DEFAULT_K);
   let lastQuery = $state('');
   let scoped = $state<ScopedTerms>({ fields: {}, bare: [] });
   let hits = $state<SearchHit[]>([]);
@@ -126,6 +129,7 @@
     vectorFields.map((v) => ({ value: v.name, label: v.dims ? `${v.name} · ${v.dims}d` : v.name })),
   );
   const rrfOptions = RRF_PRESETS.map((n) => ({ value: String(n), label: String(n) }));
+  const kOptions = K_PRESETS.map((n) => ({ value: String(n), label: String(n) }));
   // The VectorFieldInfo for the current selection — carries the `source_field` "more like this" seeds from.
   const selectedVec = $derived(vectorFields.find((v) => v.name === vectorField));
 
@@ -369,7 +373,14 @@
     partialDismissed = false;
     try {
       const t0 = performance.now();
-      const common = { vectorField, filter: filterExpr(), syntax, index: scopeIndex || undefined };
+      const common = {
+        vectorField,
+        // DEFAULT_K rides the engine's own fallback, so it's left off the wire (omit-when-default).
+        k: topK === DEFAULT_K ? undefined : topK,
+        filter: filterExpr(),
+        syntax,
+        index: scopeIndex || undefined,
+      };
       const res =
         mode === 'hybrid'
           ? await searchHybrid(query.trim(), { ...common, rrfK })
@@ -738,6 +749,17 @@
               if (searched) run(0);
             }}
           />
+          <Dropdown
+            value={String(topK)}
+            options={kOptions}
+            label={t('search.k')}
+            ariaLabel={t('search.k')}
+            width={140}
+            onchange={(v) => {
+              topK = Number(v);
+              if (searched) run(0);
+            }}
+          />
         {/if}
         {#if mode === 'hybrid'}
           <Dropdown
@@ -964,7 +986,9 @@
               <span class="muted">{t('search.shownOf', { shown: hits.length, total })}</span>
             </nav>
           {/if}
-        {:else if total > PAGE_SIZE}
+        {:else if mode === 'lexical' && total > PAGE_SIZE}
+          <!-- Offset pager is lexical-only. Semantic/hybrid return a single top-K page (no offset/
+               keyset paging), so all k hits are already shown — a pager there is misleading. -->
           <nav class="pager" aria-label={t('search.pager')}>
             <button type="button" onclick={() => page(-1)} disabled={offset === 0}>
               {t('search.prev')}
