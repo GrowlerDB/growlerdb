@@ -20,6 +20,15 @@ Metrics defined as SLIs include: query latency; **ingest lag** (`growlerdb_inges
 **segments/compactions**. Gauges are kept fresh by a background sampler in the control plane so
 dashboards don't depend on console polling.
 
+The **query** and **hydration** SLIs are labelled `{index}` — `growlerdb_query_{total,errors_total,duration_seconds}{index}`
+(the gateway labels with the *resolved* target index, so a default-index request attributes to its real
+index, not a blank; recorded on the lexical search path) and
+`growlerdb_hydration_*{index}` / `growlerdb_stale_locators_total{index}` (the node labels with the served
+index). This makes the console's **Search** tab per-index under the scope selector. Labelling the two
+latency histograms multiplies their bucket series by the index count — bounded and acceptable for a small
+index set. The **cold-cache** hit rate is the deliberate exception: its `growlerdb_cold_cache_{hits,misses}_total{tier="cold"}`
+counters are emitted from a process-wide range LRU with no index in scope, so that SLI stays cluster-wide.
+
 **Topology sync:** a gateway hot-reload that rejects a malformed shard map keeps the old, servable
 routing and records it through the background-loop SLIs
 (`growlerdb_background_failures_total{loop="topology-swap"}` plus the

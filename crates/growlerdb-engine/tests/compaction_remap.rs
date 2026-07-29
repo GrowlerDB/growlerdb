@@ -177,6 +177,7 @@ async fn hydrate(shard: &Shard, keys: &[CompositeKey], files: &[String]) -> Hydr
     }
     shard.refresh_locators(&refreshed).unwrap();
     growlerdb_telemetry::sli::hydration(
+        "docs", // this harness serves the single `docs` shard (ShardId::single("docs"))
         0.0,
         refreshed.len() as u64,
         keys.len() as u64,

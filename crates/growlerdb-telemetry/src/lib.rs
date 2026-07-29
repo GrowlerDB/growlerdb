@@ -298,13 +298,16 @@ pub mod sli {
     }
 
     /// Record a completed query (search/aggregate): its `duration_secs` and whether it
-    /// errored — drives QPS, error rate, and latency percentiles.
-    pub fn query(duration_secs: f64, errored: bool) {
-        counter!("growlerdb_query_total").increment(1);
+    /// errored — drives QPS, error rate, and latency percentiles. Labelled by `index` (the resolved
+    /// target index, or `""` when the endpoint serves a single unnamed index) so the console can chart
+    /// per-index Search SLIs, not just cluster-wide. Recorded on the lexical search path.
+    pub fn query(index: &str, duration_secs: f64, errored: bool) {
+        counter!("growlerdb_query_total", "index" => index.to_string()).increment(1);
         if errored {
-            counter!("growlerdb_query_errors_total").increment(1);
+            counter!("growlerdb_query_errors_total", "index" => index.to_string()).increment(1);
         }
-        histogram!("growlerdb_query_duration_seconds").record(duration_secs);
+        histogram!("growlerdb_query_duration_seconds", "index" => index.to_string())
+            .record(duration_secs);
     }
 
     /// Record a completed **HTTP request** to the REST API: its matched `route`
@@ -385,13 +388,25 @@ pub mod sli {
     /// **drift**: a stale index — e.g. after a recreated source — still returns search
     /// hits whose keys no longer exist in the table, so they fail to hydrate. It flags trouble even
     /// before the lineage guard engages on a restart.
-    pub fn hydration(duration_secs: f64, refreshed_locators: u64, requested: u64, found: u64) {
-        counter!("growlerdb_hydration_total").increment(1);
-        histogram!("growlerdb_hydration_duration_seconds").record(duration_secs);
-        counter!("growlerdb_hydration_keys_requested_total").increment(requested);
-        counter!("growlerdb_hydration_keys_found_total").increment(found);
+    /// Labelled by `index` (the served index) so hydrate rate/latency, the Iceberg-match ratio
+    /// (found/requested), and the stale-locator rate are all chart-able per index.
+    pub fn hydration(
+        index: &str,
+        duration_secs: f64,
+        refreshed_locators: u64,
+        requested: u64,
+        found: u64,
+    ) {
+        counter!("growlerdb_hydration_total", "index" => index.to_string()).increment(1);
+        histogram!("growlerdb_hydration_duration_seconds", "index" => index.to_string())
+            .record(duration_secs);
+        counter!("growlerdb_hydration_keys_requested_total", "index" => index.to_string())
+            .increment(requested);
+        counter!("growlerdb_hydration_keys_found_total", "index" => index.to_string())
+            .increment(found);
         if refreshed_locators > 0 {
-            counter!("growlerdb_stale_locators_total").increment(refreshed_locators);
+            counter!("growlerdb_stale_locators_total", "index" => index.to_string())
+                .increment(refreshed_locators);
         }
     }
 
@@ -524,10 +539,10 @@ mod tests {
     #[tokio::test]
     async fn metrics_endpoint_renders_recorded_slis() {
         init("test"); // installs the recorder (idempotent)
-        sli::query(0.012, false);
-        sli::query(0.034, true);
+        sli::query("docs", 0.012, false);
+        sli::query("docs", 0.034, true);
         sli::ingested_docs("docs", 5);
-        sli::hydration(0.002, 0, 10, 7); // 10 keys requested, 7 found → 3 hydration misses
+        sli::hydration("docs", 0.002, 0, 10, 7); // 10 keys requested, 7 found → 3 hydration misses
         sli::ingest_lag_ms("docs", 45_000);
         sli::shard_availability("docs", 2, 3);
         sli::compaction("docs", 5, 1); // 4 segments reclaimed
@@ -545,6 +560,15 @@ mod tests {
         // test first; assert the names are present rather than exact values).
         assert!(body.contains("growlerdb_query_total"));
         assert!(body.contains("growlerdb_query_errors_total"));
+        // Query + hydration SLIs are labelled by index so the console's Search tab is per-index.
+        assert!(
+            body.contains("growlerdb_query_total{index=\"docs\"}"),
+            "query metrics must carry an index label"
+        );
+        assert!(
+            body.contains("growlerdb_hydration_total{index=\"docs\"}"),
+            "hydration metrics must carry an index label"
+        );
         assert!(body.contains("growlerdb_ingested_docs_total"));
         // latency metrics export as true histograms (`_bucket`), NOT summaries
         // (`{quantile}`), so `histogram_quantile` works and the console/Grafana p50/p95/p99 charts are

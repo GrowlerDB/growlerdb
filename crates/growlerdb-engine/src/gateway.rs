@@ -936,13 +936,36 @@ impl Gateway {
     /// [`search`](Self::search) minus the admission permit — the internal form composite
     /// queries call, so one admitted query never charges multiple permits (or sheds its own
     /// sub-queries at the cap).
+    /// The resolved index name used to **label** the query SLIs (`sli::query`), mirroring the
+    /// empty-index rule in [`resolve_route`](Self::resolve_route): a non-empty request names its
+    /// target; an empty one falls back to the configured default (the served index name in
+    /// single-index mode), or the sole route, else `""`. Label-only — the authoritative resolve +
+    /// authorization still happens in `search_inner`, so this must not error or take auth decisions.
+    fn label_index(&self, raw: &str) -> String {
+        let want = raw.trim();
+        if !want.is_empty() {
+            return want.to_string();
+        }
+        if let Some(def) = &self.default_index {
+            return def.clone();
+        }
+        let routes = self.routes.read().expect("routes lock not poisoned");
+        if routes.len() == 1 {
+            return routes.keys().next().cloned().unwrap_or_default();
+        }
+        String::new()
+    }
+
     async fn search_unadmitted(
         &self,
         req: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
+        // Resolve the label before `req` moves into `search_inner`, so per-index query SLIs
+        // attribute a default-index request (`index=""`) to its real index rather than a blank label.
+        let index = self.label_index(&req.get_ref().index);
         let start = std::time::Instant::now();
         let result = self.search_inner(req).await;
-        growlerdb_telemetry::sli::query(start.elapsed().as_secs_f64(), result.is_err());
+        growlerdb_telemetry::sli::query(&index, start.elapsed().as_secs_f64(), result.is_err());
         result
     }
 

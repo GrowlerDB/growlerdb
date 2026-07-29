@@ -194,6 +194,11 @@
           headline: 'v',
           queries: [{ label: 'v', q: 'sum(rate(growlerdb_query_total[1m]))' }],
           help: 'Completed searches per second across the cluster.',
+          breakdown: {
+            q: 'topk(6, sum by (index) (rate(growlerdb_query_total[1m])))',
+            order: 'desc',
+            caption: 'obs.top',
+          },
         },
         {
           key: 'errors',
@@ -204,6 +209,11 @@
           queries: [{ label: 'v', q: 'sum(rate(growlerdb_query_errors_total[1m]))' }],
           help: 'Searches that returned an error, per second.',
           hint: 'Anything above zero is worth a look in the node logs.',
+          breakdown: {
+            q: 'topk(6, sum by (index) (rate(growlerdb_query_errors_total[1m])))',
+            order: 'desc',
+            caption: 'obs.worst',
+          },
         },
         {
           key: 'hydrate-rate',
@@ -264,6 +274,9 @@
             },
           ],
           help: 'Share of cold-tier range reads served from cache rather than object storage.',
+          // The cold cache is a process-wide LRU shared across all indexes (no {index} label by
+          // design), so it stays cluster-wide even when an index is selected.
+          scopable: false,
         },
         {
           key: 'query-status',

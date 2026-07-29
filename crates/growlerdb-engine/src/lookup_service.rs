@@ -222,6 +222,7 @@ impl Lookup for LookupService {
         // Hydration SLI: latency + stale-locator count + keys requested vs found (the
         // index↔source drift early-warning).
         growlerdb_telemetry::sli::hydration(
+            &self.resolved.name,
             started.elapsed().as_secs_f64(),
             refreshed,
             requested,
