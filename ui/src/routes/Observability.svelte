@@ -92,7 +92,7 @@
   const SEARCH_HERO: Hero = {
     key: 'search-latency',
     label: 'Query latency (p50 · p95 · p99)',
-    help: 'Search response time percentiles over a 5-minute window. p99 rising while p50 stays flat points at tail latency — a slow shard or GC pause.',
+    help: "The FULL GrowlerDB round-trip the caller experiences (resolve + retrieve + fuse + hydrate), across lexical/semantic/hybrid — the primary 'how long did GrowlerDB take to respond' signal. p99 rising while p50 stays flat points at tail latency (a slow shard or GC pause); if it tracks the hydrate-latency card, the time is in Iceberg, not retrieval.",
     unit: 'ms',
     queries: [
       {
@@ -224,6 +224,19 @@
           help: 'Key→row hydrations per second — fetching authoritative rows from Iceberg for a hit.',
         },
         {
+          key: 'retrieval-lat',
+          label: 'Retrieval latency p95',
+          fmt: 'ms',
+          headline: 'v',
+          queries: [
+            {
+              label: 'v',
+              q: 'histogram_quantile(0.95, sum by (le) (rate(growlerdb_query_retrieval_duration_seconds_bucket[5m]))) * 1000',
+            },
+          ],
+          help: 'The search / KNN retrieval + fusion portion of query latency, excluding Iceberg hydration. With hydrate latency it splits the full query-latency hero into where the time was spent (retrieval vs Iceberg).',
+        },
+        {
           key: 'hydrate-lat',
           label: 'Hydrate latency p95',
           fmt: 'ms',
@@ -234,7 +247,7 @@
               q: 'histogram_quantile(0.95, sum by (le) (rate(growlerdb_hydration_duration_seconds_bucket[5m]))) * 1000',
             },
           ],
-          help: '95th-percentile time to hydrate a row from the source table.',
+          help: '95th-percentile time to hydrate a row from the source table (the Iceberg layer of query latency).',
         },
         {
           key: 'stale',

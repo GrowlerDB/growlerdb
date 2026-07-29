@@ -20,16 +20,25 @@ Metrics defined as SLIs include: query latency; **ingest lag** (`growlerdb_inges
 **segments/compactions**. Gauges are kept fresh by a background sampler in the control plane so
 dashboards don't depend on console polling.
 
-The **query** and **hydration** SLIs are labelled `{index}` — `growlerdb_query_{total,errors_total,duration_seconds}{index}`
-(the gateway labels with the *resolved* target index, so a default-index request attributes to its real
-index, not a blank; recorded on the **lexical** path in `search_unadmitted` and the **semantic** path
-in the admitted `semantic_search` — a hybrid query records once via its lexical arm, so the two
-`_unadmitted` forms the hybrid arms reuse don't double-count) and
-`growlerdb_hydration_*{index}` / `growlerdb_stale_locators_total{index}` (the node labels with the served
-index). This makes the console's **Search** tab per-index under the scope selector. Labelling the two
-latency histograms multiplies their bucket series by the index count — bounded and acceptable for a small
-index set. The **cold-cache** hit rate is the deliberate exception: its `growlerdb_cold_cache_{hits,misses}_total{tier="cold"}`
-counters are emitted from a process-wide range LRU with no index in scope, so that SLI stays cluster-wide.
+**Query latency is two-tier.** `growlerdb_query_duration_seconds{index,kind,hydrated}` is the **full**
+blackbox round-trip the caller experiences (resolve + retrieve + fuse + hydrate) — the *primary* "how
+long did GrowlerDB take to respond" SLI, driving the headline latency card and the latency alert. It is
+recorded **once per request** at the Gateway's public entry (`search` / `semantic_search` / the
+`hybrid_search` wrapper), so it's transport-agnostic (REST **and** gRPC); the `_unadmitted` forms the
+hybrid arms reuse deliberately record nothing, so a hybrid query counts once. `kind` is
+`lexical`/`semantic`/`hybrid`; `hydrated` marks whether the request included the Iceberg hydration step
+(so a search-only profile is distinguishable from search+hydrate). The gateway labels `index` with the
+*resolved* target, so a default-index request attributes to its real index, not a blank. QPS/errors
+(`growlerdb_query_{total,errors_total}{index,kind}`) count at the same entry.
+
+For **where the time went**, two per-index layer histograms: `growlerdb_query_retrieval_duration_seconds{index}`
+(the search / KNN fan-out + fusion, excl. hydration) and `growlerdb_hydration_duration_seconds{index}`
+(the Iceberg row fetch); `growlerdb_hydration_*{index}` + `growlerdb_stale_locators_total{index}` are
+labelled node-side with the served index. This makes the console's **Search** tab per-index under the
+scope selector, with a retrieval-vs-hydrate breakdown beneath the full-latency hero. The label sets keep
+cardinality bounded (index × 3 kinds × 2 hydrated × buckets). The **cold-cache** hit rate is the
+deliberate exception: its `growlerdb_cold_cache_{hits,misses}_total{tier="cold"}` counters come from a
+process-wide range LRU with no index in scope, so that SLI stays cluster-wide.
 
 **Topology sync:** a gateway hot-reload that rejects a malformed shard map keeps the old, servable
 routing and records it through the background-loop SLIs
