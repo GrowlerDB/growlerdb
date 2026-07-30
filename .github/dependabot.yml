@@ -41,6 +41,13 @@ updates:
         update-types: [minor, patch]
       npm-major:
         update-types: [major]
+    ignore:
+      # Hold TypeScript at 6.x: svelte-check (our `npm run check` gate) peer-requires
+      # `typescript ^5 || ^6`, so a bump to 7 fails `npm ci` with ERESOLVE and blocks the whole
+      # UI gate. TypeScript and svelte-check must move together — lift this once a svelte-check
+      # release accepts TS 7 (bump both in one PR).
+      - dependency-name: "typescript"
+        versions: [">=7"]
 
   - package-ecosystem: maven
     directory: /connector
