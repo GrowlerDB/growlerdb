@@ -6,7 +6,7 @@ All notable changes to GrowlerDB are documented here. The format is based on
 
 ## [Unreleased]
 
-## [0.8.0] - 2026-07-30
+## [0.8.0] - 2026-07-31
 
 A console-UX and serving-reliability release: Observability becomes fleet-first with per-index
 drill-down, semantic/hybrid search gains a results-count control, and two placement-pool fixes stop a
