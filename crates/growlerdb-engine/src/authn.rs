@@ -599,7 +599,7 @@ fn api_key(authorization: Option<&str>) -> Result<&str, AuthnError> {
 /// 32 bytes from the OS CSPRNG, base64url (no pad) — an opaque, unguessable API key.
 fn generate_secret() -> String {
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).expect("OS RNG");
+    getrandom::fill(&mut bytes).expect("OS RNG");
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 

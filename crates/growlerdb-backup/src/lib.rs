@@ -663,7 +663,7 @@ pub async fn promote_cold(store: &Operator, marker: &ColdMarker, window_dir: &Pa
     // data/, manifest.json. Best-effort: a failure just leaves reclaimable objects, never breaks the
     // now-local shard. `object_prefix` is `<prefix>/data/index`, so strip that to get the prefix root.
     if let Some(base) = marker.object_prefix.strip_suffix("/data/index") {
-        let _ = store.remove_all(base).await;
+        let _ = store.delete_with(base).recursive(true).await;
     }
     Ok(())
 }
