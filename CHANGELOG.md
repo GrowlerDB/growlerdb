@@ -6,6 +6,53 @@ All notable changes to GrowlerDB are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-31
+
+A console-UX and serving-reliability release: Observability becomes fleet-first with per-index
+drill-down, semantic/hybrid search gains a results-count control, and two placement-pool fixes stop a
+node from serving a stale read-through shard.
+
+**Upgrading:** drop-in — no index rebuild, no data loss, no config changes, and defaults are
+unchanged. The on-disk index format is unchanged and both fixes are serving-side (the placement
+pool), so no action is required.
+
+### Added
+
+- **Choose how many results semantic and hybrid search return.** The console's search controls now
+  expose a results-count (`k`) selector for semantic and hybrid modes, so you can widen or narrow a
+  vector/hybrid result set without editing the query.
+- **Fleet-first Observability with per-index breakdowns.** The Observability screen previously wrapped
+  every `/v1/stats` panel in `sum()`/`avg()`, collapsing the per-index label into a cluster rollup
+  that hid which index was unhealthy. It now defaults to a **fleet view** that surfaces the outlier
+  and adds an **index-scope selector** (All indexes | one index) that drills the index-dimensioned
+  panels — Search, Data, Ingestion, Source — into a single index; the Runtime (node/API) and Access
+  (logins) panels have no per-index dimension and stay cluster/node-wide.
+
+### Fixed
+
+- **A cold read-through replica no longer 404s a query after a compaction.** Cold-tier GC pruned a
+  segment's objects as soon as a re-layout superseded them, but a read-through replica
+  ([D53](okf/system/decisions/d53-unit-replication.md)) opens at a published layout and only reopens
+  when the **source snapshot** advances — so a query touching a merged-away segment fetched a
+  now-deleted object and failed with an internal error. GC is now **snapshot-gated**: superseded
+  objects are retained until the source snapshot advances (and the previous generation is kept one
+  more cycle), so a pinned reader never loses a segment it may still fetch. Reclamation is bounded, not
+  eliminated.
+- **A pool node promoted to primary no longer keeps serving a stale read-through copy.** When the
+  control plane reassigned a hash-sharded ordinal from read-through **replica** to **primary** on the
+  same node, the node kept serving the old cold snapshot — the promotion was skipped, and the
+  de-assignment path tracked only windowed units, so nothing superseded the replica. After the source
+  advanced (e.g. a corpus reload), that ordinal served stale data until a restart. The node now
+  **promotes in place** ([D52](okf/system/decisions/d52-placement-pool.md)): the freshly-built primary
+  replaces the read-through replica in the serving maps.
+
+### Changed
+
+- Repo-wide **code-comment cleanup** (non-functional — comment text only, no code changes) with a new
+  comment-style guide in `CLAUDE.md`, plus doc refreshes for the placement-pool topology.
+- Dependency updates across Cargo, Maven, and GitHub Actions (including a major-version Cargo group);
+  TypeScript is pinned at 6.x to satisfy the console's `svelte-check` peer requirement.
+
 ## [0.7.0] - 2026-07-28
 
 The **true high-availability** release — HA reaches every index type, not just windowed streams. The
@@ -538,7 +585,8 @@ The initial public (Beta) surface.
   into the image, chart `appVersion`, binaries, and CLI `--version` while the tree stays `0.0.0`;
   the image gets an immutable `X.Y.Z` plus moving `X.Y`/`X`/`latest`. See [RELEASING.md](RELEASING.md).
 
-[Unreleased]: https://github.com/GrowlerDB/growlerdb/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/GrowlerDB/growlerdb/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.4.1...v0.5.0
