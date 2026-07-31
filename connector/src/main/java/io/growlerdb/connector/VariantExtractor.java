@@ -8,8 +8,8 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * Extraction-time variant support (D47/D48, TASK-350/352) — the connector-side walk that turns one
- * row's variant value into the wire shapes the node indexes, keeping the wire scalar-leaf-only.
+ * Extraction-time variant support (D47/D48) — the connector-side walk that turns one row's variant
+ * value into the wire shapes the node indexes, keeping the wire scalar-leaf-only.
  *
  * <p>Given a variant value (Spark reads it and hands us its JSON via {@code VariantVal.toJson()};
  * here a parsed Jackson {@link JsonNode}) and its {@link VariantSpec}, {@link #extract} produces:
@@ -35,7 +35,6 @@ public final class VariantExtractor {
     this.spec = spec;
   }
 
-  /** The spec this extractor was built from (the caller reads its column + discriminator). */
   public VariantSpec spec() {
     return spec;
   }
@@ -66,7 +65,6 @@ public final class VariantExtractor {
     if (discriminatorValue != null) {
       col.setDiscriminator(discriminatorValue);
     }
-    // Flatten: walk every leaf into a column-qualified path=value term.
     if ((spec.flattenTerms || spec.flattenText) && value != null && !value.isNull()) {
       walk(spec.column, value, col);
     }

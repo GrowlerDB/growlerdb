@@ -1,22 +1,14 @@
-//! Turning a Control-Plane **shard map** into the ordered shard set a [`Gateway`] fronts.
-//!
-//! The [`Gateway`](crate::Gateway) scatter-gathers over `Vec<Arc<dyn Node>>` where the
-//! **vector index is the shard ordinal** the [`ShardRouter`](growlerdb_core::ShardRouter)
-//! routes to. The Control-Plane [`Registry`](growlerdb_controlplane::Registry) owns the
-//! authoritative placement — `shard ordinal -> `[`ShardAssignment`] (primary + replicas).
-//! [`shard_primaries`] bridges the two: it validates the map describes a complete `0..N`
-//! shard set with a primary on every shard, and returns the primaries **ordered by ordinal**
-//! so the caller can resolve each to a [`Node`](crate::Node) (e.g. via
-//! [`RemoteNode::connect`](crate::RemoteNode::connect)) and hand the list to
-//! [`Gateway::sharded`](crate::Gateway::sharded).
+//! Turning a Control-Plane **shard map** into the ordered shard set a [`Gateway`] fronts:
+//! [`shard_primaries`] validates the map is a complete `0..N` set with a primary per shard
+//! (the [`Gateway`](crate::Gateway) indexes shards by ordinal) and returns the primaries
+//! ordered by ordinal, so position `i` is shard `i`.
 
 use std::collections::BTreeMap;
 
 use growlerdb_controlplane::{NodeId, ShardAssignment};
 
-/// Why a shard map can't be turned into a Gateway shard set. Each variant is a placement
-/// invariant the Gateway's scatter-gather depends on (ordinal = vector index, one primary
-/// per shard) — surfaced loudly rather than silently dropping or misordering a shard.
+/// Why a shard map can't be turned into a Gateway shard set — each variant is a placement
+/// invariant the scatter-gather depends on (ordinal = vector index, one primary per shard).
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ShardTopologyError {
     /// No shards are assigned yet — there is nothing to front.

@@ -1,13 +1,9 @@
-//! The MCP protocol core + the **stdio transport**.
+//! The MCP protocol core + the stdio transport.
 //!
-//! [`handle_message`] is the transport-agnostic JSON-RPC 2.0 dispatch: one parsed message in, an
-//! optional response out, tools executed against any [`QueryBackend`]. [`serve_io`] wraps it in
-//! the newline-delimited **stdio** loop (the local-agent path); the engine's gateway wraps it in
-//! the **Streamable HTTP** transport at `POST /mcp`.
-//!
-//! Stdio transport contract: one JSON object per line on stdin/stdout, no embedded newlines.
-//! **stdout carries ONLY JSON-RPC messages** — all diagnostics go to stderr (via `tracing`, which
-//! is a no-op unless a stderr subscriber is installed by the host process).
+//! [`handle_message`] is the transport-agnostic JSON-RPC 2.0 dispatch; [`serve_io`] wraps it in the
+//! newline-delimited stdio loop (the engine's gateway instead wraps it in Streamable HTTP at
+//! `POST /mcp`). Stdio contract: one JSON object per line, and stdout carries ONLY JSON-RPC —
+//! diagnostics go to stderr.
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -16,9 +12,8 @@ use crate::backend::QueryBackend;
 use crate::client::GatewayClient;
 use crate::error::McpError;
 
-/// The MCP protocol version we default to when a client's `initialize` omits one. The Streamable
-/// HTTP transport exists since 2025-03-26, and the spec's guidance for a missing version header is
-/// to assume this revision.
+/// The MCP protocol version defaulted to when a client's `initialize` omits one — the spec's
+/// guidance for a missing version header is to assume this revision.
 pub const DEFAULT_PROTOCOL_VERSION: &str = "2025-03-26";
 
 /// Runtime configuration for [`serve`] (the stdio transport).
@@ -173,9 +168,8 @@ fn initialize_result(params: &Value) -> Value {
             "name": "growlerdb",
             "version": env!("CARGO_PKG_VERSION"),
         },
-        // The MCP-official steering text a host injects into the agent's context. Field-tested:
-        // an agent working inside a code checkout hears "what does the growlerdb catalog say…"
-        // and greps FILES unless told these tools query the live, indexed data.
+        // Steering text a host injects into the agent's context: an agent in a code checkout
+        // otherwise greps FILES unless told these tools query live, indexed data.
         "instructions": "GrowlerDB serves LIVE, indexed data — these tools query running search \
             indexes (in the demo: `docs`, `catalog`, `arxiv`), NOT files on disk. When asked what \
             GrowlerDB / an index / 'the catalog' says or contains, use `search` here instead of \

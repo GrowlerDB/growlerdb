@@ -1,21 +1,15 @@
 // Pure request-body builders for the vector search endpoints (`/v1/search:semantic`,
-// `/v1/search:hybrid`). Kept side-effect-free + tested so `api.ts` is a thin transport wrapper and
-// the wire shape (snake_case, omit-when-default) is verifiable in isolation. The engine treats an
-// absent/zero `k`/`rrf_k`, and an empty `filter`/`syntax`/`index`, as "use the default", so those
-// keys are simply omitted when unset.
+// `/v1/search:hybrid`). The engine treats an absent/zero `k`/`rrf_k` and an empty
+// `filter`/`syntax`/`index` as "use the default", so those keys are omitted when unset.
 import type { QuerySyntax } from './api';
 
-/** RRF-k presets offered by the console's hybrid control (the fusion constant). 60 is the
- *  standard default the engine also falls back to when `rrf_k` is omitted. */
+/** RRF-k (fusion constant) presets for the hybrid control. 60 is the engine's own fallback. */
 export const RRF_PRESETS = [10, 30, 60, 100] as const;
-/** Default RRF-k — matches the engine's fallback (standard Reciprocal-Rank-Fusion constant). */
 export const DEFAULT_RRF_K = 60;
 
-/** Top-K presets offered by the console's semantic/hybrid control (number of results). 10 is the
- *  engine's own fallback when `k` is omitted, so the default rides that and sends nothing. Kept in
- *  step with {@link RRF_PRESETS} for a consistent set of steps across the vector-mode controls. */
+/** Top-K (result count) presets for the semantic/hybrid control. 10 is the engine's own fallback,
+ *  so the default is sent as an omitted `k`. */
 export const K_PRESETS = [10, 30, 60, 100] as const;
-/** Default top-K — matches the engine's bounded default page, so it's sent as an omitted `k`. */
 export const DEFAULT_K = 10;
 
 /** Shared options for a semantic (KNN) request over a VECTOR field. */

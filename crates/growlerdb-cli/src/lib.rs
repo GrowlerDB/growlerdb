@@ -623,11 +623,9 @@ async fn reconcile_cluster(control_plane: &str, index: &str, full: bool) -> anyh
         Ok::<ReconcileIndexResponse, anyhow::Error>(resp)
     };
 
-    // Whole-index count-gate: a cheap counts-only probe first. If Σ index docs across all
-    // shards already equals the source table's total record count, the index is in sync — skip the
-    // expensive row-level reconcile entirely. Routing-agnostic (covers hash-routed indexes the
-    // per-partition gate can't). Any unreachable shard / missing primary / zero source total falls
-    // through to a real reconcile (which surfaces the error). Skipped when `--full` forces a sweep.
+    // Count-gate: if Σ index docs across shards equals the source total, skip the expensive
+    // row-level reconcile. Any unreachable shard / zero source total falls through to a real
+    // reconcile; skipped when `--full` forces a sweep.
     if !full && shards.iter().all(|s| !s.primary.is_empty()) {
         let mut index_total = 0u64;
         let mut source_total = 0u64;
@@ -709,17 +707,16 @@ async fn reconcile_cluster(control_plane: &str, index: &str, full: bool) -> anyh
 pub async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // The `mcp` subcommand speaks JSON-RPC on stdout, so it must NOT initialize the telemetry
-    // stdout log layer (that would corrupt the protocol stream) and it opens no embedded engine
-    // (it fronts the gateway over HTTP). Handle it before both.
+    // `mcp` speaks JSON-RPC on stdout, so it must not init the telemetry stdout log layer (would
+    // corrupt the protocol) and opens no embedded engine — handle it before both.
     if matches!(cli.command, Command::Mcp { .. }) {
         return run_mcp(cli.command).await;
     }
 
     // Structured JSON logging + the Prometheus metrics recorder.
     growlerdb_telemetry::init("growlerdb");
-    // Startup splash to stderr (clap handles --help/--version before this, so it
-    // only shows for real commands and never pollutes piped stdout).
+    // Startup splash to stderr — clap handles --help/--version before this, so it never pollutes
+    // piped stdout.
     eprintln!("{}", growlerdb_core::startup_banner());
 
     // Embedded engine over the local store + the local-dev Iceberg/Polaris stack.
@@ -738,7 +735,6 @@ pub async fn run() -> anyhow::Result<()> {
         } => {
             let def_yaml = def.map(std::fs::read_to_string).transpose()?;
             if define_only {
-                // Definition only, no build — how a windowed node starts truly empty.
                 let outcome = engine
                     .define_index(&table, def_yaml.as_deref(), name.as_deref())
                     .await?;
@@ -1050,9 +1046,8 @@ fn spawn_auto_compaction(handle: growlerdb_engine::ShardHandle, label: String, i
         loop {
             tick.tick().await;
             let shard = handle.current();
-            // If the window was parked underneath this handle (hot→cold demote by `spawn_park`),
-            // the served shard is now a read-only cold read-through shard with no writer — there is
-            // nothing to compact. Stop watching; a later `revive`/pre-warm re-spawns compaction.
+            // Parked underneath this handle (hot→cold by `spawn_park`) → read-only, no writer to
+            // compact. Stop watching; a later `revive`/pre-warm re-spawns compaction.
             if shard.is_read_only() {
                 break;
             }
@@ -1064,18 +1059,16 @@ fn spawn_auto_compaction(handle: growlerdb_engine::ShardHandle, label: String, i
                     continue;
                 }
             };
-            // Track live segments every tick so the segments panel shows growth between
-            // merges, not just at compaction time — and the delete debt, so a size
-            // sample taken between merges can be read in context (superseded docs still on disk).
+            // Sample segments + delete debt every tick so the panel shows growth between merges,
+            // not just at compaction time.
             growlerdb_telemetry::sli::segments_live(&label, health.segments);
             growlerdb_telemetry::sli::index_deleted_docs(&label, health.deleted);
-            // Live doc count: the index side of the source→index convergence check —
-            // sum(growlerdb_index_docs) vs sum(growlerdb_source_records) must meet at steady state.
+            // Index side of the source→index convergence check: sum(index_docs) vs
+            // sum(source_records) must meet at steady state.
             if let Ok(docs) = shard.num_docs() {
                 growlerdb_telemetry::sli::index_docs(&label, docs);
             }
-            // One walk serves both gauges: the total is the breakdown's sum, so
-            // `growlerdb_index_bytes` == sum over `growlerdb_index_bytes_component` by construction.
+            // One walk serves both gauges: total == sum over the breakdown by construction.
             let bd = shard.index_size_breakdown();
             growlerdb_telemetry::sli::index_bytes(&label, bd.total());
             growlerdb_telemetry::sli::index_bytes_component(&label, "term", bd.term);
@@ -1094,7 +1087,6 @@ fn spawn_auto_compaction(handle: growlerdb_engine::ShardHandle, label: String, i
                 match tokio::task::spawn_blocking(move || compact_shard.compact(&policy)).await {
                     Ok(Ok(())) => {
                         eprintln!("compact `{label}`: done");
-                        // Count the merge + record the post-merge segment count.
                         if let Ok(after) = handle.current().compaction_health() {
                             growlerdb_telemetry::sli::compaction(&label, before, after.segments);
                         }
@@ -1140,8 +1132,8 @@ fn spawn_locator_remap(
     if interval_secs == 0 || handles.is_empty() {
         return;
     }
-    // Every shard of an index shares one location strategy (it's an index-definition
-    // option), so the first handle speaks for all.
+    // Every shard shares one location strategy (an index-definition option) — first handle speaks
+    // for all.
     if handles[0].current().location_strategy() == growlerdb_core::LocationStrategy::Predicate {
         println!(
             "remap `{label}`: not needed — PREDICATE location strategy (store-less; \
@@ -1149,9 +1141,8 @@ fn spawn_locator_remap(
         );
         return;
     }
-    // A variant table's metadata can't be parsed by released iceberg-rust (D49), so the re-map
-    // poller (which plans over the table) would fail every tick. Skip it, once and loudly (D45):
-    // a variant index is connector-fed and its locators are refreshed lazily on hydration instead.
+    // Released iceberg-rust can't parse variant-table metadata (D49), so the poller would fail
+    // every tick. Skip once and loudly (D45); variant locators refresh lazily on hydration.
     if handles[0].current().has_variant_fields() {
         println!(
             "remap `{label}`: skipped — variant table (iceberg-rust can't plan a v3 variant \
@@ -1168,9 +1159,8 @@ fn spawn_locator_remap(
         tick.tick().await; // skip the immediate first tick
         loop {
             tick.tick().await;
-            // Pin the current shard(s) per tick (a reindex swap is respected next tick). Skip any
-            // window parked underneath its handle (hot→cold demote by `spawn_park`): a read-only
-            // cold shard is served read-through from object storage and has no locators to patch.
+            // Pin the current shard(s) per tick (a reindex swap is respected next tick). Skip
+            // read-only parked windows — served read-through, no locators to patch.
             let shards: Vec<std::sync::Arc<growlerdb_index::Shard>> = handles
                 .iter()
                 .map(|h| h.current())
@@ -1292,9 +1282,8 @@ fn spawn_prewarm(
                 growlerdb_telemetry::sli::background_failure("pre-warm");
                 continue;
             }
-            // Reuse the cold shard's already-open `aux.redb` handle: it is still live in `handle`
-            // until the swap below, and redb allows only one open per file, so the arriving hot shard
-            // must share it rather than race a second `Database::open`.
+            // redb allows one open per file, and the cold shard's `aux.redb` stays live in `handle`
+            // until the swap below, so the arriving hot shard must share it, not reopen.
             let reuse_db = handle.current().db_handle();
             let (store2, resolved2, index2) = (store.clone(), resolved.clone(), index.clone());
             let opened = tokio::task::spawn_blocking(move || {
@@ -1401,10 +1390,9 @@ async fn park_once(
         if let Some(hook) = PARK_TEST_AFTER_BACKUP.lock().unwrap().as_ref() {
             hook(w);
         }
-        // Keep the window's `aux.redb` handle to hand to the cold shard: redb allows one open per
-        // file, and the handle still holds this hot shard until the swap below, so the cold shard
-        // must SHARE the open handle, not race a second `Database::open`. Keep the hot `Arc` too:
-        // if a write raced the backup (checked post-swap below), we swap it right back.
+        // redb allows one open per file, and the hot shard stays live until the swap below, so the
+        // cold shard must SHARE this `aux.redb` handle. Keep the hot `Arc` too: if a write raced the
+        // backup (checked post-swap below), we swap it right back.
         let reuse_db = hot.db_handle();
         // Open the read-through cold shard (object-storage reads → blocking) and hot-swap it in, so
         // queries never see a gap; then evict the now-redundant local bulk.
@@ -1436,15 +1424,11 @@ async fn park_once(
         match opened {
             Ok(Ok(shard)) => {
                 handle.swap(Arc::new(shard));
-                // Write-race check, AFTER the swap so it can't itself race: the backup snapshotted
-                // the shard at `marker.snapshot`, but the window stayed writable until the swap —
-                // a write committing in between (a broadcast delete, late data) advanced the kept
-                // `aux.redb` checkpoint while its segments exist only in the local `index/` bulk
-                // we are about to evict. Serving the cold copy would silently lose that write (the
-                // checkpoint says it's covered, so the connector never re-sends). Post-swap the
-                // window is read-only, so this comparison is stable: on a mismatch, swap the fully
-                // intact hot shard back and re-park next tick (which re-backs-up at the newer
-                // snapshot).
+                // Write-race check, AFTER the swap so it can't itself race (post-swap the window is
+                // read-only → this comparison is stable). The window stayed writable until the swap;
+                // a write in between advanced the kept `aux.redb` checkpoint while its segments live
+                // only in the local bulk we're about to evict — serving the cold copy would silently
+                // lose it. On a mismatch, swap the intact hot shard back and re-park next tick.
                 let live_snapshot = handle.current().current_snapshot().unwrap_or(u64::MAX);
                 if live_snapshot != marker.snapshot {
                     handle.swap(hot);
@@ -1457,8 +1441,7 @@ async fn park_once(
                     continue;
                 }
                 drop(hot);
-                // Marker durable + read-through shard live → drop the local bulk. `aux.redb` stays as
-                // the cold footprint.
+                // Marker durable + read-through shard live → drop the local bulk (`aux.redb` stays).
                 if let Err(e) = growlerdb_backup::evict_local_index(&window_dir) {
                     eprintln!(
                         "park `{label}`: local bulk evict failed ({e}) — parked, cleanup deferred"
@@ -1580,7 +1563,6 @@ async fn serve(cfg: ServeConfig<'_>) -> anyhow::Result<()> {
     use std::sync::Arc;
     use tonic::transport::Server;
 
-    // Load the persisted index definition + open (creating if absent) its shard.
     let def_path = std::path::Path::new(cfg.data_dir)
         .join(cfg.index)
         .join("index.json");
@@ -1642,15 +1624,11 @@ async fn serve(cfg: ServeConfig<'_>) -> anyhow::Result<()> {
     store.recover_reindex(&shard_id)?;
     let shard = Arc::new(store.open_shard(&shard_id, &resolved)?);
 
-    // Lineage guard: if this index recorded its source's Iceberg `table-uuid` at build,
-    // verify the live table still carries it. A mismatch means the source was dropped+recreated (or
-    // its catalog was reset) and the index is stale — its keys no longer exist in the table, so
-    // search would return rows that fail to hydrate ("Row not found"). Rather than refuse to boot,
-    // serve **DEGRADED**: search stays available read-only (for inspection) while writes + checkpoint
-    // reads are refused (the WriteService below) — so the connector stops advancing the stale index
-    // and the control-plane/console surface a distinct `source_recreated` state. A reindex re-anchors
-    // the lineage and clears it. Best-effort: a transient catalog/uuid read error only warns, so a
-    // catalog blip can't trip it — only a *confirmed* mismatch degrades.
+    // Lineage guard: a live `table-uuid` differing from the one recorded at build means the source
+    // was dropped+recreated and the index is stale (its keys no longer hydrate). Serve DEGRADED
+    // (read-only search, writes refused) rather than refuse to boot, so the connector stops
+    // advancing and the CP/console surface a `source_recreated` state; a reindex clears it.
+    // Best-effort: a transient catalog/uuid read error only warns — only a confirmed mismatch degrades.
     let mut source_recreated = false;
     if let Some(recorded) = shard.source_uuid()? {
         let table = match &resolved.source {
@@ -1685,9 +1663,8 @@ async fn serve(cfg: ServeConfig<'_>) -> anyhow::Result<()> {
     let write = growlerdb_engine::WriteService::new(handle.clone(), index, max_inflight)
         .with_fence(reindex_fence.clone())
         .with_source_recreated(source_recreated)
-        // Embed VECTOR fields on the streaming write path (D46) so a connector-fed index (e.g. a
-        // variant table, which can't cold-build — D49) still gets its LOCAL embeddings. No-op for a
-        // non-vector index.
+        // Embed VECTOR fields on the streaming write path (D46) so a connector-fed index (which
+        // can't cold-build — D49) still gets LOCAL embeddings. No-op for a non-vector index.
         .with_embedding(resolved.clone());
     let search = growlerdb_engine::SearchService::new(handle.clone());
     // GetByKey hydrates coordinates back to rows from the index's Iceberg source.
@@ -1742,13 +1719,12 @@ async fn serve(cfg: ServeConfig<'_>) -> anyhow::Result<()> {
         }
     });
 
-    // Health-driven **auto-compaction**, so segments don't accumulate unbounded under
-    // steady ingest. (Only this primary path compacts — a `serve --replica` must never compact, or
-    // it would diverge from the byte-identical segments it pulls.)
+    // Health-driven auto-compaction so segments don't accumulate under steady ingest. Only this
+    // primary path compacts — a `--replica` must never compact or it diverges from pulled segments.
     spawn_auto_compaction(handle.clone(), index.to_string(), compact_interval_secs);
 
-    // Background **compaction re-map**: heal locators in bulk when Iceberg
-    // compaction rewrites the source's data files, instead of a per-hydration refresh tax.
+    // Heal locators in bulk when Iceberg compaction rewrites the source's data files, instead of a
+    // per-hydration refresh tax.
     spawn_locator_remap(
         vec![handle.clone()],
         index.to_string(),
@@ -1758,9 +1734,8 @@ async fn serve(cfg: ServeConfig<'_>) -> anyhow::Result<()> {
         remap_interval_secs,
     );
 
-    // Optionally stand up the Engine API over REST/JSON on a second listener. It routes
-    // through the Gateway → an in-process LocalNode over clones of the same services, so
-    // embedded mode collapses Gateway + Node into one process with no network hop.
+    // Optional Engine API over REST/JSON on a second listener: routes through the Gateway → an
+    // in-process LocalNode, so embedded mode collapses Gateway + Node into one process, no hop.
     if let Some(rest_addr) = rest_addr {
         let rest_socket: std::net::SocketAddr = rest_addr
             .parse()
@@ -1814,11 +1789,9 @@ async fn serve(cfg: ServeConfig<'_>) -> anyhow::Result<()> {
     // that registers with a control plane reports ready only once it's in the registry.
     let readiness = spawn_health(metrics_addr).await?;
 
-    // Announce this served index to the Control-Plane registry so it's discoverable cluster-wide and
-    // routable by the gateway. Retries until the CP is reachable and re-announces on an interval
-    // in K8s the node pods routinely come up before the CP, so a one-shot attempt would
-    // leave the shard serving but invisible to the gateway forever. `serve` hosts the single shard
-    // `ShardId::single(index)`.
+    // Announce this served index to the CP registry so the gateway can route to it. Retries + re-
+    // announces on an interval: node pods routinely start before the CP, so a one-shot attempt
+    // would leave the shard serving but invisible forever.
     if let (Some(cp), Some(endpoint)) = (register, advertise_addr) {
         // Multi-node sharding: with `--shards N > 1`, register as serving only this
         // node's `--shard-ordinal`; otherwise the single-node default (serve the whole index).
@@ -1847,9 +1820,8 @@ async fn serve(cfg: ServeConfig<'_>) -> anyhow::Result<()> {
         readiness.mark_ready();
     }
 
-    // Service-token gate over the WHOLE data plane (Write/Search/Lookup/Suggest/Admin/System):
-    // a Node carries no per-user auth in distributed mode, so the shared token is the
-    // defense-in-depth boundary for a directly-reachable Node port. Unset ⇒ no-op (open dev).
+    // Service-token gate over the whole data plane: a Node carries no per-user auth in distributed
+    // mode, so the shared token is the defense-in-depth boundary. Unset ⇒ no-op (open dev).
     if service_token.is_none() {
         eprintln!(
             "serve: WARNING data-plane gRPC is open — any caller that can reach {socket} can \
@@ -1935,9 +1907,8 @@ async fn serve_replica(
         stats.downloaded, stats.skipped
     );
 
-    // Read-only service surface: a replica never writes or reindexes (it must stay byte-identical to
-    // the primary), so there's no Write service and Admin has **no source** (describe works; reindex
-    // / alter return Unimplemented).
+    // Read-only surface: a replica must stay byte-identical to the primary, so no Write service and
+    // Admin has no source (describe works; reindex/alter return Unimplemented).
     let table = match &resolved.source {
         growlerdb_core::Source::Iceberg(s) => s.table.clone(),
     };
@@ -2129,23 +2100,20 @@ async fn serve_windowed(
         growlerdb_core::Source::Iceberg(s) => s.table.clone(),
     };
 
-    // A windowed node may start **empty** (streaming-first): it registers into the CP
-    // placement pool and creates each window on the first write the connector streams to it. So an
-    // empty window set is valid — the node serves zero windows until ingest populates them (the batch
-    // `growlerdb index` build path still pre-populates them when used).
+    // A windowed node may start empty (streaming-first) and create each window on first write, so an
+    // empty window set is valid. The batch `growlerdb index` path pre-populates them when used.
     let windows = store.window_shards(index)?;
 
-    // Cold windows are served **read-through** from object storage; build the shared object store +
-    // range cache when any window is already parked OR automatic parking is enabled (it will create
-    // cold windows at runtime and must have somewhere to write + a cache to serve them read-through).
+    // Cold windows serve read-through from object storage; build the shared object store + range
+    // cache when any window is already parked OR automatic parking is enabled (which creates cold
+    // windows at runtime and needs somewhere to write + a cache to serve them).
     let park_interval = park_interval_secs();
     let any_cold = windows
         .iter()
         .any(|&w| matches!(store.cold_marker(index, w), Ok(Some(_))));
     let object_store = if any_cold || park_interval > 0 {
-        // Fail fast: parking/cold with no object store configured is a misconfiguration, not a silent
-        // no-op (`object_store_from_env` errors when neither GROWLERDB_OBJECT_STORE_FS nor
-        // GROWLERDB_BACKUP_BUCKET is set).
+        // Fail fast: parking/cold with no object store configured is a misconfiguration, not a
+        // silent no-op (`object_store_from_env` errors when neither env var is set).
         Some(object_store_from_env()?)
     } else {
         None
@@ -2155,8 +2123,8 @@ async fn serve_windowed(
         .map(|_| growlerdb_index::RangeCache::new(cold_cache_bytes()));
 
     // One in-process Node per window — a local Shard for a hot window, a read-through cold Shard for
-    // a parked one (tagged with the marker's zone-map so the Gateway prunes it without a fetch). The
-    // opens run on a blocking thread because the cold path `block_on`s object-storage reads.
+    // a parked one (tagged with the marker's zone-map so the Gateway prunes it without a fetch). Runs
+    // on a blocking thread because the cold path `block_on`s object-storage reads.
     let (
         nodes,
         descriptors,
@@ -2189,10 +2157,9 @@ async fn serve_windowed(
                 Vec<(i64, ShardHandle)>,
                 Vec<(i64, ShardHandle)>,
             );
-            // Each window shard backs an in-process `LocalNode` (the embedded REST Gateway) plus the
-            // gRPC window multiplexers over the *same* swappable handle: `SearchService` + `SuggestService`
-            // and `LookupService` (hydration) + `AdminService` (describe). The handle
-            // is also returned so a HOT window can be auto-compacted.
+            // Each window shard backs an in-process `LocalNode` (embedded REST Gateway) plus the gRPC
+            // window multiplexers over the *same* swappable handle. The handle is returned so a HOT
+            // window can be auto-compacted.
             let build = |shard: Arc<growlerdb_index::Shard>| -> (
                 Arc<dyn Node>,
                 SearchService,
@@ -2318,10 +2285,9 @@ async fn serve_windowed(
     let cold_count = cold_ids.len();
     let hot_count = windows.len() - cold_count;
 
-    // Dynamic windowed ingest: the search/suggest mux maps become **shared + mutable** so
-    // the windowed write path can add a window created at runtime, and we snapshot the boot windows
-    // as the write service's seed (window → handle/node/zone). Built before `hot_handles`/`nodes` are
-    // consumed below.
+    // Dynamic windowed ingest: the mux maps become shared + mutable so the write path can add a
+    // window created at runtime; snapshot the boot windows as the write service's seed. Built before
+    // `hot_handles`/`nodes` are consumed below.
     let handle_by_window: std::collections::BTreeMap<i64, growlerdb_engine::ShardHandle> =
         hot_handles
             .iter()
@@ -2342,9 +2308,8 @@ async fn serve_windowed(
     let admin_windows: growlerdb_engine::SharedAdminWindows =
         Arc::new(std::sync::RwLock::new(windowed_admin));
 
-    // Background **compaction re-map** across the HOT windows: one poll + one
-    // key scan of the rewritten files serves every window (each skips keys it doesn't hold).
-    // Cold read-through windows keep the lazy verify-and-refresh + dead-file short-circuit.
+    // Compaction re-map across the HOT windows: one poll + one key scan serves every window (each
+    // skips keys it doesn't hold). Cold read-through windows keep the lazy refresh path.
     spawn_locator_remap(
         hot_handles.iter().map(|(_, h)| h.clone()).collect(),
         index.to_string(),
@@ -2354,16 +2319,14 @@ async fn serve_windowed(
         remap_interval_secs,
     );
 
-    // Auto-compact each HOT window shard: under steady ingest the current window
-    // accumulates segments, so each hot window gets its own health-driven compaction loop. Cold
-    // read-through windows have no writer and are skipped.
+    // Each HOT window gets its own health-driven compaction loop (the current window accumulates
+    // segments under steady ingest). Cold read-through windows have no writer and are skipped.
     for (w, handle) in hot_handles {
         spawn_auto_compaction(handle, format!("{index} w{w}"), compact_interval_secs);
     }
 
-    // Access-driven pre-warm: each cold window watches its read rate; a parked window that
-    // gets hot again is promoted back to a local hot shard (un-bundled from object storage) and
-    // hot-swapped in, so it stops paying cold-tier latency. Needs the object store (present iff cold).
+    // Access-driven pre-warm: each cold window watches its read rate and, when it gets hot again, is
+    // promoted back to a local hot shard so it stops paying cold-tier latency. Needs the object store.
     if let Some(op) = &object_store {
         for (w, handle) in cold_handles {
             spawn_prewarm(
@@ -2386,9 +2349,9 @@ async fn serve_windowed(
     }
     let gateway = Arc::new(gateway);
 
-    // The windowed **write** service: routes each streamed doc to its window shard,
-    // creating the window on first write and publishing it (mux + this gateway) so it's immediately
-    // queryable. A new window also gets its own auto-compaction loop via `on_new_window`.
+    // Windowed write service: routes each streamed doc to its window shard, creating + publishing the
+    // window on first write so it's immediately queryable. A new window gets its own compaction loop
+    // via `on_new_window`.
     let on_new_window: growlerdb_engine::OnNewWindow = {
         let idx = index.to_string();
         let ci = compact_interval_secs;
@@ -2408,11 +2371,9 @@ async fn serve_windowed(
         on_new_window,
     )?;
 
-    // Automatic cold-tiering (opt-in via GROWLERDB_PARK_INTERVAL_SECS): demote aged windows past
-    // the `hot_windows` policy to cold read-through in the background — the hot→cold counterpart of
-    // the access-driven pre-warm above. Reads the write service's live window set so windows created
-    // at runtime by ingest are parked as they age. Needs the shared object store + cache (both present
-    // when park is enabled).
+    // Automatic cold-tiering (opt-in via GROWLERDB_PARK_INTERVAL_SECS): background-demote aged
+    // windows past `hot_windows` to cold read-through — the hot→cold counterpart of pre-warm above.
+    // Reads the write service's live window set so runtime-created windows are parked as they age.
     if let (Some(op), Some(cache)) = (&object_store, &cache) {
         spawn_park(
             write_service.clone(),
@@ -2427,7 +2388,6 @@ async fn serve_windowed(
         );
     }
 
-    // REST listener — the windowed search surface.
     let rest_socket: std::net::SocketAddr = rest_addr
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid --rest-addr `{rest_addr}`: {e}"))?;
@@ -2451,13 +2411,12 @@ async fn serve_windowed(
 
     let readiness = spawn_health(metrics_addr).await?;
 
-    // Report the served windows (+ zone-maps) to the control plane so a cluster-level Gateway can
-    // route to them. Retries until reachable and re-announces on an interval — same K8s
-    // startup race as the sharded path; `/readyz` stays not-ready until registered.
+    // Report the served windows (+ zone-maps) to the control plane so a cluster Gateway can route to
+    // them. Retries + re-announces on an interval (same K8s startup race as the sharded path);
+    // `/readyz` stays not-ready until registered.
     if let (Some(cp), Some(endpoint)) = (register, advertise_addr) {
-        // Dynamic windowed registration: heartbeat into the CP placement pool (so new
-        // windows can be placed here) AND re-announce the windows this node currently serves (+
-        // zone-maps) each tick — so a window created since boot is advertised, not just the boot set.
+        // Heartbeat into the CP placement pool (so new windows can be placed here) AND re-announce
+        // the currently-served windows each tick, so a window created since boot is advertised too.
         let label = format!("windowed `{index}` at {endpoint}");
         spawn_windowed_registration(
             cp.to_string(),
@@ -2471,10 +2430,9 @@ async fn serve_windowed(
         readiness.mark_ready();
     }
 
-    // gRPC listener: System (health/version) + the **window multiplexers** — `Search` and `Suggest`
-    // plus `Lookup` (hydration) and `Admin` (describe) — over `window id → service`
-    // maps that dispatch by the request's window selector, so a cluster Gateway can route per-window
-    // requests to this one endpoint. (Aggregate/PIT over distributed windows are follow-ons.)
+    // gRPC listener: System + the window multiplexers (Search/Suggest/Lookup/Admin) over
+    // `window id → service` maps that dispatch by the request's window selector, so a cluster Gateway
+    // can route per-window requests to this one endpoint.
     let socket: std::net::SocketAddr = addr
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid --addr `{addr}`: {e}"))?;
@@ -2497,8 +2455,7 @@ async fn serve_windowed(
         .add_service(
             growlerdb_engine::WindowedSuggestService::new(suggest_windows.clone()).into_server(),
         )
-        // Hydration (keys:get) + describe over the windows: the Gateway broadcasts a
-        // hydration to every window and fans a describe to each, dispatched by selector here.
+        // Hydration (keys:get) + describe: the Gateway broadcasts to every window, dispatched here.
         .add_service(
             growlerdb_engine::WindowedLookupService::new(lookup_windows.clone()).into_server(),
         )
@@ -2708,9 +2665,8 @@ fn spawn_shard_replicate(
         let prefix = format!("cold/{index}/{ordinal}");
         // The first tick fires immediately → publish on boot, then every interval.
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-        // Skip a re-upload when the shard hasn't committed anything since the last publish — a static
-        // (or idle) index publishes once and then no-ops, so the coarse re-upload cost is paid only
-        // when there's actually new data for a replica to catch up on.
+        // Skip a re-upload when the shard hasn't committed since the last publish, so the coarse
+        // re-upload cost is paid only when there's new data for a replica to catch up on.
         let mut last_published: Option<u64> = None;
         loop {
             tick.tick().await;
@@ -2791,19 +2747,21 @@ async fn open_and_publish_ordinal(
     })
     .await??;
     let key = ordinal as i64;
-    // Publish into each per-index map (the SAME Arcs the Pool services front), only if still absent.
+    // Publish into each per-index map (the SAME Arcs the Pool services front). Replace any existing
+    // entry: this runs only when the caller (reconcile_primary_builds) decided to (re)serve the
+    // ordinal as PRIMARY — either it was unserved, or it was a read-through REPLICA being promoted —
+    // and the freshly-built primary is authoritative over a stale cold replica. A second primary for
+    // one ordinal on a node can't race here (the reconcile `building` in-flight guard prevents it).
     if let Some(m) = search_idx
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .get(&index)
         .cloned()
     {
-        m.write()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(key)
-            .or_insert_with(|| {
-                SearchService::new(handle.clone()).with_index_heavy_share(index_heavy.clone())
-            });
+        m.write().unwrap_or_else(|e| e.into_inner()).insert(
+            key,
+            SearchService::new(handle.clone()).with_index_heavy_share(index_heavy.clone()),
+        );
     }
     if let Some(m) = suggest_idx
         .read()
@@ -2813,8 +2771,7 @@ async fn open_and_publish_ordinal(
     {
         m.write()
             .unwrap_or_else(|e| e.into_inner())
-            .entry(key)
-            .or_insert_with(|| SuggestService::new(handle.clone()));
+            .insert(key, SuggestService::new(handle.clone()));
     }
     if let Some(m) = lookup_idx
         .read()
@@ -2822,17 +2779,15 @@ async fn open_and_publish_ordinal(
         .get(&index)
         .cloned()
     {
-        m.write()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(key)
-            .or_insert_with(|| {
-                LookupService::new(
-                    handle.clone(),
-                    IcebergConfig::from_env(),
-                    table.to_string(),
-                    resolved.clone(),
-                )
-            });
+        m.write().unwrap_or_else(|e| e.into_inner()).insert(
+            key,
+            LookupService::new(
+                handle.clone(),
+                IcebergConfig::from_env(),
+                table.to_string(),
+                resolved.clone(),
+            ),
+        );
     }
     if let Some(m) = admin_idx
         .read()
@@ -2842,8 +2797,7 @@ async fn open_and_publish_ordinal(
     {
         m.write()
             .unwrap_or_else(|e| e.into_inner())
-            .entry(key)
-            .or_insert_with(|| AdminService::new(handle.clone(), &index));
+            .insert(key, AdminService::new(handle.clone(), &index));
     }
     if let Some(m) = write_hash_idx
         .read()
@@ -2851,13 +2805,11 @@ async fn open_and_publish_ordinal(
         .get(&index)
         .cloned()
     {
-        m.write()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(key)
-            .or_insert_with(|| {
-                WriteService::new(handle.clone(), index.clone(), POOL_HASH_MAX_INFLIGHT)
-                    .with_embedding(resolved.clone())
-            });
+        m.write().unwrap_or_else(|e| e.into_inner()).insert(
+            key,
+            WriteService::new(handle.clone(), index.clone(), POOL_HASH_MAX_INFLIGHT)
+                .with_embedding(resolved.clone()),
+        );
     }
     spawn_auto_compaction(
         handle.clone(),
@@ -2906,18 +2858,15 @@ async fn serve_pool(
     // (D52): a hash-sharded index's writes are ordinal-routed, not window-partitioned.
     let write_hash_idx: growlerdb_engine::SharedHashWriteIndexes =
         Arc::new(RwLock::new(BTreeMap::new()));
-    // Per-index unit kind for the Pool read/write services: a **windowed** index routes on `window`
-    // (`false`); a **hash-sharded** index routes on the `shard` ordinal (`true`). Seeded `false` and
-    // overwritten to `true` per index as its kind is resolved from the definition below.
+    // Per-index unit kind for the Pool services: `false` = windowed (routes on `window`), `true` =
+    // hash-sharded (routes on the `shard` ordinal). Seeded `false`, resolved per index below.
     let kinds: growlerdb_engine::SharedIndexKinds = Arc::new(RwLock::new(
         indexes.iter().map(|i| (i.clone(), false)).collect(),
     ));
 
-    // The node-side write fence (357.12): when this node runs from CP assignments (`--register` +
-    // `--advertise-addr`), every per-index writer refuses writes/checkpoints for `(index, window)`
-    // units the CP hasn't assigned to it as PRIMARY (structured NOT_PRIMARY) — updated atomically
-    // from each pushed assignment snapshot below. Standalone (no CP) it stays unrestricted, so
-    // classic create-on-first-write behavior is unchanged.
+    // Node-side write fence (357.12): under CP assignments (`--register` + `--advertise-addr`) each
+    // writer refuses writes/checkpoints for `(index, window)` units not assigned to it as PRIMARY
+    // (NOT_PRIMARY) — updated from each pushed assignment snapshot. Standalone it stays unrestricted.
     let fence = if register.is_some() && advertise_addr.is_some() {
         growlerdb_engine::PrimaryFence::fenced()
     } else {
@@ -2926,14 +2875,12 @@ async fn serve_pool(
     // Per-index (resolved def, writer) for the CP announce when `--register` is set: the writer's
     // live `served_windows()` is read each re-announce, so a window created since boot is advertised.
     let mut announcements: Vec<(growlerdb_core::ResolvedIndex, WindowedWriteService)> = Vec::new();
-    // Per **hash** index (def, total shard count, ordinals this node holds) for the CP announce: a
-    // hash index reports its served ordinals, not windows, so the cluster gateway can place a ShardNode
-    // per ordinal (task 2). The held-ordinal set is fixed at boot (no create-on-first-write here).
+    // Per hash index (def, total shard count, held ordinals) for the CP announce: reports served
+    // ordinals, not windows, so the gateway can place a ShardNode per ordinal. Held set fixed at boot.
     let mut hash_announcements: Vec<(growlerdb_core::ResolvedIndex, u32, Vec<u32>)> = Vec::new();
-    // Per hash index, the (def, held hot ordinal handles) this node serves locally — the primary of
-    // each such ordinal periodically publishes a frozen snapshot to object storage so replicas can
-    // open it read-through (D53). Populated in the loop; the publish loops spawn once the object store
-    // is known (below).
+    // Per hash index, the (def, held hot ordinal handles) served locally — each ordinal's primary
+    // periodically publishes a frozen snapshot to object storage so replicas open it read-through
+    // (D53). Publish loops spawn once the object store is known (below).
     #[allow(clippy::type_complexity)]
     let mut hash_hot_ordinals: Vec<(
         growlerdb_core::ResolvedIndex,
@@ -2942,12 +2889,10 @@ async fn serve_pool(
     // Per-index (def, source table, heavy budget) the D53 replica reconcile needs to open an
     // assigned replica window read-through and publish it into this index's maps.
     let mut replica_meta: ReplicaIndexMeta = std::collections::HashMap::new();
-    // Per-index fair share of the node-wide heavy-read budget (D52 pool fairness, 357.25): co-resident
-    // indexes share one process, so each gets an equal soft share so a flood of exports/aggregations
-    // on one index can't starve queries on another — while staying work-conserving (an index may
-    // overflow into globally free capacity). The share denominator is this LIVE served-index count,
-    // shared with the assignment reconcile below so it tracks the dispatch map as assignments change
-    // (D53) rather than freezing at boot.
+    // Per-index fair share of the node-wide heavy-read budget (D52 pool fairness, 357.25): each
+    // co-resident index gets an equal soft share so a flood on one can't starve another, while
+    // staying work-conserving (overflow into free capacity). Denominator is the LIVE served-index
+    // count, shared with the assignment reconcile so it tracks the dispatch map (D53), not boot.
     let live_indexes = Arc::new(std::sync::atomic::AtomicUsize::new(indexes.len().max(1)));
     let mut total_windows = 0usize;
     let mut total_ordinals = 0usize;
@@ -2961,11 +2906,9 @@ async fn serve_pool(
             growlerdb_engine::heavy_reads_cap(),
             live_indexes.clone(),
         );
-        // A HASH/partition-sharded index (no `windowing`): its units are **ordinal shards**, not time
-        // windows. Open the ordinals this node holds into the per-index read maps (keyed by
-        // ordinal-as-i64) + a per-ordinal writer, register the index as hash in `kinds` so the Pool
-        // services route on `shard`, and skip the windowed wiring below. Hash writes are ordinal-routed
-        // by the connector, so there is no window partitioning / in-process gateway swap here.
+        // A HASH/partition-sharded index (no `windowing`): its units are ordinal shards. Open the
+        // held ordinals into the per-index read maps + a per-ordinal writer, mark it hash in `kinds`
+        // so the Pool services route on `shard`, and skip the windowed wiring below.
         if resolved.windowing.is_none() {
             let handles = open_pool_hash_index(
                 &store,
@@ -2985,16 +2928,14 @@ async fn serve_pool(
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(index.clone(), true);
-            // The advertised total shard count comes from the **definition** (authoritative), not the
-            // held-ordinal set — a node serving ordinals purely read-through (a D53 replica with no
-            // local shards) still announces the index's true shard count, so the CP can place every
-            // ordinal and the gateway builds the full router.
+            // Advertised total shard count comes from the definition (authoritative), not the held
+            // set — a read-through-only node (D53 replica) still announces the true count, so the CP
+            // can place every ordinal and the gateway builds the full router.
             let held: Vec<u32> = handles.iter().map(|(o, _)| *o).collect();
             hash_announcements.push((resolved.clone(), resolved.shard_count, held));
-            // Each ordinal this node holds HOT (built/serves locally, i.e. its primary): schedule a
-            // periodic publish of a frozen snapshot to object storage (below, once the store is known),
-            // so a cross-node replica can open it read-through and a node loss is a zero-gap read
-            // failover (D53). A read-through-only node holds none here, so it never double-publishes.
+            // Ordinals held HOT (primary): schedule a periodic frozen-snapshot publish (below, once
+            // the store is known) so a replica opens it read-through and a node loss is a zero-gap
+            // read failover (D53). A read-through-only node holds none, so it never double-publishes.
             hash_hot_ordinals.push((resolved.clone(), handles));
             // The D53 reconcile needs the def/table/budget to open an assigned replica ordinal
             // read-through and publish it into this index's maps.
@@ -3005,10 +2946,9 @@ async fn serve_pool(
             .windowing
             .clone()
             .expect("windowing present (checked above)");
-        // Open each of this index's window shards into the per-window read services + an in-process
-        // node (backing the write service's gateway swap), keyed as the writer's boot seed. Cold
-        // read-through windows are not yet handled in pool mode (a follow-on) — pool serving targets
-        // hot windows.
+        // Open each window shard into the per-window read services + an in-process node (backing the
+        // write service's gateway swap), keyed as the writer's boot seed. Cold read-through windows
+        // are not yet handled in pool mode — pool serving targets hot windows.
         let windows = store.window_shards(index)?;
         let (search_w, suggest_w, lookup_w, admin_w, seed, served) = {
             let (store, resolved, index_s, table, windows, index_heavy) = (
@@ -3069,9 +3009,8 @@ async fn serve_pool(
                         ),
                     );
                     admin_w.insert(w, AdminService::new(handle.clone(), &index_s));
-                    // The in-process node fronting this window (the write service swaps its own
-                    // windowed gateway over these on new-window creation; not served over REST in
-                    // pool mode — a cluster gateway fronts pool nodes over gRPC).
+                    // In-process node fronting this window (the write service swaps its windowed
+                    // gateway over these on new-window creation; not served over REST in pool mode).
                     let node: Arc<dyn Node> = LocalNode::new(
                         SearchService::new(handle.clone()),
                         SuggestService::new(handle.clone()),
@@ -3169,16 +3108,13 @@ async fn serve_pool(
         let _ = served; // (per-window ServedWindow now re-read from the writer at announce time)
     }
 
-    // D53 assignment subscription: when this node registers into the pool, subscribe to CP
-    // assignment pushes. Every snapshot updates the write fence (primary-holder view — needs only
-    // the CP); when a backup object store is also configured, it additionally opens each assigned
-    // *replica* window read-through, so a re-placed/replica holder answers without a rebuild.
-    // Absent the object store, the node still fences writes but serves only its local/primary
-    // windows (no replica failover).
+    // D53 assignment subscription: every snapshot updates the write fence (needs only the CP); with
+    // a backup object store it also opens each assigned *replica* window read-through, so a re-placed
+    // holder answers without a rebuild. Absent the store, it fences writes but serves only its
+    // local/primary windows.
     let mut replica_capable = false;
-    // The backup object store (S3 or local fs), shared by the replica read-through path AND the
-    // primary's hash-ordinal publish loops below. `Err` when neither `GROWLERDB_BACKUP_BUCKET` nor
-    // `GROWLERDB_OBJECT_STORE_FS` is set.
+    // Backup object store (S3 or local fs), shared by the replica read-through path and the primary's
+    // hash-ordinal publish loops below. `Err` when neither backup env var is set.
     let object_store = object_store_from_env();
     if let (Some(cp), Some(endpoint)) = (register, advertise_addr) {
         let replica_root = std::path::PathBuf::from(data_dir).join(".replica");
@@ -3209,11 +3145,9 @@ async fn serve_pool(
         // The heartbeat's replica-capability declaration (HA-G2) mirrors whether the replica
         // serving path above is actually wired.
         replica_capable = replica.is_some();
-        // The **primary side** of D53 hash replication: for each hash ordinal this node holds HOT
-        // locally, publish a frozen snapshot to object storage on an interval, so a replica can open
-        // it read-through and a node loss is a zero-gap read failover. Only with an object store (else
-        // there is nothing to feed a replica); a read-through-only node holds no hot ordinals here, so
-        // there is exactly one publisher per ordinal.
+        // Primary side of D53 hash replication: for each hash ordinal held HOT, publish a frozen
+        // snapshot to object storage on an interval so a replica opens it read-through (zero-gap read
+        // failover). A read-through-only node holds no hot ordinals, so there's one publisher each.
         if let Ok(op) = &object_store {
             let interval = pool_replicate_interval_secs();
             for (resolved, handles) in &hash_hot_ordinals {
@@ -3229,10 +3163,9 @@ async fn serve_pool(
                 }
             }
         }
-        // Build-on-assignment (D52 dynamic assignment): a node the CP assigns primary of a hash
-        // ordinal it doesn't hold cold-builds it from source and serves it hot — so the operator points
-        // N interchangeable nodes at the pool with a uniform config and each builds the ordinals the CP
-        // gives it. Enabled whenever registered (it has an Iceberg source to build from).
+        // Build-on-assignment (D52 dynamic assignment): a node assigned primary of a hash ordinal it
+        // doesn't hold cold-builds it from source and serves it hot, so N interchangeable nodes run
+        // one config and each builds the ordinals the CP gives it. Enabled whenever registered.
         let building = match growlerdb_engine::Engine::open(data_dir, IcebergConfig::from_env()) {
             Ok(engine) => Some(PrimaryBuilding {
                 engine,
@@ -3287,9 +3220,9 @@ async fn serve_pool(
         );
     }
     let readiness = spawn_health(metrics_addr).await?;
-    // Register into the placement pool + announce every served index's windows, so a cluster gateway
-    // routes to this node; `/readyz` stays not-ready until the first successful registration. Without
-    // `--register` the node serves immediately (local/standalone).
+    // Register into the placement pool + announce every served index's windows so a cluster gateway
+    // routes here; `/readyz` stays not-ready until the first registration. Without `--register` the
+    // node serves immediately (standalone).
     if let (Some(cp), Some(endpoint)) = (register, advertise_addr) {
         let label = format!("pool node at {endpoint} [{}]", indexes.join(", "));
         spawn_pool_registration(
@@ -3317,11 +3250,9 @@ async fn serve_pool(
         .add_service(PoolAdminService::new(admin_idx, kinds.clone()).into_server())
         .add_service(PoolWriteService::new(write_idx, write_hash_idx, kinds).into_server())
         .add_service(SystemServer::new(SystemService::new(VERSION)))
-        // SIGINT *or* SIGTERM (HA-G4): plain Kubernetes stops a pod with SIGTERM (the Helm preStop
-        // sends SIGINT, but not every deployment runs the chart) — both must drain gracefully, not
-        // die on the default disposition. There is no deregistration RPC in control.proto (a node
-        // leaves the pool by ceasing to heartbeat and aging out of the liveness TTL), so shutdown
-        // sends nothing to the CP; the dead-owner sweeper re-places this node's units after the TTL.
+        // SIGINT *or* SIGTERM (HA-G4): plain Kubernetes stops a pod with SIGTERM, so both must drain
+        // gracefully. There is no deregistration RPC (a node leaves by ceasing to heartbeat and aging
+        // out of the liveness TTL); the dead-owner sweeper re-places its units after the TTL.
         .serve_with_shutdown(socket, shutdown_signal())
         .await?;
     println!("growlerdb serve-pool: shut down cleanly");
@@ -3503,10 +3434,9 @@ fn spawn_assignment_reconcile(
 ) {
     let replica_capable = replica.is_some();
     tokio::spawn(async move {
-        // Window units assigned to this node by any PREVIOUSLY applied snapshot — the
-        // "assignment-driven" set. Only these are ever unloaded: a boot window the CP never
-        // assigned (standalone data, a not-yet-announced window) must not be yanked by a snapshot
-        // that simply doesn't know it. Survives stream reconnects (each snapshot is full).
+        // Window units assigned by a PREVIOUSLY applied snapshot. Only these are ever unloaded: a
+        // boot window the CP never assigned must not be yanked by a snapshot that doesn't know it.
+        // Survives reconnects (each snapshot is full).
         let mut assignment_seen: std::collections::HashSet<(String, i64)> =
             std::collections::HashSet::new();
         let mut orphans_swept = false;
@@ -3514,11 +3444,9 @@ fn spawn_assignment_reconcile(
         loop {
             if let Err(e) = async {
                 let mut client = connect_cp(&cp, false).await?;
-                // Heartbeat FIRST (idempotent), on the same connection: `SubscribeAssignments`
-                // refuses an endpoint with no live registration (FAILED_PRECONDITION), and racing
-                // the parallel registration loop at startup would only burn this loop's reconnect
-                // backoff on an ordering artifact. The extra heartbeat is free — registration is
-                // uncapped and in-memory.
+                // Heartbeat FIRST (idempotent): `SubscribeAssignments` refuses an endpoint with no
+                // live registration (FAILED_PRECONDITION), so racing the parallel registration loop
+                // would burn this loop's backoff. The extra heartbeat is free (in-memory).
                 client
                     .register_node(growlerdb_proto::v1::RegisterNodeRequest {
                         endpoint: endpoint.clone(),
@@ -3531,11 +3459,9 @@ fn spawn_assignment_reconcile(
                     })
                     .await?
                     .into_inner();
-                // A full snapshot on subscribe + on every placement change; reconcile each. Between
-                // pushes, a retry tick re-attempts assigned units that weren't serveable yet (a replica
-                // waiting on its primary's not-yet-published marker, a build that failed) — the CP
-                // pushes only on placement *changes*, so a unit that becomes serveable after its push
-                // must be retried locally.
+                // Full snapshot on subscribe + every placement change; reconcile each. Between pushes
+                // a retry tick re-attempts units not yet serveable (a replica waiting on its primary's
+                // marker, a failed build) — the CP pushes only on *changes*, so retry locally.
                 let mut last_units: Vec<growlerdb_proto::v1::UnitAssignment> = Vec::new();
                 let mut retry = tokio::time::interval(RECONCILE_RETRY_INTERVAL);
                 retry.tick().await; // consume the immediate first tick
@@ -3561,9 +3487,9 @@ fn spawn_assignment_reconcile(
                             for (index, window) in assignment_seen.iter().filter(|u| !current.contains(u)) {
                                 unload_unit(&unload, index, *window);
                             }
-                            // The first snapshot is also the authority on which `.replica` scratch dirs
-                            // from PREVIOUS runs are still assigned — sweep the rest (a blind sweep at
-                            // startup would race the subscription and delete still-assigned scratch).
+                            // The first snapshot is the authority on which PREVIOUS-run `.replica`
+                            // scratch dirs are still assigned — sweep the rest (a blind startup sweep
+                            // would race the subscription and delete still-assigned scratch).
                             if !orphans_swept {
                                 orphans_swept = true;
                                 let root = unload.replica_root.clone();
@@ -3690,13 +3616,10 @@ async fn reconcile_replica_units(
     use std::sync::Arc;
     let mut served = 0usize;
     for u in units {
-        // The unit's map key + object-store park prefix + `.replica` scratch subdir + human label.
-        // A windowed index's units are cold (parked, read-only) **windows**; a hash index's are
-        // **ordinal shards** — a frozen `backup_replica_snapshot` of a live shard. Both are served
-        // read-through here, for either role (a parked window is read-only, so a primary holder serves
-        // it like a replica; a hash primary serves its ordinal HOT from the boot/local path and so is
-        // "already serving" below, skipped). A HOT window / an unpublished shard has no marker and is
-        // skipped, retried on the next snapshot.
+        // The unit's map key + object-store park prefix + `.replica` scratch subdir + label. A
+        // windowed index's units are cold (parked) windows; a hash index's are ordinal shards (a
+        // frozen `backup_replica_snapshot`). Both serve read-through here. A HOT window / unpublished
+        // shard has no marker and is skipped, retried on the next snapshot.
         let (key, prefix, scratch_sub, label) = match u.unit {
             Some(WireUnit::Window(w)) => (
                 w,
@@ -3759,11 +3682,9 @@ async fn reconcile_replica_units(
             }
         };
         let handle = ShardHandle::new(Arc::new(shard));
-        // Publish into the four per-index maps (the SAME Arcs the Pool read services front, so the
-        // unit is queryable with no restart). **Insert only if still absent** (HA-A4): the cold open
-        // above is slow, and the write path may have created this unit HOT meanwhile — an
-        // unconditional insert would clobber the live hot entry with this stale cold one. The
-        // re-check under the write lock makes the hot unit win; the cold shard is discarded.
+        // Publish into the four per-index maps (the SAME Arcs the Pool read services front). Insert
+        // only if still absent (HA-A4): the slow cold open may have raced the write path creating this
+        // unit HOT — the re-check under the write lock makes the hot unit win, discarding the cold one.
         {
             let mut sw = search_units.write().unwrap_or_else(|e| e.into_inner());
             if sw.contains_key(&key) {
@@ -3865,18 +3786,26 @@ fn reconcile_primary_builds(units: &[growlerdb_proto::v1::UnitAssignment], pb: &
         if resolved.shard_count != 1 || ordinal != 0 {
             continue;
         }
-        // Already serving this ordinal (built earlier, or opened at boot from local data)? Skip.
-        let already_served = pb
+        // Already serving this ordinal? Skip — UNLESS we serve it only as a read-through REPLICA (a
+        // read-only cold shard) while the CP now assigns us PRIMARY. That replica→primary role change
+        // isn't covered by the de-assignment path (`spawn_assignment_reconcile` tracks only Window
+        // units), so a hash ordinal's stale replica would otherwise never be superseded and the node
+        // serves the stale cold snapshot forever — stale once the source advances (e.g. after
+        // `just demo-data` reloads the corpus). Fall through to build; `open_and_publish_ordinal`
+        // then replaces the replica service with the freshly-built primary. A primary we already hold
+        // is left alone (idempotent).
+        let serving_as_primary = pb
             .search_idx
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get(&u.index)
-            .is_some_and(|m| {
+            .and_then(|m| {
                 m.read()
                     .unwrap_or_else(|e| e.into_inner())
-                    .contains_key(&(ordinal as i64))
+                    .get(&(ordinal as i64))
+                    .map(|svc| !svc.serves_read_only())
             });
-        if already_served {
+        if serving_as_primary == Some(true) {
             continue;
         }
         // In-flight guard: mark this ordinal building; if already marked, another task has it.
@@ -4029,16 +3958,13 @@ pub async fn gateway(cfg: GatewayConfig<'_>) -> anyhow::Result<()> {
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid --rest-addr `{rest_addr}`: {e}"))?;
 
-    // Serve /healthz + /readyz **before** building the gateway: if the gateway must WAIT
-    // for the control-plane at boot (rolled together), /healthz stays up so liveness passes and the
-    // pod isn't killed, while /readyz stays not-ready until the routing snapshot is in hand (marked
-    // ready just before the gRPC serve below). Net: up-but-not-ready during the wait, never
-    // CrashLoopBackOff.
+    // Serve /healthz + /readyz BEFORE building the gateway: if it must wait for the control-plane at
+    // boot, /healthz stays up (liveness passes, pod isn't killed) while /readyz stays not-ready until
+    // the routing snapshot is in hand — up-but-not-ready during the wait, never CrashLoopBackOff.
     let readiness = spawn_health(metrics_addr).await?;
 
     // For `--registry` ordinal/alias indexes, remember what the hot-reload loop needs (registry
-    // path, index, a TLS clone) — spawned after the gateway is `Arc`-wrapped below. Windowed indexes
-    // aren't reloaded.
+    // path, index, TLS clone) — spawned after the gateway is `Arc`-wrapped below. Windowed not reloaded.
     let mut reload: Option<(String, String, Option<tonic::transport::ClientTlsConfig>)> = None;
     // Control-plane (gRPC) hot-reload: (cp endpoint, index, tls, startup fingerprint to seed `last`).
     let mut reload_cp: Option<(
@@ -4134,18 +4060,16 @@ pub async fn gateway(cfg: GatewayConfig<'_>) -> anyhow::Result<()> {
         }
     };
 
-    // An injected authenticator (out-of-tree/enterprise build) takes precedence over the
-    // flag-driven auth below; it is authoritative and carries its own methods (typically a
-    // ChainAuthenticator), so we simply install it plus the standard RBAC.
+    // An injected authenticator (out-of-tree build) takes precedence over the flag-driven auth
+    // below; it carries its own methods, so just install it plus the standard RBAC.
     let gw = if let Some(authn) = injected_authn {
         println!("gateway: authentication via an injected authenticator");
         gw.with_authn(authn)
             .with_password_login(builtin_auth)
             .with_authz(Arc::new(growlerdb_engine::RbacPolicy::with_default_roles()))
     }
-    // Optional OIDC/JWT authentication. When enabled, fetch the issuer's JWKS up front (so a
-    // misconfigured issuer fails fast at startup, not per request) and keep it fresh on a timer
-    // to follow key rotation.
+    // Optional OIDC/JWT: fetch the issuer's JWKS up front (a misconfigured issuer fails fast at
+    // startup, not per request) and keep it fresh on a timer for key rotation.
     else if let Some(issuer) = oidc_issuer {
         let audience = oidc_audience
             .ok_or_else(|| anyhow::anyhow!("--oidc-audience is required with --oidc-issuer"))?;
@@ -4158,8 +4082,7 @@ pub async fn gateway(cfg: GatewayConfig<'_>) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("fetching OIDC keys from `{issuer}`: {e}"))?;
         spawn_jwks_refresher(authn.clone());
         println!("gateway: OIDC/JWT authentication enabled (issuer `{issuer}`, aud `{audience}`)");
-        // With authenticated roles in hand, enforce coarse control-plane RBAC:
-        // map the verified roles to operation scopes and reject calls that lack them.
+        // Map verified roles to operation scopes and reject calls that lack them.
         println!("gateway: RBAC enabled (viewer / index-admin / operator / service roles)");
         gw.with_authn(authn)
             .with_authz(Arc::new(growlerdb_engine::RbacPolicy::with_default_roles()))
@@ -4179,16 +4102,14 @@ pub async fn gateway(cfg: GatewayConfig<'_>) -> anyhow::Result<()> {
             .with_authz(Arc::new(growlerdb_engine::RbacPolicy::with_default_roles()))
     } else if require_auth_env() {
         // Prod safety guard: refuse to start open when GROWLERDB_REQUIRE_AUTH is set, so a
-        // deployment that forgot to configure auth fails fast instead of silently serving
-        // unauthenticated traffic. Opt-in, so dev/CI stay open by default.
+        // misconfigured deployment fails fast instead of silently serving open. Opt-in.
         anyhow::bail!(
             "gateway refused to start: GROWLERDB_REQUIRE_AUTH is set but no authentication is \
              configured — pass --oidc-issuer or --builtin-auth (or unset GROWLERDB_REQUIRE_AUTH)"
         );
     } else {
-        // Open mode. Warn through tracing (not stderr) so the telemetry exporter captures it and
-        // an "open gateway in prod" alert is possible; set GROWLERDB_REQUIRE_AUTH=1 to make this a
-        // hard startup failure instead.
+        // Open mode. Warn through tracing (not stderr) so the telemetry exporter captures it and an
+        // "open gateway in prod" alert is possible.
         tracing::warn!(
             "authentication is disabled (no --oidc-issuer / --builtin-auth); the gateway is OPEN. \
              Set GROWLERDB_REQUIRE_AUTH=1 to refuse starting without authentication."
@@ -4360,17 +4281,15 @@ async fn gateway_from_registry(
 ) -> anyhow::Result<growlerdb_engine::Gateway> {
     let registry = growlerdb_controlplane::Registry::open(registry_path)
         .map_err(|e| anyhow::anyhow!("opening registry `{registry_path}`: {e}"))?;
-    // A single **windowed** index routes per time window, not over an ordinal shard map
-    // (which it doesn't have) — front its windows over `WindowNode`s so a time-filtered search
-    // prunes to the owning windows across nodes.
+    // A single windowed index routes per time window, not an ordinal shard map — front its windows
+    // over `WindowNode`s so a time-filtered search prunes to the owning windows across nodes.
     if let Some(entry) = registry.get(name) {
         if let Some(windowing) = entry.definition.windowing.clone() {
             return gateway_windowed_from_registry(&registry, name, windowing, node_tls).await;
         }
     }
-    // Otherwise `name` is an ordinal index or an **alias**: connect the shard primaries +
-    // build the router. Factored out so the hot-reload loop ([`spawn_registry_reloader`]) can re-run
-    // it on a topology change and swap the result in.
+    // Otherwise `name` is an ordinal index or alias: connect the shard primaries + build the router.
+    // Factored out so the hot-reload loop can re-run it on a topology change and swap the result in.
     let (nodes, router) = resolve_sharded_routing(&registry, name, node_tls).await?;
     // Search fan-out pruning: if the index is partition-routed on keyword fields, tell the
     // Gateway their names so a search pinning them routes to the owning shard instead of broadcasting.
@@ -4536,9 +4455,8 @@ fn routing_plan_from_get_index(
     index: &str,
     resp: &growlerdb_proto::v1::GetIndexResponse,
 ) -> anyhow::Result<(Vec<String>, growlerdb_core::RoutingStrategy, Vec<u32>)> {
-    // A windowed index is fronted by [`windowed_gateway_from_get_index`], not the ordinal
-    // planner, and its reloader is never wired — so reaching here with window shards is an internal
-    // routing bug, not an unsupported case.
+    // A windowed index is fronted by the windowed gateway path, not this ordinal planner — reaching
+    // here with window shards is an internal routing bug, not an unsupported case.
     if resp.shard_status.iter().any(|s| s.window != 0) || resp.windowing.is_some() {
         anyhow::bail!(
             "`{index}` is windowed but reached the ordinal routing planner — it must route through \
@@ -4624,18 +4542,15 @@ fn connect_sharded_from_get_index(
     // The ordinal shards, sorted (routing_plan already asserted a contiguous 0..shard_count).
     let mut shards: Vec<&growlerdb_proto::v1::ShardStatus> = resp.shard_status.iter().collect();
     shards.sort_by_key(|s| s.ordinal);
-    // Endpoint → warm `RemoteNode`: a **pool node** hosts several ordinals of one index on ONE
-    // endpoint (and a primary/replica can share one), so dedupe the channel — a tonic `Channel` is a
-    // cheap handle, and each ordinal still gets its own `ShardNode` wrapping the shared connection.
+    // Dedupe endpoint → warm `RemoteNode`: a pool node hosts several ordinals on ONE endpoint, and a
+    // tonic `Channel` is a cheap handle — each ordinal still gets its own `ShardNode` over it.
     let mut conns: std::collections::HashMap<String, growlerdb_engine::RemoteNode> =
         std::collections::HashMap::new();
     let mut nodes: Vec<Arc<dyn growlerdb_engine::Node>> = Vec::with_capacity(shards.len());
     for s in &shards {
-        // This ordinal's **holders** (D53): the primary first, then its read replicas — deduped,
-        // blanks dropped. Each connects **lazily** (a down holder fails fast at query time, not at
-        // build) and is wrapped in a `ShardNode` that stamps `(index, ordinal)` so a pool endpoint
-        // dispatches to the right ordinal; a `FailoverNode` then fails a dead primary over to a live
-        // replica with no gap (R=1 today ⇒ a single holder, the plain-shard behavior).
+        // This ordinal's holders (D53): primary first, then read replicas (deduped). Each connects
+        // lazily (a down holder fails at query time, not build) and is wrapped in a `ShardNode`
+        // stamping `(index, ordinal)`; a `FailoverNode` fails a dead primary over to a live replica.
         let mut holder_eps: Vec<String> = vec![s.primary.clone()];
         for r in &s.replicas {
             if !r.is_empty() && !holder_eps.contains(r) {
@@ -4776,10 +4691,9 @@ async fn resolve_windowed_routing_cp(
                 s.window
             );
         }
-        // This window's **holders** (D53): the primary first, then its read replicas — deduped,
-        // blanks dropped. Each connects **lazily** so a currently-down holder doesn't fail the whole
-        // resolution (it fails fast at query time instead); a `FailoverNode` then serves each read
-        // from a live holder, failing a down primary over to a replica with no gap.
+        // This window's holders (D53): primary first, then read replicas (deduped). Each connects
+        // lazily so a down holder doesn't fail the whole resolution; a `FailoverNode` serves each
+        // read from a live holder, failing a down primary over to a replica with no gap.
         let mut holder_eps: Vec<String> = vec![s.primary.clone()];
         for r in &s.replicas {
             if !r.is_empty() && !holder_eps.contains(r) {
@@ -4876,12 +4790,10 @@ async fn gateway_from_control_plane(
     index: &str,
     node_tls: Option<tonic::transport::ClientTlsConfig>,
 ) -> (growlerdb_engine::Gateway, CpReload) {
-    // One build attempt: connect to the control plane, then resolve the index's topology. BOTH a
-    // connection refusal (the CP pod isn't up yet) and shards-not-yet-registered (the
-    // Kubernetes start race) are transient at boot, so retry_until_ok waits it out rather
-    // than exit(1) → CrashLoopBackOff. The caller serves /healthz + a not-ready /readyz meanwhile.
-    // A **windowed** index builds a window-pruning gateway (hot-reloaded via swap_windowed
-    // so runtime-created windows are picked up); an ordinal index returns its routing fingerprint.
+    // One build attempt: connect to the CP, then resolve the index's topology. Both a connection
+    // refusal and shards-not-yet-registered are transient at boot, so retry_until_ok waits it out
+    // rather than exit(1) → CrashLoopBackOff. A windowed index builds a window-pruning gateway; an
+    // ordinal index returns its routing fingerprint.
     let attempt = || {
         let node_tls = node_tls.clone();
         async move {
@@ -5048,9 +4960,8 @@ fn spawn_index_route_reloader(
 ) {
     tokio::spawn(async move {
         let mut client: Option<growlerdb_proto::service_token::CpClient> = None;
-        // Windowed reload state: the last-applied fingerprint (skip the swap when routing is
-        // unchanged, keeping warm channels + holder-health state) and the endpoint → connection
-        // cache reused across ticks (a changed topology only dials endpoints that are new).
+        // Windowed reload state: last-applied fingerprint (skip the swap when unchanged, keeping warm
+        // channels) + the endpoint → connection cache reused across ticks (dial only new endpoints).
         let mut last: Option<WindowFingerprint> = None;
         let mut conns: std::collections::HashMap<String, growlerdb_engine::RemoteNode> =
             Default::default();
@@ -5088,9 +4999,8 @@ fn spawn_index_route_reloader(
                 }
             };
             if windowed {
-                // Unchanged routing → keep the live route: swapping would discard warm node
-                // channels and the FailoverNode holder-health state for nothing. (The first tick
-                // always applies once — `last` starts empty — then only real changes swap.)
+                // Unchanged routing → keep the live route: swapping would discard warm node channels
+                // and the FailoverNode holder-health state for nothing.
                 let fp = window_fingerprint_from_get_index(&resp);
                 if last.as_ref() == Some(&fp) {
                     growlerdb_telemetry::sli::background_success("route-reload");
@@ -5204,12 +5114,10 @@ fn spawn_control_plane_reloader(
             }
             let c = client.as_mut().expect("client present");
             match resolve_sharded_routing_cp(c, &index, node_tls.clone()).await {
-                // Swap in a freshly-built routing **every** tick, not just on a topology change
-                // the node channels are lazy, so rebuilding is cheap and — crucially — it
-                // re-resolves each shard's DNS, so a shard pod that crashed and returned at a new IP
-                // is reconnected within one interval with no manual gateway restart. The connect now
-                // can't fail on a down shard (lazy), so a partially-down cluster still serves (partial)
-                // and self-heals. Log only when the topology fingerprint actually changes.
+                // Swap in freshly-built routing EVERY tick (lazy channels make it cheap): it
+                // re-resolves each shard's DNS, so a shard pod that returned at a new IP is
+                // reconnected within one interval and a partially-down cluster self-heals. Log only
+                // when the fingerprint actually changes.
                 Ok((nodes, router, fp)) => {
                     gateway.swap_routing(nodes, router);
                     if Some(&fp) != last.as_ref() {
@@ -5290,9 +5198,8 @@ fn spawn_windowed_control_plane_reloader(
                     continue;
                 }
             };
-            // Routing unchanged → skip the swap entirely: the live gateway keeps its warm node
-            // channels and the FailoverNode holder-health (down-mark) state. The fingerprint is
-            // computed straight off the response — no node connects on a no-change tick.
+            // Routing unchanged → skip the swap: keep warm node channels + FailoverNode holder-health
+            // state. Fingerprint is computed straight off the response — no node connects here.
             let fp = window_fingerprint_from_get_index(&resp);
             if last.as_ref() == Some(&fp) {
                 growlerdb_telemetry::sli::background_success("cp-reload-windowed");
@@ -5444,20 +5351,18 @@ fn connect_node_lazy(
 /// Backoff bounds + heartbeat for control-plane registration.
 const REGISTER_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 const REGISTER_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
-/// Derived from the control plane's own constant so the heartbeat cadence and the liveness TTL
-/// (`NODE_HEARTBEAT_TTL_MS` = 3× this) can never silently diverge again — they were once both 30 s
-/// and healthy nodes flapped out of the placement pool (HA-D5).
+/// Derived from the control plane's own constant so the heartbeat cadence and liveness TTL
+/// (`NODE_HEARTBEAT_TTL_MS` = 3× this) can't silently diverge and flap healthy nodes out of the
+/// placement pool (HA-D5).
 const REGISTER_REANNOUNCE_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(growlerdb_controlplane::NODE_REANNOUNCE_INTERVAL_MS as u64);
 
-/// Announce a served index to the control-plane registry in the background, **retrying until it
-/// succeeds** and then re-announcing on an interval. In Kubernetes all pods start
-/// together, so the control plane is routinely not reachable yet at node start; a one-shot
-/// best-effort attempt would leave the shard serving but invisible to the gateway forever. The node
-/// serves immediately, but `readiness` is marked ready only on the **first** successful registration — so
-/// `/readyz` stays not-ready until the node is actually in the registry, the gateway never routes to
-/// or waits on a half-joined shard, and a rolling restart re-registers. Re-announcing (an idempotent
-/// upsert, control_service.rs) re-points the registry at this node after a control-plane restart.
+/// Announce a served index to the control-plane registry in the background, retrying until it
+/// succeeds then re-announcing on an interval (pods start together, so the CP is routinely
+/// unreachable at node start; a one-shot attempt would leave the shard invisible forever). The node
+/// serves immediately, but `readiness` flips ready only on the FIRST successful registration, so
+/// `/readyz` stays not-ready until the node is in the registry. Re-announcing is an idempotent
+/// upsert that re-points the registry after a control-plane restart.
 #[allow(clippy::too_many_arguments)]
 fn spawn_registration(
     control_plane: String,
@@ -5502,11 +5407,10 @@ fn spawn_registration(
     });
 }
 
-/// Apply ±`frac` jitter to `base` so fleet-wide loops don't fire in lockstep — in
-/// Kubernetes every node starts together, and a synchronized re-announce/reload herd hammers the
-/// control plane (each re-announce drives a full-registry rewrite). Uses the sub-second wall clock as
-/// a cheap entropy source — no `rand` dependency, and only decorrelation (not unpredictability) is
-/// needed. `frac` is clamped so the result never collapses below 10% of `base`.
+/// Apply ±`frac` jitter to `base` so fleet-wide loops don't fire in lockstep and herd the control
+/// plane (each re-announce drives a full-registry rewrite). Uses the sub-second wall clock as cheap
+/// entropy — only decorrelation, not unpredictability, is needed. Clamped so the result never drops
+/// below 10% of `base`.
 fn jittered(base: std::time::Duration, frac: f64) -> std::time::Duration {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -5629,10 +5533,9 @@ fn spawn_windowed_registration(
                 let resolved = resolved.clone();
                 let write_service = write_service.clone();
                 async move {
-                    // Heartbeat first (keeps the node in the placement pool), then re-announce the
-                    // current served windows + their zone-maps for the cluster gateway to prune on.
+                    // Heartbeat first, then re-announce the current served windows + zone-maps.
                     // Never replica-capable: the single-index windowed serve mode has no assignment
-                    // reconcile, so it could not serve a replica window the CP placed on it.
+                    // reconcile, so it couldn't serve a replica window the CP placed on it.
                     register_node(&control_plane, &endpoint, false).await?;
                     register_served_index(
                         &control_plane,
@@ -5681,12 +5584,10 @@ fn spawn_pool_registration(
                 let announcements = announcements.clone();
                 let hash_announcements = hash_announcements.clone();
                 async move {
-                    // Heartbeat into the pool first, then announce each served index's windows —
-                    // read fresh from the writer each tick, so a window created since boot (or
-                    // since the last announce) is advertised, exactly as the single-index windowed
-                    // registration does. The heartbeat carries the replica-capability declaration
-                    // (HA-G2): true only when this node has an object store, so the CP never
-                    // places replica windows on a node that could not serve them.
+                    // Heartbeat first, then announce each served index's windows — read fresh from
+                    // the writer each tick, so a window created since the last announce is advertised.
+                    // The heartbeat carries replica-capability (HA-G2): true only with an object
+                    // store, so the CP never places replica windows on a node that couldn't serve them.
                     register_node(&control_plane, &endpoint, replica_capable).await?;
                     for (resolved, writer) in &announcements {
                         register_served_index(
@@ -5700,9 +5601,9 @@ fn spawn_pool_registration(
                         )
                         .await?;
                     }
-                    // A hash index announces its served **ordinals** + the total shard count (no
-                    // windows): the cluster gateway places a ShardNode per ordinal so it routes hash
-                    // reads/writes to their holder (task 2). The held set is fixed at boot.
+                    // A hash index announces its served ordinals + total shard count (no windows):
+                    // the gateway places a ShardNode per ordinal to route hash reads/writes to their
+                    // holder. Held set fixed at boot.
                     for (resolved, shard_count, ordinals) in &hash_announcements {
                         register_served_index(
                             &control_plane,
@@ -5821,10 +5722,10 @@ async fn control_plane(
     let registry_path = std::path::Path::new(data_dir).join("registry.json");
     std::fs::create_dir_all(data_dir)?;
 
-    // HA (D51): with `--registry-postgres`, every replica opens the registry as a warm **standby**
-    // over the shared store (no writer lock yet) and a background loop races for leadership; without
-    // it, the embedded single-writer JSON store — unchanged. `ha_managed` means the leadership loop
-    // owns readiness (only the leader is ready), so the k8s Service routes to the one writer.
+    // HA (D51): with `--registry-postgres`, every replica opens the registry as a warm standby over
+    // the shared store and a background loop races for leadership; without it, the embedded
+    // single-writer JSON store. `ha_managed` means the leadership loop owns readiness (only the
+    // leader is ready), so the k8s Service routes to the one writer.
     #[cfg(feature = "postgres")]
     let (registry, ha_managed) = if let Some(url) = registry_postgres.as_deref() {
         let backend = growlerdb_controlplane::PostgresBackend::open_standby(url)?;
@@ -5913,9 +5814,8 @@ async fn control_plane(
         )
         .with_authn(chain)
     } else if builtin_auth {
-        // Built-in (no external IdP) closed mode: the /v1/login RPC mints session JWTs
-        // from the registry credential store; the control plane validates them (+ API tokens) and
-        // enforces RBAC. Seed the built-in users on first boot so the deployment is reachable.
+        // Built-in closed mode: `/v1/login` mints session JWTs from the registry credential store;
+        // the control plane validates them (+ API tokens) and enforces RBAC. Seed users on first boot.
         let secret = auth_secret
             .ok_or_else(|| anyhow::anyhow!("--auth-secret is required with --builtin-auth"))?;
         seed_builtin_users(&registry, &admin_user, admin_password)?;
@@ -5942,12 +5842,10 @@ async fn control_plane(
         .with_authn(chain)
         .with_session_secret(secret.into_bytes())
     } else if login_secret {
-        // Login-only mode (the `just stack` demo): mint session JWTs via `/v1/login` and
-        // seed the built-in users, but leave the control plane's OWN authorization **open**. The
-        // enforcement point is the gateway (`--builtin-auth`) on the public data plane; the control
-        // plane stays reachable for the internal node/gateway RPCs (registration, shard-map reads)
-        // that carry no service credential. This does NOT gate the control plane — it only turns on
-        // token minting — so it is not a regression from the open control plane, just login on top.
+        // Login-only mode (the `just stack` demo): mint session JWTs via `/v1/login` + seed users,
+        // but leave the control plane's OWN authorization open. Enforcement is at the gateway
+        // (`--builtin-auth`); the CP stays reachable for internal node/gateway RPCs that carry no
+        // service credential. This only turns on token minting, it doesn't gate the control plane.
         let secret = auth_secret
             .ok_or_else(|| anyhow::anyhow!("--auth-secret is required with --login-secret"))?;
         seed_builtin_users(&registry, &admin_user, admin_password)?;
@@ -5985,8 +5883,7 @@ async fn control_plane(
         );
     }
     // Service-credential gate: closes the internal RPCs (registration, shard-map reads, placement)
-    // to callers outside the mesh, independent of user auth — so `--login-secret` (open user-auth)
-    // no longer leaves the internal RPCs reachable without a credential. Unset ⇒ open (bare dev).
+    // to callers outside the mesh, independent of user auth. Unset ⇒ open (bare dev).
     match &service_token {
         Some(t) if !t.is_empty() => {
             println!(
@@ -6007,16 +5904,14 @@ async fn control_plane(
     // Dead-owner sweeper (357.18/HA-D2): re-place units whose primary stopped heartbeating, even
     // with no writes arriving — leader-only, grace-aware; the logic lives in the engine/registry.
     svc.spawn_dead_owner_sweeper();
-    // Placement sweeper (357.26/HA-D8): self-organize the pool — proactively place a primary for each
-    // declared hash ordinal (round-robin, so nodes need no per-node designation; they build/load on
-    // assignment) and fill replicas to R, even with no writes arriving. So a batch-built, read-served
-    // index gets its primaries + replicas placed with no connector, and a node join/loss self-heals —
-    // leader-only, grace-aware.
+    // Placement sweeper (357.26/HA-D8): self-organize the pool — round-robin a primary for each
+    // declared hash ordinal (nodes build/load on assignment) and fill replicas to R, even with no
+    // writes arriving, so a batch-built index gets placed with no connector and a join/loss
+    // self-heals. Leader-only, grace-aware.
     svc.spawn_placement_sweeper();
     let readiness = spawn_health(metrics_addr).await?;
-    // In HA mode the leadership loop owns readiness — only the replica that holds the writer lock is
-    // marked ready, so the Service routes to the single leader (active-passive). Otherwise (embedded
-    // JSON, single writer) the registry is open → ready immediately.
+    // In HA mode the leadership loop owns readiness — only the writer-lock holder is ready, so the
+    // Service routes to the single leader (active-passive). Otherwise the registry is ready at once.
     if ha_managed {
         #[cfg(feature = "postgres")]
         spawn_cp_leadership(ha_registry, readiness.clone());
@@ -6048,10 +5943,9 @@ fn spawn_cp_leadership(
     readiness: growlerdb_telemetry::Readiness,
 ) {
     std::thread::spawn(move || {
-        // Fast enough that a standby promotes within a fraction of a second of the leader's death
-        // (Postgres releases the advisory lock ~immediately on the leader's connection close), and
-        // cheap enough — one `SELECT version` per standby tick, one `SELECT 1` leadership probe per
-        // leader tick — to poll continuously.
+        // Fast enough to promote a standby within a fraction of a second of the leader's death
+        // (Postgres releases the advisory lock ~immediately on connection close), and cheap enough
+        // (one `SELECT` per tick) to poll continuously.
         let interval = std::time::Duration::from_millis(250);
         let mut last_version: Option<i64> = None;
         loop {
@@ -7285,6 +7179,174 @@ mod tests {
             .await,
             0,
             "an already-served ordinal isn't re-opened"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_on_assignment_promotes_a_read_through_replica_to_primary() {
+        // A node serving a hash ORDINAL as a read-through REPLICA, then re-assigned PRIMARY for it,
+        // must promote: the freshly-built primary replaces the stale read-through replica in the pool
+        // maps. Without this the node serves the stale cold snapshot forever (the de-assignment path
+        // tracks only Window units, so a hash ordinal's replica is never otherwise superseded). Here
+        // we drive the promotion's core seam — `open_and_publish_ordinal` — directly.
+        use growlerdb_core::{
+            CommitBatch, CompositeKey, Document, IndexDefinition, IndexWriter, LocatedDoc,
+            SourceCheckpoint, SourceField, SourceSchema, SourceType, Value,
+        };
+        use growlerdb_index::{LocalIndexStore, ShardId};
+        use growlerdb_proto::v1::unit_assignment::Unit as WireUnit;
+        use growlerdb_proto::v1::UnitAssignment;
+        use std::collections::{BTreeMap, HashMap};
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Arc, RwLock};
+
+        let src = SourceSchema::new(
+            vec![SourceField::new("id", SourceType::String)],
+            vec![],
+            vec!["id".into()],
+        );
+        let resolved = IndexDefinition::from_yaml(
+            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nshard_count: 2\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD, fast: true } ] }\n",
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+        let ordinal: u32 = 1;
+        let id = ShardId::shard("docs", ordinal);
+
+        // --- Build ordinal 1 in a local store + publish its replica snapshot to object storage. ---
+        let primary_root = tempfile::tempdir().unwrap();
+        let primary = LocalIndexStore::open(primary_root.path()).unwrap();
+        let shard = primary.create_shard(&id, &resolved).unwrap();
+        let key = CompositeKey::new(vec![], vec![("id".into(), Value::from("doc-1"))]);
+        let mut f = BTreeMap::new();
+        f.insert("id".to_string(), Value::from("doc-1"));
+        IndexWriter::write(
+            &shard,
+            &CommitBatch::from_upserts(
+                vec![LocatedDoc {
+                    doc: Document::new(key, f),
+                    iceberg_file: "f".into(),
+                    row_position: 0,
+                }],
+                SourceCheckpoint::iceberg(1),
+                "b1",
+            ),
+        )
+        .unwrap();
+        let backup_root = tempfile::tempdir().unwrap();
+        let op = growlerdb_backup::fs_store(backup_root.path()).unwrap();
+        growlerdb_backup::backup_replica_snapshot(
+            &shard,
+            "docs",
+            &ordinal.to_string(),
+            &primary_root.path().join(".stg"),
+            &op,
+            &format!("cold/docs/{ordinal}"),
+            Some(serde_json::to_string(&resolved).unwrap()),
+        )
+        .await
+        .unwrap();
+        // Release the writer lock so `open_and_publish_ordinal` can re-open the shard as primary.
+        drop(shard);
+
+        // --- Pool maps for a hash index "docs", each with an empty ordinal map. ---
+        let search_idx: growlerdb_engine::SharedSearchIndexes = Arc::new(RwLock::new(
+            BTreeMap::from([("docs".to_string(), Arc::new(RwLock::new(BTreeMap::new())))]),
+        ));
+        let suggest_idx: growlerdb_engine::SharedSuggestIndexes = Arc::new(RwLock::new(
+            BTreeMap::from([("docs".to_string(), Arc::new(RwLock::new(BTreeMap::new())))]),
+        ));
+        let lookup_idx: growlerdb_engine::SharedLookupIndexes = Arc::new(RwLock::new(
+            BTreeMap::from([("docs".to_string(), Arc::new(RwLock::new(BTreeMap::new())))]),
+        ));
+        let admin_idx: growlerdb_engine::SharedAdminIndexes = Arc::new(RwLock::new(
+            BTreeMap::from([("docs".to_string(), Arc::new(RwLock::new(BTreeMap::new())))]),
+        ));
+        let write_hash_idx: growlerdb_engine::SharedHashWriteIndexes = Arc::new(RwLock::new(
+            BTreeMap::from([("docs".to_string(), Arc::new(RwLock::new(BTreeMap::new())))]),
+        ));
+
+        // --- 1) Serve ordinal 1 as a read-through REPLICA. ---
+        let mut meta: ReplicaIndexMeta = HashMap::new();
+        meta.insert(
+            "docs".to_string(),
+            (
+                resolved.clone(),
+                "g.docs".to_string(),
+                growlerdb_engine::IndexHeavyShare::new(4, Arc::new(AtomicUsize::new(1))),
+            ),
+        );
+        let cache = growlerdb_index::RangeCache::new(8 * 1024 * 1024);
+        let replica_root = tempfile::tempdir().unwrap();
+        let replica_store = LocalIndexStore::open(replica_root.path()).unwrap();
+        let served = reconcile_replica_units(
+            &[UnitAssignment {
+                index: "docs".into(),
+                unit: Some(WireUnit::Shard(ordinal)),
+                primary: false,
+            }],
+            &meta,
+            &search_idx,
+            &suggest_idx,
+            &lookup_idx,
+            &admin_idx,
+            &replica_store,
+            &op,
+            &cache,
+            replica_root.path(),
+        )
+        .await;
+        assert_eq!(served, 1, "the replica ordinal is opened read-through");
+        let is_read_only = |m: &growlerdb_engine::SharedSearchIndexes| {
+            m.read()
+                .unwrap()
+                .get("docs")
+                .unwrap()
+                .read()
+                .unwrap()
+                .get(&(ordinal as i64))
+                .map(|svc| svc.serves_read_only())
+        };
+        assert_eq!(
+            is_read_only(&search_idx),
+            Some(true),
+            "served as a read-only read-through replica"
+        );
+
+        // --- 2) Promote: build-on-assignment publishes the primary over the replica. ---
+        open_and_publish_ordinal(
+            &primary,
+            &resolved,
+            "g.docs",
+            ordinal,
+            growlerdb_engine::IndexHeavyShare::new(4, Arc::new(AtomicUsize::new(1))),
+            0,
+            &search_idx,
+            &suggest_idx,
+            &lookup_idx,
+            &admin_idx,
+            &write_hash_idx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            is_read_only(&search_idx),
+            Some(false),
+            "the built primary REPLACED the read-through replica — no longer read-only"
+        );
+        // The write service now exists for the ordinal too (a replica has none), so the promoted
+        // primary is writable.
+        assert!(
+            write_hash_idx
+                .read()
+                .unwrap()
+                .get("docs")
+                .unwrap()
+                .read()
+                .unwrap()
+                .contains_key(&(ordinal as i64)),
+            "promotion registers the primary's write service"
         );
     }
 

@@ -1,7 +1,6 @@
-// Runtime app config. OIDC is optional — with no issuer configured the UI runs
-// against an open Engine (mirrors the gateway, which is open until `--oidc-issuer` is set).
-// Configured at build time via `VITE_OIDC_*`; a runtime `window.__GROWLERDB_CONFIG__` override
-// is supported so a deployment can set it without rebuilding.
+// Runtime app config. OIDC is optional — with no issuer the UI runs against an open Engine
+// (mirrors the gateway). Set at build time via `VITE_OIDC_*`, or overridden at runtime via
+// `window.__GROWLERDB_CONFIG__` so a deployment can configure it without rebuilding.
 import type { OidcConfig } from './auth';
 
 export interface AppConfig {

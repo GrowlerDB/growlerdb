@@ -59,7 +59,6 @@ describe('componentsFromUp', () => {
 
   it('recognises k8s targets by their gdb-* job — pod-IP instance, no namespace', () => {
     // In k8s the `up` sample has a pod-IP instance and no namespace label; only the job identifies it.
-    // Previously these matched nothing → the header rolled up to "Unknown" even when all were up.
     const gdb: InstantSample[] = [
       { metric: { job: 'gdb-controlplane', instance: '10.42.4.9:9101' }, value: 1 },
       { metric: { job: 'gdb-node', instance: '10.42.1.7:9102' }, value: 1 },

@@ -1,7 +1,5 @@
-// Cold-tier presentation logic — pure + unit-tested. The Cluster screen's "Storage tiers"
-// panel renders these from `GET /v1/cold` (per-window hot/cold tier + the shared read-through
-// cache's stats), so the cost story is visible: how much of the index is parked to object storage
-// and how effective the read-through cache is.
+// Cold-tier presentation logic — pure + unit-tested. Feeds the Cluster screen's "Storage tiers"
+// panel from `GET /v1/cold`: per-window hot/cold tier + the shared read-through cache's stats.
 import type { ColdCacheStats, ColdStatus, WindowTier } from './api';
 
 /** Cache hit rate in `[0, 1]` (0 when there have been no reads). */

@@ -1,11 +1,7 @@
-//! **Walking-skeleton** end-to-end test.
+//! **Walking-skeleton** end-to-end test: proves the whole spine against the **real** Compose stack
+//! (MinIO + Polaris + the seeded `growlerdb.docs` table, no mocks): index → search → hydrate.
 //!
-//! Proves the whole spine against the **real** Compose stack (MinIO + Polaris +
-//! the seeded `growlerdb.docs` table — no lakehouse mocks): index → search → assert
-//! coordinates (ranked) → hydrate → assert the authoritative row.
-//!
-//! Prereqs: `just up` (brings up the stack and seeds `growlerdb.docs`) and
-//! `127.0.0.1 minio` in `/etc/hosts` (see `deploy/compose/README.md`).
+//! Prereqs: `just up` and `127.0.0.1 minio` in `/etc/hosts` (see `deploy/compose/README.md`).
 //! Run: `cargo test -p growlerdb-engine --test e2e -- --ignored`.
 
 use std::collections::BTreeMap;
@@ -106,13 +102,8 @@ async fn walking_skeleton_index_search_hydrate() {
 }
 
 /// **Sharded-build gate** — building two shards of the real seeded table partitions it
-/// disjointly, so a multi-shard cluster sees every document exactly once.
-///
-/// Builds shard 0 and shard 1 of `growlerdb.docs` with `index_shard(.., shards=2, ordinal=K)`
-/// (the per-node sharded build) into two stores, then asserts the two shards' documents are a
-/// **disjoint partition** of the full table, each landing on the shard the shared
-/// [`ShardRouter`] routes it to — so the Gateway's broadcast-and-merge over the shards (proven
-/// in-process) returns each doc once, with no cross-shard duplicates.
+/// disjointly, so a multi-shard cluster's broadcast-and-merge sees every document exactly once.
+/// Each shard must hold exactly the docs the shared [`ShardRouter`] routes to it.
 #[tokio::test]
 #[ignore = "requires the local dev stack (just up) + `127.0.0.1 minio` in /etc/hosts"]
 async fn sharded_build_partitions_the_table_disjointly() {
@@ -215,15 +206,10 @@ async fn a_sparse_shard_with_no_rows_records_the_source_snapshot() {
     );
 }
 
-/// An update + a delete round-trip reflected in search.
-///
-/// Builds the index from the real seeded table, then applies a changelog-style
-/// [`DocOp`] batch (the same ops the Spark connector commits over gRPC, here applied
-/// in-process): **update** doc-3's content and **delete** doc-2. Asserts that search
-/// reflects both — the new content is found, the superseded/deleted content is gone —
-/// proving updates & deletes (`key_to_doc` supersede + merge-on-read) end-to-end on
-/// Compose. The JVM↔Rust gRPC path for the same is covered by the connector
-/// cross-process test.
+/// An update + a delete round-trip reflected in search — a changelog-style [`DocOp`] batch (the
+/// same ops the Spark connector commits over gRPC, here in-process) updates doc-3 and deletes
+/// doc-2, proving `key_to_doc` supersede + merge-on-read end-to-end on Compose. The JVM↔Rust gRPC
+/// path is covered by the connector cross-process test.
 #[tokio::test]
 #[ignore = "requires the local dev stack (just up) + `127.0.0.1 minio` in /etc/hosts"]
 async fn update_and_delete_round_trip_reflected_in_search() {
@@ -243,9 +229,8 @@ async fn update_and_delete_round_trip_reflected_in_search() {
     ids.sort();
     assert_eq!(ids, vec!["doc-2".to_string(), "doc-3".to_string()]);
 
-    // Apply an UPDATE (doc-3 → new distinctive body) + a DELETE (doc-2), as one
-    // committed changelog batch. Scoped so the shard's redb handle drops (releasing
-    // the file lock) before the engine reopens it to search.
+    // UPDATE (doc-3 → new body) + DELETE (doc-2) as one changelog batch. Scoped so the shard's
+    // redb handle drops (releasing the file lock) before the engine reopens it to search.
     {
         let resolved: ResolvedIndex =
             serde_json::from_slice(&std::fs::read(tmp.path().join("docs/index.json")).unwrap())
@@ -381,17 +366,14 @@ async fn stale_locator_self_heals_via_verify_and_fall_back() {
     assert_eq!(again[0].fields["title"].to_index_string(), "iceberg search");
 }
 
-/// **Reconcile backstop** — the detect-and-repair promise, end-to-end against
-/// the real seeded table. Injects drift in **both** directions into the built index, then asserts a
-/// single [`Engine::reconcile`] cycle repairs it all, and that re-running is a no-op (idempotent).
+/// **Reconcile backstop** — the detect-and-repair promise, end-to-end against the real seeded
+/// table. Injects drift in **both** directions and asserts a single [`Engine::reconcile`] cycle
+/// repairs it all, idempotently.
 ///
-/// The two *missing* injections stand for two provenances: an **artificially-deleted
-/// indexed row** (indexed, then lost from the index while still in the source — the
-/// silent-loss class) and an **artificially-skipped source row** (a source row ingest never
-/// applied). Both leave the index in the same "source has the key, index doesn't" state, which
-/// reconcile repairs *regardless of cause* — the whole point of the backstop. A third **stale**
-/// injection (an indexed key the source never held) exercises the delete direction, so one cycle is
-/// shown to close drift both ways.
+/// The two *missing* injections (a deleted-but-still-in-source row, and a never-applied source row)
+/// leave the same "source has the key, index doesn't" state, which reconcile repairs regardless of
+/// cause — the point of the backstop. A third *stale* injection (indexed key the source never held)
+/// exercises the delete direction, so one cycle is shown to close drift both ways.
 #[tokio::test]
 #[ignore = "requires the local dev stack (just up) + `127.0.0.1 minio` in /etc/hosts"]
 async fn reconcile_backstop_detects_and_repairs_drift_both_ways() {
@@ -495,12 +477,11 @@ async fn reconcile_backstop_detects_and_repairs_drift_both_ways() {
     assert!(again.is_clean(), "second reconcile is a no-op: {again:?}");
 }
 
-/// **MCP Streamable HTTP transport e2e** — an HTTP MCP client's flow against the real stack:
-/// build the index from the seeded `growlerdb.docs` Iceberg table, mount the composed REST
-/// surface + `/mcp` exactly as the CLI fronts do, then drive `initialize` → `tools/list` →
-/// `tools/call search` (with inline hydration) over the transport and assert the authoritative
-/// row comes back from the real lakehouse — tool calls riding the same admitted, governed
-/// `/v1` surface as any other query.
+/// **MCP Streamable HTTP transport e2e** — an HTTP MCP client's flow against the real stack: build
+/// the index from the seeded `growlerdb.docs` table, mount the composed REST surface + `/mcp` as
+/// the CLI fronts do, then drive `initialize` → `tools/list` → `tools/call search` (inline
+/// hydration) over the transport and assert the authoritative row comes back — tool calls riding
+/// the same governed `/v1` surface as any other query.
 #[tokio::test]
 #[ignore = "requires the local dev stack (just up) + `127.0.0.1 minio` in /etc/hosts"]
 async fn mcp_http_transport_searches_and_hydrates_the_real_stack() {

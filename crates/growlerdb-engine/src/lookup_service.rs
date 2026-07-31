@@ -1,8 +1,7 @@
-//! The Node **Lookup** gRPC service — the **PK-lookup / hydration**
-//! path. Given search coordinates (composite keys), resolve each through the shard
-//! [locator](growlerdb_core::RowLocator) and read the authoritative rows from the
-//! Iceberg source, returning the projected columns. Pairs with [`SearchService`] (which
-//! returns coordinates) to complete a search → row round-trip.
+//! The Node **Lookup** gRPC service — the PK-lookup / hydration path: resolve each
+//! coordinate through the shard [locator](growlerdb_core::RowLocator) and read the
+//! authoritative rows from Iceberg. Pairs with [`SearchService`] (which returns
+//! coordinates) to complete a search → row round-trip.
 //!
 //! [`SearchService`]: crate::SearchService
 
@@ -21,36 +20,30 @@ use crate::error::EngineError;
 use crate::hydrate;
 use crate::shard_handle::ShardHandle;
 
-/// Hard ceiling on the number of coordinates a single `GetByKey` may request. A Node is directly
-/// reachable in distributed mode, so it must self-defend against an unbounded batch that would
-/// pin locate/hydrate work. Enforced at the Gateway too, before any fan-out.
+/// Hard ceiling on coordinates per `GetByKey`: a directly-reachable Node must self-defend
+/// against an unbounded batch that would pin locate/hydrate work. Enforced at the Gateway too.
 pub(crate) const MAX_KEYS: usize = 1_000;
 
-/// A `Lookup` service over one shard and its Iceberg source. Hydration is async (an
-/// Iceberg read); the locator resolution that precedes it is a quick redb read. Every
-/// RPC consults the [auth hook](SharedAuth) (no-op by default) first.
+/// A `Lookup` service over one shard and its Iceberg source. Every RPC consults the
+/// [auth hook](SharedAuth) (no-op by default) first.
 ///
-/// The Iceberg source is held as a **shared, lazily-connected** [`SharedReader`]:
-/// the catalog client is built once and reused across RPCs (with the
-/// reader's snapshot-pinned plan cache), instead of reconnecting per request; a source
+/// The Iceberg source is a shared, lazily-connected [`SharedReader`]: the catalog client is
+/// built once and reused across RPCs (with the reader's snapshot-pinned plan cache); a source
 /// failure invalidates it so the next RPC reconnects.
 #[derive(Clone)]
 pub struct LookupService {
     shard: ShardHandle,
     reader: Arc<SharedReader>,
     table: String,
-    /// The resolved index — carried so hydration can fork a **variant** table onto the interim
-    /// Trino lane (D48/D49): `TrinoHydrator::hydrate` needs the full `ResolvedIndex`, and the
-    /// `Shard` alone doesn't retain it. `Arc` keeps the per-request `Clone` cheap.
+    /// Carried so hydration can fork a variant table onto the interim Trino lane (D48/D49):
+    /// `TrinoHydrator::hydrate` needs the full `ResolvedIndex`, which the `Shard` doesn't retain.
     resolved: Arc<ResolvedIndex>,
     auth: SharedAuth,
 }
 
 impl LookupService {
-    /// A Lookup service hydrating `shard`'s coordinates from `table` in the Iceberg
-    /// catalog `iceberg`, with the default no-op auth hook. Accepts an `Arc<Shard>` (fresh
-    /// handle) or a shared [`ShardHandle`]. `resolved` is the served index (drives the variant
-    /// hydration fork).
+    /// A Lookup service hydrating `shard`'s coordinates from `table` in catalog `iceberg`, with
+    /// the default no-op auth hook. `resolved` is the served index (drives the variant fork).
     pub fn new(
         shard: impl Into<ShardHandle>,
         iceberg: IcebergConfig,
@@ -107,7 +100,6 @@ impl Lookup for LookupService {
             ));
         }
 
-        // Decode coordinates → composite keys.
         let mut keys: Vec<CompositeKey> = Vec::with_capacity(req.keys.len());
         for coord in req.keys {
             let key = coord.try_into().map_err(|e| {
@@ -122,10 +114,9 @@ impl Lookup for LookupService {
         // Pin the live shard for this request (a concurrent reindex swap won't pull it).
         let shard = self.shard.current();
 
-        // Tenant scoping: on a tenant-scoped index a caller must carry a verified
-        // claim and must not hydrate another tenant's rows — even with a guessed/forged
-        // coordinate. The tenant field is decoupled from the key, so we enforce *after*
-        // hydration against the row's authoritative tenant value from Iceberg.
+        // On a tenant-scoped index a caller must carry a verified claim; enforcement happens
+        // *after* hydration against the row's authoritative tenant value (the field is
+        // decoupled from the key, so a forged coordinate can't be caught before the read).
         let tenant_field = shard.tenant_field().map(str::to_string);
         if let Some(field) = &tenant_field {
             if tenant.is_none() {
@@ -141,8 +132,8 @@ impl Lookup for LookupService {
             }
         }
 
-        // Build the projection; on a scoped index ensure the tenant field is fetched (so we can
-        // verify it) and remember to strip it afterward if the caller didn't ask for it.
+        // On a scoped index, force-fetch the tenant field (so we can verify it) and remember to
+        // strip it afterward if the caller didn't ask for it.
         let mut added_tenant_col = false;
         let projection = if req.columns.is_empty() {
             Projection::All
@@ -157,24 +148,18 @@ impl Lookup for LookupService {
             Projection::Columns(cols)
         };
 
-        // Resolve requests first (a quick, Iceberg-free local read) so a missing key is
-        // a clear `NotFound` *before* we connect to the catalog — strategy-aware:
-        // under `COORDINATES` the layered locate + live-file bitmap;
-        // under `PREDICATE` a key-presence check, with every key sent locator-less
-        // straight to the source's pruned key scan (its primary path).
+        // Resolve first (a quick, Iceberg-free local read) so a missing key is a clear `NotFound`
+        // *before* we connect to the catalog. Strategy-aware: `COORDINATES` uses the layered
+        // locate + live-file bitmap; `PREDICATE` a locator-less key-presence check.
         let predicate_index =
             shard.location_strategy() == growlerdb_core::LocationStrategy::Predicate;
         let located = hydrate::resolve_requests(&shard, &keys).map_err(engine_status)?;
         growlerdb_telemetry::sli::locate_keys(located.len() as u64);
 
-        // Read the projected rows from Iceberg (only the located files), then refresh
-        // any locators Iceberg rewrote so later lookups stay fast. The shared reader
-        // connects on the first RPC and is reused after; a source failure
-        // drops it so the *next* RPC reconnects instead of reusing a dead client.
         // Variant fork (D48/D49): a variant-table index hydrates through the interim Trino lane
-        // (released iceberg-rust can't scan a v3 variant table). Non-variant indexes keep the
-        // native `SharedReader` path — lazily connected + reused, dropped on a source failure so
-        // the next RPC reconnects.
+        // (released iceberg-rust can't scan a v3 variant table). Non-variant indexes read the
+        // projected rows via the native `SharedReader`, dropping it on a source failure so the
+        // next RPC reconnects.
         let result = if self.resolved.has_variant_field() {
             growlerdb_source::shared_hydrator()
                 .hydrate(&self.resolved, &located, &projection)
@@ -196,17 +181,14 @@ impl Lookup for LookupService {
         if let Some(hit) = result.plan_cache_hit {
             growlerdb_telemetry::sli::plan_cache(hit);
         }
-        // Count the locators Iceberg rewrote (the stale-locator/verify-fallback SLI) and the rows
-        // that authoritatively hydrated, before the result is consumed. `requested - found` is the
-        // hydration-miss signal: a stale index (e.g. a recreated source) returns hits
-        // whose keys no longer exist in the table, so they don't hydrate. On a `PREDICATE` index
-        // the pruned key scan is the *primary* read path, not a stale-locator refresh — its
-        // re-found rows must not count as stale (`growlerdb_stale_locators_total` stays 0) and
-        // there is no location layer to write back.
+        // `requested - found` is the hydration-miss signal: a stale index (e.g. a recreated
+        // source) returns hits whose keys no longer exist in the table. On a `PREDICATE` index the
+        // pruned key scan is the *primary* read path, not a refresh, so its re-found rows never
+        // count as stale (`growlerdb_stale_locators_total` stays 0) and there's no layer to write back.
         let refreshed = stale_locators_for_metrics(predicate_index, result.refreshed.len());
         let requested = keys.len() as u64;
         let found = result.rows.len() as u64;
-        // Duplicate-PK detection: the key scan saw >1 distinct source row for a key.
+        // The key scan saw >1 distinct source row for a key.
         growlerdb_telemetry::sli::duplicate_pks(result.duplicate_pks);
         if !predicate_index {
             shard
@@ -219,8 +201,7 @@ impl Lookup for LookupService {
             enforce_tenant_post_hydration(&mut rows, field, claim, added_tenant_col);
         }
 
-        // Hydration SLI: latency + stale-locator count + keys requested vs found (the
-        // index↔source drift early-warning).
+        // Hydration SLI: latency + stale-locator count + requested-vs-found (index↔source drift).
         growlerdb_telemetry::sli::hydration(
             &self.resolved.name,
             started.elapsed().as_secs_f64(),
@@ -235,13 +216,10 @@ impl Lookup for LookupService {
     }
 }
 
-/// **Tenant post-filter**: drop every hydrated row whose authoritative Iceberg
-/// `tenant_field` value isn't the caller's verified `claim`, so a forged/guessed coordinate can never
-/// hydrate another tenant's row — the tenant field is decoupled from the key, so enforcement happens
-/// *after* the source read against the row's real value (not the searched-for key). A dropped row is
-/// omitted silently (not an error), so the caller can't even confirm the foreign row exists. When the
-/// tenant column was added to the projection only to enforce this (`added_tenant_col`), it's stripped
-/// from the surviving rows so the caller sees exactly the columns it asked for.
+/// Tenant post-filter: drop every hydrated row whose authoritative `tenant_field` value isn't the
+/// caller's verified `claim`, so a forged coordinate can never hydrate another tenant's row. Drops
+/// are silent (not errors), so the caller can't confirm a foreign row exists. When `added_tenant_col`
+/// (the column was force-fetched only to verify), it's stripped from the surviving rows.
 fn enforce_tenant_post_hydration(
     rows: &mut Vec<HydratedRow>,
     field: &str,
@@ -256,11 +234,9 @@ fn enforce_tenant_post_hydration(
     }
 }
 
-/// The stale-locator count to feed the hydration SLI: on a
-/// **`PREDICATE`** index every re-found row came through the pruned key scan — the
-/// strategy's *primary* read path, not a stale-locator refresh — so it never counts
-/// toward `growlerdb_stale_locators_total`. On `COORDINATES` a re-found row means a
-/// locator really had gone stale (Iceberg rewrote its file), so each one counts.
+/// The stale-locator count for the hydration SLI. On a `PREDICATE` index re-found rows came
+/// through the pruned key scan (the primary read path, not a refresh), so none count. On
+/// `COORDINATES` a re-found row means a locator had genuinely gone stale, so each one counts.
 fn stale_locators_for_metrics(predicate_index: bool, refound_rows: usize) -> u64 {
     if predicate_index {
         0
@@ -269,7 +245,7 @@ fn stale_locators_for_metrics(predicate_index: bool, refound_rows: usize) -> u64
     }
 }
 
-/// A hydrated row → its wire form (coordinates + projected fields).
+/// A hydrated row → its wire form.
 fn to_wire_row(row: HydratedRow) -> WireRow {
     WireRow {
         key: Some((&row.key).into()),
@@ -589,11 +565,8 @@ mod tests {
         HydratedRow { key, fields }
     }
 
-    /// The authoritative-value post-filter: rows hydrated from Iceberg are dropped unless
-    /// their real `tenant` value matches the caller's verified claim — a forged coordinate that
-    /// resolves to another tenant's row is silently omitted, never returned. This is the drop the
-    /// end-to-end `tenant_isolation.rs` cases assert the boundary of (the row read itself needs a live
-    /// catalog); here we prove the filter itself on hydrated rows without one.
+    /// Rows are dropped unless their real `tenant` value matches the caller's claim; here we prove
+    /// the filter on hydrated rows without a live catalog (`tenant_isolation.rs` covers end-to-end).
     #[test]
     fn post_hydration_filter_drops_foreign_tenant_rows() {
         // acme asked for its own row `a` and (via a forged coordinate) globex's `b`; both hydrate,
@@ -602,7 +575,7 @@ mod tests {
         enforce_tenant_post_hydration(&mut rows, "tenant", "acme", false);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].fields["id"].to_index_string(), "a");
-        // Not projected-in, so the tenant column stays on the surviving row.
+        // Not force-fetched, so the tenant column stays on the surviving row.
         assert_eq!(rows[0].fields["tenant"].to_index_string(), "acme");
     }
 

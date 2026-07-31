@@ -12,9 +12,8 @@ import java.io.IOException;
  * (e.g. {@code rate(under_reads_total) > 0}).
  *
  * <p>Static holder to fit the connector's static/lambda call sites without threading an object
- * through every seam. Metric updates are always cheap and safe to call; the HTTP endpoint is started
- * only when {@link #startServer} is invoked (the entrypoint does so when {@code GROWLERDB_METRICS_PORT}
- * is set), so unit tests and local one-shot runs never bind a port.
+ * through every seam. Metric updates are always safe to call; the HTTP endpoint binds only when
+ * {@link #startServer} is invoked, so unit tests and local one-shot runs never bind a port.
  */
 public final class ConnectorMetrics {
 
@@ -82,9 +81,8 @@ public final class ConnectorMetrics {
   private ConnectorMetrics() {}
 
   /**
-   * Start the metrics HTTP server on {@code GROWLERDB_METRICS_PORT} if it is set (a no-op otherwise,
-   * so local one-shot runs don't bind a port). Idempotent; a bind failure is logged and swallowed —
-   * losing metrics must never take down ingestion.
+   * Start the metrics HTTP server on {@code GROWLERDB_METRICS_PORT} if set (no-op otherwise).
+   * Idempotent; a bind failure is logged and swallowed — losing metrics must never halt ingestion.
    */
   static void startServer() {
     String port = System.getenv(PORT_ENV);

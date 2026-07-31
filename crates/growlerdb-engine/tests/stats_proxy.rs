@@ -106,7 +106,7 @@ async fn query_range_forwards_path_and_query() {
     assert!(body.contains("\"status\":\"success\""));
     assert!(body.contains("query=up") && body.contains("step=15s"));
 
-    // The instant-query route forwards the same way (previously untested).
+    // The instant-query route forwards the same way.
     let req = HttpRequest::builder()
         .uri("/v1/stats/query?query=up")
         .body(Body::empty())

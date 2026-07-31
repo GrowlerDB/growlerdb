@@ -43,11 +43,9 @@ impl From<growlerdb_core::Value> for v1::Value {
             growlerdb_core::Value::Float(f) => Some(Kind::Float(f)),
             growlerdb_core::Value::Bool(b) => Some(Kind::Bool(b)),
             growlerdb_core::Value::Ts(t) => Some(Kind::TsMicros(t)),
-            // A vector is a local-store artifact — embedded node-locally at ingest and kept in
-            // the segment; it never crosses the document wire (the `Document` bridge below drops
-            // vector fields). There is no scalar wire kind for it, so this arm is unreachable by
-            // construction; stay total and inert (never panic in a `From`) if the invariant is
-            // ever bypassed directly.
+            // A vector is a node-local segment artifact; it never crosses the document wire (the
+            // `Document` bridge below drops vector fields), so this arm is unreachable. Stay total
+            // and inert — never panic in a `From`.
             growlerdb_core::Value::Vector(_) => {
                 debug_assert!(false, "vector values do not cross the document wire");
                 None

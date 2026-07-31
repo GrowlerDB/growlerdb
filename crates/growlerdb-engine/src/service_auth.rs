@@ -1,13 +1,8 @@
-//! **Service-credential enforcement for the control plane** (server side). A control plane
-//! configured with a service token rejects any internal RPC that doesn't carry the matching
-//! `x-growlerdb-service-token` — closing registration, shard-map reads, and placement to callers
-//! outside the cluster mesh. This is a distinct layer from the per-user [auth hook](crate::auth) /
-//! RBAC ([`gate`](crate::control_service)): it runs as a tonic **interceptor** ahead of every RPC,
-//! so it gates the whole service regardless of the user-auth mode (it closes the internal RPCs even
-//! in `--login-secret`, where user-authorization is intentionally open). When no token is
-//! configured the interceptor is a no-op, so bare local dev stays open.
-//!
-//! The client counterpart (attach the token) lives in
+//! **Service-credential enforcement for the control plane** (server side). When a service token is
+//! configured, a tonic interceptor rejects any internal RPC lacking the matching
+//! `x-growlerdb-service-token`, closing registration/placement to callers outside the cluster mesh —
+//! a layer distinct from the per-user [auth hook](crate::auth)/RBAC, gating regardless of user-auth
+//! mode. No token configured ⇒ a no-op (bare local dev stays open). Client counterpart:
 //! [`growlerdb_proto::service_token`](growlerdb_proto::service_token).
 
 use growlerdb_proto::service_token::SERVICE_TOKEN_KEY;
@@ -15,10 +10,9 @@ use sha2::{Digest, Sha256};
 use tonic::service::interceptor::InterceptedService;
 use tonic::{Request, Status};
 
-/// Compare two tokens in time independent of their contents, so a network attacker can't recover
-/// the token byte-by-byte from response timing. Both sides are first hashed to a fixed-width digest
-/// (constant work regardless of length), then the digests are compared with a branch-free bit
-/// accumulator.
+/// Constant-time token comparison, so a network attacker can't recover the token byte-by-byte from
+/// response timing. Both sides are hashed to a fixed-width digest (constant work regardless of
+/// length), then compared with a branch-free bit accumulator.
 fn tokens_match(presented: &[u8], expected: &[u8]) -> bool {
     let a = Sha256::digest(presented);
     let b = Sha256::digest(expected);
@@ -57,12 +51,10 @@ impl tonic::service::Interceptor for ServiceTokenAuth {
     }
 }
 
-/// A whole-server tower layer applying the same service-token requirement to **every** service a
-/// tonic server mounts — the data-plane (Node) counterpart of [`intercept`], which wraps one
-/// service. A Node's gRPC surface (Write/Search/Lookup/Suggest/Admin/System) carries no per-user
-/// auth of its own in distributed mode (authn/RBAC/tenant enforcement live at the Gateway), so
-/// without this the only boundary is network isolation; the token adds defense-in-depth for a
-/// directly-reachable Node port. `None`/empty ⇒ a no-op layer (open single-node dev).
+/// A whole-server tower layer applying the service-token requirement to **every** service a tonic
+/// server mounts — the data-plane (Node) counterpart of [`intercept`] (which wraps one service). A
+/// Node carries no per-user auth in distributed mode (that lives at the Gateway), so the token adds
+/// defense-in-depth for a directly-reachable Node port. `None`/empty ⇒ a no-op layer (open dev).
 pub fn layer(
     token: Option<String>,
 ) -> tonic::service::interceptor::InterceptorLayer<ServiceTokenAuth> {

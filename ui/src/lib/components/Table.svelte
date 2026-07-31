@@ -1,7 +1,6 @@
 <script lang="ts">
-  // A styled data table: consistent header/row chrome at the current density (`--cell`).
-  // The caller supplies the column headers + the rows via the `head` and `body` snippets so the
-  // table stays type-safe over its own row shape.
+  // Styled data table with consistent header/row chrome at the current density (`--cell`).
+  // Caller supplies `head`/`body` snippets so it stays type-safe over its own row shape.
   import type { Snippet } from 'svelte';
   let { head, body }: { head: Snippet; body: Snippet } = $props();
 </script>

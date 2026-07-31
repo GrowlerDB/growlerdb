@@ -16,11 +16,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 /**
- * A hash <b>pool node</b> (D52) dispatches by {@code (index, shard)}: the connector builds one {@link
- * WriteClient} per ordinal ({@link ShardedWriteClient} / {@link ShardGroupWriteClient}) and must stamp
- * that ordinal on every {@code Write} and {@code GetCheckpoint}, so a node holding several ordinals of
- * one index over one endpoint routes each to the right ordinal shard. These assert the selector lands
- * on the wire — the connector half of the hash routing that {@code ShardNode} completes at the gateway.
+ * A hash pool node (D52) dispatches by {@code (index, shard)}: an ordinal-tagged {@link WriteClient}
+ * must stamp its ordinal on every {@code Write} and {@code GetCheckpoint}. These assert it lands on the wire.
  */
 class ShardOrdinalTaggingTest {
 

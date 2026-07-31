@@ -504,11 +504,9 @@ async fn data_objects(store: &Operator, prefix: &str) -> std::collections::BTree
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backup_gc_is_snapshot_gated() {
-    // Backup GC is snapshot-gated so a cold read-through reader never 404s. After the primary
-    // compacts (fusing many segments into one) WITHIN a source snapshot, a re-backup to the same
-    // prefix RETAINS the now-superseded segment objects — a reader pinned to the old layout only
-    // reopens when the snapshot advances, and would 404 on a lazily-fetched segment if it vanished.
-    // The superseded objects are reclaimed on the next snapshot ADVANCE (past all such readers).
+    // Backup GC is snapshot-gated so a cold read-through reader never 404s: a same-snapshot re-backup
+    // after a compaction RETAINS the superseded segment objects (a reader pinned to the old layout
+    // reopens only on a snapshot advance), and the next snapshot ADVANCE reclaims them.
     let idx = docs_index();
     let id = ShardId::single("docs");
 

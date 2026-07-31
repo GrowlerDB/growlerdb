@@ -1,7 +1,6 @@
 <script lang="ts">
-  // Tabbed view of one index. Stats strip is always visible; tabs split
-  // policy/mapping/shards/maintenance/activity. Maintenance wires reindex/drop/alias against
-  // current APIs; Mapping, Shards and Activity are scaffolds, and Compact/Backup render as PLANNED.
+  // Tabbed view of one index: an always-visible stats strip over
+  // mapping/policies/shards/maintenance/activity tabs.
   import { onMount } from 'svelte';
   import { get } from 'svelte/store';
   import { canAdminister } from '../lib/identity';
@@ -97,8 +96,7 @@
 
   const ownAliases = $derived(aliases.filter((a) => a.targets.includes(name)));
 
-  // Cached-fields policy summary derived from the loaded mapping: how many fields are
-  // cached for display, and how many are excluded by policy (blocked / not cached).
+  // Cached-fields policy summary: fields cached for display vs. excluded by policy.
   const mappingFields = $derived(info?.fields ?? []);
   const cachedCount = $derived(mappingFields.filter((f) => f.cached).length);
   const excludedCount = $derived(mappingFields.filter((f) => f.blocked).length);
@@ -134,9 +132,8 @@
 
   onMount(async () => {
     await load();
-    // `BackupStatus` is Admin-scoped — only fetch it where the caller could be authorized (open mode
-    // or an admin session); a closed-mode reader/operator would get a 403 on every detail open and
-    // sees the "Off" default instead.
+    // `BackupStatus` is Admin-scoped — only fetch where the caller could be authorized, else a
+    // reader/operator gets a 403 on every detail open. Unfetched shows the "Off" default.
     if (get(canAdminister)) {
       try {
         bstatus = await backupStatus(name);

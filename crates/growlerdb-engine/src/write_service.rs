@@ -1,7 +1,6 @@
-//! The Node **Write** gRPC service ([Design 06]) — the Rust side of the JVM↔Rust
-//! ingestion boundary. Adapts the in-process [`IndexWriter`] (stage/commit +
-//! `DocOp`) to the wire `Write` service, so the Spark
-//! changelog connector can apply batches to a shard over gRPC.
+//! The Node **Write** gRPC service ([Design 06]) — the Rust side of the JVM↔Rust ingestion boundary.
+//! Adapts the in-process [`IndexWriter`] to the wire `Write` service, so the Spark changelog connector
+//! can apply batches to a shard over gRPC.
 //!
 //! [Design 06]: ../../../okf/system/architecture.md
 
@@ -17,12 +16,10 @@ use tonic::{Code, Request, Response, Status};
 use crate::fence::ReindexFence;
 use crate::shard_handle::ShardHandle;
 
-/// Max decoded size of an inbound `Write` request. The ingestion connector commits a
-/// whole changelog window in one request, so a catch-up after downtime — or an initial backfill of
-/// an existing table — can far exceed tonic's default **4 MiB** decode cap (which surfaces as
-/// `OUT_OF_RANGE: decoded message length too large` and kills the streaming query). 256 MiB is a
-/// generous safety margin; the durable fix is to **bound the per-commit window** in the connector so
-/// a single batch can't grow without limit.
+/// Max decoded size of an inbound `Write` request. The connector commits a whole changelog window in
+/// one request, so a catch-up or backfill can far exceed tonic's default **4 MiB** cap (surfaces as
+/// `OUT_OF_RANGE: decoded message length too large`). 256 MiB is a generous margin; the durable fix is
+/// to bound the per-commit window in the connector.
 const MAX_WRITE_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 
 /// Map an index [`StoreError`](growlerdb_index::StoreError) from a commit to a gRPC status. A
@@ -60,20 +57,16 @@ pub struct WriteService {
     ///
     /// [`with_fence`]: Self::with_fence
     fence: ReindexFence,
-    /// Set when the node booted against a **recreated source**: the source table's
-    /// `table-uuid` no longer matches the one this index was built from, so the index is stale.
-    /// Writes and checkpoint reads are then refused with a non-retryable `FAILED_PRECONDITION`
-    /// (`SOURCE_RECREATED`) — so the connector stops advancing a stale index and the control-plane
-    /// renders the shard `source_recreated`. Search still serves the (stale) index read-only for
-    /// inspection; a reindex re-anchors and clears it. Set once at startup via
-    /// [`with_source_recreated`](Self::with_source_recreated).
+    /// Set when the node booted against a **recreated source** (the table's `table-uuid` no longer
+    /// matches the one this index was built from). Writes and checkpoint reads are then refused with a
+    /// non-retryable `FAILED_PRECONDITION` (`SOURCE_RECREATED`), so the connector stops advancing and
+    /// the control-plane renders the shard `source_recreated`. Search still serves it read-only; a
+    /// reindex re-anchors and clears it. Set via [`with_source_recreated`](Self::with_source_recreated).
     source_recreated: bool,
-    /// When the served index maps a VECTOR field, the resolved index — so the streaming write path
-    /// can run the embed stage (D46) on each batch's upsert docs before commit. The connector sends
-    /// the source text, not the embedding, so without this a **connector-fed** index (which never
-    /// cold-builds — e.g. a variant table) would have empty vectors and no semantic/hybrid coverage.
-    /// `None` for a non-vector index (the embed stage is skipped entirely). Set via
-    /// [`with_embedding`](Self::with_embedding).
+    /// When the served index maps a VECTOR field, the resolved index — so the streaming write path can
+    /// run the embed stage (D46) before commit. The connector sends source text, not embeddings, so
+    /// without this a **connector-fed** index (which never cold-builds, e.g. a variant table) would
+    /// have empty vectors. `None` for a non-vector index. Set via [`with_embedding`](Self::with_embedding).
     embedding: Option<Arc<growlerdb_core::ResolvedIndex>>,
 }
 
@@ -105,9 +98,8 @@ impl WriteService {
     }
 
     /// Run the embed stage (D46) on incoming batches for a VECTOR index — the streaming-write
-    /// counterpart of the cold-build/sync embed. `resolved` is the served index. A no-op when the
-    /// index has no VECTOR field, so serve can call this unconditionally. This is what gives a
-    /// **connector-fed** index (e.g. a variant table, which can't cold-build) its LOCAL embeddings.
+    /// counterpart of the cold-build/sync embed. `resolved` is the served index; a no-op when the
+    /// index has no VECTOR field, so serve can call it unconditionally.
     pub fn with_embedding(mut self, resolved: growlerdb_core::ResolvedIndex) -> Self {
         self.embedding = resolved
             .fields
@@ -166,10 +158,8 @@ impl Write for WriteService {
         if self.source_recreated {
             return Err(Self::source_recreated_status());
         }
-        // Reindex fence: reject writes while a reindex rebuilds, with a retryable
-        // status, so the connector can't advance the shard past the rebuild snapshot (the swap
-        // would drop that delta and regress the checkpoint). The connector retries and resumes
-        // once the reindex completes.
+        // Reindex fence: reject writes (retryably) while a reindex rebuilds, so the connector can't
+        // advance the shard past the rebuild snapshot (the swap would drop that delta).
         if self.fence.is_engaged() {
             return Err(to_status(
                 Code::Unavailable,
@@ -182,10 +172,8 @@ impl Write for WriteService {
 
         // Admission control: refuse rather than queue when saturated.
         let permit = self.admit()?;
-        // Backpressure signal: in-flight commits after admitting this write. It pins at
-        // max_inflight when the connector out-runs the commit path — at which point further writes get
-        // RESOURCE_EXHAUSTED (visible as the connector's write_retries), so lag climbs. Sampled here on
-        // each admitted write (a streaming workload writes continuously).
+        // Backpressure signal: in-flight commits after admitting this write. Pins at max_inflight when
+        // the connector out-runs the commit path (further writes then get RESOURCE_EXHAUSTED).
         growlerdb_telemetry::sli::write_queue_depth(
             &self.index_name,
             (self.max_inflight - self.inflight.available_permits()) as u64,
@@ -219,23 +207,19 @@ impl Write for WriteService {
             if let Some(idx) = &embedding {
                 growlerdb_embed::embed_commit_batch(idx, &mut batch);
             }
-            // Hold the admission permit for the TRUE duration of the blocking commit.
-            // `spawn_blocking` tasks can't be cancelled, so when a client gives up (its deadline
-            // fires and tonic drops this handler future), the commit keeps running. Moving the permit
-            // in — rather than leaving it on the dropped future's frame, where it releases early —
-            // keeps that orphaned commit occupying its slot until it actually finishes. New writes
-            // then get RESOURCE_EXHAUSTED (retryable backpressure) and back off, instead of the Node
-            // spawning unbounded concurrent commits that fight the compaction I/O storm and thrash
-            // the shard's write lock — the contention that detonated the silent-loss event.
+            // Hold the admission permit for the TRUE duration of the blocking commit. `spawn_blocking`
+            // can't be cancelled, so a client giving up drops this handler future while the commit runs
+            // on; moving the permit in (vs. leaving it on the dropped frame, where it releases early)
+            // keeps the orphaned commit holding its slot, so new writes get RESOURCE_EXHAUSTED and back
+            // off instead of spawning unbounded concurrent commits that thrash the shard's write lock.
             let _permit = permit;
             IndexWriter::write(&*shard, &batch)
         })
         .await
         .map_err(|e| to_status(Code::Internal, WireError::new("INTERNAL", e.to_string())))?
         .map_err(store_error_to_status)?;
-        // Ingestion throughput + write-latency SLIs: committed doc-ops per write and
-        // the wall-clock stage+commit time, both labelled by index — the latency localizes an ingest
-        // ceiling to the commit path when node CPU stays flat.
+        // Ingestion throughput + write-latency SLIs (labelled by index): the latency localizes an
+        // ingest ceiling to the commit path when node CPU stays flat.
         growlerdb_telemetry::sli::ingested_docs(&self.index_name, ops);
         growlerdb_telemetry::sli::write(&self.index_name, started.elapsed().as_secs_f64());
 
@@ -249,8 +233,7 @@ impl Write for WriteService {
         _request: Request<GetCheckpointRequest>,
     ) -> Result<Response<GetCheckpointResponse>, Status> {
         // Recreated-source guard: a stale index must not hand back a resume point — the
-        // `FAILED_PRECONDITION` both stops the connector and lets the control-plane render the shard
-        // `source_recreated` (distinct from a transport-level `unreachable`).
+        // `FAILED_PRECONDITION` stops the connector and renders the shard `source_recreated`.
         if self.source_recreated {
             return Err(Self::source_recreated_status());
         }

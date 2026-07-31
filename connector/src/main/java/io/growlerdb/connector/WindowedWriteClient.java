@@ -82,12 +82,11 @@ public final class WindowedWriteClient implements BatchWriter {
   }
 
   /**
-   * Commit one window's sub-batch to its owning node (tagged with this index, so a pool node
-   * serving many indexes dispatches it). A transport-class failure — the pinned owner unreachable
-   * past {@link WriteClient}'s own in-place retry budget — invalidates the window's pin and
-   * re-resolves the owner from the CP once: if the CP re-placed the window, the retry lands on the
-   * new owner (the idempotent {@code batch_id} dedups a replay); if not, the second failure
-   * propagates with the pin dropped, so the NEXT batch re-resolves too instead of staying wedged.
+   * Commit one window's sub-batch to its owning node (tagged with this index so a pool node
+   * dispatches it). A transport-class failure past {@link WriteClient}'s own retry budget invalidates
+   * the window's pin and re-resolves the owner from the CP once: a re-placed window's retry lands on
+   * the new owner (idempotent {@code batch_id} dedups the replay); otherwise the second failure
+   * propagates with the pin dropped, so the NEXT batch re-resolves instead of staying wedged.
    */
   private long writeWindow(long window, DocBatch sub) {
     try {

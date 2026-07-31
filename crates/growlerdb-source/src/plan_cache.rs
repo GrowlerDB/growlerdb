@@ -1,21 +1,12 @@
-//! Snapshot-pinned **plan cache** for hydration.
+//! Snapshot-pinned **plan cache** for hydration: the planned pass-1 task set (from the
+//! `scan().plan_files()` manifest reads) is cached pinned to the snapshot it was planned at —
+//! same `(table, snapshot)` reuses; a snapshot advance replans and replaces — so per-batch
+//! lookups don't re-read manifests. A small LRU keyed by table ident (cap [`PLAN_CACHE_CAP`]).
 //!
-//! Planning a hydration pass-1 read is `load_table` (one catalog REST call) plus
-//! `scan().plan_files()` (manifest-list + manifest GETs from object storage). The catalog
-//! call is cheap and unavoidable — it is how we learn the *current snapshot id* — but the
-//! manifest reads only change when the snapshot does. At the target lookup rates
-//! (~10–50 batches/s) re-planning per batch would dominate hydration p99, so the planned
-//! task set is cached **pinned to the snapshot it was planned at**: same `(table,
-//! snapshot)` → reuse; snapshot advanced → replan and replace.
-//!
-//! The cache is generic over the plan type `T` (production uses
-//! `Arc<Vec<FileScanTask>>`) so the keyed-by-snapshot behavior is unit-testable without a
-//! catalog. It is a small LRU keyed by table ident — the engine serves few tables, so the
-//! cap ([`IcebergReader`](crate::IcebergReader) uses [`PLAN_CACHE_CAP`]) only guards an
-//! operator pointing many indexes at one node. Locking is a short `std::sync::Mutex`
-//! critical section around map access only — never held across the planning `await` — so
-//! concurrent misses at the same snapshot may **duplicate a replan** (benign: last writer
-//! wins, both plans are identical) rather than serializing all hydrations.
+//! Generic over the plan type `T` so the keyed-by-snapshot behavior is unit-testable without a
+//! catalog. The `std::sync::Mutex` guards map access only, never the planning `await`, so
+//! concurrent misses at the same snapshot may duplicate a replan (benign — identical plans, last
+//! writer wins) rather than serializing all hydrations.
 
 use std::collections::HashMap;
 use std::sync::Mutex;

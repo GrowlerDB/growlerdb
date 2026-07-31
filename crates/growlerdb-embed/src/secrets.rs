@@ -14,10 +14,9 @@
 //! | Embedding provider | `GROWLERDB_EMBEDDING_API_KEY` |
 //! | Rerank provider    | `GROWLERDB_RERANK_API_KEY`    |
 //!
-//! A Kubernetes `Secret` or a Vault agent mounts its material as exactly these env vars (a
-//! mounted-secret volume projected into the container env, or an `envFrom`/`valueFrom.secretKeyRef`
-//! in the pod spec). Because [`ProviderSecrets`] **re-reads the environment on every call**, a
-//! rotated secret (the platform updating the projected env) is picked up without a restart.
+//! A Kubernetes `Secret` or Vault agent mounts its material as exactly these env vars. Because
+//! [`ProviderSecrets`] re-reads the environment (within the TTL cache), a rotated secret is picked
+//! up without a restart.
 //!
 //! # Never logged, never served
 //!
@@ -34,11 +33,9 @@ use std::fmt;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// How long a provider key is cached before the env is re-read. Reading the key on **every**
-/// embed/rerank call means a `std::env::var` (a process-global lock + an allocation) on a hot path;
-/// caching for a short window removes that per-call cost while still picking up a rotated
-/// Secret/Vault-mounted env **within the TTL** (no restart needed). 5 min is a deliberate balance:
-/// negligible read cost vs. how promptly a rotation must take effect.
+/// How long a provider key is cached before the env is re-read. Reading on every embed/rerank call
+/// is a `std::env::var` (process-global lock + alloc) on a hot path; caching removes that while still
+/// picking up a rotation within the TTL. 5 min balances read cost vs. rotation latency.
 const KEY_TTL: Duration = Duration::from_secs(300);
 
 /// Env var carrying the outbound **embedding** provider API key (server-side only).
@@ -119,10 +116,9 @@ pub(crate) fn clear_key_cache() {
 /// enough that the last four characters don't reveal it, else a bare `***`. Use this anywhere a
 /// key-derived string might reach a log or a human.
 pub fn redact(key: &str) -> String {
-    // Only expose a tail once there's enough entropy in front of it that four visible chars
-    // can't reconstruct the secret; short keys are fully masked. Take the tail by CHARS, not a
-    // byte slice — a multibyte key whose last four bytes split a UTF-8 boundary would panic,
-    // and this runs on error/log paths where a panic takes the request down with it.
+    // Only expose a tail once there's enough entropy in front that four chars can't reconstruct the
+    // secret; short keys are fully masked. Take the tail by CHARS, not bytes — a multibyte key whose
+    // last four bytes split a UTF-8 boundary would panic on this error/log path.
     if key.chars().count() > 8 {
         let tail: String = key
             .chars()

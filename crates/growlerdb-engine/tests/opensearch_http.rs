@@ -42,8 +42,8 @@ impl Node for CaptureNode {
     ) -> Result<Response<SearchResponse>, Status> {
         let inner = req.into_inner();
         *self.seen_query.lock().unwrap() = inner.query.clone();
-        // Echo a highlight fragment back only when the request opted in, so the HTTP test
-        // can assert both that the `highlight` clause was forwarded and that it renders in the response.
+        // Echo a highlight fragment only when the request opted in, so the HTTP test can assert both
+        // that the `highlight` clause was forwarded and that it renders in the response.
         let highlight = if inner.highlight.is_some() {
             let mut m = std::collections::HashMap::new();
             m.insert(
@@ -100,7 +100,7 @@ impl Node for CaptureNode {
         _req: Request<GetByKeyRequest>,
     ) -> Result<Response<GetByKeyResponse>, Status> {
         // Return the row keyed by its own coordinates, as the real Lookup service does — the adapter
-        // now attributes `_source` by coordinates, not response position.
+        // attributes `_source` by coordinates, not response position.
         Ok(Response::new(GetByKeyResponse {
             rows: vec![HydratedRow {
                 key: Some(Coordinates {
@@ -260,8 +260,7 @@ async fn unsupported_clause_returns_clear_error() {
 }
 
 /// `POST /_search` (no index in the path — OpenSearch "_all"): resolves to the endpoint's
-/// default/sole index and runs the same translated search. Previously the only uncovered
-/// OpenSearch route.
+/// default/sole index and runs the same translated search.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn search_all_routes_to_the_default_index() {
     let seen = Arc::new(Mutex::new(String::new()));

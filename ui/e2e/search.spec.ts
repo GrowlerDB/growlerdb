@@ -238,8 +238,7 @@ test.describe('Search & Explore', () => {
 
   test('time filter stays disabled when the index reports no DATE columns', async ({ page }) => {
     // Default describeIndex mock carries no `time_fields`. The backend always populates the field,
-    // so empty means "no DATE column" — the time control must stay disabled, NOT re-derive fields
-    // from the mapping (the removed client-side fallback).
+    // so empty means "no DATE column" — the time control must stay disabled.
     await installMocks(page);
     await page.goto('/');
     await page.fill('#query', 'status:ok');

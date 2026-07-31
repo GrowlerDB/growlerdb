@@ -558,8 +558,7 @@ impl Parser {
         match self.peek() {
             Some(Tok::LParen) => {
                 self.pos += 1;
-                // Bound recursion: a group descends into `parse_or` again, so unbounded nesting
-                // would overflow the stack.
+                // Bound recursion: each `(` descends into `parse_or` again (see MAX_QUERY_DEPTH).
                 self.depth += 1;
                 if self.depth > MAX_QUERY_DEPTH {
                     return Err(ParseError::TooDeep(MAX_QUERY_DEPTH));

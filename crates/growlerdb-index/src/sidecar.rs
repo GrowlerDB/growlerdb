@@ -1,9 +1,8 @@
-//! Versioned framing for the cold-tier postcard sidecars. Postcard is **not**
-//! self-describing, so a later change to the [`HotCache`](crate::hotcache) or
-//! [`BundleLayout`](crate::bundle::BundleLayout) layout would be silently mis-parsed against an
-//! old sidecar (or vice versa). A 4-byte magic + `u16` version lets a reader **detect** an
-//! incompatible sidecar and degrade deliberately — the hotcache falls back to plain read-through,
-//! the load-bearing bundle manifest surfaces a clear error — instead of corrupting a cold open.
+//! Versioned framing for the cold-tier postcard sidecars. Postcard is **not** self-describing, so a
+//! layout change to the [`HotCache`](crate::hotcache) or
+//! [`BundleLayout`](crate::bundle::BundleLayout) would silently mis-parse an old sidecar. A 4-byte
+//! magic + `u16` version lets a reader **detect** an incompatible sidecar and degrade deliberately
+//! (hotcache falls back to read-through, bundle manifest surfaces a clear error).
 
 use crate::store::{Result, StoreError};
 
@@ -24,7 +23,7 @@ pub(crate) fn frame(magic: [u8; 4], payload: Vec<u8>) -> Vec<u8> {
 }
 
 /// Verify a framed sidecar's magic + version and return its postcard payload. Errors (rather than
-/// mis-parsing) on a wrong tag or an unsupported version — including a pre-versioning sidecar, whose
+/// mis-parsing) on a wrong tag or unsupported version — including a pre-versioning sidecar, whose
 /// bytes won't match the magic.
 pub(crate) fn unframe(magic: [u8; 4], bytes: &[u8]) -> Result<&[u8]> {
     if bytes.len() < 6 || bytes[..4] != magic {

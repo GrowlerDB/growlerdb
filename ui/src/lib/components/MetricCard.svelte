@@ -1,6 +1,5 @@
 <script lang="ts">
-  // A metric card for the Observability SLI grid: label · big value · unit · sub-line · optional
-  // sparkline, tinted by tone.
+  // A metric card for the Observability SLI grid, tinted by tone.
   import type { Snippet } from 'svelte';
   let {
     label,
@@ -57,7 +56,7 @@
   }
   .dc-metric-info {
     flex: 0 0 auto;
-    /* Pull the ⓘ tight to the top-right and out of the text baseline. */
+    /* Pull the ⓘ tight to the top-right, off the text baseline. */
     margin: -2px -4px 0 0;
   }
   .dc-metric-value {

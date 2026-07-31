@@ -1,25 +1,13 @@
-//! Positional parquet **point reads** for hydration pass 1 (the layered locator —
-//! `okf/system/decisions/d30-layered-locator.md`).
+//! Positional parquet **point reads** for hydration pass 1 (layered locator —
+//! `okf/system/decisions/d30-layered-locator.md`): resolve a `(file, row_position)` locator by
+//! reading the parquet footer once, scoping the Arrow reader to the row group(s) holding the
+//! requested positions (`with_row_groups` + a [`RowSelection`]) so IO/decode is bounded by touched
+//! row groups, not the file prefix. All columns are projected — the win is skipping rows.
 //!
-//! Resolving a `(file, row_position)` locator by streaming the data file's Arrow reader from
-//! row 0 would decode every batch until it passed `max(row_position)` — for a late row in a large
-//! file that decodes nearly the whole file per lookup batch. Instead, one parquet **footer
-//! metadata** read per file uses the per-row-group row counts to identify the row group(s) holding
-//! the requested positions, and the Arrow reader is scoped with `with_row_groups` + a
-//! [`RowSelection`] that skips to the exact
-//! rows. IO and decode are bounded by the touched row groups (and, where the writer emitted an
-//! offset index, the touched pages — the iceberg [`ArrowFileReader`] preloads offset indexes),
-//! not by the file prefix. All columns are projected — hydration returns the full row; the win is
-//! skipping rows, not columns.
-//!
-//! The read goes to the `parquet` crate directly over the **same `FileIO` stack** the iceberg
-//! scan path uses (opendal S3 + built-in retry, coalesced concurrent range fetches), because
-//! iceberg-rust's scan API has no positional selection. That makes positions **physical** row
-//! positions — an exact drop-in for delete-free files, where the ingest-time stream position
-//! equals the physical position. Files carrying delete files keep the iceberg streaming read
-//! (see [`hydrate`](crate::IcebergReader::hydrate)'s pass 1), so verify-and-fall-back semantics
-//! are unchanged: a targeted read that yields a row whose key doesn't match goes stale exactly
-//! as before.
+//! Goes to the `parquet` crate directly over the same `FileIO` stack the iceberg scan uses (which
+//! has no positional selection), so positions are **physical** — an exact drop-in for delete-free
+//! files. Delete-bearing files keep the iceberg streaming read (see
+//! [`hydrate`](crate::IcebergReader::hydrate)); either way a key-mismatched row goes stale.
 
 use std::collections::{BTreeMap, BTreeSet};
 

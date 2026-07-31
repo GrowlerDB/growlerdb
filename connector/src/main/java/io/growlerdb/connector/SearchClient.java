@@ -26,12 +26,11 @@ import java.util.function.Supplier;
  * <p>The endpoint is the index — a Gateway is started per index ({@code gateway --index}) — so the
  * query carries no index name. Plaintext only; TLS/auth on this read path are a follow-up.
  *
- * <p><b>Resilience.</b> The read path mirrors {@link WriteClient}'s guards so a
- * wedged Node/Gateway can't hang the query thread forever: a {@link #keepAliveTime keepalive} trips a
- * black-holed connection to re-resolve DNS, a <b>per-call deadline</b> fails a stuck RPC fast, and
- * transient transport failures are <b>retried with backoff</b> (a read is idempotent, so retry is
- * always safe). {@link #maxInboundMessageSize} lets a wide hit list through instead of failing the
- * SQL query with {@code RESOURCE_EXHAUSTED}.
+ * <p><b>Resilience.</b> Mirrors {@link WriteClient}'s guards so a wedged Node/Gateway can't hang the
+ * query thread forever: keepalive trips a black-holed connection to re-resolve DNS, a per-call
+ * deadline fails a stuck RPC fast, and transient transport failures are retried with backoff (a read
+ * is idempotent, so retry is always safe). A large inbound cap lets a wide hit list through instead
+ * of failing the SQL query with {@code RESOURCE_EXHAUSTED}.
  */
 public final class SearchClient implements AutoCloseable {
 
@@ -79,7 +78,7 @@ public final class SearchClient implements AutoCloseable {
     return PER_CALL_DEADLINE_SECONDS;
   }
 
-  /** As above with explicit deadline/retry tunables — used by tests. */
+  /** As above with explicit deadline/retry tunables — for tests. */
   SearchClient(
       String host,
       int port,
@@ -91,7 +90,7 @@ public final class SearchClient implements AutoCloseable {
       throw new IllegalArgumentException("maxAttempts must be >= 1");
     }
     // dns:/// so a restarted endpoint's new pod IP is re-resolved on reconnect; keepalive trips a
-    // black-holed connection to TRANSIENT_FAILURE, forcing re-resolution (see WriteClient for detail).
+    // black-holed connection to TRANSIENT_FAILURE, forcing re-resolution.
     this.channel =
         ManagedChannelBuilder.forTarget("dns:///" + host + ":" + port)
             .usePlaintext()
@@ -100,8 +99,8 @@ public final class SearchClient implements AutoCloseable {
             .keepAliveTimeout(5, TimeUnit.SECONDS)
             .keepAliveWithoutCalls(true)
             .build();
-    // Stamp the shared service token when set (a directly-dialed Node's data plane enforces
-    // it; a Gateway ignores it — user auth governs there). Mirrors WriteClient.
+    // Stamp the shared service token when set: a directly-dialed Node's data plane enforces it; a
+    // Gateway ignores it (user auth governs there).
     SearchGrpc.SearchBlockingStub s = SearchGrpc.newBlockingStub(channel);
     String token = System.getenv("GROWLERDB_SERVICE_TOKEN");
     if (token != null && !token.isEmpty()) {

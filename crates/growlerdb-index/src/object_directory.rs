@@ -1,13 +1,10 @@
-//! A **read-only object-storage** [`tantivy::Directory`](Directory). It lets a tantivy
-//! index whose files live in an opendal store be opened and queried *in place* — fetching only the
-//! byte ranges a query touches — so cold (parked) time-window shards stay searchable without
-//! restoring the whole window to local NVMe.
+//! A **read-only object-storage** [`tantivy::Directory`](Directory): opens and queries a tantivy
+//! index whose files live in an opendal store *in place*, fetching only the byte ranges a query
+//! touches, so cold (parked) time-window shards stay searchable without restoring to local NVMe.
 //!
-//! tantivy's `Directory` reads are **synchronous**, so we drive opendal through its `blocking`
-//! operator, which `block_on`s the current tokio runtime. That requires opening from within a
-//! runtime context and reading from a *synchronous* one — exactly the shape the Search service
-//! already uses (it runs query execution on `spawn_blocking`). Writes are unsupported: a cold
-//! window is immutable.
+//! tantivy's `Directory` reads are **synchronous**, so opendal is driven through its `blocking`
+//! operator, which `block_on`s the current tokio runtime — hence open from a runtime context, read
+//! from a synchronous one (the Search service's `spawn_blocking` shape). Writes are unsupported.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -27,13 +24,11 @@ use tantivy::HasLen;
 use crate::bundle::BundleState;
 use crate::range_cache::RangeCache;
 
-/// Preloaded structural state so a cold open needs **zero object round-trips** (from the hotcache):
-/// the full bytes of the tiny atomic files (`meta.json`, `.managed.json`), each file's length (so
-/// `get_file_handle` can skip its `stat`), and the structural byte `ranges` each segment reader
-/// touches on open. All **pinned** for the shard's lifetime — the ranges live here rather than in the
-/// shared evictable [`RangeCache`], so other windows' traffic can't evict them and
-/// silently re-introduce the cold round-trips the hotcache exists to avoid. Keyed by path relative to
-/// the directory prefix; `ranges` maps a file → its `(start, bytes)` spans.
+/// Preloaded structural state (from the hotcache) so a cold open needs **zero object round-trips**:
+/// atomic-file bodies (`meta.json`, `.managed.json`), each file's length (so `get_file_handle`
+/// skips its `stat`), and the structural byte `ranges` each segment reader touches on open. All
+/// **pinned** for the shard's lifetime — held here rather than in the shared evictable
+/// [`RangeCache`] so other windows' traffic can't evict them. Keyed by path relative to the prefix.
 #[derive(Default)]
 pub(crate) struct HotState {
     pub lens: HashMap<String, u64>,
@@ -55,13 +50,13 @@ pub struct ObjectDirectory {
     op: blocking::Operator,
     /// Key prefix (with a trailing `/`) every file path is resolved under.
     prefix: String,
-    /// Optional shared byte-range cache so repeat cold reads stay local.
+    /// Shared byte-range cache so repeat cold reads stay local.
     cache: Option<RangeCache>,
-    /// Preloaded structural state served locally instead of hitting object storage.
+    /// Preloaded structural state served locally instead of object storage.
     hot: Option<Arc<HotState>>,
-    /// Build-time recorder; when set, structural reads are captured for the hotcache.
+    /// When set, structural reads are captured for the hotcache.
     rec: Option<Arc<Mutex<Recorder>>>,
-    /// Split-bundle state: when set, file reads map to ranged GETs of one bundle object.
+    /// When set, file reads map to ranged GETs of one bundle object.
     bundle: Option<Arc<BundleState>>,
 }
 
@@ -75,10 +70,9 @@ impl fmt::Debug for ObjectDirectory {
 
 impl ObjectDirectory {
     /// Open the tantivy index rooted at `prefix` in the async `op`, read-only. Wraps `op` in a
-    /// blocking operator that drives reads via the **current tokio runtime's** `block_on`, so this
-    /// must be called from within a runtime context (it captures `Handle::current`); reads then run
-    /// in synchronous context — which is exactly where tantivy search executes (the Search service
-    /// runs it on `spawn_blocking`). Errors if there is no current runtime.
+    /// blocking operator driven by the **current tokio runtime's** `block_on`, so this must be
+    /// called from within a runtime context (it captures `Handle::current`) and read from a
+    /// synchronous one. Errors if there is no current runtime.
     pub fn open(op: opendal::Operator, prefix: impl Into<String>) -> Result<Self, opendal::Error> {
         Ok(Self {
             op: blocking::Operator::new(op)?,
@@ -97,24 +91,24 @@ impl ObjectDirectory {
         self
     }
 
-    /// Serve open-time structural reads (atomic files + file lengths) from a preloaded hotcache
-    /// instead of object storage, so opening a cold window needs zero round-trips.
+    /// Serve open-time structural reads (atomic files + lengths) from a preloaded hotcache instead
+    /// of object storage, so opening a cold window needs zero round-trips.
     pub(crate) fn with_hot(mut self, hot: Arc<HotState>) -> Self {
         self.hot = Some(hot);
         self
     }
 
-    /// Serve file reads from a single **bundle** object instead of one object per file:
-    /// each read is mapped to a ranged GET of the bundle at the file's offset. Caching stays keyed by
-    /// the per-file logical key, so this composes with [`Self::with_hot`].
+    /// Serve file reads from a single **bundle** object instead of one object per file — each read
+    /// is a ranged GET of the bundle at the file's offset. Caching stays keyed by the per-file
+    /// logical key, so this composes with [`Self::with_hot`].
     pub(crate) fn with_bundle(mut self, bundle: Arc<BundleState>) -> Self {
         self.bundle = Some(bundle);
         self
     }
 
-    /// Record structural reads: every atomic-file body and file length this directory
-    /// fetches is captured for packaging into a hotcache. Combine with [`Self::with_cache`] over a
-    /// fresh cache to also capture the byte ranges.
+    /// Record structural reads: every atomic-file body and file length this directory fetches is
+    /// captured for a hotcache. Combine with [`Self::with_cache`] over a fresh cache to also capture
+    /// the byte ranges.
     pub(crate) fn recording(mut self) -> Self {
         self.rec = Some(Arc::new(Mutex::new(Recorder::default())));
         self
@@ -142,8 +136,7 @@ impl ObjectDirectory {
     }
 }
 
-/// A tantivy file path rendered relative to the directory prefix (forward-slashed), the key used in
-/// the hotcache maps.
+/// A tantivy file path relative to the directory prefix (forward-slashed) — the hotcache map key.
 fn rel(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
@@ -165,21 +158,20 @@ fn read_only() -> io::Error {
 }
 
 /// A handle to one tantivy file, served by ranged GETs (cached when a cache is set). When the window
-/// is **bundled**, the file's bytes live inside one shared bundle object at `phys_offset`,
-/// but caching stays keyed by the per-file `cache_key` so hotcache-preloaded ranges still hit.
+/// is **bundled**, the file's bytes live inside one shared bundle object at `phys_offset`, but
+/// caching stays keyed by the per-file `cache_key` so hotcache-preloaded ranges still hit.
 #[derive(Clone)]
 struct ObjectFile {
     op: blocking::Operator,
-    /// Logical key for the [`RangeCache`] — stable per tantivy file, bundled or not.
+    /// Logical [`RangeCache`] key — stable per tantivy file, bundled or not.
     cache_key: Arc<str>,
-    /// Physical object to GET: the bundle (bundled) or the file's own object (not bundled).
+    /// Physical object to GET: the bundle (bundled) or the file's own object.
     phys_key: Arc<str>,
     /// Byte offset of this file within `phys_key` (0 when not bundled).
     phys_offset: u64,
     len: usize,
     cache: Option<RangeCache>,
-    /// Pinned hotcache spans for this file: `(start, bytes)`, served before the
-    /// shared cache and never evicted.
+    /// Pinned hotcache spans `(start, bytes)`, served before the shared cache and never evicted.
     pinned: Vec<(u64, OwnedBytes)>,
 }
 
@@ -201,12 +193,11 @@ impl HasLen for ObjectFile {
 }
 
 impl ObjectFile {
-    /// Fetch `range` (relative to this file) from object storage — shifted into the physical object
-    /// by `phys_offset` so a bundled file reads the right window of the shared bundle.
+    /// Fetch `range` (relative to this file) from object storage — shifted by `phys_offset` so a
+    /// bundled file reads the right window of the shared bundle.
     fn fetch(&self, range: &Range<usize>) -> io::Result<OwnedBytes> {
-        // Bound the read to this file's extent: in bundle mode the physical object is
-        // the shared bundle, so a read past `len` (off-by-one / corruption) would silently return the
-        // *adjacent* file's bytes as this file's data. Reject it instead of bleeding across files.
+        // Bound the read to this file's extent: in bundle mode a read past `len` would silently
+        // return the *adjacent* file's bytes. Reject it instead of bleeding across files.
         if range.end > self.len || range.start > range.end {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -232,8 +223,8 @@ impl ObjectFile {
 
 impl FileHandle for ObjectFile {
     fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
-        // Pinned hotcache spans first: an exact (start, len) match is served from the
-        // per-shard, never-evicted set — so a cold open's structural reads stay round-trip-free.
+        // Pinned hotcache spans first: an exact (start, len) match is served from the never-evicted
+        // set, keeping a cold open's structural reads round-trip-free.
         for (start, bytes) in &self.pinned {
             if *start == range.start as u64 && bytes.len() == range.len() {
                 return Ok(bytes.clone());
@@ -255,7 +246,6 @@ impl Directory for ObjectDirectory {
     fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
         let cache_key = self.key(path);
         let rel = rel(path);
-        // Pinned hotcache spans for this file, if any.
         let pinned = self
             .hot
             .as_ref()
@@ -274,7 +264,7 @@ impl Directory for ObjectDirectory {
                 pinned,
             }));
         }
-        // Prefer a preloaded length (hotcache) → no `stat` round-trip on open.
+        // A preloaded length (hotcache) skips the `stat` round-trip on open.
         let len = match self.hot.as_ref().and_then(|h| h.lens.get(&rel).copied()) {
             Some(len) => len,
             None => {
@@ -306,11 +296,11 @@ impl Directory for ObjectDirectory {
 
     fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
         let rel = rel(path);
-        // Preloaded atomic bodies (meta.json / .managed.json) served locally on a hotcache open.
+        // Preloaded atomic bodies served locally on a hotcache open.
         if let Some(buf) = self.hot.as_ref().and_then(|h| h.atomic.get(&rel)) {
             return Ok(buf.clone());
         }
-        // Bundled (and not in the hotcache): read the file's span out of the one bundle object.
+        // Bundled (and not in the hotcache): read the file's span out of the bundle object.
         if let Some((phys_key, offset, len)) = self.bundle_span(&rel) {
             let opts = ReadOptions {
                 range: (offset..offset + len).into(),
@@ -379,8 +369,8 @@ impl Directory for ObjectDirectory {
         Ok(())
     }
 
-    /// No-op lock: a read-only directory can't (and needn't) write a lock file, but tantivy's
-    /// `Index::open`/reload acquires `META_LOCK`. Hand back a lock that owns nothing.
+    /// No-op lock: a read-only directory needn't write a lock file, but tantivy's `Index::open`
+    /// acquires `META_LOCK`. Hand back a lock that owns nothing.
     fn acquire_lock(&self, _lock: &Lock) -> Result<DirectoryLock, LockError> {
         Ok(DirectoryLock::from(Box::new(())))
     }

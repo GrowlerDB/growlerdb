@@ -1,8 +1,6 @@
-//! The Node **Suggest** gRPC service ([Design 01]) — term suggestions over an
-//! indexed field's dictionary: **autocomplete** (prefix completions) and
-//! **did-you-mean** (fuzzy corrections). Adapts the in-process `Shard::suggest_prefix`
-//! / `suggest_fuzzy`. Suggestion frequencies are approximate (not liveness-filtered),
-//! the suggester contract.
+//! The Node **Suggest** gRPC service ([Design 01]) — term suggestions over an indexed field's
+//! dictionary: autocomplete (prefix) and did-you-mean (fuzzy). Suggestion frequencies are
+//! approximate (not liveness-filtered), per the suggester contract.
 //!
 //! [Design 01]: ../../../okf/product/interfaces/grpc.md
 
@@ -80,8 +78,8 @@ impl Suggest for SuggestService {
         } else {
             req.limit as usize
         };
-        // Node-level ceiling: a Node is directly reachable in distributed mode, so
-        // cap an unbounded `limit` before it drives a huge scan.
+        // Node-level ceiling: cap an unbounded `limit` before it drives a huge scan (a Node is
+        // directly reachable in distributed mode).
         if limit > crate::search_service::MAX_NODE_FETCH {
             return Err(invalid("limit exceeds the maximum page fetch (10000)"));
         }
@@ -91,9 +89,8 @@ impl Suggest for SuggestService {
         };
 
         let shard = self.shard.current();
-        // Tenant scoping: suggest scans a field's term dictionary across all docs,
-        // which a per-doc filter can't constrain — so it would leak other tenants' terms.
-        // Fail closed on a tenant-scoped index until a tenant-aware suggester lands.
+        // Tenant scoping: suggest scans a field's term dictionary across all docs, which a per-doc
+        // filter can't constrain — so fail closed on a tenant-scoped index (it would leak terms).
         if let Some(field) = shard.tenant_field() {
             return Err(to_status(
                 Code::PermissionDenied,
@@ -124,9 +121,8 @@ impl Suggest for SuggestService {
     }
 }
 
-/// Map a store error to a gRPC status. A bad field / query-shape error (an
-/// [`IndexError`] of the request-validation kind) is a client-facing
-/// `InvalidArgument`; anything else is `Internal`.
+/// Map a store error to a gRPC status: a request-validation [`IndexError`] (bad field/query shape)
+/// is a client-facing `InvalidArgument`; anything else is `Internal`.
 fn store_status(e: StoreError) -> Status {
     match e {
         StoreError::Segment(

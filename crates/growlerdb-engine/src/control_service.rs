@@ -1,8 +1,6 @@
 //! The **Control Plane** gRPC service — cluster-wide index lifecycle over the
-//! [`Registry`](growlerdb_controlplane::Registry): create / drop / list. `CreateIndex` resolves
-//! the candidate definition against its source schema before registering it (status `building`);
-//! the registry mutations are durable. Lightweight and off the search/write hot path. Every RPC
-//! consults the [auth hook](SharedAuth) first.
+//! [`Registry`](growlerdb_controlplane::Registry). `CreateIndex` resolves the definition against
+//! its source schema before registering it (status `building`); every RPC gates on the auth hook first.
 
 use std::sync::Arc;
 
@@ -114,11 +112,9 @@ impl LoginThrottle {
     }
 }
 
-/// Per-node assignment-push subscribers (D53): `node endpoint → a watch sender holding the node's
-/// latest assignment snapshot`. A node's `SubscribeAssignments` call subscribes here; a placement
-/// change pushes a fresh snapshot to every node. `watch` **coalesces to the latest value**, so a slow
-/// node never wedges the CP and always converges on the current assignment set (snapshots are
-/// idempotent — the node reconciles). `Arc<Mutex<…>>` so every clone of the (`Clone`)
+/// Per-node assignment-push subscribers (D53): `node endpoint → watch sender` holding each node's
+/// latest snapshot. `watch` coalesces to the latest value, so a slow node never wedges the CP and
+/// converges on the current set (snapshots are idempotent). `Arc<Mutex<…>>` so every clone of the
 /// [`ControlPlaneService`] shares one subscriber set.
 #[derive(Clone, Default)]
 struct AssignmentHub {
@@ -130,13 +126,11 @@ struct AssignmentHub {
 }
 
 impl AssignmentHub {
-    /// Subscribe `endpoint` and seed the stream with its current snapshot. **Register-then-
-    /// compute-then-send** (HA-D4a): the receiver is created *before* the snapshot is computed, and
-    /// the hub lock is held across compute+send both here and in [`notify_all`](Self::notify_all) —
-    /// so no placement change can land in a gap and be clobbered by a stale seed, and a re-subscribe
-    /// can only re-send the *current* truth to the endpoint's other live receivers (snapshots are
-    /// idempotent). The registry read inside the lock is brief and never takes the hub lock back,
-    /// so the lock order (hub → registry read) is acyclic.
+    /// Subscribe `endpoint`, seeding the stream with its current snapshot. Register-then-compute-then-send
+    /// (HA-D4a): the receiver is created before the snapshot is computed and the hub lock held across
+    /// compute+send (here and in [`notify_all`](Self::notify_all)), so no placement change lands in a gap
+    /// and gets clobbered by a stale seed. The registry read inside the lock never re-takes the hub lock,
+    /// so the lock order (hub → registry) is acyclic.
     fn subscribe(
         &self,
         endpoint: &str,
@@ -153,10 +147,9 @@ impl AssignmentHub {
     }
 
     /// Push a fresh snapshot to every subscribed node — invoked by the registry's placement-change
-    /// hook after any persisted placement mutation, so every change path (resolve, announce,
-    /// drop-index, promote, remove-node, sweeper) pushes without remembering to. Senders whose
-    /// receivers have all dropped are **evicted** (HA-D4b) — a disconnected node re-subscribes and
-    /// gets a fresh full snapshot, so nothing is lost and the hub can't grow with dead endpoints.
+    /// hook after any persisted mutation, so every change path pushes without remembering to. Senders
+    /// whose receivers have all dropped are evicted (HA-D4b): a disconnected node re-subscribes for a
+    /// fresh full snapshot, so nothing is lost and the hub can't grow with dead endpoints.
     fn notify_all(&self, registry: &Registry) {
         let mut map = self.senders.lock().unwrap_or_else(|e| e.into_inner());
         map.retain(|ep, tx| {
@@ -198,9 +191,8 @@ pub struct ControlPlaneService {
     iceberg: IcebergConfig,
     auth: SharedAuth,
     /// Optional authenticator: when set, the control plane validates the forwarded bearer itself
-    /// (rather than trusting gateway-stamped metadata) before authorizing — needed so local role
-    /// bindings are merged against a *verified* subject. `None` trusts the gateway-stamped
-    /// principal/roles.
+    /// (not trusting gateway-stamped metadata) before authorizing — so local role bindings merge
+    /// against a *verified* subject. `None` trusts the gateway-stamped principal/roles.
     authn: Option<SharedAuthn>,
     /// Built-in login signing key: `Some` enables the `Login` RPC, which verifies a password against
     /// the registry credential store and mints an HS256 session JWT signed with this secret (the
@@ -211,9 +203,8 @@ pub struct ControlPlaneService {
     /// Optional scale-limit [license](crate::license). `None` ⇒ the free tier
     /// ([`FREE_NODE_LIMIT`](crate::license::FREE_NODE_LIMIT)); a valid license raises the node cap.
     license: Option<crate::license::License>,
-    /// Cluster-wide **replication factor** R (D53): the number of holders the CP places per unit —
-    /// 1 primary + R−1 read replicas. `1` (the default) is primary-only, the D52 behavior — the
-    /// `ResolveUnitOwner` path is then byte-identical to before. `> 1` engages
+    /// Cluster-wide **replication factor** R (D53): holders the CP places per unit — 1 primary +
+    /// R−1 read replicas. `1` (the default) is primary-only; `> 1` engages
     /// [`resolve_unit_holders`](Registry::resolve_unit_holders) so a resolve also places replicas.
     replication_factor: usize,
     /// D53 assignment-push subscribers: nodes subscribe (`SubscribeAssignments`) and a placement
@@ -231,11 +222,9 @@ impl ControlPlaneService {
     /// As [`new`](Self::new), with a specific [auth hook](SharedAuth).
     pub fn with_auth(registry: Arc<Registry>, iceberg: IcebergConfig, auth: SharedAuth) -> Self {
         let assignments = AssignmentHub::default();
-        // Placement-change hook (HA-D1): EVERY persisted placement mutation — resolve, announce
-        // re-point, drop-index, promote, remove-node, the dead-owner sweeper, a standby's
-        // reload-on-promotion — pushes each subscribed node its fresh snapshot. Wired at the
-        // registry's persist boundary so a new mutation can't forget to notify. `Weak` breaks the
-        // registry → listener → registry cycle.
+        // Placement-change hook (HA-D1): wired at the registry's persist boundary so every persisted
+        // placement mutation pushes each subscribed node its fresh snapshot, and no new mutation can
+        // forget to notify. `Weak` breaks the registry → listener → registry cycle.
         {
             let hub = assignments.clone();
             let weak = Arc::downgrade(&registry);
@@ -332,12 +321,11 @@ impl ControlPlaneService {
                             WireError::new("UNAUTHENTICATED", e.to_string()),
                         )
                     })?;
-                // Session revocation: reject a token minted before the subject's session epoch —
-                // set when their roles change or credential is removed. Forces re-authentication
-                // with the current roles rather than riding a stale embedded set.
-                // Compared at second granularity (`iat` is floored seconds; the epoch is ms): since
-                // floor is monotonic, a token minted at-or-after the epoch is never wrongly rejected —
-                // at worst a token from the same second as the change survives <1s.
+                // Session revocation: reject a token minted before the subject's session epoch (set
+                // when roles change or a credential is removed), forcing re-auth with current roles.
+                // Compared at second granularity (`iat` floored seconds, epoch ms): floor is monotonic,
+                // so a token at-or-after the epoch is never wrongly rejected — at worst one from the
+                // same second survives <1s.
                 if let Some(iat) = v.issued_at {
                     let epoch_secs = self.registry.session_epoch(&v.principal) / 1000;
                     if (iat as i64) < epoch_secs {
@@ -808,9 +796,8 @@ impl ControlPlane for ControlPlaneService {
         }
 
         // Resolve against the source schema, then register. A variant table's introspection routes
-        // through Trino (D49): released iceberg-rust can't parse a v3 variant schema in
-        // `load_table`, so a def declaring a variant reads its columns from Trino `information_schema`
-        // instead of the native reader. Non-variant defs keep the native path.
+        // through Trino (D49): released iceberg-rust can't parse a v3 variant schema, so a variant def
+        // reads its columns from Trino `information_schema`; non-variant defs keep the native reader.
         let Source::Iceberg(src) = &def.source;
         let table = src.table.clone();
         let internal = |e: String| to_status(Code::Internal, WireError::new("INTERNAL", e));
@@ -934,11 +921,10 @@ impl ControlPlane for ControlPlaneService {
             .ok_or_else(|| registry_status(RegistryError::NotFound(req.index.clone())))?;
         // The count the data is **currently routed over** — the stored bucket map's shard count,
         // NEVER the registered-node count: registration already includes the new (empty) build
-        // targets, and deriving the current count from it would make growth impossible (register
-        // the new shards → current == new → rejected) while pre-cutover registration flipped
-        // routing. Registration adopts a map on first announce, so a registered ordinal index
-        // always has one; the fallback covers only a CP-created index no node ever announced
-        // (apply then fails on missing endpoints below anyway).
+        // targets, so deriving current from it makes growth impossible (current == new → rejected).
+        // Registration adopts a map on first announce, so a registered ordinal index always has one;
+        // the fallback covers only a CP-created index no node announced (apply then fails on missing
+        // endpoints below anyway).
         let current_map = self.registry.bucket_map(&req.index);
         let current_count = current_map
             .as_ref()
@@ -1437,12 +1423,10 @@ impl ControlPlane for ControlPlaneService {
         self.gate("RegisterServedIndex", &request)?;
         let req = request.into_inner();
         validate_endpoint(&req.endpoint)?;
-        // Heartbeat the owner into the liveness pool: a classic `serve --index X` node only ever
-        // announces via RegisterServedIndex (never RegisterNode), so without this the dead-owner
-        // sweeper would see its owner as dead and steal its self-declared units onto a pool node
-        // (which then rejects reads for that index). This records LIVENESS ONLY — the endpoint is not
-        // made placement-eligible, so the CP still never assigns POOL units to it (Registry::
-        // touch_node_liveness / placement_nodes).
+        // Heartbeat the owner into the liveness pool: a classic `serve --index X` node only announces
+        // via RegisterServedIndex (never RegisterNode), so without this the dead-owner sweeper would
+        // see its owner as dead and steal its self-declared units onto a pool node. Records LIVENESS
+        // ONLY — the endpoint isn't made placement-eligible, so the CP never assigns POOL units to it.
         self.registry.touch_node_liveness(&req.endpoint, now_ms());
         // The node ships its already-resolved definition (its `index.json`), so registration is a
         // pure registry op — no source round-trip (unlike CreateIndex, which resolves YAML).
@@ -1467,11 +1451,10 @@ impl ControlPlane for ControlPlaneService {
             }
         }
         if !is_windowed {
-            // Ordinal shard map. A node serving specific ordinals claims only those. An empty list
-            // means "claim all 0..count" for a classic single node, but "claim none" for a
-            // **placement-pool** node (D52) — its ordinals are placed by `ResolveUnitOwner`, so a
-            // replica-only node registers the entry + bucket map below without grabbing every shard
-            // as primary (which would conflict with every peer serving the same index read-through).
+            // Ordinal shard map. An empty list means "claim all 0..count" for a classic single node,
+            // but "claim none" for a **placement-pool** node (D52) — its ordinals are placed by
+            // `ResolveUnitOwner`, so a replica-only node registers without grabbing every shard as
+            // primary (which would conflict with every peer serving the same index).
             let owned: Vec<u32> = if req.pool_managed {
                 req.shard_ordinals.clone()
             } else if req.shard_ordinals.is_empty() {
@@ -1486,11 +1469,10 @@ impl ControlPlane for ControlPlaneService {
                     )));
                 }
             }
-            // One persist for all this node's ordinals, not one rewrite per ordinal. The announce
-            // is guarded (HA-D3/D7): idempotent for this endpoint's own shards, a serving report for
-            // shards it replicates, a takeover for confidently-dead primaries — but a shard held by
-            // a live foreign primary is PLACEMENT_CONFLICT (first-wins, not last-write-wins), and
-            // fresh primaries are entitlement-checked (fail-closed) like any placement.
+            // One persist for all this node's ordinals. The announce is guarded (HA-D3/D7): idempotent
+            // for this endpoint's own shards, a serving report for shards it replicates, a takeover for
+            // confidently-dead primaries — but a shard held by a live foreign primary is
+            // PLACEMENT_CONFLICT (first-wins), and fresh primaries are entitlement-checked (fail-closed).
             self.registry
                 .announce_primaries(
                     &name,
@@ -1509,11 +1491,9 @@ impl ControlPlane for ControlPlaneService {
                 .map_err(registry_status)?;
         } else {
             // Windowed: place the served windows on this node and record their event-time zone-maps
-            // + hot/cold tier — one guarded, batched registry mutation (one persist for the whole
-            // announce). Same first-wins semantics as the ordinal path: a window primaried by a
-            // live foreign node conflicts unless this node is its listed replica (serving report).
-            // `windows` may be empty (an empty streaming node) — the entry still exists + activates
-            // below so placement can proceed.
+            // + hot/cold tier in one guarded, batched mutation. Same first-wins semantics as the
+            // ordinal path. `windows` may be empty (an empty streaming node) — the entry still exists
+            // + activates below so placement can proceed.
             let announces: Vec<growlerdb_controlplane::WindowAnnounce> = req
                 .windows
                 .iter()
@@ -1552,13 +1532,12 @@ impl ControlPlane for ControlPlaneService {
         // index-agnostic (D52): a node registers once as an interchangeable shard host.
         //
         // Node registration is **uncapped** (D53/D38 Option A): the scale entitlement counts distinct
-        // *primary-holding nodes*, so registering a node (or a read-replica node) adds capacity for
-        // free and never trips the limit — the cap is enforced at unit placement (`ResolveUnitOwner` /
-        // the `RegisterServedIndex` announce) instead.
+        // primary-holding nodes, so registering a node adds capacity for free; the cap is enforced at
+        // unit placement (`ResolveUnitOwner` / the `RegisterServedIndex` announce) instead.
         //
-        // The node's replica-capability declaration rides the heartbeat (HA-G2): only a node with
-        // an object store can serve replica windows read-through, so replica placement filters on
-        // it. Absent (old binary) decodes false — the safe default (no replicas placed there).
+        // The replica-capability declaration rides the heartbeat (HA-G2): only a node with an object
+        // store can serve replica windows read-through, so replica placement filters on it. Absent
+        // (old binary) decodes false — the safe default (no replicas placed there).
         self.registry
             .register_node_with_capability(&req.endpoint, req.replica_capable, now_ms());
         Ok(Response::new(RegisterNodeResponse {}))
@@ -1607,13 +1586,11 @@ impl ControlPlane for ControlPlaneService {
             RegistryError::NoLiveNode { .. } => Status::unavailable(e.to_string()),
             other => registry_status(other),
         };
-        // One placement path for every R (D53): resolve places 1 primary + R−1 read replicas.
-        // The scale entitlement (D38/D53: distinct live primary-holding nodes) is enforced
-        // ATOMICALLY inside the registry's placement critical section — lighting up a node beyond the
-        // cap is RESOURCE_EXHAUSTED (at the cap a fresh unit packs onto an already-primary node);
-        // re-resolves and dead-owner re-placement always pass, so a live cluster is never disrupted,
-        // and replicas are free. Placement pushes ride the registry's placement-change hook, so every
-        // subscribed holder gets its fresh snapshot.
+        // One placement path for every R (D53): resolve places 1 primary + R−1 read replicas. The
+        // scale entitlement (distinct live primary-holding nodes, D38/D53) is enforced ATOMICALLY in
+        // the registry's placement critical section — beyond the cap is RESOURCE_EXHAUSTED (at the cap
+        // a fresh unit packs onto an already-primary node); re-resolves and dead-owner re-placement
+        // always pass, and replicas are free. Pushes ride the placement-change hook.
         let holders = self
             .registry
             .resolve_unit_holders(
@@ -1914,13 +1891,11 @@ impl ControlPlaneService {
 
     /// Spawn the **placement sweeper** (HA-D8 / 357.26): every TTL/2, drive every unit to
     /// `replication_factor` live holders via the idempotent resolve path
-    /// ([`Registry::ensure_placement`]) — **place a primary** for each declared hash ordinal that has
-    /// none (round-robin across the pool, so nodes need no per-node build/primary designation — they
-    /// build/load on assignment) and **fill replicas** for placed units. This is what makes the pool
-    /// self-organize and read HA independent of write activity: a batch-built, read-served index gets
-    /// its primaries + replicas placed with no connector, and a node join/loss self-heals the set. The
-    /// counterpart to [`spawn_dead_owner_sweeper`](Self::spawn_dead_owner_sweeper) (which promotes on a
-    /// dead primary). Only the **leader** sweeps; the grace window is honored inside the sweep.
+    /// ([`Registry::ensure_placement`]) — place a primary for each declared hash ordinal lacking one
+    /// (round-robin; nodes build/load on assignment) and fill replicas. Makes the pool self-organize
+    /// and read HA independent of write activity. Counterpart to
+    /// [`spawn_dead_owner_sweeper`](Self::spawn_dead_owner_sweeper). Only the leader sweeps; the grace
+    /// window is honored inside the sweep.
     pub fn spawn_placement_sweeper(&self) {
         use growlerdb_controlplane::NODE_REANNOUNCE_INTERVAL_MS;
         let registry = self.registry.clone();
@@ -2021,10 +1996,9 @@ async fn shard_checkpoint(
     let mut client = WriteClient::with_interceptor(channel, stamp);
     let resp = client
         // `window` selects the time-window shard on a windowed node; `shard` the ordinal on a hash
-        // node. `index` names the unit: a single-index node ignores all three (it has one shard and
-        // defaults to its sole index), but a MULTI-index pool node REQUIRES the index (+ ordinal) to
-        // route the probe — without them it can't disambiguate and answers InvalidArgument, which the
-        // caller reads back as `unreachable` and reports every pool-served shard as DOWN.
+        // node. A single-index node ignores all three, but a MULTI-index pool node REQUIRES the index
+        // (+ ordinal) to route the probe — without them it answers InvalidArgument, read back as
+        // `unreachable`, reporting every pool-served shard as DOWN.
         .get_checkpoint(GetCheckpointRequest {
             window,
             index: index.to_string(),
@@ -2567,8 +2541,7 @@ mod tests {
         // D53/D38 (Option A): the scale cap is on distinct live **primary-holding nodes**, enforced
         // atomically at placement — node registration is uncapped, a windowed index accumulating
         // windows on already-primary nodes costs nothing new, and at the cap a fresh unit (of the
-        // same OR a different index) packs onto an already-primary node rather than bricking. (The
-        // per-unit count this replaced bricked a free-tier daily-windowed index in 3 days.)
+        // same OR a different index) packs onto an already-primary node rather than bricking.
         let tmp = tempfile::tempdir().unwrap();
         let svc = service(tmp.path()); // R=1, no license → 3-node free tier
         svc.registry.create(resolved_windowed("logs")).unwrap();
@@ -3670,9 +3643,7 @@ mod tests {
 
     /// The full online grow for a **normally-created** index: nodes announce (adopting the
     /// bucket map), the growth build target registers with the new total WITHOUT flipping live
-    /// routing, and apply builds → cuts over → trims. This is the path that used to deadlock:
-    /// deriving the current count from the registered-node count made `current == new` the
-    /// moment the build target registered, so no real index could ever reshard.
+    /// routing, and apply builds → cuts over → trims.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_normally_registered_index_completes_an_online_grow() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3739,8 +3710,8 @@ mod tests {
             .all(|(_, n)| *n == growlerdb_core::routing::NUM_BUCKETS as usize));
     }
 
-    /// A real bucket move end to end (previously only the validation paths ran): build on the
-    /// target, cut the map over, trim the source — and routing reflects the relocation.
+    /// A real bucket move end to end: build on the target, cut the map over, trim the source — and
+    /// routing reflects the relocation.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn move_bucket_relocates_and_trims() {
         let tmp = tempfile::tempdir().unwrap();

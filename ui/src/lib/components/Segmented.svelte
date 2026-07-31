@@ -1,6 +1,6 @@
 <script lang="ts">
-  // Segmented toggle: a row of mutually-exclusive options; the active one is raised.
-  // `value` is bindable. Used for String/AST, Lucene/KQL, theme, density, etc.
+  // Segmented toggle over mutually-exclusive options; `value` is bindable.
+  // Used for String/AST, Lucene/KQL, theme, density, etc.
   let {
     options,
     value = $bindable(),

@@ -136,8 +136,7 @@ async fn growlerdb_serve_hosts_write_grpc() {
         "checkpoint should be Iceberg snapshot 1",
     );
 
-    // Search over gRPC: the just-written doc is queryable by body text,
-    // returning its coordinates.
+    // Search over gRPC: the just-written doc is queryable by body text.
     let mut search =
         growlerdb_proto::v1::search_client::SearchClient::connect(format!("http://{addr}"))
             .await
@@ -217,9 +216,8 @@ fn http_get(addr: &str, path: &str) -> std::io::Result<(u16, String)> {
     Ok((status, body))
 }
 
-/// The observability surface of the REAL running binary (previously covered only by in-crate
-/// router tests): `--metrics-addr` serves `/healthz` + `/readyz` (both 200 once standalone serve
-/// is up) and Prometheus `/metrics`.
+/// The observability surface of the REAL running binary: `--metrics-addr` serves `/healthz` +
+/// `/readyz` (both 200 once standalone serve is up) and Prometheus `/metrics`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn growlerdb_serve_exposes_health_and_metrics() {
     let tmp = tempfile::tempdir().unwrap();

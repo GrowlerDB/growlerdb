@@ -46,9 +46,8 @@ class ConnectorAppTest {
 
   @Test
   void shardEndpointsFromCpRejectsADuplicateOrdinal() {
-    // One ShardStatus per ordinal is the registry contract; two entries claiming shard 1 makes the
-    // owner of its writes ambiguous. Silent last-wins would pick one arbitrarily — writes could land
-    // where reads never look — so it must fail loudly instead.
+    // One ShardStatus per ordinal is the registry contract; two entries claiming shard 1 make write
+    // ownership ambiguous, so it must fail loudly rather than silently pick one.
     GetIndexResponse entry =
         indexWithShards(2)
             .addShardStatus(ShardStatus.newBuilder().setOrdinal(0).setPrimary("n0:50051"))

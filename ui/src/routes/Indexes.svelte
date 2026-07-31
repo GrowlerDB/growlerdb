@@ -95,10 +95,9 @@
       );
       enriched = Object.fromEntries(entries);
       now = Date.now();
-      // Backup column: last-backup status per index (best-effort — a node without a
-      // backup target reports `configured: false`, rendered as "Off"). `BackupStatus` is Admin-scoped,
-      // so only fetch it where the caller could be authorized (open mode or an admin session); a
-      // closed-mode reader/operator would get a 403 per index (console spam) — they see "Off".
+      // Backup column, best-effort. `BackupStatus` is Admin-scoped, so only fetch it where the
+      // caller could be authorized — otherwise a reader/operator gets a 403 per index (console
+      // spam). Unfetched/unconfigured renders as "Off".
       backupMap = get(canAdminister)
         ? Object.fromEntries(
             await Promise.all(

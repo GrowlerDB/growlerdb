@@ -1,21 +1,9 @@
 //! **Distributed per-window routing**: the two halves that let a standalone
-//! [Gateway](crate::gateway::Gateway) prune a time-filtered search to the owning windows when those
-//! windows live on remote Nodes — the distributed mirror of the embedded `serve_windowed`.
-//!
-//! A windowed index is served by **one process fronting many window shards** (so they share one
-//! read-through cold cache), reachable on a single gRPC endpoint. So a per-window request
-//! must say *which* window it targets:
-//!
-//! * [`WindowNode`] is the **client** half — the Gateway holds one per window (all over the same
-//!   remote endpoint), and each stamps its window id onto every search/suggest before delegating,
-//!   so the Gateway's existing scatter/prune ([`Gateway::windowed`](crate::gateway::Gateway::windowed))
-//!   needs no change.
-//! * [`WindowedSearchService`] / [`WindowedSuggestService`] are the **server** halves — `Search` /
-//!   `Suggest` services over `window id → service` maps that dispatch each request to the shard the
-//!   selector names.
-//!
-//! Embedded mode is unaffected: there each window is its own in-process `LocalNode`, so no selector
-//! is needed.
+//! [Gateway](crate::gateway::Gateway) address per-window requests when the windows live on remote
+//! Nodes. [`WindowNode`] is the **client** half (stamps its window id onto each request before
+//! delegating); [`WindowedSearchService`] / [`WindowedSuggestService`] are the **server** halves
+//! (dispatch each request to the shard its selector names). Embedded mode needs no selector — each
+//! window is its own in-process `LocalNode`.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
@@ -41,9 +29,8 @@ use crate::{AdminService, LookupService, Node, SearchService, SuggestService};
 
 /// Structured wire code for "this node does not serve the addressed unit" — a **routing-staleness**
 /// signal, not a request error: the CP may have re-placed the unit or a replica may not have warmed
-/// it yet, and another holder can well serve it. Responders (the window muxes here,
-/// [`route_index`](crate::pool_routing) on a pool node) attach it as the structured
-/// [`Error`](growlerdb_proto::v1::Error) detail on a `FailedPrecondition`, and read failover
+/// it yet, so another holder can serve it. Responders attach it as the structured
+/// [`Error`](growlerdb_proto::v1::Error) detail on a `FailedPrecondition`; read failover
 /// ([`FailoverNode`](crate::FailoverNode)) matches it to try the next holder instead of aborting.
 pub const UNIT_NOT_SERVED: &str = "UNIT_NOT_SERVED";
 
@@ -67,9 +54,8 @@ pub fn is_unit_not_served(status: &Status) -> bool {
 /// caller can tell *wrong node for writes* (re-resolve the primary) from *not serving at all* (try
 /// the next holder). Emitted by the windowed write path
 /// ([`WindowedWriteService`](crate::windowed_ingest::WindowedWriteService)) when a `Write` /
-/// `GetCheckpoint` addresses a `(index, window)` outside the node's CP-assigned primary set.
-/// `FAILED_PRECONDITION`, so the connector treats it as non-retryable and re-resolves placement on
-/// its restart path instead of hammering the wrong node.
+/// `GetCheckpoint` addresses a `(index, window)` outside the node's primary set.
+/// `FAILED_PRECONDITION`, so the connector re-resolves placement instead of hammering the wrong node.
 pub const NOT_PRIMARY: &str = "NOT_PRIMARY";
 
 /// A `FailedPrecondition` carrying the [`NOT_PRIMARY`] structured code.
@@ -88,10 +74,8 @@ pub fn is_not_primary(status: &Status) -> bool {
 }
 
 /// Route a window selector to its entry in a shared `window id → service` map. `window == 0`
-/// (unset) is a request-level `InvalidArgument` — a windowed node always expects a selector, and no
-/// holder can satisfy a request that names none. A **set but unserved** window is
-/// [`unit_not_served`]: the route is stale or this holder hasn't warmed it — try-the-next-holder
-/// territory, not a client error.
+/// (unset) is a request-level `InvalidArgument` (a windowed node always expects a selector); a **set
+/// but unserved** window is [`unit_not_served`] — a stale route, try-the-next-holder territory.
 fn route_window<T: Clone>(
     windows: &Arc<RwLock<BTreeMap<i64, T>>>,
     window: i64,
@@ -109,10 +93,10 @@ fn route_window<T: Clone>(
         .ok_or_else(|| unit_not_served(format!("window {window} is not served by this node")))
 }
 
-/// A node's live `window id → SearchService` map behind a shared lock (dynamic windowed
-/// ingest): the windowed write path **inserts** a new window's service on first write, and the
-/// multiplexer reads it — so a freshly-created window becomes queryable with no restart. The service
-/// is `Clone` (an `Arc` handle), so `route` clones it out from under the read lock.
+/// A node's live `window id → SearchService` map behind a shared lock (dynamic windowed ingest):
+/// the write path **inserts** a new window's service on first write and the multiplexer reads it,
+/// so a freshly-created window becomes queryable with no restart. The service is `Clone` (an `Arc`
+/// handle), so `route` clones it out from under the read lock.
 pub type SharedSearchWindows = Arc<RwLock<BTreeMap<i64, SearchService>>>;
 /// The suggest counterpart to [`SharedSearchWindows`].
 pub type SharedSuggestWindows = Arc<RwLock<BTreeMap<i64, SuggestService>>>;
@@ -124,14 +108,11 @@ pub type SharedLookupWindows = Arc<RwLock<BTreeMap<i64, LookupService>>>;
 /// describe to every window and sums the per-window stats into the index total.
 pub type SharedAdminWindows = Arc<RwLock<BTreeMap<i64, AdminService>>>;
 
-/// The **server** half of distributed windowed routing: a `Search` service that fronts a
-/// node's many window shards (`window id → SearchService`) and dispatches each request to the shard
-/// its [`SearchRequest::window`] selector names. A request for a window this node doesn't serve is
-/// the structured [`unit_not_served`] refusal (a stale route the caller's failover can walk past);
-/// `window = 0` (unset) is an `InvalidArgument` — a windowed node always expects a selector.
-///
-/// The window map is **shared + mutable** ([`SharedSearchWindows`]) so the windowed write
-/// path can add a newly-created window without rebuilding the service.
+/// The **server** half of distributed windowed routing: a `Search` service fronting a node's window
+/// shards (`window id → SearchService`) that dispatches each request to the shard its
+/// [`SearchRequest::window`] selector names. Unserved window → [`unit_not_served`] (a stale route
+/// failover walks past); `window = 0` (unset) → `InvalidArgument`. The map is **shared + mutable**
+/// ([`SharedSearchWindows`]) so the write path can add a new window without rebuilding the service.
 pub struct WindowedSearchService {
     windows: SharedSearchWindows,
 }
@@ -147,8 +128,8 @@ impl WindowedSearchService {
         SearchServer::new(self)
     }
 
-    /// A clone of the [`SearchService`] for `window` ([`route_window`] — [`unit_not_served`] when
-    /// this node doesn't serve it). Cloned out of the read lock so the request runs without holding it.
+    /// A clone of the [`SearchService`] for `window` ([`unit_not_served`] when unserved). Cloned out
+    /// of the read lock so the request runs without holding it.
     fn route(&self, window: i64) -> Result<SearchService, Status> {
         route_window(&self.windows, window)
     }
@@ -160,8 +141,7 @@ impl Search for WindowedSearchService {
         &self,
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
-        // The window selector picks the shard; the inner SearchService runs the (auth'd) query
-        // against it exactly as a single-shard node would (it ignores the now-satisfied selector).
+        // The window selector picks the shard; the inner SearchService runs the query against it.
         let window = request.get_ref().window;
         let svc = self.route(window)?;
         Search::search(&svc, request).await
@@ -171,8 +151,6 @@ impl Search for WindowedSearchService {
         &self,
         request: Request<SemanticSearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
-        // The window selector picks the shard, exactly like `search`; the inner SearchService
-        // embeds + runs the KNN against it.
         let window = request.get_ref().window;
         let svc = self.route(window)?;
         Search::semantic_search(&svc, request).await
@@ -182,8 +160,7 @@ impl Search for WindowedSearchService {
         &self,
         request: Request<AggregateRequest>,
     ) -> Result<Response<AggregateResponse>, Status> {
-        // Aggregate dispatches by the same window selector as search: the Gateway prunes a
-        // time-filtered aggregation to the overlapping windows, then scatters a partial to each.
+        // Same window-selector dispatch as `search`.
         let window = request.get_ref().window;
         let svc = self.route(window)?;
         Search::aggregate(&svc, request).await
@@ -230,11 +207,10 @@ impl Search for WindowedSearchService {
     }
 }
 
-/// The suggest counterpart to [`WindowedSearchService`]: a `Suggest` service over a
-/// node's `window id → SuggestService` map that dispatches each request to the shard its
+/// The suggest counterpart to [`WindowedSearchService`]: a `Suggest` service over a node's
+/// `window id → SuggestService` map, dispatching each request to the shard its
 /// [`SuggestRequest::window`] selector names. Suggest fans out to *every* window (a term can live in
-/// any of them — no time pruning), so the Gateway scatters to all windows and each is dispatched
-/// here. Unserved window → [`unit_not_served`]; unset → `InvalidArgument`.
+/// any — no time pruning). Unserved window → [`unit_not_served`]; unset → `InvalidArgument`.
 pub struct WindowedSuggestService {
     windows: SharedSuggestWindows,
 }
@@ -267,12 +243,11 @@ impl Suggest for WindowedSuggestService {
     }
 }
 
-/// The **lookup** (GetByKey hydration) counterpart to [`WindowedSearchService`]: a `Lookup`
-/// service over a node's `window id → LookupService` map that dispatches each hydration to the shard
-/// its [`GetByKeyRequest::window`] selector names. Unlike search there's no time pruning — a key's
-/// coordinate carries no window — so the Gateway **broadcasts** to every window and each is dispatched
-/// here; the window that owns the key returns its row, the rest return nothing. Unserved window →
-/// [`unit_not_served`]; unset → `InvalidArgument`.
+/// The **lookup** (GetByKey hydration) counterpart to [`WindowedSearchService`]: a `Lookup` service
+/// over a node's `window id → LookupService` map, dispatching each hydration to the shard its
+/// [`GetByKeyRequest::window`] selector names. No time pruning (a key's coordinate carries no
+/// window), so the Gateway **broadcasts** to every window and the owner returns its row, the rest
+/// nothing. Unserved window → [`unit_not_served`]; unset → `InvalidArgument`.
 pub struct WindowedLookupService {
     windows: SharedLookupWindows,
 }
@@ -305,11 +280,11 @@ impl Lookup for WindowedLookupService {
     }
 }
 
-/// The **admin** (DescribeIndex) counterpart to [`WindowedSearchService`]: an `Admin`
-/// service over a node's `window id → AdminService` map that dispatches a describe to the window its
+/// The **admin** (DescribeIndex) counterpart to [`WindowedSearchService`]: an `Admin` service over a
+/// node's `window id → AdminService` map, dispatching a describe to the window its
 /// [`DescribeIndexRequest::window`] selector names, so the Gateway can fan a describe to every window
-/// and sum the per-window stats into the index total. Alter/reindex are cluster-shape ops that don't
-/// apply per-window over a distributed windowed index — they return `Unimplemented`.
+/// and sum the per-window stats. Alter/reindex are cluster-shape ops that don't apply per-window →
+/// `Unimplemented`.
 pub struct WindowedAdminService {
     windows: SharedAdminWindows,
 }
@@ -396,17 +371,16 @@ impl Admin for WindowedAdminService {
     }
 }
 
-/// The **client** half of distributed windowed routing: a [`Node`] that wraps the remote node
-/// serving a window and **stamps the `(index, window)` unit** onto every search/suggest before
-/// delegating, so the receiving multiplexer knows which shard to hit. The Gateway holds one per window
-/// (often several over the same endpoint) and scatters to them exactly as it would plain shards — the
-/// unit addressing is localized here, so [`Gateway::windowed`](crate::gateway::Gateway::windowed) and
+/// The **client** half of distributed windowed routing: a [`Node`] wrapping the remote node serving
+/// a window that **stamps the `(index, window)` unit** onto every search/suggest before delegating,
+/// so the receiving multiplexer knows which shard to hit. The Gateway holds one per window and
+/// scatters to them as plain shards, so [`Gateway::windowed`](crate::gateway::Gateway::windowed) and
 /// its pruning are untouched.
 ///
-/// Stamping the **index** too (not just the window) is what lets the Gateway front a **pool node**
-/// (D52): a node serving windows of many indexes over one endpoint routes on the request's index
-/// selector first ([`PoolSearchService`](crate::pool_routing::PoolSearchService)), then the window. A
-/// single-index windowed node ignores the index selector, so stamping it is harmless there.
+/// Stamping the **index** too is what lets the Gateway front a **pool node** (D52): a node serving
+/// windows of many indexes routes on the index selector first
+/// ([`PoolSearchService`](crate::pool_routing::PoolSearchService)), then the window. A single-index
+/// node ignores the index selector, so stamping it is harmless.
 pub struct WindowNode {
     inner: Arc<dyn Node>,
     index: String,
@@ -549,11 +523,11 @@ impl Node for WindowNode {
 
 /// The **client** half of distributed **hash-shard** routing (D52) — the hash counterpart to
 /// [`WindowNode`]: a [`Node`] wrapping the remote node that holds an **ordinal shard**, stamping the
-/// `(index, ordinal)` unit onto every request's `index` + `shard` selectors before delegating. A pool
-/// node fronting many indexes' ordinals over one endpoint then dispatches to the right ordinal
-/// ([`PoolSearchService`](crate::pool_routing::PoolSearchService) routes a hash index on `shard`). The
-/// Gateway holds one per ordinal (often several over one endpoint) and scatters to them exactly as it
-/// would plain shards; a single-shard node ignores the selectors, so stamping is harmless there.
+/// `(index, ordinal)` unit onto every request's `index` + `shard` selectors before delegating, so a
+/// pool node fronting many indexes' ordinals dispatches to the right one
+/// ([`PoolSearchService`](crate::pool_routing::PoolSearchService) routes a hash index on `shard`).
+/// The Gateway holds one per ordinal and scatters as plain shards; a single-shard node ignores the
+/// selectors, so stamping is harmless.
 pub struct ShardNode {
     inner: Arc<dyn Node>,
     index: String,
@@ -895,9 +869,8 @@ mod tests {
     async fn window_node_stamps_the_unit_onto_semantic_search() {
         let rec = Arc::new(RecordingNode(Mutex::new((String::new(), -1))));
         let node = WindowNode::new(rec.clone(), "logs", 7);
-        // Regression guard: before this override existed, semantic_search fell through to the Node
-        // trait's `Unimplemented` default (the 501 that broke semantic/hybrid search on pool nodes).
-        // It must now stamp the (index, window) unit and forward, exactly like `search`.
+        // Regression guard: semantic_search must stamp the (index, window) unit and forward like
+        // `search`, not fall through to the Node trait's Unimplemented default.
         node.semantic_search(Request::new(SemanticSearchRequest {
             query_text: "hello".into(),
             ..Default::default()
@@ -1067,7 +1040,7 @@ mod tests {
         ]))));
 
         // A terms agg over each window reflects only that window's docs — proof of dispatch, not
-        // broadcast (aggregate now routes by selector instead of returning Unimplemented).
+        // broadcast.
         let r10 = agg_ids(&mux, 10).await.unwrap();
         assert!(r10.contains("win10doc"), "window 10 agg: {r10}");
         assert!(

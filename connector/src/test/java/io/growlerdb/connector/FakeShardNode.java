@@ -17,12 +17,10 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Test double of one Node shard's Write service that ENFORCES the ingest contract — unlike
- * {@code RecordingWrite}, which records blindly. Mirrors the Rust {@code Shard::continuity}
- * (window-covering by sequence number, exact-match fallback without one), batch-id
- * dedup, the safe-checkpoint prune (so tests can prove the set survives WITHOUT dedup records),
- * and {@code GetCheckpoint} with the stored sequence. Used by the connector-set tests to catch
- * a guard violation as a loud {@code FAILED_PRECONDITION}, exactly like the real node.
+ * Test double of one Node shard's Write service that ENFORCES the ingest contract (unlike
+ * {@code RecordingWrite}, which records blindly): mirrors the Rust {@code Shard::continuity} guard,
+ * batch-id dedup, the safe-checkpoint prune, and {@code GetCheckpoint}, raising a loud
+ * {@code FAILED_PRECONDITION} on a guard violation exactly like the real node.
  */
 final class FakeShardNode extends WriteGrpc.WriteImplBase {
 

@@ -1,20 +1,10 @@
-//! **Per-index dispatch** for a universal-placement-pool node (D52): the outer half of a node that
-//! serves units from *many* indexes over one gRPC endpoint.
-//!
-//! A pool node hosts a CP-assigned set of `(index, window)` units drawn from several indexes. The
-//! existing [windowed multiplexers](crate::windowed_routing) already dispatch a request to the right
-//! **window** within one index; these [`PoolSearchService`] / … wrap them with an **index** layer:
-//! each request first routes on its [`SearchRequest::index`](growlerdb_proto::v1::SearchRequest)
-//! selector to that index's window map, then the inner windowed mux routes on the window. So one
-//! process fronts many indexes' windows — the multi-index-per-node property that kills node-per-index.
-//!
-//! The two layers compose cleanly: the index map holds one [`SharedSearchWindows`] per served index
-//! (the same shared, mutable maps the windowed write path already grows), and the inner
-//! [`WindowedSearchService`] is rebuilt per call — cheap, it just wraps an `Arc`. An index this node
-//! doesn't serve is the structured [`unit_not_served`] refusal, exactly as an unserved window is —
-//! a stale-route signal read failover walks past; an **empty** index selector defaults to the sole
-//! served index when there is exactly one (so a pool service is a drop-in even for a node that
-//! happens to serve a single index).
+//! **Per-index dispatch** for a universal-placement-pool node (D52): the outer half of a node
+//! serving units from *many* indexes over one endpoint. Each request routes first on its
+//! [`SearchRequest::index`](growlerdb_proto::v1::SearchRequest) selector to that index's window
+//! map, then the inner [windowed mux](crate::windowed_routing) routes on the window — one process
+//! fronts many indexes' windows (the property that kills node-per-index). An index this node
+//! doesn't serve is the structured [`unit_not_served`] refusal; an **empty** index selector
+//! defaults to the sole served index when there is exactly one.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
@@ -43,10 +33,9 @@ use crate::windowed_routing::{
 };
 use crate::write_service::WriteService;
 
-/// A pool node's live `index → SharedSearchWindows` map behind a shared lock: an index this node is
-/// assigned units for is inserted with its window map; the multiplexer reads it, so a freshly-assigned
-/// index becomes queryable with no restart (the same dynamic-growth property the windowed maps have,
-/// lifted one level to the index).
+/// A pool node's live `index → SharedSearchWindows` map behind a shared lock: an assigned index is
+/// inserted with its window map, so a freshly-assigned index becomes queryable with no restart
+/// (the windowed maps' dynamic growth, lifted one level up to the index).
 pub type SharedSearchIndexes = Arc<RwLock<BTreeMap<String, SharedSearchWindows>>>;
 /// The suggest counterpart to [`SharedSearchIndexes`].
 pub type SharedSuggestIndexes = Arc<RwLock<BTreeMap<String, SharedSuggestWindows>>>;
@@ -55,29 +44,25 @@ pub type SharedLookupIndexes = Arc<RwLock<BTreeMap<String, SharedLookupWindows>>
 /// The admin (DescribeIndex) counterpart to [`SharedSearchIndexes`].
 pub type SharedAdminIndexes = Arc<RwLock<BTreeMap<String, SharedAdminWindows>>>;
 /// A pool node's live `index → WindowedWriteService` map: the write counterpart to
-/// [`SharedSearchIndexes`]. Each entry is a full single-index windowed writer (it owns that index's
-/// windows and creates them on first write); the [`PoolWriteService`] routes each `Write` on its
-/// `index` selector to the right one. Behind a lock so a dynamically-assigned index's writer can be
-/// inserted without a restart (the read maps grow the same way, one level down at the window).
+/// [`SharedSearchIndexes`]. Each entry is a full single-index windowed writer; the
+/// [`PoolWriteService`] routes each `Write` on its `index` selector. Behind a lock so a
+/// dynamically-assigned index's writer is inserted without a restart.
 pub type SharedWriteIndexes = Arc<RwLock<BTreeMap<String, WindowedWriteService>>>;
 
-/// A pool node's live `index → (ordinal → WriteService)` map for **hash-sharded** indexes: the
-/// write counterpart to a hash index's ordinal read maps (D52). Each ordinal is a single-shard
-/// [`WriteService`] over that ordinal's shard — hash writes are ordinal-routed by the connector
-/// (not window-partitioned like a [`WindowedWriteService`]), so the [`PoolWriteService`] routes each
-/// `Write` on its `(index, shard)` selector straight to the ordinal's writer. Ordinals are keyed as
-/// `ordinal as i64` to share the pool's generic `(index, unit)` routing. Both levels behind locks so a
-/// dynamically-assigned ordinal registers without a restart.
+/// A pool node's live `index → (ordinal → WriteService)` map for **hash-sharded** indexes (D52):
+/// the write counterpart to a hash index's ordinal read maps. Each ordinal is a single-shard
+/// [`WriteService`]; the [`PoolWriteService`] routes each `Write` on its `(index, shard)` selector.
+/// Ordinals are keyed `ordinal as i64` to share the pool's generic `(index, unit)` routing. Both
+/// levels behind locks so a dynamically-assigned ordinal registers without a restart.
 pub type SharedHashWriteUnits = Arc<RwLock<BTreeMap<i64, WriteService>>>;
 /// The `index → ordinal writers` map behind the hash half of [`PoolWriteService`] — see
 /// [`SharedHashWriteUnits`].
 pub type SharedHashWriteIndexes = Arc<RwLock<BTreeMap<String, SharedHashWriteUnits>>>;
 
-/// A pool node's live `index → is-hash?` map (D52): `true` when the index is **hash/partition-sharded**
-/// (its units are ordinal shards, routed on the request's `shard` selector), `false`/absent for a
-/// **windowed** index (units are windows, routed on `window`). The pool read services consult this to
-/// pick the unit selector per index, so one endpoint serves both kinds. Behind a lock so a
-/// dynamically-assigned index registers its kind without a restart.
+/// A pool node's live `index → is-hash?` map (D52): `true` when the index is **hash/partition-
+/// sharded** (units are ordinal shards, routed on `shard`), `false`/absent for a **windowed** index
+/// (units are windows, routed on `window`). Read to pick the unit selector per index, so one
+/// endpoint serves both kinds. Behind a lock for restart-free registration.
 pub type SharedIndexKinds = Arc<RwLock<BTreeMap<String, bool>>>;
 
 /// The generic shape shared by the four `SharedX Indexes` read maps: `index → (unit → leaf service)`,
@@ -96,11 +81,10 @@ fn index_is_hash(kinds: &SharedIndexKinds, index: &str) -> bool {
 }
 
 /// Resolve `(index, unit)` to its leaf service on a pool node: route the index to its per-unit map,
-/// then the unit to its service — the unit is the request's **`shard`** ordinal for a hash index or its
-/// **`window`** for a windowed one (per [`index_is_hash`]). The maps are `i64`-keyed either way
-/// (ordinals stored as `ordinal as i64`), so both kinds share one storage type; a hash index routes on
-/// `shard` directly (ordinal 0 is valid — unlike a windowed node, where `window == 0` means "no
-/// selector"). An unserved index or unit is the structured [`unit_not_served`] refusal.
+/// then the unit — the request's **`shard`** ordinal for a hash index or its **`window`** for a
+/// windowed one (per [`index_is_hash`]). Maps are `i64`-keyed either way, so both kinds share one
+/// storage type; a hash index routes on `shard` directly (ordinal 0 is valid — unlike a windowed
+/// node where `window == 0` means "no selector"). An unserved index/unit → [`unit_not_served`].
 fn route_unit<T: Clone>(
     by_index: &SharedIndexUnits<T>,
     kinds: &SharedIndexKinds,
@@ -133,12 +117,10 @@ fn route_unit<T: Clone>(
     })
 }
 
-/// Route an index selector to its per-index shared map `T` (one of the `SharedX` window maps), or
-/// the structured [`unit_not_served`] refusal when this node doesn't serve it (a stale route —
-/// try-the-next-holder territory, like an unserved window). An **empty** selector resolves to the
-/// sole served index when there is exactly one — a pool service then works unchanged for a
-/// single-index node whose caller didn't stamp the index; ambiguous (multi-index) it stays a
-/// request-level `InvalidArgument` — no holder could satisfy it either.
+/// Route an index selector to its per-index shared map `T`, or the structured [`unit_not_served`]
+/// refusal when this node doesn't serve it (a stale route). An **empty** selector resolves to the
+/// sole served index when there is exactly one (drop-in for a single-index node whose caller didn't
+/// stamp the index); ambiguous (multi-index) it stays a request-level `InvalidArgument`.
 fn route_index<T: Clone>(
     by_index: &Arc<RwLock<BTreeMap<String, T>>>,
     index: &str,
@@ -159,8 +141,7 @@ fn route_index<T: Clone>(
 
 /// The **index-dispatch** `Search` service for a pool node: routes each request on its
 /// [`SearchRequest::index`] selector to that index's window map, then delegates to a
-/// [`WindowedSearchService`] which routes on the window. Both layers are pure selectors — the inner
-/// [`SearchService`](crate::SearchService) runs the (auth'd) query once the unit is resolved.
+/// [`WindowedSearchService`] which routes on the window.
 pub struct PoolSearchService {
     by_index: SharedSearchIndexes,
     kinds: SharedIndexKinds,
@@ -230,12 +211,10 @@ impl Search for PoolSearchService {
         &self,
         request: Request<ExplainRequest>,
     ) -> Result<Response<ExplainResponse>, Status> {
-        // Explain names a doc by coordinate, not a window/shard selector (ExplainRequest carries
-        // neither). For a HASH (non-windowed) index the gateway already routed to the owner node, so
-        // delegate to that index's unit — shard 0, the sole unit in the common single-shard case —
-        // exactly as `search`/`semantic`/`aggregate` route to the resolved leaf `SearchService`.
-        // A distributed WINDOWED index still can't pick the window from a coordinate without a
-        // scatter, so it stays unimplemented.
+        // Explain names a doc by coordinate, not a window/shard selector. For a HASH index the
+        // gateway already routed to the owner, so delegate to shard 0 (the sole unit in the common
+        // single-shard case). A distributed WINDOWED index can't pick the window from a coordinate
+        // without a scatter, so it stays unimplemented.
         let r = request.get_ref();
         if !index_is_hash(&self.kinds, &r.index) {
             return Err(Status::unimplemented(
@@ -407,14 +386,12 @@ impl Admin for PoolAdminService {
     }
 }
 
-/// The **index-dispatch** `Write` service for a pool node (D52): routes each `Write` / `GetCheckpoint`
-/// on its `index` selector to that index's writer. A **windowed** index dispatches to its
-/// [`WindowedWriteService`], which then routes on the window (creating the window shard on first write
-/// and publishing it to the query paths). A **hash-sharded** index (per [`kinds`](SharedIndexKinds))
-/// dispatches on the request's `shard` ordinal to that ordinal's [`WriteService`] — hash writes are
-/// ordinal-routed by the connector, not window-partitioned. The write counterpart to
-/// [`PoolSearchService`]; the same empty-selector-defaults-to-sole-index rule holds, so a single-index
-/// pool node is writable by a connector that doesn't stamp the index.
+/// The **index-dispatch** `Write` service for a pool node (D52): routes each `Write` /
+/// `GetCheckpoint` on its `index` selector. A **windowed** index dispatches to its
+/// [`WindowedWriteService`] (which routes on the window, creating the shard on first write); a
+/// **hash-sharded** index (per [`kinds`](SharedIndexKinds)) dispatches on the `shard` ordinal to
+/// that ordinal's [`WriteService`]. The write counterpart to [`PoolSearchService`], with the same
+/// empty-selector-defaults-to-sole-index rule.
 pub struct PoolWriteService {
     windowed: SharedWriteIndexes,
     hash: SharedHashWriteIndexes,
@@ -437,7 +414,7 @@ impl PoolWriteService {
     }
 
     /// Wrap as a mountable tonic [`WriteServer`] with the large-commit decode cap (a catch-up batch
-    /// spanning many windows can be large — matching the single-index windowed writer).
+    /// spanning many windows can be large).
     pub fn into_server(self) -> WriteServer<Self> {
         WriteServer::new(self).max_decoding_message_size(MAX_WRITE_MESSAGE_BYTES)
     }

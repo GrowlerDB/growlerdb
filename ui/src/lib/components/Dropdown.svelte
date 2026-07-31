@@ -1,8 +1,7 @@
 <script lang="ts">
-  // Styled dropdown button: replaces bare native <select>s on the chrome with a
-  // button that matches the field styling (mono uppercase label + selected value + caret) and a
-  // Popover listbox. Keyboard-operable: Enter/Space/ArrowDown open; arrows move; Enter/click select;
-  // Escape closes (via Popover). `value` is bindable.
+  // Styled dropdown: a field-styled button plus a Popover listbox, in place of a native <select>.
+  // Keyboard: Enter/Space/ArrowDown open; arrows move; Enter/click select; Escape closes.
+  // `value` is bindable.
   import Popover from './Popover.svelte';
 
   let {
@@ -55,7 +54,7 @@
     (items[(next + items.length) % items.length] ?? items[0])?.focus();
   }
 
-  // On open, move focus to the selected option (or the first) so arrows work immediately.
+  // On open, focus the selected option (or the first) so arrows work immediately.
   $effect(() => {
     if (!open || !listEl) return;
     const active = listEl.querySelector('button.dc-option.active') as HTMLButtonElement | null;

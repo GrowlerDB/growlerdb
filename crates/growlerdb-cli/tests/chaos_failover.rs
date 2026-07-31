@@ -1,13 +1,11 @@
-//! D53 chaos drill (357.10, honest edition 357.23): **zero-gap read failover under sustained
-//! query**. Two parked windows live in a shared local-filesystem object store
-//! (`GROWLERDB_OBJECT_STORE_FS` — no MinIO needed). A control plane at `R=2` places two pool nodes
-//! as each window's holders (primary + replica); both open them **read-through** from the object
-//! store via the CP assignment push. A gateway built **before** the kill (so established channels
-//! are exercised, not a fresh dial) scatters every read across both windows through a
-//! `FailoverNode` per window — and when the **primary node is killed under sustained query**, reads
-//! keep answering via the replica with a **bounded gap and no `partial`** (two windows put every
-//! query on the scatter path, where `partial` is structurally reachable — so asserting its absence
-//! means something).
+//! D53 chaos drill: **zero-gap read failover under sustained query**. Two parked windows live in a
+//! shared local-fs object store (`GROWLERDB_OBJECT_STORE_FS` — no MinIO needed); a CP at `R=2` places
+//! two pool nodes as each window's holders (primary + replica), both opening them read-through via
+//! the CP assignment push. A gateway built **before** the kill (established channels, not a fresh
+//! dial) scatters every read across both windows through a `FailoverNode` per window — when the
+//! primary is killed under sustained query, reads keep answering via the replica with a bounded gap
+//! and no `partial`. Two windows put every query on the scatter path where `partial` is reachable, so
+//! asserting its absence means something.
 
 use std::collections::BTreeMap;
 use std::process::{Child, Command, Stdio};
@@ -120,8 +118,7 @@ impl Drop for Proc {
 }
 
 /// Reserve `n` **distinct** free ports by binding all `n` listeners at once (so the OS hands out
-/// different ports), then dropping them. Binding one at a time can hand back the same port twice —
-/// the listener is released before the next call — and two processes would then collide on it.
+/// different ports), then dropping them — binding one at a time can hand back the same port twice.
 fn free_addrs(n: usize) -> Vec<String> {
     let listeners: Vec<_> = (0..n)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -146,18 +143,16 @@ async fn wait_for_grpc(endpoint: &str) {
 }
 
 /// Serialize the port-reservation → process-bind window across this file's concurrent tests.
-/// [`free_addrs`] reserves ports by binding `:0` and releasing them; a sibling test that spawns in
-/// that release window can grab the same port, and this test would then connect to a *sibling's*
-/// control plane (seen as `resolve` returning a foreign node's endpoint). `cargo test` runs test
-/// binaries serially, so the only contention is among this file's own parallel tests — each holds
-/// this guard for its duration.
+/// [`free_addrs`] reserves ports by binding `:0` and releasing them; a sibling test spawning in that
+/// release window can grab the same port and connect to a *sibling's* control plane. Only this
+/// file's own parallel tests contend (`cargo test` runs test binaries serially) — each holds this
+/// guard for its duration.
 static STARTUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A gRPC-level control-plane readiness gate. A bare TCP/HTTP2 connect can succeed before the CP is
-/// answering, so nodes spawned right after would spin their `--register` on transport errors and,
-/// under load, miss the CP's post-boot liveness grace (leaving a unit's holder set frozen at one
-/// node). Gate the CP with this BEFORE spawning nodes: only a gRPC reply — `Ok`, or an application
-/// `Status` with no transport source — proves the CP is actually serving.
+/// answering, so nodes spawned right after would spin their `--register` and, under load, miss the
+/// CP's post-boot liveness grace (freezing a unit's holder set at one node). Only a gRPC reply — `Ok`,
+/// or an application `Status` with no transport source — proves the CP is actually serving.
 async fn wait_for_cp_ready(cp_ep: &str) {
     for _ in 0..600 {
         if let Ok(mut c) = ControlPlaneClient::connect(cp_ep.to_string()).await {
@@ -175,11 +170,11 @@ async fn wait_for_cp_ready(cp_ep: &str) {
     panic!("control plane did not become ready at {cp_ep}");
 }
 
-/// Poll a node's `/readyz` (its `--metrics-addr`) until it reports ready — i.e. the node's first
-/// pool registration succeeded. The R=2 drills must hold the FIRST resolve until **both** nodes
-/// are in the placement pool: a resolve that lands while only one node has registered places a
-/// single holder, and the CP's post-boot liveness grace (one heartbeat TTL) then freezes the
-/// assigned unit's holder set — the late node would never be topped up within the test budget.
+/// Poll a node's `/readyz` (its `--metrics-addr`) until ready — i.e. its first pool registration
+/// succeeded. The R=2 drills must hold the FIRST resolve until **both** nodes are in the placement
+/// pool: a resolve landing while only one has registered places a single holder, and the CP's
+/// post-boot liveness grace then freezes that unit's holder set — the late node never gets topped up
+/// within the test budget.
 async fn wait_until_ready(metrics_addr: &str) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     for _ in 0..600 {
@@ -199,9 +194,9 @@ async fn wait_until_ready(metrics_addr: &str) {
     panic!("node at {metrics_addr} never became ready (pool registration)");
 }
 
-/// The sorted `id`s a windowed gateway returns for a `*` search (window unset → the gateway fans to
-/// every window). A transport error *or* an honest `partial` is an `Err` — for this drill a
-/// degraded page with a live replica available is exactly as much a failure as no page at all.
+/// The sorted `id`s a windowed gateway returns for a `*` search (window unset → fan to every window).
+/// A transport error *or* an honest `partial` is an `Err` — for this drill a degraded page with a
+/// live replica available is exactly as much a failure as no page at all.
 async fn search_ids(gw: &Gateway) -> Result<Vec<String>, String> {
     search_ids_idx(gw, IDX).await
 }
@@ -239,11 +234,10 @@ async fn search_ids_idx(gw: &Gateway, index: &str) -> Result<Vec<String>, String
     Ok(ids)
 }
 
-/// A windowed gateway over `units` (`(window, primary endpoint, replica endpoint)`), each behind a
-/// `FailoverNode` over `[primary, replica]` — the D53 read path the cluster gateway builds from the
-/// CP's holder set. Lazy connect (as the real gateway does): building a holder over a DOWN endpoint
-/// must not fail — it fails fast at query time, which is exactly what lets the FailoverNode fall
-/// over to the replica once the primary is killed.
+/// A windowed gateway over `units` (`(window, primary, replica)`), each behind a `FailoverNode` —
+/// the D53 read path the cluster gateway builds from the CP's holder set. Lazy connect (as the real
+/// gateway): a holder over a DOWN endpoint must build without failing — it fails at query time, which
+/// is what lets the FailoverNode fall over to the replica once the primary is killed.
 fn failover_gateway(units: &[(i64, String, String)]) -> Gateway {
     let holder = |ep: &str, w: i64| {
         let remote = RemoteNode::connect_lazy(ep.to_string(), None).unwrap();
@@ -263,11 +257,9 @@ fn failover_gateway(units: &[(i64, String, String)]) -> Gateway {
     )
 }
 
-/// Poll `endpoint` (a lone `WindowNode` over `(IDX, window)`) until it serves the parked window's
-/// doc — i.e. the node has picked up the CP assignment and opened it read-through. The budget is
-/// generous (30 s) because the tests in this file run in parallel: several CP + node processes
-/// each cold-opening windows contend for CPU/IO, and the pre-serve convergence (register →
-/// subscribe → push → cold open) is exactly what slows down under that load.
+/// Poll `endpoint` (a lone `WindowNode` over `(IDX, window)`) until it serves the parked window's doc
+/// — i.e. the node picked up the CP assignment and opened it read-through. Generous 30s budget:
+/// parallel tests contend for CPU/IO during the register → subscribe → push → cold-open convergence.
 async fn wait_until_serving(endpoint: &str, window: i64, doc: &str) {
     for _ in 0..600 {
         if let Ok(remote) = RemoteNode::connect(endpoint.to_string(), None).await {
@@ -440,9 +432,8 @@ async fn killing_a_units_primary_fails_reads_over_to_the_replica() {
     }
 
     // 9. Sustained queries across the kill on the SAME gateway. The failover gap must be bounded:
-    //    within a short grace (the OS tearing down the dead process's sockets) reads may error, but
-    //    after it EVERY query answers both docs with no partial — the replica absorbed the loss and
-    //    the gap never reopens. 40 consecutive post-kill successes prove sustained recovery.
+    //    reads may error during a short grace (the OS tearing down the dead process's sockets), but
+    //    after it EVERY query answers both docs with no partial. 40 consecutive successes prove it.
     const GRACE: Duration = Duration::from_millis(1000);
     let mut successes = 0u32;
     let mut gap_failures = 0u32;
@@ -473,8 +464,7 @@ async fn killing_a_units_primary_fails_reads_over_to_the_replica() {
         "no sustained recovery after the primary kill ({gap_failures} failures in the gap)"
     );
 
-    // 10. A FRESH gateway (new channels dialing the dead primary) also answers — the cold-dial
-    //     failover mode, kept from the original drill.
+    // 10. A FRESH gateway (new channels dialing the dead primary) also answers — cold-dial failover.
     assert_eq!(
         search_ids(&failover_gateway(&units))
             .await
@@ -485,9 +475,9 @@ async fn killing_a_units_primary_fails_reads_over_to_the_replica() {
 }
 
 /// HA-G1 end-to-end: a unit the CP **de-assigns is unloaded** — the node stops serving it (the
-/// structured `UNIT_NOT_SERVED` refusal, as if it never held it) and the unit's `.replica`
-/// read-through scratch is deleted after the short drain grace. `DropIndex` is the cleanest
-/// de-assignment driver: the CP's next pushed snapshot simply no longer contains the unit.
+/// structured `UNIT_NOT_SERVED` refusal) and the unit's `.replica` read-through scratch is deleted
+/// after the drain grace. `DropIndex` is the cleanest de-assignment driver: the CP's next pushed
+/// snapshot simply no longer contains the unit.
 #[tokio::test]
 async fn a_deassigned_unit_is_unloaded_and_its_replica_scratch_cleaned() {
     // Serialize the port-reservation/process-bind window against this file's other tests.
@@ -573,7 +563,7 @@ async fn a_deassigned_unit_is_unloaded_and_its_replica_scratch_cleaned() {
         .expect("drop index");
 
     // The node UNLOADS the window: the very shard it just answered from becomes the structured
-    // not-served refusal (pre-fix it kept serving the de-assigned unit forever).
+    // not-served refusal.
     let mut search = SearchClient::connect(a_ep.clone()).await.unwrap();
     let mut unloaded = false;
     for _ in 0..400 {
@@ -595,7 +585,7 @@ async fn a_deassigned_unit_is_unloaded_and_its_replica_scratch_cleaned() {
     }
     assert!(unloaded, "the de-assigned unit was never unloaded");
 
-    // …and its scratch is deleted once the drain grace elapses (pre-fix it accumulated forever).
+    // …and its scratch is deleted once the drain grace elapses.
     let mut cleaned = false;
     for _ in 0..400 {
         if !scratch.exists() {
@@ -610,12 +600,12 @@ async fn a_deassigned_unit_is_unloaded_and_its_replica_scratch_cleaned() {
     );
 }
 
-/// 357.12 (HA-A1..A3) end-to-end: the node-side **write fence**. With a CP at R=2 both nodes hold a
-/// parked window — one as primary, one as replica. A `Write` / `GetCheckpoint` addressed to the
-/// REPLICA holder is refused with the structured `NOT_PRIMARY` detail (never committed, never a
-/// fabricated empty checkpoint); a `Write` to the PRIMARY holder of the parked window is refused
-/// `WINDOW_PARKED` instead of overwriting the served snapshot with a fresh empty shard (HA-A2). And
-/// after both refusals, both holders still serve the parked doc read-through — nothing was clobbered.
+/// HA-A1..A3 end-to-end: the node-side **write fence**. With a CP at R=2 both nodes hold a parked
+/// window (one primary, one replica). A `Write`/`GetCheckpoint` to the REPLICA holder is refused with
+/// the structured `NOT_PRIMARY` detail (never committed, never a fabricated empty checkpoint); a
+/// `Write` to the PRIMARY holder of the parked window is refused `WINDOW_PARKED` instead of
+/// overwriting the served snapshot (HA-A2). After both refusals, both holders still serve the parked
+/// doc read-through.
 #[tokio::test]
 async fn a_write_to_a_replica_held_window_is_fenced_and_the_parked_data_survives() {
     // Serialize the port-reservation/process-bind window against this file's other tests.
@@ -733,8 +723,8 @@ async fn a_write_to_a_replica_held_window_is_fenced_and_the_parked_data_survives
         b
     };
 
-    // HA-A1/A2: the REPLICA holder refuses the write with the structured NOT_PRIMARY detail —
-    // previously it silently created a fresh empty shard and overwrote the served parked snapshot.
+    // HA-A1/A2: the REPLICA holder refuses the write with the structured NOT_PRIMARY detail, rather
+    // than silently creating a fresh empty shard that overwrites the served parked snapshot.
     let mut writer = WriteClient::connect(replica_ep.clone()).await.unwrap();
     let err = writer
         .write(WriteRequest {
@@ -790,12 +780,10 @@ async fn a_write_to_a_replica_held_window_is_fenced_and_the_parked_data_survives
 }
 
 // ── Hash-shard failover (D53 parity) ──────────────────────────────────────────────────────────────
-// The windowed drill above proves zero-gap read failover for a windowed index. This one proves the
-// same for a **hash-sharded** index: a TWO-ordinal index whose shards live frozen in the shared
-// object store (published by `backup_replica_snapshot`), placed at R=2 so both pool nodes open each
-// ordinal read-through. Two ordinals put every `*` search on the scatter path (where `partial` is
-// reachable), so asserting its absence across a primary kill means something — the hash counterpart
-// of the two-window setup.
+// Same zero-gap read failover as the windowed drill above, for a **hash-sharded** index: a
+// two-ordinal index frozen in the shared object store (via `backup_replica_snapshot`), placed at R=2
+// so both pool nodes open each ordinal read-through. Two ordinals put every `*` search on the scatter
+// path where `partial` is reachable, so asserting its absence across a primary kill means something.
 
 const HASH_IDX: &str = "docs";
 const ORD0_DOC: &str = "ord0doc";
@@ -828,8 +816,7 @@ fn define_hash_index(data_dir: &std::path::Path) {
 }
 
 /// Publish ordinal `ordinal` (holding one doc `id`) to the shared object store as a frozen replica
-/// snapshot — the hash counterpart to [`park_window`]. Built in a throwaway dir; the marker lands at
-/// `cold/docs/{ordinal}` for a replica to open read-through.
+/// snapshot — the hash counterpart to [`park_window`]. The marker lands at `cold/docs/{ordinal}`.
 async fn seed_ordinal(store_dir: &std::path::Path, ordinal: u32, id: &str) {
     let build = tempfile::tempdir().unwrap();
     let store = LocalIndexStore::open(build.path()).unwrap();
@@ -866,9 +853,9 @@ async fn seed_ordinal(store_dir: &std::path::Path, ordinal: u32, id: &str) {
     .unwrap();
 }
 
-/// A **sharded** gateway over `units` (`(ordinal, primary endpoint, replica endpoint)`, in ordinal
-/// order), each behind a `FailoverNode` over `[ShardNode(primary), ShardNode(replica)]` — the D53 hash
-/// read path the cluster gateway builds from the CP's holder set. Lazy connect, as the real gateway.
+/// A **sharded** gateway over `units` (`(ordinal, primary, replica)`, in ordinal order), each behind
+/// a `FailoverNode` — the D53 hash read path the cluster gateway builds from the CP's holder set.
+/// Lazy connect, as the real gateway.
 fn sharded_failover_gateway(units: &[(u32, String, String)]) -> Gateway {
     let holder = |ep: &str, o: u32| {
         let remote = RemoteNode::connect_lazy(ep.to_string(), None).unwrap();
@@ -882,9 +869,8 @@ fn sharded_failover_gateway(units: &[(u32, String, String)]) -> Gateway {
     Gateway::sharded(nodes)
 }
 
-/// Poll `endpoint` (a lone `ShardNode` over `(HASH_IDX, ordinal)`) until it serves the ordinal's doc —
-/// i.e. the node picked up the CP assignment and opened it read-through. Generous budget: parallel
-/// tests contend for CPU/IO during the register → subscribe → push → cold-open convergence.
+/// Poll `endpoint` (a lone `ShardNode` over `(HASH_IDX, ordinal)`) until it serves the ordinal's doc.
+/// Generous budget: parallel tests contend for CPU/IO during the register → push → cold-open convergence.
 async fn wait_until_serving_shard(endpoint: &str, ordinal: u32, doc: &str) {
     for _ in 0..600 {
         if let Ok(remote) = RemoteNode::connect(endpoint.to_string(), None).await {

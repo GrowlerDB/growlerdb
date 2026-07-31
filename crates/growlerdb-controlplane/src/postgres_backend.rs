@@ -1,26 +1,17 @@
 //! The **externalized Postgres registry backend** (D51) — behind the `postgres` feature.
 //!
-//! Stores the same versioned registry envelope the [`JsonFileBackend`](crate::JsonFileBackend) writes
-//! to disk, but as JSONB rows in a shared Postgres, so the control plane can run as **N stateless
-//! replicas** over one durable store. Single-writer is the store's job: the **leader** holds a
-//! **session-level advisory lock** — the direct successor to the JSON backend's `flock` — so a
-//! second control plane over the same database cannot also become writer.
+//! Stores the same versioned registry envelope as the [`JsonFileBackend`](crate::JsonFileBackend),
+//! but as JSONB rows in a shared Postgres, so the control plane can run as **N stateless replicas**
+//! over one durable store. The **leader** holds a session-level advisory lock (the successor to the
+//! JSON backend's `flock`); a **standby** serves reads, [polls](RegistryBackend::poll_version) +
+//! [reloads](crate::Registry::reload) on the leader's writes, refuses every persist, and promotes
+//! itself ([`try_become_leader`](RegistryBackend::try_become_leader)) once Postgres releases the lock
+//! on the leader's death.
 //!
-//! Both roles live here: [`open`](PostgresBackend::open) connects and takes leadership (or errors if
-//! held); [`open_standby`](PostgresBackend::open_standby) connects read-only. A standby serves reads,
-//! [polls the version](RegistryBackend::poll_version) and [reloads](crate::Registry::reload) when the
-//! leader writes, refuses every persist ([`is_leader`](RegistryBackend::is_leader) guard), and — when
-//! the leader dies and Postgres releases the lock — promotes itself via
-//! [`try_become_leader`](RegistryBackend::try_become_leader). The `growlerdb control-plane` run-loop
-//! that drives these over a live gRPC server (write-routing + readiness) is the follow-on slice.
-//!
-//! The write-coordination model is **leader-writer + reloading standbys**: exactly one replica holds
-//! the advisory lock and writes; two concurrent placement ops can only ever run on the one leader,
-//! where the existing in-memory expected-map check serializes them. The advisory lock alone is not
-//! trusted as the last line of defense, though — every persist also carries an **expected-version
-//! guard** (optimistic concurrency per `cp_state` row), so a replica whose leadership silently
-//! lapsed (dead session, partition) gets a [`NotLeader`](crate::RegistryError::NotLeader) refusal
-//! from the store instead of overwriting the real leader's writes (D51: the CAS maps to the store).
+//! The advisory lock is not the last line of defense: every persist also carries an **expected-version
+//! guard** (optimistic concurrency per `cp_state` row), so a replica whose leadership silently lapsed
+//! (dead session, partition) gets a [`NotLeader`](crate::RegistryError::NotLeader) refusal from the
+//! store instead of overwriting the real leader's writes (D51: the CAS maps to the store).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,22 +48,18 @@ CREATE TABLE IF NOT EXISTS cp_state ( \
 );";
 
 /// The externalized Postgres [`RegistryBackend`]. The blocking `postgres` client drives its **own**
-/// tokio runtime under the hood, so it must never be called from a thread that is already inside the
-/// control plane's async runtime (its gRPC handlers) — that panics with *"cannot start a runtime from
-/// within a runtime"*. So the `Client` is confined to one **dedicated worker thread** with no ambient
-/// runtime; every op is marshaled to it over [`jobs`](Self::jobs) and blocks for the reply. That one
-/// thread also holds the single session that owns the single-writer advisory lock, and serializes all
-/// access (no `Mutex<Client>` needed). `is_writer` tracks leadership so a standby refuses every
-/// persist until it is promoted.
+/// tokio runtime, so it must never be called from inside the control plane's async runtime (its gRPC
+/// handlers) — that panics with *"cannot start a runtime from within a runtime"*. So the `Client` is
+/// confined to one **dedicated worker thread** with no ambient runtime; every op is marshaled to it
+/// over [`jobs`](Self::jobs) and blocks for the reply. That thread also holds the single session that
+/// owns the single-writer advisory lock, and serializes all access (no `Mutex<Client>` needed).
 ///
 /// **Leadership is only as alive as the session.** If the session dies (Postgres restart, network
 /// drop, a job panic unwinding the worker thread), Postgres releases the advisory lock and another
 /// replica may promote — so any signal the session is gone demotes this backend immediately
 /// (`is_writer = false`): a worker send/recv failure in [`on_worker`](Self::on_worker), a failed
 /// [`verify_leadership`](RegistryBackend::verify_leadership) probe, or a persist error. A demoted
-/// backend re-enters the standby race with a **fresh connection**
-/// ([`try_become_leader`](RegistryBackend::try_become_leader) revives the worker if the old session
-/// died).
+/// backend re-enters the standby race with a fresh connection.
 pub struct PostgresBackend {
     /// Connection string, kept so a dead session can be replaced by a fresh worker.
     url: String,
@@ -419,10 +406,10 @@ mod tests {
     use crate::{ApiToken, IndexStatus, Registry};
     use growlerdb_core::{IndexDefinition, SourceField, SourceSchema, SourceType};
 
-    /// The live Postgres to test against. Unset ⇒ the test **skips** (default `cargo test --features
-    /// postgres` stays green without a database). CI's `build-test` job sets it against a postgres:16
-    /// service container; locally, `just test-postgres` spins up a throwaway dockerized Postgres and
-    /// sets it. E.g. `postgresql://postgres:pw@127.0.0.1:55432/cp`.
+    /// The live Postgres to test against. Unset ⇒ the test **skips**, so the default feature build
+    /// stays green without a database. CI sets it against a postgres:16 service container; locally,
+    /// `just test-postgres` spins up a throwaway dockerized Postgres. E.g.
+    /// `postgresql://postgres:pw@127.0.0.1:55432/cp`.
     fn test_url() -> Option<String> {
         std::env::var("GROWLERDB_TEST_POSTGRES_URL").ok()
     }

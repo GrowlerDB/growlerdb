@@ -1,6 +1,5 @@
-// Cluster status (stoplight) logic — pure + unit-tested. Assembled from two existing surfaces the
-// gateway already proxies: Prometheus `up` (one sample per scrape target = each process) and the
-// control plane's ingestion status (the Iceberg source + per-index sync). No backend change.
+// Cluster status (stoplight) logic — pure + unit-tested. Assembled from two surfaces the gateway
+// proxies: Prometheus `up` (one sample per scrape target) and the control plane's ingestion status.
 import type { InstantSample } from './stats';
 import type { IndexIngestion } from './api';
 import { worstState } from './ingestion';
@@ -22,10 +21,8 @@ const INSTANCE_NAMES: Record<string, string> = {
   lgtm: 'Observability (LGTM)',
 };
 
-// Kubernetes scrape-job names (chart default) → role. In k8s a target's `instance` is a
-// pod IP (not a role) and the `up` sample carries no `namespace` label, so the roll-up can't match on
-// either — it matches on the `job` instead. Without this the header health reads "Unknown" on every
-// k8s deploy even when all targets are up.
+// Kubernetes scrape-job names (chart default) → role. In k8s a target's `instance` is a pod IP and
+// the `up` sample carries no `namespace` label, so the roll-up matches on the `job` instead.
 const GROWLERDB_JOBS: Record<string, string> = {
   'gdb-controlplane': 'Control plane',
   'gdb-node': 'Node',
@@ -38,14 +35,13 @@ export function friendlyInstance(instance: string): string {
   return INSTANCE_NAMES[host] ?? host;
 }
 
-// The deploy namespace GrowlerDB's scrape targets carry in Kubernetes (chart default). This is the
-// chart's default namespace; scoping it is not yet configurable.
+// The deploy namespace GrowlerDB's scrape targets carry in Kubernetes (chart default); scoping it is
+// not yet configurable.
 const GROWLERDB_NAMESPACE = 'growlerdb';
 
-/** Whether a Prometheus `up` sample belongs to **GrowlerDB** — so the header health roll-up isn't
- *  dragged Down by unrelated targets on a **shared** Prometheus/Mimir. A target counts if
- *  its instance maps to a known GrowlerDB role (the Compose stack names targets `controlplane:9101`
- *  …) **or** it lives in the GrowlerDB namespace (Kubernetes, where instances are pod IPs). */
+/** Whether a Prometheus `up` sample belongs to **GrowlerDB** — so unrelated targets on a **shared**
+ *  Prometheus/Mimir can't drag the header health Down. Matches a known role (Compose names targets
+ *  `controlplane:9101` …), a gdb-* job, or the GrowlerDB namespace (k8s pod-IP instances). */
 export function isGrowlerdbTarget(s: InstantSample): boolean {
   const host = (s.metric.instance ?? s.metric.job ?? '').split(':')[0];
   return (
@@ -55,9 +51,8 @@ export function isGrowlerdbTarget(s: InstantSample): boolean {
   );
 }
 
-/** One component per GrowlerDB Prometheus `up` scrape target (value 1 = up, 0 = down). Non-GrowlerDB
- *  targets on a shared metrics backend are excluded ([`isGrowlerdbTarget`]) so they can't falsely
- *  report the cluster Down. */
+/** One component per GrowlerDB Prometheus `up` scrape target (1 = up, 0 = down). Non-GrowlerDB
+ *  targets on a shared metrics backend are excluded so they can't falsely report the cluster Down. */
 export function componentsFromUp(samples: InstantSample[]): Component[] {
   return samples
     .filter(isGrowlerdbTarget)
@@ -76,11 +71,9 @@ export function componentsFromUp(samples: InstantSample[]): Component[] {
 }
 
 // Map each ingestion state to a header-pill health. Ingestion *lag* (`behind`) is **not** a cluster
-// degradation — a continuously-streaming index is almost always a little behind its source, so
-// flagging it "Degraded" is a false alarm. The lag is shown where it belongs (the Ingestion screen +
-// Grafana). Only structural failures degrade the roll-up: no assigned primary, or an unreachable
-// shard. (Catching a *stalled* — not merely lagging — ingestion needs a staleness threshold the API
-// doesn't expose yet; tracked separately.)
+// degradation — a continuously-streaming index is almost always a little behind its source. Only
+// structural failures degrade the roll-up: no assigned primary, or an unreachable shard. (Catching a
+// *stalled* ingestion needs a staleness threshold the API doesn't expose yet; tracked separately.)
 const STATE_HEALTH: Record<string, Health> = {
   in_sync: 'ok',
   behind: 'ok',
@@ -88,18 +81,16 @@ const STATE_HEALTH: Record<string, Health> = {
   unknown: 'unknown',
   no_primary: 'down',
   unreachable: 'down',
-  // The source was recreated: the index is stale and serving read-only. The cluster is
-  // impaired but not down (search still answers) — surface it as Degraded; the Ingestion screen
-  // carries the specific "source recreated — reindex" detail.
+  // Source recreated: the index is stale and serving read-only — impaired but not down (search still
+  // answers), so surface it as Degraded.
   source_recreated: 'warn',
 };
 
 /** Components from ingestion: the Iceberg source (readable?) + each index's ingestion sync. */
 export function componentsFromIngestion(items: IndexIngestion[]): Component[] {
   const out: Component[] = [];
-  // Only **probeable** sources count toward the Iceberg-source health: a variant index's head can't
-  // be read natively (D49, `source_probeable = false`), so its null head is expected — not an outage
-  // — and must not turn the source component (or the cluster) Down.
+  // Only **probeable** sources count toward Iceberg-source health: a variant index's head can't be
+  // read natively (D49), so its null head is expected — not an outage — and must not read Down.
   const probeable = items.filter((i) => i.source_probeable);
   if (probeable.length > 0) {
     const unreadable = probeable.filter((i) => i.source_snapshot_id === null).length;
@@ -117,10 +108,8 @@ export function componentsFromIngestion(items: IndexIngestion[]): Component[] {
     const st = worstState(i.shards);
     let health = STATE_HEALTH[st] ?? 'unknown';
     let detail = `${i.shard_count} shard(s) — ${st.replace(/_/g, ' ')}`;
-    // A variant index reports "unknown" lag by design — its source head isn't natively probeable
-    // (D49), so lag can't be measured — but it's still ingesting + serving. That's not a degradation:
-    // treat an "unknown"-only variant index as ok. Structural failures (no_primary / unreachable)
-    // still degrade, variant or not.
+    // A variant index reports "unknown" lag by design (D49: head not natively probeable) but is still
+    // serving — not a degradation. Structural failures (no_primary / unreachable) still degrade.
     if (!i.source_probeable && st === 'unknown') {
       health = 'ok';
       detail = `${i.shard_count} shard(s) — serving (variant source: lag not natively measured, D49)`;

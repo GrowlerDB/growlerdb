@@ -1,14 +1,8 @@
 //! Segment build over [Tantivy] — the `SegmentCore` seam ([wiki 05]).
 //!
-//! [`TantivySegmentCore`] turns a [`DocBatch`] into an **immutable on-disk
-//! segment set** in a local directory, and reopens it for BM25 search. Keeping
-//! the core behind a small surface (build / open) leaves a future Lucene backend
-//! possible, exactly as the design intends.
-//!
-//! TEXT fields are analyzed (Tantivy's default tokenizer — simple tokenizer +
-//! lowercasing, i.e. "standard + lowercase"), KEYWORD fields are indexed raw, and
-//! the [`CompositeKey`] is stored per document (JSON) so every hit carries the
-//! coordinates the engine hydrates from Iceberg.
+//! [`TantivySegmentCore`] builds a [`DocBatch`] into an immutable on-disk segment set and reopens
+//! it for BM25 search. TEXT fields are analyzed (default tokenizer + lowercasing), KEYWORD raw, and
+//! the [`CompositeKey`] is stored per doc so every hit carries its hydration coordinates.
 //!
 //! [Tantivy]: https://github.com/quickwit-oss/tantivy
 //! [wiki 05]: ../../../okf/system/decisions/d22-search-core.md
@@ -42,19 +36,15 @@ use tantivy::{
     TERMINATED,
 };
 
-/// Name of the stored field holding a doc's `enc(CompositeKey)` bytes — hit identity,
-/// rebuilt via [`CompositeKey::decode`]. Same encoding as [`KEY_ENC_FIELD`], computed
-/// once per doc.
+/// Stored field holding a doc's `enc(CompositeKey)` bytes — hit identity, rebuilt via
+/// [`CompositeKey::decode`]. Same encoding as [`KEY_ENC_FIELD`].
 pub const KEY_FIELD: &str = "_key";
-/// Name of the **bytes-indexed** field holding `enc(CompositeKey)` — lets a reader
-/// exclude a generation's tombstoned docs by key for liveness-correct aggregations.
-/// Not stored (the stored `_key` carries the same bytes for hits).
+/// Bytes-indexed `enc(CompositeKey)` field — delete-by-key plus the agg liveness keyset
+/// exclusion. Not stored (`_key` carries the same bytes for hits).
 const KEY_ENC_FIELD: &str = "_keyenc";
-/// Name of the u64 **fast field** holding a doc's internal **locator ID** — the
-/// immutable *reference* layer of the [D30] layered locator. The id indexes the shard's
-/// dense location array ([`crate::location`]), which maps it to the row's current
-/// `(file_id, row_position)`. Written on every upsert — the layered locator is the only
-/// shard layout.
+/// u64 fast field holding a doc's **locator ID** — the reference layer of the [D30] layered
+/// locator. Indexes the shard's dense location array ([`crate::location`]) → the row's current
+/// `(file_id, row_position)`. Written on every upsert.
 ///
 /// [D30]: ../../../okf/system/decisions/d30-layered-locator.md
 pub const LOC_ID_FIELD: &str = "_locid";
@@ -62,10 +52,9 @@ pub const LOC_ID_FIELD: &str = "_locid";
 /// Writer heap budget.
 pub const WRITER_HEAP_BYTES: usize = 50_000_000;
 
-/// Separator between a variant flatten leaf's dotted path and its canonical value inside the
-/// single `<column>#terms` keyword token — e.g. `payload.user.login\u{1}octocat` (D47). SOH
-/// (`0x01`) never appears in a field path or a rendered scalar, so the `path`/`value` split is
-/// unambiguous and a query rewrite reconstructs the exact token.
+/// Separator between a variant flatten leaf's dotted path and its value in the `<column>#terms`
+/// keyword token (D47). SOH (`0x01`) never appears in a path or rendered scalar, so the
+/// `path`/`value` split is unambiguous.
 const FLATTEN_TERM_SEP: char = '\u{1}';
 
 /// The reserved Tantivy field name for a variant column's flatten **term** index (`path = value`
@@ -147,38 +136,33 @@ pub struct IndexSchema {
     /// u64 FAST locator-ID field ([`LOC_ID_FIELD`], the D30 reference layer), attached
     /// to every upsert by the store's commit path.
     loc_id_field: Field,
-    /// (path, tantivy field, type, declared timestamp format) for each mapped field, in definition
-    /// order. The optional [`TimeFormat`] is set only for fields declared as timestamps; it tells
-    /// [`add_typed_value`] to normalize the source epoch to canonical micros at build.
+    /// (path, tantivy field, type, declared timestamp format) per mapped field, in definition
+    /// order. The [`TimeFormat`] is set only for timestamp fields; it tells [`add_typed_value`] to
+    /// normalize the source epoch to canonical micros at build.
     fields: Vec<(String, Field, FieldType, Option<TimeFormat>)>,
-    /// The mapped fields a query can sort by — numeric/date/keyword fields declared `fast`,
-    /// precomputed here (the tuple above drops the `fast` flag). See [`sort_fields`](Self::sort_fields).
+    /// The fields a query can sort by — numeric/date/keyword fields declared `fast`, precomputed
+    /// here (the tuple above drops `fast`). See [`sort_fields`](Self::sort_fields).
     sortable_fields: Vec<String>,
-    /// Every mapped field's describe-facing summary (type + capability flags), in definition
-    /// order — precomputed at build (the tuple above drops `fast`/`cached`). See
+    /// Every mapped field's describe-facing summary, precomputed at build. See
     /// [`mapped_fields`](Self::mapped_fields).
     mapped_field_summaries: Vec<MappedFieldSummary>,
     /// The tenant-scoping field, if the index is tenant-scoped.
     tenant_field: Option<String>,
-    /// The index's **location strategy** (D30). Under
-    /// [`Predicate`](LocationStrategy::Predicate) the store's commit path never
-    /// populates [`LOC_ID_FIELD`] and writes no location slots — the schema **keeps**
-    /// the field either way (see [`from_resolved`](Self::from_resolved)).
+    /// The index's **location strategy** (D30). Under [`Predicate`](LocationStrategy::Predicate) the
+    /// commit path never populates [`LOC_ID_FIELD`], yet the schema **keeps** the field either way
+    /// (see [`from_resolved`](Self::from_resolved)).
     location_strategy: LocationStrategy,
-    /// The VECTOR fields, in definition order — the ANN-build inputs. Each carries the
-    /// stored-bytes field handle plus the [`VectorSpec`](growlerdb_core::VectorSpec)'s `dims`/`metric`
-    /// the per-segment ANN index is built with. Empty for a non-vector index (the ANN build is then
-    /// skipped entirely).
+    /// The VECTOR fields (ANN-build inputs), in definition order — each with its stored-bytes handle
+    /// and [`VectorSpec`](growlerdb_core::VectorSpec). Empty for a non-vector index (ANN skipped).
     vector_fields: Vec<VectorFieldInfo>,
-    /// The VARIANT columns' flatten fields (D47), keyed by column name. Each carries the reserved
-    /// `<column>#terms` / `<column>#text` Tantivy handles (present iff that flatten mode is on).
-    /// Empty for an index with no variant column — the flatten write path is then skipped.
+    /// The VARIANT columns' flatten fields (D47), keyed by column — the reserved
+    /// `<column>#terms` / `<column>#text` handles (each present iff that flatten mode is on).
     variant_fields: Vec<VariantFieldInfo>,
 }
 
 /// One VARIANT column's flatten index handles ([`IndexSchema::variant_fields`]): the reserved
-/// `<column>#terms` keyword field (path=value tokens) and/or the `<column>#text` analyzed
-/// catch-all, whichever the [`FlattenConfig`](growlerdb_core::FlattenConfig) enabled.
+/// `<column>#terms` keyword field and/or the `<column>#text` analyzed catch-all, whichever the
+/// [`FlattenConfig`](growlerdb_core::FlattenConfig) enabled.
 struct VariantFieldInfo {
     /// The variant column name, e.g. `payload`.
     column: String,
@@ -188,9 +172,9 @@ struct VariantFieldInfo {
     text: Option<Field>,
 }
 
-/// One VECTOR field's ANN-build inputs: its path, the stored-bytes Tantivy field handle, and the
-/// full [`VectorSpec`](growlerdb_core::VectorSpec). The ANN build reads `spec.dims`/`spec.metric`;
-/// the query path reads the whole spec (to embed a query with the field's configured embedder).
+/// One VECTOR field's ANN-build inputs: path, stored-bytes handle, and the full
+/// [`VectorSpec`](growlerdb_core::VectorSpec) (ANN build reads `dims`/`metric`; the query path
+/// reads the whole spec to embed with the field's configured embedder).
 struct VectorFieldInfo {
     path: String,
     field: Field,
@@ -199,8 +183,7 @@ struct VectorFieldInfo {
 
 /// One mapped field's describe-facing summary — name, type, and what a query can do with it
 /// (`fast` = range/sort/aggregate, `indexed` = term-queryable, `cached` = returned with hits).
-/// The describe/stats path surfaces the full list so clients (console pickers, MCP agents)
-/// compose valid queries from the schema instead of discovering it by trial 400s.
+/// Surfaced by the describe/stats path so clients compose valid queries from the schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MappedFieldSummary {
     /// Dotted field path.
@@ -212,10 +195,9 @@ pub struct MappedFieldSummary {
     pub cached: bool,
 }
 
-/// A VECTOR field's describe-facing summary: its field path plus the embedding config a console
-/// needs to offer semantic/hybrid search (the embedded text `source_field`, the `model`, and the
-/// `dims`). The internal [`VectorFieldInfo`] is private (it carries a Tantivy field handle); this
-/// is the owned, public projection the describe/stats path returns.
+/// A VECTOR field's describe-facing summary: field path plus the embedding config a console needs
+/// to offer semantic/hybrid search (`source_field`, `model`, `dims`) — the owned, public
+/// projection of the private [`VectorFieldInfo`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VectorFieldSummary {
     /// The VECTOR field path — what a semantic/hybrid request targets.
@@ -241,19 +223,15 @@ impl IndexSchema {
         let key_field = builder.add_bytes_field(KEY_FIELD, STORED);
         let key_enc_field = builder.add_bytes_field(KEY_ENC_FIELD, INDEXED);
         let mut fields = Vec::with_capacity(idx.fields.len());
-        // Sortable fields: `fast` + a sortable type (numeric/date/keyword) — the exact set the
-        // sort path's `ensure_sortable` accepts. Collected here where the `fast` flag is still in scope.
+        // Collected here while the `fast`/`cached` capability flags are still in scope.
         let mut sortable_fields = Vec::new();
-        // Every field's describe summary, captured here where the capability flags are in scope.
         let mut mapped_field_summaries = Vec::with_capacity(idx.fields.len());
-        // VECTOR fields, captured with their `dims`/`metric` for the per-segment ANN build.
         let mut vector_fields = Vec::new();
-        // VARIANT columns' flatten fields (`<col>#terms` / `<col>#text`).
         let mut variant_fields = Vec::new();
         for f in &idx.fields {
             // A VARIANT field carries no single typed Tantivy field — only its flatten index
-            // (`<col>#terms` raw keyword tokens + an optional analyzed `<col>#text` catch-all).
-            // Its declared shape leaves are separate `ResolvedField`s handled by the normal arms.
+            // (`<col>#terms` + optional `<col>#text`). Its declared shape leaves are separate
+            // `ResolvedField`s handled by the normal arms.
             if f.ty == FieldType::Variant {
                 let Some(v) = &f.variant else { continue };
                 let terms = v.flatten.enabled && v.flatten.terms;
@@ -297,9 +275,8 @@ impl IndexSchema {
             }
             let handle = match f.ty {
                 FieldType::Text => {
-                    // Per-field indexing detail: record level (positions are the phrase-query
-                    // slice, usually the largest part of a text field's inverted index) and
-                    // fieldnorms (BM25 length normalization, ~1 byte/doc).
+                    // Record level drives positions (the phrase-query slice, usually the largest
+                    // part of the inverted index); fieldnorms drive BM25 length normalization.
                     let indexing = TextFieldIndexing::default()
                         .set_tokenizer("default")
                         .set_index_option(record_option(f.record))
@@ -349,13 +326,9 @@ impl IndexSchema {
                 cached: f.cached,
             });
         }
-        // The D30 locator-ID fast field, added after the mapped fields so the internal
-        // handles never shift a user field's ordinal. It is declared for **every**
-        // strategy — a `PREDICATE` index just never populates it (a missing u64 fast
-        // value costs ~nothing bitpacked). Keeping the schema identical across strategies
-        // avoids the field-ordinal hazard: segments, backup, reindex, and cold-open
-        // tooling see one schema shape, and a strategy never shifts another field's
-        // ordinal.
+        // Added after the mapped fields so internal handles never shift a user field's ordinal.
+        // Declared for **every** strategy (a `PREDICATE` index just never populates it) so the
+        // schema shape is identical across strategies — avoiding the field-ordinal hazard.
         let loc_id_field = builder.add_u64_field(LOC_ID_FIELD, FAST);
         Self {
             schema: builder.build(),
@@ -373,8 +346,7 @@ impl IndexSchema {
     }
 
     /// Whether this index has any VECTOR field — i.e. whether a per-segment ANN sidecar is built.
-    /// The store's commit/compaction paths skip the ANN build entirely when this is false, so a
-    /// non-vector index pays nothing.
+    /// When false the commit/compaction paths skip the ANN build entirely.
     pub fn has_vector_fields(&self) -> bool {
         !self.vector_fields.is_empty()
     }
@@ -399,9 +371,8 @@ impl IndexSchema {
     }
 
     /// The [`VectorSpec`](growlerdb_core::VectorSpec) of the VECTOR field named `path`, or `None`
-    /// if `path` is not a VECTOR field on this index. The semantic-search path reads this to
-    /// embed a query with the field's configured embedder (matching the space its documents were
-    /// embedded in at ingest).
+    /// if `path` is not a VECTOR field. The semantic-search path reads this to embed a query in the
+    /// same space its documents were embedded in at ingest.
     pub fn vector_spec(&self, path: &str) -> Option<&growlerdb_core::VectorSpec> {
         self.vector_fields
             .iter()
@@ -409,10 +380,8 @@ impl IndexSchema {
             .map(|vf| &vf.spec)
     }
 
-    /// The mapped **DATE** fields, in definition order. These are the columns a console
-    /// time filter can range-scope a query on; when one is also the windowing field, the
-    /// gateway prunes non-overlapping windows. Stored as canonical **epoch microseconds** —
-    /// the unit Tantivy `DateTime::from_timestamp_micros` and the range/sort path use.
+    /// The mapped **DATE** fields, in definition order — the columns a console time filter can
+    /// range-scope a query on. Stored as canonical **epoch microseconds**.
     pub fn date_fields(&self) -> Vec<&str> {
         self.fields
             .iter()
@@ -422,25 +391,21 @@ impl IndexSchema {
     }
 
     /// The fields a query can **sort** by — numeric/date/keyword fields declared `fast`, in
-    /// definition order (precomputed at build time in [`from_resolved`](Self::from_resolved)). This
-    /// exactly matches the sort path's `ensure_sortable` check
-    /// (`fast` + `I64`/`F64`/`Date`/`Str`), so the console only ever offers a sort field the engine
-    /// will accept — a non-fast keyword like `author` is excluded rather than 400ing at query time.
+    /// definition order. Exactly matches the sort path's `ensure_sortable` check, so the console
+    /// only ever offers a sort field the engine accepts.
     pub fn sort_fields(&self) -> Vec<&str> {
         self.sortable_fields.iter().map(String::as_str).collect()
     }
 
-    /// Every mapped field's describe-facing summary (name, type, capability flags), in
-    /// definition order — the full schema the describe path surfaces so clients compose valid
-    /// queries instead of discovering the mapping by trial 400s.
+    /// Every mapped field's describe-facing summary, in definition order — the full schema the
+    /// describe path surfaces so clients compose valid queries from it.
     pub fn mapped_fields(&self) -> Vec<MappedFieldSummary> {
         self.mapped_field_summaries.clone()
     }
 
-    /// The index's VECTOR fields, in definition order — each a [`VectorFieldSummary`] of the field
-    /// path plus its embedding config (`source_field`/`model`/`dims`). The describe path surfaces
-    /// these so a console can offer a semantic/hybrid vector-field picker without re-deriving the
-    /// mapping. Empty for a non-vector index.
+    /// The index's VECTOR fields, in definition order — each a [`VectorFieldSummary`] (path +
+    /// `source_field`/`model`/`dims`) for the describe path's semantic/hybrid picker. Empty for a
+    /// non-vector index.
     pub fn vector_fields(&self) -> Vec<VectorFieldSummary> {
         self.vector_fields
             .iter()
@@ -453,20 +418,19 @@ impl IndexSchema {
             .collect()
     }
 
-    /// The bytes-indexed `enc(key)` field — used to **delete by key** (the Tantivy-native
-    /// supersede/delete under the single-index model) and for the agg keyset exclusion.
+    /// The bytes-indexed `enc(key)` field — used to **delete by key** and for the agg keyset
+    /// exclusion.
     pub fn key_enc_field(&self) -> Field {
         self.key_enc_field
     }
 
-    /// The u64 FAST **locator-ID** field ([`LOC_ID_FIELD`], D30 reference layer) — the
-    /// store attaches each upsert's location-array id through this handle.
+    /// The u64 FAST **locator-ID** field ([`LOC_ID_FIELD`], D30 reference layer) — the store
+    /// attaches each upsert's location-array id through this handle.
     pub fn loc_id_field(&self) -> Field {
         self.loc_id_field
     }
 
-    /// Build the [`TantivyDocument`] for `doc`: the stored + indexed `enc(key)` (one
-    /// encoding, computed once — hit identity and the delete term), and each mapped
+    /// Build the [`TantivyDocument`] for `doc`: the stored + indexed `enc(key)` and each mapped
     /// field's typed value (skipping absent fields).
     pub fn to_tantivy(&self, doc: &Document) -> TantivyDocument {
         let mut td = TantivyDocument::new();
@@ -478,9 +442,9 @@ impl IndexSchema {
                 add_typed_value(&mut td, *field, *ty, *fmt, path, value);
             }
         }
-        // Variant flatten leaves (D47): each `(path, value)` becomes an exact `path=value` keyword
-        // token in `<col>#terms`, and each **string** leaf feeds the analyzed `<col>#text`
-        // catch-all. Declared shape leaves already rode `doc.fields` above (typed fields).
+        // Variant flatten leaves (D47): each `(path, value)` → a `path=value` token in
+        // `<col>#terms`; each string leaf also feeds the analyzed `<col>#text` catch-all. Declared
+        // shape leaves already rode `doc.fields` above.
         for vc in &doc.variants {
             let Some(info) = self.variant_fields.iter().find(|v| v.column == vc.field) else {
                 continue; // a variant column not in this schema — ignore its leaves
@@ -514,11 +478,9 @@ fn record_option(record: TextRecord) -> IndexRecordOption {
     }
 }
 
-/// `NumericOptions` for a LONG/DOUBLE/BOOL field per the field's `indexed`/`fast`/`cached` flags.
-/// A **fast-only** field (the default when `fast: true`) carries no inverted index —
-/// range, exact-match (routed through Range), sort/search-after, and exists all run on the
-/// columnar store (Tantivy's `RangeQuery` takes the fast path whenever the field is fast, and
-/// `ExistsQuery` only ever reads fast fields), so the postings + term dict would be dead weight.
+/// `NumericOptions` for a LONG/DOUBLE/BOOL field per its `indexed`/`fast`/`cached` flags. A
+/// **fast-only** field carries no inverted index: range, exact-match, sort/search-after, and exists
+/// all run on the columnar store, so postings + term dict would be dead weight.
 fn num_opts(f: &ResolvedField) -> NumericOptions {
     let mut o = NumericOptions::default();
     if f.indexed {
@@ -563,10 +525,9 @@ fn ip_opts(f: &ResolvedField) -> IpAddrOptions {
     o
 }
 
-/// Add a wire [`Value`](growlerdb_core::Value) to the document as the field's typed
-/// Tantivy value. A value whose kind doesn't match the field type is **skipped** (the
-/// document still indexes its other fields) rather than failing the whole batch —
-/// source-type validation is a richer concern handled at resolve time.
+/// Add a wire [`Value`](growlerdb_core::Value) to the document as the field's typed Tantivy value.
+/// A value whose kind doesn't match the field type is **skipped** (the doc still indexes its other
+/// fields) rather than failing the batch — source-type validation happens at resolve time.
 fn add_typed_value(
     td: &mut TantivyDocument,
     field: Field,
@@ -593,13 +554,9 @@ fn add_typed_value(
                 td.add_bool(field, *b);
             }
         }
-        // Dates are stored as canonical epoch **microseconds**. A field declared with a
-        // `format` carries its source value in some other epoch unit (the demo's `ts` is millis), so
-        // normalize it here; an unparseable value is **skipped** (the doc still indexes its other
-        // fields) rather than wedging the batch or writing an off-by-10³ date. A field with no
-        // declared format already arrives as canonical micros — a native source date/timestamp
-        // extracts to `Ts`, and a pre-parsed epoch column may still arrive as `Int`
-        // (`TimeFormat::to_micros` likewise passes a `Ts` through untouched).
+        // Dates are stored as canonical epoch **microseconds**. A `format` field carries its source
+        // in another epoch unit, so normalize here (an unparseable value is skipped, not wedged).
+        // A format-less field already arrives as canonical micros (`Ts`, or a pre-parsed `Int`).
         FieldType::Date => match format {
             Some(fmt) => {
                 if let Ok(micros) = fmt.to_micros(path, value) {
@@ -626,9 +583,8 @@ fn add_typed_value(
                 td.add_bytes(field, &vec_f32_to_le_bytes(v));
             }
         }
-        // A VARIANT field has no single typed field: its flatten leaves are indexed separately in
-        // `to_tantivy` (`<col>#terms`/`<col>#text`), and it never appears in `self.fields`. A
-        // declared shape leaf reaches here under its own concrete type, not as `Variant`.
+        // A VARIANT field never appears in `self.fields` (its leaves are indexed in `to_tantivy`);
+        // a declared shape leaf reaches here under its own concrete type, not `Variant`.
         FieldType::Variant => {}
     }
 }
@@ -643,10 +599,8 @@ fn vec_f32_to_le_bytes(v: &[f32]) -> Vec<u8> {
     out
 }
 
-/// Decode raw little-endian `f32` bytes back into a vector — inverse of
-/// [`vec_f32_to_le_bytes`]. A trailing partial element (input length not a multiple of 4)
-/// is dropped. Read by the per-segment ANN build, which reconstitutes each doc's
-/// stored embedding from these bytes.
+/// Decode raw little-endian `f32` bytes back into a vector — inverse of [`vec_f32_to_le_bytes`]. A
+/// trailing partial element (length not a multiple of 4) is dropped.
 fn le_bytes_to_vec_f32(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -654,8 +608,7 @@ fn le_bytes_to_vec_f32(b: &[u8]) -> Vec<f32> {
 }
 
 /// The file name of a segment's ANN sidecar: `<segment-uuid>.ann`, beside the lexical segment
-/// files in the index directory. Registered in the segment's backup file set so it travels with
-/// the lexical segment.
+/// files in the index directory.
 fn ann_sidecar_name(segment_uuid: &str) -> String {
     format!("{segment_uuid}.{ANN_SUFFIX}")
 }
@@ -726,11 +679,10 @@ fn guard_regex(pattern: &str) -> Result<()> {
 pub struct TantivySegmentCore;
 
 impl TantivySegmentCore {
-    /// The settings a **new** index is created with: zstd doc-store compression.
-    /// lz4 (the default) only match-copies, so high-entropy stored values — hex/UUID hit keys,
-    /// random-ish cached fields — pass through nearly uncompressed; zstd entropy-codes them
-    /// (~2x on hex). Per-index: the compressor persists in `meta.json`, so an existing index
-    /// keeps whatever it was created with and its segments stay readable.
+    /// The settings a **new** index is created with: zstd doc-store compression. lz4 (the default)
+    /// only match-copies, so high-entropy stored values (hex/UUID keys) pass through nearly
+    /// uncompressed; zstd entropy-codes them (~2x on hex). The compressor persists in `meta.json`,
+    /// so an existing index keeps whatever it was created with.
     fn new_index_settings() -> tantivy::IndexSettings {
         tantivy::IndexSettings {
             docstore_compression: tantivy::store::Compressor::Zstd(Default::default()),
@@ -752,8 +704,7 @@ impl TantivySegmentCore {
         }
 
         writer.commit()?;
-        // Build the per-segment ANN sidecar(s) over the just-committed vectors, so a
-        // freshly built segment set carries its KNN index like the store's commit path does.
+        // Build the per-segment ANN sidecar(s) over the just-committed vectors.
         if schema.has_vector_fields() {
             let reader = self.open(dir)?;
             reader.build_ann_sidecars(schema, dir)?;
@@ -772,11 +723,10 @@ impl TantivySegmentCore {
         })
     }
 
-    /// Open the shard's **single** Tantivy index at `dir`, creating it empty if absent.
-    /// All commits add segments to this one index (the single-index model); compaction
-    /// is `IndexWriter::merge` over its segments. An existing index opens with
-    /// the settings persisted in its `meta.json` (its original doc-store compressor);
-    /// only a fresh create gets [`new_index_settings`](Self::new_index_settings).
+    /// Open the shard's **single** Tantivy index at `dir`, creating it empty if absent. All commits
+    /// add segments to this one index; compaction is `IndexWriter::merge` over its segments. An
+    /// existing index opens with the settings persisted in its `meta.json`; only a fresh create gets
+    /// [`new_index_settings`](Self::new_index_settings).
     pub fn open_or_create_index(&self, schema: &IndexSchema, dir: &Path) -> Result<Index> {
         if dir.join("meta.json").exists() {
             Ok(Index::open_in_dir(dir)?)
@@ -820,17 +770,15 @@ pub struct ExplainHit {
 pub struct SegmentReader {
     index: Index,
     reader: IndexReader,
-    /// The local directory holding the index's files, when known — where the per-segment ANN
-    /// sidecars (`<segment-uuid>.ann`) live. Set for a local (mmap) index; `None` for a reader
-    /// whose directory isn't a local path (a cold read-through object directory), where KNN finds
-    /// no local sidecar and returns no vector hits.
+    /// The local directory holding the index's files (and the `<segment-uuid>.ann` sidecars), when
+    /// known. `None` for a cold read-through object directory, where KNN finds no local sidecar and
+    /// returns no vector hits.
     index_dir: Option<PathBuf>,
 }
 
 impl SegmentReader {
-    /// A read handle over `index` that **auto-reloads on commit** — the shard's live
-    /// reader; reads see each commit's new segment (and its native deletes). `index_dir` is the
-    /// local directory the index's files (and ANN sidecars) live in.
+    /// A read handle over `index` that **auto-reloads on commit** — the shard's live reader; reads
+    /// see each commit's new segment (and its native deletes).
     pub fn live(index: &Index, index_dir: impl Into<PathBuf>) -> Result<Self> {
         Ok(SegmentReader {
             index: index.clone(),
@@ -839,9 +787,9 @@ impl SegmentReader {
         })
     }
 
-    /// A read handle **pinned** to `index`'s current commit — never reloads, so its
-    /// searcher is a stable snapshot and Tantivy keeps the referenced segment files
-    /// alive even as later commits/compaction run. This is a point-in-time pin.
+    /// A read handle **pinned** to `index`'s current commit — never reloads, so its searcher is a
+    /// stable snapshot and Tantivy keeps the referenced segment files alive even as later
+    /// commits/compaction run.
     pub fn snapshot(index: &Index, index_dir: impl Into<PathBuf>) -> Result<Self> {
         Ok(SegmentReader {
             index: index.clone(),
@@ -864,11 +812,10 @@ impl SegmentReader {
         self.reader.searcher().num_docs()
     }
 
-    /// The **locator ID** (`_locid` fast field) of the live doc carrying `enc(key)`,
-    /// or `None` when no live doc has the key. This is the D30 write path's pre-commit
-    /// **reuse lookup**: a key-term probe of each segment's dictionary + one fast-field
-    /// read, ~1 µs warm per key (≈1–2% of ingest CPU at bulk rates), which keeps the
-    /// location array O(live keys) instead of O(all versions ever written).
+    /// The **locator ID** (`_locid` fast field) of the live doc carrying `enc(key)`, or `None` when
+    /// no live doc has the key. The D30 write path's pre-commit **reuse lookup** — a key-term probe
+    /// per segment + one fast-field read — which keeps the location array O(live keys), not O(all
+    /// versions ever written).
     pub fn live_loc_id(&self, key_enc: &[u8]) -> Result<Option<u64>> {
         let schema = self.index.schema();
         let Ok(key_enc_field) = schema.get_field(KEY_ENC_FIELD) else {
@@ -884,8 +831,8 @@ impl SegmentReader {
             else {
                 continue;
             };
-            // Defensive: a segment with no `_locid` column can't contribute an id
-            // (should be unreachable — every upsert writes the field).
+            // Defensive: a segment with no `_locid` column can't contribute an id (should be
+            // unreachable — every upsert writes the field).
             let Some(col) = segment.fast_fields().column_opt::<u64>(LOC_ID_FIELD)? else {
                 continue;
             };
@@ -903,11 +850,9 @@ impl SegmentReader {
         Ok(None)
     }
 
-    /// Whether any **live** doc carries `enc(key)` — a postings probe filtered by each
-    /// segment's alive bitset. The presence half of a drift check: unlike a raw term
-    /// lookup this never counts a deleted-but-unmerged doc (the store runs
-    /// `NoMergePolicy`, so term dictionaries retain superseded/deleted keys until
-    /// compaction).
+    /// Whether any **live** doc carries `enc(key)` — a postings probe filtered by each segment's
+    /// alive bitset. Unlike a raw term lookup this never counts a deleted-but-unmerged doc (under
+    /// `NoMergePolicy` term dictionaries retain superseded/deleted keys until compaction).
     pub fn live_key_exists(&self, key_enc: &[u8]) -> Result<bool> {
         let key_enc_field = self.index.schema().get_field(KEY_ENC_FIELD)?;
         let term = Term::from_field_bytes(key_enc_field, key_enc);
@@ -932,22 +877,18 @@ impl SegmentReader {
         Ok(false)
     }
 
-    /// Enumerate the **live-key set** under a raw-bytes `prefix` of the `_keyenc` term
-    /// dictionary — the D30 replacement for the deleted keyed locator table's key
-    /// range. `enc(CompositeKey)` is partition-first and length-prefixed, so a
-    /// partition's encoded keys form one contiguous byte-prefix range: streaming the
-    /// dictionary from `prefix` and stopping at the first non-matching term preserves
-    /// partition scoping **exactly** (an empty prefix enumerates the whole shard).
+    /// Enumerate the **live-key set** under a raw-bytes `prefix` of the `_keyenc` term dictionary
+    /// (D30). `enc(CompositeKey)` is partition-first and length-prefixed, so a partition's keys form
+    /// one contiguous byte-prefix range: streaming from `prefix` and stopping at the first
+    /// non-matching term preserves partition scoping exactly (empty prefix → whole shard).
     ///
-    /// Per term, the key is counted only if it has a **live** doc (postings walk +
-    /// alive bitset): under `NoMergePolicy` the dictionary retains
-    /// deleted-but-unmerged keys, so raw term enumeration would over-report. A key's
-    /// term can appear in several segments (superseded versions); the result set is
-    /// deduplicated, and a key counts once however many segments name it.
+    /// A key is counted only if it has a **live** doc (postings walk + alive bitset): under
+    /// `NoMergePolicy` the dictionary retains deleted-but-unmerged keys, so raw enumeration would
+    /// over-report. A key can appear in several segments (superseded versions); the result is
+    /// deduplicated so a key counts once.
     ///
-    /// Cost: O(terms in range) dictionary streaming + one postings probe per candidate
-    /// term, and O(live keys in range) memory for the returned set — the same order as
-    /// the redb prefix range it replaces, minus the second copy of every key on disk.
+    /// Cost: O(terms in range) streaming + one postings probe per candidate term, O(live keys)
+    /// memory for the result.
     pub fn live_keys_with_prefix(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
         let key_enc_field = self.index.schema().get_field(KEY_ENC_FIELD)?;
         let searcher = self.reader.searcher();
@@ -985,10 +926,9 @@ impl SegmentReader {
         Ok(live.into_iter().collect())
     }
 
-    /// Read the **cached** (stored) display fields of `doc` into a value map (D23) —
-    /// every stored field except the internal key, typed back to a wire
-    /// [`Value`](growlerdb_core::Value). These ride along on each [`Hit`] so a page
-    /// renders without hydration.
+    /// Read the **cached** (stored) display fields of `doc` into a value map (D23) — every stored
+    /// field except the internal key, typed back to a wire [`Value`](growlerdb_core::Value). These
+    /// ride along on each [`Hit`] so a page renders without hydration.
     fn cached_fields(&self, doc: &TantivyDocument) -> std::collections::BTreeMap<String, GValue> {
         let schema = self.index.schema();
         let mut out = std::collections::BTreeMap::new();
@@ -1033,11 +973,9 @@ impl SegmentReader {
         Ok(searcher.search(query.as_ref(), &collector)?)
     }
 
-    /// Count the documents matching `query` — the **live match total**, since the single
-    /// index natively excludes superseded/deleted docs (same liveness as `num_docs`/aggregations).
-    /// Cheap: no scoring, sorting, or doc materialization, just a `Count` over the matched docset.
-    /// Used for the search response's `total` (the true match count, distinct from page size).
-    /// Validates fields like [`search`](Self::search), so a bad query errors clearly.
+    /// Count the documents matching `query` — the **live match total** (the single index natively
+    /// excludes superseded/deleted docs). No scoring/sorting/materialization; the search response's
+    /// `total`. Validates fields like [`search`](Self::search), so a bad query errors clearly.
     pub fn count(&self, query: &Query) -> Result<u64> {
         // A top-level KNN query has no Tantivy representation — count its resolved neighbors.
         if let Query::Knn {
@@ -1054,13 +992,11 @@ impl SegmentReader {
         Ok(searcher.search(tantivy_query.as_ref(), &Count)? as u64)
     }
 
-    /// Build the **per-segment ANN sidecar(s)** ([D19]) for every VECTOR field in
-    /// `schema`, writing `<segment-uuid>.ann` beside each Tantivy segment in `dir`. Idempotent: a
-    /// segment whose sidecar already exists is skipped, so this can run after every commit and only
-    /// the newly-sealed segments are indexed. A sidecar is built over **all** docs in a segment
-    /// (including deleted/superseded ones) — deletes write a new `.del` without rewriting the
-    /// segment or its sidecar, so [`knn_search`](Self::knn_search) filters results by the segment's
-    /// live alive-bitset at query time instead.
+    /// Build the **per-segment ANN sidecar(s)** ([D19]) for every VECTOR field in `schema`, writing
+    /// `<segment-uuid>.ann` beside each Tantivy segment in `dir`. Idempotent (an existing sidecar is
+    /// skipped), so it can run after every commit. A sidecar covers **all** docs in a segment
+    /// including deleted ones — deletes only write a `.del`, so [`knn_search`](Self::knn_search)
+    /// filters by the live alive-bitset at query time instead.
     ///
     /// [D19]: ../../../okf/system/decisions/d19-ann-library.md
     pub fn build_ann_sidecars(&self, schema: &IndexSchema, dir: &Path) -> Result<()> {
@@ -1071,7 +1007,7 @@ impl SegmentReader {
         for (seg_ord, seg) in searcher.segment_readers().iter().enumerate() {
             let path = dir.join(ann_sidecar_name(&seg.segment_id().uuid_string()));
             if path.exists() {
-                continue; // content-stable per segment id — already built
+                continue; // already built (content-stable per segment id)
             }
             let mut sidecar = SegmentAnn::new();
             for vf in &schema.vector_fields {
@@ -1087,8 +1023,7 @@ impl SegmentReader {
                     }
                 }
                 if !items.is_empty() {
-                    // Auto-select brute-force (exact) vs HNSW (approximate) by this segment's
-                    // vector count for the field — transparent to the query path.
+                    // Auto-selects brute-force vs HNSW by this segment's vector count for the field.
                     sidecar.insert(
                         vf.path.clone(),
                         &StoredAnnIndex::build(vf.spec.dims, vf.spec.metric, &items),
@@ -1102,26 +1037,11 @@ impl SegmentReader {
         Ok(())
     }
 
-    /// Execute a **top-level KNN** query: the `k` documents whose stored embedding for `field` is
-    /// nearest to `vector`, ranked by descending KNN score. Loads each Tantivy segment's ANN
-    /// sidecar, runs `knn`, filters to **live** docs (the segment's alive-bitset), maps each
-    /// segment-local docid back to its stored composite key exactly as a lexical hit resolves
-    /// (`DocAddress` → stored `_key`), then merges across segments and keeps the global top-`k`.
-    /// `field` must be a VECTOR (stored-bytes) field; a missing sidecar (e.g. a cold read-through
-    /// reader, or a segment with no vectors) contributes no hits rather than erroring.
-    ///
-    /// When `filter` is `Some`, it is a lexical/fast-field sub-query whose matching docs constrain
-    /// the candidates: it is compiled once and collected into an allowed-address set, and a neighbor
-    /// is admitted only if it is both **live** and in that set. With a filter present the search
-    /// requests **all** of each segment's candidates (not just `k`) so the constraint can't starve
-    /// the result below `k` when matches exist. `None` keeps the unfiltered fast path.
-    /// Per-field count of vectors present in the live segments' ANN sidecars — the KNN
-    /// coverage numerator the describe path pairs with `num_docs`. A shortfall means documents
-    /// were indexed **without** an embedding (e.g. an ingest-time embed failure) and are
-    /// invisible to semantic search — a gap nothing else surfaces, since lexical search and
-    /// `num_docs` both see the full corpus. Counts sidecar entries, so recently deleted docs may
-    /// still be included until compaction rewrites their segment; a segment with no sidecar
-    /// contributes 0 (mirroring `knn_search`, which skips it).
+    /// Per-field count of vectors present in the live segments' ANN sidecars — the KNN coverage
+    /// numerator the describe path pairs with `num_docs`. A shortfall means documents were indexed
+    /// **without** an embedding (e.g. an ingest-time embed failure) and are invisible to semantic
+    /// search — a gap nothing else surfaces. Counts sidecar entries, so recently deleted docs may
+    /// still be included until compaction; a segment with no sidecar contributes 0.
     pub fn vector_coverage(&self, field: &str) -> Result<u64> {
         let Some(dir) = self.index_dir.as_ref() else {
             return Ok(0); // no local sidecar directory (e.g. cold read-through)
@@ -1151,8 +1071,7 @@ impl SegmentReader {
         let tv_field = schema
             .get_field(field)
             .map_err(|_| IndexError::UnknownField(field.to_string()))?;
-        // A VECTOR field is the only bytes field a user names; the internal `_key` bytes field is
-        // never a query target. Reject anything that isn't a stored-bytes (vector) field.
+        // A VECTOR field is the only bytes field a user names — reject anything else.
         if !matches!(
             schema.get_field_entry(tv_field).field_type(),
             TvFieldType::Bytes(_)
@@ -1169,9 +1088,8 @@ impl SegmentReader {
         };
         let key_field = schema.get_field(KEY_FIELD)?;
         let searcher = self.reader.searcher();
-        // Filtered KNN: compile the lexical/fast-field sub-query **once** and collect the full set of
-        // matching `(seg_ord, doc_id)` addresses. A neighbor is admitted only if it is also in this
-        // set — so tenant and fast-field constraints intersect the candidate pool.
+        // Filtered KNN: compile the sub-query once and collect its matching addresses; a neighbor is
+        // admitted only if it is also in this set.
         let allowed: Option<std::collections::HashSet<DocAddress>> = match filter {
             Some(f) => {
                 let tantivy_query = self.build(f)?;
@@ -1190,14 +1108,11 @@ impl SegmentReader {
             };
             let alive = seg.alive_bitset();
             match allowed.as_ref() {
-                // **Filtered KNN is exact** — this is the tenant-isolation path, so it must not
-                // depend on the ANN tier's recall. An approximate index (HNSW) returns only
-                // ~ef_search candidates, not all N, so `index.knn(vector, index.len())` could
-                // silently drop filter-allowed matches that rank outside that window. Instead we
-                // score the alive+allowed subset **directly from stored vectors** (the same
-                // `get_first(field).as_bytes()` → `le_bytes_to_vec_f32` path the sidecar is built
-                // from), using the field's metric. Exact regardless of the tier, and cheap because
-                // the filter already limits the candidate set.
+                // **Filtered KNN is exact** — the tenant-isolation path must not depend on the ANN
+                // tier's recall. HNSW returns only ~ef_search candidates, so it could silently drop
+                // filter-allowed matches ranking outside that window. Instead score the
+                // alive+allowed subset **directly from stored vectors** with the field's metric —
+                // exact regardless of tier, and cheap because the filter already limits the set.
                 Some(a) => {
                     let metric = index.metric();
                     for address in a.iter().filter(|addr| addr.segment_ord as usize == seg_ord) {
@@ -1222,7 +1137,7 @@ impl SegmentReader {
                     }
                 }
                 // Unfiltered fast path: the ANN index ranks; request enough that dropping
-                // deleted/superseded docs still leaves `k` live ones.
+                // deleted docs still leaves `k` live ones.
                 None => {
                     let want = k.saturating_add(seg.num_deleted_docs() as usize);
                     for (doc_id, score) in index.knn(vector, want) {
@@ -1251,10 +1166,9 @@ impl SegmentReader {
         Ok(hits)
     }
 
-    /// Execute a [`Query`] AST as BM25, returning ranked **coordinates + scores**.
-    /// Validates fields against the schema (unknown/non-searchable field →
-    /// [`IndexError::UnknownField`]), so a bad query is a clear error, not a
-    /// silent empty result.
+    /// Execute a [`Query`] AST as BM25, returning ranked **coordinates + scores**. Validates fields
+    /// against the schema (unknown/non-searchable → [`IndexError::UnknownField`]), so a bad query is
+    /// a clear error, not a silent empty result.
     pub fn search(&self, query: &Query, k: usize) -> Result<Vec<Hit>> {
         Ok(self
             .search_sorted(query, k, &[], None)?
@@ -1263,14 +1177,11 @@ impl SegmentReader {
             .collect())
     }
 
-    /// Execute `query` returning up to `limit` `(hit, sort_values)` pairs. With no
-    /// `sort` keys the window is the top-`limit` by **score** (descending) and each
-    /// hit's `sort_values` is empty (the store ranks by `Hit::score`). With one or
-    /// more keys the window is the top-`limit` by the **primary** key, and each hit
-    /// carries the value of **every** key (in key order) read from its columnar fast
-    /// field — `None` when the doc lacks the field — so the store can do the full
-    /// multi-key merge + page across generations. For key sort `Hit::score` is 0.0
-    /// (relevance isn't the ranking).
+    /// Execute `query` returning up to `limit` `(hit, sort_values)` pairs. With no `sort` keys the
+    /// window is the top-`limit` by descending **score** and `sort_values` is empty. With keys the
+    /// window is the top-`limit` by the **primary** key, and each hit carries every key's value (in
+    /// key order) from its fast field, so the store can do the full multi-key merge + page across
+    /// generations. For key sort `Hit::score` is 0.0.
     pub fn search_sorted(
         &self,
         query: &Query,
@@ -1278,10 +1189,9 @@ impl SegmentReader {
         sort: &[Sort],
         after: Option<&SearchAfter>,
     ) -> Result<Vec<(Hit, Vec<SortValue>)>> {
-        // A top-level KNN query is resolved over the per-segment ANN sidecars, not compiled to a
-        // Tantivy query. It ranks by KNN score (no field sort, no keyset cursor — fusion with a
-        // lexical query is a later task), so hand back score-ranked hits with empty sort values;
-        // the store's paging then slices the window like any score-ranked result.
+        // A top-level KNN query is resolved over the ANN sidecars, not compiled to a Tantivy query.
+        // It ranks by KNN score (no field sort or keyset cursor), so hand back score-ranked hits
+        // with empty sort values.
         if let Query::Knn {
             field,
             vector,
@@ -1298,9 +1208,8 @@ impl SegmentReader {
             khits.truncate(limit);
             return Ok(khits.into_iter().map(|h| (h, Vec::new())).collect());
         }
-        // With a keyset cursor, AND the user query with a predicate that admits only
-        // docs strictly after the cursor in the total order. The cursor needs a primary
-        // sort key to range over.
+        // With a keyset cursor, AND the user query with a predicate admitting only docs strictly
+        // after the cursor in the total order.
         let base = self.build(query)?;
         let tantivy_query: Box<dyn TantivyQuery> = match after {
             None => base,
@@ -1341,17 +1250,15 @@ impl SegmentReader {
             }
         };
 
-        // The window score is the ranking value for an unsorted query and for an
-        // explicit `_score` primary; for a field-sorted query it's 0.0 (the store ranks
-        // by the sort tuple, not relevance).
+        // The window score is the ranking value for an unsorted query or an explicit `_score`
+        // primary; for a field-sorted query it's 0.0.
         let by_score = sort.is_empty() || sort.first().is_some_and(Sort::is_score);
         let key_field = self.index.schema().get_field(KEY_FIELD)?;
         let mut out = Vec::with_capacity(window.len());
         for (score, address) in window {
             let doc: TantivyDocument = searcher.doc(address)?;
             let key = stored_key(&doc, key_field)?;
-            // For each sort key, this doc's value: the relevance score for a `_score`
-            // key (only a primary reaches this windowed path), else the fast field.
+            // Each key's value: the relevance score for a `_score` key, else the fast field.
             let mut sort_values = Vec::with_capacity(sort.len());
             for s in sort {
                 sort_values.push(if s.is_score() {
@@ -1373,11 +1280,10 @@ impl SegmentReader {
         Ok(out)
     }
 
-    /// **Exhaustively** scan every matching doc (honoring an optional keyset `after`),
-    /// returning `(hit, sort_values)` for each. Unlike [`search_sorted`](
-    /// Self::search_sorted)'s top-`limit`-by-primary window, this is correct for
-    /// **multi-key** sort even when many docs tie on the primary key — the store does
-    /// the full-tuple sort. `O(matches)`; used for the multi-key paging path.
+    /// **Exhaustively** scan every matching doc (honoring an optional keyset `after`), returning
+    /// `(hit, sort_values)` for each. Unlike [`search_sorted`](Self::search_sorted)'s
+    /// top-`limit`-by-primary window, this is correct for **multi-key** sort even when many docs tie
+    /// on the primary key. `O(matches)`.
     pub fn scan_sorted(
         &self,
         query: &Query,
@@ -1401,10 +1307,9 @@ impl SegmentReader {
         };
         let searcher = self.reader.searcher();
         let docs = searcher.search(tantivy_query.as_ref(), &DocSetCollector)?;
-        // When a `_score` key is present we need each matching doc's relevance.
-        // The exhaustive collector doesn't score, so score per doc via `explain` (the same
-        // scorer as search, so it matches ranking exactly). `_score` rejects keyset paging,
-        // so `tantivy_query` here is the unwrapped user query — the right thing to explain.
+        // A `_score` key needs each doc's relevance, but the exhaustive collector doesn't score —
+        // score per doc via `explain` (the same scorer as search). `_score` rejects keyset paging,
+        // so `tantivy_query` here is the unwrapped user query.
         let want_score = sort_has_score(sort);
         let key_field = self.index.schema().get_field(KEY_FIELD)?;
         let mut out = Vec::with_capacity(docs.len());
@@ -1440,11 +1345,9 @@ impl SegmentReader {
         Ok(out)
     }
 
-    /// The set of **highlightable** TEXT field names given a highlight request: the
-    /// requested `fields`, or — when the request lists none — every analyzed TEXT field the index
-    /// stores (`cached`), in schema order. A requested field that isn't an analyzed, stored TEXT
-    /// field is silently dropped (highlighting is best-effort; a non-highlightable name shouldn't
-    /// fail the search). Returns each name paired with its Tantivy [`Field`].
+    /// The **highlightable** TEXT field names for a request: the requested `fields`, or — when none
+    /// are listed — every stored analyzed TEXT field, in schema order. A requested field that isn't
+    /// an analyzed stored TEXT field is silently dropped (highlighting is best-effort).
     fn highlightable_fields(&self, requested: &[String]) -> Vec<(String, Field)> {
         let schema = self.index.schema();
         let is_highlightable = |field: Field| -> bool {
@@ -1470,15 +1373,14 @@ impl SegmentReader {
         }
     }
 
-    /// Fill each hit's per-field [`highlight`](Hit::highlight) from the **analyzed match**:
-    /// for every requested highlightable TEXT field, build a Tantivy
-    /// [`SnippetGenerator`](tantivy::snippet::SnippetGenerator) for `query` and snippet the hit's
-    /// own **cached** text, converting the highlighted byte ranges to XSS-safe
-    /// [segments](HighlightSegment). Bounded by `hl.fragment_size` (the snippet window). Fields with
-    /// no matching fragment for a hit are simply absent from its map.
+    /// Fill each hit's per-field [`highlight`](Hit::highlight) from the analyzed match: for every
+    /// requested highlightable TEXT field, snippet the hit's own **cached** text with a Tantivy
+    /// [`SnippetGenerator`](tantivy::snippet::SnippetGenerator), converting the highlighted ranges
+    /// to XSS-safe [segments](HighlightSegment). Bounded by `hl.fragment_size`. A field with no
+    /// matching fragment is absent from the hit's map.
     ///
-    /// Cost: one `SnippetGenerator` per requested field (built once here, reused across the page)
-    /// plus one snippet per (hit, field). Only runs when the request opted in — off by default.
+    /// Cost: one generator per requested field (reused across the page) + one snippet per (hit,
+    /// field). Off by default.
     pub fn highlight_hits(&self, query: &Query, hits: &mut [Hit], hl: &Highlight) -> Result<()> {
         let fields = self.highlightable_fields(&hl.fields);
         if fields.is_empty() || hits.is_empty() {
@@ -1499,8 +1401,7 @@ impl SegmentReader {
         }
         for hit in hits.iter_mut() {
             for (name, gen) in &generators {
-                // Highlight the field's cached text on the hit — no doc re-fetch. A field
-                // without cached text on this hit has nothing to snippet.
+                // Highlight the field's cached text — no doc re-fetch.
                 let Some(GValue::Str(text)) = hit.fields.get(name) else {
                     continue;
                 };
@@ -1510,8 +1411,7 @@ impl SegmentReader {
                 }
                 let fragment = snippet_to_fragment(snippet.fragment(), snippet.highlighted());
                 if !fragment.segments.is_empty() {
-                    // A single best fragment per field (a solid first version); `max_fragments`
-                    // caps the vec so the wire shape can carry more later without a break.
+                    // A single best fragment per field; `max_fragments` caps the vec.
                     let mut frags = vec![fragment];
                     frags.truncate(hl.max_fragments.max(1));
                     hit.highlight.insert(name.clone(), frags);
@@ -1521,17 +1421,14 @@ impl SegmentReader {
         Ok(())
     }
 
-    /// **Prefix autocomplete**: the indexed terms of `field` that start with
-    /// `prefix`, each with its document frequency, by scanning the field's term
-    /// dictionary from `prefix` until a term no longer matches. `field` must be an
-    /// indexed string field (TEXT → analyzed tokens, KEYWORD → raw values); the store
-    /// merges these across generations and keeps the top suggestions. Collection is
-    /// capped at `scan_cap` terms so a broad prefix can't scan an entire vocabulary.
+    /// **Prefix autocomplete**: the indexed terms of `field` starting with `prefix`, each with its
+    /// doc frequency, by scanning the term dictionary from `prefix` until a term no longer matches.
+    /// `field` must be an indexed string field (TEXT → analyzed tokens, KEYWORD → raw). Capped at
+    /// `scan_cap` terms so a broad prefix can't scan an entire vocabulary.
     ///
-    /// Frequencies are **approximate** — the term dictionary is not merge-on-read
-    /// liveness-filtered, so a term present only in superseded docs may still appear
-    /// (a hint, self-healing on compaction). The prefix is lowercased for TEXT fields
-    /// to match the analyzer's lowercasing.
+    /// Frequencies are **approximate** — the dictionary isn't liveness-filtered, so a term present
+    /// only in superseded docs may still appear (self-healing on compaction). The prefix is
+    /// lowercased for TEXT to match the analyzer.
     pub fn prefix_terms(
         &self,
         field: &str,
@@ -1559,7 +1456,7 @@ impl SegmentReader {
             while stream.advance() {
                 let key = stream.key();
                 if !key.starts_with(needle) {
-                    break; // sorted dictionary — past the prefix range
+                    break; // sorted dictionary — past the prefix
                 }
                 out.push((
                     String::from_utf8_lossy(key).into_owned(),
@@ -1573,15 +1470,12 @@ impl SegmentReader {
         Ok(out)
     }
 
-    /// **Did-you-mean** candidates: indexed terms of `field` within edit
-    /// distance `max_dist` of `term` (excluding `term` itself), each as `(term,
-    /// distance, doc_freq)`. Scans the field's term dictionary, pruning by length and
-    /// a distance-bounded Levenshtein, capped at `scan_cap` terms. The store merges
-    /// across generations and ranks. `field` must be an indexed TEXT/KEYWORD field; the
-    /// query is lowercased for TEXT to match the analyzer.
+    /// **Did-you-mean** candidates: indexed terms of `field` within edit distance `max_dist` of
+    /// `term` (excluding `term` itself), each as `(term, distance, doc_freq)`. Scans the term
+    /// dictionary, pruning by length and a distance-bounded Levenshtein, capped at `scan_cap`.
+    /// `field` must be an indexed TEXT/KEYWORD field; the query is lowercased for TEXT.
     ///
-    /// A linear dictionary scan (a Levenshtein automaton is a future optimization);
-    /// frequencies are **approximate** (not liveness-filtered), the suggester contract.
+    /// Frequencies are **approximate** (not liveness-filtered).
     pub fn fuzzy_terms(
         &self,
         field: &str,
@@ -1631,9 +1525,8 @@ impl SegmentReader {
     }
 
     /// The candidate **window**: the top-`limit` `(score=0, addr)` ordered by the
-    /// numeric/date/**string** fast field `field`. Errors if the field isn't a fast
-    /// field. The values themselves are read back per key by [`fast_value`](
-    /// Self::fast_value) so multi-key ordering is resolved in the store.
+    /// numeric/date/string fast field `field` (errors if it isn't fast). Values are read back per
+    /// key by [`fast_value`](Self::fast_value) so multi-key ordering resolves in the store.
     fn windowed_by_field(
         &self,
         searcher: &tantivy::Searcher,
@@ -1642,10 +1535,9 @@ impl SegmentReader {
         order: tantivy::Order,
         limit: usize,
     ) -> Result<Vec<(f32, tantivy::DocAddress)>> {
-        // `_score` as the primary key: the window IS the top-`limit` by score —
-        // ordered by relevance, with the real per-doc score carried through (unlike fast
-        // fields, whose window score is 0.0 and read back via `fast_value`). Descending is
-        // the natural score order; an ascending `_score` is re-ordered by the store.
+        // `_score` primary: the window IS the top-`limit` by score, with the real per-doc score
+        // carried through (fast fields carry 0.0 and read back via `fast_value`). An ascending
+        // `_score` is re-ordered by the store.
         if field == SCORE_SORT_KEY {
             return Ok(searcher.search(query, &TopDocs::with_limit(limit).order_by_score())?);
         }
@@ -1718,9 +1610,8 @@ impl SegmentReader {
         Ok(v)
     }
 
-    /// Validate `field` is a **fast** field usable as a sort key — numeric, date, or a
-    /// KEYWORD string fast field. The reserved [`SCORE_SORT_KEY`] (`_score`) is always
-    /// sortable (relevance, not a field), so it is exempt from the fast check.
+    /// Validate `field` is a **fast** field usable as a sort key — numeric, date, or KEYWORD.
+    /// The reserved [`SCORE_SORT_KEY`] (`_score`) is always sortable, so it is exempt.
     fn ensure_sortable(&self, field: &str) -> Result<()> {
         if field == SCORE_SORT_KEY {
             return Ok(());
@@ -1739,12 +1630,11 @@ impl SegmentReader {
         }
     }
 
-    /// Scan **every** matching doc for a [field collapse](growlerdb_core::SearchParams)
-    /// (grouping and counting need all members, not a top-`k` window), returning
-    /// `(hit, group_value, sort_values)` for each doc that has the `collapse` field
-    /// set. Docs lacking the collapse field are skipped (they can't be grouped). The
-    /// store merges across generations (liveness), orders by `sort`, and reduces to the
-    /// top hit + count per group. Cost is `O(matches)` — search-support scope (D24).
+    /// Scan **every** matching doc for a [field collapse](growlerdb_core::SearchParams) (grouping
+    /// needs all members, not a top-`k` window), returning `(hit, group_value, sort_values)` for
+    /// each doc that has the `collapse` field set (docs lacking it are skipped). The store then
+    /// merges across generations, orders by `sort`, and reduces to the top hit + count per group.
+    /// `O(matches)` (D24).
     pub fn collapse_scan(
         &self,
         query: &Query,
@@ -1824,19 +1714,15 @@ impl SegmentReader {
         Ok(v)
     }
 
-    /// Build the **keyset predicate**: a query matching exactly the docs strictly
-    /// *after* `cursor` in the [total order](growlerdb_core::Sort) defined by `sort`
-    /// (then the composite key). It is the lexicographic "tuple > cursor" expressed as
-    /// an OR of clauses — for each position `i`, *all earlier keys equal the cursor
-    /// AND key `i` is strictly after the cursor*; plus a final clause where every key
-    /// equals the cursor AND the composite key is greater. A missing field sorts last,
-    /// so "strictly after a present value" also admits docs lacking that field, and
-    /// "equal to a missing cursor value" means the field is absent. `sort` is
-    /// non-empty (checked by the caller).
+    /// Build the **keyset predicate**: a query matching exactly the docs strictly *after* `cursor`
+    /// in the [total order](growlerdb_core::Sort) of `sort` (then the composite key). The
+    /// lexicographic "tuple > cursor" as an OR of clauses — for each position `i`, *all earlier keys
+    /// equal the cursor AND key `i` is strictly after*; plus a final clause where every key equals
+    /// the cursor AND the composite key is greater. A missing field sorts last, so "strictly after a
+    /// present value" also admits docs lacking the field. `sort` is non-empty (checked by caller).
     fn keyset_after(&self, sort: &[Sort], cursor: &SearchAfter) -> Result<Box<dyn TantivyQuery>> {
         if sort_has_score(sort) {
-            // A relevance score isn't a stable, range-able key, so it can't anchor a
-            // keyset predicate. `_score` sorts are offset-paged only.
+            // A relevance score isn't a stable, range-able key — `_score` is offset-paged only.
             return Err(IndexError::QueryType(
                 "search_after (keyset paging) is not supported with a `_score` sort key; \
                  use offset paging"
@@ -1848,7 +1734,7 @@ impl SegmentReader {
                 "search_after cursor arity does not match the sort keys".into(),
             ));
         }
-        // Resolve each sort key's field + type once (validates they're sortable).
+        // Resolve each sort key's field + type once (also validates sortability).
         let mut cols = Vec::with_capacity(sort.len());
         for s in sort {
             self.ensure_sortable(&s.field)?;
@@ -1859,8 +1745,8 @@ impl SegmentReader {
 
         let mut shoulds: Vec<(Occur, Box<dyn TantivyQuery>)> = Vec::new();
         for i in 0..sort.len() {
-            // Position `i` strictly after the cursor; skip if the cursor value is
-            // missing there (nothing sorts strictly after "last").
+            // Position `i` strictly after the cursor; skip if its cursor value is missing (nothing
+            // sorts after "last").
             let Some(after_i) = self.kv_after(
                 cols[i].0,
                 cols[i].1,
@@ -1900,9 +1786,9 @@ impl SegmentReader {
         Ok(Box::new(BooleanQuery::new(shoulds)))
     }
 
-    /// A query matching docs whose `field` **equals** the cursor value `val` — an
-    /// inclusive point range for a present value, or "field absent" (`MustNot Exists`)
-    /// when the cursor lacked the field ([`Missing`](SortValue::Missing)).
+    /// A query matching docs whose `field` **equals** the cursor value `val` — an inclusive point
+    /// range for a present value, or "field absent" when the cursor lacked it
+    /// ([`Missing`](SortValue::Missing)).
     fn kv_exact(
         &self,
         name: &str,
@@ -1919,10 +1805,9 @@ impl SegmentReader {
         }
     }
 
-    /// A query matching docs whose `field` is **strictly after** the cursor value
-    /// `val` in `order` — i.e. greater (asc) / lesser (desc), *plus* docs missing the
-    /// field (a missing value sorts last, after any present one). `None` when the
-    /// cursor value is itself [`Missing`](SortValue::Missing) (nothing is after "last").
+    /// A query matching docs whose `field` is **strictly after** the cursor value `val` in `order`
+    /// — greater (asc) / lesser (desc), *plus* docs missing the field (a missing value sorts last).
+    /// `None` when the cursor value is itself [`Missing`](SortValue::Missing).
     fn kv_after(
         &self,
         name: &str,
@@ -1963,9 +1848,8 @@ impl SegmentReader {
             Query::MatchAll => Ok(Box::new(AllQuery)),
             Query::Term { field, value } => {
                 // A dotted `<col>.<path>:value` on an **undeclared** variant sub-path is a flatten
-                // exact-term match — rewrite to the single `<col>#terms` keyword field with the
-                // `path\u{1}value` token the write path indexed. A *declared* shaped path is a
-                // direct field (below), and full-text `<col>:value` resolves to the catch-all.
+                // exact-term match — rewrite to `<col>#terms` with the `path\u{1}value` token. A
+                // declared shaped path is a direct field (below).
                 if let Some(name) = field.as_deref() {
                     if let Some(terms) = self.flatten_terms_field(name) {
                         let token = format!("{name}{FLATTEN_TERM_SEP}{value}");
@@ -1975,17 +1859,14 @@ impl SegmentReader {
                         )));
                     }
                 }
-                // A bare `field:value` on a numeric / date / bool / IP field is an **exact-value
-                // match**, not a text term — those columns are indexed but not analyzed, so a text
-                // `TermQuery` finds nothing and `resolve_field` (text-only) would reject the field as
-                // "non-searchable". Reuse the typed, validated range path as an inclusive
-                // `[value TO value]`. (A genuinely unknown field still falls through to the text path
-                // below and errors as `UnknownField`.)
+                // A bare `field:value` on a numeric/date/bool/IP field is an **exact-value match**,
+                // not a text term — those columns aren't analyzed, so a text `TermQuery` finds
+                // nothing. Reuse the typed range path as an inclusive `[value TO value]`. (A truly
+                // unknown field falls through to the text path below and errors as `UnknownField`.)
                 if let Some(name) = field.as_deref() {
                     if let Ok((f, ftype)) = self.resolve_typed_field(name) {
-                        // BOOL is exact-match, but Tantivy's `RangeQuery` rejects a `Bool` term
-                        // ("Expected term with u64, i64, f64 or date"), so a `[true TO true]` range
-                        // errors. Build the `TermQuery` directly instead.
+                        // Tantivy's `RangeQuery` rejects a `Bool` term, so build the `TermQuery`
+                        // directly for BOOL.
                         if let TvFieldType::Bool(_) = ftype {
                             let b = value.parse::<bool>().map_err(|_| {
                                 IndexError::QueryType(format!("bad bool value `{value}`"))
@@ -2007,9 +1888,8 @@ impl SegmentReader {
                     }
                 }
                 let (field, is_text) = self.resolve_field(field.as_deref())?;
-                // TEXT is analyzed (lowercased) at index time; match that. KEYWORD
-                // is raw/exact. The record option must match how the field was
-                // indexed (TEXT has freqs+positions; KEYWORD is basic).
+                // TEXT is analyzed (lowercased); KEYWORD is raw/exact. The record option must match
+                // how the field was indexed (TEXT freqs+positions; KEYWORD basic).
                 let (term, opt) = if is_text {
                     (
                         Term::from_field_text(field, &value.to_lowercase()),
@@ -2068,14 +1948,12 @@ impl SegmentReader {
             }
             Query::Phrase { field, terms, slop } => {
                 // A quoted `field:"value"` parses as a Phrase, but a positional phrase only means
-                // something on an analyzed TEXT field. The facet / filter chips emit `field:"value"`
-                // for *every* field type (KEYWORD, numeric, date, …), so on anything but analyzed
-                // TEXT a phrase is an **exact-value match** — reuse the Term path (KEYWORD raw,
-                // numeric/date exact via Range) rather than rejecting the field.
+                // something on analyzed TEXT. The facet/filter chips emit `field:"value"` for every
+                // field type, so on anything but TEXT a phrase is an **exact-value match** — reuse
+                // the Term path rather than rejecting the field.
                 if let Some(name) = field.as_deref() {
                     if let Ok((_, ftype)) = self.resolve_typed_field(name) {
-                        // Non-Str (numeric / date / bool / IP): resolve_field (text-only) would
-                        // reject it; delegate before resolving.
+                        // Non-Str: resolve_field (text-only) would reject it; delegate first.
                         if !matches!(ftype, TvFieldType::Str(_)) {
                             return self.build(&Query::Term {
                                 field: Some(name.to_string()),
@@ -2086,8 +1964,7 @@ impl SegmentReader {
                 }
                 let name = field.clone();
                 let (field, is_text) = self.resolve_field(field.as_deref())?;
-                // KEYWORD (raw, non-analyzed Str): a phrase is an exact keyword match, not a
-                // positional phrase — reuse Term so `field:"value"` matches the stored keyword.
+                // KEYWORD: a phrase is an exact keyword match, not positional — reuse Term.
                 if !is_text {
                     return self.build(&Query::Term {
                         field: name,
@@ -2107,9 +1984,8 @@ impl SegmentReader {
                         IndexRecordOption::WithFreqsAndPositions,
                     ))),
                     _ => {
-                        // A multi-token phrase needs positions. A field mapped with
-                        // `record: BASIC|FREQ` doesn't have them — fail with the fix, not
-                        // tantivy's opaque weight error or silently-empty results.
+                        // A multi-token phrase needs positions; a `record: BASIC|FREQ` field lacks
+                        // them — fail with the fix, not an opaque error or empty results.
                         let schema = self.index.schema();
                         let entry = schema.get_field_entry(field);
                         let has_positions = matches!(
@@ -2167,8 +2043,7 @@ impl SegmentReader {
                 Ok(Box::new(RegexQuery::from_pattern(pattern, field)?))
             }
             Query::Exists { field } => {
-                // Exists works on any indexed/fast field, so it skips the text-only
-                // `resolve_field`; the field must exist and not be the stored key.
+                // Exists works on any indexed/fast field, so it skips the text-only `resolve_field`.
                 if field == KEY_FIELD || self.index.schema().get_field(field).is_err() {
                     return Err(IndexError::UnknownField(field.clone()));
                 }
@@ -2230,10 +2105,8 @@ impl SegmentReader {
                 }
                 Ok(Box::new(BooleanQuery::new(clauses)))
             }
-            // KNN is resolved over the per-segment ANN sidecars, not compiled to a Tantivy query —
-            // it is a top-level retrieval clause ([`knn_search`](Self::knn_search) / the
-            // `search_sorted` fast path handle it). Reaching here means it was nested inside a
-            // lexical query (a `Bool`/`Boost`), which is fusion — a later task.
+            // KNN is a top-level retrieval clause resolved over the ANN sidecars, not compiled here.
+            // Reaching this arm means it was nested in a lexical query (fusion — a later task).
             Query::Knn { .. } => Err(IndexError::QueryType(
                 "KNN cannot be combined lexically — run it as a top-level KNN search (score \
                  fusion with lexical results is not yet supported)"
@@ -2254,10 +2127,9 @@ impl SegmentReader {
         Ok(out)
     }
 
-    /// **Explain** how `query` scores the document identified by `key_enc`: locate the doc
-    /// by its encoded composite key, then ask Tantivy for the per-clause BM25 explanation. Also
-    /// returns the post-analyzer tokens the query searched for. `found = false` if the key isn't in
-    /// the index; `matched = false` if the doc exists but the query doesn't select it.
+    /// **Explain** how `query` scores the doc identified by `key_enc`: locate it by encoded key,
+    /// then ask Tantivy for the per-clause BM25 explanation, plus the post-analyzer tokens searched
+    /// for. `found = false` if the key isn't indexed; `matched = false` if it is but doesn't select.
     pub fn explain(&self, query: &Query, key_enc: &[u8]) -> Result<ExplainHit> {
         let analyzed = self.analyzed_terms(query);
         let searcher = self.reader.searcher();
@@ -2277,8 +2149,7 @@ impl SegmentReader {
             });
         };
         let tantivy_query = self.build(query)?;
-        // `explain` errors when the doc doesn't match the query — that's a real, expected answer
-        // ("matched = false"), not a failure.
+        // `explain` errors when the doc doesn't match — that's an expected answer (matched = false).
         match tantivy_query.explain(&searcher, address) {
             Ok(exp) => Ok(ExplainHit {
                 found: true,
@@ -2297,8 +2168,8 @@ impl SegmentReader {
         }
     }
 
-    /// The post-analyzer tokens `query` searches for, as `(field, tokens)`. Walks the
-    /// leaf clauses, running each field's analyzer so the console can show exactly what was matched.
+    /// The post-analyzer tokens `query` searches for, as `(field, tokens)` — the leaf clauses run
+    /// through each field's analyzer, so the console can show exactly what was matched.
     fn analyzed_terms(&self, query: &Query) -> Vec<(String, Vec<String>)> {
         let mut out = Vec::new();
         self.collect_analyzed(query, &mut out);
@@ -2334,7 +2205,7 @@ impl SegmentReader {
 
     fn push_analyzed(&self, field: Option<&str>, text: &str, out: &mut Vec<(String, Vec<String>)>) {
         let name = field.unwrap_or("_default").to_string();
-        // Run the field's analyzer when it's a TEXT field; otherwise the raw value is the token.
+        // TEXT fields run through the analyzer; otherwise the raw value is the token.
         let tokens = match self.resolve_field(field) {
             Ok((f, true)) => self
                 .analyze(f, text)
@@ -2344,9 +2215,8 @@ impl SegmentReader {
         out.push((name, tokens));
     }
 
-    /// Resolve a query field name to its Tantivy field + whether it is analyzed
-    /// (TEXT). `None` resolves to the default TEXT field. The stored key field and
-    /// any non-indexed field are rejected as unknown.
+    /// Resolve a query field name to its Tantivy field + whether it is analyzed (TEXT). `None`
+    /// resolves to the default TEXT field. The stored key and non-indexed fields are rejected.
     fn resolve_field(&self, name: Option<&str>) -> Result<(Field, bool)> {
         let schema = self.index.schema();
         match name {
@@ -2356,9 +2226,8 @@ impl SegmentReader {
                 }
                 let field = match schema.get_field(name) {
                     Ok(f) => f,
-                    // A bare variant column name (`payload`) has no field of its own — it resolves
-                    // to its analyzed flatten catch-all `<col>#text` (full-text over the value's
-                    // string leaves), when that mode is enabled.
+                    // A bare variant column name (`payload`) resolves to its analyzed flatten
+                    // catch-all `<col>#text`, when that mode is enabled.
                     Err(_) => schema
                         .get_field(&flatten_text_field_name(name))
                         .map_err(|_| IndexError::UnknownField(name.to_string()))?,
@@ -2374,15 +2243,14 @@ impl SegmentReader {
         }
     }
 
-    /// If `name` is an **undeclared** dotted sub-path under a variant column whose flatten term
-    /// index (`<col>#terms`) exists, return that field — the rewrite target for a flatten
-    /// `path = value` term query. `None` when `name` is a declared field (a shaped path uses its
-    /// own typed field) or no variant column is a dotted prefix of it. Scans dotted prefixes
+    /// If `name` is an **undeclared** dotted sub-path under a variant column whose `<col>#terms`
+    /// index exists, return that field — the rewrite target for a flatten `path = value` term query.
+    /// `None` for a declared field or when no variant column is a dotted prefix. Scans prefixes
     /// longest-first, so the most specific variant column wins.
     fn flatten_terms_field(&self, name: &str) -> Option<Field> {
         let schema = self.index.schema();
         if schema.get_field(name).is_ok() {
-            return None; // a declared field (incl. a shaped path) — not a flatten rewrite
+            return None; // a declared field — not a flatten rewrite
         }
         let mut end = name.len();
         while let Some(dot) = name[..end].rfind('.') {
@@ -2436,9 +2304,8 @@ fn range_term(field: Field, ftype: &TvFieldType, v: &str) -> Result<Term> {
         TvFieldType::I64(_) => Term::from_field_i64(field, v.parse().map_err(|_| bad("integer"))?),
         TvFieldType::F64(_) => Term::from_field_f64(field, v.parse().map_err(|_| bad("float"))?),
         TvFieldType::Bool(_) => Term::from_field_bool(field, v.parse().map_err(|_| bad("bool"))?),
-        // A DATE bound is canonical epoch micros, but for authoring convenience it may also be
-        // written as an ISO-8601 / RFC3339 datetime (`2024-01-01T00:00:00Z`) or a bare `YYYY-MM-DD`
-        // date (UTC midnight); a raw integer stays epoch micros.
+        // A DATE bound is canonical epoch micros, but may also be written as ISO-8601/RFC3339 or a
+        // bare `YYYY-MM-DD` (UTC midnight) for authoring convenience.
         TvFieldType::Date(_) => Term::from_field_date(
             field,
             DateTime::from_timestamp_micros(
@@ -2458,9 +2325,8 @@ fn range_term(field: Field, ftype: &TvFieldType, v: &str) -> Result<Term> {
     })
 }
 
-/// Levenshtein edit distance between `a` and `b`, short-circuiting to `None` once it
-/// is known to exceed `max` (a whole DP row above `max` ⇒ no path back under it). Used
-/// by the did-you-mean suggester to keep candidate scoring cheap.
+/// Levenshtein edit distance between `a` and `b`, short-circuiting to `None` once it is known to
+/// exceed `max` (a whole DP row above `max` ⇒ no path back under it).
 fn bounded_levenshtein(a: &[char], b: &[char], max: u8) -> Option<u8> {
     let max = max as usize;
     let (n, m) = (a.len(), b.len());
@@ -2550,10 +2416,9 @@ fn field_kind(schema: &Schema, field: Field) -> Option<bool> {
     }
 }
 
-/// Convert a Tantivy snippet — a `fragment` string plus `highlighted` byte ranges into it — to an
-/// XSS-safe [`HighlightFragment`] of alternating context / matched [segments](HighlightSegment).
-/// Overlapping ranges are collapsed first (Tantivy can emit adjacent/overlapping hits),
-/// and the fragment carries no HTML — the client wraps `marked` segments in `<mark>` itself.
+/// Convert a Tantivy snippet — a `fragment` string plus `highlighted` byte ranges — to an XSS-safe
+/// [`HighlightFragment`] of alternating context/matched [segments](HighlightSegment). Overlapping
+/// ranges are collapsed first; the fragment carries no HTML (the client wraps `marked` segments).
 fn snippet_to_fragment(
     fragment: &str,
     highlighted: &[std::ops::Range<usize>],

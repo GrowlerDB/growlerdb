@@ -1,13 +1,7 @@
-//! The **Node client seam**: the [`Node`] trait is the Gateway's
-//! view of one Node's query/admin surface, and [`LocalNode`] is the in-process
-//! implementation that delegates straight to this process's services (embedded mode);
-//! [`RemoteNode`] implements the same trait over a gRPC channel for distributed mode, so the
-//! [Gateway](crate::gateway::Gateway) routes through `dyn Node` without caring whether the Node is
-//! in-process or across the network.
-//!
-//! Scope is the surface the Engine API terminates — search, suggest, hydrate
-//! (`get_by_key`), and `describe_index`. Writes go connector → Node `Write` gRPC directly
-//! (not through the Gateway).
+//! The **Node client seam**: the [`Node`] trait is the Gateway's view of one Node's query/admin
+//! surface. [`LocalNode`] delegates in-process (embedded mode); [`RemoteNode`] implements the same
+//! trait over gRPC (distributed mode), so the [Gateway](crate::gateway::Gateway) routes through
+//! `dyn Node` regardless of transport. Writes go connector → Node `Write` gRPC directly, not the Gateway.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -43,10 +37,8 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// How long to wait for a keepalive ping ack before the connection is declared dead.
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a [`FailoverNode`] holder stays **down-marked** after a transport-down failure before
-/// one read probes it again (half-open). Short by design: it only has to bridge the window between
-/// a holder dying and either its channel reconnecting or the gateway's CP poll re-placing the unit —
-/// long enough that a blackholed peer doesn't cost every read a probe, short enough that a recovered
-/// holder is back in rotation within a few seconds.
+/// one read probes it again (half-open). Short by design: long enough that a blackholed peer doesn't
+/// cost every read a probe, short enough that a recovered holder is back in rotation within seconds.
 const HOLDER_DOWN_COOLDOWN: Duration = Duration::from_secs(3);
 
 /// The shared [`Endpoint`] shape for a Node channel: connect + per-request timeouts, and HTTP/2
@@ -71,11 +63,9 @@ pub trait Node: Send + Sync {
     async fn search(&self, req: Request<SearchRequest>)
         -> Result<Response<SearchResponse>, Status>;
 
-    /// Semantic (KNN) search against the Node's shard: the Node embeds the request's `query_text`
-    /// with the vector field's embedder and returns the nearest documents' coordinates + KNN
-    /// scores. Defaults to `Unimplemented` so simple Node impls (and test stubs / windowed nodes
-    /// that don't yet serve vector search) need not provide it; [`LocalNode`]/[`RemoteNode`]
-    /// override it.
+    /// Semantic (KNN) search against the Node's shard: embeds the request's `query_text` with the
+    /// vector field's embedder and returns the nearest documents' coordinates + KNN scores. Defaults
+    /// to `Unimplemented`; [`LocalNode`]/[`RemoteNode`] override it.
     async fn semantic_search(
         &self,
         _req: Request<SemanticSearchRequest>,
@@ -98,8 +88,8 @@ pub trait Node: Send + Sync {
         req: Request<DescribeIndexRequest>,
     ) -> Result<Response<DescribeIndexResponse>, Status>;
 
-    /// Aggregate over the docs a query matches. Defaults to `Unimplemented` so simple Node
-    /// impls (and test stubs) need not provide it; [`LocalNode`]/`RemoteNode` override it.
+    /// Aggregate over the docs a query matches. Defaults to `Unimplemented`; [`LocalNode`]/`RemoteNode`
+    /// override it.
     async fn aggregate(
         &self,
         _req: Request<AggregateRequest>,
@@ -107,8 +97,8 @@ pub trait Node: Send + Sync {
         Err(Status::unimplemented("aggregate"))
     }
 
-    /// Explain how a query scores one document. Defaults to `Unimplemented` so test
-    /// stubs need not provide it; [`LocalNode`]/[`RemoteNode`] override it.
+    /// Explain how a query scores one document. Defaults to `Unimplemented`;
+    /// [`LocalNode`]/[`RemoteNode`] override it.
     async fn explain(
         &self,
         _req: Request<ExplainRequest>,
@@ -116,10 +106,9 @@ pub trait Node: Send + Sync {
         Err(Status::unimplemented("explain"))
     }
 
-    /// Rebuild this Node's index from source and durably swap it live. A write-fenced
-    /// **mutation** — unlike the read RPCs the Gateway scatters, this targets the single owning
-    /// Node. Defaults to `Unimplemented` so test stubs need not provide it; [`LocalNode`] and
-    /// [`RemoteNode`] override it.
+    /// Rebuild this Node's index from source and durably swap it live. A write-fenced **mutation** —
+    /// unlike the read RPCs the Gateway scatters, this targets the single owning Node. Defaults to
+    /// `Unimplemented`; [`LocalNode`]/[`RemoteNode`] override it.
     async fn reindex_index(
         &self,
         _req: Request<ReindexIndexRequest>,
@@ -128,10 +117,9 @@ pub trait Node: Send + Sync {
     }
 
     /// Plan (and optionally apply in-place) an index-definition change against the owning Node:
-    /// diff a candidate definition vs the served one — in-place metadata changes vs
-    /// changes that force a reindex — and, with `apply`, persist the in-place ones live. A
-    /// write-targeted **mutation** like reindex. Defaults to `Unimplemented`; [`LocalNode`] and
-    /// [`RemoteNode`] override it.
+    /// diff a candidate definition vs the served one and, with `apply`, persist the in-place changes
+    /// live. A write-targeted **mutation** like reindex. Defaults to `Unimplemented`; [`LocalNode`]
+    /// and [`RemoteNode`] override it.
     async fn alter_index(
         &self,
         _req: Request<AlterIndexRequest>,
@@ -336,12 +324,11 @@ impl RemoteNode {
         Ok(Self::with_channel(channel, token))
     }
 
-    /// Like [`connect`](Self::connect) but **lazy**: build the channel without establishing the
-    /// connection now. The connection opens on first use and — crucially for resilience —
-    /// **re-resolves DNS on every (re)connect attempt**, so a shard whose pod crashed and came back
-    /// at a *new* IP is reached again automatically, and a still-down shard fails fast at
-    /// [`CONNECT_TIMEOUT`] (→ a `partial` query) instead of blocking on a stale connection. Building
-    /// never fails on an unreachable node, so a Gateway can front a partially-down cluster.
+    /// Like [`connect`](Self::connect) but **lazy**: build the channel without connecting now. The
+    /// connection opens on first use and re-resolves DNS on every (re)connect, so a shard that came
+    /// back at a new IP is reached again automatically, and a still-down shard fails fast at
+    /// [`CONNECT_TIMEOUT`]. Building never fails on an unreachable node, so a Gateway can front a
+    /// partially-down cluster.
     pub fn connect_lazy(
         endpoint: impl Into<String>,
         token: Option<&str>,
@@ -604,17 +591,14 @@ impl HolderHealth {
 /// honest error — never a possibly-stale replica answer dressed as complete.
 ///
 /// **Health memory (down-marking).** Each holder carries a lock-free last-failure timestamp
-/// ([`HolderHealth`]): a transport-down failure down-marks the holder, and ordinary failover reads
-/// **skip** a holder down-marked less than [`HOLDER_DOWN_COOLDOWN`] ago — so after a primary dies,
-/// reads go straight to a replica instead of paying the dead primary's probe (up to a connect
-/// timeout when blackholed) on every request until the gateway's CP poll re-places the unit. Once a
-/// mark expires the next read probes the holder again (half-open) and either clears the mark or
-/// refreshes it. Two deliberate exceptions ignore down-marks:
-/// - if **every** holder is down-marked, reads try all of them anyway (fast-failing without probing
-///   would turn a blip on a single-holder unit into a cooldown of guaranteed errors);
+/// ([`HolderHealth`]): a transport-down failure down-marks it, and failover reads skip a holder
+/// down-marked less than [`HOLDER_DOWN_COOLDOWN`] ago, so after a primary dies reads go straight to
+/// a replica instead of re-probing the dead one every request. An expired mark half-opens (next read
+/// probes). Two exceptions ignore down-marks:
+/// - if **every** holder is down-marked, reads try all anyway (else a blip on a single-holder unit
+///   becomes a cooldown of guaranteed errors);
 /// - **`require_complete` pinned reads and mutations** always go to the primary regardless of its
-///   mark — an honest error beats a silently stale replica, and they neither consult nor update the
-///   health state.
+///   mark — an honest error beats a silently stale replica; they neither consult nor update health.
 pub struct FailoverNode {
     /// Primary first, then replicas. Always non-empty (a primary is required).
     holders: Vec<HolderHealth>,

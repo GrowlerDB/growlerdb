@@ -1,9 +1,6 @@
-//! The **reindex write-fence**: a clone-shared flag the [Admin](crate::AdminService)
-//! service engages while a reindex rebuilds, and the [Write](crate::WriteService) service checks to
-//! reject new writes with a retryable status. Fencing writes across the rebuild stops the connector
-//! from advancing the shard past the rebuild's source snapshot — a delta the swap would otherwise
-//! drop (regressing the checkpoint / breaking exactly-once). It also doubles as the
-//! single-flight guard: a second reindex can't [`engage`](ReindexFence::engage) an engaged fence.
+//! The **reindex write-fence**: a clone-shared flag [Admin](crate::AdminService) engages during a
+//! reindex and [Write](crate::WriteService) checks to reject writes — stopping the connector advancing
+//! the shard past the rebuild's snapshot (breaking exactly-once). Also the single-flight guard.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -71,7 +68,7 @@ mod tests {
         {
             let _guard = ReindexGuard::new(fence.clone());
             assert!(fence.is_engaged());
-        } // guard dropped here
+        }
         assert!(!fence.is_engaged(), "guard released the fence on drop");
         assert!(fence.engage(), "fence is reusable after release");
     }

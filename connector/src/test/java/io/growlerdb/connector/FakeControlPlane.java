@@ -19,10 +19,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 final class FakeControlPlane extends ControlPlaneGrpc.ControlPlaneImplBase {
 
   private volatile GetIndexResponse index = GetIndexResponse.getDefaultInstance();
-  /** The endpoint resolveUnitOwner hands out for EVERY window (one owner is enough for the tests). */
+  /** Endpoint handed out for EVERY window — one owner is enough for the tests. */
   private volatile String windowOwner = "";
-  /** Per-call owner overrides, consumed in order before {@link #windowOwner} — so a test can model
-   *  "first resolve says A (dead), the re-resolve after its failure says B (the re-placement)". */
+  /** Per-call owner overrides, consumed in order before {@link #windowOwner}, so a test can model a
+   *  dead owner followed by the re-placement on the re-resolve. */
   private final Deque<String> ownerQueue = new ConcurrentLinkedDeque<>();
 
   final AtomicInteger getIndexCalls = new AtomicInteger();

@@ -75,7 +75,6 @@
     }
   });
 
-  // Fetch the explanation the first time the Explain tab is shown.
   $effect(() => {
     if (tab === 'explain' && !explainRequested && hit.coordinates) {
       explainRequested = true;

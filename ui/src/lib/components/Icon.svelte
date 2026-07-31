@@ -1,7 +1,6 @@
 <script lang="ts">
-  // Small inline stroke icons (console revamp) — replace the legacy emoji (🕑/⚠/⏱) with crisp,
-  // currentColor-tinted SVGs. Stroke weight 1.5 matches the Sparkline/nav line weight. Decorative
-  // by default (aria-hidden); pair with visible text or an aria-label on the control.
+  // Small inline currentColor-tinted stroke icons; weight 1.5 matches the Sparkline/nav line.
+  // Decorative (aria-hidden) — pair with visible text or an aria-label on the control.
   let { name, size = 14 }: { name: 'clock' | 'warn' | 'stopwatch'; size?: number } = $props();
 </script>
 

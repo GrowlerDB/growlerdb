@@ -68,7 +68,11 @@ for windowed units and following the same path for hash ordinals. The pool now *
 leader-only placement sweep distributes hash primaries round-robin, and a node the CP assigns a primary
 it doesn't hold **builds it on assignment** from source (single-shard today) — so the operator points N
 interchangeable nodes at the pool with a **uniform config** and the CP designates who owns what, no
-per-node build/primary designation. **Cold-start fast path:** a *never-placed* primary is placed as
+per-node build/primary designation. A node already serving that ordinal as a read-through **replica**
+is **promoted** rather than skipped: the freshly-built primary **replaces** the replica in the pool
+maps, so a replica→primary role change never leaves the node serving the stale cold snapshot after the
+source advances (the window-style de-assignment path tracks only windowed units, so hash ordinals rely
+on this in-place promotion). **Cold-start fast path:** a *never-placed* primary is placed as
 soon as a brief initial settle clears (`INITIAL_PLACEMENT_SETTLE_MS`, a few seconds — long enough for
 co-booting nodes to register so primaries round-robin balanced), rather than waiting out the full
 liveness grace ([`NODE_HEARTBEAT_TTL_MS`](/system/decisions/d53-unit-replication.md), ~30 s, which

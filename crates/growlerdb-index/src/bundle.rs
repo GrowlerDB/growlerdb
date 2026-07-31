@@ -1,14 +1,12 @@
-//! **Split bundling** for cold windows. The cold tier parks each Tantivy segment file
-//! as its own object, so a cold query that touches several files issues one ranged GET *per file*
-//! (term dict, postings, fast fields, store — easily 5–15 objects per segment). Bundling
-//! concatenates a window's files into a single "split" object and records each file's byte span, so
-//! the read path issues ranged GETs against **one** object instead — cutting per-query request
-//! fan-out (and the per-object latency/overhead), the Quickwit split model.
+//! **Split bundling** for cold windows (the Quickwit split model). The cold tier parks each Tantivy
+//! segment file as its own object, so a cold query touching several files issues one ranged GET per
+//! file (easily 5–15 objects per segment). Bundling concatenates a window's files into one "split"
+//! object and records each file's byte span, so the read path issues ranged GETs against **one**
+//! object — cutting per-query request fan-out and per-object overhead.
 //!
-//! The bundle composes with the [`hotcache`](crate::hotcache): the hotcache still serves structural
-//! reads on open with zero round-trips (its ranges are keyed by the *logical* per-file key, stable
-//! across bundling), and only a query's actual cold postings are fetched — now from the one bundle
-//! object at the file's offset.
+//! Composes with the [`hotcache`](crate::hotcache): its ranges are keyed by the *logical* per-file
+//! key (stable across bundling), so structural reads on open stay round-trip-free and only a query's
+//! actual cold postings are fetched — now from the one bundle object at the file's offset.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,10 +30,10 @@ pub(crate) struct BundleState {
     pub files: HashMap<String, (u64, u64)>,
 }
 
-/// Build a single bundle from the individual index files under `object_prefix` in `op`: concatenate
-/// them into one object at `bundle_key` and write the [`BundleLayout`] (postcard) to `manifest_key`.
-/// Async object I/O only (no tantivy), so it runs directly on the caller's runtime. Files are read in
-/// listing order; Tantivy addresses them by name, so order is irrelevant to correctness.
+/// Build a single bundle from the index files under `object_prefix` in `op`: concatenate them into
+/// one object at `bundle_key` and write the [`BundleLayout`] (postcard) to `manifest_key`. Async
+/// object I/O only, so it runs on the caller's runtime. Files are read in listing order; Tantivy
+/// addresses them by name, so order is irrelevant to correctness.
 pub async fn build(
     op: &opendal::Operator,
     object_prefix: &str,
@@ -49,9 +47,8 @@ pub async fn build(
         .recursive(true)
         .await
         .map_err(|e| StoreError::Cold(e.to_string()))?;
-    // Stream each file through the object writer (multipart on S3) rather than concatenating the
-    // whole window into one Vec<u8> — a cold window is potentially many GB, so buffering it all would
-    // OOM the node at park time. Peak memory is one segment file, not the window.
+    // Stream each file through the object writer (multipart on S3) rather than buffering the whole
+    // window (potentially many GB) into one Vec — peak memory is one segment file, not the window.
     let mut writer = op
         .writer(bundle_key)
         .await
@@ -99,15 +96,12 @@ async fn write_bundle_manifest(
     Ok(())
 }
 
-/// Like [`build`], but streams the window's index files straight from a **local directory** instead of
-/// re-downloading them from object storage. At cold-park the files are still on local disk
-/// (eviction is the last step), so re-fetching each one from the store just to concatenate it is pure
-/// I/O waste. `files` are paths relative to `local_dir` — pass the backup manifest's `index/` files
-/// (stripped of that prefix) so the bundle records the same bare rels as [`build`] and contains
-/// exactly what was parked. Peak memory stays one file: each is streamed through the multipart writer
-/// and dropped, matching [`build`]'s bound. The resulting [`BundleLayout`] is byte-identical in shape
-/// to a [`build`] over the same files (offsets follow `files` order; Tantivy addresses by name, so
-/// order is irrelevant to correctness).
+/// Like [`build`], but streams the window's index files straight from a **local directory** instead
+/// of re-downloading them. At cold-park the files are still on local disk (eviction is the last
+/// step), so re-fetching each from the store to concatenate it is pure I/O waste. `files` are paths
+/// relative to `local_dir` — pass the backup manifest's `index/` files (stripped of that prefix) so
+/// the bundle records the same bare rels as [`build`]. Peak memory stays one file, matching
+/// [`build`]'s bound; the resulting [`BundleLayout`] is byte-identical in shape.
 pub async fn build_from_dir(
     op: &opendal::Operator,
     local_dir: &std::path::Path,
@@ -140,11 +134,10 @@ pub async fn build_from_dir(
     Ok(layout)
 }
 
-/// Un-bundle a split back into individual files under `dest_index_dir` (for pre-warm): read
-/// the layout from `manifest_key`, then **ranged-read each file's span** from the bundle straight to
-/// disk. The inverse of [`build`] — used to promote a bundled cold window back to a local hot shard.
-/// Ranged per-file reads (not one whole-bundle fetch) keep peak memory to one segment, so promoting a
-/// multi-GB window can't OOM the node. Async object I/O only.
+/// Un-bundle a split back into individual files under `dest_index_dir` (the pre-warm promote path):
+/// read the layout from `manifest_key`, then **ranged-read each file's span** from the bundle
+/// straight to disk. The inverse of [`build`]. Ranged per-file reads (not one whole-bundle fetch)
+/// keep peak memory to one segment. Async object I/O only.
 pub async fn unbundle(
     op: &opendal::Operator,
     bundle_key: &str,

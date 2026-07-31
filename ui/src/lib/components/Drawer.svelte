@@ -1,5 +1,5 @@
 <script lang="ts">
-  // A right-side slide-in drawer: the document drawer, etc. Backdrop click + Escape close.
+  // A right-side slide-in drawer. Backdrop click + Escape close.
   import type { Snippet } from 'svelte';
   let {
     title,
@@ -22,7 +22,7 @@
 
 <svelte:window onkeydown={onKey} />
 
-<!-- Backdrop: a styling/close affordance; Escape + the × button are the keyboard paths. -->
+<!-- Backdrop is mouse-only; Escape + the × button are the keyboard close paths. -->
 <div class="dc-drawer-backdrop" onclick={onClose} role="presentation"></div>
 <div
   class="dc-drawer"

@@ -9,8 +9,8 @@
 //!
 //! Two **placement** modes:
 //! * **Legacy** — `shard = fnv1a(key) % shards`. The direct mapping; resharding
-//!   re-routes (almost) every key, so it's reindex-only. Indexes without a bucket
-//!   layer use this, and it stays the default so existing data is never misplaced.
+//!   re-routes (almost) every key, so it's reindex-only. The default for indexes
+//!   without a bucket layer.
 //! * **Bucketed** — `bucket = fnv1a(key) % `[`NUM_BUCKETS`]`; shard = `bucket→shard map. A fixed
 //!   virtual-bucket layer (consistent hashing): growing/shrinking shards moves whole **buckets**
 //!   ([`BucketMap::reassign`]) — bounded data movement (~1/N), online — instead of re-routing

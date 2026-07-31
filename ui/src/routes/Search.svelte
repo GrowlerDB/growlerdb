@@ -69,7 +69,7 @@
   let hits = $state<SearchHit[]>([]);
   let total = $state(0);
   let partial = $state(false);
-  let partialDismissed = $state(false); // the partial-results banner is dismissible
+  let partialDismissed = $state(false);
   let elapsedMs = $state<number | null>(null); // client-measured query round-trip
   let shardsScanned = $state(0); // shards the Gateway queried; 0 = bare Node, no scope
   let shardsTotal = $state(0); // the index's full shard count
@@ -85,14 +85,12 @@
   let scopeIndex = $state(''); // '' = the index this endpoint serves
   const SEARCH_INDEX_KEY = 'growlerdb.searchIndex'; // remember the last chosen index
   let sortField = $state(''); // '' = relevance (_score)
-  // Sortable field names for the current index — the server's authoritative list (numeric/date/
-  // keyword `fast` fields). Sorting on anything else is rejected by the engine, so the menu only
-  // offers these; loaded with the index metadata.
+  // The server's authoritative sortable fields (numeric/date/keyword `fast` fields); the engine
+  // rejects sorting on anything else, so the menu offers only these.
   let sortFields = $state<string[]>([]);
   let cursor = $state<string | undefined>(undefined); // next_cursor for keyset "Load more"
-  // Monotonic search generation: overlapping searches (typing + facet/sort changes)
-  // race, so a slow earlier response must not clobber a fresh later one. Each run bumps it; a
-  // response is applied only if it's still the latest. Not reactive — a plain guard.
+  // Monotonic search generation: overlapping searches race, so a slow earlier response must not
+  // clobber a fresh later one — a response is applied only if it's still the latest. Plain guard.
   let searchSeq = 0;
 
   // Sorted by a field ⇒ keyset (search_after) scrolling with "Load more"; relevance ⇒ offset pager.
@@ -100,8 +98,6 @@
   const sortKeys = $derived<SortKey[] | undefined>(
     sorted ? [{ field: sortField, desc: true }] : undefined,
   );
-  // Field names available to sort by — the current index's sortable fast fields (server-authoritative),
-  // so the menu never offers a field the engine can't sort on (e.g. a non-fast keyword like `author`).
   const sortableFields = $derived([...sortFields].sort());
 
   // Option lists for the styled dropdowns.
@@ -114,7 +110,7 @@
     ...sortableFields.map((f) => ({ value: f, label: f })),
   ]);
 
-  // Vector search wiring. Semantic/Hybrid modes appear only when the index has a VECTOR field.
+  // Semantic/Hybrid modes appear only when the index has a VECTOR field.
   const hasVector = $derived(vectorFields.length > 0);
   const modeOptions = $derived([
     { value: 'lexical', label: t('search.modeLexical') },
@@ -150,9 +146,8 @@
     }
   });
 
-  // Time filter: the index's DATE columns + the chosen field/range. A resolved range is
-  // ANDed into the query as `field:[fromUs TO toUs]` in canonical epoch **micros** — the
-  // unit DATE columns are indexed/range-queried in — which the gateway also uses to prune windows.
+  // A resolved range is ANDed in as `field:[fromUs TO toUs]` in canonical epoch micros — the unit
+  // DATE columns are indexed/range-queried in, which the gateway also uses to prune windows.
   let timeFields = $state<string[]>([]);
   let timeField = $state('');
   let timePreset = $state(''); // '' = any; else a TIME_PRESETS id
@@ -199,10 +194,8 @@
     run(0);
   }
 
-  /** Load the selected index's metadata from `describe`: its DATE columns (for the time filter) and
-   *  its sortable fields (for the sort menu). The backend populates both on every describe path —
-   *  including the default-served index (empty `scopeIndex`) — so an empty list means the index
-   *  genuinely has none, rather than us re-deriving it from the mapping. */
+  /** Load the selected index's `describe` metadata: DATE columns (time filter) and sortable fields
+   *  (sort menu). The backend populates both on every describe path, so an empty list is authoritative. */
   async function loadIndexMeta() {
     try {
       const stats = await describeIndex(scopeIndex);
@@ -235,11 +228,9 @@
     } catch {
       indexOptions = []; // no control plane fronted here → scope selector hidden; serve default
     }
-    // Pick the opening index: the last chosen one if it still exists, else the deployment's
-    // configured front door (`GROWLERDB_DEFAULT_INDEX` → /v1/config — the demo points at `movies`,
-    // where semantic/hybrid is a click away), else the first served index. A multi-index endpoint
-    // rejects an index-less search, so the UI must never send one; empty options = a single-index
-    // endpoint with no control plane fronted → leave '' to use the served default.
+    // Pick the opening index: last chosen if it still exists, else the deployment's configured
+    // default (/v1/config), else the first served index. A multi-index endpoint rejects an
+    // index-less search; empty options = single-index endpoint → leave '' to use the served default.
     let configuredDefault: string | undefined;
     try {
       configuredDefault = (await serverConfig()).default_index;
@@ -361,9 +352,8 @@
     return runLexical(from);
   }
 
-  /** Semantic (KNN) or hybrid (RRF-fused) retrieval over the selected VECTOR field. The typed text
-   *  is `query_text`; the time/facet refinement goes in `filter`. One page of `k` results — no
-   *  offset/keyset paging, no facet rail (a lexical-refinement concept). */
+  /** Semantic (KNN) or hybrid (RRF-fused) retrieval over the selected VECTOR field. One page of `k`
+   *  results — no offset/keyset paging, no facet rail (both lexical-refinement concepts). */
   async function runVector() {
     if (!vectorField || !query.trim()) return;
     const seq = ++searchSeq;
@@ -375,8 +365,7 @@
       const t0 = performance.now();
       const common = {
         vectorField,
-        // DEFAULT_K rides the engine's own fallback, so it's left off the wire (omit-when-default).
-        k: topK === DEFAULT_K ? undefined : topK,
+        k: topK === DEFAULT_K ? undefined : topK, // omit-when-default: ride the engine's fallback
         filter: filterExpr(),
         syntax,
         index: scopeIndex || undefined,
@@ -395,10 +384,8 @@
       cursor = undefined;
       offset = 0;
       lastQuery = query.trim(); // the drawer's Explain re-parses this as a lexical query
-      // Term highlighting reflects a LEXICAL match. Hybrid has a BM25 arm, so mark its query terms.
-      // Pure Semantic (KNN) matches on meaning, not terms — highlighting the query words would
-      // falsely imply a literal match (and a natural-language query would mark stopwords), so mark
-      // nothing.
+      // Highlighting reflects a LEXICAL match: hybrid has a BM25 arm, so mark its terms; pure
+      // semantic (KNN) matches on meaning, so marking query words would falsely imply a literal hit.
       scoped = mode === 'hybrid' ? queryTermsByField(query.trim()) : { fields: {}, bare: [] };
       searched = true;
       facetGroups = []; // facets are a lexical refinement; not shown for vector modes
@@ -497,9 +484,8 @@
     }
     const res = await facets(eq, [...fields]);
     if (seq !== searchSeq) return; // discard facets for a superseded search
-    // Hide degenerate facets: a group whose every bucket has count 1 groups nothing — clicking a
-    // value just narrows to a single hit (e.g. unique numerics like `views`), so it's noise, not a
-    // filter. Keep a group only if some value groups ≥2 hits, or the user is already filtering on it.
+    // Hide degenerate facets: a group whose every bucket has count 1 groups nothing (e.g. unique
+    // numerics like `views`). Keep one only if some value groups ≥2 hits, or it's already filtered on.
     const activeFields = new Set(filters.map((f) => f.field));
     facetGroups = res.facets.filter(
       (g) => activeFields.has(g.field) || g.buckets.some((b) => b.count >= 2),
@@ -550,12 +536,10 @@
     run(0);
   }
 
-  /** Re-run from page 1 when the sort field changes. */
   function rerun() {
     if (searched) run(0);
   }
 
-  /** Scope index changed: reload its time fields, then re-run. */
   async function onScopeChange() {
     persist(SEARCH_INDEX_KEY, scopeIndex); // remember the choice across reloads
     await loadIndexMeta();
@@ -598,7 +582,6 @@
     }
   }
 
-  /** Restore a saved search: re-apply every facet of its state, then run it. */
   async function loadQuery(s: SavedSearch) {
     const st = s.state ?? { query: s.query, syntax: 'lucene' };
     query = st.query ?? s.query;
@@ -643,9 +626,8 @@
   /** Header label for the identifier column — the index's key field name (fallback `id`). */
   let keyLabel = $derived(hits[0]?.coordinates?.identifier?.[0]?.name ?? 'id');
 
-  /** One cell's display value: DATE/time-field columns render as formatted UTC; every
-   *  other field renders its raw cached value, preferring the server highlight fragment when the
-   *  gateway returned one for this field, else client-side term marking. */
+  /** One cell's display value: time-field columns render as formatted UTC; every other field
+   *  renders its raw cached value, preferring the server highlight fragment over client marking. */
   function cellText(hit: SearchHit, col: string): { text: string; segments?: HighlightSegment[] } {
     const raw = hit.fields?.[col];
     if (timeFields.includes(col)) {
@@ -928,11 +910,11 @@
         {/if}
 
         {#if hits.length > 0}
-          <!-- Results as a fixed-layout datatable: one row per hit, one cell per cached
-               field, so the layout is uniform across rows. Cells clip on overflow — never wrap. -->
+          <!-- Fixed-layout datatable: one row per hit, one cell per cached field; cells clip on
+               overflow, never wrap. -->
           <div class="results">
-            <!-- Fixed layout so cells clip uniformly; a min-width floor per field column means many
-                 columns scroll horizontally rather than squeezing to nothing (rows never wrap). -->
+            <!-- min-width floor per field column so many columns scroll horizontally rather than
+                 squeezing to nothing. -->
             <table class="hits-table" style="min-width: {13.5 + columns.length * 7}rem">
               <thead>
                 <tr>
@@ -1065,9 +1047,8 @@
             <div class="rail-section">
               <h2>{t('search.facets')}</h2>
               {#if facetGroups.length === 0}
-                <!-- In Semantic/Hybrid the result is a top-k neighbour set, not a full matching set,
-                     so facet counts aren't computed — say so rather than the (false) "no facetable
-                     fields", which would imply the index has none. -->
+                <!-- Semantic/Hybrid return a top-k neighbour set, not a full matching set, so facet
+                     counts aren't computed — say so rather than the (false) "no facetable fields". -->
                 <p class="muted small">
                   {mode === 'lexical' ? t('search.noFacets') : t('search.facetsLexicalOnly')}
                 </p>
@@ -1126,9 +1107,8 @@
 {/if}
 
 <style>
-  /* The Search screen is a full-viewport app shell: full-bleed horizontal bands over
-     a flex body whose panes scroll independently. The section itself does not scroll and carries no
-     padding — each band and the body own their spacing (overrides the generic `#main > section`). */
+  /* Full-viewport app shell: full-bleed horizontal bands over a flex body whose panes scroll
+     independently. The section itself carries no padding — each band owns its spacing. */
   .search {
     padding: 0;
     overflow: hidden;
@@ -1154,8 +1134,6 @@
     gap: 0.6rem;
     flex-wrap: wrap;
   }
-  /* Row 2 holds the retrieval-mode controls (scope / mode / syntax / vector / RRF) so the query box
-     on row 1 keeps full width. */
   .qrow-controls {
     gap: 0.5rem;
   }
@@ -1647,7 +1625,6 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  /* The saved query's text on a second line, muted + truncated. */
   .saved-q .sq-query {
     overflow: hidden;
     text-overflow: ellipsis;
