@@ -224,6 +224,10 @@ pub async fn backup(
             .unwrap_or(0),
         bundled: false,
     };
+    // Read the manifest we're about to replace — its file set and source snapshot drive the
+    // snapshot-aware GC below. Absent (Err) on the first backup to this prefix.
+    let previous = read_manifest(store, prefix).await.ok();
+
     // Written LAST — its presence is the "backup is complete and restorable" commit point.
     store
         .write(
@@ -232,13 +236,24 @@ pub async fn backup(
         )
         .await?;
 
-    // Backup GC: prune superseded splits from object storage. Every compaction on the
-    // primary fuses segments into new, differently-named files; the old segment objects under
-    // `{prefix}/data/` are no longer referenced by any manifest, and re-backing-up to the same
-    // prefix only *adds* the new files — so without this the store accumulates orphaned splits
-    // forever. Mirrors refresh()'s local prune on the remote side. Run AFTER the manifest commit:
-    // a crash here leaves a valid manifest plus a few orphans, which the next backup's GC reclaims.
-    prune_superseded(store, prefix, &manifest).await?;
+    // Snapshot-aware cold GC. A cold read-through reader (D53) opens at a published layout and only
+    // reopens when the SOURCE SNAPSHOT advances — it has no self-refresh loop. Within one source
+    // snapshot the primary can still re-lay-out its segments (build finalize-merge, or compaction)
+    // into differently-named files; deleting the superseded objects would 404 the next lazy fetch of
+    // a reader still pinned to the old layout (the bug this guards). So:
+    //   * same source snapshot (a re-layout) — retain ALL superseded objects: a pinned reader may
+    //     still fetch them and won't reopen until the snapshot advances;
+    //   * snapshot ADVANCE — prune, but retain the PREVIOUS snapshot's files one generation, covering
+    //     a replica still mid-reopen from that snapshot.
+    // Run AFTER the manifest commit: a crash here leaves a valid manifest plus reclaimable orphans,
+    // which a later snapshot-advancing backup's GC reclaims. Bounded: a shard compacts a finite
+    // number of times per source snapshot (compaction stops below `min_segments`), so same-snapshot
+    // superseded objects accumulate only until the next source commit, then are reclaimed.
+    if let Some(prev) = &previous {
+        if manifest.snapshot > prev.snapshot {
+            prune_superseded(store, prefix, &manifest, Some(prev)).await?;
+        }
+    }
 
     let _ = std::fs::remove_dir_all(staging);
     Ok(manifest)
@@ -280,10 +295,22 @@ async fn delete_prefix_best_effort(store: &Operator, prefix: &str) {
     }
 }
 
-async fn prune_superseded(store: &Operator, prefix: &str, manifest: &Manifest) -> Result<usize> {
+/// Delete objects under `{prefix}/data/` referenced by neither the just-committed `manifest` nor
+/// `retain_previous` (the manifest this one replaces). Keeping the previous generation's files is a
+/// one-generation grace: a replica still mid-reopen from the prior snapshot can finish its in-flight
+/// lazy fetches before the objects vanish. Idempotent; returns the number of objects pruned.
+async fn prune_superseded(
+    store: &Operator,
+    prefix: &str,
+    manifest: &Manifest,
+    retain_previous: Option<&Manifest>,
+) -> Result<usize> {
     let data_prefix = format!("{prefix}/data/");
-    let wanted: std::collections::HashSet<&str> =
+    let mut wanted: std::collections::HashSet<&str> =
         manifest.files.iter().map(|f| f.path.as_str()).collect();
+    if let Some(prev) = retain_previous {
+        wanted.extend(prev.files.iter().map(|f| f.path.as_str()));
+    }
     let mut pruned = 0;
     // Recursive: segment files live directly under data/ but travel through an `index/` subdir.
     for key in list_object_keys(store, &data_prefix).await? {
@@ -854,8 +881,11 @@ async fn refresh_once(
 /// backup's **snapshot** advancing past the `served_snapshot` the replica is currently serving. (The
 /// raw `RefreshStats` counts can't tell idle from changed: the mutable meta/locator always count as
 /// downloaded, and opening the shard writes a local writer-lock that the next refresh prunes — so
-/// only the snapshot is reliable. A primary compaction at the same snapshot leaves results
-/// unchanged, so skipping its re-open is correct; the next real commit picks up the merged layout.)
+/// only the snapshot is reliable. A primary compaction at the same snapshot leaves query results
+/// unchanged, so skipping its re-open is correct; the next real commit picks up the merged layout. (A
+/// downloading replica keeps serving the pre-merge segments from mmap even after `refresh` unlinks
+/// them — safe on Unix — so it never 404s; the reader that must NOT lose its objects is the cold
+/// read-through replica, protected on the primary's GC side by snapshot-gated retention in `backup`.)
 /// On a snapshot advance, the definition is re-materialized at `def_path` (if the manifest carries
 /// one and `def_path` is set) so the replica tracks the primary's schema, and the shard is re-opened.
 /// `Ok((None, stats))` means the replica was already up to date, so a steady-state poll never
@@ -1039,6 +1069,99 @@ mod tests {
                     .len(),
                 1,
                 "doc {id} present after the guarded refresh"
+            );
+        }
+    }
+
+    /// Segment file paths (`index/*`) in a manifest — the objects a reader lazily fetches.
+    fn segment_files(m: &Manifest) -> std::collections::HashSet<String> {
+        m.files
+            .iter()
+            .map(|f| f.path.clone())
+            .filter(|p| p.starts_with("index/"))
+            .collect()
+    }
+
+    async fn object_exists(op: &Operator, prefix: &str, rel: &str) -> bool {
+        op.stat(&format!("{prefix}/data/{rel}")).await.is_ok()
+    }
+
+    /// The compaction-GC bug (a read-through reader 404ing on a pruned cold object): a primary can
+    /// re-lay-out its segments WITHIN one source snapshot (a build finalize-merge or compaction),
+    /// and the cold read-through reader that opened at the old layout only reopens when the SOURCE
+    /// SNAPSHOT advances. So a same-snapshot re-backup must RETAIN the superseded objects — deleting
+    /// them would 404 the reader's next lazy fetch. Reclamation still happens once the snapshot
+    /// advances (past all readers), so this isn't an unbounded leak.
+    #[tokio::test]
+    async fn same_snapshot_compaction_retains_superseded_cold_objects() {
+        let primary_tmp = tempfile::tempdir().unwrap();
+        let store_tmp = tempfile::tempdir().unwrap();
+        let staging = primary_tmp.path().join(".staging");
+        let op = fs_store(store_tmp.path()).unwrap();
+        let idx = docs_index();
+        let store = LocalIndexStore::open(primary_tmp.path()).unwrap();
+        let shard = store
+            .create_shard(&growlerdb_index::ShardId::single("docs"), &idx)
+            .unwrap();
+        let prefix = "backups/docs";
+
+        // Two commits → two segments, at source snapshot 2.
+        for (id, cp) in [("a", 1u64), ("b", 2)] {
+            IndexWriter::write(
+                &shard,
+                &CommitBatch::from_upserts(vec![doc(id)], SourceCheckpoint::iceberg(cp as i64), id),
+            )
+            .unwrap();
+        }
+        let pre = backup(&shard, "docs", "docs", &staging, &op, prefix, None)
+            .await
+            .unwrap();
+        assert_eq!(pre.snapshot, 2);
+        let pre_files = segment_files(&pre);
+
+        // Compact — fuses the two segments into a new, differently-named one. The source snapshot is
+        // unchanged (no new commit), so this is a same-snapshot re-layout.
+        shard
+            .compact(&growlerdb_index::CompactionPolicy::default())
+            .unwrap();
+        let post = backup(&shard, "docs", "docs", &staging, &op, prefix, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            post.snapshot, 2,
+            "compaction does not advance the source snapshot"
+        );
+        let post_files = segment_files(&post);
+        let superseded: Vec<_> = pre_files.difference(&post_files).cloned().collect();
+        assert!(
+            !superseded.is_empty(),
+            "the compaction must actually supersede some segment files, else the test is vacuous"
+        );
+
+        // THE FIX: the superseded objects are RETAINED, so a reader pinned to the pre-compaction
+        // layout can still fetch them.
+        for rel in &superseded {
+            assert!(
+                object_exists(&op, prefix, rel).await,
+                "same-snapshot re-layout must retain superseded object {rel} (a read-through reader \
+                 pinned to it only reopens on a snapshot advance)"
+            );
+        }
+
+        // A snapshot ADVANCE reclaims them — GC still works, it's just snapshot-gated.
+        IndexWriter::write(
+            &shard,
+            &CommitBatch::from_upserts(vec![doc("c")], SourceCheckpoint::iceberg(3), "c"),
+        )
+        .unwrap();
+        let adv = backup(&shard, "docs", "docs", &staging, &op, prefix, None)
+            .await
+            .unwrap();
+        assert_eq!(adv.snapshot, 3);
+        for rel in &superseded {
+            assert!(
+                !object_exists(&op, prefix, rel).await,
+                "a snapshot advance past the pinned readers must reclaim superseded object {rel}"
             );
         }
     }
