@@ -19,19 +19,21 @@ With the stack up (`just stack`):
 just demo-data
 ```
 
-This downloads the pre-sliced parquet (a GitHub release asset), writes it into Iceberg first
-(`growlerdb.movies`, the system of record, same lakehouse-first shape as everything else), then
-starts `node-movies`, which builds the index and embeds each plot locally (bge-small-en-v1.5 on
-ONNX Runtime, no API key, no egress) before registering with the control plane. The gateway routes
-`{"index":"movies"}` requests to it automatically, and the demo token is already scoped to it. To
-keep embedding fast, the vector is built from a short synopsis (the first few plot sentences);
-the full `plot` is kept for lexical search and reading.
+This downloads the pre-sliced parquet (a GitHub release asset) and writes it into Iceberg first
+(`growlerdb.movies`, the system of record, same lakehouse-first shape as everything else). The
+`movies` index is served by the HA placement pool (`pool-a`/`pool-b`): the control plane places its
+primary on one of the pool nodes, and that node builds the index from `growlerdb.movies` **on
+assignment**, embedding each plot locally (bge-small-en-v1.5 on ONNX Runtime, no API key, no egress).
+`just demo-data` recreates the pool nodes so the index is rebuilt from the freshly loaded corpus. The
+gateway routes `{"index":"movies"}` requests to the pool automatically, and the demo token is already
+scoped to the index. To keep embedding fast, the vector is built from a short synopsis (the first few
+plot sentences); the full `plot` is kept for lexical search and reading.
 
 The default is 5000 films. The local ONNX embedder does ~500 docs/s, so build, embed, and serve
 takes about 45 seconds. Watch the build, or change the size:
 
 ```sh
-docker compose -f deploy/compose/docker-compose.yml --profile stack --profile demo-data logs -f node-movies
+docker compose -f deploy/compose/docker-compose.yml --profile pool logs -f pool-a pool-b
 DEMO_DATA_SIZE=0 just demo-data      # the full corpus
 ```
 
