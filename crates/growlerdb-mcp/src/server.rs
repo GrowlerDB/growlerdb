@@ -171,7 +171,7 @@ fn initialize_result(params: &Value) -> Value {
         // Steering text a host injects into the agent's context: an agent in a code checkout
         // otherwise greps FILES unless told these tools query live, indexed data.
         "instructions": "GrowlerDB serves LIVE, indexed data — these tools query running search \
-            indexes (in the demo: `docs`, `catalog`, `arxiv`), NOT files on disk. When asked what \
+            indexes (in the demo: `movies` — the default — and `catalog`), NOT files on disk. When asked what \
             GrowlerDB / an index / 'the catalog' says or contains, use `search` here instead of \
             file or grep tools. ALWAYS start an unfamiliar index with `describe_index`: it returns \
             the schema, example queries, and any `vector_fields` — and when vector fields exist, \

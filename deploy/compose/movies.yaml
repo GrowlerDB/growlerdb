@@ -7,9 +7,10 @@
 # The `--all-indexes` gateway routes `{"index":"movies", ...}` requests here automatically.
 #
 # We embed a short **synopsis** (the first few plot sentences), not the full `plot`: ~80 tokens/doc
-# keeps the local BGE embed fast at build, while `plot` (the full text) still powers lexical search
-# and reading. `title`/`plot`/`synopsis` are **cached** so agents read hits' text without a
-# hydration round trip (search alone answers; `hydrate`/inline hydration stays the escalation).
+# keeps the local BGE embed fast at build, while `plot` (the full text) still powers lexical search.
+# `title`/`synopsis` are **cached** so a hit shows the gist without a hydration round trip; the full
+# `plot` is hydrate-only — at ~2 KB/doc, caching it bloats every hit past an agent's token budget, so
+# `hydrate`/inline hydration is the escalation to read it (cf. `catalog.body`, uncached for the same reason).
 name: movies
 source:
   iceberg:
@@ -22,8 +23,9 @@ mapping:
   fields:
     - { path: id, type: KEYWORD }
     - { path: title, type: TEXT, cached: true, default_field: true }
-    # Full plot: the lexical arm's rich exact-term surface, and readable in a hit.
-    - { path: plot, type: TEXT, cached: true }
+    # Full plot: the lexical arm's rich exact-term surface. NOT cached — too large to return on
+    # every hit (see header); read it via `hydrate`.
+    - { path: plot, type: TEXT }
     # Short synopsis: the embed source (see plot_vec) — also cached so a hit shows the gist.
     - { path: synopsis, type: TEXT, cached: true }
     # The primary genre is the facet/filter axis (`genre:drama`), aggregatable for the console's
