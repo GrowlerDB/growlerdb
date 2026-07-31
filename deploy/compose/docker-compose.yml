@@ -436,8 +436,9 @@ services:
 
   # ---- Opt-in demo corpus (profile `demo-data`, run via `just demo-data`) ----------
   # A slice of Wikipedia movie plots (CC-BY-SA-4.0): the loader writes the parquet into Iceberg
-  # FIRST (`growlerdb.movies`, the system of record), then `node-movies` builds + serves the
-  # vector-enabled index from it — same lakehouse-first shape as everything else.
+  # FIRST (`growlerdb.movies`, the system of record); the placement pool (`pool-a`/`pool-b`) then
+  # builds + serves the vector-enabled index from it on assignment — same lakehouse-first shape as
+  # everything else.
   demo-data:
     profiles: ["demo-data"]
     build: ./demo-data
