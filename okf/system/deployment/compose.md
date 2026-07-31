@@ -78,8 +78,9 @@ corpus:** a loader one-shot downloads the pre-sliced parquet (a GitHub release a
 `DEMO_DATA_URL`/`DEMO_DATA_FILE` overridable, `DEMO_DATA_SIZE` caps rows — default 5000) and writes
 `growlerdb.movies` into Iceberg **first** (before the pool boots — its `--define-only` step blocks
 until each source table resolves); the **pool** then builds + serves the vector-enabled index
-(`movies.yaml` — `plot_vec` embedded locally from a short **synopsis** to keep embedding fast; full
-`plot`/`title` **cached** so agents answer from `search` alone) on assignment, so the `--all-indexes`
+(`movies.yaml` — `plot_vec` embedded locally from a short **synopsis** to keep embedding fast;
+`title`/`synopsis` **cached** so agents answer from `search` alone, the full `plot` hydrate-only to
+keep hits small) on assignment, so the `--all-indexes`
 gateway routes to it and the demo token (allowlist `docs,catalog,movies`) may query it. The slicer
 (`demo-data/build_movies_slice.py`) regenerates the asset.
 
