@@ -7,7 +7,8 @@ use std::collections::BTreeMap;
 
 use growlerdb_backup::{
     backup, cold_park, cold_park_in_place, evict_local_index, fs_store, park, promote_cold,
-    read_manifest, refresh, restore, revive, BackupError, FileEntry, Manifest, MANIFEST_FORMAT,
+    read_manifest, refresh, restore, revive, BackupError, FileEntry, Manifest, Operator,
+    MANIFEST_FORMAT,
 };
 use growlerdb_core::{
     CommitBatch, CompositeKey, Document, IndexDefinition, IndexWriter, LocatedDoc, Query,
@@ -487,18 +488,34 @@ async fn open_cold_replica_serves_a_parked_window_from_a_bare_node() {
     );
 }
 
+/// List the segment objects (relative paths) currently under a backup prefix's `data/`.
+async fn data_objects(store: &Operator, prefix: &str) -> std::collections::BTreeSet<String> {
+    store
+        .list_with(&format!("{prefix}/data/"))
+        .recursive(true)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.path().to_string())
+        .filter(|p| !p.ends_with('/'))
+        .map(|p| p.trim_start_matches(&format!("{prefix}/data/")).to_string())
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn backup_gc_prunes_superseded_splits() {
-    // Backup GC: after the primary compacts (fusing many segments into one), a re-backup
-    // to the same prefix must remove the now-orphaned old segment objects from the store, not just
-    // add the new fused segment. Assert the store's data/ objects match the new manifest exactly.
+async fn backup_gc_is_snapshot_gated() {
+    // Backup GC is snapshot-gated so a cold read-through reader never 404s. After the primary
+    // compacts (fusing many segments into one) WITHIN a source snapshot, a re-backup to the same
+    // prefix RETAINS the now-superseded segment objects — a reader pinned to the old layout only
+    // reopens when the snapshot advances, and would 404 on a lazily-fetched segment if it vanished.
+    // The superseded objects are reclaimed on the next snapshot ADVANCE (past all such readers).
     let idx = docs_index();
     let id = ShardId::single("docs");
 
     let src_root = tempfile::tempdir().unwrap();
     let src_store = LocalIndexStore::open(src_root.path()).unwrap();
     let shard = src_store.create_shard(&id, &idx).unwrap();
-    // Three separate commits → three segments (each commit seals its own segment).
+    // Three separate commits at the SAME source snapshot → three segments.
     for (n, d) in [
         ("b1", doc("doc-1", "alpha")),
         ("b2", doc("doc-2", "beta")),
@@ -518,19 +535,13 @@ async fn backup_gc_prunes_superseded_splits() {
     let prefix = "backups/docs/snap";
 
     // First backup: uploads every segment.
-    backup(&shard, "docs", "docs", &staging, &store, prefix, None)
+    let first = backup(&shard, "docs", "docs", &staging, &store, prefix, None)
         .await
         .unwrap();
-    let after_first = store
-        .list_with(&format!("{prefix}/data/"))
-        .recursive(true)
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|e| !e.path().ends_with('/'))
-        .count();
+    let first_files: std::collections::BTreeSet<String> =
+        first.files.iter().map(|f| f.path.clone()).collect();
 
-    // Compact on the primary → the many segments fuse into one (new file names).
+    // Compact on the primary → the many segments fuse into one (new file names), SAME snapshot.
     shard
         .compact(&growlerdb_index::CompactionPolicy::default())
         .unwrap();
@@ -540,32 +551,51 @@ async fn backup_gc_prunes_superseded_splits() {
         "compacted to one segment"
     );
 
-    // Second backup to the SAME prefix: uploads the fused segment AND GCs the orphaned old ones.
-    let manifest = backup(&shard, "docs", "docs", &staging, &store, prefix, None)
+    // Second backup to the SAME prefix at the SAME snapshot: uploads the fused segment but RETAINS
+    // the superseded splits.
+    let compacted = backup(&shard, "docs", "docs", &staging, &store, prefix, None)
         .await
         .unwrap();
-
-    let remaining: std::collections::BTreeSet<String> = store
-        .list_with(&format!("{prefix}/data/"))
-        .recursive(true)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|e| e.path().to_string())
-        .filter(|p| !p.ends_with('/'))
-        .map(|p| p.trim_start_matches(&format!("{prefix}/data/")).to_string())
-        .collect();
-    let wanted: std::collections::BTreeSet<String> =
-        manifest.files.iter().map(|f| f.path.clone()).collect();
     assert_eq!(
-        remaining, wanted,
-        "store holds exactly the manifest's files — superseded splits pruned"
+        compacted.snapshot, first.snapshot,
+        "compaction does not advance the source snapshot"
     );
+    let compacted_files: std::collections::BTreeSet<String> =
+        compacted.files.iter().map(|f| f.path.clone()).collect();
+    let superseded: Vec<String> = first_files.difference(&compacted_files).cloned().collect();
     assert!(
-        remaining.len() < after_first,
-        "GC actually removed orphaned splits (was {after_first}, now {})",
-        remaining.len()
+        !superseded.is_empty(),
+        "the compaction must actually supersede some splits, else the test is vacuous"
     );
+    let same_snap = data_objects(&store, prefix).await;
+    for f in &superseded {
+        assert!(
+            same_snap.contains(f),
+            "same-snapshot compaction must RETAIN superseded split {f} for pinned read-through readers"
+        );
+    }
+
+    // A snapshot ADVANCE reclaims the superseded splits — GC still works, it's just snapshot-gated.
+    IndexWriter::write(
+        &shard,
+        &CommitBatch::from_upserts(
+            vec![doc("doc-4", "delta")],
+            SourceCheckpoint::iceberg(2),
+            "b4",
+        ),
+    )
+    .unwrap();
+    let advanced = backup(&shard, "docs", "docs", &staging, &store, prefix, None)
+        .await
+        .unwrap();
+    assert!(advanced.snapshot > first.snapshot, "snapshot advanced");
+    let after_advance = data_objects(&store, prefix).await;
+    for f in &superseded {
+        assert!(
+            !after_advance.contains(f),
+            "a snapshot advance past the pinned readers must reclaim superseded split {f}"
+        );
+    }
 
     // And it's still restorable end-to-end after GC.
     let dest_root = tempfile::tempdir().unwrap();
