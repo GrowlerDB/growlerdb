@@ -1,24 +1,15 @@
-//! **End-to-end tenant isolation** (GA criterion). The per-seam pieces are unit-tested — the authn
-//! boundary drops forged identity headers ([`authn`]), search injects a mandatory tenant filter,
-//! hydration refuses a missing claim. This test composes them **through the `Gateway`**: a real
-//! two-tenant index + an API-key authenticator, proving a caller scoped to one tenant can never read
-//! another's rows — even while spoofing the tenant header or widening the query.
-//!
-//! Coverage spans **every read path** the mandatory tenant filter governs, so SECURITY.md's
-//! "verified" claim is backed by direct coverage:
+//! **End-to-end tenant isolation** (GA criterion). The per-seam pieces are unit-tested; this test
+//! composes them **through the `Gateway`** over a real two-tenant index + API-key authenticator,
+//! proving a caller scoped to one tenant can never read another's rows — even while spoofing the
+//! tenant header or widening the query. Coverage spans **every read path** the mandatory tenant
+//! filter governs, backing SECURITY.md's "verified" claim:
 //! - **search** — forged header / widening clause / unauthenticated.
-//! - **aggregate** — a tenant-scoped aggregation counts only the caller's docs; a forged header can't
-//!   widen it and an unauthenticated one is rejected.
-//! - **hydration (`get_by_key`)** — a missing verified claim fails closed with `PermissionDenied`
-//!   before any Iceberg connect, an unauthenticated request is rejected, and a forged header can't
-//!   inject a tenant. (The row itself is hydrated from Iceberg, so the authoritative-value drop is
-//!   asserted as a unit in `lookup_service.rs`; here we assert the boundary that governs it.)
-//! - **export** — the streaming scroll (a Node-only RPC, not Gateway-routed) applies the same tenant
-//!   scope as search: only the caller's rows stream out, a widening clause can't widen, and a
-//!   missing claim fails closed.
-//! - **suggest** — a tenant-scoped index **fails closed** (`PermissionDenied`): term-dictionary
-//!   suggestions aren't yet tenant-filtered, so they're refused rather than leaking other tenants'
-//!   terms.
+//! - **aggregate** — counts only the caller's docs; forged header can't widen, unauthenticated rejected.
+//! - **hydration (`get_by_key`)** — missing claim fails closed (`PermissionDenied`) before any
+//!   Iceberg connect; forged header can't inject a tenant. (The authoritative-value drop is a unit
+//!   test in `lookup_service.rs`; here we assert the boundary.)
+//! - **export** — Node-only scroll, same tenant scope as search: widening can't widen, missing claim fails closed.
+//! - **suggest** — **fails closed** (`PermissionDenied`): term-dictionary suggestions aren't tenant-filtered yet.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -81,8 +72,7 @@ fn two_tenant_node(root: &std::path::Path) -> (Arc<dyn Node>, Arc<ApiKeyStore>, 
         vec![],
         vec!["id".into()],
     );
-    // `tenant` is a fast field so the aggregate cases can terms-bucket on it; this doesn't change
-    // search/hydration behaviour, it only makes the column aggregatable.
+    // `tenant` is a fast field so the aggregate cases can terms-bucket on it.
     let idx = IndexDefinition::from_yaml(
         "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\ntenant_field: tenant\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD }, { path: tenant, type: KEYWORD, fast: true } ] }\n",
     )

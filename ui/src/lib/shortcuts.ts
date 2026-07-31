@@ -1,9 +1,9 @@
-// Keyboard shortcuts: a pure event→action mapper so the bindings are unit-testable independent of
-// the DOM. App.svelte feeds it `keydown`s and performs the returned action.
+// Keyboard shortcuts: a pure event→action mapper so bindings are unit-testable independent of the
+// DOM. App.svelte feeds it `keydown`s and performs the returned action.
 //
-// Bindings: `/` focus search · `g` then s/i/o/e jump to a screen (Gmail-style prefix) ·
-// `t` toggle theme · `?` toggle the help overlay · Escape close overlays. Modifier combos and
-// keystrokes inside text fields are ignored (Escape still closes, so a field can be escaped).
+// Bindings: `/` focus search · `g` then s/i/o/e jump to a screen (Gmail-style prefix) · `t` toggle
+// theme · `?` toggle help · Escape close overlays. Modifier combos and in-field keystrokes are
+// ignored (Escape still closes, so a field can be escaped).
 import type { Route } from './router';
 
 export type ShortcutAction =

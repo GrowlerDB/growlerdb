@@ -1,32 +1,22 @@
-//! The **Gateway** terminates the Engine API
-//! ([REST](crate::rest) + [gRPC](crate::gateway_grpc)) and routes each call to the Nodes
-//! through the [`Node`](crate::node::Node) seam. A Node is a
-//! [`LocalNode`](crate::node::LocalNode) (embedded) or a gRPC client (distributed) — the
-//! surface is identical either way.
+//! The **Gateway** terminates the Engine API ([REST](crate::rest) + [gRPC](crate::gateway_grpc))
+//! and routes each call to the Nodes through the [`Node`](crate::node::Node) seam — a
+//! [`LocalNode`](crate::node::LocalNode) (embedded) or a gRPC client (distributed), identical either way.
 //!
-//! A Gateway fronts one Node per shard. With a single shard it forwards verbatim; with many
-//! it **scatter-gathers** the query to every shard concurrently and **merges** the results:
-//! search by score (top-k), suggest by count, key lookups routed by key, describe by summed
-//! stats, and **aggregations** by merging each shard's mergeable partial (terms/stats/range/
-//! date_histogram exact; HLL/DDSketch approximate but correctly merged). A shard that fails to
-//! respond is a **flagged gap, never a silent one**: `search` sets `SearchResponse.partial`, and
-//! `suggest`/`get_by_key`/`describe_index`/`aggregate` set a `failed_shards` count on their
-//! responses; if **every** shard fails the call returns `UNAVAILABLE` rather than a
-//! success-shaped empty result.
+//! A Gateway fronts one Node per shard. With one shard it forwards verbatim; with many it
+//! **scatter-gathers** concurrently and **merges**: search by score (top-k), suggest by count,
+//! lookups routed by key, describe by summed stats, aggregations by merging each shard's mergeable
+//! partial (terms/stats/range/date_histogram exact; HLL/DDSketch approximate but correctly merged).
+//! A shard that fails is a **flagged gap, never silent**: `search` sets `partial`, the others set a
+//! `failed_shards` count; if **every** shard fails the call is `UNAVAILABLE`, not an empty success.
 //!
-//! **Paging is merged correctly across shards**: `offset` via offset-merge (each shard
-//! returns rank 0 .. `offset+limit`, the Gateway applies the global window once), and
-//! `search_after` keyset scrolling via a **global** cursor — the Gateway sends the same cursor to
-//! every shard and composes the next one from the last returned hit's (sort tuple, key), so a
-//! full scroll visits every doc exactly once. Keyset paging needs a sort (scores aren't a stable
-//! keyset). **`collapse`** is folded across shards: each shard collapses locally and the Gateway
-//! merges groups by value, summing `group_count` and keeping each group's global top hit. A
-//! single-shard Gateway forwards verbatim and is unaffected by any of this.
+//! **Paging merges correctly across shards**: `offset` via offset-merge, and `search_after` keyset
+//! scrolling via a **global** cursor (needs a sort — scores aren't a stable keyset). **`collapse`**
+//! folds across shards: each collapses locally, the Gateway merges groups by value. A single-shard
+//! Gateway forwards verbatim, unaffected.
 //!
-//! **Resiliency** ([`GatewayLimits`]): each scatter-gather runs under a **deadline** — a
-//! hung/slow shard is aborted and flagged `partial` rather than stalling the query forever (Nodes
-//! also carry transport connect/request timeouts) — and a search's **`offset + limit`** is capped
-//! at the boundary so an unbounded `limit` can't OOM the Gateway.
+//! **Resiliency** ([`GatewayLimits`]): each scatter-gather runs under a **deadline** (a hung shard is
+//! aborted and flagged `partial`) and a search's **`offset + limit`** is capped so an unbounded
+//! `limit` can't OOM the Gateway.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -61,18 +51,15 @@ pub struct GatewayLimits {
     /// Max `offset + limit` a search may request. Oversized → `InvalidArgument`. `0` = unbounded.
     /// Env knob: `GROWLERDB_MAX_FETCH` (via the CLI).
     pub max_fetch: usize,
-    /// Max concurrent per-shard RPCs in flight across all scatter-gathers. At hundreds of
-    /// shards an unbounded fan-out would open hundreds of simultaneous connections per burst of
-    /// queries and exhaust the Gateway's socket/fd budget; a semaphore caps it (excess tasks queue
-    /// under the deadline). `0` = unbounded. Env knob: `GROWLERDB_MAX_CONCURRENT_FANOUT` (via the CLI).
+    /// Max concurrent per-shard RPCs in flight across all scatter-gathers. Unbounded fan-out at
+    /// hundreds of shards would exhaust the Gateway's socket/fd budget; a semaphore caps it (excess
+    /// queues under the deadline). `0` = unbounded. Env knob: `GROWLERDB_MAX_CONCURRENT_FANOUT`.
     pub max_concurrent_fanout: usize,
-    /// Max concurrent **queries** admitted at the Gateway (search/semantic/hybrid/suggest/
-    /// aggregate/lookup/explain, over REST and gRPC alike — both fronts route through these
-    /// methods). At the cap, a query is REJECTED immediately with `RESOURCE_EXHAUSTED`
-    /// (HTTP 429) rather than queued — load-shedding keeps admitted queries fast and gives the
-    /// client an honest retry signal instead of a timeout. Distinct from
-    /// [`max_concurrent_fanout`], which bounds per-shard RPCs *within* admitted queries.
-    /// `0` = unbounded. Env knob: `GROWLERDB_MAX_CONCURRENT_QUERIES` (via the CLI).
+    /// Max concurrent **queries** admitted at the Gateway (all query methods, REST + gRPC). At the
+    /// cap a query is REJECTED with `RESOURCE_EXHAUSTED` (HTTP 429) rather than queued — load-shedding
+    /// keeps admitted queries fast and gives an honest retry signal. Distinct from
+    /// [`max_concurrent_fanout`], which bounds per-shard RPCs *within* admitted queries. `0` =
+    /// unbounded. Env knob: `GROWLERDB_MAX_CONCURRENT_QUERIES`.
     pub max_concurrent_queries: usize,
 }
 
@@ -84,9 +71,8 @@ impl Default for GatewayLimits {
             deadline: Some(Duration::from_secs(30)),
             max_fetch: 10_000,
             max_concurrent_fanout: 256,
-            // 256 concurrent admitted queries: far above a healthy interactive load, a firm
-            // wall against an unbounded flood (each admitted query can hold shard RPCs, PITs,
-            // and blocking-pool time).
+            // 256 concurrent admitted queries: far above healthy interactive load, a firm wall
+            // against an unbounded flood.
             max_concurrent_queries: 256,
         }
     }
@@ -119,10 +105,9 @@ impl GatewayLimits {
     }
 }
 
-/// Loop label for the topology-swap SLI metrics. A rejected hot-reload bumps
-/// `growlerdb_background_failures_total{loop="topology-swap"}`; a successful one sets
-/// `growlerdb_background_last_success_timestamp{loop="topology-swap"}`. Together they let operators
-/// alert on a node stuck on a stale routing table ("topology hasn't synced in N minutes"), which a
+/// Loop label for the topology-swap SLI metrics: a rejected hot-reload bumps
+/// `growlerdb_background_failures_total{loop="topology-swap"}`, a successful one sets the
+/// last-success gauge — so operators can alert on a node stuck on a stale routing table, which a
 /// plain `/healthz` 200 wouldn't reveal.
 const TOPOLOGY_SWAP_LOOP: &str = "topology-swap";
 
@@ -135,39 +120,34 @@ fn fanout_semaphore(max: usize) -> Arc<tokio::sync::Semaphore> {
     }))
 }
 
-/// Routes Engine-API calls to one [`Node`] per shard. Holds `dyn Node`s, so routing is
-/// identical whether the Nodes are in-process (embedded) or remote (distributed). A
-/// [`ShardRouter`] decides which shard owns a key (for [`get_by_key`](Self::get_by_key)).
+/// Routes Engine-API calls to one [`Node`] per shard. Holds `dyn Node`s, so routing is identical
+/// whether the Nodes are in-process (embedded) or remote (distributed). A [`ShardRouter`] decides
+/// which shard owns a key (for [`get_by_key`](Self::get_by_key)).
 ///
-/// **Multi-index**: a Gateway can front *many* indexes at once. Each named index has its
-/// own [`IndexRoute`] (its shard-set + router + partition fields, each independently hot-reloadable),
-/// stored in `routes` keyed by resolved index name. A request names its target index; the Gateway
-/// [`resolve_route`](Self::resolve_route)s it at entry and operates on that route. Built via the
-/// single-index constructors ([`new`](Self::new)/[`sharded`](Self::sharded)/…) the Gateway holds one
-/// static route (`single`); built via
-/// [`multi_index`](Self::multi_index) with a [`RouteResolver`] it lazily resolves each named index
-/// through the control plane on first use.
+/// **Multi-index**: a Gateway can front *many* indexes at once, each with its own [`IndexRoute`]
+/// (shard-set + router + partition fields, independently hot-reloadable) keyed by resolved name. A
+/// request names its target index, [`resolve_route`](Self::resolve_route)d at entry. Single-index
+/// constructors ([`new`](Self::new)/[`sharded`](Self::sharded)/…) hold one static route (`single`);
+/// [`multi_index`](Self::multi_index) with a [`RouteResolver`] resolves each named index lazily.
 #[derive(Clone)]
 pub struct Gateway {
-    /// The single static route, when the Gateway was built via a single-index constructor
-    /// (`new`/`sharded`/`windowed`/…). Present iff `resolver` is `None`. Every read routes to it;
-    /// `served_index` (below) still gates the request's `index` field. Its inner swap cell backs
-    /// [`swap_routing`](Self::swap_routing)/[`swap_windowed`](Self::swap_windowed) hot-reload.
+    /// The single static route, when built via a single-index constructor. Present iff `resolver` is
+    /// `None`; every read routes to it (`served_index` still gates the request's `index` field). Its
+    /// swap cell backs [`swap_routing`](Self::swap_routing)/[`swap_windowed`](Self::swap_windowed).
     single: Option<Arc<IndexRoute>>,
-    /// Lazily-populated per-index routes for a **multi-index** Gateway: resolved-index-name
-    /// → its [`IndexRoute`]. Empty in single-index mode. Populated on first request for an index via
-    /// `resolver`, then hot-reloaded by a per-index reloader the resolver spawns.
+    /// Lazily-populated per-index routes for a **multi-index** Gateway (resolved name → [`IndexRoute`]).
+    /// Empty in single-index mode. Populated on first request for an index via `resolver`, then
+    /// hot-reloaded by a per-index reloader.
     routes: Arc<std::sync::RwLock<HashMap<String, Arc<IndexRoute>>>>,
-    /// Resolves a named index into an [`IndexRoute`] (fetch its `GetIndex`, connect nodes). `Some`
-    /// only in multi-index mode; drives lazy population of `routes`. `None` = single-index (static).
+    /// Resolves a named index into an [`IndexRoute`]. `Some` only in multi-index mode; drives lazy
+    /// population of `routes`. `None` = single-index (static).
     resolver: Option<Arc<dyn RouteResolver>>,
-    /// Brief negative cache of index names the resolver reported as absent: name → when it
-    /// was cached. A flood of requests for a nonexistent index shouldn't hammer the control plane; a
-    /// `NOT_FOUND` is remembered for [`NEGATIVE_CACHE_TTL`] before we ask the CP again.
+    /// Brief negative cache of index names the resolver reported absent (name → cached-at), so a flood
+    /// of requests for a nonexistent index doesn't hammer the control plane. See [`NEGATIVE_CACHE_TTL`].
     missing: Arc<std::sync::RwLock<HashMap<String, Instant>>>,
-    /// The index a request with an **empty** `index` field resolves to. `Some` = that
-    /// index; `None` = no default (empty `index` errors unless exactly one index is served — see
-    /// [`resolve_route`](Self::resolve_route)). In single-index mode this is the served index name.
+    /// The index a request with an **empty** `index` field resolves to. `None` = no default (empty
+    /// errors unless exactly one index is served — see [`resolve_route`](Self::resolve_route)). In
+    /// single-index mode this is the served index name.
     default_index: Option<String>,
     limits: GatewayLimits,
     /// Query-admission semaphore over [`GatewayLimits::max_concurrent_queries`] — `try_acquire`
@@ -180,37 +160,35 @@ pub struct Gateway {
     authz: Option<SharedAuth>,
     cold: Option<ColdTier>,
     /// Each temporal field's declared unit (by path), so the `_search` adapter converts a range/exact
-    /// bound written in that unit to canonical micros before planning — keeping window pruning and
-    /// segment execution (both micros-native) consistent. Populated from the served definition
-    /// ([`with_date_formats`](Self::with_date_formats)); empty ⇒ no conversion (bounds are micros).
+    /// bound written in that unit to canonical micros before planning (keeping window pruning and
+    /// segment execution consistent). From [`with_date_formats`](Self::with_date_formats); empty ⇒ no
+    /// conversion (bounds are micros).
     date_formats: crate::opensearch::FieldFormats,
-    /// The index name this Gateway serves, in **single-index** mode. A request whose `index`
-    /// is non-empty and names a *different* index is answered `NOT_FOUND` instead of silently searching
-    /// this one. `None` (the default, and all tests) means "serve any request" — no index scoping. In
-    /// multi-index mode this is unused (scoping is per-`routes` membership).
+    /// The index name served in **single-index** mode. A non-empty `index` naming a *different* index
+    /// is answered `NOT_FOUND` rather than silently searching this one. `None` (the default, and all
+    /// tests) serves any request. Unused in multi-index mode (scoping is per-`routes` membership).
     served_index: Option<String>,
     /// Bounds concurrent per-shard RPCs across all scatter-gathers — see
     /// [`GatewayLimits::max_concurrent_fanout`].
     fanout: Arc<tokio::sync::Semaphore>,
 }
 
-/// How long a `NOT_FOUND` from the [`RouteResolver`] is remembered before the control plane is asked
-/// again: short, so an index created moments ago becomes queryable quickly,
-/// but long enough that a burst of requests for a bad name doesn't storm the control plane.
+/// How long a `NOT_FOUND` from the [`RouteResolver`] is remembered before re-asking the control
+/// plane: short, so a just-created index becomes queryable quickly, but long enough that a burst of
+/// bad-name requests doesn't storm the control plane.
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5);
 
-/// One index's routing on a [`Gateway`]: the shard-set + key router (+ optional windowed
-/// descriptors) behind a hot-swap cell, plus that
-/// index's keyword partition fields for fan-out pruning. A multi-index Gateway holds one per served
-/// index; a single-index Gateway holds exactly one (its `single`). Cloneable-cheap (`Arc` inner).
+/// One index's routing on a [`Gateway`]: the shard-set + key router (+ optional windowed descriptors)
+/// behind a hot-swap cell, plus that index's keyword partition fields for fan-out pruning. A
+/// multi-index Gateway holds one per served index; a single-index Gateway holds exactly one (its
+/// `single`). Cloneable-cheap (`Arc` inner).
 pub struct IndexRoute {
     /// The shard set + key router, behind a swap so a running route can **hot-reload** its topology
-    /// after a reshard cutover: [`swap`](Self::swap) installs a new `(shards, router)`
-    /// atomically; each request reads a snapshot via [`routing`](Self::routing).
+    /// after a reshard cutover. Each request reads a snapshot via [`routing`](Self::routing).
     routing: std::sync::RwLock<Arc<RoutingState>>,
-    /// This index's **keyword** partition-key fields, for search fan-out pruning. When a
-    /// search AND-pins all of them to values, every matching key routes to a single shard, so the
-    /// query goes there instead of broadcasting. Empty = no pruning.
+    /// This index's **keyword** partition-key fields, for search fan-out pruning. When a search
+    /// AND-pins all of them, every matching key routes to a single shard, so the query goes there
+    /// instead of broadcasting. Empty = no pruning.
     partition_fields: Vec<String>,
 }
 
@@ -241,14 +219,12 @@ impl IndexRoute {
             .clone()
     }
 
-    /// **Hot-reload** this route's ordinal topology: atomically replace shard set + router.
-    /// Skips an empty/count-mismatched swap (keeps the current servable topology), like the Gateway
-    /// method it backs.
+    /// **Hot-reload** this route's ordinal topology: atomically replace shard set + router. Skips an
+    /// empty/count-mismatched swap (keeps the current servable topology).
     pub fn swap(&self, shards: Vec<Arc<dyn Node>>, router: ShardRouter) {
         if shards.is_empty() || router.shards() as usize != shards.len() {
-            // Keep the old (servable) topology, but make the rejection observable: a `warn!` that
-            // reaches the telemetry exporter and a failure metric operators can alert on, so a node
-            // stuck on a stale routing table isn't silently "healthy" (see the topology-swap SLI).
+            // Keep the old (servable) topology, but make the rejection observable (warn + failure
+            // metric), so a node stuck on a stale routing table isn't silently "healthy".
             tracing::warn!(
                 shards = shards.len(),
                 router_covers = router.shards(),
@@ -291,11 +267,10 @@ impl IndexRoute {
     }
 }
 
-/// Resolves a named index into an [`IndexRoute`] for a **multi-index** Gateway: fetch the
-/// index's shard map (e.g. a control-plane `GetIndex`), connect a [`Node`] per shard, and build the
-/// route (with a per-index hot-reloader wired to its [`IndexRoute::swap`]). Returns `Ok(None)` when
-/// the index doesn't exist (→ `NOT_FOUND`, negative-cached), `Err` on a transient failure (→ the
-/// caller surfaces `Unavailable`, not cached, so it retries).
+/// Resolves a named index into an [`IndexRoute`] for a **multi-index** Gateway: fetch the index's
+/// shard map, connect a [`Node`] per shard, build the route (with a per-index hot-reloader). Returns
+/// `Ok(None)` when the index doesn't exist (→ `NOT_FOUND`, negative-cached), `Err` on a transient
+/// failure (→ `Unavailable`, not cached, so it retries).
 #[tonic::async_trait]
 pub trait RouteResolver: Send + Sync {
     /// Resolve `index` into its route, or `Ok(None)` if no such index is registered.
@@ -304,10 +279,9 @@ pub trait RouteResolver: Send + Sync {
 
 /// The Gateway's hot-swappable routing: one [`Node`] per shard + the [`ShardRouter`] that places
 /// keys, plus (for a windowed index) the [`WindowRouting`] descriptors. Snapshotted per request
-/// (cheap `Arc` clone) so an in-flight scatter sees a consistent topology even as a reshard — or a
-/// **new window** — swaps in a new one. Keeping `window_routing`
-/// *inside* the swap cell (rather than a fixed Gateway field) is what lets a running windowed gateway
-/// learn a new window's id + zone-map atomically with its node, via [`swap_windowed`](Gateway::swap_windowed).
+/// (cheap `Arc` clone) so an in-flight scatter sees a consistent topology across a reshard — or a
+/// **new window** — swap. Keeping `window_routing` inside the swap cell is what lets a running
+/// windowed gateway learn a new window atomically with its node, via [`swap_windowed`](Gateway::swap_windowed).
 pub struct RoutingState {
     shards: Vec<Arc<dyn Node>>,
     router: ShardRouter,
@@ -315,10 +289,6 @@ pub struct RoutingState {
     window_routing: Option<WindowRouting>,
 }
 
-/// Windowed-index routing: the [`TimeWindowing`] config plus, **aligned 1:1 with
-/// `shards`**, each shard's window id and event-time zone-map. Lets the Gateway prune a
-/// time-filtered search to the windows that can match before scatter-gather. `None` on a normal
-/// (hash/partition) Gateway.
 /// One window's routing descriptor: `(window id, event zone-map, cold)` — `cold` = served
 /// read-through from object storage (parked). Aligned 1:1 with a route's `shards`.
 pub type WindowDescriptor = (i64, Option<(i64, i64)>, bool);
@@ -338,10 +308,10 @@ impl WindowRouting {
     }
 }
 
-/// Collect `field → value` for [`Query::Term`] leaves that are **ANDed** (in `must`/`filter`,
-/// possibly nested) and target one of `fields` — the partition equalities a search pins.
-/// Only AND clauses force the field to a single value for *every* match, so `should`/OR, `must_not`,
-/// and negation are ignored: pruning on them could drop shards that legitimately hold matches.
+/// Collect `field → value` for [`Query::Term`] leaves **ANDed** (in `must`/`filter`, possibly
+/// nested) that target one of `fields` — the partition equalities a search pins. Only AND clauses
+/// force the field to a single value for *every* match, so `should`/OR, `must_not`, and negation are
+/// ignored (pruning on them could drop shards that hold matches).
 fn collect_and_pins(
     q: &Query,
     fields: &[String],
@@ -363,10 +333,9 @@ fn collect_and_pins(
     }
 }
 
-/// The shared read-through byte-range cache of an **in-process** (node) windowed Gateway — kept so
-/// `/v1/cold` can report its hit/miss/byte stats. Per-window hot/cold tier is NOT here: it comes from
-/// the routing descriptors (a node's live shards, or the tiers each node reports to the cluster
-/// gateway), so a runtime park/pre-warm is reflected without re-wiring this.
+/// The shared read-through byte-range cache of an **in-process** windowed Gateway — kept so
+/// `/v1/cold` can report its hit/miss/byte stats. Per-window hot/cold tier is NOT here; it comes from
+/// the routing descriptors, so a runtime park/pre-warm is reflected without re-wiring this.
 #[derive(Clone)]
 struct ColdTier {
     cache: growlerdb_index::RangeCache,
@@ -400,9 +369,8 @@ pub struct WindowStatus {
 }
 
 impl Gateway {
-    /// Assemble a single-index Gateway from its routing + the optional features (the shared
-    /// constructor body). Holds one static [`IndexRoute`]; multi-index gateways use
-    /// [`multi_index`](Self::multi_index) instead.
+    /// Assemble a single-index Gateway from its routing + optional features (the shared constructor
+    /// body). Holds one static [`IndexRoute`]; multi-index uses [`multi_index`](Self::multi_index).
     fn with_routing(
         shards: Vec<Arc<dyn Node>>,
         router: ShardRouter,
@@ -426,11 +394,10 @@ impl Gateway {
         }
     }
 
-    /// A **multi-index** Gateway: serves *many* indexes over one endpoint, resolving each
-    /// named index lazily through `resolver` (typically a control-plane `GetIndex` builder) and
-    /// hot-reloading each independently. A request with an empty `index` uses `default_index` (or, if
-    /// `None` and exactly one index has been resolved, that one; else `InvalidArgument`). Readiness is
-    /// the control plane's reachability, not any one index resolving.
+    /// A **multi-index** Gateway: serves *many* indexes over one endpoint, resolving each named index
+    /// lazily through `resolver` and hot-reloading each independently. An empty `index` uses
+    /// `default_index` (or, if `None` and exactly one index resolved, that one; else `InvalidArgument`).
+    /// Readiness is the control plane's reachability, not any one index resolving.
     pub fn multi_index(resolver: Arc<dyn RouteResolver>, default_index: Option<String>) -> Self {
         Self {
             single: None,
@@ -451,10 +418,9 @@ impl Gateway {
     }
 
     /// Declare the (single) index's **keyword** partition-key fields so a search that pins them prunes
-    /// its fan-out to the owning shard. Pass only keyword-typed partition fields — the
-    /// caller (the sharded serve path) filters them from the resolved definition; a non-keyword
-    /// partition field is omitted so pruning never routes a mistyped value to the wrong shard. Only
-    /// meaningful in single-index mode; multi-index routes carry their own partition fields.
+    /// its fan-out to the owning shard. Pass only keyword-typed partition fields (the caller filters
+    /// them) — a non-keyword field would route a mistyped value to the wrong shard. Single-index only;
+    /// multi-index routes carry their own.
     pub fn with_partition_fields(mut self, fields: Vec<String>) -> Self {
         if let Some(single) = &self.single {
             self.single = Some(IndexRoute::new(
@@ -475,26 +441,22 @@ impl Gateway {
             .expect("single-index gateway has a static route")
     }
 
-    /// A snapshot of the single-index route's current routing (`Arc` clone). Only valid in
-    /// single-index mode (the swap methods below back the CLI reloaders that operate on `self.single`).
+    /// A snapshot of the single-index route's current routing (`Arc` clone). Single-index mode only.
     fn routing(&self) -> Arc<RoutingState> {
         self.single().routing()
     }
 
-    /// **Hot-reload** the (single) topology: atomically replace the shard set + router, e.g.
-    /// after a reshard cutover the control plane committed a new bucket map and added nodes. In-flight
-    /// requests finish against their snapshot; subsequent ones route through the new topology. The
-    /// router's shard count must match the node count. (Ordinal indexes only — not windowed.)
+    /// **Hot-reload** the (single) topology: atomically replace the shard set + router (e.g. after a
+    /// reshard cutover). In-flight requests finish against their snapshot. The router's shard count
+    /// must match the node count. (Ordinal indexes only — not windowed.)
     pub fn swap_routing(&self, shards: Vec<Arc<dyn Node>>, router: ShardRouter) {
         self.single().swap(shards, router);
     }
 
-    /// **Hot-swap** the (single) windowed gateway's window set:
-    /// atomically install a new `(shards, window descriptors)` so a running windowed gateway can serve
-    /// a **newly-created** window (or an updated zone-map) without a restart — the windowed analog of
-    /// [`swap_routing`]. `windows` aligns 1:1 with `shards` (one `(window id, event zone-map)` each);
-    /// the key router is regenerated as `hashed(n)` (windowed fan-out never key-routes). In-flight
-    /// requests finish against their snapshot. Skips an empty/mismatched swap, like `swap_routing`.
+    /// **Hot-swap** the (single) windowed gateway's window set: install a new `(shards, window
+    /// descriptors)` so a running windowed gateway serves a **newly-created** window (or updated
+    /// zone-map) without a restart — the windowed analog of [`swap_routing`]. `windows` aligns 1:1
+    /// with `shards`; the key router is regenerated as `hashed(n)`. Skips an empty/mismatched swap.
     pub fn swap_windowed(
         &self,
         shards: Vec<Arc<dyn Node>>,
@@ -505,17 +467,14 @@ impl Gateway {
     }
 
     /// Resolve a request's target `index` field to the [`IndexRoute`] that answers it — the
-    /// per-request routing decision every read/write handler makes at entry.
+    /// per-request routing decision every handler makes at entry.
     ///
-    /// The empty-index rule: an empty `index` uses `default_index` if set; else, if exactly one index
-    /// is currently served (a lone `single` route, or a single resolved multi-index route with no
-    /// resolver ambiguity), that one; else `InvalidArgument` ("index required; endpoint serves N
-    /// indexes"). A non-empty `index` names its target directly.
+    /// Empty-index rule: an empty `index` uses `default_index` if set; else, if exactly one index is
+    /// served, that one; else `InvalidArgument`. A non-empty `index` names its target directly.
     ///
-    /// Single-index mode preserves index scoping exactly: a non-empty name that differs from the
-    /// served index is `NOT_FOUND`; empty or the served name resolves to the static route. Multi-index
-    /// mode resolves the named index through the `resolver` (lazily populating `routes` and spawning
-    /// that index's hot-reloader), negative-caching a `NOT_FOUND` briefly.
+    /// Single-index mode preserves scoping: a non-empty name differing from the served index is
+    /// `NOT_FOUND`; empty or the served name resolves to the static route. Multi-index resolves the
+    /// named index through the `resolver` (lazily populating `routes`), negative-caching a `NOT_FOUND`.
     async fn resolve_route(&self, index: &str) -> Result<Arc<IndexRoute>, Status> {
         let want = index.trim();
         // ---- Single-index (static) mode. --------------------------
@@ -631,11 +590,10 @@ impl Gateway {
         Self::with_routing(shards, router, None)
     }
 
-    /// A **windowed** Gateway: one Node per time-window shard, each tagged with its
-    /// window id + event-time zone-map (`windows` aligns 1:1 with `shards`). A search carrying a
-    /// range filter on the window or event-time field is pruned to the overlapping windows before
-    /// scatter-gather; an unfiltered search fans out to all. The cross-shard merge is the same as
-    /// any multi-shard Gateway — windows are just shards the query may skip.
+    /// A **windowed** Gateway: one Node per time-window shard, each tagged with its window id +
+    /// event-time zone-map (`windows` aligns 1:1 with `shards`). A search carrying a range filter on
+    /// the window or event-time field is pruned to the overlapping windows before scatter-gather; an
+    /// unfiltered search fans out to all. The merge is the same as any multi-shard Gateway.
     pub fn windowed(
         shards: Vec<Arc<dyn Node>>,
         windowing: TimeWindowing,
@@ -651,14 +609,12 @@ impl Gateway {
     }
 
     /// The shards a search must touch on `route`. Normally every shard; for a windowed route, only the
-    /// windows whose id + event zone-map overlap the query's time range. A query that
-    /// doesn't parse or carries no relevant range bound prunes nothing (fans out to all) — pruning
-    /// only ever *removes* windows that provably can't match, so results never change.
+    /// windows whose id + event zone-map overlap the query's time range. Pruning only *removes*
+    /// windows that provably can't match, so results never change.
     fn target_shards(route: &IndexRoute, body: &SearchRequest) -> Vec<Arc<dyn Node>> {
-        // Partition-prune: on a non-windowed, partition-routed index, a search that
-        // AND-pins every (keyword) partition field can only match keys owned by one shard — route
-        // there instead of broadcasting to all. Correct because Partition routing depends solely on
-        // the partition (the identifier is dropped), so no matching key lives on another shard.
+        // Partition-prune: on a partition-routed index, a search that AND-pins every keyword
+        // partition field can only match keys owned by one shard — route there. Correct because
+        // Partition routing depends solely on the partition, so no matching key lives elsewhere.
         let rs = route.routing();
         if rs.window_routing.is_none() {
             if let Some(ord) = Self::partition_prune(route, &body.query, &rs) {
@@ -670,7 +626,7 @@ impl Gateway {
 
     /// The single shard a search must touch when its filter AND-pins **all** of `route`'s keyword
     /// partition fields — else `None` (fan out). Builds the pinned partition into a [`CompositeKey`]
-    /// and routes it (reusing the same [`ShardRouter`] as [`get_by_key`](Self::get_by_key)).
+    /// and routes it (same [`ShardRouter`] as [`get_by_key`](Self::get_by_key)).
     fn partition_prune(route: &IndexRoute, query_str: &str, rs: &RoutingState) -> Option<usize> {
         if route.partition_fields.is_empty() {
             return None;
@@ -690,10 +646,9 @@ impl Gateway {
     }
 
     /// The shards a `query_str` must touch on routing snapshot `rs` (shared by search and aggregate):
-    /// all shards on a normal route; on a windowed route only the windows whose id + event
-    /// zone-map overlap the query's time range. An unparseable / unfiltered query prunes nothing.
-    /// Pruning only removes windows that can't match, so a windowed aggregate over a time range gives
-    /// the same result as scanning all windows — just cheaper.
+    /// all shards on a normal route; on a windowed route only the windows whose id + event zone-map
+    /// overlap the query's time range. An unparseable / unfiltered query prunes nothing (results are
+    /// unchanged — just cheaper).
     fn windows_matching(rs: &RoutingState, query_str: &str) -> Vec<Arc<dyn Node>> {
         let Some(wr) = &rs.window_routing else {
             return rs.shards.clone();
@@ -717,10 +672,9 @@ impl Gateway {
         self
     }
 
-    /// Admit one query, or load-shed: at [`GatewayLimits::max_concurrent_queries`] concurrent
-    /// admitted queries the call is rejected immediately with `RESOURCE_EXHAUSTED` (HTTP 429 over
-    /// REST) — an honest "retry with backoff" instead of queueing into a timeout. The permit is
-    /// held for the query's whole lifetime (RAII).
+    /// Admit one query, or load-shed: at [`GatewayLimits::max_concurrent_queries`] the call is
+    /// rejected immediately with `RESOURCE_EXHAUSTED` (HTTP 429) — an honest "retry with backoff"
+    /// instead of queueing into a timeout. The permit is held for the query's lifetime (RAII).
     fn admit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Status> {
         self.admission.clone().try_acquire_owned().map_err(|_| {
             Status::resource_exhausted(format!(
@@ -730,9 +684,8 @@ impl Gateway {
         })
     }
 
-    /// Run a single-shard forward under the same per-query deadline the scatter-gather uses. The
-    /// multi-shard path bounds itself via [`gather_responses`], but a direct single-shard forward
-    /// otherwise had no ceiling, so one slow legal query could pin a blocking worker indefinitely.
+    /// Run a single-shard forward under the same per-query deadline the scatter-gather uses — a direct
+    /// forward otherwise had no ceiling, so one slow query could pin a blocking worker indefinitely.
     /// On expiry the caller gets `DEADLINE_EXCEEDED`.
     async fn under_deadline<T>(
         &self,
@@ -746,10 +699,9 @@ impl Gateway {
         }
     }
 
-    /// Declare the index name this Gateway serves. A search whose `index` is non-empty and
-    /// names a different index is then rejected with `NOT_FOUND` — the console can scope a query to a
-    /// named index and trust it won't be silently answered by the wrong one. Without this the Gateway
-    /// ignores `SearchRequest.index` and serves every request.
+    /// Declare the index name this Gateway serves. A search whose `index` is non-empty and names a
+    /// different index is then rejected with `NOT_FOUND`, so the console can scope a query and trust
+    /// it won't be answered by the wrong index. Without this the Gateway ignores `index` and serves all.
     pub fn serving(mut self, index: impl Into<String>) -> Self {
         let name = index.into();
         // The served index also becomes the empty-`index` default, so a bare request resolves to it.
@@ -758,11 +710,10 @@ impl Gateway {
         self
     }
 
-    /// Install an [authenticator](crate::authn) — the Gateway is where authentication
-    /// terminates (see okf/system/decisions/d06-authn-authz.md). Once set, every query-surface call must carry a valid
-    /// credential: the Gateway authenticates it, stamps the *verified* principal/tenant into
-    /// the request (dropping any caller-asserted identity), then routes. Without this the
-    /// Gateway stays open and forwards caller-supplied identity verbatim.
+    /// Install an [authenticator](crate::authn) — where authentication terminates
+    /// (see okf/system/decisions/d06-authn-authz.md). Once set, every query-surface call must carry a
+    /// valid credential: the Gateway authenticates it, stamps the *verified* principal/tenant into the
+    /// request (dropping any caller-asserted identity), then routes. Without this it stays open.
     pub fn with_authn(mut self, authn: SharedAuthn) -> Self {
         self.authn = Some(authn);
         self
@@ -781,18 +732,16 @@ impl Gateway {
     }
 
     /// Install an [authorization hook](crate::auth::AuthHook) — typically an
-    /// [`RbacPolicy`](crate::rbac::RbacPolicy) — enforced at the Gateway after authentication.
-    /// A call whose verified roles don't grant the method's scope is rejected with
-    /// `PermissionDenied` *before* any shard is touched. Without this, only AuthN runs.
+    /// [`RbacPolicy`](crate::rbac::RbacPolicy) — enforced after authentication. A call whose verified
+    /// roles don't grant the method's scope is `PermissionDenied` *before* any shard is touched.
     pub fn with_authz(mut self, authz: SharedAuth) -> Self {
         self.authz = Some(authz);
         self
     }
 
-    /// Tag a windowed Gateway with its **cold-tier** state: the set of `cold_windows`
-    /// served read-through + the shared read-through `cache`, surfaced by [`cold_status`](Self::cold_status).
-    /// Wire the shared read-through cache so `/v1/cold` can report its stats (an in-process node
-    /// gateway). The per-window tier is carried by the routing descriptors, not here.
+    /// Wire a windowed Gateway's shared read-through `cache` so `/v1/cold` can report its stats (an
+    /// in-process node gateway), surfaced by [`cold_status`](Self::cold_status). The per-window tier is
+    /// carried by the routing descriptors, not here.
     pub fn with_cold_tier(mut self, cache: growlerdb_index::RangeCache) -> Self {
         self.cold = Some(ColdTier { cache });
         self
@@ -800,8 +749,7 @@ impl Gateway {
 
     /// Declare the served index's temporal-field units so the `_search` adapter converts range/exact
     /// bounds written in those units to canonical micros before planning. From the served definition
-    /// ([`ResolvedIndex::date_formats`](growlerdb_core::ResolvedIndex::date_formats), or the field
-    /// mappings on `GetIndex` for a live-CP gateway).
+    /// ([`ResolvedIndex::date_formats`](growlerdb_core::ResolvedIndex::date_formats) or `GetIndex`).
     pub fn with_date_formats(mut self, formats: crate::opensearch::FieldFormats) -> Self {
         self.date_formats = formats;
         self
@@ -815,17 +763,14 @@ impl Gateway {
     /// Cold-tier status: each window's hot/cold tier + event zone-map, plus the shared
     /// read-through cache's hit/miss/byte stats. `None` on a non-windowed Gateway.
     pub fn cold_status(&self) -> Option<ColdStatus> {
-        // A multi-index gateway (e.g. the HA placement pool) has no single static route, so there's
-        // no windowed cold tier to report — return None (→ 404) instead of panicking in `single()`.
-        // Guard on `self.single` first so the `routing()` call below can't hit that `.expect()`.
+        // A multi-index gateway has no single static route → no windowed cold tier. Guard on
+        // `self.single` first so `routing()` below can't hit its `.expect()` (return None → 404).
         self.single.as_ref()?;
         let rs = self.routing();
         let wr = rs.window_routing.as_ref()?;
-        // The per-window tier comes from the routing descriptors — for the in-process node gateway
-        // that is its live shard set; for the cluster gateway it is the tier each node reports every
-        // heartbeat (so a runtime park/pre-warm shows up here, not just the boot snapshot). The shared
-        // read-through cache (and its hit/miss stats) is local to a node, so only an in-process
-        // gateway that was wired [`with_cold_tier`] reports cache stats.
+        // The per-window tier comes from the routing descriptors (a node's live shards, or the tier
+        // each node reports per heartbeat), so a runtime park/pre-warm shows up here. The shared
+        // read-through cache is node-local, so only a [`with_cold_tier`] gateway reports cache stats.
         let windows: Vec<WindowStatus> = wr
             .windows
             .iter()
@@ -846,14 +791,13 @@ impl Gateway {
     }
 
     /// Authenticate + authorize + **resolve the target route** for a read/write `method` in one step:
-    /// guards the request against the target index (so per-index RBAC sees it), then hands
-    /// back the [`IndexRoute`] the handler operates on. `index` is the request's `index` field.
+    /// guards the request against the target index (so per-index RBAC sees it), then returns the
+    /// [`IndexRoute`] the handler operates on. `index` is the request's `index` field.
     ///
-    /// Order: **authn → authz(target index) → resolve**. Authenticating first stamps the verified
-    /// identity; authorizing *before* resolution means a token whose allowlist forbids the index is
-    /// `PermissionDenied` without a control-plane round-trip and without revealing whether the index
-    /// exists (no shard is ever touched for a denied index). The authz target is the request's explicit
-    /// name, or — when empty — the endpoint's default index (so an allowlist still binds the default).
+    /// Order: **authn → authz(target index) → resolve**. Authorizing *before* resolution means a token
+    /// whose allowlist forbids the index is `PermissionDenied` without a control-plane round-trip and
+    /// without revealing whether the index exists. The authz target is the explicit name, or — when
+    /// empty — the endpoint's default index.
     async fn guard_and_resolve<T>(
         &self,
         method: &'static str,
@@ -877,12 +821,10 @@ impl Gateway {
         self.resolve_route(index).await
     }
 
-    /// The **verified identity** of the caller of `req`, for `GET /v1/me`. Authenticates
-    /// (but does not authorize — identity is not a gated operation) and returns the trusted
-    /// principal/roles/profile. On an **open** gateway (no authenticator) returns the
-    /// [anonymous](crate::authn::Verified::anonymous) shape, so the console shows "not signed in"
-    /// rather than erroring; a configured gateway with a missing/invalid token returns the authn
-    /// error (401), which the console also treats as anonymous.
+    /// The **verified identity** of the caller of `req`, for `GET /v1/me`. Authenticates (but does not
+    /// authorize — identity is not gated). An **open** gateway returns the
+    /// [anonymous](crate::authn::Verified::anonymous) shape; a configured gateway with a bad token
+    /// returns the authn error (401), which the console also treats as anonymous.
     pub fn identity<T>(&self, req: &mut Request<T>) -> Result<crate::authn::Verified, Status> {
         match &self.authn {
             Some(authn) => crate::authn::authenticate(authn, req),
@@ -890,17 +832,15 @@ impl Gateway {
         }
     }
 
-    /// Whether this gateway **requires authentication** ("closed mode") — true iff an authenticator
-    /// is configured. The console reads this from `GET /v1/config` to decide whether to gate the app
-    /// behind a login screen; an open gateway (no authenticator) returns false and the
-    /// console runs un-gated, the zero-config trial/POC path.
+    /// Whether this gateway **requires authentication** ("closed mode") — true iff an authenticator is
+    /// configured. The console reads this from `GET /v1/config` to decide whether to gate behind login;
+    /// an open gateway runs un-gated (the zero-config trial/POC path).
     pub fn auth_required(&self) -> bool {
         self.authn.is_some()
     }
 
-    /// Number of shards this Gateway fronts for its single index. In multi-index mode there
-    /// is no single shard count (each resolved index has its own), so this reports `0` — callers that
-    /// log a shard count use it only for the single-index CLI paths.
+    /// Number of shards this Gateway fronts for its single index. Multi-index mode reports `0` (each
+    /// resolved index has its own count) — callers use it only for single-index CLI paths.
     pub fn shard_count(&self) -> usize {
         match &self.single {
             Some(single) => single.routing().shards.len(),
@@ -908,25 +848,22 @@ impl Gateway {
         }
     }
 
-    /// Run a search. Single-shard: forward verbatim. Multi-shard: scatter to every shard,
-    /// merge the hits into one global order (by sort tuple when sorted, else by score), apply
-    /// the global `offset`/`limit`, and flag `partial` if any shard failed. Records the query
-    /// SLI (rate/errors/duration) around the whole call, so both the gRPC and REST
-    /// fronts are covered through this one chokepoint.
+    /// Run a search. Single-shard: forward verbatim. Multi-shard: scatter to every shard, merge into
+    /// one global order (by sort tuple when sorted, else score), apply the global `offset`/`limit`, and
+    /// flag `partial` if any shard failed. Records the query SLI around the whole call (REST + gRPC).
     pub async fn search(
         &self,
         mut req: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         let _permit = self.admit()?;
-        // Inline hydration is Gateway orchestration (like hybrid): take the opt-in out of the
-        // request so shards never see it, run the search, then attach rows via the governed
-        // GetByKey path under this same admission permit.
+        // Inline hydration is Gateway orchestration (like hybrid): take the opt-in out of the request
+        // so shards never see it, then attach rows via the governed GetByKey path under this permit.
         let hydrate = std::mem::take(&mut req.get_mut().hydrate);
         let hydrate_columns = std::mem::take(&mut req.get_mut().hydrate_columns);
         self.check_hydrate_page(hydrate, req.get_ref().limit)?;
         let hydration = hydrate.then(|| (req.metadata().clone(), req.get_ref().index.clone()));
-        // Query SLIs, once per request at this public entry (covers REST + gRPC): the retrieval
-        // layer, then the FULL blackbox round-trip (incl. hydration) — the primary latency SLI.
+        // Query SLIs, once per request at this public entry (REST + gRPC): the retrieval layer, then
+        // the full blackbox round-trip incl. hydration (the primary latency SLI).
         let index = self.label_index(&req.get_ref().index);
         let start = std::time::Instant::now();
         let retrieved = self.search_unadmitted(req).await;
@@ -1031,10 +968,9 @@ impl Gateway {
         let offset = body.offset as usize;
         let limit = body.limit as usize;
 
-        // `offset` paging (offset-merge) and `search_after` keyset scrolling (below) are both
-        // supported across shards. Keyset paging needs a sort to define the keyset — a
-        // score-ranked scroll has no stable cursor (scores aren't a keyset), so reject that —
-        // whether the sort is empty (pure relevance) or carries an explicit `_score` key.
+        // Keyset paging needs a sort to define the keyset — a score-ranked scroll has no stable
+        // cursor (scores aren't a keyset), so reject `search_after` whether the sort is empty (pure
+        // relevance) or carries an explicit `_score` key. `offset` paging is offset-merged below.
         let sort_by_score = body.sort.iter().any(|s| s.field == SCORE_SORT_KEY);
         if !body.search_after.is_empty() && (body.sort.is_empty() || sort_by_score) {
             return Err(Status::invalid_argument(
@@ -1042,21 +978,17 @@ impl Gateway {
                  keyset paging is unsupported because scores aren't a stable keyset.",
             ));
         }
-        // Collapse folds groups across shards on its own scatter/merge path — it ignores
-        // offset/keyset paging, so it doesn't share the offset-merge logic below.
+        // Collapse folds groups on its own scatter/merge path — it ignores offset/keyset paging.
         if !body.collapse.is_empty() {
             return self
                 .search_collapsed_merge(&shards, shards_total, meta, body)
                 .await;
         }
 
-        // Offset-merge: a shard can't apply the *global* offset, so ask each for
-        // the page from rank 0 deep enough to cover it — `offset + limit` hits — and apply the
-        // global `offset`/`limit` once, at the merge. A `search_after` cursor encodes the global
-        // position directly, so `offset` is ignored on the keyset path (each shard resumes
-        // strictly after the cursor and returns up to `limit`). `limit == 0` propagates as a
-        // zero per-shard limit, which each shard answers with an empty page — a de-facto
-        // hits-metadata-only query, not an unbounded one.
+        // Offset-merge: a shard can't apply the *global* offset, so ask each for the page from rank 0
+        // deep enough to cover it (`offset + limit` hits) and apply the global window once at the
+        // merge. A `search_after` cursor encodes the global position, so `offset` is ignored on the
+        // keyset path. `limit == 0` propagates as a zero per-shard limit (an empty, metadata-only page).
         let effective_offset = if body.search_after.is_empty() {
             offset
         } else {
@@ -1093,19 +1025,17 @@ impl Gateway {
         // is aborted) simply doesn't contribute a body — `failed` counts those.
         let Fanout { bodies, errors } = gather_responses(set, self.limits.deadline).await;
         let failed = total_shards - bodies.len();
-        // Every shard failed/timed out ⇒ an honest error, not a success-shaped empty page a
-        // client could mistake for "no matches". A uniform client error (e.g. a bad query shape)
-        // surfaces verbatim as a 4xx instead of an opaque 500 — see `all_shards_failed`.
+        // Every shard failed/timed out ⇒ an honest error, not a success-shaped empty page. A uniform
+        // client error (e.g. a bad query shape) surfaces verbatim as a 4xx — see `all_shards_failed`.
         if bodies.is_empty() {
             return Err(all_shards_failed(
                 format!("all {total_shards} shards failed to respond"),
                 errors,
             ));
         }
-        // Each shard reports its true match count; sum them for the global total. Shards are
-        // normally disjoint, but during a **reshard** a moved bucket briefly lives on both
-        // its old and new shard, so the merged hits are deduped by key below. `total` still
-        // sums per-shard counts — it can over-count during that window, like the `partial` flag.
+        // Sum each shard's true match count for the global total. Shards are normally disjoint, but a
+        // **reshard** briefly places a moved bucket on both old and new shard, so hits are deduped by
+        // key below; `total` still sums per-shard counts (can over-count in that window).
         if body.require_complete && failed > 0 {
             return Err(refuse_partial(failed, total_shards, &errors));
         }
@@ -1118,12 +1048,9 @@ impl Gateway {
             hits.extend(r.hits);
         }
 
-        // Merge into one globally-ordered sequence, both paths using the encoded composite key
-        // as the final, deterministic tiebreaker (a total order independent of shard
-        // *completion* order). A **field-sorted** query orders by the sort tuple (the same
-        // comparator the store uses across generations, lifted across shards); a
-        // **score-ranked** query orders by score desc. Cross-shard keyset paging isn't defined
-        // yet, so the page carries no cursor.
+        // Merge into one globally-ordered sequence, both paths using the encoded composite key as the
+        // deterministic tiebreaker (a total order independent of shard completion order): a
+        // field-sorted query orders by the sort tuple, a score-ranked query by score desc.
         if body.sort.is_empty() {
             let mut decorated: Vec<(Vec<u8>, growlerdb_proto::v1::SearchHit)> =
                 hits.into_iter().map(|h| (hit_key(&h), h)).collect();
@@ -1137,13 +1064,12 @@ impl Gateway {
         } else {
             hits = merge_field_sorted(hits, &body.sort);
         }
-        // Dedupe by composite key: keep the first (best-ranked) occurrence of each key, so
-        // a doc that a reshard has on two shards mid-cutover is returned once. A no-op when shards
-        // are disjoint (every key appears once).
+        // Dedupe by composite key, keeping the first (best-ranked) occurrence — so a doc a reshard has
+        // on two shards mid-cutover is returned once. A no-op when shards are disjoint.
         let mut seen = std::collections::HashSet::new();
         hits.retain(|h| seen.insert(hit_key(h)));
-        // Apply the global window to the merged order: drop the first `effective_offset`, then
-        // keep `limit` (0 = keep all). This is the step a single shard couldn't do.
+        // Apply the global window to the merged order (the step a single shard couldn't do): drop the
+        // first `effective_offset`, then keep `limit` (0 = keep all).
         if effective_offset > 0 {
             hits.drain(..effective_offset.min(hits.len()));
         }
@@ -1153,11 +1079,9 @@ impl Gateway {
         // `total` is the global match count (summed across shards), not the page size.
         let total = total_matches;
 
-        // Compose the **global** keyset cursor: for a sorted query that returned a
-        // full page, the next page resumes strictly after the last returned hit's (sort tuple,
-        // key). A short page means every shard is exhausted at this position → no cursor.
-        // Score-ranked queries — pure relevance or an explicit `_score` key — have no stable
-        // keyset, so they never carry a cursor.
+        // Compose the **global** keyset cursor: a sorted query that returned a full page resumes
+        // strictly after the last hit's (sort tuple, key); a short page means every shard is
+        // exhausted → no cursor. Score-ranked queries have no stable keyset → never a cursor.
         let next_cursor =
             if !body.sort.is_empty() && !sort_by_score && limit > 0 && hits.len() == limit {
                 hits.last()
@@ -1178,15 +1102,13 @@ impl Gateway {
         }))
     }
 
-    /// Multi-shard **collapse**: each shard collapses locally and returns its top-`limit` groups,
-    /// each carrying the group's top-hit sort values. The Gateway **folds** groups by
-    /// value across shards — summing each group's `group_count` and keeping the globally-best hit
-    /// (the first in the merged sort order) — then orders the folded groups and truncates to
+    /// Multi-shard **collapse**: each shard collapses locally and returns its top-`limit` groups with
+    /// their top-hit sort values. The Gateway **folds** groups by value across shards (summing each
+    /// `group_count`, keeping the globally-best hit), orders the folded groups, and truncates to
     /// `limit`. Collapse ignores offset/keyset paging, so no cursor is produced.
     ///
-    /// Recall caveat (documented, same as distributed terms aggs / Elasticsearch field collapse):
-    /// a group present on a shard but outside that shard's local top-`limit` can be missed; the
-    /// fold is exact for the groups every relevant shard surfaced.
+    /// Recall caveat (as with distributed terms aggs / Elasticsearch field collapse): a group outside a
+    /// shard's local top-`limit` can be missed; the fold is exact for the groups every relevant shard surfaced.
     async fn search_collapsed_merge(
         &self,
         shards: &[Arc<dyn Node>],
@@ -1276,25 +1198,22 @@ impl Gateway {
         }))
     }
 
-    /// Run a **semantic (KNN) search**. The Gateway is pure orchestration: it
-    /// resolves + authorizes the index, then scatters the `SemanticSearchRequest` to each shard —
-    /// **each Node embeds the query text itself** (the Gateway carries no ML model) — and merges the
-    /// KNN hits into one global top-`k` by score (the same score-merge + dedupe the lexical path
-    /// uses). Single-shard forwards verbatim. Tenant scoping is enforced Node-side, fail-closed.
+    /// Run a **semantic (KNN) search**. Pure Gateway orchestration: resolve + authorize the index,
+    /// scatter the `SemanticSearchRequest` to each shard (**each Node embeds the query text itself** —
+    /// the Gateway carries no ML model), and merge the KNN hits into one global top-`k` by score (same
+    /// score-merge + dedupe as the lexical path). Single-shard forwards verbatim; tenant scoping is Node-side.
     pub async fn semantic_search(
         &self,
         mut req: Request<SemanticSearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         let _permit = self.admit()?;
-        // Inline hydration, mirroring `search`: Gateway-only, stripped before the scatter,
-        // attached after the merge under this same admission permit.
+        // Inline hydration, mirroring `search`: stripped before the scatter, attached after the merge.
         let hydrate = std::mem::take(&mut req.get_mut().hydrate);
         let hydrate_columns = std::mem::take(&mut req.get_mut().hydrate_columns);
         self.check_hydrate_page(hydrate, req.get_ref().k)?;
         let hydration = hydrate.then(|| (req.metadata().clone(), req.get_ref().index.clone()));
-        // Query SLIs, once per request at this admitted entry — NOT in `semantic_search_unadmitted`,
-        // which the hybrid semantic arm reuses (so hybrid isn't double-counted; it records once via
-        // its own wrapper). Retrieval layer, then the full blackbox round-trip incl. hydration.
+        // Query SLIs once per request at this admitted entry — NOT in `semantic_search_unadmitted`,
+        // which the hybrid arm reuses (so hybrid records once, via its own wrapper).
         let index = self.label_index(&req.get_ref().index);
         let start = std::time::Instant::now();
         let retrieved = self.semantic_search_unadmitted(req).await;
@@ -1319,17 +1238,16 @@ impl Gateway {
         result
     }
 
-    /// [`semantic_search`](Self::semantic_search) minus the admission permit — the internal form composite
-    /// queries call, so one admitted query never charges multiple permits (or sheds its own
-    /// sub-queries at the cap).
+    /// [`semantic_search`](Self::semantic_search) minus the admission permit — the internal form
+    /// composite queries call, so one admitted query never charges multiple permits.
     async fn semantic_search_unadmitted(
         &self,
         mut req: Request<SemanticSearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         let index = req.get_ref().index.clone();
         let route = self.guard_and_resolve("Search", &index, &mut req).await?;
-        // Page-fetch ceiling on `k`, mirroring the lexical path's `offset+limit` guard: an
-        // unbounded `k` would make every shard build a giant top-k and OOM the Gateway.
+        // Page-fetch ceiling on `k`, mirroring the lexical `offset+limit` guard: an unbounded `k`
+        // would make every shard build a giant top-k and OOM the Gateway.
         let k = req.get_ref().k as usize;
         if self.limits.max_fetch > 0 && k > self.limits.max_fetch {
             return Err(Status::invalid_argument(format!(
@@ -1380,9 +1298,8 @@ impl Gateway {
             merge_warnings(&mut warnings, std::mem::take(&mut r.warnings));
             hits.extend(r.hits);
         }
-        // KNN hits are score-ranked (no field sort) — merge by score desc + key tiebreak, dedupe
-        // (a reshard can briefly place a key on two shards), and keep the global top-`k`. Identical
-        // to the lexical `search_inner` score branch.
+        // KNN hits are score-ranked — merge by score desc + key tiebreak, dedupe (a reshard can
+        // briefly place a key on two shards), keep the global top-`k`.
         let hits = merge_score_topk(hits, k);
         Ok(Response::new(SearchResponse {
             hits,
@@ -1395,19 +1312,18 @@ impl Gateway {
         }))
     }
 
-    /// Run a **hybrid search**: fan out BOTH a lexical (BM25) [`search`](Self::search)
-    /// over `query_text` AND a [`semantic_search`](Self::semantic_search) over `vector_field`, each
-    /// already merged into a ranked list across shards, then **Reciprocal-Rank-Fuse** the two lists
-    /// at the Gateway. The Gateway embeds nothing — each Node embeds its own semantic arm. A doc
-    /// strong in *both* modalities fuses above one strong in only one. The two arms carry the same
-    /// auth metadata, so authz/tenant scoping binds each independently.
+    /// Run a **hybrid search**: fan out BOTH a lexical (BM25) [`search`](Self::search) over
+    /// `query_text` AND a [`semantic_search`](Self::semantic_search) over `vector_field`, each already
+    /// merged across shards, then **Reciprocal-Rank-Fuse** the two at the Gateway. The Gateway embeds
+    /// nothing — each Node embeds its own semantic arm. The two arms carry the same auth metadata, so
+    /// authz/tenant scoping binds each independently.
     pub async fn hybrid_search(
         &self,
         req: Request<HybridSearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         let _permit = self.admit()?;
-        // One query SLI for the whole fused query, once at this public entry (covers REST + gRPC).
-        // The arms reuse the `_unadmitted` forms, which don't record, so this doesn't double-count.
+        // One query SLI for the whole fused query, once at this entry (the arms reuse `_unadmitted`
+        // forms, which don't record, so no double-count).
         let index = self.label_index(&req.get_ref().index);
         let hydrated = req.get_ref().hydrate;
         let start = std::time::Instant::now();
@@ -1422,9 +1338,8 @@ impl Gateway {
         result
     }
 
-    /// The body of [`hybrid_search`](Self::hybrid_search) minus admission + SLI recording (done by the
-    /// wrapper). `start` is the wrapper's timer, so the retrieval-layer SLI (recorded after fusion,
-    /// before hydration) shares the full metric's origin.
+    /// The body of [`hybrid_search`](Self::hybrid_search) minus admission + SLI recording. `start` is
+    /// the wrapper's timer, so the retrieval-layer SLI shares the full metric's origin.
     async fn hybrid_search_impl(
         &self,
         req: Request<HybridSearchRequest>,
@@ -1432,8 +1347,8 @@ impl Gateway {
         start: std::time::Instant,
     ) -> Result<Response<SearchResponse>, Status> {
         let (meta, _ext, mut body) = req.into_parts();
-        // Inline hydration: consumed here, after the fusion; the arm requests below are
-        // built field-by-field, so neither arm re-hydrates.
+        // Inline hydration: consumed here after the fusion; the arm requests are built field-by-field,
+        // so neither arm re-hydrates.
         let hydrate = body.hydrate;
         let hydrate_columns = std::mem::take(&mut body.hydrate_columns);
         self.check_hydrate_page(hydrate, body.k)?;
@@ -1453,12 +1368,9 @@ impl Gateway {
             )));
         }
 
-        // Lexical arm: the query text as a BM25 query, with `filter` ANDed in. The filter must
-        // constrain the FUSED result — before this, it bound only the semantic arm, so a doc the
-        // filter excludes could still surface via its lexical rank (surprising whenever the
-        // filter encodes a data-scoping restriction). Composed textually in the request's own
-        // grammar (Lucene `AND` / KQL `and`); an empty query text means the filter alone drives
-        // the lexical arm.
+        // Lexical arm: the query text as a BM25 query, with `filter` ANDed in so the filter constrains
+        // the FUSED result (not just the semantic arm). Composed in the request's own grammar (Lucene
+        // `AND` / KQL `and`); an empty query text means the filter alone drives the lexical arm.
         let lexical_query = {
             let (q, f) = (body.query_text.trim(), body.filter.trim());
             let conj = if body.syntax == growlerdb_proto::v1::QuerySyntax::Kql as i32 {
@@ -1497,9 +1409,8 @@ impl Gateway {
                 filter: body.filter.clone(),
                 syntax: body.syntax,
                 window: 0,
-                // Hybrid reranking reorders the semantic candidates node-side (where the vector
-                // spec + cached text live) before RRF, so the cross-encoder relevance carries into
-                // the fused ranks. `rerank_top_k` bounds the candidate pool the Node reranks.
+                // Reranking reorders the semantic candidates node-side (where the vector spec + cached
+                // text live) before RRF. `rerank_top_k` bounds the candidate pool the Node reranks.
                 rerank: body.rerank,
                 rerank_top_k: body.rerank_top_k,
                 // Hydration happens once, after the fusion — never per arm.
@@ -1509,14 +1420,11 @@ impl Gateway {
             },
         );
 
-        // The semantic arm defines the request (its vector field, index resolution, and authz), so
-        // surface its error verbatim. The lexical arm tolerates an unparseable/empty query — the
-        // fusion then just reflects the semantic ranking (mirroring the engine's MatchAll-fallback
-        // intent), rather than failing the whole hybrid on a query the vector arm handled fine.
-        // A dropped lexical arm is a **flagged** degradation (`warn!` + `partial` + `warnings`),
-        // never a silent one: without the flag a hybrid response is indistinguishable from
-        // semantic-only, which is exactly how a broken arm hid in the demo stack. The arms run
-        // concurrently — hybrid latency is max(arms), not sum.
+        // The semantic arm defines the request (vector field, index resolution, authz), so surface
+        // its error verbatim. The lexical arm tolerates an unparseable/empty query — the fusion then
+        // reflects the semantic ranking rather than failing the whole hybrid. A dropped lexical arm is
+        // a **flagged** degradation (`warn!` + `partial` + `warnings`), never silent (else it's
+        // indistinguishable from semantic-only). The arms run concurrently — latency is max, not sum.
         let (semantic, lexical) = tokio::join!(
             self.semantic_search_unadmitted(semantic_req),
             self.search_unadmitted(lexical_req),
@@ -1524,9 +1432,8 @@ impl Gateway {
         let semantic = semantic?.into_inner();
         let lexical = lexical.map(Response::into_inner);
 
-        // `require_complete` opts out of the third (partial) state: a dropped arm is a refusal,
-        // not a flagged fusion. (Shard-level gaps inside each arm already errored arm-side —
-        // the flag rides the arm requests — so this is the last degradation point.)
+        // `require_complete` opts out of the partial state: a dropped arm is a refusal, not a flagged
+        // fusion. (Shard-level gaps inside each arm already errored arm-side.)
         if body.require_complete {
             if let Err(status) = &lexical {
                 return Err(Status::unavailable(format!(
@@ -1566,8 +1473,8 @@ impl Gateway {
         let fused = rrf_fuse_hits(&[lex_hits, semantic.hits.as_slice()], rrf_k, k);
         // Retrieval layer done (both arms + fusion); hydration, if any, follows below.
         growlerdb_telemetry::sli::query_retrieval(index, start.elapsed().as_secs_f64());
-        // `total`: the lexical arm's true corpus-wide match count when that arm succeeded (KNN
-        // has no match count — it is a top-k retrieval), else honestly just the fused page size.
+        // `total`: the lexical arm's true corpus-wide match count when it succeeded (KNN has none — it
+        // is a top-k retrieval), else the fused page size.
         let total = lexical
             .as_ref()
             .map(|r| r.total.max(fused.len() as u64))
@@ -1603,11 +1510,9 @@ impl Gateway {
     }
 
     /// **Inline hydration**: resolve the page's hit coordinates through
-    /// [`get_by_key_unadmitted`](Self::get_by_key_unadmitted) — the same governed, key-verified
-    /// path as a standalone GetByKey, under the caller's own request metadata — and attach each
-    /// row to its hit. Failure degrades **per-hit** (`hydrate_error`), never the search: the hits
-    /// keep their coordinates + cached fields whether a shard dropped, a row was tenant-filtered
-    /// or source-missing, or the whole hydration errored.
+    /// [`get_by_key_unadmitted`](Self::get_by_key_unadmitted) — the same governed, key-verified path
+    /// as a standalone GetByKey, under the caller's own metadata — and attach each row to its hit.
+    /// Failure degrades **per-hit** (`hydrate_error`), never the search.
     async fn hydrate_hits(
         &self,
         resp: &mut SearchResponse,
@@ -1636,8 +1541,7 @@ impl Gateway {
             },
         );
         // Key rows by their own coordinates: rows come back in completion order and may drop
-        // tenant-filtered or missing keys, so pairing by position would mis-attribute rows
-        // (same rationale as the OpenSearch adapter's `_source` attribution).
+        // tenant-filtered/missing keys, so pairing by position would mis-attribute rows.
         let (mut rows, error) = match self.get_by_key_unadmitted(req).await {
             Ok(r) => {
                 let r = r.into_inner();
@@ -1674,8 +1578,7 @@ impl Gateway {
         mut req: Request<SuggestRequest>,
     ) -> Result<Response<SuggestResponse>, Status> {
         let _permit = self.admit()?;
-        // Resolve the target index: suggest honors `SuggestRequest.index`, so a
-        // multi-index endpoint suggests over the named index (and per-index RBAC applies).
+        // Resolve the target index: suggest honors `SuggestRequest.index` (per-index RBAC applies).
         let index = req.get_ref().index.clone();
         let route = self.guard_and_resolve("Suggest", &index, &mut req).await?;
         let rs = route.routing();
@@ -1736,14 +1639,13 @@ impl Gateway {
     }
 
     /// [`get_by_key`](Self::get_by_key) minus the admission permit — the internal form composite
-    /// queries call, so one admitted query never charges multiple permits (or sheds its own
-    /// sub-queries at the cap).
+    /// queries call, so one admitted query never charges multiple permits.
     async fn get_by_key_unadmitted(
         &self,
         mut req: Request<GetByKeyRequest>,
     ) -> Result<Response<GetByKeyResponse>, Status> {
-        // Bound the batch before any routing/fan-out — mirrors the Node's self-defense so the
-        // gateway rejects an oversized request up front rather than scattering it.
+        // Bound the batch before any routing/fan-out — reject an oversized request up front rather
+        // than scattering it.
         let n_keys = req.get_ref().keys.len();
         if n_keys > crate::lookup_service::MAX_KEYS {
             return Err(Status::invalid_argument(format!(
@@ -1760,14 +1662,11 @@ impl Gateway {
         }
         let (meta, _ext, body) = req.into_parts();
 
-        // Windowed: a key's coordinate carries no window selector, so we can't route it to a
-        // single shard the way ordinal hashing does. Broadcast every key to every window shard — each
-        // WindowNode stamps its window id, the node's WindowedLookupService dispatches locally, and the
-        // window that owns a key returns its row (others return none). Under the default COORDINATES
-        // locator a non-owning window returns just the subset it holds; under PREDICATE it answers a
-        // missing key with NotFound, folded into an empty contribution here (correct for single-key
-        // hydration; a multi-key request spanning windows under PREDICATE would need per-key window
-        // routing — a follow-on).
+        // Windowed: a key's coordinate carries no window selector, so broadcast every key to every
+        // window shard — each WindowNode stamps its window id, the node dispatches locally, and the
+        // owning window returns its row (others none). Under PREDICATE a missing key is NotFound,
+        // folded into an empty contribution here (a multi-key request spanning windows would need
+        // per-key window routing — a follow-on).
         if rs.window_routing.is_some() {
             let total = rs.shards.len();
             let mut set = tokio::task::JoinSet::new();
@@ -1812,9 +1711,8 @@ impl Gateway {
             }));
         }
 
-        // Group requested keys by owning shard. A malformed coordinate is rejected loudly
-        // — routing it to an arbitrary shard would surface as a spurious
-        // "not found" that hides the real cause (a bad key, not a missing row).
+        // Group requested keys by owning shard. A malformed coordinate is rejected loudly — routing it
+        // to an arbitrary shard would surface as a spurious "not found" that hides the real cause.
         let mut per_shard: Vec<Vec<Coordinates>> = vec![Vec::new(); rs.shards.len()];
         for coord in body.keys {
             let key = CompositeKey::try_from(coord.clone())
@@ -1873,10 +1771,9 @@ impl Gateway {
         }))
     }
 
-    /// Explain how a query scores one document. Routes to the **single owning shard**
-    /// (by key), then fills the per-stage timings + shard counts the leaf can't know: `index_ms` is
-    /// the Node's; `hydration_ms` is a best-effort PK lookup here; `total_ms` is the gateway wall
-    /// time. `shards_scanned = 1` (only the owner is touched) of `shards_total`.
+    /// Explain how a query scores one document. Routes to the **single owning shard** (by key), then
+    /// fills the per-stage timings + shard counts the leaf can't know: `index_ms` is the Node's,
+    /// `hydration_ms` a best-effort PK lookup here, `total_ms` the gateway wall time. `shards_scanned = 1`.
     pub async fn explain(
         &self,
         mut req: Request<ExplainRequest>,
@@ -1904,8 +1801,7 @@ impl Gateway {
         resp.shards_total = rs.shards.len() as u32;
 
         // Best-effort hydration timing — the authoritative row the console shows alongside the
-        // explanation (forwarding auth metadata so a tenant-scoped read still resolves). Carry the
-        // resolved index so the internal hydration routes to the same index.
+        // explanation (forwarding auth metadata + the resolved index so the read routes correctly).
         let gk = Request::from_parts(
             meta,
             Extensions::default(),
@@ -1964,9 +1860,8 @@ impl Gateway {
         // Reject a malformed spec at the boundary, before fanning out.
         growlerdb_core::validate_aggs(&aggs).map_err(Status::invalid_argument)?;
 
-        // Windowed: prune to the windows whose time range can match the query; non-windowed
-        // keeps every shard. A windowed query filtered beyond *all* windows prunes to none → a real,
-        // empty aggregation (zero counts), not a failure.
+        // Windowed: prune to the windows whose time range can match; non-windowed keeps every shard.
+        // Filtered beyond all windows → none → a real, empty aggregation (zero counts), not a failure.
         let shards = Self::windows_matching(&route.routing(), &body.query);
         let total_shards = shards.len();
         if total_shards == 0 {
@@ -2101,13 +1996,11 @@ impl Gateway {
         }))
     }
 
-    /// Reindex an index: rebuild it from source and durably swap it live. Unlike the
-    /// scatter-gather read RPCs, reindex is a **write-fenced mutation** that must run on the single
-    /// Node owning the shard. We route it only for a **single-shard** gateway (the embedded
-    /// `serve` deployment the console fronts); a distributed multi-shard reindex needs orchestration
-    /// (fence + rebuild + swap per shard) we don't do yet, so it surfaces an honest `Unimplemented`
-    /// rather than silently reindexing one shard. The owning Node still enforces the write-fence and
-    /// the single-flight guard (a second concurrent reindex → `FailedPrecondition`).
+    /// Reindex an index: rebuild from source and durably swap it live. Unlike the scatter-gather read
+    /// RPCs, reindex is a **write-fenced mutation** that must run on the single Node owning the shard.
+    /// Routed only for a **single-shard** gateway (the embedded `serve` the console fronts); a
+    /// distributed reindex needs per-shard orchestration we don't do yet → honest `Unimplemented`. The
+    /// owning Node still enforces the write-fence and single-flight guard.
     pub async fn reindex_index(
         &self,
         mut req: Request<ReindexIndexRequest>,
@@ -2127,10 +2020,9 @@ impl Gateway {
         rs.shards[0].reindex_index(req).await
     }
 
-    /// Plan (and optionally apply in-place) an index-definition change: diff a candidate
-    /// definition vs the served one, reporting reindex-forcing vs in-place changes and, with
-    /// `apply`, persisting the in-place ones live. A write-targeted mutation like reindex, so it
-    /// routes only for a **single-shard** gateway (the embedded `serve` the console fronts); a
+    /// Plan (and optionally `apply` in-place) an index-definition change: diff a candidate definition
+    /// vs the served one, reporting reindex-forcing vs in-place changes and, with `apply`, persisting
+    /// the in-place ones live. A write-targeted mutation like reindex, so single-shard only; a
     /// multi-shard alter needs per-shard orchestration we don't do yet → honest `Unimplemented`.
     pub async fn alter_index(
         &self,
@@ -2204,16 +2096,11 @@ impl Gateway {
     }
 }
 
-/// Drain a scatter's [`JoinSet`](tokio::task::JoinSet) into the successful response bodies,
-/// enforcing an optional **deadline**: on expiry, abort the outstanding shard tasks
-/// and return whatever arrived. A shard that errors, panics, or is aborted simply doesn't
-/// contribute a body — so the caller derives `failed = spawned - bodies.len()` and flags
-/// `partial` (or returns `UNAVAILABLE` when nothing arrived).
-/// The outcome of a scatter/gather fan-out: the bodies of the shards that answered, plus the
-/// error [`Status`]es of the shards that answered with an error. A shard that panicked or was
-/// aborted at the deadline contributes to neither (there is no status to carry). The errors let
-/// the caller distinguish a **bad request** (every shard rejects the same query the same way)
-/// from a **transient/server failure** — see [`all_shards_failed`].
+/// The outcome of a scatter/gather fan-out ([`gather_responses`]): the bodies of the shards that
+/// answered, plus the error [`Status`]es of shards that answered with an error. A shard that panicked
+/// or was aborted at the deadline contributes to neither (no status to carry). The errors let the
+/// caller distinguish a **bad request** (every shard rejects the same query alike) from a
+/// **transient/server failure** — see [`all_shards_failed`].
 struct Fanout<T> {
     bodies: Vec<T>,
     errors: Vec<Status>,
@@ -2250,10 +2137,9 @@ async fn gather_responses<T: Send + 'static>(
     Fanout { bodies, errors }
 }
 
-/// gRPC codes that map to a **4xx**: the request itself is at fault, so a retry won't help.
-/// Exactly the codes the OpenSearch adapter renders as 4xx (`rest.rs` code→HTTP) — notably
-/// **not** `Unimplemented` (501) or the `_ => 500` fallthrough (e.g. `OutOfRange`), which are
-/// server-side, so a fan-out that saw only those keeps the retryable `unavailable`.
+/// gRPC codes that map to a **4xx**: the request itself is at fault, so a retry won't help. Exactly
+/// the codes the OpenSearch adapter renders as 4xx — notably **not** `Unimplemented` (501) or the
+/// `_ => 500` fallthrough, which are server-side (a fan-out that saw only those keeps `unavailable`).
 fn is_client_error(code: tonic::Code) -> bool {
     matches!(
         code,
@@ -2265,13 +2151,11 @@ fn is_client_error(code: tonic::Code) -> bool {
     )
 }
 
-/// The error to return when a fan-out produced **no usable body**. Every shard ran the *same*
-/// request against the *same* schema, so a bad query fails them all identically: when every
-/// reported failure is a client error (4xx), surface the first verbatim so the caller learns
-/// *why* (e.g. `ip_cidr requires an IP field`, `sort needs a … fast field`) instead of an
-/// opaque, retryable 500. If any failure is server-side/transient — or shards vanished without a
-/// status (panic/deadline) leaving no reported error at all — keep the retryable `unavailable`,
-/// which is honest about "the query might be fine; the cluster couldn't answer it".
+/// The error to return when a fan-out produced **no usable body**. Every shard ran the *same* request
+/// against the *same* schema, so a bad query fails them all identically: when every reported failure
+/// is a client error (4xx), surface the first verbatim so the caller learns *why* instead of an
+/// opaque, retryable 500. Any server-side/transient failure — or shards that vanished without a status
+/// (panic/deadline) — keeps the retryable `unavailable`.
 fn all_shards_failed(fallback: String, errors: Vec<Status>) -> Status {
     if !errors.is_empty() && errors.iter().all(|s| is_client_error(s.code())) {
         return errors.into_iter().next().unwrap();
@@ -2279,10 +2163,9 @@ fn all_shards_failed(fallback: String, errors: Vec<Status>) -> Status {
     Status::unavailable(fallback)
 }
 
-/// The error a merge point returns when shards dropped out of an otherwise-mergeable response
-/// but the request set `require_complete`: the caller opted out of the third (partial) state,
-/// so a flagged gap becomes a retryable UNAVAILABLE, with the first shard error inline so the
-/// refusal says *why* coverage was lost.
+/// The error a merge point returns when shards dropped but the request set `require_complete`: the
+/// caller opted out of the partial state, so a flagged gap becomes a retryable UNAVAILABLE, with the
+/// first shard error inline so the refusal says *why* coverage was lost.
 fn refuse_partial(failed: usize, total_shards: usize, errors: &[Status]) -> Status {
     let first = errors
         .first()
@@ -2312,9 +2195,9 @@ fn group_key(h: &growlerdb_proto::v1::SearchHit) -> Option<String> {
         .map(|v| v.to_index_string())
 }
 
-/// Build the keyset cursor that resumes strictly after `h`: its sort tuple plus its composite
-/// key (the unique tiebreaker). `None` if the hit has no decodable coordinates — without a key
-/// the cursor wouldn't be a total position, so we'd rather emit no cursor than an ambiguous one.
+/// Build the keyset cursor that resumes strictly after `h`: its sort tuple plus its composite key
+/// (the unique tiebreaker). `None` if the hit has no decodable coordinates — without a key the cursor
+/// wouldn't be a total position, so emit no cursor rather than an ambiguous one.
 fn search_after_from_hit(h: &growlerdb_proto::v1::SearchHit) -> Option<SearchAfter> {
     let key = CompositeKey::try_from(h.coordinates.clone()?).ok()?;
     let sort_values = h
@@ -2326,9 +2209,9 @@ fn search_after_from_hit(h: &growlerdb_proto::v1::SearchHit) -> Option<SearchAft
     Some(SearchAfter { sort_values, key })
 }
 
-/// The encoded composite key of a hit — the cross-shard merge's final, unique tiebreaker
-/// (the same total order the store applies intra-shard). A hit with no/undecodable
-/// coordinates yields an empty key (sorts first), never a panic.
+/// The encoded composite key of a hit — the cross-shard merge's final, unique tiebreaker (the same
+/// total order the store applies intra-shard). A hit with no/undecodable coordinates yields an empty
+/// key (sorts first), never a panic.
 fn hit_key(h: &growlerdb_proto::v1::SearchHit) -> Vec<u8> {
     h.coordinates
         .clone()
@@ -2337,12 +2220,10 @@ fn hit_key(h: &growlerdb_proto::v1::SearchHit) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-/// Merge field-sorted hits from many shards into one globally-ordered page. Orders by
-/// the request's sort tuple via the shared [`cmp_sort_value`] (so the cross-shard order
-/// matches the store's cross-generation order), with the encoded composite key as the
-/// final tiebreaker — a total, deterministic order, the same rule the store applies
-/// intra-shard. A hit missing a value for a key (e.g. from an older Node that didn't
-/// populate `sort_values`) is treated as `Missing` (sorts last), never a panic.
+/// Merge field-sorted hits from many shards into one globally-ordered page. Orders by the request's
+/// sort tuple via the shared [`cmp_sort_value`], with the encoded composite key as the final
+/// tiebreaker — the same total, deterministic order the store applies intra-shard. A hit missing a
+/// sort value is treated as `Missing` (sorts last), never a panic.
 fn merge_field_sorted(
     hits: Vec<growlerdb_proto::v1::SearchHit>,
     sort: &[growlerdb_proto::v1::Sort],
@@ -2390,10 +2271,9 @@ fn merge_field_sorted(
 /// any single arm contributes, so a doc must rank well across arms to rise.
 const HYBRID_RRF_K: usize = 60;
 
-/// Merge score-ranked hits from many shards into one global top-`k`: order by score descending
-/// with the encoded composite key as the deterministic tiebreaker, dedupe by key (a reshard can
-/// briefly place a key on two shards), and keep the first `k` (0 = keep all). This is the KNN /
-/// pure-relevance merge — the same rule the lexical `search_inner` score branch applies.
+/// Merge score-ranked hits from many shards into one global top-`k`: order by score descending with
+/// the encoded composite key as the deterministic tiebreaker, dedupe by key (a reshard can briefly
+/// place a key on two shards), keep the first `k` (0 = keep all). The KNN / pure-relevance merge.
 fn merge_score_topk(hits: Vec<SearchHit>, k: usize) -> Vec<SearchHit> {
     let mut decorated: Vec<(Vec<u8>, SearchHit)> =
         hits.into_iter().map(|h| (hit_key(&h), h)).collect();
@@ -2418,14 +2298,11 @@ fn merge_score_topk(hits: Vec<SearchHit>, k: usize) -> Vec<SearchHit> {
 }
 
 /// **Reciprocal Rank Fusion** of several ranked [`SearchHit`] lists into one ranking — the
-/// Gateway-side analogue of the engine's `rrf_fuse` (over `Hit`), operating on the already
-/// cross-shard-merged wire hits. For each list, the hit at 0-based `rank` contributes
-/// `1 / (k_rrf + rank + 1)` to that document's fused score (keyed by its encoded composite key);
-/// contributions sum across lists. The fused list sorts by score descending with the encoded key
-/// as a stable tiebreaker, then truncates to `limit` (0 = keep all). A doc present in only one arm
-/// still appears; one high in *both* outranks it. The representative hit prefers one carrying
-/// display `fields`/`highlight` (a lexical hit) over a bare vector hit, so it renders without
-/// hydration.
+/// Gateway-side analogue of the engine's `rrf_fuse`, over the already cross-shard-merged wire hits.
+/// The hit at 0-based `rank` in a list contributes `1 / (k_rrf + rank + 1)` to that doc's fused score
+/// (keyed by encoded composite key); contributions sum across lists. The fused list sorts by score
+/// desc with the key as tiebreaker, then truncates to `limit` (0 = keep all). The representative hit
+/// prefers one carrying display `fields`/`highlight` (a lexical hit) so it renders without hydration.
 fn rrf_fuse_hits(lists: &[&[SearchHit]], k_rrf: usize, limit: usize) -> Vec<SearchHit> {
     let mut acc: HashMap<Vec<u8>, (f64, SearchHit)> = HashMap::new();
     for list in lists {
@@ -2467,9 +2344,8 @@ mod tests {
     use super::*;
     use growlerdb_proto::v1::IndexStats;
 
-    /// A stand-in Node that answers `describe_index` and leaves the rest unimplemented —
-    /// enough to prove the Gateway routes through `dyn Node` and propagates results/errors
-    /// verbatim, without standing up a real shard.
+    /// A stand-in Node that answers `describe_index` and leaves the rest unimplemented — enough to
+    /// prove the Gateway routes through `dyn Node` and propagates results/errors verbatim.
     struct FakeNode;
 
     #[tonic::async_trait]
@@ -2841,12 +2717,10 @@ mod tests {
         }
     }
 
-    /// Regression (from the http_logs benchmark): on a multi-shard index a genuinely-unsupported query makes *every*
-    /// shard reject it with the same client error (a bad query shape is uniform — same schema on
-    /// each shard). The fan-out must surface that **4xx verbatim**, not collapse it into an
-    /// opaque, retryable `unavailable` (which the OpenSearch adapter renders as a 500). Both the
-    /// http_logs `cidr_clientip` and `topk_hydrated` shapes that failed on the live scale run are
-    /// this case: `ip_cidr` on a mis-mapped TEXT field, and a sort on a non-`fast` field.
+    /// Regression: on a multi-shard index a genuinely-unsupported query makes *every* shard reject it
+    /// with the same client error (uniform — same schema on each shard). The fan-out must surface that
+    /// **4xx verbatim**, not collapse it into an opaque, retryable `unavailable` (a 500). Covers
+    /// `ip_cidr` on a mis-mapped TEXT field and a sort on a non-`fast` field.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn all_shards_rejecting_a_bad_query_surface_the_client_4xx_not_a_500() {
         // cidr_clientip against a field the deployed index auto-mapped to TEXT instead of IP.
@@ -4976,9 +4850,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn multi_index_cold_status_is_none_not_panic() {
-        // Regression: a multi-index gateway (the HA placement pool) has no single static route, so
-        // `cold_status()` must return None (→ REST 404 "not a windowed index"), never panic in
-        // `single()` — which previously reset the connection on every `GET /v1/cold`.
+        // Regression: a multi-index gateway has no single static route, so `cold_status()` must return
+        // None (→ REST 404 "not a windowed index"), never panic in `single()`.
         let (gw, _) = multi_gw();
         assert!(gw.cold_status().is_none());
     }
@@ -5398,10 +5271,8 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), "tenant:acme");
     }
 
-    /// Regression (demo stack, 2026-07-20): a failed lexical arm degraded hybrid to the semantic
-    /// ranking with **nothing** flagging it — no log, no `partial`, no warning — so hybrid was
-    /// indistinguishable from semantic-only (every score exactly `1/(rrf_k + rank)`). A dropped
-    /// arm must be a flagged gap, never a silent one.
+    /// Regression: a failed lexical arm must degrade hybrid to the semantic ranking with the drop
+    /// **flagged** (log + `partial` + warning), never silently indistinguishable from semantic-only.
     #[tokio::test(flavor = "current_thread")]
     async fn hybrid_lexical_arm_failure_is_flagged_not_silent() {
         let node = Arc::new(VectorNode {
@@ -5456,9 +5327,8 @@ mod tests {
         assert!(err.message().contains("requires complete results"));
     }
 
-    /// Hybrid `total` is the lexical arm's true corpus-wide match count when that arm succeeded
-    /// (KNN has no match count) — previously it echoed the fused page size, which read as a
-    /// corpus-wide count.
+    /// Hybrid `total` is the lexical arm's true corpus-wide match count when that arm succeeded (KNN
+    /// has no match count), not the fused page size.
     #[tokio::test(flavor = "current_thread")]
     async fn hybrid_total_reports_the_lexical_arms_match_count() {
         let node = Arc::new(VectorNode {

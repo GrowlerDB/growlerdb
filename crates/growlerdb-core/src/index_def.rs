@@ -1,24 +1,17 @@
-//! **Index definition & field mapping**.
+//! **Index definition & field mapping** ([Design 04]).
 //!
-//! An [`IndexDefinition`] is the declarative config describing one index: its
-//! source, its composite [key](KeySpec), and its field [`Mapping`]. Users author
-//! it in YAML; the server *resolves* it against the [`SourceSchema`] (the source's
-//! leaf fields + key hints) into a [`ResolvedIndex`] — concrete key fields and a
-//! concrete typed field list — validating that every referenced path exists.
+//! An [`IndexDefinition`] is the declarative YAML config describing one index: its
+//! source, composite [key](KeySpec), and field [`Mapping`]. The server *resolves* it
+//! against the [`SourceSchema`] (leaf fields + key hints) into a [`ResolvedIndex`] —
+//! concrete key fields and a typed field list — validating every referenced path exists.
+//! Field selection is **ALL** (auto-map, `fields[]` override), **EXPLICIT** (`fields[]`
+//! allowlist), or **ALL_EXCEPT** (all but `exclude[]`); unknown YAML keys are ignored so a
+//! fuller definition still parses.
 //!
-//! Per [Design 04](../../../okf/product/functional/index-management/create.md):
+//! The [`SourceSchema`] is source-agnostic: the Iceberg/Arrow → GrowlerDB mapping lives in
+//! `growlerdb-source`, so this crate stays connector-free.
 //!
-//! * Field types: **TEXT**, **KEYWORD**, **LONG**, **DOUBLE**, **BOOL**, **DATE**,
-//!   **IP**, with the `fast` (columnar) and `cached` (returned-with-hit) flags
-//!   honoured. Vector, nested struct/list/map flattening, sub-fields, and the
-//!   sensitive-field policy are still deferred — extra YAML keys are ignored, not
-//!   rejected, so a fuller definition still parses.
-//! * Field selection is **ALL** (auto-map every source field, `fields[]` are
-//!   per-path overrides), **EXPLICIT** (`fields[]` is the allowlist), or
-//!   **ALL_EXCEPT** (all but `exclude[]`).
-//!
-//! The [`SourceSchema`] is source-agnostic on purpose: the Iceberg/Arrow → GrowlerDB
-//! mapping lives in `growlerdb-source`, so this crate stays free of any connector.
+//! [Design 04]: ../../../okf/product/functional/index-management/create.md
 
 use std::collections::HashSet;
 
@@ -341,12 +334,12 @@ impl IndexDefinition {
         Ok(def)
     }
 
-    /// Whether this **unresolved** definition maps a `variant` column — a field mapping declared
-    /// `type: VARIANT`. Checked before [`resolve`](Self::resolve) so the create path can route
-    /// schema introspection around released iceberg-rust (which fails to parse a v3 variant
-    /// schema) to the Trino lane ([D48](../../../okf/system/decisions/d48-variant-delivery.md),
-    /// [D49](../../../okf/system/decisions/d49-variant-iceberg-rust-routing.md)) before it ever
-    /// calls `load_table`. The resolved counterpart is [`ResolvedIndex::has_variant_field`].
+    /// Whether this **unresolved** definition declares a `type: VARIANT` field. Checked before
+    /// [`resolve`](Self::resolve) so the create path routes schema introspection around released
+    /// iceberg-rust (which can't parse a v3 variant schema) to the Trino lane
+    /// ([D48](../../../okf/system/decisions/d48-variant-delivery.md),
+    /// [D49](../../../okf/system/decisions/d49-variant-iceberg-rust-routing.md)) before `load_table`.
+    /// The resolved counterpart is [`ResolvedIndex::has_variant_field`].
     pub fn declares_variant(&self) -> bool {
         self.mapping
             .fields
@@ -438,11 +431,9 @@ impl IndexDefinition {
         }
         let (equality_deletes, mut warnings) =
             classify_equality_deletes(&source.equality_delete_fields, &key, &fields);
-        // Honest-scope guardrail: a `PREDICATE` index stores no
-        // location data, so hydration latency depends entirely on how well the source
-        // layout prunes a key-equality scan. We do NOT inspect the table layout (that
-        // is deferred with auto-detection) — we warn, so the trade-off is a stated
-        // choice, not a surprise.
+        // Honest-scope guardrail: a PREDICATE index stores no location data, so hydration
+        // latency depends on the source layout. We don't inspect the layout (deferred with
+        // auto-detection) — we warn, so the trade-off is a stated choice.
         if self.location_strategy == LocationStrategy::Predicate {
             warnings.push(
                 "location_strategy PREDICATE stores no per-row location data: every hydration \
@@ -569,7 +560,7 @@ pub struct IcebergSource {
     pub scan: ScanMode,
 }
 
-/// How the source is scanned. Neither variant is honoured specially yet.
+/// How the source is scanned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ScanMode {
@@ -1093,12 +1084,11 @@ pub enum FieldType {
     Vector,
     /// An Iceberg v3 **variant** column — a semi-structured value indexed through two composable
     /// modes ([variant fields](../../../okf/product/functional/index-management/variant.md), D47):
-    /// an untyped **flatten** catch-all (every leaf as an exact `path = value` term, plus an optional
-    /// analyzed TEXT catch-all) and declared, discriminator-selected **shapes** (typed sub-mappings).
-    /// Declared explicitly with a [`variant`](FieldMapping::variant) config; never auto-derived
-    /// (a variant column has no fixed leaf schema). Shape leaves resolve to their own dotted
-    /// `column.path` fields of the full type surface; the variant field itself carries only the
-    /// flatten index.
+    /// an untyped **flatten** catch-all (every leaf as a `path = value` term, plus an optional
+    /// analyzed TEXT catch-all) and discriminator-selected **shapes** (typed sub-mappings). Declared
+    /// explicitly via [`variant`](FieldMapping::variant) (never auto-derived — a variant has no fixed
+    /// leaf schema); shape leaves resolve to their own dotted `column.path` fields, the variant field
+    /// carrying only the flatten index.
     Variant,
 }
 
@@ -1493,8 +1483,7 @@ pub struct ResolvedIndex {
     pub key: ResolvedKey,
     /// The resolved, typed field list.
     pub fields: Vec<ResolvedField>,
-    /// How this source's equality deletes apply to the index. Defaulted
-    /// for definitions resolved before this field existed.
+    /// How this source's equality deletes apply to the index.
     #[serde(default)]
     pub equality_deletes: EqualityDeleteHandling,
     /// Non-fatal resolution warnings to surface (e.g. an equality-delete column
@@ -1502,22 +1491,17 @@ pub struct ResolvedIndex {
     #[serde(default)]
     pub warnings: Vec<String>,
     /// Shard count the index is routed/built at (carried from the definition). Changing
-    /// it re-routes every document → reindex-only (see [`alter_to`](Self::alter_to)). Defaulted
-    /// for definitions resolved before this field existed.
+    /// it re-routes every document → reindex-only (see [`alter_to`](Self::alter_to)).
     #[serde(default = "default_shard_count")]
     pub shard_count: u32,
     /// The tenant-scoping field, validated to be a mapped KEYWORD field. When set,
-    /// reads inject a mandatory `tenant_field = <verified claim>` filter. Defaulted for
-    /// definitions resolved before this field existed.
+    /// reads inject a mandatory `tenant_field = <verified claim>` filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_field: Option<String>,
     /// Time-window sharding, validated to a mapped fast DATE/LONG field. `None` = none.
-    /// Defaulted for definitions resolved before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub windowing: Option<crate::window::TimeWindowing>,
-    /// The index's [location strategy](LocationStrategy), carried from
-    /// the definition. Defaulted (`COORDINATES`) for definitions resolved before this
-    /// field existed.
+    /// The index's [location strategy](LocationStrategy), carried from the definition.
     #[serde(default)]
     pub location_strategy: LocationStrategy,
 }
@@ -1557,12 +1541,10 @@ impl ResolvedIndex {
         ShardRouter::new(shards, self.routing_strategy())
     }
 
-    /// Whether this index maps an Iceberg v3 **variant** column (D47). This is the per-index
-    /// **routing fork** ([D48](../../../okf/system/decisions/d48-variant-delivery.md)): a variant
-    /// table's schema introspection, hydration, stats, and snapshot polling all route around
-    /// released iceberg-rust (which cannot parse a v3 variant schema) — hydration through Trino,
-    /// the rest through the connector / raw metadata — while a non-variant index keeps the native
-    /// path untouched.
+    /// Whether this index maps an Iceberg v3 **variant** column (D47). The per-index **routing
+    /// fork** ([D48](../../../okf/system/decisions/d48-variant-delivery.md)): a variant table routes
+    /// schema introspection, hydration, stats, and snapshot polling around released iceberg-rust
+    /// (which can't parse a v3 variant schema); a non-variant index keeps the native path.
     pub fn has_variant_field(&self) -> bool {
         self.fields.iter().any(|f| f.ty == FieldType::Variant)
     }

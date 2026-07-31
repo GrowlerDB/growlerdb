@@ -1,13 +1,7 @@
-//! `growlerdb-telemetry` — the **observability foundation**: structured JSON
-//! logging, a Prometheus metrics recorder for the core SLIs, and Kubernetes health/readiness
-//! probes. Per [observability](../../../okf/system/observability.md), telemetry is open and
-//! standards-based: metrics are scrapeable in Prometheus exposition format (the wiki's
-//! "scrape or OTLP" metrics path), logs are machine-parseable JSON carrying span context.
-//!
-//! Metrics travel the Prometheus scrape path (`/metrics`); traces are emitted as `tracing`
-//! spans and, when `GROWLERDB_OTLP_ENDPOINT` is set, **exported via OTLP** (HTTP/protobuf, over
-//! the in-tree `reqwest`) to a collector (Tempo/Jaeger/any). Without that env var the spans
-//! stay local — visible as span context in the JSON logs. The `sli` module names the core SLIs.
+//! `growlerdb-telemetry` — the observability foundation: structured JSON logging, a Prometheus
+//! metrics recorder for the core SLIs (the [`sli`] module), and Kubernetes health/readiness probes.
+//! Traces are `tracing` spans, exported via OTLP when `GROWLERDB_OTLP_ENDPOINT` is set, else local
+//! as span context in the JSON logs. See [observability](../../../okf/system/observability.md).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -41,15 +35,12 @@ const OTLP_ENDPOINT_ENV: &str = "GROWLERDB_OTLP_ENDPOINT";
 /// safe to call once per process; later calls (and a pre-existing global subscriber, e.g. in
 /// tests) are no-ops rather than panics. `service` tags every log and the trace resource.
 pub fn init(service: &str) {
-    // Global metrics recorder (install once). The handle renders Prometheus exposition text.
+    // Global metrics recorder (install once).
     //
-    // Give the latency histograms explicit buckets: without them, the Prometheus exporter
-    // renders a `histogram!` as a **summary** (client-computed `{quantile}` series over a decaying
-    // window), which has no `_bucket` — so `histogram_quantile` returns nothing and the reported
-    // p50/p95/p99 drift on every scrape and decay to 0 when traffic stops (confusing on a live chart).
-    // With buckets it exports a true cumulative histogram: stable, monotonic, aggregatable across
-    // replicas, and queryable with `histogram_quantile(…, rate(…_bucket[5m]))`. All latency metrics end
-    // in `_duration_seconds`, so one suffix rule covers query / hydration / http-request.
+    // Give the latency histograms explicit buckets: without them the exporter renders a `histogram!`
+    // as a summary (`{quantile}`, no `_bucket`), so `histogram_quantile` returns nothing. With buckets
+    // it exports a true cumulative histogram, aggregatable across replicas. All latency metrics end in
+    // `_duration_seconds`, so one suffix rule covers query / hydration / http-request.
     if PROMETHEUS.get().is_none() {
         const LATENCY_BUCKETS: &[f64] = &[
             0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
@@ -105,10 +96,9 @@ where
     Some(tracing_opentelemetry::layer().with_tracer(tracer).boxed())
 }
 
-/// The OTLP `GROWLERDB_OTLP_ENDPOINT` env names the collector **base** (e.g.
-/// `http://lgtm:4318`), but `SpanExporter::with_endpoint` uses its value **verbatim** — it does
-/// NOT append the per-signal path — so the spans must be POSTed to `…/v1/traces`. Append it
-/// here (idempotently). Without this, the exporter hits the base URL and the collector 404s.
+/// `GROWLERDB_OTLP_ENDPOINT` names the collector base, but `SpanExporter::with_endpoint` uses it
+/// verbatim (no per-signal path), so append `/v1/traces` here (idempotently) — else the exporter
+/// hits the base URL and the collector 404s.
 fn traces_endpoint(base: &str) -> String {
     let base = base.trim_end_matches('/');
     if base.ends_with("/v1/traces") {
@@ -225,11 +215,10 @@ pub mod sli {
         gauge!("growlerdb_index_bytes", "index" => label.to_string()).set(bytes as f64);
     }
 
-    /// Live indexed document count for a shard, emitted on the compaction loop's tick
-    /// alongside `index_bytes`. `sum(growlerdb_index_docs)` across shards is GrowlerDB's own count of
-    /// what it holds — the index side of the **source→index convergence** check: at steady state it
-    /// must equal the source's live row count (`sum(growlerdb_source_records)`); a persistent gap is
-    /// dup/loss. Native, so convergence no longer depends on the scale-test's external exporter.
+    /// Live indexed document count for a shard, emitted on the compaction loop's tick alongside
+    /// `index_bytes`. `sum(growlerdb_index_docs)` is the index side of the **source→index
+    /// convergence** check: at steady state it must equal `sum(growlerdb_source_records)`; a
+    /// persistent gap is dup/loss.
     pub fn index_docs(label: &str, docs: u64) {
         gauge!("growlerdb_index_docs", "index" => label.to_string()).set(docs as f64);
     }
@@ -362,13 +351,10 @@ pub mod sli {
         counter!("growlerdb_ingested_docs_total", "index" => index.to_string()).increment(count);
     }
 
-    /// Record a completed **index write/commit**: the wall-clock `duration_secs` of the
-    /// blocking stage+commit (Tantivy commit + location fsync + redb checkpoint), labelled by `index`.
-    /// The latency counterpart to [`ingested_docs`](Self::ingested_docs) (throughput): when ingestion
-    /// saturates, a rising write p95 *while node CPU stays flat* localizes the ceiling to the commit
-    /// path rather than query or compaction (the exact gap that left the scale run unable to
-    /// pinpoint its ~6.5k docs/s ceiling). Exports as a true histogram — the `_duration_seconds` suffix
-    /// picks up the explicit latency buckets.
+    /// Record a completed **index write/commit**: the wall-clock `duration_secs` of the blocking
+    /// stage+commit (Tantivy commit + location fsync + redb checkpoint), labelled by `index`. The
+    /// latency counterpart to [`ingested_docs`](Self::ingested_docs): a rising write p95 while node
+    /// CPU stays flat localizes an ingestion ceiling to the commit path, not query or compaction.
     pub fn write(index: &str, duration_secs: f64) {
         histogram!("growlerdb_write_duration_seconds", "index" => index.to_string())
             .record(duration_secs);

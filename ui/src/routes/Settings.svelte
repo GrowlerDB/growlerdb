@@ -1,7 +1,5 @@
 <script lang="ts">
-  // Appearance · Connection · Users & roles · API tokens · About.
-  // Appearance + Connection + About are live; Users & roles is real for admins; API
-  // tokens is a PLANNED placeholder.
+  // Appearance · Connection · Users & roles · API tokens · License · About.
   import { t } from '../lib/i18n';
   import {
     theme,
@@ -41,7 +39,7 @@
   let users = $state<RoleBinding[]>([]);
   let roleCatalog = $state<string[]>([]);
   let newSubject = $state('');
-  let newRoles = $state<Set<string>>(new Set(['reader'])); // roles to grant a new user
+  let newRoles = $state<Set<string>>(new Set(['reader']));
   let usersErr = $state('');
   let usersLoaded = false;
 
@@ -114,7 +112,7 @@
   // API tokens — admin-only.
   let tokens = $state<ApiTokenMeta[]>([]);
   let newTokenLabel = $state('');
-  let newTokenRoles = $state<Set<string>>(new Set(['reader'])); // roles for a new token
+  let newTokenRoles = $state<Set<string>>(new Set(['reader']));
   let newSecret = $state(''); // the just-issued secret, shown once
   let tokensErr = $state('');
   let tokensLoaded = false;

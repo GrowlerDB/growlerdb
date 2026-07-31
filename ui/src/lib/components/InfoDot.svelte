@@ -1,6 +1,5 @@
 <script lang="ts">
-  // Self-serve help affordance: a small ⓘ button that opens a Popover describing a metric/panel —
-  // what it is, and (optionally) what an elevated value means. Keeps the cards themselves clean.
+  // A small ⓘ button that opens a Popover describing a metric/panel, keeping the cards clean.
   import Popover from './Popover.svelte';
 
   let {
@@ -12,7 +11,7 @@
     title: string;
     /** Plain-language "what this is". */
     body: string;
-    /** Optional "what elevated/low means" diagnostic line. */
+    /** Optional "what an elevated/low value means" diagnostic line. */
     hint?: string;
   } = $props();
 

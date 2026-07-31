@@ -1,38 +1,25 @@
-//! The background **compaction re-map** driver (the `coordinates`
-//! strategy): turn locator staleness from a per-read tax into a bounded background cost.
+//! The background **compaction re-map** driver (the `coordinates` strategy): turn locator
+//! staleness from a per-read tax into a bounded background cost.
 //!
-//! Iceberg compaction (`rewrite_data_files` — a `replace` snapshot) moves rows into new
-//! data files, so every location slot pointing into a rewritten file goes stale at once.
-//! Before this driver the only healing was the lazy per-key verify-and-refresh at
-//! hydration (`growlerdb_stale_locators_total` ≈ 1 per hydrated key under churn). The
-//! driver polls the table's **current plan** (via the reader's snapshot-pinned plan
-//! cache — one catalog REST call per tick, manifest reads only on snapshot advance;
-//! observing table metadata is read-only and imposes nothing on the source) and, when
-//! interned files **disappear** from the live file set:
+//! Iceberg compaction (`rewrite_data_files`, a `replace` snapshot) moves rows into new data
+//! files, so every location slot into a rewritten file goes stale at once. The driver polls
+//! the table's current plan (one catalog REST call per tick) and, when interned files
+//! **disappear** from the live set:
 //!
-//! 1. marks the disappeared files **dead** (the live-file bitmap — hydration then skips
-//!    the doomed point read and goes straight to the pass-2 fallback), and
-//! 2. **re-maps**: column-projects only the key columns + row positions of the plan's
-//!    *added* files, and bulk-patches each key's location slot with its new
-//!    `(file, position)` — batched and key-sorted (term-dictionary locality),
-//!    fsynced per chunk under the shard's writer-lock contract.
+//! 1. marks them **dead** (hydration then skips the doomed point read for the pass-2 fallback), and
+//! 2. **re-maps**: column-projects the key columns + row positions of the plan's *added* files,
+//!    bulk-patching each key's location slot with its new `(file, position)`.
 //!
 //! ## Why every interleaving is safe
 //!
-//! Ingest may intern new files and commit upserts, and hydration may lazily refresh
-//! slots, while a re-map runs. Slot patches are idempotent last-wins 12-byte writes,
-//! serialized by the writer lock (held per chunk, released between chunks — the re-map
-//! never blocks ingest or hydration for its full duration), and the shard-side patch
-//! guard (`Shard::remap_locations`) only patches a slot that **still points at a dead
-//! file** — so a slot that ingest or a lazy refresh already re-pointed at a live file
-//! is never clobbered with the (older) rewritten row. Keys with no live doc (deleted,
-//! or not yet ingested) are skipped; if ingest lands them later, its commit writes the
-//! fresh location anyway. For any residual window, hydration's verify-and-fallback
-//! remains the correctness safety net — the re-map only changes *where the cost lands*.
+//! Slot patches are idempotent last-wins 12-byte writes serialized by the writer lock (held per
+//! chunk, released between). The shard-side guard (`Shard::remap_locations`) only patches a slot
+//! that **still points at a dead file**, so one ingest or a lazy refresh already re-pointed is
+//! never clobbered. Keys with no live doc are skipped; hydration's verify-and-fallback remains
+//! the correctness safety net for any residual window — the re-map only changes *where the cost lands*.
 //!
-//! Files that carry delete files are **not** re-mapped (ingest records delete-shifted
-//! positions for them; the key scan reads physical positions) — their slots heal via
-//! the lazy path. Freshly-compacted files are delete-free, so this is the rare case.
+//! Files carrying delete files are **not** re-mapped (ingest positions are delete-shifted, the
+//! key scan reads physical positions) — their slots heal via the lazy path.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -70,37 +57,31 @@ pub struct RemapOutcome {
     pub stats: RemapStats,
 }
 
-/// The per-shard re-map **entry point**: mark `disappeared` files dead (the live-file
-/// bitmap), then bulk-patch the slots of `moved` rows (`key → new (file, position)`,
-/// read from the replace snapshot's added files). Returns `(files newly marked dead,
-/// patch stats)`. Split out from [`remap_tick`] so a rewrite can be fed to it directly
-/// — the regression tests simulate compaction by rewriting fixture files and calling
-/// this with the diff.
+/// The per-shard re-map **entry point**: mark `disappeared` files dead (the live-file bitmap),
+/// then bulk-patch the slots of `moved` rows (`key → new (file, position)`). Returns `(files
+/// newly marked dead, patch stats)`. Split from [`remap_tick`] so a rewrite diff can be fed
+/// directly (the regression tests do this).
 pub fn remap_shard(
     shard: &Shard,
     disappeared: &[String],
     moved: &[(CompositeKey, RowLocator)],
 ) -> Result<(u64, RemapStats), EngineError> {
-    // Dead flags first: from this instant hydration stops issuing doomed point reads
-    // into the rewritten files, and the flags are the patch guard remap_locations
-    // checks (only dead-pointing slots are healed).
+    // Dead flags first: hydration then stops issuing doomed point reads, and the flags are the
+    // guard remap_locations checks (only dead-pointing slots are healed).
     let marked = shard.mark_files_dead(disappeared)?;
     let stats = shard.remap_locations(moved)?;
     Ok((marked, stats))
 }
 
-/// One poll of the re-map loop: fetch the table's current plan, diff its live data-file
-/// set against the shards' interned live files, and — when interned files disappeared
-/// (a `replace`/rewrite) — mark them dead and re-map from the plan's added files.
+/// One poll of the re-map loop: fetch the table's current plan, diff its live data-file set
+/// against the shards' interned files and — when interned files disappeared (a rewrite) — mark
+/// them dead and re-map from the plan's added files.
 ///
-/// Returns `Ok(None)` when nothing happened (snapshot unchanged, or a pure append —
-/// files only added, nothing interned disappeared). `key_fields` is the index's
-/// composite key (`(partition fields, identifier fields)`), used to project + encode
-/// the added files' rows. Multiple `shards` (a windowed index's hot windows) share one
-/// plan fetch and one key scan; each shard skips the keys it doesn't hold (no live
-/// doc). The first tick after boot has no previous plan, so `added` falls back to
-/// "plan files not interned by any shard" — a superset that is safe (foreign keys are
-/// skipped; already-live slots aren't patched).
+/// Returns `Ok(None)` when nothing happened (snapshot unchanged, or a pure append). `key_fields`
+/// is the index's composite key, used to project the added files' rows. Multiple `shards` (a
+/// windowed index's hot windows) share one plan fetch and key scan; each skips keys it doesn't
+/// hold. The first tick after boot has no previous plan, so `added` falls back to "plan files
+/// not interned by any shard" — a safe superset (foreign keys skipped, already-live slots not patched).
 pub async fn remap_tick(
     reader: &IcebergReader,
     table: &str,
@@ -118,8 +99,8 @@ pub async fn remap_tick(
         .map(|t| t.data_file_path.clone())
         .collect();
 
-    // Which interned, still-live files vanished from the live set — per shard, since
-    // each shard interns only the files its own rows came from.
+    // Interned, still-live files that vanished from the live set — per shard, since each shard
+    // interns only its own rows' files.
     let disappeared_per_shard: Vec<Vec<String>> = shards
         .iter()
         .map(|s| {
@@ -130,17 +111,16 @@ pub async fn remap_tick(
         })
         .collect();
     if disappeared_per_shard.iter().all(Vec::is_empty) {
-        // Pure append (or unrelated change) — the lazy path owes nothing. Commit the
-        // observation so the next replace diffs against THIS plan.
+        // Pure append (or unrelated change). Commit the observation so the next replace diffs
+        // against THIS plan.
         state.last_snapshot = Some(plan.snapshot_id);
         state.prev_files = Some(current);
         return Ok(None);
     }
 
-    // The rewrite's *added* files: in the current plan but not the previous one (first
-    // tick: not interned anywhere — see the doc comment). State commits only at the
-    // end — a failed scan/patch leaves it untouched, so the next tick retries the
-    // same diff instead of skipping the snapshot.
+    // The rewrite's *added* files: in the current plan but not the previous (first tick: not
+    // interned anywhere — see the doc comment). State commits only at the end, so a failed
+    // scan/patch is retried next tick rather than skipping the snapshot.
     let baseline: HashSet<String> = match &state.prev_files {
         Some(files) => files.clone(),
         None => shards
@@ -158,9 +138,8 @@ pub async fn remap_tick(
             continue;
         }
         if !task.deletes.is_empty() {
-            // Ingest positions for delete-bearing files are delete-shifted; the key
-            // scan reads physical positions — don't write a mismatch, let the lazy
-            // verify-and-refresh heal these.
+            // Delete-bearing files have delete-shifted ingest positions but the key scan reads
+            // physical ones — don't write a mismatch; the lazy refresh heals these.
             outcome.files_skipped_deletes += 1;
             continue;
         }

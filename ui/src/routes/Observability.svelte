@@ -1,9 +1,7 @@
 <script lang="ts">
-  // One screen that answers the product questions ("Does GrowlerDB keep up with Iceberg?",
-  // "…match Iceberg?", "index:source size ratio?"). Organised into sub-tabs (Search · Runtime · Data · Ingestion ·
-  // Source · Access) with Alerts as a persistent strip. Clean cards (value + sparkline) carry a ⓘ info
-  // popover for self-serve help; a few "hero" ECharts overlays show the relationships sparklines
-  // can't. Data comes from the /v1/stats Prometheus proxy + the /v1/ingestion control-plane feed.
+  // Sub-tabs (Search · Runtime · Data · Ingestion · Source · Access) with a persistent Alerts strip.
+  // Cards (value + sparkline + ⓘ help) plus a few "hero" ECharts overlays for relationships a
+  // sparkline can't show. Data: the /v1/stats Prometheus proxy + the /v1/ingestion control-plane feed.
   import { onMount, onDestroy } from 'svelte';
   import { t } from '../lib/i18n';
   import {
@@ -38,9 +36,8 @@
   type Fmt = 'rate' | 'ms' | 'lagms' | 'pct' | 'num' | 'bytes' | 'ratio';
   type Bad = 'nonzero' | 'lag' | 'lowpct' | 'highpct';
 
-  /** A per-index breakdown for a "collapse" card: an instant query returning one sample per index
-   *  (a `topk`/`bottomk … by (index)`), shown as a "worst/top: X" annotation and a click-to-scope
-   *  top-N list in the detail modal. Only used in the fleet (all-indexes) view. */
+  /** A per-index breakdown for a "collapse" card (a `topk`/`bottomk … by (index)`): a "worst/top: X"
+   *  annotation plus a click-to-scope top-N list in the detail modal. Fleet (all-indexes) view only. */
   interface Breakdown {
     q: string;
     /** Display sort of the samples: `desc` = biggest first (worst/top), `asc` = smallest first. */
@@ -60,13 +57,11 @@
     bad?: Bad;
     /** Needs backend instrumentation not landed yet → renders as a "planned" tile. */
     planned?: boolean;
-    /** Comes from the external cluster metrics stack (node-exporter/kube-state), which not every
-     *  deployment runs. When its query returns nothing, show a "needs the metrics stack" state
-     *  instead of a misleading 0. */
+    /** From the external cluster metrics stack (node-exporter/kube-state), which not every deployment
+     *  runs. When the query returns nothing, show "needs the metrics stack" instead of a fake 0. */
     external?: boolean;
     /** Opt out of index scoping even on an index-scoped tab — for cards whose metric carries no
-     *  `{index}` label (e.g. route-labelled `growlerdb_http_requests_total`), which would match
-     *  nothing once scoped. */
+     *  `{index}` label (e.g. route-labelled `growlerdb_http_requests_total`) and would match nothing. */
     scopable?: boolean;
     /** Per-index breakdown surfaced in the fleet view (annotation + modal top-N). */
     breakdown?: Breakdown;
@@ -955,10 +950,9 @@
     return out;
   }
 
-  /** Run a card's per-index breakdown as an instant query, sorted for display (biggest/smallest first).
-   *  Secondary enrichment: a failure just hides the annotation, so it stays OUT of the proxy-health
-   *  accounting (`acc`) that drives the "metrics unavailable" banner — a working breakdown must not
-   *  mask a wholly-down range-query proxy, nor a broken one trip the banner on its own. */
+  /** Run a card's per-index breakdown as an instant query, sorted for display. Secondary enrichment:
+   *  a failure just hides the annotation, so it stays OUT of the proxy-health `acc` that drives the
+   *  "metrics unavailable" banner. */
   async function loadBreakdown(bd: Breakdown): Promise<InstantSample[]> {
     try {
       const got = await queryInstant(bd.q);
@@ -1207,7 +1201,7 @@
   </div>
 
   {#if active === 'ingestion'}
-    <!-- Folded in from the old Ingestion tab: per-index source binding + per-shard sync detail. -->
+    <!-- Per-index source binding + per-shard sync detail. -->
     <div class="gb-panel drill">
       <div class="gb-panel-head">Per-index ingestion</div>
       {#if ingestionError}

@@ -1,10 +1,7 @@
 //! Hydration orchestration — the **PK lookup** path ([Flow 2]).
 //!
-//! Given search coordinates (composite keys), resolve each through the shard's
-//! [locator](growlerdb_core::RowLocator) to `{iceberg_file, row_position}`, then read
-//! the authoritative rows from Iceberg (reading only the located files). This ties
-//! the [`IndexReader`] (locator) and the [`IcebergReader`] (rows) together; the
-//! engine façade and CLI drive it.
+//! Resolve composite keys through the shard's locator to `{iceberg_file, row_position}`,
+//! then read the authoritative rows from Iceberg (only the located files).
 //!
 //! [Flow 2]: ../../../okf/system/architecture.md
 
@@ -36,14 +33,13 @@ pub fn resolve_locators(
 /// Resolve `keys` into the source's hydration requests **per the shard's location
 /// strategy**:
 ///
-/// * `COORDINATES` — the layered locate ([`resolve_locators`]) + the live-file bitmap
+/// * `COORDINATES` — layered locate ([`resolve_locators`]) + live-file bitmap
 ///   ([`apply_live_file_bitmap`]): each key carries its `(file, position)` for the
 ///   pass-1 point read, `None` only when its file is flagged dead.
-/// * `PREDICATE` — the store holds no location data; every key goes out with **no
-///   locator**, which sends it straight to the source's pruned key-scan (the pass-2
-///   machinery *is* this strategy's primary path). Key **presence** is still checked
-///   against the index first, so an unindexed key is a clean `MissingLocator`
-///   (→ `NotFound`) before any Iceberg connect — same contract as `COORDINATES`.
+/// * `PREDICATE` — no location data stored; every key goes out with **no locator**,
+///   straight to the source's pruned key-scan. Presence is still checked against the
+///   index first, so an unindexed key is a clean `MissingLocator` (→ `NotFound`) before
+///   any Iceberg connect — same contract as `COORDINATES`.
 pub fn resolve_requests(
     shard: &Shard,
     keys: &[CompositeKey],
@@ -64,11 +60,10 @@ pub fn resolve_requests(
     }
 }
 
-/// Apply the **live-file bitmap** to resolved locators: a locator
-/// whose file the shard has flagged dead (rewritten away by Iceberg compaction) is
-/// **known stale** — its point read is doomed — so it's stripped to `None` and the
-/// source's hydrate sends the key straight to the pass-2 fallback (whose result then
-/// refreshes the slot). Everything else passes through for the normal pass-1 read.
+/// Apply the **live-file bitmap** to resolved locators: a locator whose file the shard
+/// flagged dead (rewritten away by Iceberg compaction) is known stale, so it's stripped
+/// to `None` — the source's hydrate then sends the key straight to the pass-2 fallback.
+/// Everything else passes through for the normal pass-1 read.
 pub fn apply_live_file_bitmap(
     shard: &Shard,
     located: Vec<(CompositeKey, RowLocator)>,
@@ -84,16 +79,14 @@ pub fn apply_live_file_bitmap(
 
 /// Hydrate `keys` to authoritative rows: strategy-aware request resolution
 /// ([`resolve_requests`]) + a partition/file scoped Iceberg read of the projected
-/// columns. Rows come back in `keys` order. Under `COORDINATES`, locator entries that
-/// fell back (Iceberg rewrote their file) are **refreshed** in the store so subsequent
-/// lookups are fast again; under `PREDICATE` there is nothing to refresh — the pruned
-/// scan is the read path itself, not a fallback.
+/// columns. Rows come back in `keys` order. Under `COORDINATES`, fallen-back locator
+/// entries are **refreshed** in the store so subsequent lookups are fast again;
+/// `PREDICATE` has nothing to refresh — the pruned scan is the read path itself.
 ///
 /// **Variant fork** ([D48](../../../okf/system/decisions/d48-variant-delivery.md)/[D49]): a
-/// variant-table index (`index.has_variant_field()`) routes hydration through the interim Trino
-/// lane instead of the native reader — released iceberg-rust can't scan a v3 variant table. The
-/// Trino lane re-finds rows by key predicate (no per-row locator to refresh, so nothing to write
-/// back), returning the variant column(s) as JSON. Non-variant indexes are untouched.
+/// variant-table index routes hydration through the interim Trino lane — released iceberg-rust
+/// can't scan a v3 variant table. The Trino lane re-finds rows by key predicate (nothing to write
+/// back), returning the variant column(s) as JSON.
 ///
 /// [D49]: ../../../okf/system/decisions/d49-variant-iceberg-rust-routing.md
 pub async fn get_by_key(
@@ -110,7 +103,7 @@ pub async fn get_by_key(
             .hydrate(index, &located, projection)
             .await?;
         growlerdb_telemetry::sli::duplicate_pks(result.duplicate_pks);
-        // The Trino lane has no per-row locator to refresh (it re-finds by key predicate).
+        // Trino lane re-finds by key predicate — no per-row locator to refresh.
         return Ok(result.rows);
     }
     let result = source.hydrate(table, &located, projection).await?;
@@ -200,7 +193,7 @@ mod tests {
     #[test]
     fn bitmap_strips_locators_pointing_into_dead_files() {
         let tmp = tempfile::tempdir().unwrap();
-        let shard = committed_shard(tmp.path()); // one doc located in data/f0.parquet
+        let shard = committed_shard(tmp.path());
         let located = resolve_locators(&shard, &[key(1)]).unwrap();
         assert!(
             apply_live_file_bitmap(&shard, located.clone())[0]
@@ -265,9 +258,8 @@ mod tests {
 
     #[test]
     fn resolve_requests_on_a_predicate_shard_skips_locators_entirely() {
-        // Every present key goes out with NO locator — the source's hydrate then skips
-        // pass 1 and sends it straight to the pruned key scan (the strategy's primary
-        // path). No location data was ever stored to resolve anyway.
+        // Every present key goes out with NO locator → source hydrate skips pass 1, straight
+        // to the pruned key scan. No location data was ever stored to resolve anyway.
         let tmp = tempfile::tempdir().unwrap();
         let shard = committed_predicate_shard(tmp.path());
         assert_eq!(
@@ -295,8 +287,7 @@ mod tests {
 
     #[test]
     fn resolve_requests_on_a_coordinates_shard_is_the_layered_locate() {
-        // Zero behavior change for the default strategy: the same locator + live-file
-        // bitmap path as before, request-shaped.
+        // Default strategy: the same locator + live-file bitmap path, request-shaped.
         let tmp = tempfile::tempdir().unwrap();
         let shard = committed_shard(tmp.path());
         let requests = resolve_requests(&shard, &[key(1)]).unwrap();

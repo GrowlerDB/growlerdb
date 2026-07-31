@@ -1,32 +1,22 @@
 //! The **location store** — the mutable third layer of the [D30] layered locator:
 //! locator ID → `(file_id, row_position)`.
 //!
-//! A shard-local dense array file (`location.arr`, beside `aux.redb`) of fixed
-//! **12-byte** entries: `u32 file_id` (LE) + `u64 row_position` (LE). The locator ID
-//! *is* the slot index — an entry's byte offset is `id × 12` — so the file needs no
-//! keys, no tree, and no per-entry overhead (12.0 B/entry exact vs redb's
-//! 53.9 B/entry). `file_id` indexes the
-//! interned file table (`files` in `aux.redb`); the row position is the row's ordinal
-//! in that Iceberg data file.
+//! A shard-local dense array file (`location.arr`, beside `aux.redb`) of fixed **12-byte** entries:
+//! `u32 file_id` (LE) + `u64 row_position` (LE). The locator ID *is* the slot index (offset =
+//! `id × 12`), so the file needs no keys, tree, or per-entry overhead (12.0 B/entry vs redb's 53.9).
 //!
-//! **Durability / crash contract** (extends the store's two-phase commit): appends and
-//! patches are written and **fsynced before** the durable Tantivy commit of the docs
-//! that reference them. A crash after the fsync but before the Tantivy commit leaves
-//! *orphan* slots — appended entries no live doc points at — which are harmless
-//! (unreachable through any doc; reclaimed by a later store compaction) and cost 12 B
-//! each. A crash **mid-append** can leave a torn partial entry at the tail; on open the
-//! length is floored to whole entries, so the torn bytes sit past `len()` and are
-//! overwritten by the next append. Deletes never touch the array — a deleted doc's slot
-//! simply becomes unreachable.
+//! **Durability / crash contract** (extends the store's two-phase commit): appends/patches are
+//! fsynced **before** the Tantivy commit of the docs that reference them. A crash after the fsync
+//! but before that commit leaves harmless *orphan* slots (unreachable, reclaimed by compaction). A
+//! crash mid-append can leave a torn tail entry; on open the length is floored to whole entries, so
+//! the torn bytes sit past `len()` and are overwritten by the next append. Deletes never touch the
+//! array.
 //!
-//! **Reads are lock-free**: `get` is a positional `pread` (`FileExt::read_at` on
-//! `&File`), safe under concurrent appends/patches because entries are fixed-size and a
-//! reader only dereferences ids it obtained from a *committed* doc's fast field. We
-//! chose pread over an mmap-and-remap strategy deliberately: one syscall per 12-byte
-//! lookup is cheap at hydration volumes, and it avoids remap-on-grow lifetime hazards.
-//! **Writes** (append/patch/sync) are serialized by the shard's writer lock; a small
-//! internal mutex additionally guards the append offset so the store is safe even if a
-//! future caller writes outside that lock.
+//! **Reads are lock-free**: `get` is a positional `pread`, safe under concurrent appends/patches
+//! because entries are fixed-size and a reader only dereferences ids from a *committed* doc's fast
+//! field (pread over mmap-and-remap avoids remap-on-grow lifetime hazards). **Writes** are
+//! serialized by the shard's writer lock; a small internal mutex additionally guards the append
+//! offset so writes outside that lock are still safe.
 //!
 //! [D30]: ../../../okf/system/decisions/d30-layered-locator.md
 
@@ -43,22 +33,21 @@ pub const LOCATION_FILE: &str = "location.arr";
 /// Fixed size of one entry: `u32 file_id` LE + `u64 row_position` LE.
 pub const ENTRY_BYTES: u64 = 12;
 
-/// The dense location array: locator ID → `(file_id, row_position)`. See the module
-/// docs for the format and the crash/concurrency contract.
+/// The dense location array: locator ID → `(file_id, row_position)`. See the module docs for the
+/// format and the crash/concurrency contract.
 pub struct LocationStore {
     file: File,
-    /// Number of **complete** entries (torn tail bytes excluded); the next appended
-    /// entry gets id `len`. `Acquire`/`Release` pairs `get`'s bound check with the
-    /// append that published the entry.
+    /// Number of **complete** entries (torn tail excluded); the next appended entry gets id `len`.
+    /// `Acquire`/`Release` pairs `get`'s bound check with the append that published the entry.
     len: AtomicU64,
-    /// Serializes appends (the offset computation + length publish). Patches and reads
-    /// don't need it — they address existing slots positionally.
+    /// Serializes appends (offset computation + length publish). Patches and reads address existing
+    /// slots positionally and don't need it.
     append: Mutex<()>,
 }
 
 impl LocationStore {
-    /// Open (or create) the array at `path`. The next locator id is `file_len / 12`;
-    /// a torn tail (crash mid-append) is floored away and overwritten by the next append.
+    /// Open (or create) the array at `path`. The next locator id is `file_len / 12`; a torn tail
+    /// (crash mid-append) is floored away and overwritten by the next append.
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
@@ -85,16 +74,15 @@ impl LocationStore {
             buf.extend_from_slice(&pos.to_le_bytes());
         }
         self.file.write_all_at(&buf, first * ENTRY_BYTES)?;
-        // Publish the new length only after the bytes are written, so a concurrent
-        // `get` never reads a slot the write hasn't reached yet.
+        // Publish the new length only after the bytes are written, so a concurrent `get` never reads
+        // a slot the write hasn't reached yet.
         self.len
             .store(first + entries.len() as u64, Ordering::Release);
         Ok(first)
     }
 
-    /// Overwrite slot `id` in place with a new `(file_id, row_position)` — the update
-    /// path when a key's row moved. Errors on an id past the end (slots are only ever
-    /// allocated by `append`).
+    /// Overwrite slot `id` in place — the update path when a key's row moved. Errors on an id past
+    /// the end (slots are only ever allocated by `append`).
     pub fn patch(&self, id: u64, file_id: u32, row_position: u64) -> io::Result<()> {
         if id >= self.len.load(Ordering::Acquire) {
             return Err(io::Error::new(
@@ -108,8 +96,8 @@ impl LocationStore {
         self.file.write_all_at(&buf, id * ENTRY_BYTES)
     }
 
-    /// Read slot `id` → `(file_id, row_position)`, or `None` past the end. Lock-free
-    /// (`pread` on `&File`) — safe from concurrent search threads.
+    /// Read slot `id` → `(file_id, row_position)`, or `None` past the end. Lock-free (`pread`) —
+    /// safe from concurrent search threads.
     pub fn get(&self, id: u64) -> io::Result<Option<(u32, u64)>> {
         if id >= self.len.load(Ordering::Acquire) {
             return Ok(None);
@@ -121,8 +109,8 @@ impl LocationStore {
         Ok(Some((file_id, pos)))
     }
 
-    /// fsync the array — the durability point that must precede the Tantivy commit of
-    /// the docs referencing the written slots (the D30 crash contract).
+    /// fsync the array — the durability point that must precede the Tantivy commit of the docs
+    /// referencing the written slots (the D30 crash contract).
     pub fn sync(&self) -> io::Result<()> {
         self.file.sync_all()
     }

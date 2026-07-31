@@ -1,9 +1,7 @@
-//! The real local cross-encoder reranker: `bge-reranker-base` (a BERT-family model) on Candle,
-//! CPU, offline. It scores each `(query, document)` pair with a single relevance logit — the
-//! cross-encoder attends over query and document jointly, so it is a strictly better relevance
-//! signal than the bi-encoder retrieval it reorders. Loaded from the same local model directory
-//! layout as the [`BgeEmbedder`](crate::BgeEmbedder); a missing model falls the factory back to the
-//! dependency-free [`HashReranker`](growlerdb_core::HashReranker).
+//! The real local cross-encoder reranker: `bge-reranker-base` (BERT-family) on Candle, CPU, offline.
+//! Scores each `(query, document)` pair with one relevance logit, attending over both jointly — a
+//! better signal than the bi-encoder retrieval it reorders. Missing model ⇒ the factory falls back
+//! to the dependency-free [`HashReranker`](growlerdb_core::HashReranker).
 
 use std::path::{Path, PathBuf};
 
@@ -76,8 +74,8 @@ impl BgeReranker {
             Tokenizer::from_file(&tokenizer_path).map_err(|e| backend(&tokenizer_path, &e))?;
 
         let device = Device::Cpu;
-        // SAFETY: mmap of a trusted, operator-provisioned weights file — see the identical note in
-        // `bge.rs`; the model directory is read-only config, not attacker-writable input.
+        // SAFETY: mmap of a trusted, operator-provisioned weights file; the model directory is
+        // read-only config, not attacker-writable input.
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&weights_path), DTYPE, &device)
                 .map_err(|e| backend(&weights_path, &e.to_string()))?
@@ -85,9 +83,8 @@ impl BgeReranker {
         let model = BertModel::load(vb.clone(), &config)
             .map_err(|e| backend(&weights_path, &e.to_string()))?;
 
-        // Cross-encoders emit a single relevance logit: a `[num_labels, hidden]` linear head over
-        // the `[CLS]` state, `num_labels == 1` for a ranking model. If the head isn't present the
-        // model isn't a cross-encoder we can score with — error so the factory falls back.
+        // Cross-encoder head: a `[num_labels==1, hidden]` linear over the `[CLS]` state. Absent ⇒
+        // not a cross-encoder we can score with, so error and let the factory fall back.
         let classifier_w = vb
             .get((1, hidden), "classifier.weight")
             .map_err(|e| backend(&weights_path, &format!("classifier.weight: {e}")))?;

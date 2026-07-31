@@ -1,16 +1,12 @@
 //! The registry **persistence backend** seam.
 //!
 //! [`Registry`](crate::Registry) holds all in-memory state + logic; *where* that state is durably
-//! stored sits behind [`RegistryBackend`]. The default [`JsonFileBackend`] is the current
-//! single-writer JSON store — a `flock`'d `registry.json` envelope plus `activity.json` /
-//! `sessions.json` sidecars, atomic temp+rename writes — byte-for-byte the pre-seam behavior. A
-//! replicated backend (Postgres/etcd, so the control plane can run as N stateless replicas — see
-//! `okf/system/decisions/d51-controlplane-ha.md`) implements the same trait without touching the
-//! registry's logic.
+//! stored sits behind [`RegistryBackend`]. The default [`JsonFileBackend`] is a single-writer JSON
+//! store; a replicated backend (Postgres/etcd, so the control plane can run as N stateless replicas
+//! — D51) implements the same trait without touching the registry's logic.
 //!
 //! The interface is deliberately **snapshot-shaped** — a mutation applies in memory, then hands the
-//! backend the full core snapshot to persist — which mirrors how the JSON store already rewrites the
-//! whole envelope each write, and maps cleanly onto a transactional upsert for an external store.
+//! backend the full core snapshot to persist — which maps cleanly onto a transactional upsert.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -21,14 +17,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::registry::{ActivityEvent, ApiToken, IndexEntry, RegistryError, Result, SavedQuery};
 
-/// On-disk schema version for the registry envelope. A versioned envelope means a future format
-/// change can be detected and migrated instead of mis-parsed. Shared by every backend (the JSON file
-/// and the externalized store persist the same envelope).
+/// On-disk schema version for the registry envelope, so a future format change can be detected and
+/// migrated instead of mis-parsed. Shared by every backend.
 pub(crate) const REGISTRY_VERSION: u32 = 1;
 
 /// The full state loaded from a backend on [`Registry`](crate::Registry) open: the core catalog maps
-/// plus the two sidecar maps (activity log, session epochs). The registry moves each field into its
-/// own `RwLock` from here.
+/// plus the two sidecar maps (activity log, session epochs).
 #[derive(Debug, Default)]
 pub struct PersistedState {
     pub indexes: BTreeMap<String, IndexEntry>,
@@ -43,9 +37,8 @@ pub struct PersistedState {
 }
 
 /// The core catalog snapshot a mutation hands the backend to persist — the seven durable maps of the
-/// `registry.json` envelope (the activity log and session epochs persist through their own backend
-/// methods, since they're independent sidecars with different durability rules). Owned, so the JSON
-/// backend serializes it without a second clone.
+/// `registry.json` envelope. The activity log and session epochs persist through their own backend
+/// methods, as independent sidecars with different durability rules.
 #[derive(Debug)]
 pub struct RegistrySnapshot {
     pub indexes: BTreeMap<String, IndexEntry>,
@@ -58,8 +51,8 @@ pub struct RegistrySnapshot {
 }
 
 /// Where the registry's durable state lives. The default [`JsonFileBackend`] is the local
-/// single-writer JSON store; a replicated backend (D51) implements the same three persist paths plus
-/// [`load`](RegistryBackend::load) against an external store.
+/// single-writer JSON store; a replicated backend (D51) implements the same trait against an external
+/// store.
 ///
 /// **Single-writer** is the backend's responsibility: [`JsonFileBackend::open`] takes an exclusive
 /// advisory `flock`; a store-backed backend enforces it with a lease / conditional write.
@@ -79,9 +72,9 @@ pub trait RegistryBackend: Send + Sync {
     fn persist_sessions(&self, sessions: &BTreeMap<String, i64>) -> Result<()>;
 
     // ---- leadership & change-polling (for N-replica HA over a shared store) -------------------
-    // The defaults model the local single-writer file: it is unconditionally the leader (its `flock`
-    // already made it the sole writer) and has no standbys polling for changes. A replicated backend
-    // overrides these so a read-only standby can detect the leader's writes and take over on its death.
+    // The defaults model the local single-writer file: unconditionally the leader (its `flock` made
+    // it the sole writer) with no standbys. A replicated backend overrides these so a read-only
+    // standby can detect the leader's writes and take over on its death.
 
     /// The store's monotonic registry version, when the backend supports change-polling. A **standby**
     /// polls this and calls [`Registry::reload`](crate::Registry::reload) when it advances — the
@@ -95,8 +88,8 @@ pub trait RegistryBackend: Send + Sync {
     /// [`confirm_leadership`](RegistryBackend::confirm_leadership) (or
     /// [`resign_leadership`](RegistryBackend::resign_leadership) if that reload fails) — so a
     /// promoted leader can never persist a snapshot built from a stale catalog and overwrite the
-    /// dead leader's last writes. Default: unconditionally `true` — the [`JsonFileBackend`] took its
-    /// exclusive `flock` at open and its memory has no other writer to be stale against.
+    /// dead leader's last writes. Default: unconditionally `true` (the [`JsonFileBackend`]'s `flock`
+    /// leaves no other writer to be stale against).
     fn try_become_leader(&self) -> Result<bool> {
         Ok(true)
     }
@@ -130,8 +123,8 @@ pub trait RegistryBackend: Send + Sync {
 /// The persisted registry **envelope**: a `{ version, indexes, … }` document around the catalog,
 /// rather than a bare map — so the format is self-describing and evolvable. `#[serde(default)]` on
 /// every non-core map means older files (written before a field existed) load cleanly. Every backend
-/// serializes exactly this envelope (the JSON file writes it to disk; the Postgres backend stores it
-/// as a JSONB document), so the two are byte-for-byte interchangeable.
+/// serializes exactly this envelope, so the JSON file and the Postgres JSONB document are
+/// byte-for-byte interchangeable.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct RegistryFile {
     version: u32,
@@ -202,8 +195,7 @@ impl RegistryFile {
 
 /// The default backend: the local **single-writer JSON store**. Holds the exclusive `flock` for the
 /// process lifetime, writes the `registry.json` envelope and the `activity.json` / `sessions.json`
-/// sidecars with atomic temp+rename (keeping a `.prev` fallback), exactly as the control plane did
-/// before the backend seam.
+/// sidecars with atomic temp+rename (keeping a `.prev` fallback).
 pub struct JsonFileBackend {
     path: PathBuf,
     activity_path: PathBuf,
@@ -221,8 +213,8 @@ impl JsonFileBackend {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Exclusive single-writer lock on a stable `.lock` sibling (the data file is renamed over,
-        // so locking it directly wouldn't be stable across writes).
+        // Lock a stable `.lock` sibling, not the data file: the data file is renamed over, so a lock
+        // on it wouldn't be stable across writes.
         let lock_path = path.with_extension("lock");
         let lock = File::create(&lock_path)?;
         lock.try_lock_exclusive()
@@ -246,8 +238,7 @@ impl RegistryBackend for JsonFileBackend {
             RegistryFile::empty()
         };
         // Sidecars are best-effort: a missing/corrupt log or session file starts empty rather than
-        // failing registry startup (they're a non-critical audit convenience / revocation state, not
-        // catalog truth).
+        // failing startup — they're audit convenience / revocation state, not catalog truth.
         let activity = std::fs::read(&self.activity_path)
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
@@ -278,9 +269,8 @@ impl RegistryBackend for JsonFileBackend {
     }
 }
 
-/// Load the core catalog from `path`, parsing the `{ version, indexes, … }` envelope. On a parse
-/// failure (a corrupt file), fall back to the last-known-good `.prev` copy with a loud warning
-/// instead of hard-failing — bricking the control plane on a single bad file would be worse.
+/// Load the core catalog from `path`. On a parse failure (a corrupt file), fall back to the
+/// last-known-good `.prev` copy with a loud warning rather than bricking the control plane.
 fn load_core(path: &Path) -> Result<RegistryFile> {
     fn parse(bytes: &[u8]) -> Result<RegistryFile> {
         Ok(serde_json::from_slice::<RegistryFile>(bytes)?)

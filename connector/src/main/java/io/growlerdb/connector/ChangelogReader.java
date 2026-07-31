@@ -83,11 +83,9 @@ public final class ChangelogReader {
 
   /**
    * Stream the changelog DataFrame as {@link ChangelogRow}s, pulling <b>one partition at a time</b>
-   * to the driver ({@link Dataset#toLocalIterator}) rather than the whole window at once. Combined
-   * with the bounded read→map→commit loop, this keeps driver memory O(chunk) — a large post-outage
-   * backlog does not OOM the driver. The DataFrame is ordered by {@code _change_ordinal} (a global
-   * sort's range partitioning), so iterating partitions in index order preserves changelog order.
-   * Locator is a placeholder (see class docs).
+   * to the driver ({@link Dataset#toLocalIterator}) so driver memory stays O(chunk) — a large
+   * post-outage backlog does not OOM the driver. Ordered by {@code _change_ordinal}, so iterating
+   * partitions in index order preserves changelog order. Locator is a placeholder (see class docs).
    */
   public static Iterator<ChangelogRow> rowIterator(Dataset<Row> changelog, List<String> columns) {
     return rowIterator(changelog, columns, null);
@@ -136,10 +134,9 @@ public final class ChangelogReader {
   private static final com.fasterxml.jackson.databind.ObjectMapper VARIANT_JSON =
       new com.fasterxml.jackson.databind.ObjectMapper();
 
-  /** As {@link #toRow(Row, List)}, but with a {@code variant} extractor (D47/D48): the variant
-   *  column (a JSON string) is walked into flatten leaves (carried on the {@link ChangelogRow}) plus
-   *  discriminator-selected shape values (merged into {@code columns}, so they ride the document's
-   *  normal typed fields). {@code null} = no variant column. */
+  /** As {@link #toRow(Row, List)}, but with a {@code variant} extractor (D47/D48): the variant column
+   *  is walked into flatten leaves (carried on the {@link ChangelogRow}) plus discriminator-selected
+   *  shape values (merged into {@code columns}, riding the typed fields). {@code null} = no variant. */
   static ChangelogRow toRow(Row row, List<String> columns, VariantExtractor variant) {
     ChangeType type = ChangeType.fromIceberg(row.getAs("_change_type"));
     long ordinal = ((Number) row.getAs("_change_ordinal")).longValue();
@@ -147,9 +144,8 @@ public final class ChangelogReader {
     String variantColumn = variant == null ? null : variant.spec().column;
     var cols = new java.util.HashMap<String, Value>();
     for (String column : columns) {
-      // The variant column itself and its shaped sub-paths (`payload`, `payload.number`, …) are
-      // NOT real changelog columns — they live inside the variant and are produced by the extractor
-      // below (`row.getAs("payload.number")` would fail as a struct-field access). Skip them here.
+      // The variant column and its shaped sub-paths aren't real changelog columns — they live inside
+      // the variant and are produced by the extractor below (row.getAs would fail). Skip them here.
       if (variantColumn != null
           && (column.equals(variantColumn) || column.startsWith(variantColumn + "."))) {
         continue;
@@ -207,12 +203,11 @@ public final class ChangelogReader {
   private static final long MICROS_PER_DAY = 86_400_000_000L;
 
   /**
-   * Map a Spark scalar to a wire {@link Value}. Temporal scalars map to
-   * {@code ts_micros} — canonical <b>epoch microseconds UTC</b>, matching what the
-   * Rust source extracts ({@code Value::Ts}) — so a temporal key encodes/routes identically on
-   * both sides instead of stringifying via {@code toString()}. Spark's external row types are
-   * {@code java.sql.Date}/{@code Timestamp} (or {@code java.time.LocalDate}/{@code Instant}
-   * with {@code spark.sql.datetime.java8API.enabled}); all normalize to the same micros.
+   * Map a Spark scalar to a wire {@link Value}. Temporal scalars map to {@code ts_micros} — canonical
+   * <b>epoch microseconds UTC</b>, matching what the Rust source extracts ({@code Value::Ts}) — so a
+   * temporal key encodes/routes identically on both sides instead of stringifying. Spark's external
+   * types ({@code java.sql.Date}/{@code Timestamp}, or the {@code java.time} ones under the java8 API)
+   * all normalize to the same micros.
    */
   static Value toValue(Object value) {
     if (value instanceof String s) {

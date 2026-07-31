@@ -22,14 +22,12 @@ import java.util.function.Supplier;
  * shard count and routing strategy; the connector validates its own endpoint set against them and
  * fails fast on a mismatch instead of silently writing where reads never look.
  *
- * <p><b>Resilience to a CP restart.</b> {@link #resolveWindowOwner} sits on the windowed
- * <i>write hot path</i>, so this client carries the same two guards as {@link WriteClient}: a
- * <b>per-call deadline</b> (a force-killed CP pod black-holes a blocking stub — without a deadline
- * ingestion freezes silently on TCP retransmits) plus channel keepalive to trip the dead socket
- * into re-resolution, and a <b>bounded retry with backoff</b> for {@code UNAVAILABLE}/{@code
- * DEADLINE_EXCEEDED} — the CP sits behind a Service, so a leader failover lands the retry on the
- * new pod. Both RPCs are idempotent ({@code ResolveUnitOwner} re-asks for an already-placed unit),
- * so a retry never double-places.
+ * <p><b>Resilience to a CP restart.</b> {@link #resolveWindowOwner} sits on the windowed write hot
+ * path, so this client carries the same two guards as {@link WriteClient}: a <b>per-call deadline</b>
+ * plus channel keepalive (a force-killed CP pod black-holes a blocking stub; without a deadline
+ * ingestion freezes silently on TCP retransmits), and a <b>bounded retry with backoff</b> for {@code
+ * UNAVAILABLE}/{@code DEADLINE_EXCEEDED} — the CP is behind a Service, so a leader failover lands the
+ * retry on the new pod. Both RPCs are idempotent, so a retry never double-places.
  */
 public final class ControlPlaneClient implements AutoCloseable {
 
@@ -38,8 +36,8 @@ public final class ControlPlaneClient implements AutoCloseable {
       Metadata.Key.of("x-growlerdb-service-token", Metadata.ASCII_STRING_MARSHALLER);
 
   /**
-   * Per-call deadline. CP calls are small metadata lookups — far below {@link
-   * WriteClient#PER_CALL_DEADLINE_SECONDS}'s large-batch allowance — so 10s is generous while still
+   * Per-call deadline. CP calls are small metadata lookups (far below {@link
+   * WriteClient#PER_CALL_DEADLINE_SECONDS}'s large-batch allowance), so 10s is generous while still
    * bounding a black-holed call to seconds, not TCP-retransmit forever.
    */
   static final int PER_CALL_DEADLINE_SECONDS = 10;
@@ -58,10 +56,10 @@ public final class ControlPlaneClient implements AutoCloseable {
   private final long maxBackoffMs;
 
   /**
-   * Connect to the Control Plane at {@code host:port} (plaintext). When {@code GROWLERDB_SERVICE_TOKEN}
-   * is set, every call carries it as the {@code x-growlerdb-service-token} header so a closed control
-   * plane authenticates the connector; unset ⇒ no header (open dev). TLS to the control plane is not
-   * yet wired here.
+   * Connect to the Control Plane at {@code host:port} (plaintext). When {@code
+   * GROWLERDB_SERVICE_TOKEN} is set, every call carries it as the {@code x-growlerdb-service-token}
+   * header so a closed control plane authenticates the connector; unset ⇒ no header (open dev). TLS
+   * to the control plane is not yet wired here.
    */
   public ControlPlaneClient(String host, int port) {
     this(
@@ -84,9 +82,9 @@ public final class ControlPlaneClient implements AutoCloseable {
     if (maxAttempts < 1) {
       throw new IllegalArgumentException("maxAttempts must be >= 1"); // else callWithRetry NPEs
     }
-    // dns:/// + keepalive, mirroring WriteClient: a force-killed CP pod black-holes its TCP
-    // connection; the unanswered ping trips the subchannel to TRANSIENT_FAILURE → DNS re-resolution
-    // → reconnect to the Service's live pod, so the retry below lands somewhere alive.
+    // dns:/// + keepalive, mirroring WriteClient: an unanswered ping to a force-killed CP pod trips
+    // the subchannel to TRANSIENT_FAILURE → DNS re-resolution → reconnect to the Service's live pod,
+    // so the retry below lands somewhere alive.
     this.channel =
         ManagedChannelBuilder.forTarget("dns:///" + host + ":" + port)
             .usePlaintext()
@@ -132,9 +130,9 @@ public final class ControlPlaneClient implements AutoCloseable {
   /**
    * Resolve the node that owns ordinal {@code shard} of a hash/partition-sharded {@code index},
    * placing it on the least-loaded live node on first ask — the hash counterpart to {@link
-   * #resolveWindowOwner}. In the placement pool (D52) a hash index's ordinals are CP-placed (not
-   * pinned to a per-ordinal StatefulSet), so the connector resolves each owned ordinal's current
-   * pool node this way. Idempotent for an already-placed shard (returns its existing primary).
+   * #resolveWindowOwner}. In the placement pool (D52) a hash index's ordinals are CP-placed, so the
+   * connector resolves each owned ordinal's current pool node this way. Idempotent for an
+   * already-placed shard (returns its existing primary).
    */
   public ResolveUnitOwnerResponse resolveShardOwner(String index, int shard) {
     return callWithRetry(

@@ -33,8 +33,8 @@ import org.apache.spark.sql.types.StructType;
  *
  * <p>A scalar {@code growlerdb_match} predicate doesn't fit Spark's per-row UDF model (a search runs
  * once, not per row); the join expresses "match" (inner join keeps only hits) and "score" (the
- * carried column) — the two UDFs the task calls for. The hit-to-row mapping is factored into pure,
- * {@code SparkSession}-free helpers so it's unit-testable without a cluster.
+ * carried column). The hit-to-row mapping is factored into pure, {@code SparkSession}-free helpers so
+ * it's unit-testable without a cluster.
  */
 public final class GrowlerDbSearch {
 

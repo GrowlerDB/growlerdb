@@ -1,26 +1,20 @@
-//! **Scale-limit license.** An Ed25519-signed entitlement that unlocks node counts beyond the free
-//! tier. Verified **offline** — no phone-home (see [D26](/system/decisions/d26-telemetry.md)) —
-//! against a public key baked into the binary. Expiry is parsed but **not enforced** yet; see backlog
-//! task-266 for expiry + pre-expiry notification/grace before turning it on.
+//! **Scale-limit license.** An Ed25519-signed entitlement unlocking node counts beyond the free
+//! tier. Verified **offline** — no phone-home (D26) — against a public key baked into the binary.
+//! Expiry is parsed but **not enforced** yet (task-266).
 
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 
 /// The free tier: a deployment using at most this many **nodes** needs no license. The metric is the
-/// number of distinct live **nodes that hold a primary of any index** (D38/D53, Option A) — the
-/// metric of *concurrent* scale, never lifetime usage: a windowed index accumulating windows on one
-/// node costs one node forever (the per-window count bricked a free-tier daily index in 3 days),
-/// packing primaries of many indexes onto one node still costs one, read replicas are free (never a
-/// primary), and only tracked-and-heartbeat-stale nodes stop counting (unknown liveness counts —
-/// fail-closed). Enforced atomically inside registry placement (`resolve_unit_holders` / the
-/// `RegisterServedIndex` announce paths). See [D38](/system/decisions/d38-scale-limit-entitlement.md).
+/// number of distinct live **nodes that hold a primary of any index** (D38/D53, Option A) — concurrent
+/// scale, never lifetime: many indexes' primaries on one node still cost one, read replicas are free
+/// (never a primary), and unknown-liveness nodes count (fail-closed). Enforced atomically inside
+/// registry placement (`resolve_unit_holders` / the `RegisterServedIndex` announce paths).
 pub const FREE_NODE_LIMIT: usize = 3;
 
-/// GrowlerDB LLC's license-signing **public** key (Ed25519) — the production key. Licenses are minted
-/// offline with the matching **private** key, which is held privately by GrowlerDB LLC and never lives
-/// in this repository; only this public half ships, to verify tokens at startup. The free tier works
-/// without any license — a valid license is only needed to exceed [`FREE_NODE_LIMIT`]. Rotating the key
-/// means minting against a new keypair and shipping its public half here.
+/// GrowlerDB LLC's license-signing **public** key (Ed25519) — the production key. Only the public half
+/// ships (to verify tokens at startup); the matching private key is held by GrowlerDB LLC and never
+/// lives in this repo. Rotating means minting against a new keypair and shipping its public half here.
 const LICENSE_PUBLIC_KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
 MCowBQYDK2VwAyEAyizufq7Ro4/FzX0FhQqH2945GnMat7aYVr2Vf0kzGks=\n\
 -----END PUBLIC KEY-----\n";
@@ -29,9 +23,8 @@ MCowBQYDK2VwAyEAyizufq7Ro4/FzX0FhQqH2945GnMat7aYVr2Vf0kzGks=\n\
 struct Claims {
     /// Who the license is issued to (shown in the console).
     licensee: String,
-    /// Maximum **distinct primary-holding nodes** this license entitles (the D38/D53 Option-A
-    /// metric — replicas free, window accumulation free, many indexes co-located on one node free).
-    /// The signed claim's `max_nodes` name is now literal: it counts nodes.
+    /// Maximum **distinct primary-holding nodes** this license entitles (D38/D53 Option-A: replicas
+    /// free, window accumulation free, many indexes co-located on one node free).
     max_nodes: u32,
     /// Optional expiry (unix seconds). Parsed but NOT enforced yet — see task-266.
     #[serde(default)]
@@ -77,10 +70,8 @@ impl License {
     }
 
     /// Mint (sign) a license token with an Ed25519 **private-key** PEM — the inverse of [`verify`].
-    /// Used only by the offline issuing ceremony (the `mint_license` example / the runbook in
-    /// `COMM-LICENSE.md`): the private key is held by GrowlerDB LLC and **never** lives in this repo,
-    /// so this is not a runtime path. The minted token is verified at startup against the embedded
-    /// public key ([`LICENSE_PUBLIC_KEY_PEM`]) — the two must be the matching pair.
+    /// Used only by the offline issuing ceremony (the private key never lives in this repo), so not a
+    /// runtime path. The token verifies at startup against the embedded [`LICENSE_PUBLIC_KEY_PEM`].
     pub fn mint(
         private_key_pem: &str,
         licensee: &str,

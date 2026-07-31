@@ -1,21 +1,13 @@
-//! **Compaction-under-hydration regression test**:
-//! an Iceberg compaction moves every row to new data files at new positions and deletes
-//! the old files — with the background **re-map** on, hydration afterwards needs **zero**
-//! lazy refreshes (`growlerdb_stale_locators_total` delta = 0) and every slot points at
-//! the new files; with re-map off (**bitmap-only**), hydration is still correct via the
-//! pass-2 fallback, the dead-file bitmap short-circuits every doomed pass-1 point read,
-//! and the stale counter counts each fallback.
+//! **Compaction-under-hydration regression**: an Iceberg compaction rewrites every row to new
+//! files/positions and deletes the old ones. With background re-map on, hydration needs ZERO lazy
+//! refreshes (`growlerdb_stale_locators_total` delta = 0); with re-map off (bitmap-only), hydration
+//! is still correct via the pass-2 fallback, the dead-file bitmap short-circuits every doomed pass-1
+//! read, and the stale counter counts each fallback.
 //!
-//! There is no in-process Iceberg-catalog fixture, so the test builds the documented
-//! minimal seam: real parquet data files on local disk (read through the same
-//! column-projected reader production's re-map uses — `read_file_key_rows` over the
-//! production `FileIO` stack), a real shard (ingest → `location.arr` slots), a simulated
-//! `replace` (rewrite rows into a new parquet file, delete the old ones), and the diff
-//! fed to the re-map entry point directly (`growlerdb_engine::remap_shard`). The
-//! hydration harness mirrors the production `LookupService` flow at the same seams it
-//! composes: `resolve_locators` → `apply_live_file_bitmap` → pass-1 verify against the
-//! real parquet contents → pass-2 fallback by key → `refresh_locators` +
-//! `sli::hydration` (which owns the stale counter).
+//! No in-process Iceberg fixture exists, so the harness composes the production seams over real
+//! on-disk parquet: the `read_file_key_rows` reader, a real shard, a simulated `replace`, and the
+//! diff fed straight to `remap_shard`; hydration mirrors `LookupService` (resolve → bitmap → pass-1
+//! verify → pass-2 fallback → refresh + `sli::hydration`, which owns the stale counter).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -56,8 +48,8 @@ fn key(id: i64) -> CompositeKey {
     CompositeKey::new(vec![], vec![("id".into(), Value::Int(id))])
 }
 
-/// Write `ids` as rows of a real parquet data file (`id` Int64 + `body` Utf8), row
-/// groups of `group_size` — the shape of an Iceberg data file for the `docs` table.
+/// Write `ids` as a real parquet data file (`id` Int64 + `body` Utf8) — the shape of a `docs`
+/// Iceberg data file.
 fn write_parquet(path: &str, ids: &[i64], group_size: usize) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -125,16 +117,11 @@ struct Hydration {
     pass1_reads: usize,
 }
 
-/// Hydrate `keys` against the table's current live `files`, mirroring the production
-/// flow at the same seams `LookupService` composes: resolve → live-file bitmap →
-/// pass-1 read-and-verify of each locator's `(file, position)` against the **real
-/// parquet contents** (via the production column reader) → pass-2 fallback by key over
-/// the live files → `refresh_locators` + `sli::hydration` (the stale counter's owner).
+/// Hydrate `keys` against the current live `files`, mirroring `LookupService`'s get_by_key flow.
 async fn hydrate(shard: &Shard, keys: &[CompositeKey], files: &[String]) -> Hydration {
     let fio = fs_file_io();
     let ident = ["id".to_string()];
-    // The live table's rows, read through the production reader: file → rows, and the
-    // pass-2 index key → (file, position).
+    // The live table's rows via the production reader: file → rows, and key → (file, position).
     let mut rows_of: BTreeMap<String, Vec<(CompositeKey, u64)>> = BTreeMap::new();
     let mut by_key: BTreeMap<Vec<u8>, RowLocator> = BTreeMap::new();
     for file in files {
@@ -177,7 +164,7 @@ async fn hydrate(shard: &Shard, keys: &[CompositeKey], files: &[String]) -> Hydr
     }
     shard.refresh_locators(&refreshed).unwrap();
     growlerdb_telemetry::sli::hydration(
-        "docs", // this harness serves the single `docs` shard (ShardId::single("docs"))
+        "docs", // the single `docs` shard
         0.0,
         refreshed.len() as u64,
         keys.len() as u64,
@@ -212,7 +199,7 @@ const N: i64 = 200;
 /// assert deltas of the same process-global stale counter.
 #[tokio::test(flavor = "current_thread")]
 async fn compaction_under_hydration_with_remap_and_bitmap_only() {
-    growlerdb_telemetry::init("test"); // install the metrics recorder (idempotent)
+    growlerdb_telemetry::init("test"); // install the metrics recorder
     let keys: Vec<CompositeKey> = (0..N).map(key).collect();
 
     // ================= scenario 1: compaction + background re-map =================
@@ -255,8 +242,7 @@ async fn compaction_under_hydration_with_remap_and_bitmap_only() {
     std::fs::remove_file(&f1).unwrap();
 
     // The re-map, fed the diff directly (the seam remap_tick drives in production):
-    // disappeared = {f0, f1}; moved = the added file's key column + positions, read
-    // through the production column-projected scan.
+    // disappeared = {f0, f1}; moved = the added file's keys + positions.
     let moved: Vec<(CompositeKey, RowLocator)> =
         read_file_key_rows(&fs_file_io(), &compacted, &[], &["id".to_string()])
             .await

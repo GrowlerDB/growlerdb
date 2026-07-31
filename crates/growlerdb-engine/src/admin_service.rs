@@ -1,11 +1,6 @@
-//! The Node **Admin** gRPC service over the served shard.
-//! `DescribeIndex` reports stats. `AlterIndex` resolves a candidate definition against the
-//! source schema and returns the [`AlterPlan`](growlerdb_core::AlterPlan) (detect + guide);
-//! with `apply` set it accepts only a true **no-op** live — every real change (reindex-requiring,
-//! rename, or a restart-required read-time policy like `sensitive`/`max_bytes`) is rejected with a
-//! clear status, since the running shard keeps its built schema. `ReindexIndex` rebuilds
-//! from the source and durably swaps the shard live, fencing writes for the rebuild so the
-//! checkpoint can't regress. Create / drop / list pair with the multi-index server + Control Plane.
+//! The Node **Admin** gRPC service over the served shard. `DescribeIndex` reports stats;
+//! `AlterIndex` diffs a candidate definition (applying only a true no-op live); `ReindexIndex`
+//! rebuilds from source and durably swaps the shard live, fencing writes so the checkpoint can't regress.
 
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -476,11 +471,10 @@ impl Admin for AdminService {
             .await
             .map_err(internal)?;
         // Fix the rebuild snapshot from table metadata (cheap, no scan) before streaming, so every
-        // chunk commits at one checkpoint. The rebuilt shard cannot regress the live one:
-        // writes are fenced, so the live checkpoint is an ancestor of the head read here. There is
-        // no numeric `max(old, snapshot_id)` "monotonicity belt" — snapshot ids are random longs, so
-        // a numeric max could actually PICK the stale side; the fence is the guarantee, and the
-        // sequence number stamped below is the order.
+        // chunk commits at one checkpoint. The rebuilt shard can't regress the live one: writes are
+        // fenced, so the live checkpoint is an ancestor of the head read here. No numeric
+        // `max(old, snapshot_id)` belt — snapshot ids are random longs, so a max could pick the stale
+        // side; the fence is the guarantee, the sequence number stamped below is the order.
         let (snapshot_id, sequence) = reader
             .current_snapshot_ordered(&ctx.table)
             .await
@@ -835,11 +829,9 @@ fn reindex_commit(docs: Vec<LocatedDoc>, checkpoint: i64, sequence: i64, seq: u6
 
 /// Guard against a reindex silently rebuilding an **empty** index over a live shard:
 /// if the streamed read produced 0 docs but the source snapshot reports rows, the read is broken
-/// (e.g. a delete-in-history the changelog read mishandles) — so the swap must be aborted rather
-/// than destroy the served data. `records` is the source's reported row count (`None` ⇒ unknown ⇒
-/// allow). Returns the abort reason, or `None` when the empty rebuild is legitimate (genuinely
-/// empty source) or non-empty. Mirrors `Engine::build_from_source`'s `EmptyReadFromNonEmptySource`
-/// guard, but on the reindex path the stakes are higher: the swap replaces a *live* index.
+/// (e.g. a delete-in-history the changelog read mishandles) — so the swap must abort rather than
+/// destroy the served data. `records` is the source's reported row count (`None` ⇒ unknown ⇒ allow).
+/// Returns the abort reason, or `None` when the empty rebuild is legitimate or non-empty.
 fn empty_rebuild_abort_reason(doc_count: u64, records: Option<i64>) -> Option<String> {
     match records {
         Some(n) if doc_count == 0 && n > 0 => Some(format!(

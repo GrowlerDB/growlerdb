@@ -1,13 +1,9 @@
-//! **Object-storage backup & restore** for a shard's index. A backup ships a shard's
-//! consistent committed state — sealed Tantivy segments + the `location.arr` array + the
-//! `aux.redb` aux store + the index definition — to object storage; a restore pulls it back onto
-//! a replacement node, which then
-//! **replays the tail from the backed-up checkpoint** via normal ingestion. With no backup, the
-//! shard is rebuilt from Iceberg (the engine's `rebuild`) — no GrowlerDB state is irreplaceable.
-//!
-//! Transport is [`opendal`]: **S3/MinIO** in production (`s3_store`) and a local **filesystem**
-//! service (`fs_store`) for backup-to-a-mounted-volume and for tests — so the logic is verifiable
-//! without a live object store. Layout under a backup `prefix`:
+//! **Object-storage backup & restore** for a shard's index. A backup ships a shard's consistent
+//! committed state (sealed Tantivy segments + `location.arr` + the `aux.redb` aux store + the index
+//! definition) to object storage; a restore pulls it onto a replacement node, which replays the tail
+//! from the backed-up checkpoint. With no backup a shard is rebuilt from Iceberg — nothing is
+//! irreplaceable. Transport is [`opendal`] (S3/MinIO via `s3_store`, local fs via `fs_store`).
+//! Layout under a backup `prefix`:
 //!
 //! ```text
 //! <prefix>/data/<relpath>   # each shard file's bytes (index/<segment files>, aux.redb, index.json)
@@ -59,10 +55,9 @@ pub enum BackupError {
 type Result<T> = std::result::Result<T, BackupError>;
 
 /// The manifest **format version** this binary writes and consumes. Format **1** is the
-/// layered-locator shard format — the file list carries `location.arr` beside the
-/// segments and `aux.redb`. The version field + the refuse-newer check in [`read_manifest`]
-/// are release hygiene: a future incompatible layout bumps this, and older binaries fail
-/// loudly instead of mis-restoring.
+/// layered-locator shard format (the file list carries `location.arr` beside the segments and
+/// `aux.redb`). A future incompatible layout bumps this; [`read_manifest`] refuses newer formats
+/// rather than mis-restore.
 pub const MANIFEST_FORMAT: u32 = 1;
 
 /// Manifests written without a `format` field deserialize as format 1.
@@ -117,13 +112,11 @@ pub struct S3Config {
     pub secret_access_key: String,
 }
 
-/// Wrap `op` with a **jittered retry layer**. Object stores routinely return
-/// transient errors — S3 `503 SlowDown`, 5xx, connection resets — under exactly the load GrowlerDB
-/// generates (shipping a many-file shard, scanning a big snapshot). Without this a single blip aborts
-/// the whole backup / restore / replica-refresh mid-flight, and the non-transactional file-then-
-/// manifest write can leave a partial prefix. opendal only retries errors it marks *temporary*, so
-/// terminal failures (`NotFound`, auth) still surface immediately. Jitter avoids a synchronized retry
-/// herd across a fleet.
+/// Wrap `op` with a **jittered retry layer**. Object stores return transient errors (S3 `503
+/// SlowDown`, 5xx, resets) under GrowlerDB's load; without retry a single blip aborts a whole
+/// backup/restore/refresh and the non-transactional file-then-manifest write can leave a partial
+/// prefix. opendal retries only *temporary* errors (terminal `NotFound`/auth still surface); jitter
+/// avoids a synchronized retry herd.
 fn with_retry(op: Operator) -> Operator {
     op.layer(
         opendal::layers::RetryLayer::new()
@@ -152,16 +145,13 @@ pub fn s3_store(cfg: &S3Config) -> Result<Operator> {
 pub const FS_ATOMIC_WRITE_DIR: &str = ".atomic-writes";
 
 /// An [`Operator`] over a local directory — a filesystem backup target (mounted volume / NFS),
-/// and the backend the tests use. Retries transient failures (NFS can blip too).
+/// and the backend the tests use. Retries transient failures.
 ///
-/// **Writes are atomic** (HA-G4): opendal's fs service writes in place by default, so a concurrent
-/// reader — a replica fetching `cold.json` / `manifest.json` while a re-park overwrites it — could
-/// observe a torn object. `atomic_write_dir` makes every write land in a tempfile under
-/// [`FS_ATOMIC_WRITE_DIR`] and **rename** into place on close; POSIX rename is atomic on one
-/// filesystem, which holds because the staging dir lives under the same root. S3-style backends
-/// need none of this (a PUT is already all-or-nothing) and are untouched. A crash mid-write can
-/// leave a stale tempfile behind — harmless, bounded by write frequency, and outside every listed
-/// prefix.
+/// **Writes are atomic** (HA-G4): `atomic_write_dir` stages every write in a tempfile under
+/// [`FS_ATOMIC_WRITE_DIR`] and renames it into place on close, so a concurrent reader (a replica
+/// fetching `cold.json` / `manifest.json` mid-overwrite) never sees a torn object. POSIX rename is
+/// atomic within the one filesystem the staging dir shares. S3 backends need none of this (a PUT is
+/// atomic); a crash can leave a harmless stale tempfile outside every listed prefix.
 pub fn fs_store(root: impl AsRef<Path>) -> Result<Operator> {
     let root = root.as_ref();
     std::fs::create_dir_all(root)?;
@@ -236,19 +226,13 @@ pub async fn backup(
         )
         .await?;
 
-    // Snapshot-aware cold GC. A cold read-through reader (D53) opens at a published layout and only
-    // reopens when the SOURCE SNAPSHOT advances — it has no self-refresh loop. Within one source
-    // snapshot the primary can still re-lay-out its segments (build finalize-merge, or compaction)
-    // into differently-named files; deleting the superseded objects would 404 the next lazy fetch of
-    // a reader still pinned to the old layout (the bug this guards). So:
-    //   * same source snapshot (a re-layout) — retain ALL superseded objects: a pinned reader may
-    //     still fetch them and won't reopen until the snapshot advances;
-    //   * snapshot ADVANCE — prune, but retain the PREVIOUS snapshot's files one generation, covering
-    //     a replica still mid-reopen from that snapshot.
-    // Run AFTER the manifest commit: a crash here leaves a valid manifest plus reclaimable orphans,
-    // which a later snapshot-advancing backup's GC reclaims. Bounded: a shard compacts a finite
-    // number of times per source snapshot (compaction stops below `min_segments`), so same-snapshot
-    // superseded objects accumulate only until the next source commit, then are reclaimed.
+    // Snapshot-aware cold GC. A cold read-through reader (D53) reopens only when the SOURCE SNAPSHOT
+    // advances, so deleting objects a same-snapshot re-layout (finalize-merge / compaction)
+    // superseded would 404 a reader still pinned to the old layout. So: same snapshot → retain ALL
+    // superseded objects; snapshot ADVANCE → prune, but retain the previous snapshot's files one
+    // generation for a replica still mid-reopen. Run AFTER the manifest commit (a crash here leaves
+    // reclaimable orphans a later advancing GC reclaims). Bounded: same-snapshot superseded objects
+    // accumulate only until the next source commit.
     if let Some(prev) = &previous {
         if manifest.snapshot > prev.snapshot {
             prune_superseded(store, prefix, &manifest, Some(prev)).await?;
@@ -259,20 +243,8 @@ pub async fn backup(
     Ok(manifest)
 }
 
-/// Delete objects under `{prefix}/data/` that the just-committed `manifest` no longer references —
-/// the remote counterpart of [`refresh`]'s local prune. Idempotent and safe to re-run: it only
-/// removes keys absent from the manifest's file set, so the restorable state (manifest + its files)
-/// is never touched. Returns the number of objects pruned.
-///
-/// **Precondition — single writer per prefix.** GrowlerDB backs a shard up from its
-/// **one** primary, so there is exactly one writer per backup prefix. Two concurrent `backup()`s
-/// against the same prefix (e.g. a split-brain "both primary") could have one's prune delete a file
-/// the other just committed. That precondition holds by the shard-ownership model; the safety net for
-/// a replica that read an older manifest and races this prune is [`refresh`]'s re-read-and-retry on a
-/// mid-flight `NotFound`.
 /// List every **object** key under `prefix` (recursive), filtering out the trailing-slash directory
-/// markers the fs backend emits. The shared scan behind prune / bundle-delete /
-/// promote — each of those only differs in what it does per key, not in how it enumerates them.
+/// markers the fs backend emits. The shared scan behind prune / bundle-delete / promote.
 async fn list_object_keys(store: &Operator, prefix: &str) -> Result<Vec<String>> {
     let mut keys = Vec::new();
     for entry in store.list_with(prefix).recursive(true).await? {
@@ -299,6 +271,10 @@ async fn delete_prefix_best_effort(store: &Operator, prefix: &str) {
 /// `retain_previous` (the manifest this one replaces). Keeping the previous generation's files is a
 /// one-generation grace: a replica still mid-reopen from the prior snapshot can finish its in-flight
 /// lazy fetches before the objects vanish. Idempotent; returns the number of objects pruned.
+///
+/// **Precondition — single writer per prefix** (shard ownership): concurrent `backup()`s to one
+/// prefix could have this prune delete a file the other just committed. A replica racing on an older
+/// manifest is caught by [`refresh`]'s re-read-and-retry on a mid-flight `NotFound`.
 async fn prune_superseded(
     store: &Operator,
     prefix: &str,
@@ -430,16 +406,13 @@ async fn cold_park_to_store(
             None => None,
         }
     };
-    // Split bundle: concatenate the parked index files into ONE object so cold queries
-    // issue ranged GETs against a single object instead of one per file. On success the now-redundant
-    // individual index objects are removed — the bundle is the sole serving copy, so no storage
-    // doubling — and open falls to the bundle for both structural and posting reads. On failure we
-    // keep the individual files and fall back to plain per-file read-through. Stored OUTSIDE `data/`
-    // so backup GC won't touch it. Built AFTER the hotcache (which reads the individual files).
-    // Bundle from the LOCAL window files: they're still on disk here (eviction is the last
-    // step), so stream them straight into the split object instead of re-downloading the whole window
-    // from the store. The backup manifest lists exactly what was parked; the `index/` entries (stripped
-    // of that prefix) are the bare rels the bundle records, read from `window_dir/index`.
+    // Split bundle: concatenate the parked index files into ONE object so cold queries issue ranged
+    // GETs against a single object instead of one per file. On success the now-redundant individual
+    // index objects are removed (the bundle is the sole serving copy — no storage doubling); on
+    // failure keep them and fall back to per-file read-through. Stored OUTSIDE `data/` so backup GC
+    // won't touch it, and built AFTER the hotcache (which reads the individual files). Bundled from
+    // the LOCAL window files (still on disk pre-eviction), so `index/` manifest entries stripped of
+    // that prefix are the bare rels, read from `window_dir/index`.
     let index_rels: Vec<String> = manifest
         .files
         .iter()
@@ -459,13 +432,10 @@ async fn cold_park_to_store(
         .await
         {
             Ok(_) => {
-                // Commit the `bundled` manifest BEFORE deleting the per-file objects. The old
-                // order (delete, then best-effort rewrite) left a crash window where the durable
-                // manifest still listed the deleted `index/*` objects as restorable — a later
-                // `restore` 404'd mid-download instead of getting the clean `Bundled` refusal.
-                // With manifest-first, every crash point is consistent: rewrite fails ⇒ objects
-                // are kept and the old manifest still restores; rewrite lands ⇒ the objects are
-                // unreferenced and their deletion is pure (best-effort) reclamation.
+                // Commit the `bundled` manifest BEFORE deleting the per-file objects, so every crash
+                // point stays consistent: rewrite fails ⇒ objects kept and the old manifest still
+                // restores; rewrite lands ⇒ the objects are unreferenced and their deletion is pure
+                // (best-effort) reclamation.
                 manifest.bundled = true;
                 manifest.files.retain(|f| !f.path.starts_with("index/"));
                 let manifest_committed = match serde_json::to_vec(&manifest) {
@@ -776,14 +746,11 @@ pub async fn refresh(store: &Operator, prefix: &str, dest: &Path) -> Result<Refr
     // * A listed segment **404s** mid-download — the backup's GC (`prune_superseded`) pruned a
     //   file this now-stale manifest still names. Re-read and go again.
     // * The pass **tears**: the mutable objects (`index/meta.json`, `aux.redb`, `location.arr`)
-    //   are fetched live while segment files come from the manifest's list, so a backup landing
-    //   mid-pass can pair a NEWER meta with the OLDER segment set — a meta referencing segments
-    //   never downloaded (and the prune step even removes files the new meta needs). The
-    //   manifest is the backup's commit point (written last), so re-reading it after the pass
-    //   and comparing snapshots detects any backup that completed during the pass; a retry is
-    //   cheap (the immutable segments already downloaded are reused). A sub-object-read race
-    //   narrower than the manifest commit remains theoretically possible but is bounded by one
-    //   GET, not the whole multi-second pass.
+    //   are fetched live while segments come from the manifest's list, so a backup landing mid-pass
+    //   can pair a NEWER meta with the OLDER segment set. The manifest is the commit point (written
+    //   last), so re-reading it after the pass and comparing snapshots detects any backup that
+    //   completed during it; the retry is cheap (already-downloaded immutable segments are reused).
+    //   A sub-object read race narrower than the manifest commit is bounded by one GET, not the pass.
     const MAX_REFRESH_RETRIES: usize = 3;
     let mut manifest = read_manifest(store, prefix).await?;
     // One re-read covers the GC race; a SECOND NotFound is a genuinely missing object and
@@ -874,23 +841,16 @@ async fn refresh_once(
     })
 }
 
-/// One **live read-replica** refresh cycle: [`refresh`] the replica's `shard_id` shard in
-/// `store`, and re-open it **only when the primary has actually moved on** — returning the fresh
-/// shard for the caller to hot-swap (e.g. `ShardHandle::swap`). The primary's `meta.json`/`aux.redb`
-/// re-download every poll (they're mutable), so the authoritative "something changed" signal is the
-/// backup's **snapshot** advancing past the `served_snapshot` the replica is currently serving. (The
-/// raw `RefreshStats` counts can't tell idle from changed: the mutable meta/locator always count as
-/// downloaded, and opening the shard writes a local writer-lock that the next refresh prunes — so
-/// only the snapshot is reliable. A primary compaction at the same snapshot leaves query results
-/// unchanged, so skipping its re-open is correct; the next real commit picks up the merged layout. (A
-/// downloading replica keeps serving the pre-merge segments from mmap even after `refresh` unlinks
-/// them — safe on Unix — so it never 404s; the reader that must NOT lose its objects is the cold
-/// read-through replica, protected on the primary's GC side by snapshot-gated retention in `backup`.)
-/// On a snapshot advance, the definition is re-materialized at `def_path` (if the manifest carries
-/// one and `def_path` is set) so the replica tracks the primary's schema, and the shard is re-opened.
-/// `Ok((None, stats))` means the replica was already up to date, so a steady-state poll never
-/// re-opens. The swap is the caller's (serving) concern, keeping this pure of the server loop and
-/// unit-testable against an `fs` backup.
+/// One **live read-replica** refresh cycle: [`refresh`] the replica's `shard_id` shard in `store`
+/// and re-open it **only when the primary has moved on** — returning the fresh shard for the caller
+/// to hot-swap (e.g. `ShardHandle::swap`). The signal is the backup's **snapshot** advancing past
+/// `served_snapshot`: the mutable `meta.json`/`aux.redb` re-download every poll and opening writes a
+/// local writer-lock the next refresh prunes, so the raw `RefreshStats` counts can't tell idle from
+/// changed. A same-snapshot compaction leaves query results unchanged, so skipping its re-open is
+/// correct. On a snapshot advance the definition is re-materialized at `def_path` (when the manifest
+/// carries one and `def_path` is set) so the replica tracks the primary's schema, and the shard is
+/// re-opened; `Ok((None, stats))` means already up to date. The swap is the caller's concern, keeping
+/// this pure of the server loop and unit-testable against an `fs` backup.
 pub async fn refresh_and_reopen(
     store: &Operator,
     prefix: &str,
@@ -1001,13 +961,11 @@ mod tests {
         );
     }
 
-    /// The torn-refresh hazard and its guard. A refresh pass fetches the mutable objects
-    /// (`index/meta.json`, `aux.redb`, `location.arr`) live while segment files come from the
-    /// manifest's list — so a pass running against a **stale** manifest while the store already
-    /// holds a newer backup assembles a shard whose meta references segments it never
-    /// downloaded (and prunes ones it shouldn't). `refresh_once` (the raw pass) reproduces
-    /// exactly that; the public [`refresh`] re-reads the manifest after the pass and retries,
-    /// converging on a consistent, openable shard.
+    /// The torn-refresh hazard and its guard: a pass against a **stale** manifest (while the store
+    /// already holds a newer backup) pairs live mutable objects with the old segment list, assembling
+    /// a shard whose meta references segments it never downloaded. `refresh_once` reproduces that; the
+    /// public [`refresh`] re-reads the manifest after the pass and retries, converging on an openable
+    /// shard.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stale_manifest_pass_tears_and_refresh_converges() {
         let primary_tmp = tempfile::tempdir().unwrap();
@@ -1086,12 +1044,10 @@ mod tests {
         op.stat(&format!("{prefix}/data/{rel}")).await.is_ok()
     }
 
-    /// The compaction-GC bug (a read-through reader 404ing on a pruned cold object): a primary can
-    /// re-lay-out its segments WITHIN one source snapshot (a build finalize-merge or compaction),
-    /// and the cold read-through reader that opened at the old layout only reopens when the SOURCE
-    /// SNAPSHOT advances. So a same-snapshot re-backup must RETAIN the superseded objects — deleting
-    /// them would 404 the reader's next lazy fetch. Reclamation still happens once the snapshot
-    /// advances (past all readers), so this isn't an unbounded leak.
+    /// Snapshot-gated cold GC: a same-snapshot re-layout (finalize-merge / compaction) must RETAIN
+    /// the superseded objects, since a cold read-through reader pinned to the old layout reopens only
+    /// on a SOURCE SNAPSHOT advance and would 404 on its next lazy fetch. A snapshot advance (past all
+    /// such readers) reclaims them — not an unbounded leak.
     #[tokio::test]
     async fn same_snapshot_compaction_retains_superseded_cold_objects() {
         let primary_tmp = tempfile::tempdir().unwrap();

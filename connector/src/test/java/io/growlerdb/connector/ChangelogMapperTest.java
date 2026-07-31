@@ -54,11 +54,10 @@ class ChangelogMapperTest {
 
   @Test
   void equalityDeleteOnKeyMapsToDeleteByKey() {
-    // An Iceberg equality delete keyed on `id` surfaces as a DELETE change carrying
-    // only the equality (key) column — no full pre-image. GrowlerDB is keyed by the
-    // composite key, so it still maps cleanly to delete-by-key.
+    // An equality delete carries only the key column (no pre-image); keyed by the
+    // composite key, it still maps cleanly to delete-by-key.
     Map<String, Value> keyOnly = new HashMap<>();
-    keyOnly.put("id", str("doc-1")); // body (a non-key column) is absent
+    keyOnly.put("id", str("doc-1"));
     ChangelogRow eqDelete =
         new ChangelogRow(ChangeType.DELETE, 0, 1, keyOnly, "data/f0.parquet", 0);
 
@@ -114,9 +113,8 @@ class ChangelogMapperTest {
 
   @Test
   void orderingFollowsChangeOrdinalNotSnapshotId() {
-    // Real Iceberg snapshot ids are random longs, not monotonic: here the earlier
-    // INSERT has a *larger* id than the later UPDATE. Ordering must follow
-    // _change_ordinal (commit order), so the UPDATE_AFTER wins — not the insert.
+    // Snapshot ids are random longs, not monotonic (earlier INSERT has a larger id).
+    // Ordering must follow change_ordinal (commit order), so UPDATE_AFTER wins.
     DocBatch batch =
         mapper()
             .toBatch(

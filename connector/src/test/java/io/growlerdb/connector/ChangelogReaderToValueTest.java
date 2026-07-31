@@ -10,10 +10,9 @@ import java.time.ZoneOffset;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@link ChangelogReader#toValue} temporal mapping: Spark date/timestamp scalars must
- * become {@code ts_micros} — canonical <b>epoch microseconds UTC</b> — matching what the Rust
- * source extracts for the same Iceberg value, so a temporal key hashes/routes identically on both
- * sides (see {@link ShardRouterParityTest} for the byte-level contract).
+ * {@link ChangelogReader#toValue} temporal mapping: Spark date/timestamp scalars must become
+ * {@code ts_micros} (epoch microseconds UTC), matching what the Rust source extracts so a temporal
+ * key hashes/routes identically on both sides (byte-level contract: {@link ShardRouterParityTest}).
  */
 class ChangelogReaderToValueTest {
 

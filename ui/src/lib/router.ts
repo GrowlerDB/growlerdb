@@ -2,16 +2,13 @@
 // client routes are real paths.
 import { writable } from 'svelte/store';
 
-// NB: the standalone "Ask" (grounded-retrieval) screen was retired — semantic/hybrid retrieval lives
-// inline in Search (the mode toggle), so a second door was redundant and confusing. A bookmarked
-// '/rag' URL falls back to '/'. See okf/product/interfaces/ui.md.
+// No '/rag' route: semantic/hybrid retrieval lives inline in Search (the mode toggle), so a
+// bookmarked '/rag' falls back to '/'. See okf/product/interfaces/ui.md.
 export const routes = ['/', '/indexes', '/observability', '/settings'] as const;
 export type Route = (typeof routes)[number];
 
 function normalize(pathname: string): Route {
-  // The Cluster screen folds into the header Health pill + Observability, and the Ingestion screen
-  // into Observability's Ingestion section, so bookmarked `/cluster` and `/ingestion` both redirect
-  // there.
+  // Cluster and Ingestion fold into Observability, so their bookmarked paths redirect there.
   if (pathname === '/cluster' || pathname === '/ingestion') return '/observability';
   return (routes as readonly string[]).includes(pathname) ? (pathname as Route) : '/';
 }

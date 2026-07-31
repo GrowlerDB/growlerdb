@@ -1,13 +1,11 @@
-//! **Service-credential auth for the control plane** — the service-to-service layer that closes
-//! the internal control-plane RPCs (registration, shard-map reads, placement) to callers that
-//! don't share the cluster's `GROWLERDB_SERVICE_TOKEN`. It is *separate* from the per-user auth
-//! (`--login-secret` / RBAC): mesh peers prove "I am a cluster service" with the shared token,
-//! independent of any user identity a request carries.
+//! **Service-credential auth for the control plane** — the service-to-service layer that closes the
+//! internal control-plane RPCs (registration, shard-map reads, placement) to callers lacking the
+//! cluster's `GROWLERDB_SERVICE_TOKEN`. Separate from per-user auth (`--login-secret`/RBAC): mesh
+//! peers prove "I am a cluster service" independent of any user identity a request carries.
 //!
-//! This module holds the **client** side (attach the token on every control-plane call) plus the
-//! shared metadata key; the server-side verification lives with the control-plane service (it needs
-//! a constant-time compare). When no token is configured the interceptor is a no-op, so bare local
-//! dev stays open.
+//! This module holds the client side (attach the token) plus the shared metadata key; server-side
+//! verification (constant-time compare) lives with the control-plane service. No token ⇒ the
+//! interceptor is a no-op, so bare local dev stays open.
 
 use tonic::metadata::MetadataValue;
 use tonic::service::interceptor::InterceptedService;

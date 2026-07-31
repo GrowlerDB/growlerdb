@@ -1,29 +1,16 @@
 //! Per-segment **ANN (approximate-nearest-neighbor) index** + its on-disk sidecar
 //! ([D19](../../../okf/system/decisions/d19-ann-library.md)).
 //!
-//! A [`VectorIndex`] answers `knn(query, k)` over one segment's stored embeddings for one
-//! VECTOR field. Per D19 the ANN artifact is **GrowlerDB-owned, one per segment**, carried
-//! through the single Tantivy segment lifecycle: built at segment build, written beside the
-//! segment as a versioned sidecar ([`SegmentAnn`]), and backed up / restored with it.
+//! A [`VectorIndex`] answers `knn(query, k)` over one segment's stored embeddings for one VECTOR
+//! field. Per D19 the ANN artifact is GrowlerDB-owned, one per segment, built at segment build and
+//! carried through the segment lifecycle as a versioned sidecar ([`SegmentAnn`]).
 //!
-//! **Crate choice.** D19 blesses a pure-Rust HNSW crate (`instant-distance`/`hnsw_rs`) *or* the
-//! brute-force exact fallback behind the same trait. This build ships **both** behind
-//! [`VectorIndex`] and picks between them by size ([`StoredAnnIndex::build`]):
-//! * [`BruteForceIndex`] — brute-force **exact** (no recall loss), the default at small per-segment
-//!   N where a full scan is already the fastest correct answer;
-//! * [`HnswIndex`] — an approximate **HNSW** graph (via `instant-distance`, MIT/Apache-2.0) chosen
-//!   once a segment's vector count for a field crosses [`HNSW_MIN_VECTORS`], where the graph's
-//!   sub-linear search pays for itself. It is high-recall (≥0.9 recall@10 on the benchmark set),
-//!   not exact.
-//!
-//! Both express **all three** [`VectorMetric`](growlerdb_core::VectorMetric)s and return the SAME
-//! `(docid, score)` shape with the same higher-is-nearer ordering, so callers ([`knn_search`]) are
-//! impl-agnostic. `instant-distance` bakes one distance into its point type, so [`HnswIndex`] feeds
-//! it `-score(metric, a, b)` as the distance: a strictly-decreasing transform of the similarity, so
-//! the graph navigates by the exact same nearest-first comparisons the metric implies (identical to
-//! a true Euclidean HNSW for L2/Cosine; Dot is MIPS, well-behaved for the similar-norm vectors we
-//! see). The [`SegmentAnn`] sidecar stores each field's index **tagged** ([`StoredAnnIndex`]) so
-//! read-back dispatches to the right impl; each index self-describes its `dims`/`metric`.
+//! Two impls behind the trait, picked by size ([`StoredAnnIndex::build`]): [`BruteForceIndex`]
+//! (exact, small-N default) and [`HnswIndex`] (approximate `instant-distance` HNSW, ≥0.9 recall@10,
+//! chosen above [`HNSW_MIN_VECTORS`]). Both express all three
+//! [`VectorMetric`](growlerdb_core::VectorMetric)s and return the SAME `(docid, score)` shape and
+//! higher-is-nearer ordering, so [`knn_search`] is impl-agnostic. The [`SegmentAnn`] sidecar stores
+//! each field's index **tagged** ([`StoredAnnIndex`]) so read-back dispatches to the right impl.
 //!
 //! [`knn_search`]: crate::SegmentReader::knn_search
 
@@ -36,23 +23,21 @@ use serde::{Deserialize, Serialize};
 /// The ANN sidecar's magic tag — mirrors the cold-tier [`sidecar`](crate::sidecar) framing so a
 /// wrong-format or pre-versioning file is **detected**, never mis-parsed.
 pub const ANN_MAGIC: [u8; 4] = *b"GDBv";
-/// Current ANN sidecar format version. Bump on any incompatible payload-layout change.
-/// v2: each field's index is a **tagged** [`StoredAnnIndex`] (brute-force vs HNSW) rather than a
-/// bare [`BruteForceIndex`].
+/// Current ANN sidecar format version. Bump on any incompatible payload-layout change. v2: each
+/// field's index is a **tagged** [`StoredAnnIndex`] (brute-force vs HNSW).
 const ANN_VERSION: u16 = 2;
 /// File-name suffix of a segment's ANN sidecar: `<segment-uuid>.ann`, beside the lexical segment.
 pub const ANN_SUFFIX: &str = "ann";
 
 /// Per-field vector count at which [`StoredAnnIndex::build`] switches from the exact
-/// [`BruteForceIndex`] to the approximate [`HnswIndex`]. Below this an exact full scan is already
-/// the fastest correct answer (and has zero recall loss); above it the HNSW graph's sub-linear
-/// search wins. 4096 is a deliberately conservative default — "scale is the gate": HNSW's build
-/// cost and approximation only earn their keep once a segment holds thousands of vectors for a
-/// field. Internal + transparent: both impls answer `knn` identically in shape and ordering.
+/// [`BruteForceIndex`] to the approximate [`HnswIndex`]. Below this a full scan is already the
+/// fastest correct answer; above it HNSW's sub-linear search wins. 4096 is a deliberately
+/// conservative default — HNSW's build cost and approximation only earn their keep at thousands of
+/// vectors per field.
 pub const HNSW_MIN_VECTORS: usize = 4096;
 
 /// HNSW construction/search knobs, fixed so a rebuild of the same vectors is reproducible.
-/// `ef_*` trade recall for latency; 100 comfortably clears the ≥0.9 recall@10 bar on the benchmark.
+/// `ef_*` trade recall for latency; 100 clears the ≥0.9 recall@10 bar on the benchmark.
 const HNSW_EF_CONSTRUCTION: usize = 100;
 const HNSW_EF_SEARCH: usize = 100;
 /// A fixed RNG seed so a segment's HNSW graph is a deterministic function of its vectors.
@@ -71,10 +56,9 @@ pub enum VectorIndexError {
 
 /// A per-segment, per-field approximate-nearest-neighbor index over embeddings.
 ///
-/// `build` takes each doc's **segment-local docid** paired with its embedding; `knn` returns the
-/// `k` nearest docids with a **higher-is-nearer** score (so callers rank by descending score, the
-/// same convention as BM25 hits). The index (de)serializes to the sidecar payload and
-/// self-describes its `dims`/`metric`, so the query path needs no external schema to read it.
+/// `build` takes each doc's **segment-local docid** + embedding; `knn` returns the `k` nearest
+/// docids with a **higher-is-nearer** score (same convention as BM25 hits). The index
+/// (de)serializes to the sidecar payload and self-describes its `dims`/`metric`.
 pub trait VectorIndex: Sized {
     /// Build an index over `items` — `(segment-local docid, embedding)` — for a field of the given
     /// `dims` and distance `metric`.
@@ -97,8 +81,7 @@ pub trait VectorIndex: Sized {
 }
 
 /// The **brute-force exact** [`VectorIndex`] (D19 fallback): every `knn` scans all stored vectors
-/// and exactly ranks them by the field's metric. Correct (no approximation) at the current
-/// per-segment scale.
+/// and exactly ranks them by the field's metric.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BruteForceIndex {
     dims: u32,
@@ -125,8 +108,8 @@ impl VectorIndex for BruteForceIndex {
             .iter()
             .map(|(id, v)| (*id, score(self.metric, query, v)))
             .collect();
-        // Descending score (nearest first); NaN sinks to the bottom via a total-ish compare, and
-        // the docid is a stable tiebreaker so ties don't reorder nondeterministically.
+        // Descending score (nearest first); NaN sinks to the bottom, docid breaks ties
+        // deterministically.
         scored.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -137,8 +120,8 @@ impl VectorIndex for BruteForceIndex {
     }
 
     fn to_bytes(&self) -> Vec<u8> {
-        // Infallible in practice (a plain struct of primitives); an alloc failure is the only
-        // path, which would abort anyway — so an empty payload is a safe, detectable degrade.
+        // Infallible in practice (a plain struct of primitives); an empty payload on the impossible
+        // alloc failure is a safe, detectable degrade.
         postcard::to_allocvec(self).unwrap_or_default()
     }
 
@@ -156,17 +139,15 @@ impl VectorIndex for BruteForceIndex {
 }
 
 /// One embedding as an `instant-distance` [`Point`]. Carries its field's `metric` so
-/// [`distance`](Point::distance) can express **any** of the three metrics from a single point type,
-/// always **smaller = nearer** (what HNSW wants) and always a strictly-decreasing transform of
-/// [`score`], so every nearest-first comparison the graph makes matches the metric's own ranking:
-/// * `Cosine` — `data` is stored **unit-normalized** (see [`VecPoint::indexed`]), so `dot == cosine`
-///   and distance is `-dot`; one dot product per call instead of `score`'s three (`a·b`, `a·a`,
-///   `b·b`), which is the difference between a fast HNSW build and a slow one.
-/// * `Dot` — distance is `-dot` on the raw vectors (raw inner product).
+/// [`distance`](Point::distance) can express any of the three metrics from a single point type,
+/// always **smaller = nearer** (what HNSW wants) and a strictly-decreasing transform of [`score`],
+/// so every nearest-first comparison matches the metric's own ranking:
+/// * `Cosine` — `data` is stored **unit-normalized** (see [`VecPoint::indexed`]) so `dot == cosine`;
+///   distance is `-dot`, one dot product per call instead of `score`'s three.
+/// * `Dot` — distance is `-dot` on the raw vectors.
 /// * `L2` — distance is the true Euclidean distance (a proper metric → best HNSW navigation).
 ///
-/// [`HnswIndex::knn`] inverts this back to the exact [`score`] value. The per-point `metric` costs
-/// one byte in postcard next to the `dims`-wide `f32` vector — negligible.
+/// [`HnswIndex::knn`] inverts this back to the exact [`score`] value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VecPoint {
     metric: VectorMetric,
@@ -184,8 +165,8 @@ impl VecPoint {
         Self { metric, data }
     }
 
-    /// The score a distance from [`distance`](Point::distance) corresponds to — the exact inverse of
-    /// the transform above, so it equals [`score`] and matches [`BruteForceIndex`].
+    /// The score a [`distance`](Point::distance) corresponds to — the exact inverse of the transform
+    /// above, so it equals [`score`] and matches [`BruteForceIndex`].
     fn score_of(metric: VectorMetric, distance: f32) -> f32 {
         match metric {
             VectorMetric::L2 => 1.0 / (1.0 + distance),
@@ -217,15 +198,14 @@ impl Point for VecPoint {
 }
 
 /// The **approximate HNSW** [`VectorIndex`] (`instant-distance`), selected by
-/// [`StoredAnnIndex::build`] once a segment's per-field vector count exceeds [`HNSW_MIN_VECTORS`].
-/// Search is sub-linear and high-recall (≥0.9 recall@10 on the benchmark), not exact. `knn` returns
-/// the SAME `(docid, score)` shape and higher-is-nearer ordering as [`BruteForceIndex`], so it drops
-/// in behind the trait with no caller change.
+/// [`StoredAnnIndex::build`] above [`HNSW_MIN_VECTORS`]. Sub-linear and high-recall (≥0.9
+/// recall@10), not exact. `knn` returns the SAME `(docid, score)` shape and ordering as
+/// [`BruteForceIndex`].
 #[derive(Serialize, Deserialize)]
 pub struct HnswIndex {
     dims: u32,
     metric: VectorMetric,
-    /// Vector count — kept explicit so `len` is `O(1)` and answers even for an empty index.
+    /// Vector count — explicit so `len` is `O(1)` even for an empty index.
     len: u32,
     /// The built graph mapping each point to its segment-local docid. `None` only for an empty
     /// build (`instant-distance` needs no graph for zero points; `knn` short-circuits).
@@ -268,13 +248,11 @@ impl VectorIndex for HnswIndex {
         let Some(map) = self.map.as_ref() else {
             return Vec::new();
         };
-        // The query is normalized the same way indexed points are (Cosine), so `dot == cosine`.
+        // The query is normalized like indexed points (Cosine), so `dot == cosine`.
         let q = VecPoint::indexed(self.metric, query);
         let mut search = Search::default();
-        // `search` yields candidates nearest-first (ascending distance = descending score). Recover
-        // the exact `score` from each distance, then re-sort with the SAME descending-score,
-        // docid-tiebreak ordering as `BruteForceIndex` so cross-segment/impl merges are
-        // deterministic.
+        // `search` yields candidates nearest-first; recover the exact `score` per distance, then
+        // re-sort with the SAME ordering as `BruteForceIndex` so cross-impl merges are deterministic.
         let mut scored: Vec<(u32, f32)> = map
             .search(&q, &mut search)
             .take(k)
@@ -305,10 +283,10 @@ impl VectorIndex for HnswIndex {
     }
 }
 
-/// A **tagged** per-field index in the [`SegmentAnn`] sidecar: either the exact [`BruteForceIndex`]
-/// or the approximate [`HnswIndex`]. Postcard writes a leading variant discriminant, so read-back
-/// dispatches to the right impl with no external schema. Answers `knn`/`len`/`dims` uniformly so
-/// [`knn_search`](crate::SegmentReader::knn_search) never sees which impl it holds.
+/// A **tagged** per-field index in the [`SegmentAnn`] sidecar: [`BruteForceIndex`] or [`HnswIndex`].
+/// Postcard writes a leading variant discriminant, so read-back dispatches to the right impl.
+/// Answers `knn`/`len`/`dims` uniformly so [`knn_search`](crate::SegmentReader::knn_search) never
+/// sees which impl it holds.
 #[derive(Serialize, Deserialize)]
 pub enum StoredAnnIndex {
     /// Exact brute-force scan — the small-N default.
@@ -318,9 +296,8 @@ pub enum StoredAnnIndex {
 }
 
 impl StoredAnnIndex {
-    /// Build the index, **auto-selecting** the impl by size: [`HnswIndex`] once `items` exceeds
-    /// [`HNSW_MIN_VECTORS`], else the exact [`BruteForceIndex`]. Selection is internal and
-    /// transparent — both answer `knn` with identical shape and ordering.
+    /// Build the index, **auto-selecting** by size: [`HnswIndex`] once `items` exceeds
+    /// [`HNSW_MIN_VECTORS`], else the exact [`BruteForceIndex`].
     pub fn build(dims: usize, metric: VectorMetric, items: &[(u32, Vec<f32>)]) -> Self {
         if items.len() > HNSW_MIN_VECTORS {
             Self::Hnsw(HnswIndex::build(dims, metric, items))
@@ -353,7 +330,7 @@ impl StoredAnnIndex {
         }
     }
 
-    /// The field's distance metric (self-described by the stored index). Lets the exact
+    /// The field's distance metric (self-described by the stored index) — lets the exact
     /// filtered-KNN path score a subset without an external schema.
     pub fn metric(&self) -> VectorMetric {
         match self {
@@ -379,17 +356,13 @@ impl StoredAnnIndex {
 }
 
 /// A **higher-is-nearer** similarity score between `a` and `b` under `metric`:
-/// * `Cosine` → cosine similarity in `[-1, 1]` (0 if either vector is the zero vector);
+/// * `Cosine` → cosine similarity in `[-1, 1]` (0 if either vector is zero);
 /// * `Dot` → raw inner product;
-/// * `L2` → `1 / (1 + euclidean_distance)` in `(0, 1]` — monotonically decreasing in distance, so
-///   the ranking is identical to sorting by ascending L2 distance while staying higher-is-better
-///   (uniform with the other metrics and with BM25 hit scores).
+/// * `L2` → `1 / (1 + euclidean_distance)` in `(0, 1]` — decreasing in distance, so ranking matches
+///   ascending L2 distance while staying higher-is-better (uniform with the other metrics + BM25).
 ///
-/// Vectors are compared element-wise over their common prefix, so a length mismatch degrades
-/// gracefully rather than panicking (the query path validates `dims` upstream).
-///
-/// `pub(crate)` so the **exact filtered-KNN** path in [`knn_search`](crate::SegmentReader::knn_search)
-/// can score a filter-allowed subset directly from stored vectors with the field's metric.
+/// Compared element-wise over the common prefix, so a length mismatch degrades gracefully (the
+/// query path validates `dims` upstream). `pub(crate)` for the exact filtered-KNN path.
 pub(crate) fn score(metric: VectorMetric, a: &[f32], b: &[f32]) -> f32 {
     match metric {
         VectorMetric::Dot => dot(a, b),
@@ -432,15 +405,13 @@ fn normalized(v: &[f32]) -> Vec<f32> {
     }
 }
 
-/// One segment's ANN sidecar: the per-field [`StoredAnnIndex`]es for every VECTOR field that had
-/// at least one vector in the segment, keyed by field path. Serialized as a versioned frame
-/// (magic + version + postcard) written to `<segment-uuid>.ann` beside the lexical segment and
-/// registered in the segment's backup file set.
+/// One segment's ANN sidecar: the per-field [`StoredAnnIndex`]es for every VECTOR field with at
+/// least one vector, keyed by field path. Serialized as a versioned frame (magic + version +
+/// postcard) written to `<segment-uuid>.ann` beside the lexical segment.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SegmentAnn {
-    /// Field path → that field's **tagged** index bytes ([`StoredAnnIndex::to_bytes`]). Opaque
-    /// bytes keep the container agnostic of the concrete [`VectorIndex`] implementation; the tag
-    /// inside picks brute-force vs HNSW on read-back.
+    /// Field path → that field's **tagged** index bytes ([`StoredAnnIndex::to_bytes`]). Opaque bytes
+    /// keep the container agnostic of the concrete impl; the inner tag picks it on read-back.
     fields: BTreeMap<String, Vec<u8>>,
 }
 

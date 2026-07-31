@@ -1,21 +1,8 @@
-//! The **AuthN core**: validate a caller's bearer credential into a
-//! *verified* identity ([`Verified`]) that the [auth seam](crate::auth) can trust.
-//!
-//! The bare [auth seam](crate::auth) reads the principal/tenant straight off request
-//! metadata — convenient, but any caller can assert any identity. AuthN closes that gap:
-//! an [`Authenticator`] turns the raw `Authorization` header into a `Verified` identity
-//! derived from a **validated** credential, stamped into the request
-//! (replacing, never trusting, caller-asserted headers).
-//!
-//! Authenticators: [`JwtAuthenticator`] (a fixed key — HS256/RS256 PEM, for simple/test
-//! deploys), [`JwksAuthenticator`] (RS256 against an IdP's JWKS, selecting the key by `kid`
-//! and refreshing to follow rotation — the production OIDC path), [`ApiKeyStore`] (issue/
-//! revoke scoped keys for programmatic clients), and [`ChainAuthenticator`] (route by
-//! `Authorization` scheme — `Bearer` vs `ApiKey`). The default [`Anonymous`] ignores
-//! credentials and yields an anonymous identity, so dev and the existing suite stay open
-//! until a deployment opts in. [`authenticate`] is the transport entry point the
-//! [`Gateway`](crate::gateway::Gateway) calls to verify a request and stamp the trusted
-//! identity.
+//! The **AuthN core**: validate a caller's bearer credential into a *verified* identity
+//! ([`Verified`]) the [auth seam](crate::auth) can trust — an [`Authenticator`] replaces
+//! caller-asserted identity headers with one derived from a validated credential. Implementations:
+//! [`JwtAuthenticator`], [`JwksAuthenticator`] (OIDC/JWKS), [`ApiKeyStore`], [`ChainAuthenticator`];
+//! the default [`Anonymous`] keeps dev open. [`authenticate`] is the transport entry point.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
@@ -131,15 +118,11 @@ pub fn default_authn() -> SharedAuthn {
 }
 
 /// Authenticate `request` with `authn` and rewrite its identity metadata to the **verified**
-/// principal/tenant — the trust boundary. The credential is read from the `authorization`
-/// metadata (the HTTP `Authorization` header over both gRPC and REST). Any caller-asserted
-/// `x-growlerdb-principal`/`x-growlerdb-tenant` is **dropped first**, so the downstream
-/// [authorization seam](crate::auth) (and the shards the Gateway forwards to) only ever sees
-/// an identity this layer vouched for. A failure maps to `Unauthenticated`.
-///
-/// Called only when a deployment has installed an authenticator; with none, the request
-/// passes through untouched (internal-trust behavior). Returns the [`Verified`]
-/// identity for callers that need the roles directly (e.g. control-plane RBAC).
+/// principal/tenant — the trust boundary. Any caller-asserted `x-growlerdb-principal`/`-tenant` is
+/// dropped first, so the downstream [authorization seam](crate::auth) only ever sees an identity this
+/// layer vouched for. A failure maps to `Unauthenticated`. Called only when an authenticator is
+/// installed; with none the request passes through untouched. Returns the [`Verified`] identity for
+/// callers that need the roles directly (e.g. control-plane RBAC).
 pub fn authenticate<T>(authn: &SharedAuthn, request: &mut Request<T>) -> Result<Verified, Status> {
     let authorization = request
         .metadata()
@@ -186,11 +169,9 @@ pub fn authenticate<T>(authn: &SharedAuthn, request: &mut Request<T>) -> Result<
 }
 
 /// Drop any caller-asserted identity metadata (`x-growlerdb-principal`/`-tenant`/`-roles`) from a
-/// request. Used on an **open** gateway (no authenticator), where nothing verifies these headers —
-/// without this, a client could forge `x-growlerdb-tenant` and read across tenants on a
-/// tenant-scoped index. Leaving them stripped makes tenant scoping fail closed
-/// (no verified tenant → the scoped index denies), which is the honest behaviour: a tenant-scoped
-/// index can't be safely served without authentication.
+/// request. Used on an **open** gateway (no authenticator), where nothing verifies these headers:
+/// without this a client could forge `x-growlerdb-tenant` and read across tenants. Stripping them
+/// makes tenant scoping fail closed (no verified tenant → the scoped index denies).
 pub fn strip_identity<T>(request: &mut Request<T>) {
     let meta = request.metadata_mut();
     meta.remove(PRINCIPAL_KEY);
@@ -729,12 +710,11 @@ struct SessionClaims<'a> {
     name: Option<&'a str>,
 }
 
-/// Mint a short-lived HS256 **session JWT** for built-in (no external IdP) closed mode.
-/// Carries the verified `subject` + `roles` (+ an optional `indexes` allowlist for per-index RBAC),
-/// signed with the deployment's shared `secret`, expiring in `ttl_secs`. The gateway
-/// accepts it via [`JwtAuthenticator::from_hs256_secret`]`(secret, issuer, audience)` — which already
-/// checks `exp`, so the TTL needs no extra revocation store. (Logout is client-side token drop;
-/// global invalidation is rotating the secret.)
+/// Mint a short-lived HS256 **session JWT** for built-in (no external IdP) closed mode. Carries the
+/// verified `subject` + `roles` (+ an optional `indexes` allowlist for per-index RBAC), signed with
+/// the deployment's shared `secret`, expiring in `ttl_secs`. The gateway accepts it via
+/// [`JwtAuthenticator::from_hs256_secret`], which checks `exp` (so no revocation store). Logout is
+/// client-side; global invalidation is rotating the secret.
 // Each argument is a distinct, security-relevant claim (subject / roles / index scope / iss / aud /
 // ttl / name); a struct would only rename them, so keep the explicit signature.
 #[allow(clippy::too_many_arguments)]

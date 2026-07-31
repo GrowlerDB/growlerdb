@@ -1,8 +1,6 @@
-// UI preferences (theme, accent, density): the design-system knobs, persisted and mirrored onto
-// <html> as `data-theme` / `data-accent` / `data-density`. The stylesheet is entirely
-// variable-driven, so a preference is just a data-attribute flip. Theme defaults to dark (Brand v1.0
-// is dark-first, D40); accent + density have fixed defaults. An explicit choice is remembered in
-// localStorage and wins afterwards.
+// UI preferences (theme, accent, density), persisted in localStorage and mirrored onto <html> as
+// `data-theme` / `data-accent` / `data-density`. The stylesheet is variable-driven, so a preference
+// is just a data-attribute flip. Theme defaults to dark (Brand v1.0 is dark-first, D40).
 import { writable, type Writable } from 'svelte/store';
 
 export type Theme = 'light' | 'dark';
@@ -40,8 +38,7 @@ const DENSITY_KEY = 'growlerdb.density';
 
 function initialTheme(): Theme {
   const saved = read(THEME_KEY);
-  // Brand v1.0 is dark-first (D40): default to dark unless the user has explicitly chosen a theme.
-  // `systemTheme()` remains available for a "match system" option, but is no longer the default.
+  // Brand v1.0 is dark-first (D40): default to dark unless the user explicitly chose a theme.
   return saved === 'light' || saved === 'dark' ? saved : 'dark';
 }
 

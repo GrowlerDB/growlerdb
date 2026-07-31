@@ -1,19 +1,8 @@
-//! Column-projected **key scans** for the compaction re-map (the layered-locator
-//! `coordinates` strategy — `okf/system/decisions/d30-layered-locator.md`).
-//!
-//! When an Iceberg rewrite (`replace` snapshot) moves rows into new data files, every
-//! location slot pointing into the rewritten files goes stale at once. The re-map heals
-//! them in the background by reading **only the key columns + row positions** of the
-//! snapshot's *added* files — the minimum needed to recompute `key → (file, position)`
-//! — instead of the full rows. The read mirrors [`point_read`](crate::point_read)'s
-//! stack: the `parquet` crate directly over the table's `FileIO` (opendal + retry),
-//! with a [`ProjectionMask`] narrowing IO/decode to the root columns of the key paths.
-//!
-//! Positions are **physical** row positions, matching what ingest records for
-//! delete-free files — which freshly-compacted files are. A file already carrying
-//! delete files is *not* re-mapped from here (the caller skips it; ingest-recorded
-//! positions for such files are delete-shifted), leaving those slots to the lazy
-//! verify-and-refresh safety net.
+//! Column-projected **key scans** for the compaction re-map (layered-locator
+//! `coordinates` — `okf/system/decisions/d30-layered-locator.md`): read only the key
+//! columns + row positions of a rewrite's added files to recompute `key → (file, position)`,
+//! over the same `parquet`/`FileIO` stack as [`point_read`](crate::point_read). Positions
+//! are physical, matching ingest's record for the delete-free files this is used on.
 
 use futures::TryStreamExt;
 use growlerdb_core::{CompositeKey, Value};
@@ -25,12 +14,10 @@ use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use crate::{nested_value, Result};
 
 /// Read `(composite key, row position)` for **every row** of the parquet data file at
-/// `path`, projecting only the root columns of the key paths (partition + identifier
-/// fields). The re-map's per-file read: its output feeds the shard's
-/// `remap_locations` (batched, key-sorted term lookups → slot patches). A key field
-/// absent from the file simply doesn't contribute to that row's key (the resulting
-/// key then matches no live doc and is skipped downstream — never a wrong patch);
-/// if *no* key field resolves, the file yields nothing.
+/// `path`, projecting only the root columns of the key paths. Feeds the shard's
+/// `remap_locations`. A key field absent from the file doesn't contribute to that row's
+/// key (which then matches no live doc — never a wrong patch); if *no* key field
+/// resolves, the file yields nothing.
 pub async fn read_file_key_rows(
     file_io: &FileIO,
     path: &str,

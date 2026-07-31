@@ -168,17 +168,12 @@ public final class WriteClient implements BatchWriter {
     if (maxAttempts < 1) {
       throw new IllegalArgumentException("maxAttempts must be >= 1"); // else callWithRetry NPEs
     }
-    // Transport-agnostic at compile time; grpc-netty-shaded supplies it at runtime. dns:/// so a
-    // restarted Node's new pod IP is re-resolved on reconnect.
-    //
-    // Keepalive is what makes that reconnect happen *in place*. A force-killed Node pod
-    // black-holes its TCP connection: without keepalive the subchannel stays READY (gRPC never
-    // learns the socket is dead), a call just hits its deadline, and the channel never re-resolves
-    // DNS — so every retry re-uses the dead connection until the budget exhausts and the connector
-    // restarts. With keepalive, an unanswered ping (10s interval, 5s ack timeout) trips the
-    // subchannel to TRANSIENT_FAILURE → DNS re-resolution → reconnect to the returned pod's new IP,
-    // so writes resume without a pod restart. Pair with a low JVM DNS TTL (connector.yaml) so the
-    // re-resolution returns the new IP. keepAliveWithoutCalls so a dead idle connection is caught too.
+    // dns:/// so a restarted Node's new pod IP is re-resolved on reconnect. Keepalive makes that
+    // reconnect happen *in place*: a force-killed pod black-holes its TCP connection, and without
+    // keepalive the subchannel stays READY (gRPC never learns the socket is dead) so every retry
+    // re-uses the dead connection until the budget exhausts. An unanswered ping (10s interval, 5s ack
+    // timeout) instead trips it to TRANSIENT_FAILURE → DNS re-resolution → reconnect to the new pod.
+    // Pair with a low JVM DNS TTL (connector.yaml); keepAliveWithoutCalls catches idle deaths too.
     this.channel =
         ManagedChannelBuilder.forTarget("dns:///" + host + ":" + port)
             .usePlaintext()

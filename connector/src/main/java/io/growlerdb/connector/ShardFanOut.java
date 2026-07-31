@@ -19,10 +19,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  * is what keeps the continuity guard's per-shard ordering intact: the next chunk is not fanned out
  * until every shard has settled this one.
  *
- * <p>Failure semantics: <b>no fail-fast</b> — shards that can commit do commit (a failed sibling just lags and the
- * resume-from-min machinery covers it) — and after all writes settle, the lowest-ordinal
- * failure propagates with the others attached as suppressed. Retry/backoff and the
- * non-retryable set stay inside {@link WriteClient}, untouched.
+ * <p>Failure semantics: <b>no fail-fast</b> — shards that can commit do commit (a failed sibling just
+ * lags and the resume-from-min machinery covers it) — and after all writes settle, the lowest-ordinal
+ * failure propagates with the others attached as suppressed. Retry/backoff and the non-retryable set
+ * stay inside {@link WriteClient}.
  */
 final class ShardFanOut {
 

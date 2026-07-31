@@ -1,14 +1,7 @@
-//! The real local BGE embedder: bge-small-en-v1.5 (a BERT model) on **ONNX Runtime**, CPU, offline.
-//!
-//! ONNX Runtime links a native `libonnxruntime` (fetched at build time via ort's `download-binaries`
-//! feature; runtime stays offline). This replaces the former pure-Rust Candle path for ~2-4x CPU
-//! throughput (D20/D46). The cross-encoder reranker still runs on Candle pending its own ONNX move.
-//!
-//! The model directory holds `config.json`, `tokenizer.json`, and `model.onnx` (the BERT graph with
-//! `input_ids` / `attention_mask` / `token_type_ids` inputs and a `last_hidden_state` output).
-//! Sentence embeddings are the attention-masked **mean pool** of the last hidden state, **L2
-//! normalized** — identical semantics to the prior Candle path, so vectors stay reproducible across
-//! ingest and query (D43).
+//! The real local BGE embedder: bge-small-en-v1.5 (a BERT model) on ONNX Runtime, CPU, offline
+//! (~2-4x CPU throughput over Candle, D20/D46). Sentence embeddings are the attention-masked mean
+//! pool of the last hidden state, L2-normalized, so vectors stay reproducible across ingest and
+//! query (D43). The model dir holds `config.json`, `tokenizer.json`, `model.onnx`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -25,9 +18,8 @@ const CONFIG_JSON: &str = "config.json";
 const TOKENIZER_JSON: &str = "tokenizer.json";
 const MODEL_ONNX: &str = "model.onnx";
 
-/// Upper bound on inputs per ONNX `Run`. ONNX Runtime parallelizes a single run across its
-/// intra-op thread pool, and short synopses pad cheaply, so this is larger than the old Candle
-/// bound (32) — but still bounded so a whole-table build doesn't materialize one giant tensor.
+/// Upper bound on inputs per ONNX `Run` — bounded so a whole-table build doesn't materialize one
+/// giant tensor. ONNX Runtime parallelizes each run across its intra-op pool, so a large batch is fine.
 const MAX_FORWARD_BATCH: usize = 64;
 
 /// Resolve the model directory for `model_id`:
@@ -49,11 +41,8 @@ fn default_model_root() -> PathBuf {
 
 /// A local BERT embedder (ONNX Runtime) producing L2-normalized, mean-pooled sentence embeddings.
 pub struct BgeEmbedder {
-    // `Session::run` takes `&mut self`, but the [`Embedder`] seam is shared (`&self` behind an
-    // `Arc`), so the session lives behind a `Mutex`. ONNX Runtime parallelizes each `run` across
-    // its intra-op threads, so serializing runs still saturates the cores — the win is per-run,
-    // not per-concurrent-call. The embedder is cached per model dir by the factory, so the lock is
-    // uncontended on the ingest path (one embed loop) and cheap on the query path.
+    // `Session::run` needs `&mut self` but the `Embedder` seam is `&self` behind an `Arc`, so the
+    // session lives behind a `Mutex`. ONNX parallelizes each run internally, so serializing is fine.
     session: Mutex<Session>,
     tokenizer: Tokenizer,
     model_id: String,
@@ -106,9 +95,8 @@ impl BgeEmbedder {
             strategy: PaddingStrategy::BatchLongest,
             ..Default::default()
         }));
-        // BERT position embeddings stop at `max_position_embeddings` (512 for BGE): an over-long
-        // text otherwise blows the graph's position range. Embedding the head of a long text is the
-        // designed degradation, so truncate to the model's window.
+        // BERT position embeddings stop at `max_position_embeddings` (512 for BGE); truncate to the
+        // window (embedding the head of an over-long text is the designed degradation).
         tokenizer
             .with_truncation(Some(TruncationParams {
                 max_length: max_seq,

@@ -1,23 +1,17 @@
-//! **mTLS for internal services**: the tonic TLS configs that secure the
-//! Gateway↔Node hops. Internal traffic is *mutually* authenticated — a server presents its own
-//! identity **and** requires the client to present a certificate signed by the shared cluster
-//! CA, so only cluster peers (not arbitrary network clients) can reach a Node. This is the
-//! transport-trust layer beneath the per-request [authentication](crate::authn): mTLS proves
-//! "you are a cluster service", AuthN proves "you are this user/client".
-//!
-//! These are thin builders over [`tonic::transport`] TLS types from PEM material; the CLI reads
-//! the PEM files and installs the result (server via `Server::builder().tls_config(...)`, client
-//! via [`RemoteNode::connect_with_tls`](crate::node::RemoteNode::connect_with_tls)).
+//! **mTLS for internal services**: tonic TLS configs securing the Gateway↔Node hops. Traffic is
+//! *mutually* authenticated — a server presents its identity and requires a client cert signed by
+//! the shared cluster CA, so only cluster peers reach a Node. The transport-trust layer beneath the
+//! per-request [authentication](crate::authn): mTLS proves "you are a cluster service", AuthN proves
+//! "you are this user". Thin builders over [`tonic::transport`] TLS types from PEM material.
 
 use std::sync::Once;
 
 use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
 
 /// Pin rustls to the `ring` provider for this process. Two provider features are compiled in —
-/// `ring` (via tonic) and `aws-lc-rs` (pulled transitively by opendal's reqwest TLS) — so rustls
-/// can no longer auto-determine a default and panics when tonic builds its config. We select
-/// `ring`, the provider our mTLS used before opendal introduced the ambiguity. Idempotent, and the
-/// `Err` (a provider already installed) is deliberately ignored.
+/// `ring` (via tonic) and `aws-lc-rs` (via opendal's reqwest TLS) — so rustls can't auto-pick a
+/// default and panics when tonic builds its config; we select `ring`. Idempotent; the `Err` (a
+/// provider already installed) is deliberately ignored.
 fn ensure_crypto_provider() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {

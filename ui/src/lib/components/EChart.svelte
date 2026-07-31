@@ -1,8 +1,7 @@
 <script lang="ts">
-  // Themed ECharts wrapper: the "hero" time-series charts (source-vs-index rate, index:source
-  // size, latency) the sparkline cards can't express. The parent passes a plain
-  // ECharts `option` (series/data only); this component injects theme-token colors (so light/dark
-  // + accent keep working), handles resize, and disposes cleanly. Deep charts still live in Grafana.
+  // Themed ECharts wrapper for hero time-series charts. The parent passes a plain ECharts `option`
+  // (series/data only); this injects theme-token colors so light/dark + accent keep working, and
+  // handles resize/dispose.
   import { onMount, onDestroy } from 'svelte';
   import * as echarts from 'echarts';
 
@@ -42,18 +41,16 @@
   function themed(opt: any) {
     const c = tokens();
     return {
-      // Theme tokens first; then fixed mid-tone hues (legible on light + dark) so a chart with
-      // more than four series (the 8-component index-size stack) doesn't cycle back to a
-      // duplicate color.
+      // Theme tokens first, then fixed mid-tone hues (legible on light + dark) so charts with more
+      // than four series don't cycle back to a duplicate color.
       color: [c.accent, c.ok, c.warn, c.faint, '#7c6ff0', '#12a5b8', '#d6558f', '#8a8f98'],
       textStyle: {
         color: c.text,
         fontFamily: 'Instrument Sans, system-ui, sans-serif',
         fontSize: 11,
       },
-      // containLabel makes the grid reserve exactly enough room for the axis labels, so wide
-      // y-labels (e.g. byte values like "221 MB") never clip; left/bottom become small paddings
-      // outside the labels rather than a fixed label budget.
+      // containLabel reserves exactly enough room for axis labels so wide y-labels (e.g. "221 MB")
+      // never clip.
       grid: { top: 26, right: 12, bottom: 6, left: 8, containLabel: true, ...(opt.grid ?? {}) },
       legend: {
         type: 'plain',

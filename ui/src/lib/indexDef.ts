@@ -1,6 +1,5 @@
 // Build an index-definition YAML from the create-form inputs. Kept pure + tested so the form just
-// collects choices. The Control Plane resolves this against the source schema and hard-blocks
-// cached fields that policy forbids (the create error surfaces inline).
+// collects choices; the Control Plane resolves this against the source schema and enforces policy.
 import type { SourceField } from './api';
 
 /** Map a coarse source type to a default GrowlerDB field type, or `null` if it can't be indexed
@@ -18,7 +17,7 @@ export function defaultFieldType(sourceType: string): string | null {
     case 'date':
       return 'DATE';
     default:
-      return null; // binary / other
+      return null;
   }
 }
 
@@ -103,9 +102,8 @@ export function buildDefinition(input: DefinitionInput): string {
   const win = input.windowing && tf ? input.windowing : null;
   const eventTf = win?.eventTimeField && win.eventTimeField.path ? win.eventTimeField : null;
 
-  // Every declared time field (ingest + optional event) becomes a `format`+`fast` override (no
-  // `type` — the format forces DATE; an explicit non-DATE type alongside it would be rejected).
-  // Deduped by path so an event field that reuses the ingest column isn't emitted twice.
+  // Every declared time field (ingest + optional event) becomes a `format`+`fast` override with no
+  // `type` (the format forces DATE; a non-DATE type would be rejected). Deduped by path.
   const timeOverrides: TimeFieldInput[] = [];
   for (const t of [tf, eventTf]) {
     if (t && !timeOverrides.some((o) => o.path === t.path)) timeOverrides.push(t);
@@ -114,9 +112,8 @@ export function buildDefinition(input: DefinitionInput): string {
   const overrideEntry = (t: TimeFieldInput) =>
     `{ path: ${t.path}, format: ${t.format}, fast: true }`;
 
-  // Optional vectorized field: a new VECTOR field derived from a TEXT source column. Only honored
-  // when both the field path and its source column are set. Emitted as its own mapping entry
-  // (never auto-derived — a vector has no source column of its own).
+  // Optional vectorized field: a new VECTOR field derived from a TEXT source column, honored only
+  // when both its path and source column are set. Emitted as its own entry (never auto-derived).
   const vec =
     input.vectorField && input.vectorField.path && input.vectorField.sourceField
       ? input.vectorField
@@ -142,8 +139,8 @@ export function buildDefinition(input: DefinitionInput): string {
   }
 
   if (input.selection === 'ALL') {
-    // Under ALL, `fields[]` are per-path overrides/additions — so the only entries we need are the
-    // time-field overrides and any vectorized field (a derived VECTOR field, never auto-mapped).
+    // Under ALL, `fields[]` are per-path overrides/additions — only the time overrides and any
+    // vectorized field.
     const extra = [...timeOverrides.map(overrideEntry), ...vectorEntries];
     if (extra.length) {
       lines.push(`mapping: { selection: ALL, fields: [ ${extra.join(', ')} ] }`);
@@ -159,7 +156,6 @@ export function buildDefinition(input: DefinitionInput): string {
     const entries = mapped.map((f) => `{ path: ${f.path}, type: ${f.type} }`);
     // Include time fields even if unchecked, so they get indexed under the allowlist.
     entries.push(...timeOverrides.map(overrideEntry));
-    // The vectorized field (if any) is a new derived VECTOR field, appended last.
     entries.push(...vectorEntries);
     lines.push(`mapping: { selection: EXPLICIT, fields: [ ${entries.join(', ')} ] }`);
   }

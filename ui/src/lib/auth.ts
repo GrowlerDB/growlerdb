@@ -1,8 +1,6 @@
-// OIDC **authorization-code + PKCE**. The UI authenticates the human against
-// the IdP (Keycloak by default) and forwards the resulting bearer token to the Engine API
-// (see `api.ts`); the Engine gateway validates it. No client secret — PKCE is the
-// public-client flow. The pure pieces (verifier/challenge/authorize-URL) are unit-tested; the
-// redirect + token exchange are thin wrappers over the IdP's discovery document.
+// OIDC authorization-code + PKCE. The UI authenticates the human against the IdP (Keycloak by
+// default) and forwards the bearer token to the Engine API; the gateway validates it. No client
+// secret — PKCE is the public-client flow.
 
 export interface OidcConfig {
   issuer: string;
@@ -32,9 +30,8 @@ export function isAuthenticated(): boolean {
   return getToken() !== null;
 }
 
-/** Whether `token` (default: the stored one) is past its JWT `exp`. A token with no
- *  `exp` is treated as non-expiring here — the gateway is still the authority (it verifies `exp`
- *  server-side); this just lets the client skip a known-401 request and re-gate proactively. */
+/** Whether `token` (default: the stored one) is past its JWT `exp`. No `exp` = treated as
+ *  non-expiring; the gateway is still the authority — this just skips a known-401 request. */
 export function isTokenExpired(token: string | null = getToken()): boolean {
   if (!token) return false;
   const claims = decodeJwtClaims(token);
@@ -42,10 +39,8 @@ export function isTokenExpired(token: string | null = getToken()): boolean {
   return exp !== null && Date.now() >= exp * 1000;
 }
 
-/** The signed-in user, derived from the bearer's claims, or `null` when not authenticated. An
- *  interim client-side read of the JWT until the server identity surface (`GET /v1/me`)
- *  lands — never faked: `null` means "show the unauthenticated state". `roles` is best-effort from
- *  common claim shapes (the gateway is the authority on roles). */
+/** The signed-in user, derived from the bearer's claims, or `null` when not authenticated.
+ *  `roles` is best-effort from common claim shapes (the gateway is the authority on roles). */
 export interface CurrentUser {
   subject: string;
   name: string;

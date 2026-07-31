@@ -352,7 +352,7 @@ async fn serve_pool_quarantines_a_corrupt_window_shard_and_serves_the_rest() {
             .expect("spawn growlerdb serve-pool"),
     );
 
-    // The process came up (a pre-fix binary crashed here) and the healthy index serves.
+    // The process came up despite the corrupt shard, and the healthy index serves.
     let mut client = connect(&format!("http://{addr}")).await;
     assert_eq!(
         search_ids(&mut client, "beta", 10).await,

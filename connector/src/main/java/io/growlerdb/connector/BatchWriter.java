@@ -21,13 +21,10 @@ public interface BatchWriter extends AutoCloseable {
   Long checkpointSnapshotId();
 
   /**
-   * The end-of-trigger / drain <b>barrier</b>: whether <b>every</b> shard has durably committed
-   * exactly {@code head}. Distinct from {@link #checkpointSnapshotId} (the MIN, for resume) — this
-   * requires <b>all</b> shards to have converged on the head, so a drain gate can assert convergence
-   * (per-shard {@code GetCheckpoint == lineage head}) instead of sleeping a fixed interval and hoping
-   * ingest caught up. A shard still behind — or with no checkpoint yet — makes it {@code false}.
-   * Empty windows advance every shard in lockstep, so a fully-drained sharded cluster converges here
-   * exactly.
+   * The drain <b>barrier</b>: whether <b>every</b> shard has durably committed exactly {@code head}.
+   * Distinct from {@link #checkpointSnapshotId} (the MIN, for resume) — the barrier lets a drain gate
+   * assert convergence instead of sleeping and hoping ingest caught up. A shard still behind — or with
+   * no checkpoint yet — makes it {@code false}.
    */
   boolean drainedTo(long head);
 

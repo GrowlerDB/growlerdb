@@ -21,11 +21,9 @@ import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 /**
- * The parallel connector set against REAL {@code growlerdb serve} shards: two workers,
- * each owning one of two sharded Nodes (`--shards 2 --shard-ordinal k`), ingest one table in
- * parallel over the real Write gRPC — per-shard continuity guard, sequence-stamped checkpoints,
- * dedup and pruning all live. Covers: parallel commit with skewed worker triggers, checkpoint
- * durability across a Node restart, no-op resume, and disjoint per-shard search results.
+ * The parallel connector set against REAL {@code growlerdb serve} shards: two workers each own one
+ * of two sharded Nodes, ingesting one table over the real Write gRPC. Covers skewed-trigger parallel
+ * commit, checkpoint durability across a Node restart, no-op resume, and disjoint per-shard search.
  *
  * <p>{@code @Tag("e2e")} — run with {@code mvn test -Dtest.excludedGroups= -Dgroups=e2e}; skips
  * when the binary is absent.
@@ -80,8 +78,8 @@ class ConnectorSetCrossProcessTest {
       Long head;
       try (ShardGroupWriteClient c0 = new ShardGroupWriteClient(endpoints, router, lineage, g0);
           ShardGroupWriteClient c1 = new ShardGroupWriteClient(endpoints, router, lineage, g1)) {
-        // Parallel ingest with skewed triggers: worker 0 commits at head H1; more rows land;
-        // worker 1 first triggers at H2. Two writers, one table, zero guard trips.
+        // Skewed triggers: worker 0 commits, more rows land, then worker 1 first triggers.
+        // Two writers, one table, zero guard trips.
         assertTrue(w0.runOnce(spark, c0.checkpointSnapshotId(), c0).wrote, "worker 0 commits");
         insertRows(spark, 6, 2);
         assertTrue(w1.runOnce(spark, c1.checkpointSnapshotId(), c1).wrote, "worker 1 commits");

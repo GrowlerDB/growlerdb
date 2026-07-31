@@ -1,7 +1,6 @@
 // Saved searches: server-persisted per-user when authenticated, with a per-browser localStorage
-// fallback for an open/anonymous gateway. Each saved search captures the full search state (query,
-// syntax, index, sort, filters, time range) so restoring re-applies all of it — not just the raw
-// query string.
+// fallback for an anonymous gateway. Captures the full search state so restoring re-applies all of
+// it — not just the raw query string.
 import { isAuthenticated } from './auth';
 import { listSavedQueries, saveSavedQuery, deleteSavedQuery, type SavedQueryRow } from './api';
 

@@ -181,7 +181,6 @@ class ConnectorJobIntegrationTest {
               new IndexMapping(List.of(), List.of("id"), List.of("id", "body")),
               List.of("id"));
       try (WriteClient client = new WriteClient("127.0.0.1", server.getPort())) {
-        // Build to a checkpoint.
         Long checkpoint = job.runOnce(spark, null, client).checkpointSnapshotId;
         assertTrue(checkpoint != null, "first run establishes a checkpoint");
 
@@ -250,10 +249,8 @@ class ConnectorJobIntegrationTest {
     spark.sql("DROP TABLE IF EXISTS demo.ns.mixed");
     spark.sql("CREATE TABLE demo.ns.mixed (id STRING, body STRING) USING iceberg");
     spark.sql("INSERT INTO demo.ns.mixed VALUES ('a','1'), ('b','1')");
-    // An UPDATE / DELETE produces an overwrite/delete snapshot, whose changelog net diff legitimately
-    // diverges from physical `added-records` (a row-level delete adds a DELETE row, an update rewrites
-    // a data file). The gate must NOT strict-count such a window (that would false-stall); it returns
-    // -1 (exempt) and reconcile is the backstop there.
+    // UPDATE/DELETE snapshots have a changelog net diff that diverges from physical added-records, so
+    // the gate must not strict-count them (would false-stall): it returns -1 (exempt), reconcile backstops.
     spark.sql("UPDATE demo.ns.mixed SET body = '2' WHERE id = 'a'");
     spark.sql("DELETE FROM demo.ns.mixed WHERE id = 'b'");
 

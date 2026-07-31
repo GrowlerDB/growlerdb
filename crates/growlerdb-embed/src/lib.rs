@@ -1,34 +1,24 @@
 //! GrowlerDB's local embedding runtime.
 //!
-//! [`embedder_for`] is the single entry point ingest uses to obtain an [`Embedder`] for a
-//! vector field. When the `bge` feature is on (the default), a real **bge-small-en-v1.5**
-//! BERT model is loaded from a local directory via [Candle](https://github.com/huggingface/candle)
-//! — pure Rust, no native/C dependencies, no network. If the model isn't present (or the
-//! `bge` feature is disabled), it transparently falls back to core's dependency-free
-//! [`HashEmbedder`] so ingest and CI keep working offline.
+//! [`embedder_for`] is the single entry point ingest uses to obtain an [`Embedder`] for a vector
+//! field. With the default `bge` feature a real bge-small-en-v1.5 model loads from a local
+//! directory; absent that (or with `bge` off) it falls back to core's dependency-free
+//! [`HashEmbedder`], keeping ingest and CI offline.
 //!
 //! # Model provisioning
 //!
-//! [`BgeEmbedder`] loads three files from a local directory: `config.json`, `tokenizer.json`,
-//! and `model.safetensors`. The directory is resolved as:
-//!
-//! ```text
-//! ${GROWLERDB_MODEL_DIR:-~/.cache/growlerdb/models}/<model-id>/
-//! ```
-//!
-//! e.g. with the default model that is `~/.cache/growlerdb/models/bge-small-en-v1.5/`.
-//! Auto-download (via `hf-hub`) is intentionally **not** part of this runtime — provisioning
-//! is out of band, which keeps the default build offline and the dependency tree small.
+//! [`BgeEmbedder`] loads `config.json`, `tokenizer.json`, and `model.onnx` from
+//! `${GROWLERDB_MODEL_DIR:-~/.cache/growlerdb/models}/<model-id>/` (default model ⇒
+//! `~/.cache/growlerdb/models/bge-small-en-v1.5/`). Auto-download is intentionally out of band,
+//! keeping the default build offline and the dependency tree small.
 
 use std::sync::Arc;
 
 use growlerdb_core::index_def::{EmbedProvider, ResolvedIndex, VectorSpec};
 use growlerdb_core::{Document, EmbedError, Embedder, HashEmbedder, HashReranker, Reranker, Value};
 
-/// Serialize every test that mutates a process-global env var this crate reads
-/// (`GROWLERDB_MODEL_DIR`, `GROWLERDB_*_API_KEY`, `GROWLERDB_*_ENDPOINT`,
-/// `GROWLERDB_RERANK_PROVIDER`). `set_var`/`remove_var` are process-wide, so tests across modules
-/// race under `cargo test`'s parallelism unless they share ONE lock. Every such test takes this guard.
+/// Serialize every test that mutates a process-global env var this crate reads. `set_var`/`remove_var`
+/// are process-wide, so tests across modules race under `cargo test` unless they share ONE lock.
 #[cfg(test)]
 pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -47,12 +37,10 @@ mod bge;
 #[cfg(feature = "bge")]
 pub use bge::BgeEmbedder;
 
-/// pyke's prebuilt ONNX Runtime static lib (built with an older GCC) references
-/// `__cxa_call_terminate`, a libstdc++ internal exception-handling symbol that GCC 12
-/// (Debian bookworm's toolchain, our release-image builder) **removed** — so the static link can't
-/// resolve it. It is only ever reached when a C++ exception escapes a `noexcept` boundary, an
-/// already-fatal path, so `abort()` is a sound stand-in. Linux-only: macOS (libc++) resolves
-/// exception handling natively and needs no shim. Gated on `bge` (the only feature that links ort).
+/// Shim for a missing libstdc++ symbol: pyke's prebuilt ONNX Runtime static lib references
+/// `__cxa_call_terminate`, which GCC 12 (our release-image toolchain) removed, so the static link
+/// can't resolve it. Only reached when a C++ exception escapes a `noexcept` boundary (already
+/// fatal), so `abort()` is sound. Linux-only; macOS (libc++) needs no shim.
 #[cfg(all(feature = "bge", target_os = "linux"))]
 #[no_mangle]
 pub extern "C" fn __cxa_call_terminate(_exception: *mut core::ffi::c_void) {
@@ -84,9 +72,8 @@ pub const DEFAULT_RERANK_MODEL: &str = "bge-reranker-base";
 /// back to core's dependency-free [`HashReranker`] (token overlap), logging a one-time warning.
 /// This is the single factory the search path calls when a query opts into reranking.
 pub fn reranker_for(model_id: &str) -> Arc<dyn Reranker> {
-    // Opt-in external provider (GROWLERDB_RERANK_PROVIDER=external): call a hosted reranker over
-    // HTTP with a server-side-only key. Fail closed (no key ⇒ error at `rerank()`), never a silent
-    // fall back to the dev reranker.
+    // Opt-in external provider (GROWLERDB_RERANK_PROVIDER=external): fail closed (no key ⇒ error at
+    // `rerank()`), never a silent fall back to the dev reranker.
     #[cfg(feature = "external")]
     if external::rerank_provider_is_external() {
         return Arc::new(external::ExternalReranker::from_env(model_id));
@@ -130,12 +117,10 @@ pub fn embedder_for(spec: &VectorSpec) -> Arc<dyn Embedder> {
 /// The LOCAL, keyless embedder: a real [`BgeEmbedder`] when provisioned, else the dev
 /// [`HashEmbedder`]. Never reads a provider secret.
 ///
-/// Loaded models are **cached per resolved model directory** for the life of the process:
-/// the factory is called on every semantic query (and every ingest batch), and a BGE load is a
-/// 133 MB safetensors read + graph build — per-call loading made every query pay seconds and
-/// turned memory pressure into silent hash-fallback queries against real-model document vectors.
-/// Only successful loads are cached; a missing model keeps probing (cheap) so provisioning the
-/// model directory doesn't require a restart.
+/// Loaded models are cached per resolved model directory for the life of the process: the factory
+/// runs on every semantic query and ingest batch, and a model load is expensive (large read + graph
+/// build). Only successful loads are cached; a missing model keeps probing (cheap) so provisioning
+/// doesn't require a restart.
 fn local_embedder(spec: &VectorSpec) -> Arc<dyn Embedder> {
     #[cfg(feature = "bge")]
     {
@@ -146,8 +131,8 @@ fn local_embedder(spec: &VectorSpec) -> Arc<dyn Embedder> {
         type BgeCache = Mutex<HashMap<(PathBuf, usize), Arc<dyn Embedder>>>;
         static BGE_CACHE: OnceLock<BgeCache> = OnceLock::new();
         let key = (bge::model_dir(&spec.model), spec.dims);
-        // Hold the lock across the load: a second concurrent caller waits instead of
-        // double-loading 133 MB. First-load-only cost; every later call is a map hit.
+        // Hold the lock across the load so a second concurrent caller waits instead of
+        // double-loading. First-load-only cost; every later call is a map hit.
         let mut cache = BGE_CACHE
             .get_or_init(Default::default)
             .lock()
@@ -270,12 +255,10 @@ pub fn embed_commit_batch(idx: &ResolvedIndex, batch: &mut growlerdb_core::Commi
     embed_docs(idx, &mut refs);
 }
 
-/// Shared core: fill in each vector field's embedding across `docs`, batching the embed call per
-/// field. Best-effort (a missing source text embeds `""`), but never silently: an EXTERNAL field
-/// that fails closed (no key/endpoint) skips the field with a warning rather than writing
-/// dev-hash vectors; a LOCAL batch failure retries **per text** so one poison doc can't void the
-/// whole batch's vectors, and whatever is still skipped is counted in a per-call warning — a
-/// 20k-doc build losing its vectors must be loud, not a log-free `continue`.
+/// Shared core: fill in each vector field's embedding across `docs`, batching per field. Best-effort
+/// (missing source text embeds `""`) but never silent: an EXTERNAL field that fails closed skips the
+/// field with a warning; a LOCAL batch failure retries per text so one poison doc can't void the whole
+/// batch's vectors, and whatever stays skipped is counted in a per-call warning.
 fn embed_docs(idx: &ResolvedIndex, docs: &mut [&mut Document]) {
     for f in &idx.fields {
         let Some(spec) = f.vector.as_ref() else {
@@ -373,10 +356,8 @@ mod tests {
 
     #[test]
     fn embedder_for_falls_back_to_hash_when_no_model() {
-        // No GROWLERDB_MODEL_DIR provisioned in CI → the hash embedder. This is the CI path
-        // for both `bge`-on (load fails, falls back) and `bge`-off (feature gate) builds.
-        // Point the model dir at an empty temp dir so a developer's real ~/.cache model can't
-        // make this test flake.
+        // Point the model dir at an empty temp dir → the hash-embedder fallback, for both `bge`-on
+        // (load fails) and `bge`-off (feature gate); avoids a dev's real ~/.cache model flaking it.
         let _g = crate::env_guard();
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("GROWLERDB_MODEL_DIR", tmp.path());
@@ -487,9 +468,8 @@ mod tests {
         std::env::remove_var("GROWLERDB_MODEL_DIR");
     }
 
-    /// A batch-call embedder that fails whenever the batch contains the poison text, and
-    /// per-text fails only on the poison itself — the "one bad doc" ingest scenario (the arXiv
-    /// demo lost all 20k of a chunk's vectors to a single over-long abstract pre-truncation).
+    /// A batch-call embedder that fails whenever the batch contains the poison text, but per-text
+    /// fails only on the poison itself — the "one bad doc" ingest scenario.
     struct PoisonEmbedder;
 
     impl Embedder for PoisonEmbedder {
@@ -516,9 +496,8 @@ mod tests {
         )
     }
 
-    /// Regression (TASK-323): a batch embed failure used to void the ENTIRE batch's vectors with
-    /// a bare `continue` — one poison doc silently left every other doc un-embedded (and thus
-    /// invisible to KNN). The per-text fallback must skip only the true failures.
+    /// Regression (TASK-323): a batch embed failure must skip only the true failures via the
+    /// per-text fallback, not void every other doc's vectors.
     #[test]
     fn one_poison_text_no_longer_voids_the_batch() {
         let mut docs = [

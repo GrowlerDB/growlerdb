@@ -1,8 +1,8 @@
 <script lang="ts">
-  // Closed-mode login gate: shown full-screen instead of the app when the gateway requires
-  // authentication and the caller isn't signed in. The app body isn't mounted behind it, so
-  // anonymous users can't see data or trigger 401-ing API calls. Renders a built-in
-  // username/password form when the server advertises it, else an OIDC sign-in button.
+  // Closed-mode login gate, shown full-screen instead of the app when auth is required and the
+  // caller isn't signed in. The app body isn't mounted behind it, so anonymous users can't see
+  // data or trigger 401-ing API calls. Shows a username/password form when the server advertises
+  // it, else an OIDC sign-in button.
   import { t } from '../i18n';
   import { passwordLogin } from '../api';
   import { setToken } from '../auth';
@@ -27,7 +27,7 @@
     try {
       const result = await passwordLogin(username.trim(), password);
       setToken(result.token);
-      // Re-check identity → the app's reactive gate drops and the console renders.
+      // Re-check identity so the app's reactive gate drops and the console renders.
       await refreshIdentity();
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);

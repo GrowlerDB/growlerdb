@@ -1,6 +1,5 @@
 // Cluster-health roll-up for the header Health pill. Polls Prometheus `up` + per-index ingestion
-// through `lib/cluster.ts` and exposes one reactive `Health`. A failed scrape degrades the
-// relevant component, never throws.
+// and exposes one reactive `Health`; a failed scrape degrades that component rather than throwing.
 import { writable } from 'svelte/store';
 import { queryInstant } from './stats';
 import { getIngestion } from './api';
@@ -16,8 +15,8 @@ import {
 export const clusterHealth = writable<Health>('ok');
 
 export async function refreshHealth(): Promise<void> {
-  // Reaching this console proves the gateway is up; the other components come from the metrics +
-  // control plane, each tolerant of an outage.
+  // Reaching this console proves the gateway is up; other components come from metrics + control
+  // plane, each tolerant of an outage.
   const components: Component[] = [
     { name: 'gateway', group: 'Processes', health: 'ok', detail: 'serving this console' },
   ];

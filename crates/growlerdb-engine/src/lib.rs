@@ -1,9 +1,8 @@
-//! `growlerdb-engine` — search execution, primary-key hydration, and the engine façade
-//! that the CLI (and, later, the gRPC/REST server) drive.
+//! `growlerdb-engine` — search execution, primary-key hydration, and the engine façade the CLI and
+//! gRPC/REST server drive.
 //!
-//! The distributed split (M3 Phase B1) is taking shape: the [`gateway`]/[`node`] seam lets
-//! the Engine API route through a `dyn Node` that is either in-process (embedded) or, in a
-//! later slice, a gRPC client (distributed).
+//! The [`gateway`]/[`node`] seam lets the Engine API route through a `dyn Node` that is either
+//! in-process (embedded) or a gRPC client (distributed).
 
 pub mod admin_service;
 pub mod auth;
@@ -58,11 +57,8 @@ pub use rbac::{scope_for_method, RbacPolicy, Scope};
 pub use remap::{remap_shard, remap_tick, RemapOutcome, RemapState};
 pub use search_service::{heavy_reads_cap, IndexHeavyShare, SearchService};
 /// Serialize every test that mutates a process-global env var (`GROWLERDB_*_API_KEY`, ...).
-/// `set_var`/`remove_var` are process-wide, so env-touching tests across modules race under
-/// `cargo test`'s parallelism unless they share ONE crate-level lock (the same lesson the embed
-/// crate learned; per-module locks re-introduce the cross-file race). Every such test takes this
-/// guard — currently only `rest::tests::config_dto_has_no_secret_field`, but any future env test
-/// must too.
+/// `set_var`/`remove_var` are process-wide, so env-touching tests across modules must share ONE
+/// crate-level lock or they race under `cargo test`'s parallelism. Every such test takes this guard.
 #[cfg(test)]
 pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
