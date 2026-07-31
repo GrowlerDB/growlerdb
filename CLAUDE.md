@@ -22,6 +22,22 @@ is and how it works is the **OKF** in [`okf/`](okf/index.md) — start there.
 
 No commit trailer. Keep PRs small and honestly scoped.
 
+## Code comments
+
+Comments earn their place or they go. Applies to all languages (Rust, Java, Svelte/TS).
+
+- **Concise:** most comments are ≤2 lines — targeted sentences, not paragraphs. Minimize visual clutter.
+- **Why, not what:** the code says *what* it does; a comment explains *why* (a non-obvious rationale,
+  invariant, trade-off, safety/correctness reason, or a decision ref like `D53`/`HA-G4`). If a comment
+  only restates the code, delete it.
+- **No obvious/translated comments:** don't narrate self-explanatory code (`// increment i`), and don't
+  restate a name (`// Gets the username` on `username()` / a `getUsername` Javadoc).
+- **Current code only:** comments describe how the code is *now*. Don't tell past stories — historical
+  narratives, "originally/previously/used-to", old bug/ordering retellings, stale task IDs. Prune them.
+- **Keep the load-bearing:** invariants, security/correctness rationale, decision refs, public-item doc
+  contracts, and functional pragmas (`eslint-disable`, `svelte-ignore`, `@Override`) stay — trimmed to
+  their essence, not deleted.
+
 ## Querying GrowlerDB data
 
 When asked what a GrowlerDB **index** (`movies` — the default — `docs`, `catalog`, …) says or contains, use the
