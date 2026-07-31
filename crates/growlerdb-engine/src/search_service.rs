@@ -181,6 +181,13 @@ impl SearchService {
         Self::with_auth(shard, default_auth())
     }
 
+    /// Whether the shard this service currently fronts is a **read-only cold read-through** shard
+    /// (a D53 replica) rather than a writable primary. The pool uses this to tell a served replica
+    /// ordinal from a served primary when the control plane changes a node's role for that ordinal.
+    pub fn serves_read_only(&self) -> bool {
+        self.shard.current().is_read_only()
+    }
+
     /// Override the heavy-read admission budget (tests / bespoke embedders); production uses the
     /// process-wide [`heavy_reads`] default so all services share one budget.
     pub fn with_heavy_limit(mut self, n: usize) -> Self {

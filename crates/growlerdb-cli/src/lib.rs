@@ -2791,19 +2791,21 @@ async fn open_and_publish_ordinal(
     })
     .await??;
     let key = ordinal as i64;
-    // Publish into each per-index map (the SAME Arcs the Pool services front), only if still absent.
+    // Publish into each per-index map (the SAME Arcs the Pool services front). Replace any existing
+    // entry: this runs only when the caller (reconcile_primary_builds) decided to (re)serve the
+    // ordinal as PRIMARY — either it was unserved, or it was a read-through REPLICA being promoted —
+    // and the freshly-built primary is authoritative over a stale cold replica. A second primary for
+    // one ordinal on a node can't race here (the reconcile `building` in-flight guard prevents it).
     if let Some(m) = search_idx
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .get(&index)
         .cloned()
     {
-        m.write()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(key)
-            .or_insert_with(|| {
-                SearchService::new(handle.clone()).with_index_heavy_share(index_heavy.clone())
-            });
+        m.write().unwrap_or_else(|e| e.into_inner()).insert(
+            key,
+            SearchService::new(handle.clone()).with_index_heavy_share(index_heavy.clone()),
+        );
     }
     if let Some(m) = suggest_idx
         .read()
@@ -2813,8 +2815,7 @@ async fn open_and_publish_ordinal(
     {
         m.write()
             .unwrap_or_else(|e| e.into_inner())
-            .entry(key)
-            .or_insert_with(|| SuggestService::new(handle.clone()));
+            .insert(key, SuggestService::new(handle.clone()));
     }
     if let Some(m) = lookup_idx
         .read()
@@ -2822,17 +2823,15 @@ async fn open_and_publish_ordinal(
         .get(&index)
         .cloned()
     {
-        m.write()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(key)
-            .or_insert_with(|| {
-                LookupService::new(
-                    handle.clone(),
-                    IcebergConfig::from_env(),
-                    table.to_string(),
-                    resolved.clone(),
-                )
-            });
+        m.write().unwrap_or_else(|e| e.into_inner()).insert(
+            key,
+            LookupService::new(
+                handle.clone(),
+                IcebergConfig::from_env(),
+                table.to_string(),
+                resolved.clone(),
+            ),
+        );
     }
     if let Some(m) = admin_idx
         .read()
@@ -2842,8 +2841,7 @@ async fn open_and_publish_ordinal(
     {
         m.write()
             .unwrap_or_else(|e| e.into_inner())
-            .entry(key)
-            .or_insert_with(|| AdminService::new(handle.clone(), &index));
+            .insert(key, AdminService::new(handle.clone(), &index));
     }
     if let Some(m) = write_hash_idx
         .read()
@@ -2851,13 +2849,11 @@ async fn open_and_publish_ordinal(
         .get(&index)
         .cloned()
     {
-        m.write()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(key)
-            .or_insert_with(|| {
-                WriteService::new(handle.clone(), index.clone(), POOL_HASH_MAX_INFLIGHT)
-                    .with_embedding(resolved.clone())
-            });
+        m.write().unwrap_or_else(|e| e.into_inner()).insert(
+            key,
+            WriteService::new(handle.clone(), index.clone(), POOL_HASH_MAX_INFLIGHT)
+                .with_embedding(resolved.clone()),
+        );
     }
     spawn_auto_compaction(
         handle.clone(),
@@ -3865,18 +3861,26 @@ fn reconcile_primary_builds(units: &[growlerdb_proto::v1::UnitAssignment], pb: &
         if resolved.shard_count != 1 || ordinal != 0 {
             continue;
         }
-        // Already serving this ordinal (built earlier, or opened at boot from local data)? Skip.
-        let already_served = pb
+        // Already serving this ordinal? Skip — UNLESS we serve it only as a read-through REPLICA (a
+        // read-only cold shard) while the CP now assigns us PRIMARY. That replica→primary role change
+        // isn't covered by the de-assignment path (`spawn_assignment_reconcile` tracks only Window
+        // units), so a hash ordinal's stale replica would otherwise never be superseded and the node
+        // serves the stale cold snapshot forever — stale once the source advances (e.g. after
+        // `just demo-data` reloads the corpus). Fall through to build; `open_and_publish_ordinal`
+        // then replaces the replica service with the freshly-built primary. A primary we already hold
+        // is left alone (idempotent).
+        let serving_as_primary = pb
             .search_idx
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get(&u.index)
-            .is_some_and(|m| {
+            .and_then(|m| {
                 m.read()
                     .unwrap_or_else(|e| e.into_inner())
-                    .contains_key(&(ordinal as i64))
+                    .get(&(ordinal as i64))
+                    .map(|svc| !svc.serves_read_only())
             });
-        if already_served {
+        if serving_as_primary == Some(true) {
             continue;
         }
         // In-flight guard: mark this ordinal building; if already marked, another task has it.
@@ -7285,6 +7289,174 @@ mod tests {
             .await,
             0,
             "an already-served ordinal isn't re-opened"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_on_assignment_promotes_a_read_through_replica_to_primary() {
+        // A node serving a hash ORDINAL as a read-through REPLICA, then re-assigned PRIMARY for it,
+        // must promote: the freshly-built primary replaces the stale read-through replica in the pool
+        // maps. Without this the node serves the stale cold snapshot forever (the de-assignment path
+        // tracks only Window units, so a hash ordinal's replica is never otherwise superseded). Here
+        // we drive the promotion's core seam — `open_and_publish_ordinal` — directly.
+        use growlerdb_core::{
+            CommitBatch, CompositeKey, Document, IndexDefinition, IndexWriter, LocatedDoc,
+            SourceCheckpoint, SourceField, SourceSchema, SourceType, Value,
+        };
+        use growlerdb_index::{LocalIndexStore, ShardId};
+        use growlerdb_proto::v1::unit_assignment::Unit as WireUnit;
+        use growlerdb_proto::v1::UnitAssignment;
+        use std::collections::{BTreeMap, HashMap};
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Arc, RwLock};
+
+        let src = SourceSchema::new(
+            vec![SourceField::new("id", SourceType::String)],
+            vec![],
+            vec!["id".into()],
+        );
+        let resolved = IndexDefinition::from_yaml(
+            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nshard_count: 2\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD, fast: true } ] }\n",
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+        let ordinal: u32 = 1;
+        let id = ShardId::shard("docs", ordinal);
+
+        // --- Build ordinal 1 in a local store + publish its replica snapshot to object storage. ---
+        let primary_root = tempfile::tempdir().unwrap();
+        let primary = LocalIndexStore::open(primary_root.path()).unwrap();
+        let shard = primary.create_shard(&id, &resolved).unwrap();
+        let key = CompositeKey::new(vec![], vec![("id".into(), Value::from("doc-1"))]);
+        let mut f = BTreeMap::new();
+        f.insert("id".to_string(), Value::from("doc-1"));
+        IndexWriter::write(
+            &shard,
+            &CommitBatch::from_upserts(
+                vec![LocatedDoc {
+                    doc: Document::new(key, f),
+                    iceberg_file: "f".into(),
+                    row_position: 0,
+                }],
+                SourceCheckpoint::iceberg(1),
+                "b1",
+            ),
+        )
+        .unwrap();
+        let backup_root = tempfile::tempdir().unwrap();
+        let op = growlerdb_backup::fs_store(backup_root.path()).unwrap();
+        growlerdb_backup::backup_replica_snapshot(
+            &shard,
+            "docs",
+            &ordinal.to_string(),
+            &primary_root.path().join(".stg"),
+            &op,
+            &format!("cold/docs/{ordinal}"),
+            Some(serde_json::to_string(&resolved).unwrap()),
+        )
+        .await
+        .unwrap();
+        // Release the writer lock so `open_and_publish_ordinal` can re-open the shard as primary.
+        drop(shard);
+
+        // --- Pool maps for a hash index "docs", each with an empty ordinal map. ---
+        let search_idx: growlerdb_engine::SharedSearchIndexes = Arc::new(RwLock::new(
+            BTreeMap::from([("docs".to_string(), Arc::new(RwLock::new(BTreeMap::new())))]),
+        ));
+        let suggest_idx: growlerdb_engine::SharedSuggestIndexes = Arc::new(RwLock::new(
+            BTreeMap::from([("docs".to_string(), Arc::new(RwLock::new(BTreeMap::new())))]),
+        ));
+        let lookup_idx: growlerdb_engine::SharedLookupIndexes = Arc::new(RwLock::new(
+            BTreeMap::from([("docs".to_string(), Arc::new(RwLock::new(BTreeMap::new())))]),
+        ));
+        let admin_idx: growlerdb_engine::SharedAdminIndexes = Arc::new(RwLock::new(
+            BTreeMap::from([("docs".to_string(), Arc::new(RwLock::new(BTreeMap::new())))]),
+        ));
+        let write_hash_idx: growlerdb_engine::SharedHashWriteIndexes = Arc::new(RwLock::new(
+            BTreeMap::from([("docs".to_string(), Arc::new(RwLock::new(BTreeMap::new())))]),
+        ));
+
+        // --- 1) Serve ordinal 1 as a read-through REPLICA. ---
+        let mut meta: ReplicaIndexMeta = HashMap::new();
+        meta.insert(
+            "docs".to_string(),
+            (
+                resolved.clone(),
+                "g.docs".to_string(),
+                growlerdb_engine::IndexHeavyShare::new(4, Arc::new(AtomicUsize::new(1))),
+            ),
+        );
+        let cache = growlerdb_index::RangeCache::new(8 * 1024 * 1024);
+        let replica_root = tempfile::tempdir().unwrap();
+        let replica_store = LocalIndexStore::open(replica_root.path()).unwrap();
+        let served = reconcile_replica_units(
+            &[UnitAssignment {
+                index: "docs".into(),
+                unit: Some(WireUnit::Shard(ordinal)),
+                primary: false,
+            }],
+            &meta,
+            &search_idx,
+            &suggest_idx,
+            &lookup_idx,
+            &admin_idx,
+            &replica_store,
+            &op,
+            &cache,
+            replica_root.path(),
+        )
+        .await;
+        assert_eq!(served, 1, "the replica ordinal is opened read-through");
+        let is_read_only = |m: &growlerdb_engine::SharedSearchIndexes| {
+            m.read()
+                .unwrap()
+                .get("docs")
+                .unwrap()
+                .read()
+                .unwrap()
+                .get(&(ordinal as i64))
+                .map(|svc| svc.serves_read_only())
+        };
+        assert_eq!(
+            is_read_only(&search_idx),
+            Some(true),
+            "served as a read-only read-through replica"
+        );
+
+        // --- 2) Promote: build-on-assignment publishes the primary over the replica. ---
+        open_and_publish_ordinal(
+            &primary,
+            &resolved,
+            "g.docs",
+            ordinal,
+            growlerdb_engine::IndexHeavyShare::new(4, Arc::new(AtomicUsize::new(1))),
+            0,
+            &search_idx,
+            &suggest_idx,
+            &lookup_idx,
+            &admin_idx,
+            &write_hash_idx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            is_read_only(&search_idx),
+            Some(false),
+            "the built primary REPLACED the read-through replica — no longer read-only"
+        );
+        // The write service now exists for the ordinal too (a replica has none), so the promoted
+        // primary is writable.
+        assert!(
+            write_hash_idx
+                .read()
+                .unwrap()
+                .get("docs")
+                .unwrap()
+                .read()
+                .unwrap()
+                .contains_key(&(ordinal as i64)),
+            "promotion registers the primary's write service"
         );
     }
 
