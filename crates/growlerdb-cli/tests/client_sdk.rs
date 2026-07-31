@@ -84,11 +84,9 @@ fn seed(root: &std::path::Path) {
 }
 
 async fn client(url: &str) -> Client {
-    // Poll until the spawned `serve` binds. The budget is generous (10s): a healthy server returns
-    // the instant it accepts (~2s cold-start for a debug build here), so this only bounds the
-    // *failure* path. A tight 2s budget flaked once the read-stack bump (opendal 0.57 + a larger
-    // dependency tree, #200) nudged debug cold-start past it — readiness, not liveness, was the
-    // gap, so widen the wait rather than assert a fixed startup time.
+    // Poll until the spawned `serve` binds. Budget is generous (10s) to bound the *failure* path; a
+    // healthy server accepts in ~2s (debug cold-start). Readiness, not liveness, is the gap — widen
+    // the wait rather than assert a fixed startup time.
     for _ in 0..400 {
         if let Ok(c) = Client::connect(url.to_string()).await {
             return c;
@@ -158,8 +156,7 @@ async fn rust_sdk_drives_search_suggest_and_admin_against_a_live_server() {
     let terms: Vec<&str> = sug.suggestions.iter().map(|s| s.text.as_str()).collect();
     assert_eq!(terms, vec!["berlin", "bern"]);
 
-    // Did-you-mean: "bostom" has no near city here, "bern" is distance 2 from "ber n"…
-    // use a real near-miss: "berlim" → berlin (distance 1).
+    // Did-you-mean: "berlim" → berlin (distance 1).
     let dym = client
         .suggest_fuzzy("city", "berlim", 10, 1)
         .await

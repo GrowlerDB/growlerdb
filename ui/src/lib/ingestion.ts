@@ -1,7 +1,5 @@
-// Ingestion (sync) status helpers. Pure logic — unit-tested; the Ingestion screen renders these.
-// GrowlerDB has no separate "connector" entity: every index is kept in sync with exactly one
-// Iceberg source by changelog ingestion, so "ingestion status" = the source head vs. each shard's
-// committed checkpoint.
+// Ingestion (sync) status helpers. Every index tracks one Iceberg source by changelog ingestion,
+// so "ingestion status" = the source head vs. each shard's committed checkpoint.
 import type { ShardIngestion } from './api';
 
 export type SyncState =
@@ -21,8 +19,8 @@ const SEVERITY: Record<string, number> = {
   behind: 2,
   no_primary: 3,
   unreachable: 3,
-  // The source table was dropped+recreated: the index is stale and its keys won't hydrate — the
-  // most severe state (it serves wrong results until reindexed), so it's the headline.
+  // Source table dropped+recreated: index is stale and keys won't hydrate — serves wrong results
+  // until reindexed, so it's the most severe state.
   source_recreated: 4,
 };
 
@@ -52,8 +50,7 @@ export function badgeLevel(state: string): 'ok' | 'warning' | 'critical' | '' {
   }
 }
 
-/** The worst (largest) wall-clock lag across an index's shards, in ms. 0 when every shard is in
- *  sync — the headline lag matches the headline (worst) state. */
+/** The worst (largest) wall-clock lag across an index's shards, in ms; 0 when all shards are in sync. */
 export function worstLagMs(shards: ShardIngestion[]): number {
   return shards.reduce((max, s) => Math.max(max, s.lag_ms ?? 0), 0);
 }

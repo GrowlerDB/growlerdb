@@ -18,11 +18,9 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 /**
- * Wire-level assertions that the {@code index} selector reaches the Node on EVERY tagged path —
- * writes AND the resume/drain checkpoints (HA-E2). A pool node serving several indexes rejects an
- * empty selector as a non-retryable {@code InvalidArgument}, so an untagged {@code GetCheckpoint}
- * on the resume path is a guaranteed crash-loop against a multi-index node: writes land tagged but
- * the very next restart dies asking "whose checkpoint?".
+ * The {@code index} selector must reach the Node on EVERY tagged path — writes AND resume/drain
+ * checkpoints (HA-E2). A multi-index pool node rejects an empty selector as non-retryable
+ * {@code InvalidArgument}, so an untagged checkpoint crash-loops the connector on restart.
  */
 class IndexTagWireTest {
 
@@ -110,7 +108,7 @@ class IndexTagWireTest {
     assertAllTagged();
   }
 
-  /** The single-endpoint path must carry the tag too — it used to hand back a bare untagged client. */
+  /** The single-endpoint path must carry the tag too. */
   @Test
   void singleEndpointWriterCarriesTheIndexTag() throws IOException, InterruptedException {
     List<String> endpoints = startNodes(1);

@@ -1,6 +1,5 @@
-// Client-side highlighting. The Engine's wire response carries no server-side highlights, so the
-// UI marks the query's terms in hydrated text — a best-effort visual aid. Returns *segments* (not
-// HTML) so components render with <mark> safely: no innerHTML, no XSS.
+// Client-side highlighting: the wire response carries no server-side highlights, so the UI marks
+// query terms in hydrated text. Returns segments (not HTML) so <mark> renders without innerHTML/XSS.
 
 const OPERATORS = new Set(['AND', 'OR', 'NOT', 'TO']);
 

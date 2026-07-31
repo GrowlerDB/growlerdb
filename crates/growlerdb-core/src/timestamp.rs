@@ -1,18 +1,12 @@
-//! Timestamp parsing: turn a source value into GrowlerDB's **canonical internal
-//! representation — epoch microseconds** (the unit Tantivy's `DateTime::from_timestamp_micros` and
-//! Iceberg's default `timestamp` precision use). A field declared with a [`TimeFormat`] in the index
-//! definition is treated as a `DATE` regardless of its source Arrow type, so a plain `int64` epoch
-//! column (the streaming demo's `ts`, in millis) or a digit string can be a real timestamp — driving
-//! range queries, sort, the console time filter, window pruning, and date
-//! histograms on one consistent scale.
+//! Timestamp parsing: turn a source value into GrowlerDB's **canonical internal representation —
+//! epoch microseconds** (the unit Tantivy and Iceberg's default `timestamp` precision use). A field
+//! declared with a [`TimeFormat`] is treated as a `DATE` regardless of source Arrow type, so an
+//! `int64` epoch column or a digit string can be a real timestamp on one consistent scale.
 //!
-//! Parsing is **loud, not silent**: a wrong value type, an unparseable string, or an
-//! overflow is a clear error, never an off-by-10³ or off-by-timezone date.
-//!
-//! Two families of format are supported: **integer-epoch units** (`epoch_seconds`/`millis`/`micros`/
-//! `nanos` — what the demo and most lake tables use) and **string formats** (`rfc3339` for an
-//! ISO-8601 datetime carrying an offset, and `date_only` for a `YYYY-MM-DD` calendar date, taken at
-//! UTC midnight).
+//! Parsing is **loud, not silent**: a wrong type, unparseable string, or overflow is a clear error,
+//! never an off-by-10³ or off-by-timezone date. Two format families: **integer-epoch units**
+//! (`epoch_seconds`/`millis`/`micros`/`nanos`) and **string formats** (`rfc3339`, offset-aware; and
+//! `date_only` `YYYY-MM-DD` at UTC midnight).
 
 use crate::Value;
 

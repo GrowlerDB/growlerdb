@@ -182,8 +182,7 @@ pub struct IndexSummary {
 
 /// How often a node re-heartbeats into the CP placement pool ([`NODE_HEARTBEAT_TTL_MS`] must be a
 /// comfortable multiple of this). The CLI's registration loop derives its re-announce interval from
-/// this constant so the two can never silently diverge again (HA-D5: they were once both 30 s and
-/// healthy nodes flapped dead).
+/// this constant so the two can never silently diverge (HA-D5).
 pub const NODE_REANNOUNCE_INTERVAL_MS: i64 = 10_000;
 
 /// How long a node's heartbeat is trusted before it drops out of the CP placement pool.
@@ -266,10 +265,9 @@ pub enum RegistryError {
     #[error("invalid definition: {0}")]
     InvalidDefinition(String),
     /// A placement compare-and-set lost: a [`set_bucket_map`](Registry::set_bucket_map) whose
-    /// expected prior map no longer matches (another reshard/bucket-move committed in between), or
-    /// a [`RegisterServedIndex` announce](Registry::announce_primaries) claiming a unit whose
-    /// primary is a different, not-confidently-dead node (first-wins — no last-write-wins
-    /// re-point). Carries a human-readable detail; maps to gRPC `FAILED_PRECONDITION`.
+    /// expected prior map no longer matches (another reshard committed in between), or a
+    /// [`RegisterServedIndex` announce](Registry::announce_primaries) claiming a unit whose primary is
+    /// a different, not-confidently-dead node (first-wins). Maps to gRPC `FAILED_PRECONDITION`.
     #[error("placement conflict: {0}")]
     PlacementConflict(String),
     /// An operation named an index that is not registered.
@@ -356,12 +354,10 @@ pub struct ActivityEvent {
 /// Max events retained per index in the activity log — oldest are dropped.
 const ACTIVITY_RETAIN: usize = 200;
 
-/// Debounce window for activity-sidecar flushes. An isolated event (none within this window)
-/// flushes immediately — preserving synchronous durability for the common case — while a burst
-/// (e.g. a multi-target alias swap looping `record_activity` per target) coalesces into a single
-/// off-lock write instead of one full-file fsync per event. The burst tail is flushed on graceful
-/// shutdown ([`Registry`]'s `Drop`); a hard crash within the window may lose the last few events,
-/// which is acceptable — the log is a non-critical audit convenience, not catalog state.
+/// Debounce window for activity-sidecar flushes. An isolated event flushes immediately (synchronous
+/// durability for the common case); a burst coalesces into a single off-lock write instead of one
+/// fsync per event. The tail flushes on graceful shutdown ([`Registry`]'s `Drop`); a hard crash
+/// within the window may lose the last few events — acceptable for a non-critical audit log.
 const ACTIVITY_FLUSH_DEBOUNCE_MS: i64 = 1000;
 
 /// Coalescing state for the debounced activity-sidecar flush, behind its own mutex so a flush never
@@ -377,16 +373,13 @@ struct ActivityFlush {
 /// Registry result alias.
 pub type Result<T> = std::result::Result<T, RegistryError>;
 
-/// The index **registry**: `name → `[`IndexEntry`], persisted to a JSON document. Reads are
-/// served from memory; every mutation persists **atomically** (write a temp file, then
-/// rename over the target) so a crash never leaves a partially-written registry. Cheap to
-/// share across threads — internally `RwLock`-guarded.
+/// The index **registry**: `name → `[`IndexEntry`]. Reads are served from memory; every mutation
+/// persists durably through a [`RegistryBackend`]. Cheap to share across threads — internally
+/// `RwLock`-guarded.
 ///
-/// **Persistence backend:** durable storage sits behind a [`RegistryBackend`]; the default
-/// [`open`](Self::open) uses the local single-writer [`JsonFileBackend`] (an exclusive advisory
-/// `flock` held for the registry's lifetime, so a second control-plane process over the same file
-/// fails fast instead of last-writer-wins clobbering a stale in-memory map). A replicated backend
-/// (D51) swaps in via [`with_backend`](Self::with_backend) without changing any logic below.
+/// **Persistence backend:** the default [`open`](Self::open) uses the local single-writer
+/// [`JsonFileBackend`]; a replicated backend (D51) swaps in via
+/// [`with_backend`](Self::with_backend) without changing any logic below.
 ///
 /// **Lock-order invariant:** each data map has its own `RwLock`. A mutation holds
 /// **only the one map it changes**, drops it, then calls [`persist_snapshot`](Self::persist_snapshot)
@@ -397,9 +390,7 @@ pub type Result<T> = std::result::Result<T, RegistryError>;
 /// The derived `token_by_hash` index and the `activity`/`session_epochs` sidecars are independent,
 /// always taken one-at-a-time. Keep new lock acquisitions on this order — never the reverse.
 pub struct Registry {
-    /// Where durable state lives (the local JSON store by default; a replicated store under D51).
-    /// Every persist path — [`persist_snapshot`](Self::persist_snapshot), the activity flush, the
-    /// session-epoch write — goes through here, off any data lock.
+    /// Where durable state lives. Every persist path goes through here, off any data lock.
     backend: Box<dyn RegistryBackend>,
     indexes: RwLock<BTreeMap<String, IndexEntry>>,
     /// Index aliases: `alias → member index names`. A separate lock from `indexes`; every code path
@@ -408,18 +399,17 @@ pub struct Registry {
     /// Saved searches: `id → `[`SavedQuery`]. Lock order is **indexes → aliases → saved_queries**
     /// everywhere, to avoid deadlock.
     saved_queries: RwLock<BTreeMap<String, SavedQuery>>,
-    /// Monotonic suffix for generated saved-query ids (uniqueness within a process; combined with a
-    /// millisecond timestamp it is unique across restarts too).
+    /// Monotonic suffix for generated saved-query ids; combined with a millisecond timestamp it is
+    /// unique across restarts too.
     next_saved: std::sync::atomic::AtomicU64,
     /// Local role bindings: `subject → roles`. Lock order is **indexes → aliases → saved_queries →
     /// role_bindings → tokens**.
     role_bindings: RwLock<BTreeMap<String, Vec<String>>>,
     /// API tokens: `id → `[`ApiToken`].
     tokens: RwLock<BTreeMap<String, ApiToken>>,
-    /// Secret-hash → token-id lookup index: makes `find_token` — on every authenticated request —
-    /// O(1) instead of a linear scan of `tokens`. **Derived** from `tokens` (not persisted); rebuilt
-    /// on open and after every token mutation. Never held together with the `tokens` lock in a
-    /// nested way (see `find_token` / `rebuild_token_index`), so no deadlock.
+    /// Secret-hash → token-id lookup: makes `find_token` (every authenticated request) O(1) instead
+    /// of a linear scan. **Derived** from `tokens` (not persisted); rebuilt on open and after every
+    /// token mutation. Never nested under the `tokens` lock, so no deadlock.
     token_by_hash: RwLock<std::collections::HashMap<String, String>>,
     /// Monotonic suffix for generated token ids.
     next_token: std::sync::atomic::AtomicU64,
@@ -428,11 +418,11 @@ pub struct Registry {
     credentials: RwLock<BTreeMap<String, String>>,
     /// Per-subject index allowlist for built-in login: `subject → allowed index names`. Threaded
     /// into the session JWT's `indexes` claim so per-index RBAC restricts the subject. Lock order is
-    /// **after `credentials`** (… → credentials → index_bindings).
+    /// **after `credentials`**.
     index_bindings: RwLock<BTreeMap<String, Vec<String>>>,
-    /// Per-index activity log: `index → events`, bounded + append-only. Persisted to a **separate**
-    /// `activity.json` (non-critical, lossy-on-corruption) so the registry's atomic envelope stays
-    /// small. Lock is independent (acquired last).
+    /// Per-index activity log: `index → events`, bounded + append-only. Persisted to a separate
+    /// `activity.json` (non-critical) so the registry's atomic envelope stays small. Lock is
+    /// independent (acquired last).
     activity: RwLock<BTreeMap<String, Vec<ActivityEvent>>>,
     /// Debounce/coalescing state for the activity-sidecar flush. Its own mutex also serializes
     /// concurrent flushes (last snapshot wins the file) — like `flush_lock` for the main registry —
@@ -440,79 +430,65 @@ pub struct Registry {
     activity_flush: std::sync::Mutex<ActivityFlush>,
     /// Per-subject **session epoch** (epoch ms): sessions issued before this instant are stale.
     /// Bumped when a subject's roles change or credential is removed, giving revocation / immediate
-    /// role-downgrade for outstanding session JWTs. Persisted to a separate `sessions.json` sidecar
-    /// (independent lock, acquired last).
+    /// role-downgrade for outstanding session JWTs. Persisted to a separate `sessions.json` sidecar.
     session_epochs: RwLock<BTreeMap<String, i64>>,
-    /// Serializes session-epoch sidecar writes (like `flush_lock` for the registry envelope), so two
-    /// concurrent revokes can't persist out of order and lose one bump. Taken **after** the
-    /// `session_epochs` guard is released — the persist round-trip never sits on the auth hot path.
+    /// Serializes session-epoch sidecar writes so two concurrent revokes can't persist out of order
+    /// and lose one bump. Taken **after** the `session_epochs` guard is released, off the auth hot path.
     sessions_flush: std::sync::Mutex<()>,
-    /// Serializes registry-file writes: a mutation applies its change in memory, releases its data
-    /// lock, then persists off-lock under this — so routing reads never block on the fsync, and two
-    /// concurrent persists can't lose a change from the file (each snapshots the latest memory; the
-    /// last write wins with the full state).
+    /// Serializes registry-file writes, taken off-lock after a mutation releases its data lock — so
+    /// routing reads never block on the fsync, and two concurrent persists can't lose a change (each
+    /// snapshots the latest memory; last write wins with the full state).
     flush_lock: std::sync::Mutex<()>,
-    /// Set when a failed persist's rollback ([`persist_snapshot`](Self::persist_snapshot)) could not
-    /// restore memory from the store either: memory may still hold an unpersisted change, so every
-    /// further persist is refused until a restore/[`reload`](Self::reload) succeeds — the failed
-    /// change must never ride out on the next successful mutation's full snapshot.
+    /// Set when a failed persist's rollback could not restore memory from the store either: memory may
+    /// still hold an unpersisted change, so every further persist is refused until a
+    /// [`reload`](Self::reload) succeeds — the failed change must never ride out on the next snapshot.
     rollback_failed: std::sync::atomic::AtomicBool,
     /// The **placement pool** (D52): `node endpoint → last-heartbeat epoch-ms`. One flat pool of
-    /// interchangeable shard hosts, **not** keyed by index — any live node can be assigned units
-    /// (shards or windows) from any index, which is what lets one node process serve many indexes and
-    /// kills the node-per-index wall. **In-memory only** (like `token_by_hash`) — liveness is
-    /// ephemeral runtime state, not durable topology: after a control-plane restart every node
-    /// re-registers within a heartbeat interval, so persisting it would only add write amplification.
-    /// Unit *assignments* (which node owns a shard/window) stay durable in [`IndexEntry`].
+    /// interchangeable shard hosts, **not** keyed by index — any live node can be assigned units from
+    /// any index, which lets one node process serve many indexes. **In-memory only** — liveness is
+    /// ephemeral runtime state, re-registered within a heartbeat interval after a restart; unit
+    /// *assignments* stay durable in [`IndexEntry`].
     node_pool: RwLock<BTreeMap<String, i64>>,
-    /// The endpoints whose **latest heartbeat declared replica capability** (HA-G2): the node has an
-    /// object store configured, so it can open replica windows read-through (D53). Replica top-up
-    /// places ONLY on these — a node that never declares (old binary, `--register` without an
-    /// object store) never receives replica units it could not serve. In-memory beside
-    /// [`node_pool`](Self::node_pool) (same ephemeral-liveness rationale); membership is refreshed
-    /// on every heartbeat, so a node that loses its object store stops attracting new replicas
-    /// within one re-announce.
+    /// The endpoints whose **latest heartbeat declared replica capability** (HA-G2): an object store
+    /// is configured, so they can open replica windows read-through (D53). Replica top-up places ONLY
+    /// on these, so a node that never declares never receives replica units it could not serve.
+    /// In-memory; refreshed every heartbeat, so a node that loses its object store stops attracting
+    /// new replicas within one re-announce.
     replica_capable: RwLock<BTreeSet<String>>,
     /// The endpoints admitted as **placement-eligible pool nodes** (D52): those that registered via
-    /// `RegisterNode` (a `serve-pool` node the control plane may assign units to). A classic
-    /// fixed-endpoint node (`serve --index X`, seen only through `RegisterServedIndex`) is
-    /// deliberately ABSENT — its liveness is kept in [`node_pool`](Self::node_pool) so the dead-owner
-    /// sweeper leaves its self-declared units alone, but the CP never *places* a pool unit onto it
-    /// (it could not build or serve one). Placement draws targets from
-    /// [`placement_nodes`](Self::placement_nodes) = live ∩ this set. In-memory beside `node_pool`.
+    /// `RegisterNode`. A classic fixed-endpoint node (seen only through `RegisterServedIndex`) is
+    /// deliberately ABSENT — its liveness is kept in [`node_pool`](Self::node_pool) so the sweeper
+    /// leaves its self-declared units alone, but the CP never *places* a pool unit onto it. Placement
+    /// draws targets from [`placement_nodes`](Self::placement_nodes) = live ∩ this set.
     pool_eligible: RwLock<BTreeSet<String>>,
-    /// **Placement-change hook** (HA-D1): invoked after any successful persist/reload whose
-    /// placement fingerprint differs from the last one — the single choke point that pushes fresh
-    /// assignment snapshots to subscribed nodes. Lives at the persist boundary (not per mutation) so
-    /// a new placement mutation *cannot* forget to notify: every mutation funnels through
-    /// [`persist_snapshot`](Self::persist_snapshot). Invoked with **no** data lock held.
+    /// **Placement-change hook** (HA-D1): invoked after any successful persist/reload whose placement
+    /// fingerprint differs from the last — the single choke point that pushes fresh assignment
+    /// snapshots to subscribed nodes. At the persist boundary (not per mutation) so a new placement
+    /// mutation cannot forget to notify. Invoked with **no** data lock held.
     placement_listener: RwLock<Option<Box<dyn Fn() + Send + Sync>>>,
-    /// Fingerprint of the placement state (`(index, unit, primary, replicas)` tuples) at the last
-    /// listener check, so non-placement persists (tokens, aliases, …) don't fire spurious pushes.
+    /// Fingerprint of the placement state at the last listener check, so non-placement persists
+    /// (tokens, aliases, …) don't fire spurious pushes.
     last_placement_hash: std::sync::Mutex<u64>,
     /// The **liveness grace anchor** (HA-D5): epoch-ms of the first heartbeat observed after
-    /// boot/promotion, `-1` = none yet. For one [`NODE_HEARTBEAT_TTL_MS`] after it, owner liveness
-    /// is *unknown* (laggard nodes haven't re-registered with this — possibly freshly
-    /// promoted/restarted — control plane yet), so dead-owner actions (re-placement, the sweeper,
-    /// primary re-points) are suppressed and entitlement counting fails closed. Re-armed to `-1` on
+    /// boot/promotion, `-1` = none yet. For one [`NODE_HEARTBEAT_TTL_MS`] after it, owner liveness is
+    /// *unknown* (laggard nodes haven't re-registered with this possibly-restarted control plane yet),
+    /// so dead-owner actions are suppressed and entitlement counting fails closed. Re-armed to `-1` on
     /// leadership promotion.
     grace_anchor_ms: std::sync::atomic::AtomicI64,
 }
 
 impl Registry {
     /// Open the registry at `path` over the default local [`JsonFileBackend`]: load the existing
-    /// catalog if present (else empty), taking an exclusive lock first (fails fast with
-    /// [`Locked`](RegistryError::Locked) if another process holds it — single-writer). If the file
-    /// fails to parse, the backend falls back to the last-known-good `.prev` copy with a loud warning
-    /// rather than hard-failing startup.
+    /// catalog if present, taking the exclusive single-writer lock first (fails fast with
+    /// [`Locked`](RegistryError::Locked) if another process holds it).
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         Self::with_backend(Box::new(JsonFileBackend::open(path)?))
     }
 
     /// Build a registry over an arbitrary persistence [`backend`](RegistryBackend) — the seam that
-    /// lets the control plane run on the local JSON store ([`open`](Self::open), the default) or a
-    /// replicated external store (D51), with identical in-memory logic. Loads the backend's persisted
-    /// state into memory; the derived `token_by_hash` index is rebuilt here (never persisted).
+    /// lets the control plane run on the local JSON store or a replicated external store (D51) with
+    /// identical in-memory logic. Loads persisted state into memory; the derived `token_by_hash` index
+    /// is rebuilt here.
     pub fn with_backend(backend: Box<dyn RegistryBackend>) -> Result<Self> {
         let PersistedState {
             indexes,
@@ -525,7 +501,7 @@ impl Registry {
             activity,
             session_epochs,
         } = backend.load()?;
-        // Build the hash→id lookup index from the loaded tokens (derived, not persisted).
+        // Build the hash→id lookup from the loaded tokens (derived, not persisted).
         let token_by_hash: std::collections::HashMap<String, String> = tokens
             .iter()
             .map(|(id, t)| (t.hash.clone(), id.clone()))
@@ -629,22 +605,19 @@ impl Registry {
     }
 
     /// Snapshot every core map under brief read locks and write the registry file **off any data
-    /// lock**. A mutation applies its change in memory, releases its write lock, then calls this —
-    /// so routing reads (`resolve`/`shard_map`/`get`/`list`) never block on the fsync,
-    /// and mutations aren't globally serialized behind disk I/O. The `flush_lock` serializes the
-    /// writes themselves (they're rare) so a concurrent pair can't lose a change from the file: each
-    /// snapshot reads the latest memory, and the last write wins with the full state. Must be called
-    /// with **no** registry data lock held (it re-acquires them briefly).
+    /// lock**, so routing reads never block on the fsync and mutations aren't serialized behind disk
+    /// I/O. `flush_lock` serializes the writes so a concurrent pair can't lose a change: each snapshot
+    /// reads the latest memory, last write wins with the full state. Must be called with **no**
+    /// registry data lock held (it re-acquires them briefly).
     ///
     /// **Rollback on persist failure.** A failed persist must not leave the mutation applied in
     /// memory, or the *next* successful mutation's full snapshot silently commits it. Rollback here
     /// restores the core maps from the store's durable state (the pre-mutation state, since persists
-    /// are serialized under `flush_lock`) — chosen over per-mutation inverse patches because every
-    /// mutation funnels through this one point, so twenty hand-rolled undo paths collapse into one.
-    /// If the restore itself fails (store unreachable), `rollback_failed` latches and every further
-    /// persist is refused until a restore succeeds — stale memory can never reach the store. On the
-    /// Postgres backend a persist failure also demotes the writer, so a concurrent mutation that
-    /// raced past the rollback is refused (`NotLeader`) rather than silently re-committing it.
+    /// serialize under `flush_lock`) — one undo path since every mutation funnels through this point.
+    /// If the restore itself fails, `rollback_failed` latches and every further persist is refused
+    /// until a restore succeeds — stale memory can never reach the store. On the Postgres backend a
+    /// persist failure also demotes the writer, so a mutation that raced past the rollback is refused
+    /// (`NotLeader`) rather than silently re-committing it.
     fn persist_snapshot(&self) -> Result<()> {
         let _flush = self.flush_lock.lock().unwrap_or_else(|e| e.into_inner());
         if self
@@ -652,8 +625,8 @@ impl Registry {
             .load(std::sync::atomic::Ordering::SeqCst)
         {
             // A previous failed persist is still un-rolled-back in memory. Restore first; that also
-            // sweeps away the *current* mutation's in-memory change, so this call must fail
-            // (retryable) rather than report success for a change memory no longer holds.
+            // sweeps away the *current* mutation's change, so this call must fail (retryable) rather
+            // than report success for a change memory no longer holds.
             self.restore_core()?;
             self.rollback_failed
                 .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -676,9 +649,9 @@ impl Registry {
         match self.backend.persist_registry(snapshot) {
             Ok(()) => {
                 // The single placement-notification choke point (HA-D1): every placement mutation
-                // funnels through this persist, so none can forget to push. Non-placement persists
-                // are filtered by the fingerprint. Fired off every data lock (only `flush_lock` is
-                // held, which the listener never takes).
+                // funnels through here, so none can forget to push; non-placement persists are
+                // filtered by the fingerprint. Fired off every data lock (only `flush_lock` is held,
+                // which the listener never takes).
                 self.notify_if_placement_changed();
                 Ok(())
             }
@@ -749,9 +722,9 @@ impl Registry {
     /// Reload the whole in-memory catalog from the backend — a **standby** control plane calls this
     /// when the store's [`backend_version`](Self::backend_version) advances (the leader wrote), so it
     /// stays warm for a fast failover. Each map is replaced under its own write lock (never two at
-    /// once, so no lock-order risk), and the derived token→hash index is rebuilt. The process-local
-    /// **node heartbeats are left untouched** — they are this replica's own liveness view, and nodes
-    /// re-register with a new leader within a heartbeat after failover ([D33](/system/decisions/d33-windowed-topology.md)).
+    /// once). The process-local **node heartbeats are left untouched** — they are this replica's own
+    /// liveness view, and nodes re-register with a new leader within a heartbeat after failover
+    /// ([D33](/system/decisions/d33-windowed-topology.md)).
     pub fn reload(&self) -> Result<()> {
         let s = self.backend.load()?;
         *self.write_map() = s.indexes;
@@ -787,8 +760,7 @@ impl Registry {
     /// the previous leader dies. `Ok(true)` if this control plane is now the leader.
     ///
     /// Ordering is load-bearing: acquire the writer lock → [`reload`](Self::reload) → only then
-    /// confirm writership. Writes are gated on the confirmed flag, so no write can be accepted (let
-    /// alone persisted) between lock acquisition and the reload — a promoted leader can never
+    /// confirm writership. Writes are gated on the confirmed flag, so a promoted leader can never
     /// overwrite the dead leader's last writes with its stale pre-promotion catalog. If the reload
     /// fails, the lock is resigned and this replica stays a standby (retry next tick).
     pub fn try_become_leader(&self) -> Result<bool> {
@@ -802,8 +774,8 @@ impl Registry {
             Ok(()) => {
                 self.backend.confirm_leadership();
                 // Re-arm the liveness grace (HA-D5): this replica's heartbeat view starts empty, so
-                // dead-owner actions stay suppressed for one TTL after the first node re-registers —
-                // early resolves can't mass-re-place laggards' units onto the first re-registrant.
+                // dead-owner actions stay suppressed for one TTL — early resolves can't mass-re-place
+                // laggards' units onto the first re-registrant.
                 self.grace_anchor_ms
                     .store(-1, std::sync::atomic::Ordering::SeqCst);
                 Ok(true)
@@ -838,9 +810,8 @@ impl Registry {
     /// is already taken.
     pub fn create(&self, definition: ResolvedIndex) -> Result<()> {
         let name = definition.name.clone();
-        // Re-check the name even though `IndexDefinition::from_yaml` already validates it: the
-        // registry also accepts pre-resolved definitions (tests, future programmatic callers),
-        // and the name becomes a node-side shard directory + object prefix.
+        // Re-check the name: the registry also accepts pre-resolved definitions that bypass
+        // `from_yaml`'s validation, and the name becomes a node-side shard directory + object prefix.
         growlerdb_core::validate_index_name(&name)
             .map_err(|e| RegistryError::InvalidDefinition(e.to_string()))?;
         let mut map = self.write_map();
@@ -1055,10 +1026,10 @@ impl Registry {
             }
         }
         self.persist_snapshot()?;
-        // A role change must take effect immediately: invalidate outstanding sessions so the subject
+        // A role change takes effect immediately: invalidate outstanding sessions so the subject
         // re-authenticates with the new roles rather than riding an old token's embedded set. A
-        // revocation persist failure fails the call (retryable) — the binding is durable, the
-        // downgrade of outstanding sessions is not yet.
+        // revocation persist failure fails the call (retryable) — the binding is durable, the session
+        // downgrade is not yet.
         self.revoke_sessions(subject)?;
         Ok(())
     }
@@ -1423,10 +1394,9 @@ impl Registry {
     }
 
     /// Set `node` as the primary for **all** of `shards` of `index` in a **single** persist — the
-    /// batched form of [`assign_primary`]. Calling `assign_primary` per ordinal would be a full
-    /// `registry.json` rewrite each time, so bringing up an N-shard index would be O(N) rewrites of
-    /// an O(N)-sized file = O(N²) bytes. This mutates all K in memory under one lock, then persists
-    /// once. Errors if the index is unregistered.
+    /// batched form of [`assign_primary`]. Per-ordinal `assign_primary` would rewrite the whole
+    /// `registry.json` each time (O(N²) bytes to bring up an N-shard index); this mutates all in
+    /// memory under one lock, then persists once. Errors if the index is unregistered.
     pub fn assign_primaries(
         &self,
         index: &str,
@@ -1489,12 +1459,11 @@ impl Registry {
                 Some(cur) => {
                     if self.owner_confidently_dead(&cur.0, now_ms) || !self.is_pool_eligible(&cur.0)
                     {
-                        // Takeover of a dead primary (allowed even — especially — for a warm replica
-                        // announcing itself), OR of a **classic** (non-pool-eligible) owner: a classic
-                        // index has a single self-declared owner, so a fresh announce (e.g. a restart
-                        // at a new endpoint) re-points it — last-write-wins. A CP-assigned **pool**
-                        // primary stays first-wins (needs its owner confidently dead) so a node can't
-                        // steal an assigned unit.
+                        // Takeover of a dead primary (allowed even for a warm replica announcing
+                        // itself), OR of a **classic** (non-pool-eligible) owner: a classic index has
+                        // a single self-declared owner, so a fresh announce re-points it
+                        // (last-write-wins). A CP-assigned **pool** primary stays first-wins (needs its
+                        // owner confidently dead) so a node can't steal an assigned unit.
                     } else if entry
                         .shards
                         .get(&shard)
@@ -1723,11 +1692,11 @@ impl Registry {
 
     /// Store `map` as `index`'s bucket→shard assignment, then persist — **compare-and-swap**:
     /// `expected` must match the stored map (`None` = expects no map yet) or the write is refused
-    /// with [`PlacementConflict`](RegistryError::PlacementConflict). Placement ops
-    /// (apply-reshard, move-bucket) read the map, run a minutes-long source rebuild, and commit
-    /// here; without the CAS two concurrent ops would last-write-wins clobber each other — e.g. a
-    /// finished move-bucket committing a map derived from *before* a reshard's cutover would
-    /// revert the entire reshard's ownership while the data already lives under the new map.
+    /// with [`PlacementConflict`](RegistryError::PlacementConflict). Placement ops (apply-reshard,
+    /// move-bucket) read the map, run a minutes-long source rebuild, and commit here; without the CAS
+    /// two concurrent ops would last-write-wins clobber each other — e.g. a finished move-bucket
+    /// committing a pre-cutover map would revert a reshard's ownership while the data already lives
+    /// under the new map.
     pub fn set_bucket_map(
         &self,
         index: &str,
@@ -1749,13 +1718,12 @@ impl Registry {
         self.persist_snapshot()
     }
 
-    /// Adopt a [balanced](BucketMap::balanced) bucket map over `shard_count` if the index has
-    /// none yet; a no-op (Ok(false)) when a map is already stored. Called on every served-index
-    /// registration, so **every ordinal index is bucketed from its first announce** — there is no
-    /// long-lived "legacy" routing state. Check-and-set under one write lock, so concurrent
-    /// first-registrations can't race; crucially, a node registering as a **growth build target**
-    /// (`--shards N+k` during a reshard) finds the map already present and leaves live routing
-    /// untouched until the reshard's cutover.
+    /// Adopt a [balanced](BucketMap::balanced) bucket map over `shard_count` if the index has none
+    /// yet; a no-op (Ok(false)) when a map is already stored. Called on every served-index
+    /// registration, so **every ordinal index is bucketed from its first announce**. Check-and-set
+    /// under one write lock, so concurrent first-registrations can't race and a **growth build
+    /// target** (`--shards N+k` during a reshard) finds the map present and leaves live routing
+    /// untouched until cutover.
     pub fn adopt_bucket_map_if_absent(&self, index: &str, shard_count: u32) -> Result<bool> {
         let mut indexes = self.write_map();
         let entry = indexes
@@ -1872,8 +1840,7 @@ impl Registry {
     /// only; `now_ms` is the control plane's wall clock. The pool is index-agnostic — a node is an
     /// interchangeable shard host, not bound to one index.
     ///
-    /// Convenience form that declares the node **replica-capable** — the common case in tests and
-    /// the historical behavior. The RPC handler goes through
+    /// Convenience form that declares the node **replica-capable**. The RPC handler goes through
     /// [`register_node_with_capability`](Self::register_node_with_capability) with the flag the node
     /// actually sent (HA-G2), so an object-store-less node never attracts replica placements.
     pub fn register_node(&self, endpoint: &str, now_ms: i64) {
@@ -1925,13 +1892,11 @@ impl Registry {
 
     /// Refresh a **served-index owner's liveness** WITHOUT admitting it to the placement pool — the
     /// [`RegisterServedIndex`] counterpart to [`register_node`](Self::register_node). A classic
-    /// fixed-endpoint node (`serve --index X`) heartbeats here on every announce; it never calls
-    /// `RegisterNode`, so before this the dead-owner sweeper saw its owner as dead and *stole* its
-    /// self-declared units onto a pool node (which then rejected reads for that index). Tracking its
-    /// liveness in [`node_pool`](Self::node_pool) fixes that. Crucially it is NOT added to
-    /// [`pool_eligible`](Self::pool_eligible), so the CP never *places* a pool unit onto it (it could
-    /// not build/serve one) — see [`placement_nodes`](Self::placement_nodes). Arms the liveness grace
-    /// like any heartbeat.
+    /// fixed-endpoint node (`serve --index X`) heartbeats here on every announce; tracking its
+    /// liveness in [`node_pool`](Self::node_pool) keeps the dead-owner sweeper from stealing its
+    /// self-declared units. It is NOT added to [`pool_eligible`](Self::pool_eligible), so the CP never
+    /// *places* a pool unit onto it — see [`placement_nodes`](Self::placement_nodes). Arms the
+    /// liveness grace like any heartbeat.
     pub fn touch_node_liveness(&self, endpoint: &str, now_ms: i64) {
         self.node_pool
             .write()
@@ -1946,13 +1911,12 @@ impl Registry {
     }
 
     /// Whether the **liveness grace window** is active at `now_ms` (HA-D5): the first
-    /// [`NODE_HEARTBEAT_TTL_MS`] after the first heartbeat this (possibly freshly started or
-    /// promoted) control plane observed. While active, an assigned owner that hasn't re-registered
-    /// yet is **live-unknown** — dead-owner re-placement, announce re-points over it, and the
+    /// [`NODE_HEARTBEAT_TTL_MS`] after the first heartbeat this (possibly freshly started or promoted)
+    /// control plane observed. While active, an assigned owner that hasn't re-registered yet is
+    /// **live-unknown** — dead-owner re-placement, announce re-points over it, and the
     /// [sweeper](Self::sweep_dead_primaries) are all suppressed, so laggards' units aren't
     /// mass-re-placed onto the first re-registrant. With no heartbeat ever observed the window is
-    /// **not** active: there is no liveness tracking at all (the ordinal, non-pool deployment
-    /// shape), and empty-pool resolves already fail retryably.
+    /// **not** active (the ordinal, non-pool shape with no liveness tracking).
     pub fn placement_grace_active(&self, now_ms: i64) -> bool {
         let anchor = self
             .grace_anchor_ms
@@ -1991,13 +1955,10 @@ impl Registry {
             .is_some_and(|&t| now_ms - t <= NODE_HEARTBEAT_TTL_MS)
     }
 
-    /// Whether an assigned owner `endpoint` is **confidently dead** at `now_ms`: liveness tracking
-    /// is warmed up (a first heartbeat happened over a TTL ago, so any live node has re-registered)
-    /// and this endpoint hasn't heartbeated within the TTL. `false` while liveness is unknown —
-    /// during the grace window, or on deployments that never heartbeat (ordinal announce-only),
-    /// where an untracked owner is treated as **replaceable** (`true`) since re-announce is the only
-    /// takeover mechanism there. Concretely: untracked owner ⇒ dead unless the grace window is
-    /// active; tracked owner ⇒ dead iff its heartbeat is past the TTL.
+    /// Whether an assigned owner `endpoint` is **confidently dead** at `now_ms`: an untracked owner ⇒
+    /// dead unless the grace window is active (announce-only deployments have no heartbeats, so
+    /// re-announce is the only takeover mechanism); a tracked owner ⇒ dead iff its heartbeat is past
+    /// the TTL and the grace window is inactive.
     fn owner_confidently_dead(&self, endpoint: &str, now_ms: i64) -> bool {
         let pool = self.node_pool.read().unwrap_or_else(|e| e.into_inner());
         match pool.get(endpoint) {
@@ -2076,28 +2037,22 @@ impl Registry {
     }
 
     /// The deployment's **entitlement usage** (D38/D53, Option A): the number of distinct **live
-    /// nodes that hold ≥1 primary of any index**. This caps *concurrent scale* by node — the scale
-    /// lever that matches the marketed "3 nodes" free tier — never lifetime usage: a windowed index
-    /// accumulating windows on one node costs **one** node forever (the fix for the free-tier "3
-    /// daily windows and the deployment bricks" failure), and packing primaries of many indexes onto
-    /// one node still costs **one**. Read replicas are free (they're never a primary). A node
-    /// **tracked in the pool and stale past the TTL** stops counting (its primaries are about to be
-    /// re-placed, which lands them on a live node — net constant). **Unknown liveness counts** —
-    /// during the grace window, and for owners the pool has never tracked (announce-only deployments
-    /// with no heartbeats) — so the metric fails closed.
+    /// nodes that hold ≥1 primary of any index**. This caps *concurrent scale* by node, never lifetime
+    /// usage: a windowed index accumulating windows on one node costs **one** node forever, and
+    /// packing primaries of many indexes onto one node still costs **one**. Read replicas are free
+    /// (never a primary). A node **tracked in the pool and stale past the TTL** stops counting (its
+    /// primaries are about to be re-placed onto a live node — net constant). **Unknown liveness
+    /// counts** (grace window, or never-tracked announce-only owners) so the metric fails closed.
     pub fn count_entitlement_nodes(&self, now_ms: i64) -> usize {
         let map = self.read_map();
         self.entitlement_nodes(&map, now_ms).len()
     }
 
     /// The set of distinct live **primary-holding node endpoints** behind
-    /// [`count_entitlement_nodes`](Self::count_entitlement_nodes): every node that holds a primary of
-    /// any index, deduped across indexes. A node holding primaries of several indexes counts once;
-    /// replicas never appear; a node tracked in the pool and stale past its TTL drops out, while
-    /// unknown-liveness / grace-window owners are kept (fails closed). Takes the already-held
-    /// `indexes` guard so placement paths can count **inside the same critical section as the
-    /// mutation** (the HA-D3 TOCTOU fix). Takes `node_pool` briefly per owner — that lock is
-    /// independent and never taken in the reverse order.
+    /// [`count_entitlement_nodes`](Self::count_entitlement_nodes), deduped across indexes. Takes the
+    /// already-held `indexes` guard so placement paths can count **inside the same critical section as
+    /// the mutation** (the HA-D3 TOCTOU fix). Takes `node_pool` briefly per owner — an independent
+    /// lock, never taken in the reverse order.
     fn entitlement_nodes(
         &self,
         map: &BTreeMap<String, IndexEntry>,
@@ -2244,9 +2199,9 @@ impl Registry {
     /// [`EntitlementExceeded`](RegistryError::EntitlementExceeded). Re-resolves and dead-owner
     /// re-placement are never entitlement-gated (existing capacity, not new).
     ///
-    /// Errors if the index is unregistered or no node is live (retryable, as before). Re-placing a
-    /// dead owner's unit only moves the *assignment* — the new owner rebuilds that unit's data from
-    /// source / cold tier on demand.
+    /// Errors if the index is unregistered or no node is live (retryable). Re-placing a dead owner's
+    /// unit only moves the *assignment* — the new owner rebuilds that unit's data from source / cold
+    /// tier on demand.
     pub fn resolve_unit_holders(
         &self,
         index: &str,
@@ -2451,11 +2406,9 @@ impl Registry {
     /// — idempotent, entitlement-aware, persist + notify), so quiescent units on a dead node become
     /// available again without waiting for a write. Returns the number of primaries moved.
     ///
-    /// Respects the [liveness grace window](Self::placement_grace_active) (no sweeping while owner
-    /// liveness is unknown) and no-ops on an empty pool. The **caller** gates on leadership (only
-    /// the leader sweeps); a demotion race is still safe — the persist boundary refuses non-leader
-    /// writes (`NotLeader`). Liveness here is the same rule resolve uses: an owner that never
-    /// heartbeats into the pool is only swept once the pool is warmed up past the grace window.
+    /// Respects the [liveness grace window](Self::placement_grace_active) and no-ops on an empty pool.
+    /// The **caller** gates on leadership (only the leader sweeps); a demotion race is still safe — the
+    /// persist boundary refuses non-leader writes (`NotLeader`).
     pub fn sweep_dead_primaries(
         &self,
         replication_factor: usize,
@@ -2487,24 +2440,19 @@ impl Registry {
     }
 
     /// The units that need placement work at `now_ms` — the **placement sweeper's** work-list (HA-D8 /
-    /// 357.26). This is what makes the pool **self-organize**: the operator points N interchangeable
-    /// nodes at the pool (uniform config, no per-node build/primary designation) and the CP distributes
-    /// primaries + replicas over each index's declared units. A unit needs work when:
+    /// 357.26), which lets the pool self-organize over each index's declared units. A unit needs work
+    /// when:
     ///
-    /// - **Hash index** — for every ordinal `0..shard_count` (the declared, bounded unit set): it has
-    ///   no primary yet (**place one**, round-robin least-loaded, so a node need not have pre-built it),
-    ///   or it's placed but has fewer than `R` live holders (**top up replicas** / replace a dead one).
-    /// - **Windowed index** — windows are created on demand (unbounded, time-based; the connector's
-    ///   write-driven resolve places each), so this only **tops up replicas** for windows *already*
-    ///   placed — it never proactively creates a window.
+    /// - **Hash index** — for every ordinal `0..shard_count`: it has no primary yet (**place one**,
+    ///   round-robin least-loaded, so a node need not have pre-built it), or it's placed but has fewer
+    ///   than `R` live holders (**top up replicas** / replace a dead one).
+    /// - **Windowed index** — windows are created on demand by the connector's write-driven resolve,
+    ///   so this only **tops up replicas** for windows *already* placed; it never creates a window.
     ///
-    /// Live-holder count is the primary + replicas whose node still heartbeats. **Cold-start fast
-    /// path:** a *never-placed* unit is placed as soon as the brief
-    /// [initial settle](Self::initial_placement_settling) clears (a few seconds — matching the
-    /// on-demand [`resolve_unit_holders`](Self::resolve_unit_holders), which already places fresh
-    /// units during grace); only *re-placement* / replica top-up of an already-held unit waits out
-    /// the full [grace window](Self::placement_grace_active) (HA-D5 anti-flap). Empty during the
-    /// initial settle (so co-booting nodes register first and primaries place balanced). Read-only.
+    /// Live-holder count is the primary + replicas whose node still heartbeats. A *never-placed* unit
+    /// is placed as soon as the brief [initial settle](Self::initial_placement_settling) clears; only
+    /// *re-placement* / replica top-up of an already-held unit waits out the full
+    /// [grace window](Self::placement_grace_active) (HA-D5 anti-flap). Read-only.
     pub fn units_needing_placement(
         &self,
         replication_factor: usize,
@@ -2554,19 +2502,15 @@ impl Registry {
     /// **Placement sweep** (HA-D8 / 357.26): drive every unit in
     /// [`units_needing_placement`](Self::units_needing_placement) to `R` live holders through the SAME
     /// idempotent path a write-driven resolve takes ([`resolve_unit_holders`](Self::resolve_unit_holders)
-    /// — entitlement-aware, least-loaded, prunes dead replicas, persist + push). This is the pool's
-    /// **self-organization**: it **places a primary** for each declared hash ordinal that has none
-    /// (round-robin across the pool, so a node need not have pre-built it — it builds/loads on
-    /// assignment) and **fills replicas** for placed units, so read HA does not depend on write
-    /// activity and the operator never designates which node owns what. Returns the number of units
-    /// whose holder set changed.
+    /// — entitlement-aware, least-loaded, prunes dead replicas, persist + push). Places a primary for
+    /// each declared hash ordinal that has none and fills replicas for placed units, so read HA does
+    /// not depend on write activity. Returns the number of units whose holder set changed.
     ///
     /// The counterpart to [`sweep_dead_primaries`](Self::sweep_dead_primaries) (which promotes on a
-    /// dead *primary*); this places primaries + fills replicas. Places never-placed primaries once the
-    /// brief initial settle clears, but respects the full grace window for *re-placement*
-    /// ([`units_needing_placement`](Self::units_needing_placement)) and no-ops on an empty pool. The
-    /// **caller** gates on leadership (only the leader sweeps); the persist boundary
-    /// refuses a non-leader write (`NotLeader`), so a demotion race is safe.
+    /// dead *primary*). Places never-placed primaries once the brief initial settle clears, respects
+    /// the full grace window for *re-placement*, and no-ops on an empty pool. The **caller** gates on
+    /// leadership; the persist boundary refuses a non-leader write (`NotLeader`), so a demotion race is
+    /// safe.
     pub fn ensure_placement(
         &self,
         replication_factor: usize,

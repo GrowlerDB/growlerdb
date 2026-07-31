@@ -1,29 +1,21 @@
 package io.growlerdb.connector;
 
 /**
- * Thrown by {@link ConnectorJob#runOnce} when the changelog it read for a trigger window carries
- * <b>fewer rows than the source snapshots in that window committed</b> — an <b>under-read</b>: the
- * changelog scan missed rows a snapshot physically appended. This guard closes a silent row loss
- * under a compaction race: an empty/short window would otherwise jump the in-memory cursor to head
- * and a later batch would stamp a later checkpoint over the gap, making the loss permanent and
- * evidence-erasing.
+ * Thrown by {@link ConnectorJob#runOnce} when a trigger window's changelog carries <b>fewer rows
+ * than its source snapshots committed</b> — an <b>under-read</b>. This guard closes a silent row loss
+ * under a compaction race: an empty/short window would otherwise jump the cursor to head and a later
+ * batch would stamp a checkpoint over the gap, making the loss permanent and evidence-erasing.
  *
- * <p>The expected count is {@code Σ summary['added-records']} over the window's {@code append}
- * snapshots — the source of truth for how many records physically landed — and the observed count is
- * the changelog rows the scan returned. In a healthy scan these are equal for an append window
- * (every appended record surfaces as exactly one INSERT row; the changelog counts physical rows, so
- * even a duplicate primary key — which GrowlerDB later collapses last-write-wins in the engine —
- * appears once per physical append). A shortfall therefore means the scan genuinely dropped rows.
+ * <p>Expected is {@code Σ summary['added-records']} over the window's {@code append} snapshots;
+ * observed is the changelog rows the scan returned. For a healthy append window these are equal
+ * (every appended record surfaces as exactly one INSERT row), so a shortfall means the scan dropped
+ * rows.
  *
- * <p>Throwing here means the cursor does <b>not</b> advance: the trigger fails, the streaming query
- * restarts, and the connector re-reads the same window from the Node's durable checkpoint. A
- * transient scan race self-heals on the re-read; a persistent mismatch stays a loud, visible stall
- * instead of permanent silent loss. The gate applies only to windows composed of {@code append}
- * (and layout-only {@code replace}/compaction) snapshots — the changelog scan skips {@code replace}
- * snapshots and every append row is an INSERT, so the count is exact. Windows containing
- * {@code overwrite}/{@code delete} snapshots (row-level updates/deletes, where the changelog's net
- * diff legitimately diverges from physical {@code added-records}) are exempt; the systematic backstop
- * there is the reconcile job.
+ * <p>Throwing does <b>not</b> advance the cursor: the trigger fails, the streaming query restarts,
+ * and the connector re-reads the window from the Node's durable checkpoint — a transient scan race
+ * self-heals, a persistent mismatch stays a loud stall. The gate applies only to append (and
+ * layout-only {@code replace}) windows where the count is exact; {@code overwrite}/{@code delete}
+ * windows are exempt (the reconcile job is the backstop there).
  */
 public final class IngestUnderReadException extends RuntimeException {
 

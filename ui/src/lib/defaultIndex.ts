@@ -1,13 +1,9 @@
 /** Pick the index the Search screen opens on, in preference order:
- *
- *   1. the user's last chosen index, if it still exists (their explicit choice wins);
- *   2. the deployment's configured default index (`GROWLERDB_DEFAULT_INDEX` → `/v1/config`), if it
- *      exists — a deployment points the console at its front door (the demo → `movies`, which has a
- *      VECTOR field, so semantic/hybrid search is one click from a fresh visitor);
+ *   1. the user's last chosen index, if it still exists;
+ *   2. the deployment's configured default (`GROWLERDB_DEFAULT_INDEX` → `/v1/config`), if it exists;
  *   3. the first available index.
  *
- * Returns `''` when there are no indexes — a single-index endpoint with no control plane fronted,
- * where the caller leaves the scope empty to use the served default.
+ * Returns `''` when there are no indexes, so the caller leaves the scope empty to use the served default.
  */
 export function pickDefaultIndex(
   available: string[],

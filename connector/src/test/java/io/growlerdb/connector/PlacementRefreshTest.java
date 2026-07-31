@@ -20,12 +20,9 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 /**
- * HA-E1 (hash path): placement must be re-resolved from the control plane on every stream
- * restart, not once per process. {@link ConnectorApp#cpResolvedWriterFactory} re-reads the CURRENT
- * shard→node map per call, and {@link ConnectorApp#rebuildWriter} swaps the writer in the restart
- * loop — so after a CP re-placement the connector recovers onto the new primary instead of
- * hammering the deposed endpoint forever (or, worse, silently committing to an alive-but-deposed
- * node reads no longer look at).
+ * HA-E1 (hash path): placement must be re-resolved from the control plane on every stream restart,
+ * not once per process — so after a CP re-placement the connector recovers onto the new primary
+ * instead of hammering the deposed endpoint (or silently committing to an alive-but-deposed node).
  */
 class PlacementRefreshTest {
 

@@ -23,7 +23,6 @@ class SearchClientTest {
   @Test
   void searchForwardsTheQueryAndReturnsHits() throws Exception {
     AtomicReference<SearchRequest> seen = new AtomicReference<>();
-    // A fake Search service: record the request, return one keyed, scored hit.
     Server server =
         ServerBuilder.forPort(0)
             .addService(
@@ -54,7 +53,6 @@ class SearchClientTest {
       // The query + limit reached the Node verbatim (boolean retrieval runs server-side).
       assertEquals("body:error", seen.get().getQuery());
       assertEquals(25, seen.get().getLimit());
-      // ...and the keyed, scored hit came back for the join.
       assertEquals(1, hits.size());
       assertEquals(
           "d1", hits.get(0).getCoordinates().getIdentifier(0).getValue().getStr());

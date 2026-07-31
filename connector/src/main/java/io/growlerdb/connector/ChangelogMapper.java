@@ -28,10 +28,8 @@ import java.util.Set;
  *       so they must not be read as a flood of delete+insert.
  * </ul>
  *
- * Rows are processed in commit order by {@code _change_ordinal} (Iceberg assigns it
- * per snapshot in commit sequence — unlike the snapshot id, which is a random long)
- * with <b>last-write-wins per key</b>, so an UPDATE_BEFORE+UPDATE_AFTER pair
- * collapses to a single upsert.
+ * Rows are processed in commit order by {@code _change_ordinal} with <b>last-write-wins per key</b>,
+ * so an UPDATE_BEFORE+UPDATE_AFTER pair collapses to a single upsert.
  */
 public final class ChangelogMapper {
 
@@ -70,9 +68,8 @@ public final class ChangelogMapper {
   /**
    * Reduce a changelog window, additionally stamped with the connector's {@code safeCheckpoint}
    * resume floor (the min committed checkpoint across shards this trigger resumed from; {@code null}
-   * = none yet). The Node prunes idempotency records at/below it — those batches can never be
-   * re-sent. The floor is the same for every sub-batch of a trigger (unlike {@code from}, which is
-   * this window's start), and always {@code <=} every shard's checkpoint, so pruning stays sound.
+   * = none yet). The Node prunes idempotency records at/below it; the floor is always {@code <=}
+   * every shard's checkpoint, so those batches can never be re-sent and pruning stays sound.
    */
   public DocBatch toBatch(
       List<ChangelogRow> rows,
@@ -80,10 +77,8 @@ public final class ChangelogMapper {
       SourceCheckpoint checkpoint,
       String batchId,
       SourceCheckpoint safeCheckpoint) {
-    // `_change_ordinal` is assigned in commit order (all changes from one snapshot
-    // share an ordinal), so it — NOT the snapshot id, which is a random long — is the
-    // chronological key. Within an ordinal, order deletes before upserts so an
-    // UPDATE_BEFORE+UPDATE_AFTER pair collapses to the AFTER state under LWW.
+    // Sort by `_change_ordinal` (commit order — NOT the random snapshot id); within an ordinal,
+    // deletes before upserts so an UPDATE_BEFORE+UPDATE_AFTER pair collapses to AFTER under LWW.
     List<ChangelogRow> ordered = new ArrayList<>(rows);
     ordered.sort(
         Comparator.comparingLong((ChangelogRow r) -> r.changeOrdinal)

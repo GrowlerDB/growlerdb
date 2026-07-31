@@ -2,8 +2,7 @@
 //!
 //! GrowlerDB is an open-source **retrieval engine** — full-text, vector & hybrid search over your
 //! data (Apache Iceberg today; more sources on the roadmap). This crate holds the vocabulary the
-//! other crates build on; types
-//! are fleshed out as the M0 walking-skeleton tasks land (see the project backlog).
+//! other crates build on.
 
 pub mod api;
 pub mod doc;
@@ -60,7 +59,7 @@ pub fn startup_banner() -> String {
     )
 }
 
-/// GrowlerDB's top-level error. Variants are added as functionality lands.
+/// GrowlerDB's top-level error.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// A feature that is planned but not yet implemented.

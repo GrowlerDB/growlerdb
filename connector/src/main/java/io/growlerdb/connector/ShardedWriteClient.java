@@ -29,11 +29,10 @@ public final class ShardedWriteClient implements BatchWriter {
   /** Fills in sequence numbers the Nodes don't have at resume time. */
   private final SnapshotLineage lineage;
   /**
-   * The index every sub-batch AND checkpoint call is tagged with, so a **pool node** serving many
+   * The index every sub-batch AND checkpoint call is tagged with, so a pool node serving many
    * indexes over one endpoint can dispatch on its {@code (index, shard)} selector — resume asks the
-   * same selector the writes land on. Empty = the node's sole served index (a per-index sharded
-   * Node ignores it), so untagged single-index deployments are unchanged — the hash counterpart to
-   * {@link WindowedWriteClient}'s per-index tagging.
+   * same selector the writes land on. Empty = the node's sole served index (a per-index sharded Node
+   * ignores it). The hash counterpart to {@link WindowedWriteClient}'s per-index tagging.
    */
   private final String index;
 
@@ -67,10 +66,9 @@ public final class ShardedWriteClient implements BatchWriter {
       throw new IllegalArgumentException(
           "router covers " + router.shards() + " shards but got " + endpoints.size() + " endpoints");
     }
-    // Validate + parse EVERY endpoint before opening any channel: a `new WriteClient`
-    // eagerly opens a gRPC channel, so a malformed later endpoint throwing mid-loop would leak the
-    // channels of the ones already created. Parsing first means we only start connecting once all
-    // endpoints are known-good.
+    // Validate + parse EVERY endpoint before opening any channel: a `new WriteClient` eagerly opens
+    // a gRPC channel, so a malformed later endpoint throwing mid-loop would leak the channels
+    // already created.
     record HostPort(String host, int port) {}
     List<HostPort> parsed = new ArrayList<>(endpoints.size());
     for (String endpoint : endpoints) {
@@ -86,14 +84,13 @@ public final class ShardedWriteClient implements BatchWriter {
       }
       parsed.add(new HostPort(hp[0].trim(), port));
     }
-    // Tag each shard client with the index so EVERY call — writes and the resume/drain
-    // checkpoints alike — carries the (index, shard) selector: a pool node serving several indexes
-    // rejects an untagged GetCheckpoint as ambiguous, which would crash-loop resume.
+    // Tag each shard client with the index so EVERY call — writes and resume/drain checkpoints
+    // alike — carries the (index, shard) selector: a pool node serving several indexes rejects an
+    // untagged GetCheckpoint as ambiguous, which would crash-loop resume.
     List<WriteClient> clients = new ArrayList<>(parsed.size());
     for (int ordinal = 0; ordinal < parsed.size(); ordinal++) {
       HostPort hp = parsed.get(ordinal);
-      // Tag each client with its ordinal so a hash pool node dispatches its writes/checkpoints to
-      // the right ordinal shard (endpoints are in ordinal order — the router indexes them the same).
+      // Tag with the ordinal too (endpoints are in ordinal order — the router indexes them the same).
       clients.add(new WriteClient(hp.host(), hp.port(), index, ordinal));
     }
     this.shards = List.copyOf(clients);
@@ -110,22 +107,22 @@ public final class ShardedWriteClient implements BatchWriter {
     for (int ordinal = 0; ordinal < perShard.size(); ordinal++) {
       final int shard = ordinal;
       final DocBatch sub = perShard.get(shard);
-      // Send EVERY sub-batch, including empties. A window that routed no rows to a shard
-      // still advances that shard's checkpoint (a no-op commit on the Node), keeping all shards in
-      // lockstep at the trigger head. Skipping empties lets shards drift — which inflates the
-      // min-checkpoint resume re-read AND breaks the Node's continuity guard, whose `from ==
-      // current` invariant only holds when every shard tracks the same source position.
+      // Send EVERY sub-batch, including empties: an empty still advances that shard's checkpoint (a
+      // no-op commit), keeping all shards in lockstep at the trigger head. Skipping empties lets
+      // shards drift — inflating the min-checkpoint resume re-read AND breaking the Node's continuity
+      // guard, whose `from == current` invariant only holds when every shard tracks the same source
+      // position.
       writes.add(
           () -> {
             long snapshot = shards.get(shard).write(sub, index);
-            // Per-shard ack metric: a shard whose acks stall relative to its siblings is the tell
-            // for a partial-landing loss signature. Recorded on success only.
+            // Per-shard ack metric (success only): a shard whose acks stall relative to its siblings
+            // is the tell for a partial-landing loss signature.
             ConnectorMetrics.recordShardAck(shard);
             return snapshot;
           });
     }
-    // Concurrent fan-out with a join-all barrier: the slowest shard bounds the batch,
-    // and no next batch starts until every shard settled this one (per-shard order preserved).
+    // Concurrent fan-out with a join-all barrier: the slowest shard bounds the batch, and no next
+    // batch starts until every shard settled this one (per-shard order preserved).
     return fanOut.maxSnapshot(writes);
   }
 
@@ -152,14 +149,13 @@ public final class ShardedWriteClient implements BatchWriter {
               .addAllOps(perShard.get(ordinal))
               .setCheckpoint(batch.getCheckpoint())
               .setBatchId(batch.getBatchId() + "#s" + ordinal);
-      // Carry `from` onto each sub-batch so every shard's continuity guard sees the
-      // window's resume point; all shards resume from the same source position.
+      // Carry `from` onto each sub-batch so every shard's continuity guard resumes from the same
+      // source position.
       if (batch.hasFromCheckpoint()) {
         sub.setFromCheckpoint(batch.getFromCheckpoint());
       }
       // Carry the resume FLOOR too so each shard prunes idempotency records it can never be re-sent.
-      // It's the same across shards — the min committed checkpoint the connector resumes
-      // the whole cluster from — so each shard's local prune stays sound.
+      // Same across shards (the cluster's min committed checkpoint), so each local prune stays sound.
       if (batch.hasSafeCheckpoint()) {
         sub.setSafeCheckpoint(batch.getSafeCheckpoint());
       }
@@ -176,10 +172,9 @@ public final class ShardedWriteClient implements BatchWriter {
    * window-covering guard no-ops them by position) and misses nothing on the shard that lagged.
    * {@code null} on any shard ⇒ start from the beginning (that shard has committed nothing yet).
    *
-   * <p>Sequence numbers come from the Nodes' stored checkpoints, backfilled from the table's
-   * own metadata ({@link SnapshotLineage}) for stored values that lack one. Only when a divergent
-   * snapshot is unknown everywhere (expired + never stamped) does this degrade to the numeric
-   * min — the fallback, with a loud warning.
+   * <p>Sequence numbers come from the Nodes' stored checkpoints, backfilled from the table's own
+   * metadata ({@link SnapshotLineage}). Only when a divergent snapshot is unknown everywhere
+   * (expired + never stamped) does this degrade to the numeric min, with a loud warning.
    */
   @Override
   public Long checkpointSnapshotId() {
@@ -265,8 +260,8 @@ public final class ShardedWriteClient implements BatchWriter {
   public void close() throws InterruptedException {
     InterruptedException first = null;
     try {
-      // Drain the fan-out pool before tearing channels down so no in-flight write loses its
-      // channel mid-RPC.
+      // Drain the fan-out pool before tearing channels down so no in-flight write loses its channel
+      // mid-RPC.
       fanOut.close();
     } catch (InterruptedException e) {
       first = e;

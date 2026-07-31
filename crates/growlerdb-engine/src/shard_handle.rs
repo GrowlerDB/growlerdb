@@ -1,13 +1,6 @@
-//! [`ShardHandle`] — a live, **swappable** handle to a Node's shard (the
-//! reindex foundation). Every Node service reads the current shard through
-//! [`current`](ShardHandle::current); a reindex atomically replaces it with
-//! [`swap`](ShardHandle::swap). A request that already loaded the `Arc<Shard>` keeps reading
-//! it through completion, so a swap never tears an in-flight search — and open PITs on the
-//! retired shard stay valid until their readers release it.
-//!
-//! Backed by an `RwLock<Arc<Shard>>`: reads only clone the `Arc` under a brief read lock,
-//! and swaps are rare, so the lock is not a contention point (a lock-free `arc-swap` would
-//! be an over-optimization here).
+//! [`ShardHandle`] — a live, **swappable** handle to a Node's shard. Services read through
+//! [`current`](ShardHandle::current); a reindex atomically replaces it with [`swap`](ShardHandle::swap).
+//! A request holding the `Arc<Shard>` reads to completion, so a swap never tears an in-flight search.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -17,10 +10,9 @@ use growlerdb_index::Shard;
 /// Shared inner state: the swappable shard plus a search counter.
 struct Inner {
     shard: RwLock<Arc<Shard>>,
-    /// Searches served — the pre-warm signal. Bumped **only** by the
-    /// search path via [`record_search`](ShardHandle::record_search) — NOT by every `current()`,
-    /// which every service (suggest/lookup/admin/health) calls, so the promotion decision reflects
-    /// real query load rather than incidental access.
+    /// Searches served — the pre-warm signal. Bumped **only** by the search path
+    /// ([`record_search`](ShardHandle::record_search)), not incidental `current()` calls, so promotion
+    /// reflects real query load.
     searches: AtomicU64,
 }
 
@@ -38,11 +30,8 @@ impl ShardHandle {
         }))
     }
 
-    /// The shard currently live, as an owned `Arc` (clones under a brief read lock). Hold
-    /// the returned `Arc` for the duration of a request so a concurrent [`swap`] can't pull
-    /// the shard out from under it.
-    ///
-    /// [`swap`]: Self::swap
+    /// The shard currently live, as an owned `Arc`. Hold it for the duration of a request so a
+    /// concurrent [`swap`](Self::swap) can't pull the shard out from under it.
     pub fn current(&self) -> Arc<Shard> {
         self.0
             .shard
@@ -51,8 +40,8 @@ impl ShardHandle {
             .clone()
     }
 
-    /// Record one search against this shard — the pre-warm signal. Called by the
-    /// search path only, so a cold window is promoted for real query load, not describe/health traffic.
+    /// Record one search — the pre-warm signal. Search path only, so promotion reflects real query
+    /// load, not describe/health traffic.
     pub fn record_search(&self) {
         self.0.searches.fetch_add(1, Ordering::Relaxed);
     }
@@ -178,7 +167,7 @@ mod tests {
         let handle = ShardHandle::new(shard_with(tmp.path(), &["1"]));
         assert_eq!(handle.search_count(), 0);
         for _ in 0..5 {
-            let _ = handle.current(); // non-search access must NOT bump the signal
+            let _ = handle.current();
         }
         assert_eq!(handle.search_count(), 0);
         for _ in 0..3 {

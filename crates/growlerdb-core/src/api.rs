@@ -1,11 +1,7 @@
-//! The minimal in-process **Index API** ([Design 02]) — the seam that the write
-//! path (ingest) and read path (engine) depend on, with storage behind it.
-//!
-//! A single in-process shard, no gRPC, no admin/compaction.
-//! The traits live here in `growlerdb-core` so the engine can be written against the
-//! seam while `growlerdb-index` provides the [`LocalIndexStore`] implementation. The
-//! vocabulary types ([`Snapshot`], [`RowLocator`], [`CommitBatch`], [`Hit`], …)
-//! live here for the same reason.
+//! The minimal in-process **Index API** ([Design 02]): the seam the write (ingest) and
+//! read (engine) paths depend on. The traits and vocabulary types ([`Snapshot`],
+//! [`RowLocator`], [`CommitBatch`], [`Hit`], …) live in `growlerdb-core` so the engine builds
+//! against the seam while `growlerdb-index` provides [`LocalIndexStore`].
 //!
 //! [Design 02]: ../../../okf/system/storage/index-store.md
 //! [`LocalIndexStore`]: ../../growlerdb_index/store/struct.LocalIndexStore.html

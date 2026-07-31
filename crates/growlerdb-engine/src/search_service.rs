@@ -1,7 +1,6 @@
-//! The Node **Search** gRPC service ([Design 01]) — the read side of the Engine
-//! API. Adapts the in-process [`IndexReader`] (query execution over the local index)
-//! to the wire `Search` service, returning ranked document
-//! **coordinates** + scores. Hydration of the authoritative rows is a follow-up.
+//! The Node **Search** gRPC service ([Design 01]) — the read side of the Engine API. Adapts the
+//! in-process index reader to the wire `Search` service, returning ranked document coordinates +
+//! scores.
 //!
 //! [Design 01]: ../../../okf/product/interfaces/grpc.md
 
@@ -29,10 +28,9 @@ use crate::shard_handle::ShardHandle;
 /// leaves `page_size` at 0.
 const DEFAULT_EXPORT_PAGE_SIZE: usize = 1000;
 
-/// Hard `offset+limit` (and suggest `limit`) ceiling enforced by the Node services.
-/// The Gateway caps page fetches, but a Node is directly reachable in distributed mode, so it must
-/// self-defend against an unbounded `limit` that would build a giant top-k and OOM the process.
-/// Matches the Gateway's default `max_fetch`.
+/// Hard `offset+limit` (and suggest `limit`) ceiling enforced by the Node services. A Node is
+/// directly reachable in distributed mode, so it self-defends against an unbounded `limit` that
+/// would build a giant top-k and OOM the process. Matches the Gateway's default `max_fetch`.
 pub(crate) const MAX_NODE_FETCH: usize = 10_000;
 
 /// A `Search` service over one shard. Query execution is blocking (Tantivy + redb),
@@ -43,44 +41,34 @@ pub struct SearchService {
     shard: ShardHandle,
     auth: SharedAuth,
     /// Node-wide admission for the HEAVY read ops (`export`, `aggregate` — full scans on the blocking
-    /// pool). Defaults to the process-wide semaphore ([`heavy_reads`]) so every service on this node
-    /// shares ONE budget; saturation load-sheds with `RESOURCE_EXHAUSTED` rather than queueing
-    /// unbounded blocking work.
+    /// pool). Defaults to the process-wide [`heavy_reads`] semaphore so every service shares ONE
+    /// budget; saturation load-sheds with `RESOURCE_EXHAUSTED`.
     heavy: Arc<tokio::sync::Semaphore>,
-    /// Per-**index** soft heavy-read share, checked *after* the global permit is acquired. On a
-    /// universal-pool node co-resident indexes share one process (D52), so this keeps a flood of
-    /// exports/aggregations on one index from starving a co-tenant's — while staying
-    /// **work-conserving**: an index may exceed its share into globally free capacity (see
-    /// [`IndexHeavyShare`]). Default is a non-binding solo share (a lone index is bounded by
-    /// [`heavy`](Self::heavy) alone — no behavior change); the pool builder
-    /// ([`with_index_heavy_share`](Self::with_index_heavy_share)) gives every service of one index
-    /// the same shared [`IndexHeavyShare`].
+    /// Per-**index** soft heavy-read share, checked *after* the global permit (D52 pool fairness):
+    /// keeps a flood on one index from starving a co-tenant, while staying work-conserving — an index
+    /// may exceed its share into globally free capacity (see [`IndexHeavyShare`]). Default is a
+    /// non-binding solo share; [`with_index_heavy_share`](Self::with_index_heavy_share) installs the
+    /// shared one on a pool node.
     heavy_index: Arc<IndexHeavyShare>,
 }
 
-/// A **work-conserving** per-index share of the node-wide heavy-read budget (D52 pool fairness,
-/// 357.25). One instance is shared by every service of one index on a pool node; it tracks that
-/// index's in-flight heavy reads and admits by a **soft** fair share:
+/// A **work-conserving** per-index share of the node-wide heavy-read budget (D52 pool fairness).
+/// Shared by every service of one index on a pool node; admits by a **soft** fair share:
 ///
-/// - **Below its share** (`node_cap / live_indexes`, ≥1) an index always admits — a co-tenant's
-///   overflow can never hold it out, because overflow (below) leaves a reserve free.
+/// - **Below its share** (`node_cap / live_indexes`, ≥1) an index always admits.
 /// - **Above its share** it may still admit — overflow into *globally free* capacity — but only
-///   while the acquisition leaves at least one free global permit per *other* live index
-///   (`live_indexes - 1`). So a single index alone on the node uses the full node budget, an idle
-///   co-tenant's unused slice isn't withheld from a busy index (a multi-window aggregate's
-///   per-window sub-requests no longer self-shed on an idle node), and under contention the
-///   flooding index is shed above-share as permits free, letting a below-share index climb to its
-///   share.
+///   while the acquisition leaves one free global permit per *other* live index (`live_indexes - 1`),
+///   so overflow can't hold a below-share co-tenant out.
 ///
-/// The share denominator is the **live** served index set — an [`AtomicUsize`] owned by the pool
-/// dispatch layer and updated as assignments change (D53) — not a boot-time constant.
-/// Hard capacity stays the node-wide semaphore; this share never admits beyond it.
+/// The share denominator is the **live** served index set (an [`AtomicUsize`] updated by the pool
+/// dispatch layer as assignments change, D53), not a boot-time constant. Hard capacity stays the
+/// node-wide semaphore; this share never admits beyond it.
 #[derive(Debug)]
 pub struct IndexHeavyShare {
     /// The node-wide heavy-read cap the shares divide (must match the global semaphore's size).
     node_cap: usize,
-    /// Live count of indexes served by this process — the share denominator, updated by the pool
-    /// dispatch/reconcile layer as the served index set changes.
+    /// The share denominator: live count of indexes served by this process, updated by the pool
+    /// dispatch layer as the served set changes.
     live_indexes: Arc<AtomicUsize>,
     /// This index's heavy reads currently in flight (admitted through this share).
     in_flight: AtomicUsize,
@@ -189,9 +177,8 @@ impl SearchService {
     }
 
     /// Give this service a shared **per-index** heavy-read share (D52 pool fairness): every service
-    /// of one index on a pool node passes the same [`IndexHeavyShare`], so that index is held to its
-    /// soft fair share of the node budget — it can't starve a co-resident index, yet may overflow
-    /// into globally free capacity (work-conserving). See [`heavy_index`](Self::heavy_index).
+    /// of one index passes the same [`IndexHeavyShare`], holding that index to its soft fair share
+    /// of the node budget while staying work-conserving. See [`heavy_index`](Self::heavy_index).
     pub fn with_index_heavy_share(mut self, index_share: Arc<IndexHeavyShare>) -> Self {
         self.heavy_index = index_share;
         self
@@ -215,12 +202,10 @@ impl SearchService {
         }
     }
 
-    /// Admit one heavy read (export/aggregate): take a node-wide permit — the hard capacity —
-    /// then check the per-**index** soft share ([`IndexHeavyShare`]): below its share an index
-    /// always admits; above it, only into globally free capacity beyond the reserve for other
-    /// indexes. A soft-share shed drops the just-acquired global permit (RAII — no leak). Both
-    /// halves are held together for the op's lifetime; dropping the returned [`HeavyPermit`]
-    /// releases both. Load-sheds with `RESOURCE_EXHAUSTED`.
+    /// Admit one heavy read (export/aggregate): take a node-wide permit (hard capacity), then check
+    /// the per-**index** soft share ([`IndexHeavyShare`]). A soft-share shed drops the just-acquired
+    /// global permit (RAII — no leak). Dropping the returned [`HeavyPermit`] releases both halves.
+    /// Load-sheds with `RESOURCE_EXHAUSTED`.
     fn admit_heavy(&self) -> Result<HeavyPermit, Status> {
         let global = self
             .heavy
@@ -270,8 +255,8 @@ impl Search for SearchService {
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         auth::authorize(&self.auth, "Search", &request)?;
-        // Cold-window pre-warm signal: count real searches, so a promoted-when-hot
-        // decision reflects query load, not incidental `current()` calls from other services.
+        // Count real searches so a cold window's promote-when-hot decision reflects query load,
+        // not incidental `current()` calls from other services.
         self.shard.record_search();
         let tenant = auth::tenant_of(&request);
         let req = request.into_inner();
@@ -305,10 +290,8 @@ impl Search for SearchService {
             Some(decode_cursor(&req.search_after).map_err(invalid)?)
         };
         let offset = req.offset as usize;
-        // Page-fetch ceiling at the Node too: the Gateway caps `offset+limit`, but
-        // the Node is a real endpoint (RemoteNode connects directly to it in distributed mode), so a
-        // direct RPC with a giant `limit` would build an enormous top-k and OOM the Node, bypassing
-        // the Gateway guard. Mirror the Gateway's default ceiling here.
+        // Page-fetch ceiling at the Node too: a direct RPC (RemoteNode in distributed mode) bypasses
+        // the Gateway's `offset+limit` guard, so a giant `limit` could OOM the Node.
         if offset.saturating_add(k) > MAX_NODE_FETCH {
             return Err(invalid(format!(
                 "offset+limit ({}) exceeds the maximum page fetch ({MAX_NODE_FETCH})",
@@ -317,8 +300,7 @@ impl Search for SearchService {
         }
         let collapse = req.collapse;
         let pit_id = req.pit_id;
-        // Server-side highlighting opt-in: present only when the client asked for it.
-        // Non-highlightable field names are dropped downstream, not rejected here.
+        // Highlighting opt-in; non-highlightable field names are dropped downstream, not rejected.
         let highlight = req
             .highlight
             .map(|h| Highlight::new(h.fields, h.max_fragments as usize, h.fragment_size as usize));
@@ -397,14 +379,11 @@ impl Search for SearchService {
         Ok(Response::new(resp))
     }
 
-    /// **Semantic (KNN) search** over a VECTOR field — the node-side arm of the
-    /// authenticated gateway's semantic/hybrid search. The query arrives as *text*: this Node
-    /// embeds it with the vector field's configured embedder (the same [`embedder_for`] factory
-    /// ingest uses, so the query shares the documents' embedding space — no ML model at the
-    /// Gateway), builds a top-level [`Query::Knn`], and returns the nearest documents' coordinates
-    /// + KNN scores. Tenant scoping is enforced **fail-closed**: on a tenant-scoped index the
-    /// caller must present a verified claim (else `PermissionDenied`), injected *inside* the KNN
-    /// filter so no query-widening can escape it.
+    /// **Semantic (KNN) search** over a VECTOR field. The query arrives as *text*: this Node embeds
+    /// it with the vector field's configured embedder (the same [`embedder_for`] factory ingest
+    /// uses, so query and documents share one embedding space), runs a [`Query::Knn`], and returns
+    /// the nearest coordinates + scores. Tenant scoping is fail-closed: a scoped index requires a
+    /// verified claim, injected *inside* the KNN filter so no query-widening can escape it.
     ///
     /// [`embedder_for`]: growlerdb_embed::embedder_for
     #[tracing::instrument(name = "node.semantic_search", skip_all, err)]
@@ -413,8 +392,7 @@ impl Search for SearchService {
         request: Request<SemanticSearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         auth::authorize(&self.auth, "Search", &request)?;
-        // Count a semantic search as query load too, so a cold window's promote-when-hot decision
-        // reflects it (mirrors the lexical path).
+        // Count as query load too (mirrors the lexical path's promote-when-hot signal).
         self.shard.record_search();
         let tenant = auth::tenant_of(&request);
         let req = request.into_inner();
@@ -422,16 +400,14 @@ impl Search for SearchService {
             |e: String| to_status(Code::InvalidArgument, WireError::new("INVALID_ARGUMENT", e));
 
         let k = req.k as usize;
-        // Opt-in reranking (D21): reorder the retrieved top-K by a cross-encoder before returning.
-        // When set, over-fetch a `rerank_top_k` candidate pool (default: exactly `k`), rerank it,
-        // and return the top `k`. Off by default (retrieval-first).
+        // Opt-in reranking (D21): over-fetch a `rerank_top_k` candidate pool, rerank by a
+        // cross-encoder, return the top `k`. Off by default.
         let rerank = req.rerank;
         let rerank_top_k = req.rerank_top_k as usize;
         // The KNN fetch depth: the rerank candidate pool when reranking, else just `k`.
         let fetch = if rerank { rerank_top_k.max(k) } else { k };
-        // Self-defend against an unbounded fetch the same way the lexical path guards `offset+limit`:
-        // a direct Node RPC bypasses the Gateway ceiling, so a giant `k` (or rerank pool) would
-        // build an enormous top-k and OOM the process.
+        // Self-defend against an unbounded fetch (like the lexical path): a direct Node RPC bypasses
+        // the Gateway ceiling, so a giant `k` could OOM the process.
         if fetch > MAX_NODE_FETCH {
             return Err(invalid(format!(
                 "fetch ({fetch}) exceeds the maximum page fetch ({MAX_NODE_FETCH})"
@@ -448,11 +424,9 @@ impl Search for SearchService {
         // Keep the raw query text for reranking (the embed step below consumes a copy).
         let query_text = req.query_text.clone();
 
-        // Embed the query text with the SAME factory ingest uses (real BGE when provisioned, else
-        // the deterministic hash fallback) — the query and the stored document vectors must come
-        // from one model or KNN compares across incompatible spaces. The fallback is flagged in
-        // the response: hash-vs-hash (dev/CI) is legitimate, but a hash query against real-model
-        // document vectors returns meaningless neighbors, and the caller can't tell without a flag.
+        // Embed with the SAME factory ingest uses — query and document vectors must come from one
+        // model or KNN compares across incompatible spaces. The dev hash fallback is flagged in the
+        // response: a hash query against real-model doc vectors returns meaningless neighbors.
         let embedder = growlerdb_embed::embedder_for(&spec);
         let mut warnings = Vec::new();
         if embedder.is_dev_fallback() {
@@ -635,9 +609,8 @@ impl Search for SearchService {
                 },
             })
             .collect();
-        // Cap like every other paged endpoint (`MAX_NODE_FETCH`): an unclamped `u32::MAX`
-        // page would build a ~4-billion-entry top-k in one page — an OOM, not a big export.
-        // Export still streams the FULL result set; the cap only bounds one page's memory.
+        // Cap one page like every paged endpoint (`MAX_NODE_FETCH`): a `u32::MAX` page would build a
+        // ~4-billion-entry top-k (OOM). Export still streams the FULL set; the cap bounds page memory.
         let page_size = if req.page_size == 0 {
             DEFAULT_EXPORT_PAGE_SIZE
         } else {
@@ -646,8 +619,7 @@ impl Search for SearchService {
         let given_pit = req.pit_id;
 
         // Admission: an export is a full scan holding a PIT + blocking-pool time for its whole
-        // stream — take a heavy-read permit (per-index share + node-wide, held until the stream
-        // finishes) or load-shed now with an honest retry signal.
+        // stream — take a heavy-read permit (held until the stream finishes) or load-shed now.
         let permit = self.admit_heavy()?;
         // Stream pages from a blocking task over a bounded channel (backpressure: the
         // producer parks on `blocking_send` until the client drains).
@@ -741,8 +713,8 @@ impl Search for SearchService {
         // Tantivy, so bad input is a clear InvalidArgument, not an opaque Internal.
         growlerdb_core::validate_aggs(&aggs).map_err(invalid)?;
 
-        // Admission: an aggregation scans every matching doc's fast fields on the blocking
-        // pool — same heavy-read budget as export (per-index share + node-wide, held through the run).
+        // Admission: an aggregation scans every matching doc's fast fields on the blocking pool —
+        // same heavy-read budget as export.
         let _permit = self.admit_heavy()?;
         let shard = self.shard.current();
         // Tenant scoping: aggregations over another tenant's rows would leak counts/
@@ -797,11 +769,9 @@ fn tenant_scope(shard: &Shard, query: Query, tenant: Option<&str>) -> Result<Que
 }
 
 /// Apply **tenant scoping** to a [`Knn`](Query::Knn) read — the KNN analogue of [`tenant_scope`].
-/// If `shard` is tenant-scoped, the request must carry a verified `tenant` claim, and the
-/// mandatory `tenant_field = tenant` Term is AND-ed *inside* the KNN's filter (via
-/// [`with_knn_filter`](Query::with_knn_filter)), where the neighbor set is intersected with it —
-/// the caller can neither read nor widen past it. A tenant-scoped index with no claim is refused
-/// (`PermissionDenied`) — fail closed. Unscoped indexes pass through unchanged.
+/// The mandatory `tenant_field = tenant` Term is AND-ed *inside* the KNN's filter (via
+/// [`with_knn_filter`](Query::with_knn_filter)), where the neighbor set is intersected with it. A
+/// scoped index with no claim is refused (`PermissionDenied`) — fail closed.
 fn tenant_scope_knn(shard: &Shard, query: Query, tenant: Option<&str>) -> Result<Query, Status> {
     let Some(field) = shard.tenant_field() else {
         return Ok(query);
@@ -989,10 +959,8 @@ fn store_status(e: StoreError) -> Status {
             Code::FailedPrecondition,
             WireError::new("PIT_EXPIRED", e.to_string()),
         ),
-        // Query-validation failures are the client's fault — an unknown/non-searchable field, a bad
-        // query shape, no default field, or a cost-guarded pattern — so they're `InvalidArgument`
-        // (HTTP 400), not `Internal` (500). Mirrors the suggest service. (A single-shard Gateway
-        // forwards this code verbatim; see `gateway::search_inner`.)
+        // Query-validation failures are the client's fault (unknown field, bad query shape, no
+        // default field, cost-guarded pattern) — `InvalidArgument` (400), not `Internal` (500).
         StoreError::Segment(
             ref inner @ (IndexError::UnknownField(_)
             | IndexError::QueryType(_)

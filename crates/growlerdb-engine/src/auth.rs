@@ -1,7 +1,6 @@
-//! The **auth seam**: a pluggable authorization hook the gRPC/REST services consult
-//! before serving a request, plus the request context it inspects. The default
-//! [`AllowAll`] permits everything so the services are written against the seam and a
-//! deployment can drop in policy (OIDC/JWT/RBAC + tenant scoping) later.
+//! The **auth seam**: a pluggable authorization hook the gRPC/REST services consult before serving
+//! a request, plus the request context it inspects. The default [`AllowAll`] permits everything, so
+//! services are written against the seam and a deployment drops in policy (RBAC + tenant scoping) later.
 
 use std::sync::Arc;
 

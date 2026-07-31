@@ -83,7 +83,7 @@ public final class ShardGroupWriteClient implements BatchWriter {
           throw new IllegalArgumentException("endpoint must be host:port, got `" + endpoint + "`");
         }
         // Tagged with the index AND this ordinal so writes + resume/drain checkpoints carry the
-        // full (index, shard) selector a hash pool node dispatches on — see ShardedWriteClient.
+        // full (index, shard) selector a hash pool node dispatches on.
         byOrdinal.put(
             ordinal, new WriteClient(hp[0].trim(), Integer.parseInt(hp[1].trim()), index, ordinal));
       }
@@ -96,8 +96,8 @@ public final class ShardGroupWriteClient implements BatchWriter {
 
   @Override
   public long write(DocBatch batch) {
-    // Partition over ALL ordinals — identical ids/placement to the single-connector path —
-    // then send only the owned sub-batches (empties included for lockstep within the group).
+    // Partition over ALL ordinals (identical ids/placement to the single-connector path), then send
+    // only the owned sub-batches (empties included for lockstep within the group).
     List<DocBatch> perShard = ShardedWriteClient.partition(batch, router);
     List<Callable<Long>> writes = new ArrayList<>(owned.size());
     for (int ordinal : owned) {

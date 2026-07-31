@@ -1,24 +1,15 @@
-//! **Interim Trino-backed hydration for variant tables** ([D48]).
-//!
-//! Released iceberg-rust (our 0.9.1 pin; also 0.10) cannot parse a v3 table schema that contains a
-//! `variant` column — it errors at schema parse inside `Catalog::load_table`. That breaks *every*
-//! Rust path over a variant table, including the (otherwise iceberg-free) direct-parquet pass-1
-//! point read, because it is fronted by `load_and_plan` → `load_table`. So a **per-index fork**
+//! **Interim Trino-backed hydration for variant tables** ([D48]). Released iceberg-rust can't parse
+//! a v3 schema with a `variant` column (it errors in `Catalog::load_table`), which breaks every Rust
+//! path over such a table. So a per-index fork
 //! ([`ResolvedIndex::has_variant_field`](growlerdb_core::ResolvedIndex::has_variant_field)) routes
 //! variant-table hydration through this module — key-predicated point `SELECT`s against Trino, the
-//! variant column returned as JSON — while a non-variant index keeps the native [`IcebergReader`]
-//! path completely untouched.
+//! variant column returned as JSON — while a non-variant index keeps the native [`IcebergReader`] path.
 //!
-//! **The seam.** [`TrinoHydrator::hydrate`] returns the same [`HydrationResult`] the native
-//! [`IcebergReader::hydrate`](crate::IcebergReader::hydrate) returns, so the engine's hydrate
-//! caller forks on `has_variant_field` and is otherwise oblivious to which lane served the read.
-//! When iceberg-rust ships variant (merged upstream 2026-07-16; TASK-353), the native path decodes
-//! the variant column inside the existing point read and becomes primary for the delete-free hot
-//! path; Trino stays the permanent slow lane for delete-bearing files and the stale fallback. That
-//! swap changes only *which lane the fork selects* — never this module's callers.
-//!
-//! Trino unreachable / a query error **degrades loudly** ([D45]): [`hydrate`](TrinoHydrator::hydrate)
-//! returns an `Err`, never a silent empty/partial result.
+//! [`TrinoHydrator::hydrate`] returns the same [`HydrationResult`] as the native
+//! [`IcebergReader::hydrate`](crate::IcebergReader::hydrate), so the caller forks on
+//! `has_variant_field` and is otherwise oblivious to the lane. Trino unreachable / a query error
+//! **degrades loudly** ([D45]): [`hydrate`](TrinoHydrator::hydrate) returns an `Err`, never a silent
+//! partial result.
 //!
 //! [D48]: ../../../okf/system/decisions/d48-variant-delivery.md
 //! [D45]: ../../../okf/system/decisions/d45-degraded-vs-error.md
@@ -449,11 +440,9 @@ fn row_to_fields(
     for v in &cols.variants {
         if let Some(cell) = pos.get(v.as_str()).and_then(|i| row.get(*i)) {
             if !cell.is_null() {
-                // The whole variant object as JSON text — the "variant returned as JSON" hydration
-                // payload (D48). Trino returns `CAST(col AS JSON)` as a JSON **string** in the REST
-                // `data` array, so the cell is already the JSON text — take it verbatim rather than
-                // re-quoting it (`to_string()` on a JSON string double-encodes). A non-string cell
-                // (some drivers hand back the parsed value) is compact-serialized.
+                // Trino returns `CAST(col AS JSON)` as a JSON **string** in the REST `data` array, so
+                // take the cell verbatim — `to_string()` on a JSON string double-encodes. A
+                // non-string cell (some drivers hand back the parsed value) is compact-serialized.
                 let json = match cell {
                     serde_json::Value::String(s) => s.clone(),
                     other => other.to_string(),

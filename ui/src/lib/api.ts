@@ -1,7 +1,6 @@
-// The Engine API client. The UI is a pure client of the same gRPC/REST API programmatic callers
-// use — it never reaches the Index or storage directly. Every request carries the verified bearer
-// token, which the Engine gateway validates. The base URL is empty by default — the SPA is served
-// *by* the Engine, so the API is same-origin.
+// The Engine API client. The UI is a pure client of the same API as programmatic callers, carrying
+// the bearer token the gateway validates. The base URL is empty by default — the SPA is served *by*
+// the Engine, so the API is same-origin.
 import { getToken, clearToken, isTokenExpired } from './auth';
 import { semanticBody, hybridBody, type SemanticOpts, type HybridOpts } from './vectorSearch';
 
@@ -32,9 +31,8 @@ export async function apiFetch(path: string, body?: unknown, method?: string): P
     init.body = JSON.stringify(body);
   }
   const res = await fetch(`${BASE}${path}`, init);
-  // A 401 on a request we *did* authenticate means the token expired or was revoked. Drop the dead
-  // token and signal the app to re-gate — closed mode shows the login screen again; open mode never
-  // had a token, so it's unaffected.
+  // A 401 on a request we authenticated means the token expired/was revoked: drop it and signal the
+  // app to re-gate. Open mode never had a token, so it's unaffected.
   if (res.status === 401 && token) {
     clearToken();
     if (typeof window !== 'undefined') window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
@@ -158,18 +156,16 @@ export async function searchHybrid(queryText: string, opts: HybridOpts): Promise
   return res.json();
 }
 
-/** "More like this": re-run a semantic search seeded by a hit's own source text. The seed is the
- *  hit's `fields[sourceField]` (the text embedded to produce `vectorField`); when that field isn't
- *  cached on the hit, the authoritative row is hydrated by key to read it. Returns the semantic
- *  neighbors of the seed document. */
+/** "More like this": re-run a semantic search seeded by a hit's own source text
+ *  (`fields[sourceField]`, hydrated by key when it isn't cached on the hit). */
 export async function moreLikeThis(
   hit: SearchHit,
   opts: { vectorField: string; sourceField: string; index?: string; k?: number },
 ): Promise<SearchResponse> {
   let seed = hit.fields?.[opts.sourceField];
   if (seed == null || seed === '') {
-    // The source text isn't on the hit (index caches no display fields, or not this one) — hydrate
-    // the authoritative Iceberg row by key to read it (governed, like the document drawer).
+    // Source text isn't on the hit — hydrate the authoritative Iceberg row by key to read it
+    // (governed, like the document drawer).
     const rows = await getByKey([hit.coordinates ?? {}], [opts.sourceField], opts.index);
     seed = rows[0]?.fields?.[opts.sourceField];
   }
@@ -196,10 +192,8 @@ export interface FacetsResponse {
   partial?: boolean;
 }
 
-/** Compute left-rail facets for a query via `/v1/facets`: a top-N terms aggregation per
- *  field, reusing the engine's distributed Aggregate path. Fields that aren't aggregatable are
- *  skipped server-side. Returns `{ facets: [] }` on any failure — facets are a best-effort refinement
- *  and must never break the results view. */
+/** Compute left-rail facets for a query via `/v1/facets`: a top-N terms aggregation per field.
+ *  Returns `{ facets: [] }` on any failure — facets are best-effort and must never break results. */
 export async function facets(query: string, fields: string[], size = 10): Promise<FacetsResponse> {
   try {
     const res = await apiFetch('/v1/facets', { query, fields, size });
@@ -588,9 +582,8 @@ export interface IndexStats {
   time_fields?: string[];
   /** Mapped sortable fields (numeric/date/keyword, `fast`) — the sort menu's options. Absent when none. */
   sort_fields?: string[];
-  /** The index's VECTOR fields — the semantic/hybrid vector-field picker's options. Each carries
-   *  its field path plus the embedding config (source text field, model, dims). Absent/empty for a
-   *  non-vector index, so the console then hides the semantic/hybrid modes. */
+  /** VECTOR fields for the semantic/hybrid picker (path + embedding config). Absent/empty for a
+   *  non-vector index, so the console hides the semantic/hybrid modes. */
   vector_fields?: VectorFieldInfo[];
 }
 
@@ -675,10 +668,8 @@ export interface ReindexResult {
   snapshot: number;
 }
 
-/** Rebuild an index from its source and atomically swap it live. The write-fence
- *  lives on the owning Node, so a reindex already running surfaces as 412; a multi-shard gateway
- *  returns 501 (distributed reindex is future work). Throws with the server's reason so the screen
- *  can surface it inline. */
+/** Rebuild an index from its source and atomically swap it live. A reindex already running surfaces
+ *  as 412; a multi-shard gateway returns 501 (distributed reindex is future work). */
 export async function reindexIndex(name: string): Promise<ReindexResult> {
   const res = await apiFetch('/v1/index:reindex', { index: name });
   if (!res.ok) {
@@ -712,8 +703,7 @@ export async function listAliases(): Promise<Alias[]> {
 }
 
 /** Create or **atomically re-point** an alias to `targets` (the zero-downtime swap): one
- *  control-plane write replaces the alias's members, so reads follow with no gap. Throws with the
- *  server's reason (e.g. a name clash with an index, or an unknown target) so the form can show it. */
+ *  control-plane write replaces the alias's members, so reads follow with no gap. */
 export async function setAlias(alias: string, targets: string[]): Promise<void> {
   const res = await apiFetch('/v1/aliases', { alias, targets });
   if (!res.ok) {
@@ -734,9 +724,8 @@ export async function dropAlias(alias: string): Promise<void> {
 }
 
 // ---- ingestion (sync) status -------------------------------------------
-// GrowlerDB has no separate "connector": every index is kept in sync with exactly one Iceberg
-// source by changelog ingestion, so "ingestion status" = the source head vs. each shard's
-// committed checkpoint.
+// No separate "connector": every index syncs from one Iceberg source by changelog ingestion, so
+// "ingestion status" = the source head vs. each shard's committed checkpoint.
 
 /** One shard's committed position vs. the source, from its node's Write.GetCheckpoint. */
 export interface ShardIngestion {
@@ -764,8 +753,7 @@ export interface IndexIngestion {
   /** Commit time of that snapshot (epoch ms); `null` when unreadable/none. */
   source_timestamp_ms: number | null;
   /** Whether the control plane can natively probe this index's source head. `false` for a variant
-   *  index (D49): its null head + "unknown" lag is expected, not a source outage, so the health
-   *  roll-up excludes it. */
+   *  index (D49): its null head + "unknown" lag is expected, not an outage — the roll-up excludes it. */
   source_probeable: boolean;
   shards: ShardIngestion[];
 }

@@ -24,20 +24,16 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 /**
- * The concurrent per-shard fan-out ({@link ShardFanOut}): sub-batches of one batch commit
- * <b>overlapped</b>, every sub-batch — including empties (lockstep) — is still sent, and a failure
- * on one shard neither prevents siblings from committing nor gets lost (all-settle, lowest-ordinal
- * error propagates, later ones suppressed). Against in-process Node stubs, no Spark needed.
+ * The concurrent per-shard fan-out ({@link ShardFanOut}): sub-batches commit overlapped, empties
+ * still sent, and a failed shard neither blocks siblings nor gets lost (all-settle, lowest-ordinal wins).
  */
 class ShardedWriteClientFanOutTest {
 
   private static final DocBatch EMPTY_BATCH = DocBatch.newBuilder().setBatchId("b1").build();
 
   /**
-   * Concurrency proof: every server holds its response until ALL servers have received their
-   * sub-batch. A sequential loop would deadlock here (shard 0 blocks before shard 1 is ever
-   * called); the overlapped fan-out sails through. An empty ops list means every sub-batch is
-   * empty — passing also proves empties are still sent to every shard.
+   * Every server holds its response until ALL have arrived: a sequential loop would deadlock, the
+   * overlapped fan-out passes. Empty ops also proves empties are still sent to every shard.
    */
   @Test
   void subBatchesCommitConcurrentlyNotSequentially() throws IOException {
@@ -70,10 +66,8 @@ class ShardedWriteClientFanOutTest {
   }
 
   /**
-   * All-settle failure semantics: shard 0 gaps (FAILED_PRECONDITION), shard 1 rejects
-   * (INVALID_ARGUMENT), shard 2 is healthy. The healthy shard still commits, the lowest-ordinal
-   * failure is thrown, and the other failure rides along as suppressed — nothing is lost, and
-   * there is no fail-fast that would strand a committable shard.
+   * All-settle: shard 0 gaps, shard 1 rejects, shard 2 is healthy. The healthy shard still commits,
+   * the lowest-ordinal failure is thrown, the other rides along suppressed — no fail-fast strands a shard.
    */
   @Test
   void aFailedShardNeitherBlocksSiblingsNorGetsLost() throws IOException, InterruptedException {

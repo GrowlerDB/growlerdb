@@ -1,7 +1,6 @@
 <script lang="ts">
-  // An anchored popover: the time filter, user menu, etc. Positioned from a trigger's
-  // bounding rect (pure math in `lib/popover.ts`), with a full-screen click-away overlay. Escape
-  // closes. Pass the trigger element as `anchor`; render content in the default slot.
+  // Anchored popover positioned from a trigger's bounding rect (math in `lib/popover.ts`), with a
+  // click-away overlay and Escape-to-close. Pass the trigger as `anchor`, content in the default slot.
   import type { Snippet } from 'svelte';
   import { popoverPlacement } from '../popover';
 
@@ -32,7 +31,6 @@
   }
 
   $effect(() => {
-    // Re-place when the anchor changes or the panel measures; also on resize/scroll.
     place();
     const on = () => place();
     window.addEventListener('resize', on);

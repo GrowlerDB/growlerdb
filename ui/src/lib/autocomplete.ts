@@ -1,7 +1,5 @@
-// Query autocomplete: the search box holds a Lucene/KQL query, so completing a value
-// means finding the `field:prefix` token the user is currently typing (at the cursor/end), asking
-// the Suggest API for that field's terms, and replacing the prefix with the chosen value. Pure +
-// unit-tested; the Svelte component handles debounce, keyboard, and the network call.
+// Query autocomplete: find the `field:prefix` token being typed at the cursor, ask the Suggest API
+// for that field's terms, and replace the prefix with the chosen value.
 
 export interface FieldToken {
   /** The field name left of the colon (e.g. `body`). */
@@ -16,11 +14,8 @@ export interface FieldToken {
 // colon, quotes, parens, or range brackets — so we never autocomplete inside a phrase or `[a TO b]`.
 const TOKEN_RE = /([\w.]+):([^\s:"()[\]]*)$/;
 
-/**
- * The `field:prefix` token being typed at the end of `query`, or `null`. Returns `null` when there's
- * no field context or the prefix is empty (the Suggest API requires non-empty text), so callers only
- * fire a request when there's something to complete.
- */
+/** The `field:prefix` token being typed at the end of `query`, or `null` (incl. an empty prefix,
+ *  which the Suggest API rejects) — so callers only fire when there's something to complete. */
 export function currentFieldToken(query: string): FieldToken | null {
   const m = TOKEN_RE.exec(query);
   if (!m || m[2].length === 0) return null;

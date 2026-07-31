@@ -140,9 +140,8 @@ class ConnectorJobPlanTest {
 
   @Test
   void streamCommitsHoldsOnlyBoundedChunksNotTheWholeWindow() {
-    // 1000 rows, one snapshot each, cap 10 → the buffer never grows to the window size (the property
-    // that keeps driver memory O(chunk), not O(window)). Fed from a lazy iterator that never
-    // materializes the window.
+    // 1000 rows, one snapshot each, cap 10 → the buffer never grows to the window size (driver memory
+    // stays O(chunk), not O(window)). Fed from a lazy iterator that never materializes the window.
     Iterator<ChangelogRow> lazy =
         new Iterator<>() {
           long i = 0;

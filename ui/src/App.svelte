@@ -32,10 +32,8 @@
   const localeOptions = locales();
   // The verified identity from GET /v1/me — server truth, loaded on mount.
   const user = $derived($identity);
-  // Closed mode + not signed in → gate the app behind login.
   const gated = $derived(authRequired && !user?.authenticated);
 
-  // Mirror the persisted design-system prefs (theme + accent + density) onto <html>.
   applyPrefs();
 
   const navItems: { route: Route; key: string }[] = [
@@ -45,7 +43,7 @@
     { route: '/settings', key: 'nav.settings' },
   ];
 
-  // Header health pill: one reactive Health → dot tone + label, pulsing when healthy.
+  // Only the healthy state pulses.
   const HEALTH: Record<Health, { tone: 'ok' | 'warn' | 'muted'; key: string; pulse: boolean }> = {
     ok: { tone: 'ok', key: 'cluster.health.ok', pulse: true },
     warn: { tone: 'warn', key: 'cluster.health.warn', pulse: false },
@@ -110,7 +108,6 @@
         console.error(err);
       }
     }
-    // Load the verified identity — server truth for the header + Settings.
     await refreshIdentity();
   });
   onDestroy(() => {
@@ -136,8 +133,7 @@
     navigate(route);
   }
 
-  // The username shown beside the avatar in the top bar. Mirrors the menu's identity line: the
-  // verified name/subject when signed in, else the anon/open-mode label.
+  // Mirrors the menu's identity line: verified name/subject, else the anon/open-mode label.
   function userLabel(u: typeof user): string {
     if (u?.authenticated) return u.display_name || u.subject;
     return authRequired ? t('menu.anon') : t('menu.openMode');

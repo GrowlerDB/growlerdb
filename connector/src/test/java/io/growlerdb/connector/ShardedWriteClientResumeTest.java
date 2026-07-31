@@ -18,11 +18,9 @@ import java.util.OptionalLong;
 import org.junit.jupiter.api.Test;
 
 /**
- * Resume-from-min across shards orders checkpoints by <b>lineage</b> (Iceberg sequence numbers),
- * never by the raw snapshot id — ids are random longs, so a numeric {@code Math.min} picks the
- * wrong shard about half the time two shards diverge (a permanent {@code CHECKPOINT_GAP} stall).
- * Node-reported sequences win; the table's own {@link SnapshotLineage} backfills legacy stored
- * checkpoints; only a snapshot unknown everywhere degrades to the numeric fallback.
+ * Resume-from-min orders checkpoints by lineage (Iceberg sequence numbers), never the raw snapshot
+ * id — ids are random longs, so a numeric {@code Math.min} picks the wrong shard and stalls on
+ * {@code CHECKPOINT_GAP}. Only a snapshot unknown everywhere degrades to the numeric fallback.
  */
 class ShardedWriteClientResumeTest {
 

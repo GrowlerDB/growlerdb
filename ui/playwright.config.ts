@@ -1,8 +1,7 @@
 import { defineConfig, devices } from '@playwright/test';
 
-// Console E2E. The suite is fully mocked at the network layer (see e2e/mocks.ts), so it
-// needs no live stack — fast and deterministic, safe to run on every CI push. The webServer builds
-// and previews the real production bundle, so we exercise the shipped artifact (not the dev server).
+// Console E2E, fully mocked at the network layer (see e2e/mocks.ts) so it needs no live stack. The
+// webServer previews the real production bundle, so we exercise the shipped artifact.
 const PORT = 4173;
 
 export default defineConfig({

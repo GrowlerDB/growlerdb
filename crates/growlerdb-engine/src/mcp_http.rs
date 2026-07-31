@@ -1,23 +1,16 @@
 //! The MCP **Streamable HTTP transport**, served by the gateway at `POST /mcp`.
 //!
-//! A remote agent (Claude web/desktop connector, a hosted agent platform, CI) connects with just
-//! a URL + bearer token — no local `growlerdb` binary, no stdio process. The route is a thin shell
-//! around [`growlerdb_mcp::handle_message`] (the same JSON-RPC dispatch the stdio transport uses);
-//! tool calls re-enter the gateway's own `/v1` router **in-process** (a `tower` oneshot, no
-//! network hop), so authn, RBAC, the tenant filter, admission control, body limits, and timeouts
-//! are enforced by the one existing query surface. The transport **synthesizes no identity** — it
-//! forwards the caller's `Authorization` header verbatim.
+//! A thin shell around [`growlerdb_mcp::handle_message`] (the same JSON-RPC dispatch the stdio
+//! transport uses); tool calls re-enter the gateway's own `/v1` router **in-process** (a `tower`
+//! oneshot, no network hop), so authn, RBAC, tenant filter, and limits are enforced by the one
+//! query surface. The transport synthesizes no identity — it forwards `Authorization` verbatim.
 //!
 //! Protocol shape (spec 2025-03-26+):
-//! - **Sessionless.** Every request is independent; no `Mcp-Session-Id` is issued, so the route
-//!   scales horizontally behind a load balancer (the spec permits stateless servers).
-//! - **POST only.** The server never initiates messages, so `GET /mcp` (the SSE stream) answers
-//!   `405 Method Not Allowed`; responses are single JSON bodies, not event streams.
-//! - **No batching.** JSON-RPC batch arrays were removed in spec 2025-06-18; an array is a 400.
-//! - **`Origin` validation** rejects DNS-rebinding: a browser-sent `Origin` must be loopback or
-//!   match the request's `Host`; non-browser clients (no `Origin`) pass.
-//! - A closed gateway (authenticator configured) answers a missing/invalid bearer with
-//!   `401 WWW-Authenticate: Bearer` before any JSON-RPC processing.
+//! - **Sessionless** — no `Mcp-Session-Id`, so the route scales horizontally behind a balancer.
+//! - **POST only** — `GET /mcp` (the SSE stream) answers `405`; responses are single JSON bodies.
+//! - **No batching** — JSON-RPC batch arrays were removed in spec 2025-06-18; an array is a 400.
+//! - **`Origin` validation** rejects DNS-rebinding (loopback or matching `Host`; no `Origin` passes).
+//! - Closed gateway answers a missing/invalid bearer with `401 WWW-Authenticate: Bearer`.
 
 use std::sync::Arc;
 
@@ -48,8 +41,7 @@ struct McpState {
 
 /// Build the `/mcp` router over the gateway's composed `/v1` router. Mount it alongside that
 /// router (`app.merge(mcp_router(app.clone(), gw))`); the clone is the surface tool calls
-/// dispatch into, so everything mounted on it (search, keys:get, facets, `/v1/indexes` when the
-/// control-plane proxy is wired) is reachable through MCP under the same enforcement.
+/// dispatch into, so everything mounted on it is reachable through MCP under the same enforcement.
 pub fn mcp_router(v1: Router, gw: Arc<Gateway>) -> Router {
     // POST only: axum answers other methods on a matched path with 405 + `Allow` — exactly the
     // spec's required response for a server that doesn't offer the GET/SSE stream.
@@ -69,9 +61,8 @@ async fn mcp_post(State(st): State<McpState>, headers: HeaderMap, body: Bytes) -
             .into_response();
     }
     // Closed gateway: verify the bearer before any protocol processing, so a missing/invalid
-    // token is an HTTP 401 (the MCP auth signal), not a per-tool error. An open gateway skips
-    // this — the zero-config trial path — and per-request enforcement still happens on the
-    // `/v1` surface every tool call re-enters.
+    // token is an HTTP 401 (the MCP auth signal), not a per-tool error. An open gateway skips this
+    // — per-request enforcement still happens on the `/v1` surface every tool call re-enters.
     if st.gw.auth_required() {
         let mut probe = grpc_request((), &headers);
         if st.gw.identity(&mut probe).is_err() {
@@ -111,10 +102,9 @@ async fn mcp_post(State(st): State<McpState>, headers: HeaderMap, body: Bytes) -
     }
 }
 
-/// DNS-rebinding defense: a request carrying an `Origin` must originate from loopback or from
-/// this server's own host (same-origin, e.g. a console page). Requests without an `Origin`
-/// (curl, SDKs, non-browser MCP clients) pass — the header only exists to catch browsers whose
-/// DNS answer was rebound to us.
+/// DNS-rebinding defense: a request carrying an `Origin` must originate from loopback or this
+/// server's own host. Requests without an `Origin` (curl, SDKs, non-browser clients) pass — the
+/// header only exists to catch browsers whose DNS answer was rebound to us.
 fn origin_allowed(headers: &HeaderMap) -> bool {
     let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
         return true;

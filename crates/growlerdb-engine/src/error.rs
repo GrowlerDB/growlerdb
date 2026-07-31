@@ -34,10 +34,9 @@ pub enum EngineError {
     /// Producing the query embedding for a semantic search failed.
     #[error(transparent)]
     Embed(#[from] EmbedError),
-    /// Semantic (KNN) search on a **tenant-scoped** index without a verified tenant claim.
-    /// Filtered KNN enforces the mandatory `tenant = <claim>` filter inside the vector search;
-    /// with no claim there is nothing to filter by, so the request is refused **fail-closed**
-    /// rather than risk returning nearest neighbors across tenants.
+    /// Semantic (KNN) search on a **tenant-scoped** index without a verified tenant claim. Filtered
+    /// KNN needs the mandatory `tenant = <claim>` filter; with no claim, refused **fail-closed** to
+    /// avoid cross-tenant neighbors.
     #[error(
         "index `{0}` is tenant-scoped — semantic (KNN) search requires a verified tenant claim \
          (authenticate with a tenant-bearing identity); refused to prevent cross-tenant results"
@@ -49,9 +48,9 @@ pub enum EngineError {
     /// Reading the source (Iceberg) failed.
     #[error(transparent)]
     Source(#[from] SourceError),
-    /// A build read **0 documents from a non-empty source** — the source's current
-    /// snapshot reports `records` rows but the read produced none (e.g. a delete-in-history the
-    /// changelog read mishandles). Fail loudly instead of committing a silently-empty index.
+    /// A build read **0 documents from a non-empty source** — snapshot reports `records` rows but the
+    /// read produced none (e.g. a mishandled delete-in-history). Fail loudly rather than commit an
+    /// empty index.
     #[error(
         "indexed 0 documents from `{table}`, but its current snapshot reports {records} records — \
          the source read is broken (e.g. a delete in the table's history); refusing to commit an empty index"

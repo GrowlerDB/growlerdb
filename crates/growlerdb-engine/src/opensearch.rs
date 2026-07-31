@@ -1,14 +1,10 @@
-//! Optional **OpenSearch-compatible `_search` adapter**. Translates a *documented
-//! subset* of the OpenSearch Query DSL into GrowlerDB's native query string (which parses to the
-//! canonical [`Query`](growlerdb_core::Query) AST), runs it through the [`Gateway`], and shapes the
-//! results as OpenSearch documents: `_id` synthesized from the **composite key**, `_source` filled
-//! by the Gateway's **inline hydration** (`SearchRequest.hydrate` — the governed PK-lookup path).
-//! Read-path first — the native PK API stays primary; this is a thin migration/ecosystem
-//! convenience, mounted only when the gateway is started with `--opensearch`.
+//! Optional OpenSearch-compatible `_search` adapter. Translates a documented subset of the
+//! OpenSearch Query DSL into GrowlerDB's native query string (→ the [`Query`](growlerdb_core::Query)
+//! AST), runs it through the [`Gateway`], and shapes the results as OpenSearch documents. A thin
+//! migration convenience, mounted only with `--opensearch`; the native PK API stays primary.
 //!
-//! The supported subset and its caveats are documented in `docs/opensearch-adapter.md`; anything
-//! outside it returns a clear error (`501` unsupported / `400` malformed) rather than silently
-//! mis-translating.
+//! The supported subset and its caveats live in `docs/opensearch-adapter.md`; anything outside it
+//! returns a clear error (`501` unsupported / `400` malformed) rather than mis-translating.
 
 use std::sync::Arc;
 
@@ -28,8 +24,8 @@ use growlerdb_proto::v1::{
 use crate::gateway::Gateway;
 use crate::rest::grpc_request;
 
-/// Build the OpenSearch-compatible router over the [`Gateway`]. Mount it alongside the `/v1`
-/// router when `--opensearch` is set.
+/// Build the OpenSearch-compatible router over the [`Gateway`]. Mount alongside `/v1` when
+/// `--opensearch` is set.
 pub fn opensearch_router(gateway: Arc<Gateway>) -> Router {
     Router::new()
         .route("/{index}/_search", post(search_handler))
@@ -61,18 +57,17 @@ impl AdapterError {
     }
 }
 
-/// Query-string characters that are *structural* or *operators* and so can't sit bare in a value
-/// without changing the parse (grouping, ranges, phrases, wildcards, fuzzy, boost, field-retarget
-/// via `:`, the `&&`/`||`/`!` operators, or whitespace splitting the token). Everything else —
-/// including `- . _ + @ /` — is fine mid-value (ids, dates, UUIDs, decimals), per the parser.
+/// Query-string characters that are structural or operators and so can't sit bare in a value
+/// without changing the parse (grouping, ranges, phrases, wildcards, boost, field-retarget via `:`,
+/// the `&&`/`||`/`!` operators, whitespace). Everything else — including `- . _ + @ /` — is fine
+/// mid-value (ids, dates, UUIDs, decimals), per the parser.
 const SPECIAL: &[char] = &[
     '(', ')', '{', '}', '[', ']', '^', '"', '~', '*', '?', ':', '\\', '&', '|', '!', ' ', '\t',
     '\n',
 ];
 
-/// A value that can sit bare after `field:` (a single, unescaped token). Anything with whitespace
-/// or a query-syntax metacharacter is rejected with a clear error rather than mis-encoded — the
-/// adapter is a documented subset, not a best-effort guesser.
+/// A value that can sit bare after `field:` (a single, unescaped token). Whitespace or a
+/// query-syntax metacharacter is rejected with a clear error rather than mis-encoded.
 fn token(field: &str, value: &str) -> Result<String, AdapterError> {
     if value.is_empty() {
         return Err(AdapterError::bad(format!("empty value for `{field}`")));
@@ -102,16 +97,14 @@ fn scalar_token(field: &str, v: &JsonValue) -> Result<String, AdapterError> {
     token(field, &s)
 }
 
-/// Each temporal field's declared unit, by path — from the served index definition, so a
-/// range/exact bound written in that unit (OpenSearch semantics) is converted to canonical micros
-/// **here, once**, before planning. Both window pruning and segment execution are micros-native, so
-/// converting at this boundary keeps them consistent. Empty for an index with no temporal fields.
+/// Each temporal field's declared unit, by path — so a range/exact bound written in that unit
+/// (OpenSearch semantics) is converted to canonical micros here, once, before planning (window
+/// pruning and segment execution are both micros-native). Empty when the index has no temporal fields.
 pub type FieldFormats = std::collections::HashMap<String, growlerdb_core::TimeFormat>;
 
-/// A range **bound** token. On a temporal field a numeric bound is in the field's declared unit
-/// (e.g. `epoch_s` seconds) — convert it to canonical micros, exactly as ingestion normalized the
-/// stored value, so the range and the data share a scale. A string bound (ISO-8601 / `YYYY-MM-DD`) is
-/// absolute and passes through for the query parser to resolve; a non-temporal field is unchanged.
+/// A range bound token. On a temporal field a numeric bound is in the field's declared unit and is
+/// converted to canonical micros (as ingestion normalized the stored value), so range and data
+/// share a scale. A string bound (ISO-8601) is absolute and passes through; non-temporal is unchanged.
 fn bound_token(field: &str, v: &JsonValue, formats: &FieldFormats) -> Result<String, AdapterError> {
     if let Some(fmt) = formats.get(field) {
         if let Some(n) = v.as_i64() {
@@ -299,11 +292,10 @@ fn translate_clauses(
 }
 
 fn translate_bool(body: &JsonValue, formats: &FieldFormats) -> Result<String, AdapterError> {
-    // `filter` is treated like `must` (a required conjunct) — the read-path adapter doesn't model
-    // the non-scoring distinction. `must`/`filter` AND together; `must_not` negates. `should` is
-    // honored for *matching* only when there is no must/filter (OpenSearch's default
-    // minimum_should_match); with a must/filter present it is scoring-only and not expressible in
-    // the query string, so it's dropped from the predicate (documented in the support matrix).
+    // `filter` is treated like `must` (the read-path adapter doesn't model the non-scoring
+    // distinction): both AND together, `must_not` negates. `should` matches only when there's no
+    // must/filter (OpenSearch's default minimum_should_match); otherwise it's scoring-only,
+    // inexpressible in the query string, and dropped from the predicate (per the support matrix).
     let must = translate_clauses(body.get("must"), formats)?;
     let filter = translate_clauses(body.get("filter"), formats)?;
     let should = translate_clauses(body.get("should"), formats)?;
@@ -386,12 +378,10 @@ pub fn translate_sort(sort: &JsonValue) -> Result<Vec<WireSort>, AdapterError> {
     Ok(out)
 }
 
-/// Translate an OpenSearch `highlight` clause into the native [`HighlightRequest`]. We
-/// map the field set and the two bounds we support — `number_of_fragments` → `max_fragments` and
-/// `fragment_size` → `fragment_size` (top-level or per-field; a per-field value wins). Everything
-/// else in the OpenSearch highlight DSL (custom tags, `type`, `order`, …) is ignored: GrowlerDB
-/// emits XSS-safe segments the client marks, so pre/post tags don't apply. An empty/absent `fields`
-/// map highlights the default set (the index's highlightable TEXT fields).
+/// Translate an OpenSearch `highlight` clause into the native [`HighlightRequest`]. Maps the field
+/// set and two bounds — `number_of_fragments` → `max_fragments`, `fragment_size` (top-level or
+/// per-field; per-field wins). Other DSL keys (custom tags, `type`, `order`) are ignored — GrowlerDB
+/// emits XSS-safe segments the client marks. Empty/absent `fields` highlights the default TEXT set.
 pub fn translate_highlight(clause: &JsonValue) -> HighlightRequest {
     let obj = clause.as_object();
     let top_u32 = |key: &str| -> u32 {
@@ -408,7 +398,7 @@ pub fn translate_highlight(clause: &JsonValue) -> HighlightRequest {
     {
         for (name, spec) in fmap {
             fields.push(name.clone());
-            // A per-field override wins over the top-level default.
+            // Per-field wins over the top-level default.
             if let Some(v) = spec.get("number_of_fragments").and_then(JsonValue::as_u64) {
                 max_fragments = v as u32;
             }
@@ -424,9 +414,8 @@ pub fn translate_highlight(clause: &JsonValue) -> HighlightRequest {
     }
 }
 
-/// Render a wire [`HighlightField`]'s fragments to the OpenSearch response shape: a
-/// vector of strings, one per fragment, with `marked` segments wrapped in `<em>…</em>` (the
-/// OpenSearch default tag) and all text HTML-escaped so the fragment is safe to render.
+/// Render a wire [`HighlightField`]'s fragments to the OpenSearch response shape: one string per
+/// fragment, `marked` segments wrapped in `<em>…</em>`, all text HTML-escaped so it's safe to render.
 fn highlight_field_html(field: &HighlightField) -> Vec<String> {
     field
         .fragments
@@ -454,9 +443,8 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// Synthesize an OpenSearch `_id` from the composite key: partition values then identifier values,
-/// joined by `#`. Deterministic and round-trippable-ish (informational; hydration uses the full
-/// coordinate, not this string).
+/// Synthesize an OpenSearch `_id` from the composite key: partition then identifier values, joined
+/// by `#`. Informational only — hydration uses the full coordinate, not this string.
 pub fn compose_id(coords: &Coordinates) -> String {
     coords
         .partition
@@ -534,17 +522,15 @@ async fn run_search(
 ) -> Response {
     let start = std::time::Instant::now();
     let body = body.map(|Json(b)| b).unwrap_or_default();
-    // OpenSearch `_all` (from `/_search`) means "no specific index": route to the endpoint's default
-    // index. An empty `index` field triggers the Gateway's default/sole-index resolution
-    // (a multi-index endpoint with no default answers `InvalidArgument`).
+    // `_all` (from `/_search`) means "no specific index": an empty `index` field triggers the
+    // Gateway's default/sole-index resolution (no default on a multi-index endpoint → InvalidArgument).
     let index = if index == "_all" {
         String::new()
     } else {
         index
     };
 
-    // Translate the DSL (absent query => match_all). Temporal range/exact bounds are converted to
-    // canonical micros here using the served index's declared field units.
+    // Translate the DSL (absent query => match_all); temporal bounds convert to micros here.
     let query = match &body.query {
         Some(q) => match translate_query(q, gw.date_formats()) {
             Ok(s) => s,
@@ -556,8 +542,7 @@ async fn run_search(
         Ok(s) => s.unwrap_or_default(),
         Err(e) => return adapter_error(e),
     };
-    // Translate the OpenSearch `highlight` clause into the native opt-in. Present ⇒ the
-    // response carries a per-hit `highlight` object of matched fragments.
+    // Present ⇒ the response carries a per-hit `highlight` object of matched fragments.
     let highlight = body.highlight.as_ref().map(translate_highlight);
 
     let req = grpc_request(
@@ -574,18 +559,16 @@ async fn run_search(
             window: 0,
             // The adapter translates the DSL to a Lucene query string.
             syntax: v1::QuerySyntax::Lucene as i32,
-            // OpenSearch semantics allow partial results by default (its
-            // `allow_partial_search_results` is a query param, not a body clause); the adapter
-            // keeps the native default and flags gaps via `_shards.failed`.
+            // OpenSearch allows partial results by default (`allow_partial_search_results` is a
+            // query param, not a body clause); keep the native default and flag gaps via `_shards.failed`.
             require_complete: false,
             // Scope to the path's `{index}`; empty for `/_search` (the served index).
             index: index.clone(),
             highlight,
-            // `_source` comes from the engine's **inline hydration**: rows attach to their
-            // hits by coordinates at the Gateway (one admitted query), replacing the adapter's
-            // old search-then-GetByKey pair. A hit whose row doesn't resolve (failed shard /
+            // `_source` comes from the engine's inline hydration: rows attach to their hits by
+            // coordinates at the Gateway. A hit whose row doesn't resolve (failed shard /
             // tenant-filtered / missing) carries `hydrate_error` and gets an empty `_source` —
-            // hydration failure stays non-fatal, as before.
+            // hydration failure is non-fatal.
             hydrate: true,
             hydrate_columns: Vec::new(),
         },
@@ -620,9 +603,8 @@ async fn run_search(
             "_score": hit.score,
             "_source": source,
         });
-        // Server-side highlights: render the segment fragments into the OpenSearch
-        // `highlight` shape — field → array of `<em>`-marked fragment strings. Only present when
-        // the request carried a `highlight` clause and a field actually matched.
+        // Render the fragments into the OpenSearch `highlight` shape — field → array of
+        // `<em>`-marked strings. Only present when a `highlight` clause was sent and a field matched.
         if !hit.highlight.is_empty() {
             let hl: Map<String, JsonValue> = hit
                 .highlight
@@ -775,11 +757,8 @@ mod tests {
         assert_eq!(s, "status:(active OR pending)");
     }
 
-    /// The http_logs benchmark `cidr_clientip` workload query — a `term` whose value is a CIDR
-    /// block on an IP field. `/` is not a query metacharacter, so it passes through the token
-    /// filter and the parser recognizes the `addr/prefix` shape as a native `IpCidr` (routed to
-    /// the field's IP range). On a correctly-mapped IP field this returns matches; the failure
-    /// the scale run hit was an auto-mapped TEXT field, now surfaced as a clean 4xx by the gateway.
+    /// A `term` whose value is a CIDR block on an IP field. `/` is not a query metacharacter, so it
+    /// passes the token filter and the parser recognizes the `addr/prefix` shape as a native `IpCidr`.
     #[test]
     fn cidr_term_on_an_ip_field_parses_to_ip_cidr() {
         let s = xlate(json!({ "term": { "client_ip": "211.0.0.0/8" } }));
@@ -793,9 +772,8 @@ mod tests {
         );
     }
 
-    /// The http_logs benchmark `topk_hydrated` workload sort — top-k by a numeric field, desc.
-    /// Translates to a single descending `WireSort`; the server orders on the field's `fast`
-    /// column (a non-`fast` field is the rejected-query case the gateway now reports as a 4xx).
+    /// Top-k by a numeric field, desc → a single descending `WireSort`; the server orders on the
+    /// field's `fast` column (a non-`fast` field is rejected by the gateway as a 4xx).
     #[test]
     fn topk_hydrated_sort_translates_to_a_descending_wire_sort() {
         let out = translate_sort(&json!([{ "response_time_ms": "desc" }])).unwrap();

@@ -1,7 +1,5 @@
-// SLI metrics for the Observability screen. The UI queries the Engine's same-origin
-// metrics proxy (`/v1/stats/...`, which forwards to Prometheus), so panels need no Prometheus
-// URL or CORS. Parsing + alert evaluation are pure and unit-tested; `queryRange` is the thin
-// network wrapper.
+// SLI metrics for the Observability screen. The UI queries the Engine's same-origin metrics proxy
+// (`/v1/stats/...`, which forwards to Prometheus), so panels need no Prometheus URL or CORS.
 import { apiFetch } from './api';
 
 /** A time series: a name + `[timestampMs, value]` points. */
@@ -40,20 +38,17 @@ export function latestOf(series: Series[]): number | null {
   return pts && pts.length > 0 ? pts[pts.length - 1][1] : null;
 }
 
-/** Inject an `index` label matcher into every `growlerdb_*` selector in a PromQL string, turning a
- *  cluster-aggregate query into one scoped to a single index. `index === ''` is a no-op (the fleet /
- *  "all indexes" view). Only `growlerdb_*` metrics are rewritten — `up`, `node_*`, and PromQL
- *  functions/keywords are left untouched. A single pass over the ORIGINAL string (the replacer never
- *  re-scans injected text), handling both the bare `metric` and `metric{labels}` forms.
+/** Inject an `index` label matcher into every `growlerdb_*` selector in a PromQL string, scoping a
+ *  cluster-aggregate query to a single index. `index === ''` is a no-op (the "all indexes" view).
+ *  Only `growlerdb_*` metrics are rewritten (`up`, `node_*`, PromQL keywords left untouched).
  *
- *  Two label schemes coexist and both must match: most SLIs carry the plain index name
- *  (`index="movies"`), but the per-shard index-store gauges (`growlerdb_index_bytes`, `…_component`,
- *  `growlerdb_segments_live`) carry `index="movies s0"` (name + shard ordinal). An anchored regex
- *  matcher — Prometheus label matchers are fully anchored — matches the bare name OR the name plus a
- *  ` s<ordinal>` suffix, without leaking a prefix-sharing index (`movies` won't match `movies2`).
+ *  Two label schemes must both match: most SLIs carry the plain name (`index="movies"`), but
+ *  per-shard index-store gauges carry `index="movies s0"` (name + shard ordinal). The regex matcher
+ *  accepts the bare name OR name + ` s<ordinal>`; it's anchored (Prometheus matchers always are) so
+ *  `movies` won't leak into `movies2`.
  *
- *  Caller responsibility: metrics that carry no `{index}` label (e.g. the route-labelled
- *  `growlerdb_http_requests_total`) must be excluded from scoping — scoping them would match nothing. */
+ *  Caller must exclude metrics with no `{index}` label (e.g. `growlerdb_http_requests_total`) —
+ *  scoping them would match nothing. */
 export function scopeQuery(query: string, index: string): string {
   if (!index) return query;
   const esc = index.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

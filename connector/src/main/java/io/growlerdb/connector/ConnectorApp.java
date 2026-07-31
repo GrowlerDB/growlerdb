@@ -48,11 +48,7 @@ public final class ConnectorApp {
   static final int STREAM_RESTART_BACKOFF_SECS = 5;
 
   public static void main(String[] args) throws Exception {
-    // Cap the JDK DNS cache TTL so the write client picks up a restarted Node pod's new IP within
-    // seconds instead of re-dialing the dead cached IP. The JDK caches successful lookups often
-    // effectively forever, so a crashed-then-returned pod keeps resolving to its dead address. Must
-    // run before any hostname is resolved (before Spark/gRPC start). Overridable via
-    // GROWLERDB_DNS_TTL_SECONDS.
+    // Must run before any hostname is resolved (before Spark/gRPC start) — see capDnsCacheTtl.
     capDnsCacheTtl();
     // Start the connector metrics endpoint — a no-op unless GROWLERDB_METRICS_PORT is set, so the
     // ingest-side signals survive log rotation without binding a port in local runs.
@@ -95,22 +91,18 @@ public final class ConnectorApp {
     // by `(index, shard)`; empty (no `--index`) ⇒ the node's sole served index ignores it.
     String indexTag = opts.getOrDefault("index", "");
 
-    // Routing source of truth: when a `--control-plane host:port` (+ `--index`) is given, fetch the
-    // shard count and strategy from the registry — the same source the Gateway reads — and fail fast
-    // if the local config disagrees, so writes can't land where reads never look. Without it, fall
-    // back to deriving the strategy from `--partition`.
+    // Routing source of truth: with `--control-plane` (+ `--index`), fetch shard count and strategy
+    // from the registry — the same source the Gateway reads — and fail fast if local config disagrees,
+    // so writes can't land where reads never look. Without it, derive the strategy from `--partition`.
     ShardRouter.Strategy routing;
-    // Virtual-bucket map from the registry: when present, the connector routes `key → bucket → shard`
-    // through the same map the Gateway reads, so writes land where reads look. Empty/absent ⇒
-    // `fnv % shards`.
+    // Virtual-bucket map from the registry: routes `key → bucket → shard` through the same map the
+    // Gateway reads, so writes land where reads look. Empty/absent ⇒ `fnv % shards`.
     int[] bucketOwners = null;
-    // Windowed index: when the registry reports windowing, the connector routes each row to its time
-    // window's owning node (resolved live from the control plane) rather than by key-hash.
+    // Windowed index: the connector routes each row to its time window's owning node (resolved live
+    // from the control plane) rather than by key-hash.
     WindowingConfig windowing = null;
-    // The long-lived CP client — kept open for the whole run whenever placement is CP-driven
-    // (windowed per-window resolution, or a hash index whose shard→node map came from the registry),
-    // so a stream restart can RE-resolve placement instead of pinning the startup snapshot for the
-    // process lifetime. Null when placement is static (`--nodes`/no `--control-plane`).
+    // The long-lived CP client — kept open whenever placement is CP-driven, so a stream restart can
+    // RE-resolve placement instead of pinning the startup snapshot. Null when placement is static.
     ControlPlaneClient placementCp = null;
     String controlPlane = opts.getOrDefault("control-plane", "");
     if (!controlPlane.isEmpty()) {
@@ -135,12 +127,9 @@ public final class ConnectorApp {
           if (entry.getBucketOwnersCount() > 0) {
             bucketOwners = entry.getBucketOwnersList().stream().mapToInt(Integer::intValue).toArray();
           }
-          // CP-driven placement: unless the operator pinned endpoints with `--nodes`, source each
-          // shard's owning node from the registry's shard map — the same placement the Gateway reads
-          // for routing — so writes follow the control plane instead of static config and can't drift
-          // from where reads look. A per-index sharded Node's ordinal is pinned, so its live owner
-          // comes from the shard map (re-read from the CP on every stream restart — see the writer
-          // factory below), not a least-loaded re-placement.
+          // CP-driven placement: unless `--nodes` pins endpoints, source each shard's owning node from
+          // the registry's shard map (re-read on every stream restart — see the writer factory) so
+          // writes follow the control plane and can't drift from where reads look.
           if (!explicitNodes) {
             nodes = shardEndpointsFromCp(entry);
             placementCp = cp;
@@ -173,10 +162,9 @@ public final class ConnectorApp {
     ConnectorJob job =
         new ConnectorJob(catalog, table, mapping, identifier, java.util.Set.of(), maxCommitRows);
 
-    // Variant extraction (D47/D48): `--variant-spec <json>` declares the variant column + its
-    // flatten flags, discriminator, and shapes; the connector walks each row's variant value into
-    // flatten leaves + discriminator-selected typed shape values. Absent ⇒ no variant column.
-    // (`--fields` must include the shaped `column.path`s so they ride the document's typed fields.)
+    // Variant extraction (D47/D48): `--variant-spec <json>` declares the variant column, flatten
+    // flags, discriminator, and shapes; each row's variant is walked into flatten leaves +
+    // discriminator-selected shape values. Absent ⇒ none. (`--fields` must list the shaped paths.)
     if (opts.containsKey("variant-spec")) {
       VariantSpec spec = VariantSpec.fromJson(opts.get("variant-spec"));
       job = job.withVariant(new VariantExtractor(spec));
@@ -219,11 +207,9 @@ public final class ConnectorApp {
 
     SnapshotLineage lineage = SnapshotLineage.forTable(spark, catalog + "." + table);
     // The writer FACTORY, not a writer: every stream restart re-invokes it, so a CP-driven run
-    // re-resolves the CURRENT shard→node placement each time instead of pinning the startup
-    // snapshot. Without this, a CP re-placement leaves restarts hammering the deposed endpoint
-    // forever (ingest halts) — or worse, silently committing to an alive-but-deposed node reads no
-    // longer look at. Static (--nodes / no --control-plane) placement rebuilds to the same
-    // endpoints — just fresh channels.
+    // re-resolves the CURRENT shard→node placement instead of pinning the startup snapshot (else a
+    // re-placement leaves restarts hammering the deposed endpoint). Static placement rebuilds to the
+    // same endpoints with fresh channels.
     final ControlPlaneClient cp = placementCp;
     final WindowingConfig windowCfg = windowing;
     final List<String> staticNodes = nodes;
@@ -248,23 +234,20 @@ public final class ConnectorApp {
     }
 
     try {
-      // Manual writer lifecycle (not try-with-resources): the restart loop below REPLACES the
-      // writer after a re-resolution, so the variable can't be a resource binding — the inner
-      // finally closes whichever writer is CURRENT when the run ends.
+      // Manual writer lifecycle (not try-with-resources): the restart loop REPLACES the writer after a
+      // re-resolution, so the inner finally closes whichever writer is CURRENT when the run ends.
       BatchWriter client = writerFactory.get();
       try {
-        // Resume exactly-once: unless an explicit --start override is given, pick up
-        // from the checkpoint the Node has durably committed. null = the shard is
-        // empty, so read the changelog from the beginning.
+        // Resume exactly-once: unless --start overrides, pick up from the Node's durably-committed
+        // checkpoint. null = empty shard, so read the changelog from the beginning.
         Long resumeFrom = (start != null) ? start : client.checkpointSnapshotId();
         System.out.printf(
             "resuming from %s%n", resumeFrom == null ? "the start (no checkpoint)" : resumeFrom);
         if (stream) {
-          // A write that exhausts its retry budget (e.g. ALL Node pods mid-roll, dialing stale IPs)
-          // fails the micro-batch → the streaming query fails. Restart it IN-PROCESS — resuming from
-          // the Node's durable checkpoint (exactly-once rests there, not on Spark's offset) — rather
-          // than letting awaitTermination() throw → JVM exit(1) → CrashLoopBackOff. So a full node roll
-          // drains lag and recovers with the connector staying up (RESTARTS flat).
+          // A failed micro-batch fails the streaming query; restart it IN-PROCESS, resuming from the
+          // Node's durable checkpoint (exactly-once rests there, not on Spark's offset), rather than
+          // letting awaitTermination() throw → exit(1) → CrashLoopBackOff. So a full node roll drains
+          // lag with the connector staying up (RESTARTS flat).
           int restarts = 0;
           while (true) {
             try {
@@ -277,10 +260,9 @@ public final class ConnectorApp {
                   "connector: stream failed (%s); restart #%d in %ds — resuming from the Node checkpoint%n",
                   e.getMessage(), restarts, STREAM_RESTART_BACKOFF_SECS);
               Thread.sleep(STREAM_RESTART_BACKOFF_SECS * 1000L);
-              // Re-resolve placement BEFORE resuming: the failure may be a CP re-placement (the old
-              // primary deposed or dead), and only a rebuilt writer follows the move. Exactly-once is
-              // preserved: the new writer re-reads its resume point from the Nodes' durable
-              // checkpoints below, and idempotent batch ids dedup any boundary replay.
+              // Re-resolve placement BEFORE resuming: the failure may be a CP re-placement, and only a
+              // rebuilt writer follows the move. Exactly-once holds: the new writer re-reads its resume
+              // point from the Nodes' durable checkpoints, and idempotent batch ids dedup any replay.
               client = rebuildWriter(client, writerFactory);
               try {
                 resumeFrom = client.checkpointSnapshotId(); // latest committed; retries the Node
@@ -312,12 +294,10 @@ public final class ConnectorApp {
   }
 
   /**
-   * A writer factory over <b>CP-resolved hash placement</b>: each call re-reads the index's
-   * CURRENT shard→node map from the control plane ({@link #shardEndpointsFromCp}) and connects a
-   * fresh writer to it — so the restart loop follows a re-placement instead of retrying the
-   * startup endpoints forever. Routing (strategy, bucket map, shard-group ownership) stays fixed
-   * for the process: a re-placement moves a shard's <i>node</i>, never its ordinal; a topology
-   * change (reshard) still requires a connector restart.
+   * A writer factory over <b>CP-resolved hash placement</b>: each call re-reads the index's CURRENT
+   * shard→node map from the control plane ({@link #shardEndpointsFromCp}) and connects a fresh writer,
+   * so the restart loop follows a re-placement. Routing stays fixed for the process — a re-placement
+   * moves a shard's <i>node</i>, never its ordinal; a reshard still requires a connector restart.
    */
   static java.util.function.Supplier<BatchWriter> cpResolvedWriterFactory(
       ControlPlaneClient cp,
@@ -365,28 +345,23 @@ public final class ConnectorApp {
   }
 
   /**
-   * Drive {@link ConnectorJob#runOnce} once per new snapshot via {@code foreachBatch}.
-   * The Iceberg stream is only a <b>trigger</b> — the change set is re-derived from
-   * the changelog procedure each time — so non-append snapshots are skipped rather
-   * than failing the stream. The cursor is seeded from the Node's durable checkpoint
-   * ({@code start}) and advances in memory per trigger; exactly-once across a restart
-   * rests on the Node's atomic write+checkpoint commit, not Spark's stream offset.
+   * Drive {@link ConnectorJob#runOnce} once per new snapshot via {@code foreachBatch}. The Iceberg
+   * stream is only a <b>trigger</b> (the change set is re-derived from the changelog each time), so
+   * non-append snapshots are skipped rather than failing the stream. The cursor advances in memory
+   * per trigger; exactly-once across a restart rests on the Node's checkpoint, not Spark's offset.
    */
   static StreamingQuery runStream(
       SparkSession spark, ConnectorJob job, BatchWriter client, Long start)
       throws java.util.concurrent.TimeoutException {
     AtomicReference<Long> cursor = new AtomicReference<>(start);
     // A heartbeat trigger only — the change set is re-derived from the changelog in runOnce each
-    // batch, so the trigger source's content is irrelevant. We use Spark's built-in `rate` source
-    // (not the Iceberg streaming source) because the Iceberg source writes its offset log through the
-    // table's FileIO — with S3FileIO that rejects the local `file:` checkpoint ("Invalid S3 URI").
-    // The rate source checkpoints on the local FS, so the connector streams against any object store.
+    // batch, so trigger content is irrelevant. Use the `rate` source, not the Iceberg streaming
+    // source: the latter writes its offset log through the table's FileIO, which S3FileIO rejects for
+    // a local `file:` checkpoint ("Invalid S3 URI"); rate checkpoints on the local FS.
     Dataset<Row> trigger = spark.readStream().format("rate").option("rowsPerSecond", 1).load();
-    // Spark Structured Streaming needs a checkpoint location for its source-offset log. Pin it to a
-    // LOCAL path (file://) so Spark uses the LocalFileSystem for it — not the Iceberg table's
-    // S3FileIO, which rejects `file:` paths ("Invalid S3 URI"). This is only Spark's stream cursor;
-    // GrowlerDB's exactly-once rests on the Node's atomic write+checkpoint commit (so losing this on
-    // a restart just re-reads the changelog from the Node's durable checkpoint — a no-op replay).
+    // Spark's source-offset checkpoint — pinned LOCAL (file://) so it uses LocalFileSystem, not the
+    // table's S3FileIO (which rejects `file:` paths). Only Spark's cursor; GrowlerDB exactly-once
+    // rests on the Node's checkpoint, so losing this on a restart is a no-op changelog replay.
     String checkpoint =
         "file://" + System.getProperty("java.io.tmpdir", "/tmp") + "/growlerdb-connector-ckpt";
     return trigger
@@ -472,11 +447,9 @@ public final class ConnectorApp {
 
   /**
    * The per-ordinal owning-node endpoints of a hash-sharded index, read from the registry's shard map
-   * ({@code GetIndex.shard_status}) — the same placement the Gateway routes reads to, so CP-driven
-   * writes land where reads look. Returned in ordinal order ({@code [0, shard_count)}); each `scheme://`
-   * is stripped to the {@code host:port} the write clients dial. Fails fast if a shard has no live
-   * primary yet (the serve node hasn't registered) rather than silently dropping its writes — the
-   * operator brings all shard nodes up before starting the connector, as the read path already needs.
+   * ({@code GetIndex.shard_status}) — the same placement the Gateway routes reads to. Returned in
+   * ordinal order, each stripped to {@code host:port}. Fails fast if a shard has no live primary yet
+   * rather than silently dropping its writes.
    */
   static List<String> shardEndpointsFromCp(GetIndexResponse entry) {
     int count = entry.getShardCount();

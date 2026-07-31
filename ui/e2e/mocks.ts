@@ -1,7 +1,5 @@
-// Network mocks for the console E2E. The SPA is a pure client of the Engine REST API,
-// so intercepting `**/v1/**` lets us drive every screen deterministically with no backend. Each
-// endpoint has a sensible default; a test overrides only the slot it cares about (e.g. an error or
-// empty response for `search`).
+// Network mocks for the console E2E: intercepting `**/v1/**` drives every screen deterministically
+// with no backend. Each endpoint has a default; a test overrides only the slot it cares about.
 import type { Page } from '@playwright/test';
 
 export interface Reply {
@@ -58,13 +56,10 @@ function promVector() {
   };
 }
 
-/** Prometheus range-matrix response (used by the observability/ingestion sparklines). Values are
- *  small + healthy: the latest (0.008) is below every alert threshold (errorRate>0.05, latencyP99>1s,
- *  staleLocatorRate>1), so the alerts panel deterministically shows "No alerts firing". */
+/** Prometheus range-matrix response for the observability/ingestion sparklines. The latest value
+ *  (0.008) is below every alert threshold, so the alerts panel deterministically shows "No alerts
+ *  firing" once a refresh resolves. */
 function promMatrix() {
-  // Small, healthy values: the latest (0.008) is below every alert threshold (errorRate>0.05,
-  // latencyP99>1s, staleLocatorRate>1), so Observability deterministically shows "No alerts firing"
-  // once a refresh resolves — no race between the initial empty state and the post-refresh eval.
   return {
     status: 'success',
     data: {

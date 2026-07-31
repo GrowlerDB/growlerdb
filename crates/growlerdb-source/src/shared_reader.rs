@@ -1,13 +1,8 @@
-//! A lazily-connected, shared [`IcebergReader`] handle.
-//!
-//! Connecting `IcebergReader::connect` per RPC would rebuild the REST-catalog client
-//! (auth/config/HTTP client) for every `GetByKey`. A long-lived service instead holds a
-//! [`SharedReader`]: the first request connects, later requests
-//! reuse the same reader (and with it the reader's snapshot-pinned
-//! [plan cache](crate::plan_cache)). On a source failure the holder calls
-//! [`invalidate`](SharedReader::invalidate), so a dead/expired client is dropped and the
-//! **next** request reconnects — a broken client is never cached forever, and a failed
-//! connect leaves the slot empty (the next call simply retries).
+//! A lazily-connected, shared [`IcebergReader`] handle: the first request connects, later ones
+//! reuse the reader (and its snapshot-pinned [plan cache](crate::plan_cache)) rather than
+//! rebuilding the REST-catalog client per RPC. On a source failure the holder
+//! [`invalidate`](SharedReader::invalidate)s so the next request reconnects; a failed connect
+//! leaves the slot empty for the next call to retry.
 
 use std::sync::Arc;
 

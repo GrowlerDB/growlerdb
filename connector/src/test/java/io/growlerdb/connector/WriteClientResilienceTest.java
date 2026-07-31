@@ -19,11 +19,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 /**
- * Resilience of the connector's {@link WriteClient} to a Node restart. A force-killed shard pod
- * black-holes in-flight writes; without a
- * deadline the blocking RPC hangs ~forever and ingestion freezes silently. These exercise the two
- * guards against that — a per-call deadline (fail fast, don't hang) and idempotent retry with
- * backoff (absorb a brief outage in place) — against an in-process Node stub, no Spark needed.
+ * Resilience of {@link WriteClient} to a Node restart: a force-killed shard pod black-holes
+ * in-flight writes, so without a per-call deadline the blocking RPC hangs forever and ingestion
+ * freezes silently. Exercises the two guards — a deadline (fail fast) and idempotent retry with
+ * backoff (absorb a brief outage) — against an in-process Node stub, no Spark.
  */
 class WriteClientResilienceTest {
 

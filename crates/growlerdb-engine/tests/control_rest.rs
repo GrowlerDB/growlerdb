@@ -1,10 +1,8 @@
-//! The **control-plane REST surface**: the gateway's `/v1/indexes` REST routes proxy
-//! to the Control Plane over gRPC. Stand up a real `ControlPlaneService` (over a temp registry)
-//! on a tonic server, point the REST `control_router` at it via a gRPC client, and drive the
-//! list/get/drop lifecycle over HTTP. `CreateIndex`/`DescribeSource` need a live Iceberg source,
-//! so only their validation/error paths run in default CI (inline in `control_service.rs`);
-//! their happy paths currently have no automated coverage and are exercised manually against
-//! the Compose stack.
+//! The **control-plane REST surface**: the gateway's `/v1/indexes` REST routes proxy to the
+//! Control Plane over gRPC. A real `ControlPlaneService` runs on a tonic server, `control_router`
+//! points at it via a gRPC client, and the lifecycle is driven over HTTP. `CreateIndex`/
+//! `DescribeSource` need a live Iceberg source, so only their error paths run in CI; their happy
+//! paths are exercised manually against the Compose stack.
 
 use std::sync::Arc;
 
@@ -67,8 +65,8 @@ async fn control_app(seed: &[&str], root: &std::path::Path) -> Router {
 }
 
 /// Shared deployment secret the test authenticator validates bearer tokens against. The control
-/// plane must verify identity itself over the REST→gRPC hop — caller-asserted `x-growlerdb-*`
-/// headers are no longer forwarded — so tests carry identity in a signed bearer, not a header.
+/// plane verifies identity itself over the REST→gRPC hop (no forwarded `x-growlerdb-*` headers),
+/// so tests carry identity in a signed bearer, not a header.
 const TEST_SECRET: &[u8] = b"control-rest-test-secret";
 
 /// A signed session bearer for `subject` carrying `roles` — the verified identity the control
@@ -193,9 +191,8 @@ async fn ingestion_status_over_rest() {
     let tmp = tempfile::tempdir().unwrap();
     let app = control_app(&["docs"], tmp.path()).await;
 
-    // All-indexes ingestion status: `docs` appears with its source binding. No shards are
-    // assigned here, and the local-dev catalog isn't up, so source freshness is null — but the
-    // surface still resolves (the screen renders "—" for unknowns) rather than erroring.
+    // All-indexes ingestion status: `docs` appears with its source binding. No shards assigned and
+    // the local-dev catalog isn't up, so freshness is null — but the surface still resolves.
     let resp = app.clone().oneshot(get("/v1/ingestion")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = text(resp).await;

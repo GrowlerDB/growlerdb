@@ -1,12 +1,9 @@
-//! **Dynamic windowed streaming ingest**: a node-side `Write` gRPC service that routes
-//! each incoming doc to its **time-window shard** — creating the window shard on first write and
-//! publishing it so it becomes **live-queryable** (mux + in-process gateway) with no restart. This is
-//! the streaming counterpart to the batch [`write_windowed`](growlerdb_index::LocalIndexStore) that
-//! builds all windows up front; here windows form continuously as the ingest timeline advances.
-//!
-//! Placement is decided elsewhere (the control plane): the connector resolves a
-//! window's owning node and streams that window's rows here, so a given node only ever receives —
-//! and creates — the windows the control plane assigned to it.
+//! **Dynamic windowed streaming ingest**: a node-side `Write` gRPC service that routes each incoming
+//! doc to its **time-window shard** — creating the window shard on first write and publishing it so
+//! it becomes **live-queryable** (mux + in-process gateway) with no restart. The streaming
+//! counterpart to the batch [`write_windowed`](growlerdb_index::LocalIndexStore); here windows form
+//! as the timeline advances. Placement is the control plane's, so a node only receives — and creates
+//! — the windows assigned to it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
@@ -30,31 +27,27 @@ use crate::{AdminService, LocalNode, LookupService, Node, SearchService, Suggest
 
 /// Max decoded size of an inbound windowed `Write` (mirrors [`write_service`](crate::write_service)):
 /// a catch-up commit spanning many windows can be large. `pub(crate)` so the pool write dispatcher
-/// ([`pool_routing`](crate::pool_routing)) mounts its `WriteServer` with the same cap.
+/// mounts its `WriteServer` with the same cap.
 pub(crate) const MAX_WRITE_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 
-/// The node-side **write fence** (D53's one-writer-per-unit, task 357.12): an atomically-swapped
-/// view of the `(index, window)` units this node currently holds **as primary**, per the control
-/// plane's assignment pushes. The windowed write path consults it before committing or answering a
-/// checkpoint — a `Write`/`GetCheckpoint` addressed to a unit outside the primary set is refused
-/// with the structured [`NOT_PRIMARY`](crate::windowed_routing::NOT_PRIMARY) `FAILED_PRECONDITION`,
-/// so a misrouted or split-brain connector can never commit to (or fabricate a resume point on) a
-/// non-primary holder. When a unit's primary moves away from this node, the very next snapshot makes
-/// this node start refusing — closing the node's half of the split-brain window without waiting for
-/// the unit to unload.
+/// The node-side **write fence** (D53's one-writer-per-unit): an atomically-swapped view of the
+/// `(index, window)` units this node holds **as primary**, per the control plane's assignment pushes.
+/// The windowed write path consults it before committing or answering a checkpoint — a `Write`/
+/// `GetCheckpoint` addressed to a unit outside the primary set is refused with the structured
+/// [`NOT_PRIMARY`](crate::windowed_routing::NOT_PRIMARY) `FAILED_PRECONDITION`, so a misrouted or
+/// split-brain connector can never commit to (or fabricate a resume point on) a non-primary holder.
+/// When a unit's primary moves away, the next snapshot makes this node start refusing — closing its
+/// half of the split-brain window without waiting for the unit to unload.
 ///
 /// **Fencing applies only when the node runs from CP assignments** (`serve-pool --register`):
 ///
-/// * [`PrimaryFence::unrestricted`] (also the `Default`) never refuses — classic single-index
-///   `serve` / standalone `serve-pool` have no assignment stream, and their create-on-first-write
-///   behavior is unchanged.
+/// * [`PrimaryFence::unrestricted`] (the `Default`) never refuses — classic `serve` / standalone
+///   `serve-pool` have no assignment stream, so create-on-first-write is unchanged.
 /// * [`PrimaryFence::fenced`] enforces from the **first applied snapshot** on; before it arrives the
-///   fence stays permissive (the node just booted and the CP's seed snapshot is in flight — refusing
-///   here would fail connector streams with a non-retryable code for a startup race, and the
-///   defense-in-depth read-mux check in `ensure_window` still protects replica-held windows).
+///   fence stays permissive (the CP's seed snapshot is in flight — refusing here would fail connector
+///   streams for a startup race, and `ensure_window`'s read-mux check still protects replica windows).
 ///
-/// Cheap to clone; one instance is shared by every per-index writer on the node and updated by the
-/// assignment reconcile loop.
+/// Cheap to clone; one instance is shared by every per-index writer on the node.
 #[derive(Clone, Default)]
 pub struct PrimaryFence {
     /// `None` = unrestricted (no assignment stream). Inner `None` = fenced but no snapshot applied
@@ -81,8 +74,8 @@ impl PrimaryFence {
     }
 
     /// Atomically replace the primary-held view from a full CP assignment snapshot. Only **window**
-    /// units matter here (the windowed write path is what's fenced; hash-shard pool writes are a
-    /// follow-on); replica-role units are excluded by construction. A no-op on an unrestricted fence.
+    /// units matter here (the windowed write path is what's fenced); replica-role units are excluded.
+    /// A no-op on an unrestricted fence.
     pub fn apply_snapshot(&self, units: &[UnitAssignment]) {
         let Some(view) = &self.view else { return };
         let mut primaries = PrimaryUnits::new();
@@ -108,10 +101,9 @@ impl PrimaryFence {
     }
 }
 
-/// One window's authoritative serving state on this node: the swappable shard handle, the
-/// in-process node fronting it (for the node's own REST gateway scatter), and its event-time
-/// zone-map (widened as the window ingests). The search/suggest *services* live in the shared mux
-/// maps ([`SharedSearchWindows`]/[`SharedSuggestWindows`]) the write path keeps in sync.
+/// One window's authoritative serving state on this node: the swappable shard handle, the in-process
+/// node fronting it (for the node's own REST gateway scatter), and its event-time zone-map. The
+/// search/suggest *services* live in the shared mux maps the write path keeps in sync.
 struct WindowState {
     handle: ShardHandle,
     node: Arc<dyn Node>,
@@ -157,7 +149,7 @@ pub struct WindowedWriteService {
     fence: PrimaryFence,
     /// Serializes windowed writes on this node so two concurrent commits can't both create the same
     /// window (or fight one shard's writer). The connector streams a node's windows from one worker,
-    /// so serialization is the natural model and keeps creation single-threaded.
+    /// so serialization is the natural model.
     write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -219,11 +211,10 @@ impl WindowedWriteService {
         WriteServer::new(self).max_decoding_message_size(MAX_WRITE_MESSAGE_BYTES)
     }
 
-    /// A snapshot of the windows this node currently serves and their swappable handles — the **live**
-    /// set (boot windows plus any created at runtime by ingest). The background cold-tier *park* loop
-    /// reads this each tick to decide which aged windows to demote; swapping a returned handle to a
-    /// cold read-through shard is immediately visible to every query path sharing it. Ascending by
-    /// window id (oldest first), matching [`window_shards`](LocalIndexStore::window_shards).
+    /// A snapshot of the windows this node serves and their swappable handles — the **live** set (boot
+    /// windows plus any created at runtime). The background cold-tier park loop reads this each tick;
+    /// swapping a returned handle to a cold read-through shard is immediately visible to every query
+    /// path sharing it. Ascending by window id, matching [`window_shards`](LocalIndexStore::window_shards).
     pub fn window_handles(&self) -> Vec<(i64, ShardHandle)> {
         self.read_windows()
             .iter()
@@ -251,10 +242,9 @@ impl WindowedWriteService {
     ///
     /// **Replica-held guard (HA-A2, defense in depth under the [`PrimaryFence`]):** a window present
     /// in the shared read mux but absent from this writer's states was published **read-through**
-    /// (cold) by the pool node's assignment reconcile — a parked snapshot this node serves as a
-    /// replica (or as the primary of an already-parked window). Creating a fresh shard here would
-    /// overwrite the served entries with an empty one; refuse instead (the same non-retryable
-    /// `WINDOW_PARKED` a late write into a locally-parked window gets).
+    /// (cold) by the assignment reconcile — a parked snapshot this node serves as a replica. Creating
+    /// a fresh shard here would overwrite the served entries with an empty one; refuse instead (the
+    /// same non-retryable `WINDOW_PARKED` a late write into a locally-parked window gets).
     fn ensure_window(&self, window: i64) -> Result<(ShardHandle, bool), Status> {
         if let Some(st) = self.read_windows().get(&window) {
             return Ok((st.handle.clone(), false));
@@ -306,8 +296,8 @@ impl WindowedWriteService {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(window, SuggestService::new(handle.clone()));
-        // Hydration: a new window must also be reachable by keys:get + describe, or a doc
-        // just streamed into it can't be opened in the console and it's invisible to the index total.
+        // A new window must also be reachable by keys:get + describe, or a doc just streamed into it
+        // can't be opened in the console and is invisible to the index total.
         self.lookup
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -343,9 +333,9 @@ impl WindowedWriteService {
     /// index snapshot and the ids of any windows created this call.
     ///
     /// **Write fencing (357.12):** every target window is validated against the [`PrimaryFence`]
-    /// *before anything commits* — a batch touching even one window this node doesn't hold as
-    /// primary is refused whole (structured `NOT_PRIMARY`), with no shard created and no partial
-    /// commit, so the refusal is safely replayable against the right holder.
+    /// *before anything commits* — a batch touching even one window this node doesn't hold as primary
+    /// is refused whole (structured `NOT_PRIMARY`), with no shard created and no partial commit, so
+    /// the refusal is safely replayable against the right holder.
     fn commit_windowed(&self, batch: &CommitBatch) -> Result<(u64, Vec<i64>), Status> {
         let (window_batches, deletes) = self.windowing.partition_batch(
             batch,
@@ -392,7 +382,7 @@ impl WindowedWriteService {
             }
         }
         // Deletes carry only a key (no window value), so broadcast to every window — only the owner
-        // holds the key. Rare for the append-mostly sources windowing targets.
+        // holds the key.
         if !deletes.is_empty() {
             // Carry the connector's resume floor so each window prunes its idempotency records
             // (`from` stays absent by design — see `TimeWindowing::partition_batch`).
@@ -409,18 +399,15 @@ impl WindowedWriteService {
                 .collect();
             let mut skipped_parked = Vec::new();
             for (window, handle) in handles {
-                // A window this node no longer holds as primary must not take the broadcast either
-                // (the fence would refuse a direct write; the broadcast is no exception) — its
-                // primary applies the same delete, so nothing is lost.
+                // A window this node no longer holds as primary must not take the broadcast either —
+                // its primary applies the same delete, so nothing is lost.
                 if !self.fence.allows(&self.index_name, window) {
                     continue;
                 }
                 let shard = handle.current();
-                // A parked (cold read-through) window is immutable: writing would fail, and
-                // failing the whole batch would wedge ingest behind an un-applicable delete. Skip
-                // it — if the key lives in a parked window, the doc outlives its delete until the
-                // window is dropped/revived (accepted for the append-mostly sources windowing
-                // targets; surfaced via the warning below).
+                // A parked (cold read-through) window is immutable: failing the whole batch would
+                // wedge ingest behind an un-applicable delete. Skip it — a key in a parked window
+                // outlives its delete until the window is dropped/revived (surfaced via the warning below).
                 if shard.is_read_only() {
                     skipped_parked.push(window);
                     continue;
@@ -438,9 +425,8 @@ impl WindowedWriteService {
                 );
             }
         }
-        // Ingestion throughput SLI: committed doc-ops this commit, labelled by index
-        // — the ordinal write path emits this too, so the console Ingestion throughput + the Grafana
-        // "index docs/s" panel light up for a windowed index instead of reading a flat 0.
+        // Ingestion throughput SLI: committed doc-ops this commit, labelled by index (the ordinal
+        // write path emits this too, so a windowed index lights up the same console/Grafana panels).
         growlerdb_telemetry::sli::ingested_docs(&self.index_name, ingested);
         Ok((max_snapshot, created))
     }
@@ -470,14 +456,13 @@ impl WindowedWriteService {
     }
 
     /// **Unload** `window` from this node's serving set (D53 de-assignment, HA-G1): remove its
-    /// entries from the shared read mux maps (search/suggest/lookup/admin — the same Arcs the pool
-    /// multiplexers front, so the window stops being routable immediately) and from this writer's
-    /// authoritative window states, then rebuild the in-process gateway without it. Dropping the
-    /// map entries is safe for in-flight requests: the muxes **clone the service (an `Arc`'d shard
-    /// handle) out from under the read lock** before dispatching, so the last clone keeps the shard
-    /// (mmaps and all) alive until those requests finish — removal only unpublishes. A replica-held
-    /// (read-through) window has mux entries but no writer state; both shapes are handled. Returns
-    /// `true` iff the node was actually serving the window (anything was removed).
+    /// entries from the shared read mux maps (the same Arcs the pool muxes front, so the window stops
+    /// being routable immediately) and from this writer's window states, then rebuild the in-process
+    /// gateway without it. Safe for in-flight requests: the muxes **clone the service (an `Arc`'d
+    /// shard handle) out from under the read lock** before dispatching, so the last clone keeps the
+    /// shard alive until those requests finish. A replica-held (read-through) window has mux entries
+    /// but no writer state; both shapes are handled. Returns `true` iff the node was actually serving
+    /// the window.
     pub fn unload_window(&self, window: i64) -> bool {
         let mut any = false;
         any |= self
@@ -527,8 +512,8 @@ impl WindowedWriteService {
                 event_min: st.zone.map(|(lo, _)| lo).unwrap_or(0),
                 event_max: st.zone.map(|(_, hi)| hi).unwrap_or(0),
                 has_event_bounds: st.zone.is_some(),
-                // The window's live tier: read-through (no writer) ⇒ cold. Reported each heartbeat,
-                // so a park/pre-warm swap surfaces in the cluster gateway's /v1/cold.
+                // Live tier: read-through (no writer) ⇒ cold. Reported each heartbeat, so a
+                // park/pre-warm swap surfaces in the cluster gateway's /v1/cold.
                 cold: st.handle.current().is_read_only(),
             })
             .collect()
@@ -558,16 +543,15 @@ impl Write for WindowedWriteService {
                 )
             })?;
 
-        // Serialize windowed writes on this node so window creation is single-threaded, then run the
-        // blocking commit off the async runtime.
+        // Serialize windowed writes so window creation is single-threaded, then commit off the runtime.
         let _guard = self.write_lock.lock().await;
         let svc = self.clone();
         let started = std::time::Instant::now();
         let (snapshot, created) = tokio::task::spawn_blocking(move || svc.commit_windowed(&batch))
             .await
             .map_err(|e| to_status(Code::Internal, WireError::new("INTERNAL", e.to_string())))??;
-        // Write-latency SLI: the wall-clock per-commit time across this batch's windows —
-        // the latency counterpart to the `ingested_docs` throughput counted inside `commit_windowed`.
+        // Write-latency SLI: wall-clock per-commit time across this batch's windows (the latency
+        // counterpart to `ingested_docs`).
         growlerdb_telemetry::sli::write(&self.index_name, started.elapsed().as_secs_f64());
 
         if !created.is_empty() {
@@ -582,9 +566,9 @@ impl Write for WindowedWriteService {
     ) -> Result<Response<GetCheckpointResponse>, Status> {
         // Per-window resume: the connector reads each window's checkpoint independently.
         let window = request.into_inner().window;
-        // Write fence (357.12 / HA-A3): a checkpoint read on a non-primary holder must be the
-        // structured NOT_PRIMARY refusal, never a fabricated "no checkpoint, snapshot 0" — that
-        // answer would instruct a misrouted connector to re-ingest the window from scratch here.
+        // Write fence (HA-A3): a checkpoint read on a non-primary holder must be the structured
+        // NOT_PRIMARY refusal, never a fabricated "no checkpoint, snapshot 0" — that would instruct a
+        // misrouted connector to re-ingest the window from scratch here.
         if !self.fence.allows(&self.index_name, window) {
             return Err(not_primary(format!(
                 "this node does not hold window {} of `{}` as primary — resolve the unit's \
@@ -593,9 +577,9 @@ impl Write for WindowedWriteService {
             )));
         }
         let Some(handle) = self.read_windows().get(&window).map(|s| s.handle.clone()) else {
-            // Defense in depth (as in `ensure_window`): a window in the read mux but absent from
-            // the write states is a parked snapshot published read-through by the assignment
-            // reconcile — refuse rather than fabricate an empty checkpoint over served data.
+            // Defense in depth (as in `ensure_window`): a window in the read mux but absent from the
+            // write states is a parked snapshot published read-through — refuse rather than fabricate
+            // an empty checkpoint over served data.
             if self
                 .search
                 .read()
@@ -635,19 +619,17 @@ impl Write for WindowedWriteService {
     }
 }
 
-/// Map a commit [`StoreError`] to a gRPC status — a checkpoint gap and a write into a parked
-/// window are non-retryable `FAILED_PRECONDITION`s (retrying can never succeed; the operator
-/// must reconcile / revive), everything else internal. Mirrors
-/// [`write_service`](crate::write_service).
+/// Map a commit [`StoreError`] to a gRPC status — a checkpoint gap and a write into a parked window
+/// are non-retryable `FAILED_PRECONDITION`s (retrying can't succeed; the operator must reconcile /
+/// revive), everything else internal. Mirrors [`write_service`](crate::write_service).
 fn store_error_to_status(e: StoreError) -> Status {
     match &e {
         StoreError::CheckpointGap { .. } => to_status(
             Code::FailedPrecondition,
             WireError::new("CHECKPOINT_GAP", e.to_string()),
         ),
-        // Late data routed to a window already parked to the cold tier: an infinite-retry trap
-        // as INTERNAL (the write can never succeed while the window is cold). Loud + actionable
-        // instead: revive (pre-warm) the window or widen `hot_windows`.
+        // Late data routed to a window already parked to cold: loud + actionable rather than an
+        // infinite-retry INTERNAL trap — revive (pre-warm) the window or widen `hot_windows`.
         StoreError::ReadOnlyShard(_) => to_status(
             Code::FailedPrecondition,
             WireError::new(
@@ -961,9 +943,8 @@ mod tests {
         .unwrap();
         let _cold_store = park_window(&svc, &store, day(10)).await;
 
-        // A batch with an upsert + deletes commits cleanly: the broadcast applies to the hot
-        // window and skips the parked one (previously this panicked the write path and the
-        // connector retried the poison batch forever).
+        // A batch with an upsert + deletes commits cleanly: the broadcast applies to the hot window
+        // and skips the parked one.
         svc.write(Request::new(WriteRequest {
             batch: Some(
                 growlerdb_core::CommitBatch::new(
@@ -1007,8 +988,7 @@ mod tests {
         .unwrap();
         let _cold_store = park_window(&svc, &store, day(10)).await;
 
-        // Late data routed to the parked window: a loud, non-retryable FAILED_PRECONDITION
-        // (previously a panic surfaced as INTERNAL, which the connector retried forever).
+        // Late data routed to the parked window: a loud, non-retryable FAILED_PRECONDITION.
         let status = svc
             .write(Request::new(WriteRequest {
                 batch: Some(
@@ -1148,10 +1128,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn write_to_a_replica_published_window_refuses_and_keeps_the_served_snapshot() {
         // HA-A2 (defense in depth, independent of the fence): a window present in the READ mux but
-        // absent from the write states was published read-through by the pool node's assignment
-        // reconcile (a replica-held parked snapshot). A write addressed to it previously created a
-        // fresh empty shard and OVERWROTE the served mux entries; it must refuse instead, leaving
-        // the served data intact — even with a permissive fence (no snapshot applied yet).
+        // absent from the write states is a replica-held parked snapshot published read-through by
+        // the assignment reconcile. A write addressed to it must refuse rather than create a fresh
+        // empty shard that overwrites the served entries — even with a permissive fence.
         let (svc, search, store, _tmp) = service();
         let day = |n: i64| n * DAY;
         let svc = svc.with_primary_fence(PrimaryFence::fenced()); // fenced, no snapshot yet

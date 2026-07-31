@@ -1,7 +1,6 @@
 <script lang="ts">
-  // Inline sparkline for metric cards. Responsive width (measured, no aspect-ratio distortion) with
-  // a hover guide + tooltip so a small card reads its own numbers the way the hero charts do —
-  // mouse over to see the value (and time) at that point.
+  // Inline sparkline for metric cards: measured responsive width with a hover guide + tooltip so a
+  // small card reads its own value (and time) at a point.
   let {
     points,
     times = [],

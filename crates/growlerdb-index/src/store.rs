@@ -1,26 +1,7 @@
-//! `LocalIndexStore` — **one Tantivy index per shard** + a small [redb] aux store, with
-//! an **incremental, crash-safe commit** ([Design 08], single-index migration).
-//!
-//! Each commit adds a **segment** to the shard's single Tantivy index (not a separate
-//! index per commit). Updates/deletes are **Tantivy-native**: an upsert deletes the
-//! prior doc by `enc(key)` then adds the new one; a delete removes it by key. The
-//! searcher therefore excludes superseded/deleted docs natively — no merge-on-read
-//! liveness filter — and the Compactor fuses small segments via
-//! `IndexWriter::merge`, physically purging the deletes.
-//!
-//! **Crash safety** (D30 layered locator): the dense location array
-//! (`location.arr`) is appended/patched and **fsynced first**; then the Tantivy commit
-//! is made durable; then a redb write txn updates the checkpoint, the batch record,
-//! and any new file-table interns. A crash between the array fsync and the Tantivy
-//! commit leaves only *orphan* array slots (unreachable — no committed doc references
-//! them; reclaimed by a later store compaction). A crash between the Tantivy commit
-//! and the redb txn leaves the index ahead of the checkpoint; the connector resumes
-//! from the (unadvanced) checkpoint and **re-applies** the batch, which is idempotent
-//! on the key (delete-then-add) — so exactly-once holds. Commits are idempotent on
-//! `batch_id`.
-//!
-//! [redb]: ../../../okf/system/decisions/d11-kv-store.md
-//! [Design 08]: ../../../okf/system/storage/data-model.md
+//! `LocalIndexStore` — one Tantivy index per shard plus a small redb aux store, with an
+//! incremental, crash-safe commit. Crash safety (D30 layered locator): `location.arr` is fsynced
+//! first, then the Tantivy commit, then the redb checkpoint txn; a crash re-applies the batch on
+//! resume, idempotent on the key (delete-then-add). Commits are idempotent on `batch_id`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -56,10 +37,8 @@ use crate::segment::{
 /// Engine API put `sort_values` on every wire hit for cross-shard merge.
 type ValuedPage = (Vec<(Hit, Vec<SortValue>)>, Option<SearchAfter>);
 
-// `aux.redb` holds META + BATCH_KEYS (+ its BATCH_CKPT prune index) + FILES. Locators
-// live in the layered store (key terms + `_locid` fast field + `location.arr`, D30), and
-// the **live-key set** (drift / `key_count` / `reconcile`) is enumerated from the index
-// with per-term liveness (`SegmentReader::live_keys_with_prefix`).
+// `aux.redb` holds META + BATCH_KEYS (+ its BATCH_CKPT prune index) + FILES. Locators live in
+// the layered store (D30); the live-key set is enumerated from the index with per-term liveness.
 /// Small store metadata: `checkpoint` (JSON), `snapshot` (u64 LE).
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// `batch_id` → commit snapshot; idempotent-retry guard (the presence of the key, not the
@@ -67,53 +46,37 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// resume floor and can never be re-sent (keyed through [`BATCH_CKPT`]).
 const BATCH_KEYS: TableDefinition<&str, u64> = TableDefinition::new("batch_keys");
 /// Prune index over [`BATCH_KEYS`]: the checkpoint's **Iceberg sequence number** → the
-/// `batch_id`s committed at it. A **multimap** because many
-/// batches can share a checkpoint (an empty-window advance records a `batch_id` under the head
-/// it jumped to, and multiple sub-batches of one trigger can end at the same snapshot). Lets
-/// the write path **range-delete** every `batch_id` whose checkpoint sits at/below the
-/// connector's resume floor (`safe_checkpoint`) — the batches that can never be re-sent —
-/// instead of scanning the whole idempotency table. Written in the same redb txn as the
-/// `BATCH_KEYS` insert, so the two never diverge.
+/// `batch_id`s committed at it (a multimap — many batches can share one checkpoint). Lets the
+/// write path **range-delete** every `batch_id` at/below the connector's resume floor instead of
+/// scanning the whole table; written in the same redb txn as the `BATCH_KEYS` insert so they
+/// never diverge.
 ///
-/// The key **must be lineage-ordered** for the range prune to be sound; snapshot ids are
-/// random longs, so an index keyed by raw snapshot id could
-/// range-delete records for batches still ahead of the floor (including the one inserted in
-/// the same txn). [`migrate_batch_index`](LocalIndexStore::migrate_batch_index) clears any
-/// misordered generation once at open (safe: with the window-covering continuity guard these
-/// records are belt-and-braces, not correctness). A batch whose checkpoint carries no
-/// sequence number gets no entry here and is simply never pruned (bounded over-retention).
+/// The key **must be lineage-ordered** for the range prune to be sound (snapshot ids are random
+/// longs, so a raw-id key could delete records still ahead of the floor).
+/// [`migrate_batch_index`](LocalIndexStore::migrate_batch_index) clears any misordered generation
+/// once at open (safe: the window-covering guard makes these records an optimization, not
+/// correctness). A checkpoint with no sequence number gets no entry and is never pruned.
 const BATCH_CKPT: MultimapTableDefinition<i64, &str> = MultimapTableDefinition::new("batch_ckpt");
-/// **Interned data-file table** (D30 location layer): dense
-/// `file_id: u32` → Iceberg data-file path. `location.arr` entries carry the u32; the
-/// shard keeps an in-memory bidirectional map (path→id to intern at commit, id→path to
-/// resolve at hydration), loaded from here at open. New interns commit in the
-/// post-Tantivy redb txn — a crash before it orphans array slots referencing an
-/// unpersisted id, which is benign (unreachable; the batch replay re-interns and
-/// re-patches).
+/// **Interned data-file table** (D30 location layer): dense `file_id: u32` → Iceberg data-file
+/// path; the shard keeps an in-memory bidirectional map, loaded from here at open. New interns
+/// commit in the post-Tantivy redb txn — a crash before it only orphans array slots (benign; the
+/// batch replay re-interns and re-patches).
 const FILES: TableDefinition<u32, &str> = TableDefinition::new("files");
-/// **Dead-file bitmap** (D30 `coordinates` strategy): the set of
-/// interned `file_id`s whose data file an Iceberg rewrite (`replace` snapshot) removed
-/// from the live table. Kept as a small **parallel key-set table** rather than widening
-/// the [`FILES`] value to `(path, dead)`: the `FILES` rows stay immutable (interned
-/// once, never rewritten), the dead set is tiny (bounded by rewritten files, not rows),
-/// and marking a file dead touches one 4-byte key instead of rewriting a path row.
-/// Dead flags are **permanent tombstones** — a re-mapped file's id is never reused for
-/// a new path (interns are dense and append-only), so a flag never has to be cleared.
-/// Loaded into [`FileIntern::dead`] at open; hydration's locator resolution consults it
-/// to skip doomed point reads, and the background re-map patches only slots that still
-/// point at a dead file.
+/// **Dead-file bitmap** (D30 `coordinates` strategy): interned `file_id`s whose data file an
+/// Iceberg rewrite removed from the live table. A parallel key-set table keeps the [`FILES`] rows
+/// immutable and marking cheap. Dead flags are **permanent tombstones** — interns are dense and
+/// append-only, so an id is never reused and a flag never has to be cleared. Hydration consults it
+/// to skip doomed point reads; the background re-map patches only slots still pointing at a dead file.
 const DEAD_FILES: TableDefinition<u32, ()> = TableDefinition::new("dead_files");
 
 const META_CHECKPOINT: &str = "checkpoint";
 const META_SNAPSHOT: &str = "snapshot";
 
-/// Max documents applied per Tantivy commit inside one [`Shard::commit_staged`]. A large
-/// source snapshot lands as one big batch; without a bound it becomes one giant segment whose
-/// apply+fsync is O(batch) (~4.5s @150k rows). Bounding it caps per-commit cost and
-/// makes early docs searchable mid-batch, while the checkpoint still advances once per batch. Env
-/// `GROWLERDB_WRITE_COMMIT_CHUNK` overrides; `0` disables (commit the whole batch at once). Default
-/// ~25k ≈ ~1s/commit — a balance of commit latency vs segment count (more, smaller
-/// segments mean more compaction work). Read once.
+/// Max documents applied per Tantivy commit inside one [`Shard::commit_staged`]. Bounding it caps
+/// per-commit apply+fsync cost (unbounded, one big batch is O(batch), ~4.5s @150k rows) and makes
+/// early docs searchable mid-batch, while the checkpoint still advances once per batch. Env
+/// `GROWLERDB_WRITE_COMMIT_CHUNK` overrides; `0` commits the whole batch at once. Default ~25k
+/// (~1s/commit) balances commit latency against segment count.
 fn commit_chunk_docs() -> usize {
     static CHUNK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CHUNK.get_or_init(|| {
@@ -167,12 +130,10 @@ pub struct ColdMarker {
     /// paired with `bundle_key`.
     #[serde(default)]
     pub bundle_manifest_key: Option<String>,
-    /// Object key of the parked window's `aux.redb`. The primary keeps it **local** and reads
-    /// through that; a **replica** on another node ([D53](/system/decisions/d53-unit-replication.md))
-    /// has no local copy, so it fetches this key to a scratch dir and opens the window read-through
-    /// ([`open_cold_replica`](crate::LocalIndexStore::open_cold_replica)). A parked window is
-    /// immutable, so this snapshot is frozen — no continuous re-sync. `None` on a window parked
-    /// before replica support (falls back to the local aux).
+    /// Object key of the parked window's `aux.redb`. The primary reads its local copy; a replica on
+    /// another node ([D53](/system/decisions/d53-unit-replication.md)) has none, so it fetches this
+    /// key and opens read-through ([`open_cold_replica`](crate::LocalIndexStore::open_cold_replica)).
+    /// A parked window is immutable, so the snapshot is frozen. `None` if parked before replica support.
     #[serde(default)]
     pub aux_key: Option<String>,
     /// Object key of the parked window's `location.arr` (the [D30](/system/decisions/d30-layered-locator.md)
@@ -222,32 +183,24 @@ pub enum StoreError {
     /// underlying `growlerdb-source` error, stringified to keep this crate independent of it.
     #[error("source read: {0}")]
     Source(String),
-    /// A batch's `from` checkpoint doesn't continue from the shard's current checkpoint:
-    /// the connector is trying to apply a window that doesn't pick up exactly where this shard left
-    /// off — a lineage gap, a checkpoint regression, or a cross-wired sub-batch. Refused so the
-    /// shard never "overwrites its checkpoint forward" over unapplied data (the structural silent-loss
-    /// window). The connector treats this as non-retryable and must resolve the discontinuity
-    /// (typically a reindex/reconcile). Carries `(from, current)` for the operator.
+    /// A batch's `from` checkpoint doesn't continue from the shard's current checkpoint. Refused so
+    /// the shard never overwrites its checkpoint forward over unapplied data (the structural
+    /// silent-loss window). Non-retryable; the connector must resolve the discontinuity (typically a
+    /// reindex/reconcile). Carries `(from, current)` for the operator.
     #[error("checkpoint gap: batch resumes from {from} but this shard is at {current}")]
     CheckpointGap { from: String, current: String },
-    /// A write-path operation reached a **read-only cold** shard — a parked window served
-    /// read-through from object storage, which has no writer. Routing normally shields cold
-    /// shards from writes (background writers stand down via
-    /// [`is_read_only`](Shard::is_read_only)), but late data or an admin call can still land
-    /// here — refused cleanly so the caller can surface it, never a panic. The remedy is to
-    /// revive (pre-warm) the window back to the hot tier first.
+    /// A write-path operation reached a **read-only cold** shard (a parked window served
+    /// read-through, no writer). Routing normally shields cold shards, but late data or an admin
+    /// call can still land here — refused cleanly, never a panic. Remedy: pre-warm the window first.
     #[error(
         "cannot {0} a read-only cold shard: the window is parked — revive (pre-warm) it first"
     )]
     ReadOnlyShard(&'static str),
-    /// The on-disk index for this name was built with a **different schema** than the definition
-    /// now being opened against it: a mapped field was added/removed/renamed, or a field's type or
-    /// fast-ness changed, so the derived Tantivy schema (its field set/types) no longer matches the
-    /// one persisted in the segment's `meta.json`. Writing new-schema documents into the stale index
-    /// would corrupt the fast-field writer (the doc references a field ordinal the writer's schema
-    /// doesn't have — the historical `index out of bounds` panic), so refuse up front instead. A
-    /// schema change invalidates the old data: reindex from scratch (drop the index / use a fresh
-    /// data dir, or run `growlerdb index`, which reindexes automatically on a schema change).
+    /// The on-disk index was built with a **different schema** than the definition now opening it
+    /// (a mapped field added/removed/renamed, or a type/fast-ness change), so the derived Tantivy
+    /// schema no longer matches the segment's `meta.json`. Writing new-schema docs into the stale
+    /// index would corrupt the fast-field writer (a doc referencing a field ordinal the writer lacks),
+    /// so refuse up front. Reindex from scratch (drop the index / fresh data dir, or `growlerdb index`).
     #[error("index `{index}` was built with a different schema; drop it (or use a fresh data dir / reindex) before rebuilding")]
     SchemaChanged { index: String },
 }
@@ -418,14 +371,12 @@ impl LocalIndexStore {
         let mut dir = ObjectDirectory::open(op.clone(), prefix)
             .map_err(|e| StoreError::Cold(e.to_string()))?
             .with_cache(cache.clone());
-        // One blocking operator for the small sidecar/manifest reads (op is async; these run in the
-        // synchronous open path, same as the ObjectDirectory reads themselves).
+        // Blocking operator for the small sidecar/manifest reads (op is async; this open path is sync).
         let bop =
             opendal::blocking::Operator::new(op).map_err(|e| StoreError::Cold(e.to_string()))?;
-        // Precomputed hotcache: one GET preloads the structural reads so opening the window
-        // issues zero further object round-trips. Missing/unreadable OR an unrecognized/incompatible
-        // sidecar → fall back to plain read-through (cold-but-correct), never fail the
-        // open on a stale hotcache.
+        // Precomputed hotcache: one GET preloads the structural reads so the window opens with zero
+        // further round-trips. Missing/unreadable/incompatible → fall back to plain read-through,
+        // never fail the open on a stale hotcache.
         if let Some(key) = hotcache_key {
             match bop.read(key) {
                 Ok(buf) => match crate::hotcache::preload(&buf.to_vec()) {
@@ -438,8 +389,8 @@ impl LocalIndexStore {
                 Err(e) => return Err(StoreError::Cold(e.to_string())),
             }
         }
-        // Split bundle: read the small layout manifest, then serve every file read as a
-        // ranged GET of the one bundle object instead of one object per file.
+        // Split bundle: read the layout manifest, then serve each file read as a ranged GET of the
+        // one bundle object instead of one object per file.
         if let Some((bundle_key, manifest_key)) = bundle {
             let manifest = bop
                 .read(manifest_key)
@@ -448,26 +399,23 @@ impl LocalIndexStore {
             dir = dir.with_bundle(std::sync::Arc::new(state));
         }
         let tantivy = tantivy::Index::open(dir).map_err(|e| StoreError::Segment(e.into()))?;
-        // A cold shard reads through an object directory (no local index files); point the reader
-        // at `aux_dir` so the ANN KNN path has a directory to probe (it finds no local sidecar and
-        // returns no vector hits — cold-tier KNN is served from the parked bundle, a later step).
+        // No local index files; point the reader at `aux_dir` so the ANN KNN path has a directory to
+        // probe (it finds no local sidecar and returns no vector hits — cold-tier KNN is a later step).
         let core =
             SegmentReader::live(&tantivy, aux_dir.to_path_buf()).map_err(StoreError::Segment)?;
-        // Reuse the retiring hot shard's `aux.redb` handle when parking a window in place (redb
-        // allows only one open per file); otherwise open it fresh (cold-at-startup / offline path).
+        // Reuse the retiring shard's `aux.redb` handle when parking in place (redb allows one open
+        // per file); otherwise open fresh.
         let db = match reuse_db {
             Some(db) => db,
             None => Arc::new(Database::open(aux_dir.join("aux.redb"))?),
         };
-        // A cold shard's `location.arr` stays local beside aux.redb (D30: the array is
-        // tiny and never parked). Read-only here — cold shards take no writes.
+        // A cold shard's `location.arr` stays local beside aux.redb (D30: tiny, never parked).
         let location = LocationStore::open(&aux_dir.join(LOCATION_FILE))?;
         let files = Mutex::new(FileIntern::load(&db)?);
         Ok(Shard {
             index: tantivy,
-            // No local Tantivy dir for a cold shard; `aux_dir` carries the local `aux.redb`. The
-            // search path never reads `index_dir` (only the backup/replica layer does, which a cold
-            // shard isn't part of).
+            // No local Tantivy dir; the search path never reads `index_dir` (only backup/replica
+            // does, which a cold shard isn't part of).
             index_dir: aux_dir.to_path_buf(),
             core,
             schema,
@@ -508,8 +456,7 @@ impl LocalIndexStore {
             )),
         };
         std::fs::create_dir_all(scratch_dir)?;
-        // Blocking operator for the two one-shot sidecar downloads (this open path is synchronous,
-        // as is `open_cold_shard`'s own sidecar reads).
+        // Blocking operator for the two one-shot sidecar downloads (this open path is synchronous).
         let bop = opendal::blocking::Operator::new(op.clone())
             .map_err(|e| StoreError::Cold(e.to_string()))?;
         let aux = bop
@@ -621,9 +568,8 @@ impl LocalIndexStore {
             .windowing
             .as_ref()
             .ok_or_else(|| StoreError::NotWindowed(index.name.clone()))?;
-        // The window/event fields are DATEs; a `format`-declared one carries its source
-        // unit (e.g. `epoch_ms`), so pass each field's format to normalize values to canonical micros
-        // before bucketing — matching the unit the index/range path stores.
+        // Pass each field's `format` so values normalize to canonical micros before bucketing —
+        // matching the unit the index/range path stores.
         let format_of = |name: &str| {
             index
                 .fields
@@ -701,17 +647,11 @@ impl LocalIndexStore {
         Ok(hits)
     }
 
-    /// Build (or open) the shard rooted at an explicit `dir` — the shared core of
-    /// [`create_shard`](Self::create_shard) and [`reindex`](Self::reindex) (which
-    /// builds a staging shard at a sibling path).
-    /// One-time re-key of the batch-idempotency prune index: misordered
-    /// [`BATCH_CKPT`] rows keyed by raw snapshot id — a random long, so the range prune
-    /// over them is unsound (it could drop records for batches still ahead of
-    /// the floor). Ordering can't be recovered from the stored key, so the old generation —
-    /// both the prune index and the [`BATCH_KEYS`] records it indexes — is cleared once and
-    /// the [`META_BATCH_CKPT_ORDER`] marker set. Safe: under the window-covering continuity
-    /// guard a replayed batch no-ops by *position*, so these records are an optimization
-    /// (skip re-staging), not correctness.
+    /// One-time re-key of the batch-idempotency prune index: misordered [`BATCH_CKPT`] rows keyed by
+    /// raw snapshot id (a random long) make the range prune unsound. Ordering can't be recovered from
+    /// the stored key, so the old generation — the prune index plus the [`BATCH_KEYS`] records it
+    /// indexes — is cleared once and the [`META_BATCH_CKPT_ORDER`] marker set. Safe: the
+    /// window-covering guard makes these records an optimization, not correctness.
     fn migrate_batch_index(db: &Database) -> Result<()> {
         let read = db.begin_read()?;
         let migrated = match read.open_table(META) {
@@ -763,13 +703,9 @@ impl LocalIndexStore {
         let tantivy = TantivySegmentCore
             .open_or_create_index(&schema, &index_dir)
             .map_err(StoreError::Segment)?;
-        // Guardrail: if an index already exists on disk, its persisted (`meta.json`) Tantivy schema
-        // must match the one we just derived from `index`. A definition that changed the mapped-field
-        // set or a field's type/fast-ness derives a different Tantivy schema; opening the stale index
-        // and adding new-schema documents through its writer corrupts the fast-field writer (a doc
-        // references a field ordinal the writer's schema lacks — the `index out of bounds` panic).
-        // Refuse before any document is written. The engine's `index`/reindex path wipes the stale
-        // dir first, so a clean rebuild never reaches this; this is the safety net for any other path.
+        // Guardrail: an existing index's persisted (`meta.json`) schema must match the one derived
+        // from `index`. Writing new-schema docs through a stale index's writer corrupts the
+        // fast-field writer (see [`StoreError::SchemaChanged`]), so refuse before any doc is written.
         if tantivy.schema() != *schema.tantivy_schema() {
             return Err(StoreError::SchemaChanged {
                 index: index.name.clone(),
@@ -784,8 +720,7 @@ impl LocalIndexStore {
                 db
             }
         };
-        // Open (or create) the dense location array beside aux.redb and load the
-        // interned file table into the in-memory bidirectional map.
+        // The dense location array sits beside aux.redb.
         let location = LocationStore::open(&dir.join(LOCATION_FILE))?;
         let files = Mutex::new(FileIntern::load(&db)?);
         let writer: tantivy::IndexWriter = tantivy
@@ -1530,9 +1465,8 @@ impl Shard {
                 None => Continuity::Apply,
                 Some(_) => Continuity::NoOp,
             },
-            // Ends strictly behind (provably, by sequence number): a stale replay — never
-            // apply, never regress. This also closes the old bootstrap bypass, where a
-            // stale `from = None` batch could silently rewind the checkpoint.
+            // Ends strictly behind (by sequence number): a stale replay — never apply, never
+            // regress (this also catches a stale `from = None` bootstrap that would rewind).
             Some(Ordering::Less) => Continuity::NoOp,
             Some(Ordering::Greater) => match from {
                 None => Continuity::Apply, // covers from the start of the changelog
@@ -1660,14 +1594,10 @@ impl Shard {
             .ok_or(StoreError::ReadOnlyShard("commit a batch to"))?
             .lock()
             .expect("writer not poisoned");
-        // Authoritative continuity decision: the stage-time check ran lock-free,
-        // so a concurrent writer may have advanced this shard between stage and commit —
-        // both could have passed the advisory guard against the same `current`, and blindly
-        // committing here would let the later one REGRESS the checkpoint over the earlier
-        // one's window. Every checkpoint write happens under this writer mutex, so
-        // re-deciding here, against the live checkpoint, before anything touches Tantivy,
-        // closes that window: the loser of the race turns into a NoOp or a loud Gap, never
-        // a silent regression.
+        // Authoritative continuity decision: the stage-time check ran lock-free, so a concurrent
+        // writer may have advanced this shard between stage and commit. Re-deciding here against the
+        // live checkpoint — under the writer mutex, before touching Tantivy — turns the loser of the
+        // race into a NoOp or a loud Gap, never a silent regression.
         let mut position = self.current_checkpoint()?;
         let mut apply: Vec<&StagedRef> = Vec::new();
         for s in staged {
@@ -1696,12 +1626,10 @@ impl Shard {
 
         let live: Vec<&StagedRef> = apply.iter().copied().filter(|s| s.has_content()).collect();
         if live.is_empty() {
-            // No document work — but an empty batch still advances the source checkpoint.
-            // A trigger window that routes no rows to this shard must not leave its checkpoint
-            // behind, or shards drift: the connector's single cursor moves on while lagging shards
-            // stay put, which inflates the min-checkpoint resume re-read AND breaks the continuity
-            // guard. Advancing here keeps every shard in lockstep at the head. Redb-only (no new
-            // index snapshot): record the batch ids for idempotent replay and move the checkpoint.
+            // No document work — but an empty batch still advances the source checkpoint. A window
+            // routing no rows here must not leave its checkpoint behind, or shards drift out of
+            // lockstep (inflating the resume re-read and breaking the continuity guard). Redb-only:
+            // record the batch ids for idempotent replay and move the checkpoint.
             let snapshot = self.current_snapshot()?;
             if let Some(last) = apply.last() {
                 let txn = self.db.begin_write()?;
@@ -1733,29 +1661,20 @@ impl Shard {
         // see uncommitted docs, so a key upserted twice across staged batches must
         // reuse its in-commit id (patch), not append a second slot.
         let mut seen: HashMap<&[u8], u64> = HashMap::new();
-        // Per-phase write latency: break the commit into apply / location_sync /
-        // tantivy_commit / redb so a high `growlerdb_write_duration_seconds` is attributable to a
-        // phase. `trace()` is a test-only no-op in prod. All O(batch), so this also shows the
-        // batch-size lever.
+        // Per-phase write latency (apply / location_sync / tantivy_commit / redb) so a high
+        // `growlerdb_write_duration_seconds` is attributable to a phase.
         let phase_secs = |name: &'static str, secs: f64| {
             metrics::histogram!("growlerdb_write_phase_duration_seconds", "phase" => name)
                 .record(secs);
         };
-        // Bound each Tantivy commit to `chunk` docs. A large source snapshot arrives as one
-        // large batch; committing it whole builds ONE giant segment — apply + fsync are O(batch)
-        // (~4.5s @150k rows). Instead, flush every `chunk` docs: each flush
-        // runs the D30 durability order (array synced → writer committed → searcher reloaded), so its
-        // docs become searchable immediately, and the redb **checkpoint still advances exactly once at
-        // the end** (below). This preserves the exact crash invariant — intermediate commits leave the
-        // index ahead of the un-advanced checkpoint, and a crash before the redb txn replays the whole
-        // batch idempotently (delete-then-add by key + deterministic file-intern re-allocation) — and
-        // touches neither the continuity guard nor the checkpoint format. `chunk == 0` disables
-        // (one commit). The `seen`/`new_files`/intern state carries across
-        // chunks: a key first seen in an earlier chunk is found via `seen` (or, post-reload, via
-        // `live_loc_id`) and patched in place, so cross-chunk upserts still reuse one slot.
+        // Bound each Tantivy commit to `chunk` docs (`0` = one commit). Each flush runs the D30
+        // durability order (array synced → writer committed → searcher reloaded), but the redb
+        // checkpoint still advances exactly once at the end — so the crash invariant holds:
+        // intermediate commits leave the index ahead of the un-advanced checkpoint, and a crash
+        // before the redb txn replays the whole batch idempotently. The `seen`/`new_files`/intern
+        // state carries across chunks, so a cross-chunk re-upsert of a key still reuses one slot.
         let chunk = self.commit_chunk;
-        // A chunk flush: durable-order commit of everything staged since the last flush. `store_locations`
-        // ⇒ sync the array first (D30). Emits the per-phase latency so a chunked commit shows bounded phases.
+        // A chunk flush: durable-order commit (D30: sync the array first when `store_locations`).
         macro_rules! flush_chunk {
             () => {{
                 if store_locations {
@@ -1792,11 +1711,9 @@ impl Shard {
                     if newly_interned {
                         new_files.push((file_id, locator.iceberg_file.clone()));
                     }
-                    // Reuse the key's live locator id (pre-commit term lookup, ~1 µs
-                    // warm) and patch its slot in place, keeping
-                    // the array O(live keys); append only for a genuinely new key.
-                    // An insert *after a delete* of the same key finds no live doc and
-                    // appends a NEW id — the old slot stays orphaned.
+                    // Reuse the key's live locator id and patch its slot in place (keeping the array
+                    // O(live keys)); append only for a genuinely new key. An insert after a delete of
+                    // the same key finds no live doc and appends a NEW id — the old slot stays orphaned.
                     let reused = match seen.get(enc.as_slice()) {
                         Some(&id) => Some(id),
                         None => self.core.live_loc_id(enc).map_err(StoreError::Segment)?,
@@ -1825,16 +1742,13 @@ impl Shard {
         }
         apply_secs += t_apply.elapsed().as_secs_f64();
         phase_secs("apply", apply_secs);
-        // Final flush — the durable point for the last chunk (and any trailing deletes). Also the
-        // single durable barrier before the checkpoint advance below when chunking is disabled. If the
-        // last upsert landed exactly on a chunk boundary this commits an empty writer, which is a
-        // harmless no-op fsync.
+        // Final flush — the durable barrier before the checkpoint advance below. Committing an empty
+        // writer (last upsert on a chunk boundary) is a harmless no-op fsync.
         flush_chunk!();
 
-        // Build the per-segment ANN sidecars over the vectors just committed. Idempotent
-        // + skipped for a non-vector index; runs after the final flush so the reloaded searcher sees
-        // every new segment. The sidecars are content-stable and registered in `sealed_segments`, so
-        // backup/restore carries them with the lexical segments.
+        // Build the per-segment ANN sidecars over the just-committed vectors. Idempotent + skipped
+        // for a non-vector index; runs after the final flush so the reloaded searcher sees every new
+        // segment.
         self.build_ann_sidecars()?;
 
         // 2) redb: checkpoint + snapshot + batch ids + new file-table interns.
@@ -1843,9 +1757,8 @@ impl Shard {
         let txn = self.db.begin_write()?;
         {
             if !new_files.is_empty() {
-                // In-memory intern map is already updated; a crash before this commit
-                // re-interns the same ids deterministically on batch replay (dense
-                // allocation from the persisted table's length).
+                // A crash before this commit re-interns the same ids deterministically on replay
+                // (dense allocation from the persisted table's length).
                 let mut files = txn.open_table(FILES)?;
                 for (id, path) in &new_files {
                     files.insert(id, path.as_str())?;
@@ -1878,23 +1791,17 @@ impl Shard {
         cp.sequence_number()
     }
 
-    /// Record every committed batch's `batch_id` in `BATCH_KEYS` (the idempotent-replay guard) and
-    /// index it under its checkpoint in [`BATCH_CKPT`], then drop every idempotency record at or
-    /// below the connector's resume floor — the batches that can never be re-sent. Runs
-    /// inside the caller's redb write txn so the two tables never diverge across a crash. The caller
-    /// must not hold `BATCH_KEYS`/`BATCH_CKPT` open when calling.
+    /// Record every committed `batch_id` in `BATCH_KEYS` (the idempotent-replay guard) and index it
+    /// under its checkpoint in [`BATCH_CKPT`], then drop every record at or below the connector's
+    /// resume floor. Runs inside the caller's redb write txn so the two tables never diverge; the
+    /// caller must not hold `BATCH_KEYS`/`BATCH_CKPT` open when calling.
     ///
-    /// **Soundness.** `safe_checkpoint` is the connector's resume floor — the min committed
-    /// checkpoint across all shards, which it reads the changelog from *exclusive* and never resumes
-    /// before (it is monotonic; every shard is already at or past it). So no batch with checkpoint
-    /// `<= floor` — in **lineage order** (sequence numbers; both the index key and the
-    /// floor comparison use it, never the random snapshot id) — can be re-derived and re-sent.
-    /// And since the window-covering guard no-ops a replay by *position*, a dropped
-    /// record can never turn a benign replay into a spurious `CheckpointGap` even if the floor
-    /// were wrong — the records are an optimization, the guard is the correctness.
-    /// `None` (no floor, or a floor with no sequence number) prunes nothing. When several staged
-    /// batches carry different floors (they share one within a trigger), the **max** is used — a
-    /// higher floor is still a position the connector will never resume before.
+    /// **Soundness.** `safe_checkpoint` is the connector's resume floor (monotonic; it never resumes
+    /// before it), so no batch with checkpoint `<= floor` — in **lineage order**, never the random
+    /// snapshot id — can be re-sent. And the window-covering guard no-ops a replay by *position*, so
+    /// a dropped record can't turn a replay into a spurious `CheckpointGap` — the records are an
+    /// optimization, the guard is the correctness. `None` prunes nothing; the **max** floor is used
+    /// across differing staged batches.
     fn record_and_prune_batches(
         txn: &redb::WriteTransaction,
         committed: &[&StagedRef],
@@ -1948,22 +1855,17 @@ impl Shard {
         Ok(())
     }
 
-    /// Refresh locator entries whose source `(file, position)` moved (Iceberg rewrote
-    /// the data file) — the write-back from hydration's verify-and-fall-back. Only
-    /// updates keys still present; a deleted key is skipped.
+    /// Refresh locator entries whose source `(file, position)` moved (Iceberg rewrote the data
+    /// file) — the write-back from hydration's verify-and-fall-back. Only updates keys still present.
     ///
-    /// Patches the key's `location.arr` slot in place (resolved through the same
-    /// key → `_locid` lookup the read path uses). Ordering keeps the crash contract's
-    /// invariant that a **reachable** slot never references un-durable state: new file
-    /// interns commit in a redb txn *first*, then the slots are patched and the array
-    /// fsynced. A crash between the two leaves the slot pointing at the old (stale)
-    /// location — hydration just verify-falls-back and refreshes again. Writes are
-    /// serialized against commits by the writer lock (a cold shard has none, but is
-    /// single-writer by construction: it takes no commits).
+    /// Patches the key's `location.arr` slot in place. Ordering keeps the crash invariant that a
+    /// **reachable** slot never references un-durable state: new file interns commit in a redb txn
+    /// *first*, then the slots are patched and the array fsynced (a crash between just leaves the old
+    /// location, which hydration verify-falls-back and refreshes again). Serialized against commits
+    /// by the writer lock.
     pub fn refresh_locators(&self, entries: &[(CompositeKey, RowLocator)]) -> Result<()> {
-        // A PREDICATE index has no location layer to refresh — the pruned key scan
-        // *is* its read path, so a re-found row is not a "stale locator".
-        // (Would be a natural no-op anyway: no live doc carries a `_locid` value.)
+        // A PREDICATE index has no location layer to refresh — the pruned key scan *is* its read
+        // path, so a re-found row is not a "stale locator".
         if self.schema.location_strategy() == growlerdb_core::LocationStrategy::Predicate {
             return Ok(());
         }
@@ -2085,29 +1987,20 @@ impl Shard {
             .collect()
     }
 
-    /// **Compaction re-map** (D30 `coordinates` strategy): bulk-patch
-    /// location slots after an Iceberg rewrite, from the rewritten rows' `(key, new
-    /// location)` pairs (column-projected out of the replace snapshot's *added* files).
-    /// Callers mark the disappeared files dead ([`mark_files_dead`](Self::mark_files_dead))
-    /// **first** — the dead flag is this method's patch guard.
+    /// **Compaction re-map** (D30 `coordinates` strategy): bulk-patch location slots after an
+    /// Iceberg rewrite, from the rewritten rows' `(key, new location)` pairs. Callers mark the
+    /// disappeared files dead ([`mark_files_dead`](Self::mark_files_dead)) **first** — the dead flag
+    /// is this method's patch guard.
     ///
-    /// Per entry: resolve the key's live `_locid` (skip if the key has no live doc —
-    /// deleted, or not yet ingested), then patch its slot **only if the slot still
-    /// points at a dead file**. That guard makes every interleaving safe: if ingest
-    /// upserted the key or a lazy hydration refresh already re-pointed the slot at a
-    /// live file, that state is *newer* than the re-mapped row and blindly patching
-    /// could resurrect an older version of the key — so the re-map only ever heals
-    /// dead pointers, and loses to anything fresher. (Slot patches are idempotent
-    /// last-wins 12-byte writes; verify-and-fallback remains the safety net for any
-    /// residual window.)
+    /// Per entry: resolve the key's live `_locid` (skip if no live doc), then patch its slot **only
+    /// if it still points at a dead file**. That guard makes every interleaving safe: ingest or a
+    /// lazy refresh that already re-pointed the slot at a live file is *newer* than the re-mapped
+    /// row, so the re-map only heals dead pointers and loses to anything fresher.
     ///
-    /// Entries are **sorted by encoded key** before lookup (term-dictionary locality —
-    /// ~1M key-sorted lookups/s warm) and processed in bounded
-    /// chunks: the writer lock is taken per chunk and released between chunks, so a
-    /// large re-map never blocks ingest or hydration refresh for its full duration.
-    /// Each chunk mirrors [`refresh_locators`](Self::refresh_locators)' durability
-    /// order: new file interns commit in a redb txn first, then the slots are patched
-    /// and the array fsynced — a reachable slot never references an un-durable intern.
+    /// Entries are **sorted by encoded key** before lookup (term-dictionary locality), processed in
+    /// bounded chunks (the writer lock released between chunks so a large re-map never blocks ingest
+    /// for its full duration). Each chunk mirrors [`refresh_locators`](Self::refresh_locators)'
+    /// durability order: interns commit first, then slots are patched and the array fsynced.
     pub fn remap_locations(&self, entries: &[(CompositeKey, RowLocator)]) -> Result<RemapStats> {
         /// Slots patched per writer-lock acquisition — small enough that ingest commits
         /// interleave, large enough to amortize the fsync.
@@ -2219,17 +2112,12 @@ impl Shard {
             .lock()
             .expect("writer not poisoned");
 
-        // TOCTOU guard: `live_keys` came from a source snapshot read *before* this lock.
-        // If a concurrent ingest committed during that read, a key it just added is live in the index
-        // but absent from `live_keys` — so it looks "stale" and we'd delete a legitimately newer row
-        // (and the checkpoint-continuity guard means the connector won't re-send it, so the wrong
-        // delete could persist until the next reconcile). The writer lock serializes commits, so with
-        // it held, `current_checkpoint == expected` proves NO commit happened across the whole scan —
-        // safe to delete. A mismatch means the shard advanced under us: skip the deletes this cycle
-        // (missing-repair still runs, and re-indexing a source-present key is always safe). `None` =
-        // the caller opts out (no concurrent writer — CLI/tests). Reading redb under the writer lock
-        // is consistent because every checkpoint advance (`commit_staged`, incl. the empty-batch
-        // advance) holds this same lock.
+        // TOCTOU guard: `live_keys` came from a source snapshot read *before* this lock. A key a
+        // concurrent ingest added during that read is live in the index but absent from `live_keys`,
+        // so it looks "stale" and we'd delete a legitimately newer row. The writer lock serializes
+        // commits, so with it held `current_checkpoint == expected` proves NO commit happened across
+        // the scan — safe to delete. A mismatch means the shard advanced: skip the deletes this cycle
+        // (missing-repair still runs). `None` opts out (no concurrent writer — CLI/tests).
         if let Some(expected) = expected_checkpoint {
             if self.current_checkpoint()?.as_ref() != Some(expected) {
                 return Ok(ReconcileDelete::skipped());
@@ -2248,16 +2136,13 @@ impl Shard {
         })
     }
 
-    /// The number of **live** indexed keys — optionally scoped to a `partition`
-    /// prefix. The cheap half of a drift check.
+    /// The number of **live** indexed keys, optionally scoped to a `partition` prefix — the cheap
+    /// half of a drift check.
     ///
-    /// D30: counted from the `_keyenc` term dictionary over the partition's raw-bytes
-    /// prefix range, with a per-term liveness probe (postings + alive bitset). We use
-    /// prefix enumeration rather than a partition-field `Count` query because the key
-    /// encoding preserves partition scoping exactly whether or not the partition
-    /// fields are themselves indexed — and the empty prefix ("whole shard") falls out
-    /// naturally. Cost: O(keys in partition) with the live set held in memory to
-    /// dedupe a key across segments — the same order as the redb range it replaces.
+    /// D30: counted from the `_keyenc` term dictionary over the partition's raw-bytes prefix range,
+    /// with a per-term liveness probe. Prefix enumeration (rather than a partition-field `Count`)
+    /// preserves partition scoping exactly whether or not the partition fields are indexed, and the
+    /// empty prefix ("whole shard") falls out naturally. O(keys in partition).
     pub fn key_count(&self, partition: &[(String, Value)]) -> Result<usize> {
         let prefix = CompositeKey::new(partition.to_vec(), Vec::new()).encode();
         Ok(self
@@ -2292,8 +2177,6 @@ impl Shard {
     /// the held [`SegmentReader`] snapshot keeps its segment files alive through later
     /// commits and [`compact`](Self::compact), so the as-of-`S` view never tears.
     pub fn open_pit(&self) -> Result<Pit> {
-        // A pinned Tantivy snapshot (its segment ref-counting keeps the files alive
-        // through later commits/compaction) + a redb view (as-of-S locator/snapshot).
         let core = SegmentReader::snapshot(&self.index, self.index_dir.clone())
             .map_err(StoreError::Segment)?;
         let view = self.read_view()?;
@@ -2393,11 +2276,9 @@ impl Shard {
     /// release them (so PITs are safe by construction). A no-op when ≤1 segment.
     pub fn compact(&self, policy: &CompactionPolicy) -> Result<()> {
         // Bounded, lock-releasing compaction: each pass merges one **size tier** (up to
-        // `merge_factor` similar-sized segments) under the writer lock, then RELEASES it before the
-        // next pass — so a single lock-hold is O(a tier), never O(shard), and ingest commits
-        // interleave between passes. Merging every segment in one lock-held call would grow with
-        // shard size and shed-storm the connector. Repeats up to `MAX_COMPACTION_PASSES`; the poll
-        // re-runs to drain any remainder.
+        // `merge_factor` similar-sized segments) under the writer lock, then releases it before the
+        // next — so a single lock-hold is O(a tier), never O(shard), and ingest interleaves between
+        // passes. Repeats up to `MAX_COMPACTION_PASSES`; the poll re-runs to drain any remainder.
         for _ in 0..MAX_COMPACTION_PASSES {
             let mut writer = self
                 .writer
@@ -2431,10 +2312,9 @@ impl Shard {
                 .map_err(|e| StoreError::Segment(e.into()))?;
             drop(writer); // release the lock so ingest can commit before the next bounded pass
             self.core.reload().map_err(StoreError::Segment)?;
-            // A merge produced a new segment id → build its ANN sidecar. The merged-away
-            // segments' sidecars are now orphaned; `garbage_collect_files` only reclaims Tantivy's
-            // own managed files, so a stale `.ann` may linger on disk (harmless — `sealed_segments`
-            // lists only current segments' files, so backup never carries an orphan).
+            // A merge produced a new segment id → build its ANN sidecar. The merged-away segments'
+            // orphaned `.ann` sidecars may linger (harmless — `sealed_segments` lists only current
+            // segments, so backup never carries an orphan).
             self.build_ann_sidecars()?;
         }
         Ok(())
@@ -2452,10 +2332,8 @@ impl Shard {
         })
     }
 
-    /// The shard's Tantivy index directory — the root that [`SealedSegment::files`] paths
-    /// resolve against. The backup and replica layers read segment bytes from here.
-    /// The tenant-scoping field, if this shard's index is tenant-scoped. Reads
-    /// inject a mandatory `tenant_field = <verified claim>` filter; `None` = not scoped.
+    /// The tenant-scoping field, if this shard's index is tenant-scoped. Reads inject a mandatory
+    /// `tenant_field = <verified claim>` filter; `None` = not scoped.
     pub fn tenant_field(&self) -> Option<&str> {
         self.schema.tenant_field()
     }
@@ -2567,8 +2445,7 @@ impl Shard {
                 }
             }
         }
-        // The locator files sit beside `index_dir` — …/<shard>/aux.redb and the dense
-        // `location.arr` (D30 location layer) vs …/<shard>/index.
+        // The locator files (aux.redb + location.arr, D30) sit beside `index_dir`.
         if let Some(parent) = self.index_dir.parent() {
             if let Ok(meta) = std::fs::metadata(parent.join("aux.redb")) {
                 b.locator = meta.len();
@@ -2588,26 +2465,18 @@ impl Shard {
         self.index_size_bytes()
     }
 
-    /// Enumerate the shard's **sealed segments** — the immutable, committed segments of
-    /// the single index, each with its on-disk files (relative to [`index_dir`]). This is
-    /// the shipping/backup unit: a sealed segment's files are content-stable
-    /// (every file name embeds the content/opstamp, so a commit that re-deletes within a
-    /// segment writes a *new* `.del` file rather than mutating one). Backup therefore
-    /// uploads incrementally — unchanged segments dedupe by file name — and replicas pull
-    /// the bytes and open them without re-indexing, for byte-identical scoring.
-    ///
-    /// Reflects the *current* committed view; call after a [`commit`](IndexWriter)/
-    /// [`compact`](Self::compact) to capture the post-merge set. The index-level
-    /// `meta.json` (which ties segments together and changes every commit) is captured by
-    /// the restore manifest separately — it is not itself a sealed segment.
+    /// Enumerate the shard's **sealed segments** — the immutable committed segments, each with its
+    /// on-disk files (relative to [`index_dir`]). The shipping/backup unit: files are content-stable
+    /// (each name embeds the content/opstamp), so backup uploads incrementally (unchanged segments
+    /// dedupe by name) and replicas open the bytes without re-indexing. Reflects the *current*
+    /// committed view; call after a commit/[`compact`](Self::compact) for the post-merge set. The
+    /// index-level `meta.json` is captured by the restore manifest separately.
     ///
     /// [`index_dir`]: Self::index_dir
     ///
     /// Build the per-segment **ANN sidecars** ([D19]) for the newly-sealed segments — one
-    /// `<segment-uuid>.ann` beside each Tantivy segment, over its stored vectors. Idempotent (a
-    /// segment with an existing sidecar is skipped) and a no-op for a non-vector index, so it can
-    /// run after every commit and after each compaction pass. Must be called with the live reader
-    /// already reloaded onto the target commit, so the searcher sees the segments to index.
+    /// `<segment-uuid>.ann` per segment over its stored vectors. Idempotent and a no-op for a
+    /// non-vector index. Must run with the live reader already reloaded onto the target commit.
     ///
     /// [D19]: ../../../okf/system/decisions/d19-ann-library.md
     fn build_ann_sidecars(&self) -> Result<()> {
@@ -2625,19 +2494,15 @@ impl Shard {
             .iter()
             .map(|seg| {
                 let meta = seg.meta();
-                // `list_files` is a *superset* — one path per possible component, some of
-                // which (e.g. a `.del` for a delete-free segment, or positions for a
-                // field without them) never hit disk. Filter to the bytes that actually
-                // exist so callers get a precise copy manifest.
+                // `list_files` is a superset — one path per possible component, some of which never
+                // hit disk. Filter to the bytes that exist so callers get a precise copy manifest.
                 let mut files: Vec<PathBuf> = meta
                     .list_files()
                     .into_iter()
                     .filter(|f| self.index_dir.join(f).exists())
                     .collect();
-                // The per-segment ANN sidecar (`<segment-uuid>.ann`) is a GrowlerDB-owned
-                // artifact not listed by `list_files`, but it belongs to this segment and must ship
-                // with it — register it so backup/restore carries it (content-stable per segment id,
-                // so it hard-links/dedupes like the lexical files).
+                // The `.ann` sidecar isn't listed by `list_files` but belongs to this segment —
+                // register it so backup/restore carries it (content-stable, dedupes like the rest).
                 let ann = PathBuf::from(format!("{}.ann", meta.id().uuid_string()));
                 if self.index_dir.join(&ann).exists() {
                     files.push(ann);
@@ -2700,15 +2565,13 @@ impl Shard {
             }
         }
 
-        // aux.redb sits in the shard dir beside `index/`. A byte copy under the writer lock = a
-        // consistent committed view. (The index *definition* lives at the index root, above the
-        // shard's ordinal dir — it's not a shard file, so the orchestration layer carries it.)
+        // aux.redb sits beside `index/`; a byte copy under the writer lock = a consistent committed
+        // view. (The index *definition* lives at the index root, carried by the orchestration layer.)
         let shard_dir = self.index_dir.parent().unwrap_or(&self.index_dir);
         std::fs::copy(shard_dir.join("aux.redb"), staging.join("aux.redb"))?;
         files.push(PathBuf::from("aux.redb"));
-        // The dense location array travels with the backup (D30) — it is mutable
-        // (slots are patched in place), so a byte **copy** under the writer lock,
-        // never a hard link (a later patch must not reach into the staging copy).
+        // The dense location array travels with the backup (D30). Mutable (slots patched in place),
+        // so a byte copy, never a hard link — a later patch must not reach into the staging copy.
         std::fs::copy(shard_dir.join(LOCATION_FILE), staging.join(LOCATION_FILE))?;
         files.push(PathBuf::from(LOCATION_FILE));
         Ok(BackupSnapshot {
@@ -2948,10 +2811,9 @@ impl Shard {
         // Order by the full sort tuple so the first doc seen for a group is its top hit.
         entries.sort_by(|a, b| cmp_hits(&a.0, &a.2, &b.0, &b.2, sort));
 
-        // Fold into groups, preserving first-appearance order; count every member. The first
-        // entry seen for a group is its top hit (entries are sorted by the sort tuple above), so
-        // its sort values represent the group — carried out so a Gateway can order groups across
-        // shards.
+        // Fold into groups in first-appearance order, counting members. The first entry of a group
+        // is its top hit (entries are sorted above), so its sort values represent the group —
+        // carried out so a Gateway can order groups across shards.
         let mut order: Vec<String> = Vec::new();
         let mut groups: HashMap<String, (Hit, Value, Vec<SortValue>, usize)> = HashMap::new();
         for (hit, group, sort_values) in entries {
@@ -3002,14 +2864,10 @@ impl Shard {
         offset: usize,
         after: Option<&SearchAfter>,
     ) -> Result<Vec<(Hit, Vec<SortValue>)>> {
-        // Multi-key sort: the top-`k`-by-primary window is wrong when many docs tie on
-        // the primary, so scan all matches and full-sort (exact). Score / single-key
-        // sort: the windowed top-`k` is correct and cheap. Tantivy already excludes
-        // deleted/superseded docs — no liveness filter.
-        //
-        // A `_score` key needs the exact scan EXCEPT a sole `_score desc`, whose window
-        // is just `order_by_score` (efficient + correct); `_score asc` (lowest first)
-        // can't come from the descending score window, so it scans too.
+        // Multi-key sort: the top-`k`-by-primary window is wrong when many docs tie on the primary,
+        // so scan all matches and full-sort. Score / single-key sort: the windowed top-`k` is
+        // correct and cheap. A `_score` key needs the exact scan EXCEPT a sole `_score desc` (its
+        // window is `order_by_score`); `_score asc` can't come from the descending window, so it scans.
         let score_asc_primary =
             sort.len() == 1 && sort[0].is_score() && sort[0].order == SortOrder::Asc;
         let mut hits = if sort.len() > 1 || score_asc_primary {
@@ -3050,9 +2908,8 @@ impl Shard {
         prefix: &str,
         limit: usize,
     ) -> Result<Vec<(String, u64)>> {
-        // Scan a bounded multiple of the page so a broad prefix can't walk an entire
-        // vocabulary, while still leaving room to rank. `prefix_terms` already sums
-        // across the index's segments.
+        // Bounded multiple of the page so a broad prefix can't walk the whole vocabulary, while
+        // leaving room to rank. `prefix_terms` already sums across segments.
         let scan_cap = limit.saturating_mul(64).max(1024);
         let mut totals: HashMap<String, u64> = HashMap::new();
         for (term, freq) in self.core.prefix_terms(field, prefix, scan_cap)? {

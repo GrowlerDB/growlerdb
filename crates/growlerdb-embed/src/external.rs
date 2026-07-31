@@ -1,8 +1,7 @@
 //! The opt-in **external** embedding/rerank path: call a hosted provider over HTTP with a
-//! server-side-only API key ([`ProviderSecrets`](crate::ProviderSecrets)). Selected per vector
-//! field by `provider == External` (embedding) or by `GROWLERDB_RERANK_PROVIDER=external`
-//! (reranking). GrowlerDB calls only **embedding** and **reranking** providers — never an LLM
-//! ([D42]).
+//! server-side-only API key ([`ProviderSecrets`](crate::ProviderSecrets)). Selected per vector field
+//! by `provider == External` (embedding) or `GROWLERDB_RERANK_PROVIDER=external` (reranking).
+//! GrowlerDB calls only embedding and reranking providers — never an LLM ([D42]).
 //!
 //! # Configuration (all server-side env)
 //!
@@ -19,16 +18,15 @@
 //! # Fail closed
 //!
 //! If `External` is selected but the API key is unset, [`embed`](ExternalEmbedder::embed) /
-//! [`rerank`](ExternalReranker::rerank) return a clear [`EmbedError::Backend`] — they do **not**
-//! silently fall back to the dev embedder/reranker, which would hide a misconfiguration.
+//! [`rerank`](ExternalReranker::rerank) return a clear [`EmbedError::Backend`] — never a silent fall
+//! back to the dev embedder/reranker (which would hide a misconfiguration).
 //!
 //! # Wire format
 //!
-//! OpenAI/Voyage-style JSON. Embedding request `{"model":…,"input":[texts]}`; response accepted as
-//! either `{"data":[{"embedding":[…]}]}` (OpenAI) or `{"embeddings":[[…]]}` (Voyage). Rerank
-//! request `{"model":…,"query":…,"documents":[…]}`; response `{"results":[{"index":i,
-//! "relevance_score":s}]}` (Cohere/Voyage rerank). Providers that diverge from these shapes need a
-//! small per-provider adapter (deferred).
+//! OpenAI/Voyage-style JSON. Embed request `{"model":…,"input":[texts]}`; response as either
+//! `{"data":[{"embedding":[…]}]}` (OpenAI) or `{"embeddings":[[…]]}` (Voyage). Rerank request
+//! `{"model":…,"query":…,"documents":[…]}`; response `{"results":[{"index":i,"relevance_score":s}]}`
+//! (Cohere/Voyage). Providers diverging from these shapes need a per-provider adapter (deferred).
 //!
 //! [D42]: ../../../okf/system/decisions/d42-retrieval-first.md
 
@@ -211,10 +209,9 @@ fn endpoint_from_env(env_var: &str) -> Result<String, EmbedError> {
 /// POST `body` as JSON to `url` with an `Authorization: Bearer <key>` header and parse the JSON
 /// response into `T`.
 ///
-/// The call runs on a **dedicated OS thread**: [`embed`](Embedder::embed) is synchronous but is
-/// invoked from inside the engine's async (Tokio) runtime, and a `reqwest::blocking` client cannot
-/// be built or driven from within a runtime. Handing the work to a plain thread sidesteps that
-/// entirely. The raw key is never logged — only transport/status/parse errors surface.
+/// Runs on a dedicated OS thread: [`embed`](Embedder::embed) is synchronous but is called from
+/// inside the engine's Tokio runtime, and a `reqwest::blocking` client can't be built or driven
+/// within a runtime. The raw key is never logged — only transport/status/parse errors surface.
 fn post_json<B: Serialize, T: DeserializeOwned + Send>(
     url: &str,
     key: &str,
@@ -240,8 +237,7 @@ fn post_json<B: Serialize, T: DeserializeOwned + Send>(
 
                 let status = resp.status();
                 if !status.is_success() {
-                    // Body may echo request context but must not include our key; surface status +
-                    // a bounded snippet for diagnosis.
+                    // Body may echo request context but not our key; surface status + a bounded snippet.
                     let snippet = resp.text().unwrap_or_default();
                     let snippet: String = snippet.chars().take(200).collect();
                     return Err(EmbedError::Backend(format!(
@@ -374,14 +370,11 @@ mod tests {
             .is_empty());
     }
 
-    /// Drive the real HTTP path against a tiny in-process axum mock (offline, `127.0.0.1:0`):
-    /// assert the `Authorization: Bearer <key>` header is sent and an OpenAI-shaped response
-    /// parses into vectors. Multi-thread runtime + `spawn_blocking` so the synchronous, thread
-    /// -bridged `embed()` runs while the mock server makes progress — mirroring the real
-    /// call-from-async-runtime scenario.
-    // The env guard intentionally serializes this test against the other env-mutating tests; it is
-    // held across `.await` on purpose (the whole test is a critical section over process env). No
-    // other task contends for this std Mutex, so it can't deadlock the runtime.
+    /// Drive the real HTTP path against a tiny in-process axum mock (offline): assert the Bearer
+    /// header is sent and an OpenAI-shaped response parses into vectors. Multi-thread runtime +
+    /// `spawn_blocking` mirrors the real call-from-async-runtime scenario.
+    // Justifies await_holding_lock: the env guard is held across `.await` on purpose (the whole test
+    // is a critical section over process env); no other task contends for it, so no deadlock.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn embed_calls_mock_provider_with_bearer_auth_and_parses() {

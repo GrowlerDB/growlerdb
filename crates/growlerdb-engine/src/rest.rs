@@ -1,14 +1,6 @@
-//! The **Engine API over REST/JSON** ([Engine API]): an axum HTTP surface
-//! mirroring the query/admin RPCs 1:1 under `/v1/...`. Each handler maps a JSON DTO to the
-//! proto request and dispatches through the [Gateway](crate::gateway::Gateway) — which
-//! routes to a Node ([in-process](crate::node::LocalNode) when embedded, gRPC when
-//! distributed) — then maps the proto response back to JSON. gRPC `Status` codes map to
-//! HTTP status codes.
-//!
-//! Auth parity: only the `authorization` bearer is forwarded into request metadata; the
-//! [AuthN layer](crate::authn) stamps verified identity downstream, so caller-asserted
-//! `x-growlerdb-*` identity headers are never propagated (they would be forgeable on a
-//! control-plane path without an authenticator).
+//! The **Engine API over REST/JSON** ([Engine API]): an axum HTTP surface mirroring the
+//! query/admin RPCs 1:1 under `/v1/...`. Each handler maps a JSON DTO to the proto request,
+//! dispatches through the [Gateway](crate::gateway::Gateway), and maps the response back to JSON.
 //!
 //! [Engine API]: ../../../okf/product/interfaces/rest.md
 
@@ -32,8 +24,7 @@ use growlerdb_proto::service_token::CpClient;
 
 use crate::gateway::Gateway;
 
-/// Ceiling on a REST request body — a query DTO is small, so this rejects an oversized upload
-/// before it is buffered.
+/// Ceiling on a REST request body: a query DTO is small, so reject an oversized upload early.
 const REST_BODY_LIMIT: usize = 1 << 20; // 1 MiB
 
 /// Wall-clock ceiling on a REST request, mirroring the [Gateway's per-query deadline]. Bounds a
@@ -83,12 +74,10 @@ async fn cold_status_handler(State(gw): State<Arc<Gateway>>) -> axum::response::
     }
 }
 
-/// Axum middleware: record **RED metrics** for every REST request via
-/// [`sli::http_request`](growlerdb_telemetry::sli::http_request) — the matched route *template*,
-/// the response status code, and the wall-clock duration. Apply it **once** to the fully-merged
-/// `/v1/*` router (after all `.merge`s) so a single layer covers every endpoint. Paths that matched
-/// no route (404s) are bucketed as `"<unmatched>"` so a flood of bad URLs can't explode the label
-/// set. Drives the Runtime "API …" panels + the Search "query status codes" panel.
+/// Axum middleware recording **RED metrics** per REST request via
+/// [`sli::http_request`](growlerdb_telemetry::sli::http_request). Apply **once** to the fully-merged
+/// `/v1/*` router. Unmatched paths (404s) bucket as `"<unmatched>"` so bad URLs can't explode the
+/// metric label set.
 pub async fn track_http_metrics(
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -108,10 +97,8 @@ pub async fn track_http_metrics(
     resp
 }
 
-/// As [`router`], but also serves the built **UI SPA** from `ui_dir`: static assets
-/// directly, with `index.html` as the SPA fallback for client-side routes (e.g. `/indexes`).
-/// The `/v1/...` API routes take precedence, so the SPA only handles paths the API doesn't —
-/// this is what "served by the Engine binary" means (see okf/product/interfaces/ui.md). `ui_dir` is the Vite `dist/`.
+/// As [`router`], but also serves the built UI SPA from `ui_dir` (the Vite `dist/`): static
+/// assets, with `index.html` as the SPA fallback. `/v1/...` API routes take precedence.
 pub fn router_with_ui(gateway: Arc<Gateway>, ui_dir: &std::path::Path) -> Router {
     use tower_http::services::{ServeDir, ServeFile};
     let spa_fallback = ServeFile::new(ui_dir.join("index.html"));
@@ -119,11 +106,8 @@ pub fn router_with_ui(gateway: Arc<Gateway>, ui_dir: &std::path::Path) -> Router
     router(gateway).fallback_service(assets)
 }
 
-/// The **control-plane** REST surface: index lifecycle (`/v1/indexes`) + source
-/// introspection (`/v1/source:describe`), proxied to the Control Plane over gRPC. Merge into the
-/// query [`router`] so the UI (and REST clients) can manage indexes, not just query them. Auth
-/// headers are forwarded as metadata, so the Control Plane's RBAC seam governs these the same as
-/// over gRPC.
+/// The **control-plane** REST surface: index lifecycle + source introspection, proxied to the
+/// Control Plane over gRPC. Auth headers forward as metadata, so its RBAC seam governs these.
 pub fn control_router(client: CpClient) -> Router {
     use axum::routing::get;
     Router::new()
@@ -174,10 +158,8 @@ pub fn control_router(client: CpClient) -> Router {
         .with_state(client)
 }
 
-/// A **metrics proxy** to a Prometheus-compatible backend: the UI's native SLI panels
-/// query `/v1/stats/...` **same-origin** (no CORS, no hardcoded Prometheus URL in the browser),
-/// and the Engine forwards to Prometheus's query API. Read-only passthrough of `query`,
-/// `query_range`, and `alerts`.
+/// A **metrics proxy** to a Prometheus-compatible backend: the UI queries `/v1/stats/...`
+/// same-origin (no CORS, no Prometheus URL in the browser) and the Engine forwards. Read-only.
 pub fn stats_router(prometheus_base: impl Into<String>) -> Router {
     use axum::routing::get;
     let proxy = Arc::new(StatsProxy {
@@ -242,10 +224,8 @@ async fn stats_alerts_handler(State(proxy): State<Arc<StatsProxy>>) -> Response 
     proxy.forward("/api/v1/alerts", None).await
 }
 
-/// `GET /v1/alerts` — server-evaluated **firing alerts**, normalized from the metrics
-/// backend's Prometheus alerting rules. A clean `{ alerts: [{ name, severity, summary, state }] }`
-/// the console binds to directly (no client-side thresholds). `502` if the metrics backend is down,
-/// so the console can fall back to its local SLI checks.
+/// `GET /v1/alerts` — server-evaluated firing alerts, normalized from the metrics backend's
+/// Prometheus rules to `{ alerts: [{ name, severity, summary, state }] }`. `502` if it's down.
 async fn alerts_handler(
     State(proxy): State<Arc<StatsProxy>>,
 ) -> Result<Json<AlertsDto>, StatusCode> {
@@ -337,9 +317,8 @@ async fn list_indexes_handler(
     Ok(Json(IndexListDto::from(resp.into_inner())))
 }
 
-/// Scale-limit license status for the console settings page (proxied to the control plane). The
-/// `*_nodes` fields are literal (D38 Option A): they count distinct **primary-holding nodes** —
-/// replicas are free.
+/// Scale-limit license status for the console settings page. The `*_nodes` fields count distinct
+/// primary-holding nodes — replicas are free (D38 Option A).
 #[derive(serde::Serialize)]
 struct LicenseDto {
     licensed: bool,
@@ -1158,8 +1137,7 @@ struct IndexIngestionDto {
     /// Commit time of that snapshot (epoch ms); `null` when unreadable/none.
     source_timestamp_ms: Option<i64>,
     /// Whether the control plane can natively probe this index's source head. `false` for a variant
-    /// index (D49) — its null head + "unknown" lag is expected, so the console must not roll it up as
-    /// a source outage.
+    /// index (D49): null head + "unknown" lag is expected, not a source outage.
     source_probeable: bool,
     shards: Vec<ShardIngestionDto>,
 }
@@ -1231,10 +1209,9 @@ async fn search_handler(
     Ok(Json(SearchRespDto::from(resp.into_inner())))
 }
 
-/// `POST /v1/search:semantic` — **semantic (KNN) search** over a VECTOR field. The Gateway
-/// scatters the request to each shard; **each Node embeds `query_text`** (node-side embedding),
-/// runs the KNN, and the Gateway merges the nearest hits. Reuses [`SearchRespDto`] (the hit
-/// `score` carries the KNN score). Tenant scoping is enforced Node-side, fail-closed.
+/// `POST /v1/search:semantic` — semantic (KNN) search over a VECTOR field. Each Node embeds
+/// `query_text` node-side, runs the KNN, and the Gateway merges the nearest hits. Reuses
+/// [`SearchRespDto`] (the hit `score` is the KNN score).
 async fn semantic_handler(
     State(gw): State<Arc<Gateway>>,
     headers: HeaderMap,
@@ -1258,10 +1235,8 @@ async fn hybrid_handler(
     Ok(Json(SearchRespDto::from(resp.into_inner())))
 }
 
-/// `GET /v1/me` — the verified caller's identity + roles, for the console's header/Settings.
-/// Authenticates the bearer at the gateway and returns the trusted `{ subject, display_name, email,
-/// tenant, roles }`. On an open gateway (no `--oidc-issuer`) returns the anonymous shape; a
-/// configured gateway with a missing/invalid token returns 401 (the console treats it as anonymous).
+/// `GET /v1/me` — the verified caller's identity + roles. On an open gateway returns the anonymous
+/// shape; a closed gateway with a missing/invalid token returns 401 (treated as anonymous).
 async fn me_handler(
     State(gw): State<Arc<Gateway>>,
     headers: HeaderMap,
@@ -1278,10 +1253,9 @@ async fn me_handler(
     }))
 }
 
-/// `GET /v1/config` — **unauthenticated** runtime config the console needs *before* sign-in.
-/// Always 200 (unlike `/v1/me`, which 401s for an anonymous caller on a closed gateway),
-/// so the SPA can reliably learn whether to gate the app behind a login screen. `auth_required` is
-/// true in closed mode (an authenticator is configured), false in the open trial/POC mode.
+/// `GET /v1/config` — unauthenticated runtime config the console needs before sign-in. Always 200
+/// (unlike `/v1/me`) so the SPA can learn whether to gate the app behind login. `auth_required` is
+/// true in closed mode, false in open mode.
 async fn config_handler(State(gw): State<Arc<Gateway>>) -> Json<ConfigDto> {
     Json(ConfigDto {
         auth_required: gw.auth_required(),
@@ -1291,10 +1265,9 @@ async fn config_handler(State(gw): State<Arc<Gateway>>) -> Json<ConfigDto> {
     })
 }
 
-/// The deployment's front-door index — the one the console selects by default so a fresh visitor
-/// lands somewhere useful (e.g. the demo points at `movies`, which has a VECTOR field, so
-/// semantic/hybrid search is one click away). Runtime env, like `grafana_url`: the same static SPA
-/// adapts to *this* deployment. Unset ⇒ omitted, and the console falls back to the first index.
+/// The deployment's front-door index — the one the console selects by default. Runtime env (like
+/// `grafana_url`), so the same static SPA adapts per deployment. Unset ⇒ the console falls back to
+/// the first index.
 fn default_index_from_env() -> Option<String> {
     std::env::var("GROWLERDB_DEFAULT_INDEX")
         .ok()
@@ -1302,10 +1275,8 @@ fn default_index_from_env() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// The deployment's Grafana base URL, from the gateway process's `GROWLERDB_GRAFANA_URL` env.
-/// Runtime, not build-time, so the same static SPA points at *this* deployment's
-/// Grafana — a cluster install sets the env; a bare install leaves it unset and the console simply
-/// hides the "Open Grafana" link rather than sending users to a wrong/localhost dashboard.
+/// The deployment's Grafana base URL from `GROWLERDB_GRAFANA_URL`. Runtime, not build-time, so the
+/// same static SPA points at this deployment. Unset ⇒ the console hides the "Open Grafana" link.
 fn grafana_url_from_env() -> Option<String> {
     std::env::var("GROWLERDB_GRAFANA_URL")
         .ok()
@@ -1355,12 +1326,9 @@ async fn explain_handler(
     Ok(Json(ExplainRespDto::from(resp.into_inner())))
 }
 
-/// `POST /v1/facets` — left-rail facets for the console. Computes, for each requested
-/// field, a top-N **terms** aggregation over the docs the `query` matches, by **reusing the
-/// distributed Aggregate path** — no parallel facet engine. Each field is aggregated
-/// independently so a field that isn't a fast/aggregatable column is simply *skipped* (it returns
-/// no group) rather than failing the whole rail. The query already carries any active filter
-/// clauses, so facet counts reflect the current refinement.
+/// `POST /v1/facets` — left-rail facets. Per field, a top-N terms aggregation over the `query`
+/// matches, reusing the distributed Aggregate path. Each field aggregates independently, so a
+/// non-aggregatable field is skipped rather than failing the whole rail.
 async fn facets_handler(
     State(gw): State<Arc<Gateway>>,
     headers: HeaderMap,
@@ -1463,11 +1431,9 @@ async fn describe_handler(
     Ok(Json(IndexStatsDto::from(stats)))
 }
 
-/// `POST /v1/index:reindex` — rebuild an index from its source and durably swap it live.
-/// The Engine-side trigger for the console's reindex button; the write-fence
-/// and single-flight guard live on the owning Node, so a reindex already in progress surfaces as
-/// `412 Precondition Failed`. Single-shard (embedded) deployments only — a multi-shard gateway
-/// returns `501 Not Implemented` (distributed reindex orchestration is future work).
+/// `POST /v1/index:reindex` — rebuild an index from its source and durably swap it live. The
+/// write-fence + single-flight guard live on the owning Node, so a reindex already in progress is
+/// `412`. Single-shard (embedded) only; a multi-shard gateway returns `501`.
 async fn reindex_handler(
     State(gw): State<Arc<Gateway>>,
     headers: HeaderMap,
@@ -1492,11 +1458,9 @@ async fn reindex_handler(
 }
 
 /// `POST /v1/index:alter` — plan (and optionally apply in-place) an index-definition change.
-/// Diffs the candidate `definition_yaml` against the served definition and returns the
-/// plan: `requires_reindex` + `reindex_reasons` for changes that need a rebuild (which this does
-/// **not** perform — use `/v1/index:reindex`), and `in_place_changes` for metadata-only changes,
-/// applied live when `apply` is true. Single-shard (embedded) only — a multi-shard gateway returns
-/// `501`; a node without source access returns `501`; an unserved index `404`.
+/// Diffs the candidate against the served definition: `requires_reindex`/`reindex_reasons` for
+/// rebuild-needing changes (this does not perform them — use `/v1/index:reindex`), and
+/// `in_place_changes` applied live when `apply` is true. Single-shard only, else `501`.
 async fn alter_handler(
     State(gw): State<Arc<Gateway>>,
     headers: HeaderMap,
@@ -1796,18 +1760,15 @@ struct SearchDto {
     /// object of matched fragments per field. Absent (the default) ⇒ no highlights (a per-hit cost).
     #[serde(default)]
     highlight: Option<HighlightDto>,
-    /// Opt into **inline hydration**: each hit also carries `row`, its authoritative source
-    /// row resolved through the same governed path as `/v1/keys:get` — the search → hydrate
-    /// round-trip in one call. A row that doesn't resolve degrades per-hit (`hydrate_error`),
-    /// never the search.
+    /// Opt into **inline hydration**: each hit also carries `row`, its authoritative source row via
+    /// the governed `/v1/keys:get` path. A row that doesn't resolve degrades per-hit (`hydrate_error`).
     #[serde(default)]
     hydrate: bool,
     /// Column projection for inline hydration; empty = all source columns.
     #[serde(default)]
     hydrate_columns: Vec<String>,
-    /// Opt out of the third (partial) state: when true, any coverage degradation that would
-    /// otherwise return a flagged 200 (`partial` / a degraded hybrid arm) fails the request
-    /// with 503 instead — a complete answer or an error, never a flagged subset.
+    /// Opt out of the partial state: a coverage degradation that would return a flagged 200
+    /// (`partial` / a degraded hybrid arm) instead fails with 503 — complete answer or error.
     #[serde(default)]
     require_complete: bool,
 }
@@ -1831,10 +1792,8 @@ struct HighlightDto {
     fragment_size: u32,
 }
 
-/// Page size for a REST search that omits (or sends `0` for) `limit`. `limit = 0` on the wire still
-/// means "unbounded" for advanced/gRPC callers, but over REST an omitted limit is a footgun (it
-/// would stream the whole result set), so the REST front defaults it. For a full scan use the
-/// scroll/export path, not an unbounded page.
+/// Page size for a REST search that omits (or sends `0` for) `limit`. `limit = 0` still means
+/// "unbounded" for gRPC callers, but over REST that's a footgun, so the REST front defaults it.
 const DEFAULT_PAGE_SIZE: u32 = 10;
 
 impl SearchDto {
@@ -1842,7 +1801,6 @@ impl SearchDto {
         SearchRequest {
             shard: 0,
             query: self.query,
-            // A REST search with no `limit` gets a bounded page, not the entire result set.
             limit: if self.limit == 0 {
                 DEFAULT_PAGE_SIZE
             } else {
@@ -1867,16 +1825,13 @@ impl SearchDto {
             score_mode: growlerdb_proto::v1::ScoreMode::ScoreLocal as i32,
             // The window selector is gateway-internal; a client request never sets it.
             window: 0,
-            // Query grammar: `"kql"` → KQL, anything else → Lucene (the default).
             syntax: if self.syntax.eq_ignore_ascii_case("kql") {
                 growlerdb_proto::v1::QuerySyntax::Kql as i32
             } else {
                 growlerdb_proto::v1::QuerySyntax::Lucene as i32
             },
-            // Per-index scoping: pass the target index through; the serving Gateway
-            // validates it. Empty means "the index served here".
+            // Per-index scoping: the serving Gateway validates the target; empty ⇒ served here.
             index: self.index,
-            // Server-side highlighting opt-in; absent ⇒ no highlights.
             highlight: self.highlight.map(|h| v1::HighlightRequest {
                 fields: h.fields,
                 max_fragments: h.max_fragments,
@@ -1933,9 +1888,8 @@ struct SemanticSearchDto {
     /// Column projection for inline hydration; empty = all source columns.
     #[serde(default)]
     hydrate_columns: Vec<String>,
-    /// Opt out of the third (partial) state: when true, any coverage degradation that would
-    /// otherwise return a flagged 200 (`partial` / a degraded hybrid arm) fails the request
-    /// with 503 instead — a complete answer or an error, never a flagged subset.
+    /// Opt out of the partial state: a coverage degradation that would return a flagged 200
+    /// (`partial` / a degraded hybrid arm) instead fails with 503 — complete answer or error.
     #[serde(default)]
     require_complete: bool,
 }
@@ -2003,9 +1957,8 @@ struct HybridSearchDto {
     /// Column projection for inline hydration; empty = all source columns.
     #[serde(default)]
     hydrate_columns: Vec<String>,
-    /// Opt out of the third (partial) state: when true, any coverage degradation that would
-    /// otherwise return a flagged 200 (`partial` / a degraded hybrid arm) fails the request
-    /// with 503 instead — a complete answer or an error, never a flagged subset.
+    /// Opt out of the partial state: a coverage degradation that would return a flagged 200
+    /// (`partial` / a degraded hybrid arm) instead fails with 503 — complete answer or error.
     #[serde(default)]
     require_complete: bool,
 }
@@ -2043,16 +1996,14 @@ struct SearchRespDto {
     /// by the Gateway; omitted when the result is complete, so callers can trust a missing flag.
     #[serde(skip_serializing_if = "is_false")]
     partial: bool,
-    /// Shards the Gateway queried vs the index's total: a time/window filter prunes
-    /// shards it can prove won't match, so the console shows a "scanned/total" ratio. Both omitted
-    /// when `shards_total` is 0 (a bare Node with no shard scope).
+    /// Shards the Gateway queried vs the index's total (a time/window filter prunes provable
+    /// non-matches). Both omitted when `shards_total` is 0 (a bare Node with no shard scope).
     #[serde(skip_serializing_if = "is_zero_u32")]
     shards_scanned: u32,
     #[serde(skip_serializing_if = "is_zero_u32")]
     shards_total: u32,
-    /// Degradation notices: the response is valid but weaker than requested (e.g. a hybrid
-    /// search whose lexical arm failed, or a query embedded by the dev hash fallback). Omitted
-    /// when nothing degraded — a present `warnings` always means "read me".
+    /// Degradation notices: valid but weaker than requested (e.g. a failed hybrid arm, a dev
+    /// hash-fallback embed). Omitted when nothing degraded.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
 }
@@ -2069,19 +2020,16 @@ struct HitDto {
     group: Option<JsonValue>,
     #[serde(skip_serializing_if = "is_zero")]
     group_count: u64,
-    /// **Server-side highlights**: field → fragments → XSS-safe `{text, marked}`
-    /// segments of the analyzed match. Present only when the request opted in and a field matched;
-    /// the console renders `marked` segments in `<mark>`. Omitted otherwise.
+    /// **Server-side highlights**: field → fragments → XSS-safe `{text, marked}` segments of the
+    /// analyzed match. Present only when opted in and a field matched.
     #[serde(skip_serializing_if = "Map::is_empty")]
     highlight: Map<String, JsonValue>,
-    /// The hit's **authoritative source row** (inline hydration): present only when the
-    /// request set `hydrate` and the row resolved through the governed `/v1/keys:get` path.
-    /// Unlike `fields` (index-cached copies), these are the source-of-truth values.
+    /// The hit's **authoritative source row** (inline hydration): present only when `hydrate` was
+    /// set and the row resolved. Unlike `fields` (index-cached copies), these are source-of-truth.
     #[serde(skip_serializing_if = "Option::is_none")]
     row: Option<Map<String, JsonValue>>,
-    /// Why this hit carries no `row` under `hydrate` — the per-hit failure surface (failed
-    /// shard, tenant-filtered/missing row, or a hydration error). Omitted when `row` is present
-    /// or hydration wasn't requested.
+    /// Why this hit carries no `row` under `hydrate` (failed shard, tenant-filtered/missing row,
+    /// hydration error). Omitted when `row` is present or hydration wasn't requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     hydrate_error: Option<String>,
 }
@@ -2258,14 +2206,12 @@ struct IndexStatsDto {
     /// Mapped sortable fields (numeric/date/keyword, `fast`) — the console's sort menu.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     sort_fields: Vec<String>,
-    /// The index's VECTOR fields — the console's semantic/hybrid vector-field picker. Each carries
-    /// the field path plus its embedding config (source text field, model, dims). Empty (and
-    /// omitted) for a non-vector index.
+    /// The index's VECTOR fields — the console's semantic/hybrid picker. Each carries the field
+    /// path plus its embedding config. Omitted for a non-vector index.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     vector_fields: Vec<VectorFieldDto>,
-    /// Every mapped field with its type + capability flags, in definition order — the full
-    /// schema a client needs to compose valid queries (term-queryable? range/sortable?
-    /// returned with hits?). Empty ⇒ omitted (a pre-upgrade peer that sent no field list).
+    /// Every mapped field with type + capability flags, in definition order — the schema a client
+    /// needs to compose valid queries. Empty ⇒ omitted.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     fields: Vec<MappedFieldDto>,
 }
@@ -2296,9 +2242,8 @@ struct VectorFieldDto {
     model: String,
     /// Embedding dimensionality (vector length).
     dims: u32,
-    /// KNN **coverage**: how many documents hold a vector for this field. Pair with
-    /// `num_docs` — a shortfall means documents were indexed without an embedding and are
-    /// invisible to semantic search.
+    /// KNN **coverage**: documents holding a vector for this field. Pair with `num_docs` — a
+    /// shortfall means some documents are invisible to semantic search.
     docs_with_vector: u64,
 }
 
@@ -2534,11 +2479,9 @@ fn is_false(b: &bool) -> bool {
 
 // ---- request metadata + error mapping ------------------------------------------
 
-/// Wrap a proto body in a tonic request, forwarding only the bearer credential so
-/// authentication behaves the same over REST as over gRPC. Verified identity is stamped
-/// downstream by the [AuthN layer](crate::authn); caller-asserted `x-growlerdb-principal` /
-/// `x-growlerdb-tenant` / `x-growlerdb-roles` headers are never propagated, since a
-/// control-plane path with no authenticator would otherwise trust a forged role claim.
+/// Wrap a proto body in a tonic request, forwarding only the bearer credential. Verified identity
+/// is stamped downstream by the [AuthN layer](crate::authn); caller-asserted `x-growlerdb-*`
+/// identity headers are never propagated (a path with no authenticator would trust a forged claim).
 pub(crate) fn grpc_request<T>(body: T, headers: &HeaderMap) -> Request<T> {
     let mut req = Request::new(body);
     if let Some(val) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
@@ -2575,8 +2518,7 @@ impl From<Status> for ApiError {
             Code::Unauthenticated => StatusCode::UNAUTHORIZED,
             Code::FailedPrecondition => StatusCode::PRECONDITION_FAILED,
             Code::Unimplemented => StatusCode::NOT_IMPLEMENTED,
-            // Admission load-shed (gateway concurrent-query cap, node heavy-read cap): the
-            // client's honest signal to back off and retry.
+            // Admission load-shed: the client's signal to back off and retry.
             Code::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -2905,11 +2847,9 @@ mod tests {
     // whole env-mutating test against any other env test in the crate (see `crate::env_guard`).
     #[allow(clippy::await_holding_lock)]
     async fn config_dto_has_no_secret_field() {
-        // The unauthenticated /v1/config the browser fetches must NEVER carry an outbound
-        // provider API key (external embedding/rerank secrets are server-side only — see okf/system/decisions/d43-node-local-query-embedding.md).
-        // Even with keys present in the server's env, the response exposes no key/secret field.
-        // Env mutation is process-global: hold the crate env lock, and clean up via RAII so an
-        // assert failure can't leak the vars into other tests.
+        // The unauthenticated /v1/config must NEVER carry an outbound provider API key (embedding/
+        // rerank secrets are server-side only — d43-node-local-query-embedding.md). Env is
+        // process-global: hold the crate env lock, clean up via RAII so vars can't leak.
         let _env = crate::env_guard();
         struct Unset;
         impl Drop for Unset {
@@ -2947,8 +2887,6 @@ mod tests {
                 "config exposes a secret-shaped field `{k}`"
             );
         }
-
-        // Env cleanup happens via the `Unset` RAII guard above (survives assert failures).
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2971,7 +2909,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn explain_returns_a_real_bm25_tree_for_a_hit() {
-        // Explain a specific document's score for a query.
         let tmp = tempfile::tempdir().unwrap();
         let app = app(shard(tmp.path()), crate::auth::default_auth());
         let coord = json!({ "identifier": [{ "name": "id", "value": "1" }] });

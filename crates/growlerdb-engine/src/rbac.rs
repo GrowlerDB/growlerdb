@@ -1,13 +1,8 @@
-//! **Control-plane RBAC**: a coarse, role-based [`AuthHook`](crate::auth::AuthHook)
-//! that gates Engine operations by the caller's verified roles. Roles map to operation
-//! **scopes**, each RPC method requires a scope, and a request is allowed iff one of the
-//! caller's roles grants that scope.
-//!
-//! This is the *operation* tier ("what may you do"): coarse, about methods, not rows. Row- and
-//! column-level access stays delegated to the lake (Polaris); tenant scoping
-//! is enforced separately. The roles come from [authentication](crate::authn) — validated token
-//! or API-key claims, never caller-asserted — and reach this hook via the request metadata that
-//! the [`Gateway`](crate::gateway::Gateway) stamps and forwards.
+//! **Control-plane RBAC**: a coarse, role-based [`AuthHook`](crate::auth::AuthHook) gating Engine
+//! operations by the caller's verified roles. Roles map to operation **scopes**; each RPC requires a
+//! scope, and a request is allowed iff one of the caller's roles grants it. Operation-tier only
+//! (methods, not rows — row/column access stays with the lake; tenant scoping is separate). Roles
+//! come from [authentication](crate::authn) (validated claims, never caller-asserted).
 
 use std::collections::{HashMap, HashSet};
 
@@ -152,11 +147,10 @@ impl RbacPolicy {
     }
 }
 
-/// Validate that a caller holding `caller_roles` may assign/mint `requested_roles`.
-/// Every requested role must be in [`ASSIGNABLE_ROLES`] **and** its scopes must be a subset of the
-/// caller's effective scopes — so an `Admin`-but-not-`Ops` `index-admin` cannot grant an `Ops`-bearing
-/// role (`operator`/`admin`) and escalate to cluster operations. Evaluated against the canonical
-/// default role catalog. `Err` carries a human-readable reason.
+/// Validate that a caller holding `caller_roles` may assign/mint `requested_roles`: every requested
+/// role must be in [`ASSIGNABLE_ROLES`] **and** its scopes a subset of the caller's effective scopes,
+/// so a caller can't grant a role bearing scopes it lacks and escalate. Evaluated against the
+/// canonical default catalog. `Err` carries a human-readable reason.
 pub fn check_assignable(caller_roles: &[String], requested_roles: &[String]) -> Result<(), String> {
     let catalog = RbacPolicy::with_default_roles();
     let caller = catalog.effective_scopes(caller_roles);

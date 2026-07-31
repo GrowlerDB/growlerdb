@@ -43,8 +43,7 @@ pub struct DriftReport {
     /// Missing docs re-indexed (in the source but absent from the index).
     pub reindexed: usize,
     /// The stale-delete pass was **skipped** because a concurrent ingest advanced the shard during
-    /// the source scan (TOCTOU guard). Missing-repair still ran; the next reconcile retries
-    /// the deletes once the shard is momentarily quiescent.
+    /// the source scan (TOCTOU guard); missing-repair still ran, and the next reconcile retries it.
     pub deletes_skipped: bool,
 }
 
@@ -60,16 +59,14 @@ impl DriftReport {
 const DRIFT_LOG_KEYS: usize = 20;
 
 /// Reconcile a shard scope against the source's current `source_docs`: drop indexed
-/// keys the source no longer has (via partition reconciliation) and re-index source
-/// docs the index is missing. Pure over the store + the provided source docs, so it is
-/// exercised without a live catalog. `partition` empty ⇒ the whole index.
+/// keys the source no longer has (via partition reconciliation) and re-index missing
+/// source docs. Pure over the store + provided docs, so it runs without a live catalog.
+/// `partition` empty ⇒ the whole index.
 ///
-/// For the **sharded** backstop the caller filters `source_docs` to the keys this shard
-/// owns before calling, so the stale-set (indexed keys absent from `source_docs`) can't sweep away
-/// another shard's keys.
-/// `expected_checkpoint` is the shard's checkpoint captured **before** the source scan that produced
-/// `source_docs`; it fences the stale-delete against a concurrent ingest (TOCTOU guard).
-/// `None` opts out for callers with no concurrent writer (CLI/tests).
+/// For the **sharded** backstop the caller filters `source_docs` to this shard's keys first, so
+/// the stale-set can't sweep away another shard's keys. `expected_checkpoint` (the shard's
+/// checkpoint captured **before** the source scan) fences the stale-delete against a concurrent
+/// ingest (TOCTOU guard); `None` opts out for callers with no concurrent writer (CLI/tests).
 pub(crate) fn apply_drift(
     shard: &Shard,
     partition: &[(String, Value)],
@@ -86,9 +83,8 @@ pub(crate) fn apply_drift(
     let deleted = delete_outcome.deleted;
     let deletes_skipped = delete_outcome.skipped_concurrent_write;
 
-    // Missing: source docs the index doesn't hold → re-index as upserts. The batch id
-    // is derived from the missing key set, so repairing the *same* drift twice is a
-    // no-op while a *different* repair is never wrongly deduped.
+    // Missing: source docs the index doesn't hold → re-index as upserts. The batch id is derived
+    // from the missing key set, so repairing the *same* drift twice is a no-op (idempotent).
     let mut missing = Vec::new();
     for doc in source_docs {
         if !shard.contains_key(&doc.doc.key)? {
@@ -211,9 +207,8 @@ impl Engine {
         shards: u32,
         shard_ordinal: u32,
     ) -> Result<IndexOutcome, EngineError> {
-        // Parse the def first so a variant column is detected *before* touching iceberg-rust —
-        // released iceberg-rust can't parse a v3 variant schema in `load_table` (D49), so a variant
-        // table's schema introspection routes through Trino.
+        // Parse the def first so a variant column is detected *before* touching iceberg-rust: it
+        // can't parse a v3 variant schema in `load_table` (D49), so introspection routes through Trino.
         let parsed = def_yaml.map(IndexDefinition::from_yaml).transpose()?;
         let declares_variant = parsed.as_ref().is_some_and(|d| d.declares_variant());
         let source_schema = self.introspect_source(declares_variant, table).await?;
@@ -226,19 +221,14 @@ impl Engine {
         };
         let index_name = resolved.name.clone();
 
-        // A `growlerdb index` run is a full build. If a previously-built index for this name persists
-        // on disk with a *different* schema (a mapped field added/removed/renamed, or a type/fast-ness
-        // change), reopening it and writing new-schema documents would corrupt Tantivy's fast-field
-        // writer (a field-count mismatch panic). Detect that up front and reindex from scratch — wipe
-        // the stale dir so the build below creates a fresh index with the new schema.
+        // A full build: if a persisted index for this name has a *different* derived schema, reopening
+        // it and writing new-schema docs would corrupt Tantivy's fast-field writer — wipe + reindex.
         self.reindex_on_schema_change(&index_name, &resolved)?;
 
         self.persist_definition(&index_name, &resolved)?;
 
-        // A variant index cannot be cold-built natively — iceberg-rust can't scan a v3 variant table
-        // (D49) — so it is populated connector-first (D48): the connector's bootstrap + changelog
-        // fill it. Define it (schema persisted, shard created empty on first serve) and skip the
-        // native build, loudly (never a silent empty index).
+        // A variant index can't be cold-built natively (iceberg-rust can't scan it, D49); it's fed
+        // connector-first (D48). Define it and skip the native build, loudly (never a silent empty index).
         if resolved.has_variant_field() {
             tracing::warn!(
                 index = %index_name,
@@ -252,8 +242,7 @@ impl Engine {
             });
         }
 
-        // The per-shard build filter: keep only docs this ordinal owns. None for a single-shard
-        // (full) build. Windowed indexes shard by time window, so ordinal sharding doesn't apply.
+        // Per-shard build filter: keep only docs this ordinal owns (None for a full build).
         let filter = shard_build_filter(&resolved, shards, shard_ordinal)?;
         let reader = IcebergReader::connect(&self.iceberg).await?;
         let (snapshot, doc_count) = self
@@ -267,16 +256,13 @@ impl Engine {
     }
 
     /// Cold-build a **single-shard** index from `table` using an **already-resolved** definition —
-    /// how a pool node **builds a unit on assignment** (D52): the control plane assigns it primary of
-    /// an ordinal it doesn't hold, and it builds that shard from source using the definition it already
-    /// persisted (its `index.json`), rather than re-introspecting + re-resolving from YAML. A
-    /// **variant** index is connector-fed (D49 — iceberg-rust can't scan it), so this returns an empty
+    /// how a pool node builds a unit on assignment (D52) from its persisted `index.json`, rather than
+    /// re-resolving from YAML. A **variant** index is connector-fed (D49), so this returns an empty
     /// outcome and the connector fills it on first write.
     ///
-    /// **Single-shard only** (the demo case): [`build_from_source`](Self::build_from_source) writes to
-    /// `ShardId::single` today, so a multi-ordinal build (targeting `ShardId::shard(index, ordinal)`)
-    /// is a follow-up. The caller (serve-pool) only invokes this for a non-windowed, `shard_count == 1`
-    /// index.
+    /// **Single-shard only**: [`build_from_source`](Self::build_from_source) writes to
+    /// `ShardId::single`, so a multi-ordinal build is a follow-up; the caller (serve-pool) only invokes
+    /// this for a non-windowed, `shard_count == 1` index.
     pub async fn index_shard_resolved(
         &self,
         resolved: &ResolvedIndex,
@@ -300,11 +286,10 @@ impl Engine {
         })
     }
 
-    /// Read the [`SourceSchema`] for a definition, routing a **variant** table's introspection
-    /// through Trino ([D49](../../../okf/system/decisions/d49-variant-iceberg-rust-routing.md)):
-    /// released iceberg-rust fails to parse a v3 variant schema inside `load_table`, so a def that
-    /// declares a variant column reads its columns from Trino `information_schema` instead of the
-    /// native reader. Non-variant tables keep the native path untouched.
+    /// Read the [`SourceSchema`] for a definition, routing a **variant** table's introspection through
+    /// Trino ([D49](../../../okf/system/decisions/d49-variant-iceberg-rust-routing.md)): iceberg-rust
+    /// can't parse a v3 variant schema in `load_table`, so a variant def reads columns from Trino
+    /// `information_schema`. Non-variant tables keep the native path.
     async fn introspect_source(
         &self,
         declares_variant: bool,
@@ -320,13 +305,11 @@ impl Engine {
         }
     }
 
-    /// Persist an index's **definition only** — resolve `table`'s schema into `index.json` and write
-    /// it, building **no shards/windows**. This is how a **windowed** node starts truly
-    /// empty on k8s: `serve` needs the resolved `index.json` on disk, but a windowed node must NOT
-    /// batch-build windows from the source — with no ordinal filter every node would build *all*
-    /// windows locally, replicating them across the pool and defeating control-plane placement (the
-    /// windows a node serves are the ones the connector streams to it). Reads the source schema (so
-    /// the definition resolves) but never reads rows. Returns an [`IndexOutcome`] with `doc_count = 0`.
+    /// Persist an index's **definition only** — resolve `table`'s schema into `index.json`, building
+    /// **no shards/windows**. How a **windowed** node starts truly empty on k8s: `serve` needs the
+    /// resolved `index.json`, but a windowed node must NOT batch-build windows (every node would build
+    /// *all* windows locally, defeating control-plane placement — the connector streams it its
+    /// windows). Reads the source schema but never rows. Returns an [`IndexOutcome`] with `doc_count = 0`.
     pub async fn define_index(
         &self,
         table: &str,
@@ -360,8 +343,7 @@ impl Engine {
         reader: &IcebergReader,
         table: &str,
         resolved: &ResolvedIndex,
-        // Per-shard build filter: keep only docs this `(router, ordinal)` owns. `None` for a
-        // normal full build.
+        // Per-shard build filter: keep only docs this `(router, ordinal)` owns; `None` for a full build.
         shard_filter: Option<&(ShardRouter, u32)>,
     ) -> Result<(Snapshot, usize), EngineError> {
         let (snapshot, doc_count) = if resolved.windowing.is_some() {
@@ -409,13 +391,10 @@ impl Engine {
                         .map_err(|e| e.to_string())
                 })
                 .await?;
-            // A shard that caught up to the source snapshot but wrote **zero rows** — a sparse
-            // shard in a multi-shard build that owns none of the keys, or a currently-empty source —
-            // must still record the snapshot it reflects. Otherwise it never commits a checkpoint and
-            // reports `uninitialized` forever (a grey "unknown" health pill for the whole index),
-            // even though it is genuinely in sync. If nothing above advanced the
-            // checkpoint, anchor it with a checkpoint-only commit. Guarded on a real snapshot
-            // (`snapshot_id != 0`) so a source with no snapshot stays honestly uninitialized.
+            // A shard that caught up to the snapshot but wrote **zero rows** (a sparse shard owning
+            // none of the keys, or an empty source) must still record the snapshot it reflects, else it
+            // reports `uninitialized` forever despite being in sync. Anchor it with a checkpoint-only
+            // commit — guarded on a real snapshot so a source with no snapshot stays uninitialized.
             if snapshot_id != 0 && shard.current_checkpoint()?.is_none() {
                 IndexWriter::write(
                     &shard,
@@ -432,9 +411,8 @@ impl Engine {
             (Snapshot(shard.current_snapshot()?), written)
         };
 
-        // Never silently commit an empty index from a non-empty source: if we read 0 docs
-        // but the snapshot reports rows, the read is broken (e.g. a delete in the table's history).
-        // Skipped for a sharded build, where a shard may legitimately own no docs.
+        // Never silently commit an empty index from a non-empty source: 0 docs read but the snapshot
+        // reports rows ⇒ broken read. Skipped for a sharded build (a shard may own no docs).
         if doc_count == 0 && shard_filter.is_none() {
             if let Some(records) = reader.current_snapshot_records(table).await? {
                 if records > 0 {
@@ -448,13 +426,11 @@ impl Engine {
         Ok((snapshot, doc_count))
     }
 
-    /// Write a freshly-read build/rebuild batch to the index: one single shard, or — for a
-    /// **windowed** index — per-window shards via the time-window router
-    /// ([`write_windowed`](LocalIndexStore::write_windowed)). Returns a representative
-    /// committed [`Snapshot`]: the single shard's, or the latest window's (windowed shards commit
-    /// independently, so the outcome's lone snapshot is informational — the per-window state is the
-    /// source of truth). The single shard is created lazily here so a windowed build never leaves an
-    /// empty `ShardId::single` dir beside the `w<window>` shards.
+    /// Write a freshly-read build/rebuild batch: one single shard, or — for a **windowed** index —
+    /// per-window shards via [`write_windowed`](LocalIndexStore::write_windowed). Returns a
+    /// representative [`Snapshot`] (the single shard's, or the latest window's — windowed shards commit
+    /// independently, so it's informational). The single shard is created lazily so a windowed build
+    /// leaves no empty `ShardId::single` dir.
     fn write_build(
         &self,
         resolved: &ResolvedIndex,
@@ -513,11 +489,9 @@ impl Engine {
         })
     }
 
-    /// **Drift reconciliation**: compare the index against the source's
-    /// current snapshot and repair discrepancies — delete indexed keys the source
-    /// dropped, re-index keys it gained. The periodic backstop that keeps the index
-    /// consistent with Iceberg regardless of sync mode or delete encoding. Reconciles
-    /// the whole index; per-partition scoping is the scaling refinement.
+    /// **Drift reconciliation**: compare the index against the source's current snapshot and repair
+    /// discrepancies — delete indexed keys the source dropped, re-index keys it gained. The periodic
+    /// backstop keeping the index consistent with Iceberg regardless of sync mode or delete encoding.
     pub async fn reconcile(&self, index: &str) -> Result<DriftReport, EngineError> {
         let resolved = self.load_definition(index)?;
         let shard = self.store.open_shard(&ShardId::single(index), &resolved)?;
@@ -582,15 +556,11 @@ impl Engine {
         Ok(SearchOutcome { hits, rows })
     }
 
-    /// **Semantic (KNN) search** over a VECTOR field: embed `query_text` with the field's
-    /// configured embedder (the same [`embedder_for`] factory used at ingest, so the query and the
-    /// documents share one embedding space), then run a top-level [`Query::Knn`] returning the `k` nearest
-    /// documents' coordinates + KNN scores. When `hydrate` is set, also fetch the authoritative
-    /// rows from Iceberg (projected by `projection`), exactly as [`search`](Self::search) does.
-    ///
-    /// This is the native, end-to-end semantic path (embed → KNN → nearest coordinates); the
-    /// query-string / REST DSL surface for it is a later task. `field` must be a VECTOR field on
-    /// the index.
+    /// **Semantic (KNN) search** over a VECTOR field: embed `query_text` with the field's configured
+    /// embedder (the same [`embedder_for`] factory used at ingest, so query and documents share one
+    /// embedding space), then run a top-level [`Query::Knn`] returning the `k` nearest documents'
+    /// coordinates + KNN scores. When `hydrate` is set, also fetch the authoritative rows from Iceberg
+    /// (projected by `projection`), as [`search`](Self::search) does. `field` must be a VECTOR field.
     #[allow(clippy::too_many_arguments)] // a cohesive search-request surface, not an extractable cluster
     pub async fn semantic_search(
         &self,
@@ -601,9 +571,8 @@ impl Engine {
         tenant: Option<&str>,
         hydrate: bool,
         projection: Projection,
-        // Opt-in reranking (D21): reorder the retrieved top-K by a cross-encoder over
-        // `query_text` and each hit's cached source-field text. `rerank_top_k` is the candidate
-        // pool to fetch + rerank (0 ⇒ exactly `k`). Off by default.
+        // Opt-in reranking (D21): reorder the top-K by a cross-encoder over `query_text` and each
+        // hit's cached source-field text. `rerank_top_k` = candidate pool (0 ⇒ `k`). Off by default.
         rerank: bool,
         rerank_top_k: usize,
     ) -> Result<SearchOutcome, EngineError> {
@@ -616,12 +585,10 @@ impl Engine {
             .and_then(|f| f.vector.as_ref())
             .ok_or_else(|| EngineError::NotVectorField(field.to_string()))?;
 
-        // The KNN fetch depth: the rerank candidate pool when reranking, else just `k`.
         let fetch = if rerank { rerank_top_k.max(k) } else { k };
 
-        // Embed the query text with the SAME factory ingest uses (real BGE when a model is
-        // provisioned, else the deterministic hash fallback) — the query and the stored document
-        // vectors must come from the same model or KNN compares across incompatible spaces.
+        // Embed the query with the SAME factory ingest uses — query and stored document vectors must
+        // come from the same model or KNN compares across incompatible spaces.
         let embedder = embedder_for(spec);
         let mut vectors = embedder.embed(&[query_text.to_string()])?;
         let vector = vectors.pop().unwrap_or_default();
@@ -632,11 +599,9 @@ impl Engine {
             k: fetch,
             filter: None,
         };
-        // Tenant enforcement (filtered KNN): on a tenant-scoped index the caller MUST
-        // present a claim; the `tenant = <claim>` Term rides inside the KNN as its filter, so the
-        // neighbor set is intersected with that tenant's docs. Still fail **closed** when the claim
-        // is missing — a tenant-scoped index with no claim must refuse, never return nearest
-        // neighbors across tenants. A non-tenant-scoped index ignores `tenant`.
+        // Tenant enforcement (filtered KNN): on a tenant-scoped index the claim rides inside the KNN
+        // as a `tenant = <claim>` filter, intersecting the neighbor set with that tenant's docs. Fail
+        // **closed** on a missing claim — never return cross-tenant neighbors. Non-scoped ignores `tenant`.
         if let Some(tenant_field) = resolved.tenant_field() {
             let Some(claim) = tenant else {
                 return Err(EngineError::SemanticTenantClaimRequired(index.to_string()));
@@ -649,8 +614,7 @@ impl Engine {
 
         let shard = self.store.open_shard(&ShardId::single(index), &resolved)?;
         let hits = shard.search_all(&query, fetch)?;
-        // Reranking reorders the retrieved pool by (query, cached source-field text) relevance and
-        // returns the top `k`; off by default it's a plain KNN top-`k`.
+        // Reranking reorders the retrieved pool by (query, cached source text) relevance, top `k`.
         let hits = if rerank {
             crate::search_service::rerank_hits(hits, query_text, &spec.source_field, k)
         } else {
@@ -690,8 +654,8 @@ impl Engine {
         tenant: Option<&str>,
         hydrate: bool,
         projection: Projection,
-        // Opt-in reranking (D21): the semantic arm reorders its candidates by a cross-encoder
-        // before RRF, so cross-encoder relevance carries into the fused ranks. Off by default.
+        // Opt-in reranking (D21): the semantic arm reorders its candidates by a cross-encoder before
+        // RRF, so that relevance carries into the fused ranks. Off by default.
         rerank: bool,
         rerank_top_k: usize,
     ) -> Result<SearchOutcome, EngineError> {
@@ -753,8 +717,7 @@ impl Engine {
         let shard = self.store.open_shard(&ShardId::single(index), &resolved)?;
         let lexical_hits = shard.search_all(&lexical, k_each)?;
         let vector_hits = shard.search_all(&knn, knn_k)?;
-        // Reranking reorders the semantic arm's candidates by (query, cached source-field text)
-        // relevance before fusion, so the cross-encoder signal carries into the fused RRF ranks.
+        // Rerank the semantic arm before fusion, so the cross-encoder signal carries into RRF.
         let vector_hits = if rerank {
             crate::search_service::rerank_hits(vector_hits, query_text, &spec.source_field, k_each)
         } else {
@@ -821,14 +784,12 @@ impl Engine {
         self.root.join(index).join("index.json")
     }
 
-    /// If an index for `index` was already built and its persisted definition derives a **different**
-    /// Tantivy schema than `resolved` (a mapped-field add/remove/rename or a field type/fast-ness
-    /// change — anything that changes the field set the segment writer expects), wipe its on-disk
-    /// state so the build reindexes from scratch against the new schema. A schema change invalidates
-    /// the old segments+locator+checkpoint, so a fresh build is the correct behavior (same hard-reset
-    /// as [`rebuild`](Self::rebuild)). Without this, reopening the stale narrower index and adding
-    /// wider-schema documents panics Tantivy's fast-field writer (a field-count mismatch). No prior
-    /// definition (a fresh volume), or a schema-compatible re-run, is a no-op.
+    /// If a previously-built index's persisted definition derives a **different** Tantivy schema than
+    /// `resolved` (a mapped-field add/remove/rename or type/fast-ness change), wipe its on-disk state
+    /// so the build reindexes from scratch. Reopening the stale index and writing wider-schema docs
+    /// would panic Tantivy's fast-field writer (field-count mismatch); a schema change invalidates the
+    /// old segments anyway (same hard-reset as [`rebuild`](Self::rebuild)). No prior def, or a
+    /// schema-compatible re-run, is a no-op.
     fn reindex_on_schema_change(
         &self,
         index: &str,
@@ -839,9 +800,8 @@ impl Engine {
             return Ok(()); // nothing built yet — a fresh index
         }
         let old: ResolvedIndex = serde_json::from_slice(&std::fs::read(&path)?)?;
-        // Compare the *derived Tantivy schemas*, not the definitions: that is exactly the field set
-        // (count/types/fast-ness) the segment writer is built against, so it flags precisely the
-        // changes that would corrupt the writer while ignoring cosmetic definition edits.
+        // Compare the *derived Tantivy schemas*, not the definitions: that's the field set the segment
+        // writer is built against, so it flags corrupting changes while ignoring cosmetic def edits.
         let old_schema = IndexSchema::from_resolved(&old);
         let new_schema = IndexSchema::from_resolved(resolved);
         if old_schema.tantivy_schema() != new_schema.tantivy_schema() {
@@ -916,9 +876,8 @@ fn scan_mode(resolved: &ResolvedIndex) -> ScanMode {
 }
 
 /// The standard **RRF constant** (`k = 60`): it dampens how much a top rank in any single list
-/// contributes, so no one modality dominates and a doc must rank well across lists to rise. This is
-/// the value from Cormack et al., "Reciprocal Rank Fusion outperforms Condorcet and individual Rank
-/// Learning Methods" (SIGIR 2009), and the de-facto default in hybrid-search systems.
+/// contributes, so a doc must rank well across lists to rise. The value from Cormack et al. (SIGIR
+/// 2009), the de-facto default in hybrid-search systems.
 const RRF_K: usize = 60;
 
 /// **Reciprocal Rank Fusion** of several ranked hit lists into one ranking. For each list, the hit

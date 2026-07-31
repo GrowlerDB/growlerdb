@@ -1,16 +1,14 @@
-//! **Precomputed hotcache** for cold windows, a refinement on the read-through cold
-//! tier. Opening a parked window read-through normally costs a burst of small object-store
-//! round-trips *before the first hit is even scored*: the two atomic files (`meta.json`,
-//! `.managed.json`), a `stat` per segment file for its length, and the structural byte ranges every
-//! [`SegmentReader`](crate::SegmentReader) reads (term-dictionary index, fast-field codecs, store
-//! footers). That's the "cold open" latency tax, paid on every node restart / cache-cold query.
+//! **Precomputed hotcache** for cold windows. Opening a parked window read-through normally costs a
+//! burst of small object-store round-trips before the first hit is scored — the two atomic files, a
+//! `stat` per segment file, and the structural byte ranges every
+//! [`SegmentReader`](crate::SegmentReader) reads on open. That's the cold-open latency tax.
 //!
 //! The hotcache pays it **once, at park time**: [`build`] warms the just-parked index through a
-//! recording [`ObjectDirectory`] and captures exactly those structural reads into a single small
-//! sidecar object. A later cold open ([`preload`]) fetches that one object and serves all of it
-//! locally — atomic bodies + file lengths from an in-memory [`HotState`], byte ranges from the
-//! shared [`RangeCache`] — so `Index::open` + reader setup issue **zero** object round-trips. Only
-//! the postings a specific query actually touches are fetched cold (and then cached as usual).
+//! recording [`ObjectDirectory`] and captures those structural reads into one small sidecar object.
+//! A later cold open ([`preload`]) fetches that object and serves all of it locally — atomic bodies
+//! and lengths from an in-memory [`HotState`], byte ranges from the shared [`RangeCache`] — so
+//! `Index::open` + reader setup issue **zero** round-trips. Only a query's actual postings are
+//! fetched cold (then cached as usual).
 
 use std::collections::HashMap;
 
@@ -23,32 +21,31 @@ use crate::range_cache::RangeCache;
 use crate::store::{Result, StoreError};
 
 /// The serialized sidecar (postcard): the structural reads a cold open performs, keyed by path
-/// relative to the index object prefix. Bytes are the actual object contents, so the whole thing is
-/// self-contained — one GET reconstitutes it.
+/// relative to the index object prefix. Bytes are the actual object contents, so one GET
+/// reconstitutes the whole thing.
 #[derive(Serialize, Deserialize, Default)]
 struct HotCache {
     /// `(relative file, range start, bytes)` — the structural byte ranges tantivy reads on open.
     ranges: Vec<(String, u64, Vec<u8>)>,
     /// `(relative file, length)` — segment file lengths, so `get_file_handle` skips its `stat`.
     lens: Vec<(String, u64)>,
-    /// `(relative file, bytes)` — full bodies of the tiny atomic files (`meta.json`, `.managed.json`).
+    /// `(relative file, bytes)` — full bodies of the tiny atomic files.
     atomic: Vec<(String, Vec<u8>)>,
 }
 
 /// Build a hotcache for the cold index rooted at `object_prefix` in `op`: warm it through a
-/// recording directory and capture the structural reads. Returns the serialized sidecar to store
+/// recording directory and capture the structural reads, returning the serialized sidecar to store
 /// next to the window (see [`preload`]). **Synchronous** — [`ObjectDirectory`] reads `block_on` the
-/// current tokio runtime, so call this from a blocking context (e.g. `spawn_blocking`), same as
-/// [`open_cold_shard`](crate::LocalIndexStore::open_cold_shard).
+/// current tokio runtime, so call from a blocking context (e.g. `spawn_blocking`).
 pub fn build(op: opendal::Operator, object_prefix: &str) -> Result<Vec<u8>> {
-    // A private cache captures the ranges of this one warm-up (not the node's shared serving cache).
+    // A private cache captures this warm-up's ranges (not the node's shared serving cache).
     let cache = RangeCache::new(256 * 1024 * 1024);
     let dir = ObjectDirectory::open(op, object_prefix)
         .map_err(|e| StoreError::Cold(e.to_string()))?
         .with_cache(cache.clone())
         .recording();
     let index = Index::open(dir.clone()).map_err(|e| StoreError::Segment(e.into()))?;
-    // Opening the live reader's searcher forces every segment reader open → the structural reads.
+    // Opening the searcher forces every segment reader open → the structural reads.
     let reader = index.reader().map_err(|e| StoreError::Segment(e.into()))?;
     let _ = reader.searcher();
 
@@ -67,7 +64,7 @@ pub fn build(op: opendal::Operator, object_prefix: &str) -> Result<Vec<u8>> {
         lens: recorded.lens.into_iter().collect(),
         atomic: recorded.atomic.into_iter().collect(),
     };
-    // Frame with a magic + version so a later format change degrades instead of mis-parsing.
+    // Framed (magic + version) so a later format change degrades instead of mis-parsing.
     Ok(crate::sidecar::frame(
         crate::sidecar::HOTCACHE_MAGIC,
         postcard::to_stdvec(&hc)?,
@@ -75,11 +72,10 @@ pub fn build(op: opendal::Operator, object_prefix: &str) -> Result<Vec<u8>> {
 }
 
 /// Preload a hotcache `bytes` (from [`build`]) into a [`HotState`] to hand to
-/// [`ObjectDirectory::with_hot`](crate::ObjectDirectory). Atomic bodies, file lengths, **and** the
-/// structural byte ranges are all pinned in the returned state — the ranges no longer
-/// go into the shared evictable cache — so opening the window needs no object round-trips and they
-/// can't be evicted out from under it. Errors on an unrecognized/incompatible sidecar
-/// so the caller can fall back to plain read-through.
+/// [`ObjectDirectory::with_hot`](crate::ObjectDirectory). Atomic bodies, lengths, **and** byte
+/// ranges are all pinned in the returned state (not the shared evictable cache), so opening the
+/// window needs no round-trips and they can't be evicted from under it. Errors on an
+/// unrecognized/incompatible sidecar so the caller can fall back to plain read-through.
 pub(crate) fn preload(bytes: &[u8]) -> Result<HotState> {
     let payload = crate::sidecar::unframe(crate::sidecar::HOTCACHE_MAGIC, bytes)?;
     let hc: HotCache = postcard::from_bytes(payload)?;
