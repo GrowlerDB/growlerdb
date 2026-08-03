@@ -54,6 +54,7 @@ copyleft).
 - Data-plane authz is catalog-delegated. Hydration is governed by the Iceberg catalog and tenant
   isolation is enforced at the gateway; full Apache Polaris policy enforcement on the data plane is
   post-GA.
+- Static S3 credentials required. The query engine does not currently support AWS IAM roles, Kubernetes service accounts (IRSA), or STS credentials. You must provide static keys to connect, with native OIDC-based and IAM-based authorization support planned for our post-GA roadmap.
 - Non-windowed indexes have no cold tier (disk-capacity bound); cold-tiering applies to windowed
   indexes. See the scale-ceiling notes for the honest map toward very large (100 TB) deployments.
 
@@ -69,6 +70,7 @@ Near-term, in rough priority:
    Kafka, toward federated retrieval across lakehouse and operational data, plus a near-real-time
    hot tier.
 5. Full Polaris data-plane authz.
+6. Support for AWS IAM roles, Kubernetes service accounts (IRSA), and STS credentials for keyless cloud authentication.
 
 Dates aren't promised; this is direction, not commitment. The [GA criteria](ga-criteria) page tracks
 the go/no-go gate for the initial release.

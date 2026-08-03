@@ -7,10 +7,8 @@ nav_order: 1
 # GrowlerDB
 {: .fs-9 }
 
-Open-source retrieval engine for full-text, vector, and hybrid search over your
-data. Your source (Apache Iceberg today) stays the system of record. GrowlerDB
-keeps a fast derived index and returns the matching primary keys, which hydrate
-back to the authoritative rows.
+An open-source retrieval engine for full-text, vector, and hybrid search over your Apache Iceberg data.
+GrowlerDB keeps a fast, derived index locally and returns matching primary keys (coordinates) which hydrate back to the authoritative rows in your lakehouse. The data lake remains your single source of truth.
 {: .fs-6 .fw-300 }
 
 [Get started](getting-started){: .btn .btn-primary .fs-5 .mb-4 .mb-md-0 .mr-2 }
@@ -20,73 +18,71 @@ back to the authoritative rows.
 
 ## The model in one minute
 
-You define an index over an Iceberg source table: which columns to index, the
-composite key, and an optional `tenant_field`. A connector keeps the index in
-sync with the table.
+GrowlerDB operates on a three-step cycle:
 
-A search runs against that derived index and returns document coordinates (the
-composite key) plus scores, not documents. Your client, or built-in hydration,
-then fetches the authoritative rows from Iceberg by key (`POST /v1/keys:get`),
-governed by the catalog. The lake stays the source of truth.
+1. **Index:** Point GrowlerDB at an Apache Iceberg table. A lightweight connector streams table changes to build a local index.
+2. **Search:** Run lexical, semantic, or hybrid queries against the index. The query returns document coordinates (the composite primary key) and scores.
+3. **Hydrate:** Fetch the full, authoritative rows from your Iceberg catalog using the returned coordinates.
 
-A normal search engine owns its documents. GrowlerDB does the opposite, which is
-why it layers onto a lakehouse instead of copying it.
+Traditional search engines store a complete, separate copy of your documents. GrowlerDB stores only what is needed to search, using primary keys to bridge the index and the data lake.
 
-## Documentation
+## Choose your path
 
-New here? Start with [Getting started](getting-started). It takes you from an
-empty machine to your first search, then on to hydrate and the console. The rest
-of the pages are grouped by what you're doing, so you can find your way at your
-own pace.
+To help you get started quickly, we have organized the documentation into paths based on your role:
+
+* **Application developers:** Learn how to write search queries, configure local embeddings, and use the REST/gRPC APIs. Start with [Getting started](getting-started) and the [Query language](query-language).
+* **Platform engineers:** Deploy and manage the distributed stack, configure OIDC/JWT security, and monitor services. Start with [Install and run modes](install) and [Deployment](deployment).
+* **Data engineers:** Define index schemas, connect external tables, and set up the Spark connector. Start with [Configuration](configuration) and [Connecting your own Iceberg table](external-iceberg).
+
+---
+
+## Retrieval options
+
+When retrieving results, you can choose from three paths depending on your latency and data needs:
+
+* **Cached fields:** You can configure the index to store specific columns. These values return with the search hits immediately, requiring no Iceberg lookups.
+* **Full hydration:** For the authoritative record, your client fetches the full row by key using `POST /v1/keys:get`. This is typically used when a user opens a specific document.
+* **Inline hydration:** You can request inline hydration by setting `hydrate: true` in your search body. The engine collapses the search and lookup steps, returning the authoritative row directly in the search response.
+
+---
+
+## Documentation map
+
+Use the links below to find specific guides and reference pages.
 
 ### Start here
 
 | Page | What it covers |
 |---|---|
-| [Getting started](getting-started) | Compose stack, your first search, hydrate, console. |
-| [Install & run modes](install) | Build from source; embedded, `serve`, `gateway`, `control-plane`. |
+| [Getting started](getting-started) | Run the local Compose stack, execute your first search, and hydrate results. |
+| [Install and run modes](install) | Build from source and run in embedded, serve, gateway, or control-plane modes. |
 
-### Configure & connect
+### Configure and connect
 
 | Page | What it covers |
 |---|---|
-| [Configuration](configuration) | CLI flags, env vars, and the index-definition YAML (fields, key, tenant). |
-| [Connecting your own Iceberg table](external-iceberg) | Point GrowlerDB at your own external table on S3, plus the connector. |
-| [Storage & tiering](storage-tiering) | Hot vs cold object-storage tiering, and when to use each. |
+| [Configuration](configuration) | Configure the engine with CLI flags, environment variables, and YAML index schemas. |
+| [Connecting your own Iceberg table](external-iceberg) | Connect external tables on AWS S3 and set up the Spark ingestion connector. |
+| [Storage and tiering](storage-tiering) | Use time-windowing to park older, immutable index shards on object storage. |
 
 ### Reference
 
 | Page | What it covers |
 |---|---|
-| [Reference](reference) | Entry point to the [query language](query-language), the [REST & gRPC API](rest-api), and the [OpenSearch `_search` adapter](opensearch-adapter). |
+| [Reference](reference) | Explore the query language syntax, REST/gRPC API endpoints, and the OpenSearch compatibility adapter. |
 
-### Is it the right fit?
-
-| Page | What it covers |
-|---|---|
-| [Comparison & positioning](comparison) | When GrowlerDB fits, and when it doesn't, next to Elasticsearch and Trino. |
-| [Performance (directional)](performance) | Directional latency and throughput numbers vs Elasticsearch and Trino. |
-| [Migrating from Elasticsearch / OpenSearch](migration-from-elasticsearch) | Concepts plus the two integration paths. |
-
-### Operate & what's next
+### Architecture and positioning
 
 | Page | What it covers |
 |---|---|
-| [Deployment](deployment) | Local Compose and Kubernetes (Helm). |
-| [GA criteria](ga-criteria) | What's ready today and what's left before 1.0. |
-| [Roadmap & known limitations](roadmap) | What's coming next, and the current limits to know about. |
+| [Comparison and positioning](comparison) | Compare GrowlerDB's design and use cases with Elasticsearch and Trino. |
+| [Performance](performance) | Review directional search and hydration latency measurements. |
+| [Migrating from Elasticsearch](migration-from-elasticsearch) | Learn how to move your application search from Elasticsearch or OpenSearch. |
 
-## Feature overview
+### Operations and roadmap
 
-Search over your data with primary-key hydration (`/v1/search` then
-`/v1/keys:get`). Retrieval is lexical (Lucene/KQL), semantic (local-default
-embeddings), or hybrid (RRF), with an optional reranker and a read-only MCP
-server for AI agents. Queries go through a native structured AST or a Lucene/KQL
-string parser.
-
-To run at scale, GrowlerDB is distributed (a control plane, stateful searcher
-nodes, and a scatter-gather gateway) and multi-tenant: OIDC/JWT, API keys, and
-mTLS; control-plane RBAC; and tenant scoping that callers can't widen. Every
-service emits OpenTelemetry traces, metrics, and logs to Prometheus and bundled
-Grafana dashboards. A console UI ships with it, plus an optional OpenSearch
-`_search` adapter.
+| Page | What it covers |
+|---|---|
+| [Deployment](deployment) | Deploy GrowlerDB locally with Docker Compose or at scale with Kubernetes and Helm. |
+| [GA criteria](ga-criteria) | Track our criteria and check-off lists for the 1.0 release. |
+| [Roadmap and known limitations](roadmap) | Review upcoming features and current engine constraints. |

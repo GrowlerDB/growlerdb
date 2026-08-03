@@ -69,6 +69,7 @@ data.
   range reads. Tiering pays off only when cold data is rarely queried; a workload that
   frequently reads old data will thrash the hot⇄cold pre-warm cycle and lose the savings.
 - Mutating data can't be tiered (the rule above); it stays hot.
+- Non-windowed indexes do not support tiering. Because hash-sharded indexes do not group documents into immutable temporal shards, they cannot be tiered to object storage. Calling `GET /v1/cold` on a non-windowed index returns a `404 Not Found` response with the body `not a windowed index (no cold tier)`.
 - Late backfills erode pruning. A large late backfill widens a window's event-time zone-map, so
   event-time queries prune it less and scan it more (never *wrong*, just slower). Route known bulk
   backfills to a separate index.
