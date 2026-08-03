@@ -7,7 +7,9 @@ Kubernetes chaos scenarios (pod/node faults via the Helm chart), which live sepa
 ## Prerequisites
 
 - The full stack is up: `just stack`.
-- Host-side deps mapped: `127.0.0.1 minio` in `/etc/hosts` (see `../README.md`).
+- `127.0.0.1 minio` in `/etc/hosts` — these drills read object storage directly from the host, so
+  they need the name to resolve (see *Optional: read object storage directly from the host* in
+  `../README.md`).
 
 ## Drills
 

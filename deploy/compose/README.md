@@ -8,10 +8,13 @@ GrowlerDB's runtime dependencies for development and tests:
 - **seed** — creates the sample Iceberg tables: `growlerdb.docs` (3 rows), the richer
   `growlerdb.catalog` (10 rows), and `growlerdb.readings`.
 
-## One-time host setup
+## Optional: read object storage directly from the host
 
-The catalog hands clients an S3 endpoint of `minio:9000` (the in-network name).
-For **host** clients/tests to reach object storage, map that name to localhost:
+The catalog vends an S3 endpoint of `minio:9000` (the in-network name). The console, the gateway, and
+anything hydrating through them read object storage **in-network**, so they need nothing on your host.
+Only processes that read the store **directly from the host** need `minio` to resolve — the Rust
+integration/e2e tests (they run the engine in-process), and client-side hydration where you fetch rows
+from object storage yourself. For those, map the name to localhost:
 
 ```sh
 echo "127.0.0.1 minio" | sudo tee -a /etc/hosts
@@ -110,8 +113,8 @@ registry until something calls `CreateIndex`).
 - **Named volume, not bind mount** for MinIO (Docker Desktop refuses to create
   host bind-mount dirs in some setups).
 - **Polaris is INTERNAL** and writes the initial table metadata itself, so the
-  catalog's storage endpoint must be the in-network `minio:9000` — hence the
-  `/etc/hosts` line for host clients.
+  catalog's storage endpoint must be the in-network `minio:9000` — which is why a host
+  process reading the store *directly* needs the optional `/etc/hosts` line above.
 - **Seed runs in-network** (the `seed` compose service) so it resolves `minio`.
 - **Polaris is persistent** (Postgres-backed `polaris-db`), so a restart no longer wipes the catalog
   or orphans the index. The `down`/`stack-down` recipes pass `-v` to drop volumes for an intentional

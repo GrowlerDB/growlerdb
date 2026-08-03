@@ -15,5 +15,6 @@ for Iceberg data + index backups.
 ## Notes
 
 Wired in the [Compose](/system/deployment/index.md) and k8s deps manifests; the catalog vends a
-`minio:9000` endpoint (host clients map it in `/etc/hosts`). Production can use any S3-compatible
-service.
+`minio:9000` endpoint. In-network services and gateway-served hydration use it directly; only a host
+process reading the store directly (the Rust tests, or client-side hydration) maps it in `/etc/hosts`.
+Production can use any S3-compatible service.
