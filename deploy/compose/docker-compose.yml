@@ -382,7 +382,7 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >
-        until growlerdb index growlerdb.docs --name docs --shards 2 --shard-ordinal 0; do echo "node-s0: waiting for growlerdb.docs..."; sleep 3; done &&
+        until growlerdb index growlerdb.docs --name docs --shards 2 --shard-ordinal 0 --control-plane http://controlplane:50071; do echo "node-s0: waiting for growlerdb.docs..."; sleep 3; done &&
         growlerdb serve docs --shards 2 --shard-ordinal 0
         --addr 0.0.0.0:50051 --metrics-addr 0.0.0.0:9102
         --register http://controlplane:50071 --advertise-addr http://node-s0:50051
@@ -409,7 +409,7 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >
-        until growlerdb index growlerdb.docs --name docs --shards 2 --shard-ordinal 1; do echo "node-s1: waiting for growlerdb.docs..."; sleep 3; done &&
+        until growlerdb index growlerdb.docs --name docs --shards 2 --shard-ordinal 1 --control-plane http://controlplane:50071; do echo "node-s1: waiting for growlerdb.docs..."; sleep 3; done &&
         growlerdb serve docs --shards 2 --shard-ordinal 1
         --addr 0.0.0.0:50051 --metrics-addr 0.0.0.0:9102
         --register http://controlplane:50071 --advertise-addr http://node-s1:50051
@@ -451,9 +451,9 @@ services:
     # primary of, retrying until each table has data.
     command:
       - >
-        until growlerdb index growlerdb.docs --name docs --define-only; do echo "pool-a: waiting for growlerdb.docs..."; sleep 3; done &&
-        until growlerdb index growlerdb.catalog --def /catalog.yaml --name catalog --define-only; do echo "pool-a: waiting for growlerdb.catalog..."; sleep 3; done &&
-        until growlerdb index growlerdb.movies --def /movies.yaml --name movies --define-only; do echo "pool-a: waiting for growlerdb.movies..."; sleep 3; done &&
+        until growlerdb index growlerdb.docs --name docs --define-only --control-plane http://controlplane:50071; do echo "pool-a: waiting for growlerdb.docs..."; sleep 3; done &&
+        until growlerdb index growlerdb.catalog --def /catalog.yaml --name catalog --define-only --control-plane http://controlplane:50071; do echo "pool-a: waiting for growlerdb.catalog..."; sleep 3; done &&
+        until growlerdb index growlerdb.movies --def /movies.yaml --name movies --define-only --control-plane http://controlplane:50071; do echo "pool-a: waiting for growlerdb.movies..."; sleep 3; done &&
         growlerdb serve-pool --index docs --index catalog --index movies
         --addr 0.0.0.0:50051 --metrics-addr 0.0.0.0:9102
         --register http://controlplane:50071 --advertise-addr http://pool-a:50051
@@ -475,9 +475,9 @@ services:
     <<: *pool-node
     command:
       - >
-        until growlerdb index growlerdb.docs --name docs --define-only; do echo "pool-b: waiting for growlerdb.docs..."; sleep 3; done &&
-        until growlerdb index growlerdb.catalog --def /catalog.yaml --name catalog --define-only; do echo "pool-b: waiting for growlerdb.catalog..."; sleep 3; done &&
-        until growlerdb index growlerdb.movies --def /movies.yaml --name movies --define-only; do echo "pool-b: waiting for growlerdb.movies..."; sleep 3; done &&
+        until growlerdb index growlerdb.docs --name docs --define-only --control-plane http://controlplane:50071; do echo "pool-b: waiting for growlerdb.docs..."; sleep 3; done &&
+        until growlerdb index growlerdb.catalog --def /catalog.yaml --name catalog --define-only --control-plane http://controlplane:50071; do echo "pool-b: waiting for growlerdb.catalog..."; sleep 3; done &&
+        until growlerdb index growlerdb.movies --def /movies.yaml --name movies --define-only --control-plane http://controlplane:50071; do echo "pool-b: waiting for growlerdb.movies..."; sleep 3; done &&
         growlerdb serve-pool --index docs --index catalog --index movies
         --addr 0.0.0.0:50052 --metrics-addr 0.0.0.0:9104
         --register http://controlplane:50071 --advertise-addr http://pool-b:50052

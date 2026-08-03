@@ -1331,6 +1331,12 @@ impl ControlPlane for ControlPlaneService {
             // so a gateway/node converges on the current build + served definition via this poll.
             generation: entry.generation,
             definition_version: entry.definition_version,
+            // The authoritative resolved definition, so a booting node loads it (in cluster mode)
+            // instead of a stale local def — opening the on-disk index at the definition a durable
+            // alter last committed. Serialization can't realistically fail (the registry round-trips
+            // this same value as JSON); on the impossible error, fall back to an empty string
+            // (the node then keeps its local def) rather than fail the whole GetIndex.
+            definition_json: serde_json::to_string(&entry.definition).unwrap_or_default(),
         }))
     }
 
@@ -2972,6 +2978,45 @@ mod tests {
         // A sensitive field can't be cached → a block reason, not cached.
         assert!(!f("ssn").cached);
         assert!(f("ssn").blocked.contains("sensitive"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_index_carries_the_authoritative_definition_json() {
+        // A booting node loads this to open the on-disk index at the definition a durable alter last
+        // committed, instead of a stale local def — so definition_json must round-trip to exactly the
+        // registered ResolvedIndex.
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path());
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("body", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        let def = IndexDefinition::from_yaml(
+            "name: reload\nsource: { iceberg: { catalog: g, table: g.reload } }\nmapping: { selection: ALL }\n",
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+        svc.registry.create(def.clone()).unwrap();
+
+        let resp = svc
+            .get_index(Request::new(GetIndexRequest {
+                name: "reload".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            !resp.definition_json.is_empty(),
+            "the authoritative definition is carried for boot-time reload"
+        );
+        let parsed: growlerdb_core::ResolvedIndex =
+            serde_json::from_str(&resp.definition_json).expect("definition_json parses");
+        assert_eq!(parsed, def, "round-trips to the registered definition");
     }
 
     #[tokio::test(flavor = "current_thread")]
