@@ -38,15 +38,23 @@ brew install --cask docker   # Docker Desktop bundles Compose v2 + buildx; launc
 brew install just jq
 ```
 
-### Then, on either OS: one /etc/hosts entry
+### Optional: read the Compose MinIO directly from your host
 
-To query and hydrate from your host machine, you will need to add a single loopback entry. This maps the in-container object store (`minio`) to your localhost, so host-side hydration calls can resolve file references identically to internal container services:
+You don't need this for the tutorial. Search, `keys:get`, inline `hydrate`, the console, and the MCP
+server all hydrate **server-side** — the gateway reads object storage inside the Compose network and
+returns the rows — so nothing you run on the host touches MinIO.
+
+Add the loopback entry below **only if** you want to read the authoritative rows **directly** from the
+Compose MinIO yourself: client-side hydration, where you take the coordinates a search returns and
+fetch the rows from object storage with your own S3 client (bypassing the gateway). The catalog vends
+the in-network endpoint `minio:9000`, so map that name to localhost:
 
 ```sh
 echo "127.0.0.1 minio" | sudo tee -a /etc/hosts
 ```
 
-The console does not require this configuration, as it communicates through the gateway within the container network. This is only necessary for running host-side API requests.
+(Running the host-side test suite needs this too, for the same reason — the tests read the store
+directly.)
 
 ## 1. Bring up the full stack
 
@@ -659,9 +667,11 @@ just stack-down
   four indexes, so the gateway can't pick a default; add `"index":"movies"`, `"index":"docs"`,
   `"index":"catalog"`, or `"index":"events"` to the request body. (The console lands on `movies` via
   `/v1/config`, but that default doesn't apply to the REST API.)
-- **`keys:get` / hydration errors on the host** (`nodename nor servname` / connection refused): add the
-  `127.0.0.1 minio` `/etc/hosts` entry from Prerequisites; host-side hydration reads object storage by
-  that name.
+- **Reading MinIO directly from the host fails** (`nodename nor servname` / connection refused): this
+  hits only *direct* host-side object-storage reads — client-side hydration with your own S3 client, or
+  the host test suite — not `keys:get`/`hydrate` through the gateway, which hydrate server-side. Add the
+  `127.0.0.1 minio` `/etc/hosts` entry (see *Optional: read the Compose MinIO directly from your host*
+  in Prerequisites).
 - **Ports already in use** (`8081`, `3000`, `9000`): stop the conflicting service or `just stack-down`
   a previous run first.
 - **Console shows "Unknown"/degraded health right after start:** the node is still building the `docs`

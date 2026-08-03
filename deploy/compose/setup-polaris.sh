@@ -22,8 +22,9 @@ for _ in $(seq 1 60); do
 done
 [ -n "$TOK" ] || { echo "ERROR: Polaris did not become ready" >&2; exit 1; }
 
-# Catalog storage endpoint is the in-network name (minio:9000). Host clients must
-# resolve `minio` to 127.0.0.1 (one /etc/hosts line) to read data files.
+# Catalog storage endpoint is the in-network name (minio:9000): used by in-network services and
+# vended to clients. Gateway-served reads hydrate in-network; only a host process reading data files
+# directly (the Rust tests, client-side hydration) needs `minio` in /etc/hosts.
 code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$POLARIS/api/management/v1/catalogs" \
   -H "Authorization: Bearer $TOK" -H "Content-Type: application/json" \
   -d '{"catalog":{"name":"growlerdb","type":"INTERNAL","properties":{"default-base-location":"s3://growlerdb-warehouse/growlerdb"},"storageConfigInfo":{"storageType":"S3","allowedLocations":["s3://growlerdb-warehouse/"],"roleArn":"arn:aws:iam::000000000000:role/polaris","endpoint":"http://minio:9000","pathStyleAccess":true}}}')
