@@ -38,17 +38,15 @@ brew install --cask docker   # Docker Desktop bundles Compose v2 + buildx; launc
 brew install just jq
 ```
 
-### Then, on either OS: one `/etc/hosts` entry
+### Then, on either OS: one /etc/hosts entry
 
-So the `curl` hydration calls you run on the host can reach the in-container object storage by the
-name the stored file paths use:
+To query and hydrate from your host machine, you will need to add a single loopback entry. This maps the in-container object store (`minio`) to your localhost, so host-side hydration calls can resolve file references identically to internal container services:
 
 ```sh
 echo "127.0.0.1 minio" | sudo tee -a /etc/hosts
 ```
 
-(The console doesn't need this. It talks to the gateway, which reaches MinIO inside the Compose
-network, so this entry is only for host-side hydration.)
+The console does not require this configuration, as it communicates through the gateway within the container network. This is only necessary for running host-side API requests.
 
 ## 1. Bring up the full stack
 
@@ -152,6 +150,36 @@ curl -s localhost:8081/v1/keys:get \
 
 That round-trip, where search returns coordinates that hydrate to rows from the lake, is the core of
 GrowlerDB.
+
+### Inline hydration (one call)
+
+If your client needs the full rows immediately, you can bypass the separate lookup step. Add `"hydrate": true` to your search query:
+
+```sh
+curl -s localhost:8081/v1/search \
+  -H 'content-type: application/json' \
+  -H "authorization: Bearer $TOKEN" \
+  -d '{"index":"docs","query":"title:iceberg","limit":5,"hydrate":true}'
+```
+
+```json
+{
+  "hits": [
+    {
+      "coordinates": { "identifier": [{ "name": "id", "value": "doc-2" }] },
+      "score": 0.814,
+      "row": {
+        "id": "doc-2",
+        "title": "iceberg search",
+        "body": "fast full text search over apache iceberg"
+      }
+    }
+  ],
+  "total": 1, "shards_scanned": 1, "shards_total": 1
+}
+```
+
+The gateway handles the key lookup in the background. It returns the authoritative row inline under `hit.row`.
 
 ## 4. Explore in the console
 
