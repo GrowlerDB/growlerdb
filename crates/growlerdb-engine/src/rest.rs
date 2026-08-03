@@ -1479,13 +1479,18 @@ async fn alter_handler(
         .await
         .map_err(ApiError::from)?
         .into_inner();
+    let applied = resp.applied;
+    let reindex_triggered = resp.reindex_triggered;
+    let generation = resp.generation;
     let plan = resp.plan.unwrap_or_default();
     Ok(Json(AlterPlanDto {
         is_noop: plan.is_noop,
         requires_reindex: plan.requires_reindex,
         reindex_reasons: plan.reindex_reasons,
         in_place_changes: plan.in_place_changes,
-        applied: dto.apply && !plan.requires_reindex && !plan.is_noop,
+        applied,
+        reindex_triggered,
+        generation,
     }))
 }
 
@@ -2188,9 +2193,13 @@ struct AlterPlanDto {
     reindex_reasons: Vec<String>,
     /// Metadata-only changes safe to apply live.
     in_place_changes: Vec<String>,
-    /// Whether the in-place changes were applied (true only on `apply` for a non-reindex,
-    /// non-noop plan).
+    /// Whether the definition change was applied (durably, via the control plane on a multi-shard
+    /// index; a live in-place change on a single-shard node).
     applied: bool,
+    /// Whether a coordinated reindex from the new definition ran (a reindex-requiring apply).
+    reindex_triggered: bool,
+    /// Routing generation after a triggered reindex (0 if none).
+    generation: u64,
 }
 
 #[derive(Serialize)]

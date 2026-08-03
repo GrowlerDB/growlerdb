@@ -105,6 +105,9 @@ message AlterPlan {
 
 message AlterIndexResponse {
   AlterPlan plan = 1;
+  bool applied = 2;            // the definition change was applied (durable via the control plane)
+  bool reindex_triggered = 3;  // a coordinated reindex from the new definition ran (control plane)
+  uint64 generation = 4;       // routing generation after a triggered reindex
 }
 
 // Reindex an index: rebuild it from the source and durably swap it live.

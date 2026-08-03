@@ -2092,6 +2092,9 @@ impl Gateway {
                     reindex_reasons: out.reindex_reasons,
                     in_place_changes: out.in_place_changes,
                 }),
+                applied: out.applied,
+                reindex_triggered: out.reindex_triggered,
+                generation: out.generation,
             }));
         }
         rs.shards[0].alter_index(req).await
@@ -2457,6 +2460,7 @@ mod tests {
                     reindex_reasons: vec![],
                     in_place_changes: vec!["sentinel".into()],
                 }),
+                ..Default::default()
             }))
         }
     }

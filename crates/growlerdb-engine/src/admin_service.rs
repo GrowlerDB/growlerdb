@@ -409,13 +409,22 @@ impl Admin for AdminService {
         let candidate = resolve_candidate(&req.definition_yaml, &source)?;
         let plan = wire_plan(&baseline, &candidate);
 
+        let mut applied = false;
         if req.apply {
-            // Apply in-place changes durably, then advance the in-memory baseline so later
-            // alters/reindexes see the new definition.
-            let applied = apply_in_place(&baseline, candidate)?;
-            *ctx.resolved.write().expect("definition lock not poisoned") = applied;
+            // Apply in-place changes, then advance the in-memory baseline so later alters/reindexes
+            // see the new definition. (Reindex-requiring/restart-required changes error out above.)
+            let updated = apply_in_place(&baseline, candidate)?;
+            *ctx.resolved.write().expect("definition lock not poisoned") = updated;
+            applied = true;
         }
-        Ok(Response::new(AlterIndexResponse { plan: Some(plan) }))
+        Ok(Response::new(AlterIndexResponse {
+            plan: Some(plan),
+            applied,
+            // The node path applies only in-place/no-op changes live; a reindex-requiring change is
+            // driven by the control plane (durable alter), not here.
+            reindex_triggered: false,
+            generation: 0,
+        }))
     }
 
     async fn reindex_index(
