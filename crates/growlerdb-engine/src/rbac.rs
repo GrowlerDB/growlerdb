@@ -58,15 +58,19 @@ pub fn scope_for_method(method: &str) -> Option<Scope> {
         // `ListUsers` is NOT here: enumerating every subject + its role bindings is authorization-
         // topology disclosure, so it needs Admin, not any reader.
         "DescribeIndex" | "GetIndex" | "ListIndexes" | "ListAliases" | "DescribeSource"
-        | "IngestionStatus" | "GetCheckpoint" | "ListRoles" | "ListActivity" | "GetLicense" => {
+        | "IngestionStatus" | "GetCheckpoint" | "ListRoles" | "ListActivity" | "GetLicense"
+        // Reindex-job progress reads: polling a job / listing jobs, and the per-node build-status
+        // probe the coordinated driver fans out — observability, granted to any reader.
+        | "GetReindexJob" | "ListReindexJobs" | "ReindexStatus" => {
             Scope::IndexRead
         }
         "Write" => Scope::IndexWrite,
-        // Administer indexes + manage user role bindings + API tokens + list users.
-        "CreateIndex" | "DropIndex" | "AlterIndex" | "ReindexIndex" | "SetAlias" | "DropAlias"
-        | "SetUserRoles" | "CreateToken" | "ListTokens" | "RevokeToken" | "ListUsers" => {
-            Scope::Admin
-        }
+        // Administer indexes + manage user role bindings + API tokens + list users. Starting or
+        // canceling a coordinated reindex (whole-index or per-node) is an index mutation, like
+        // ReindexIndex itself.
+        "CreateIndex" | "DropIndex" | "AlterIndex" | "ReindexIndex" | "StartReindexJob"
+        | "CancelReindexJob" | "CancelReindex" | "SetAlias" | "DropAlias" | "SetUserRoles"
+        | "CreateToken" | "ListTokens" | "RevokeToken" | "ListUsers" => Scope::Admin,
         // Cluster operations: reshard/bucket moves + node self-registration + CP-driven pool
         // placement (node heartbeat + unit-owner resolution).
         "PlanReshard"
@@ -277,6 +281,25 @@ mod tests {
         // No admin/write scope.
         assert!(policy.authorize(&ctx("ReindexIndex", &["viewer"])).is_err());
         assert!(policy.authorize(&ctx("Write", &["viewer"])).is_err());
+    }
+
+    #[test]
+    fn reindex_job_methods_are_scoped_not_denied() {
+        // The async reindex-job RPCs must map to a scope — an unmapped method fails closed, so this
+        // guards against a new method silently 403'ing (progress reads for readers, mutations for admin).
+        let policy = RbacPolicy::with_default_roles();
+        for m in ["GetReindexJob", "ListReindexJobs", "ReindexStatus"] {
+            assert!(scope_for_method(m).is_some(), "{m} must be mapped");
+            assert!(policy.authorize(&ctx(m, &["reader"])).is_ok(), "{m} reader");
+        }
+        for m in ["StartReindexJob", "CancelReindexJob", "CancelReindex"] {
+            assert_eq!(scope_for_method(m), Some(Scope::Admin), "{m} is a mutation");
+            assert!(
+                policy.authorize(&ctx(m, &["reader"])).is_err(),
+                "{m} reader"
+            );
+            assert!(policy.authorize(&ctx(m, &["admin"])).is_ok(), "{m} admin");
+        }
     }
 
     #[test]
