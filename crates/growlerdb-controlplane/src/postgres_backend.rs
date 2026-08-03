@@ -22,7 +22,7 @@ use postgres::{Client, NoTls};
 use serde_json::Value;
 
 use crate::backend::{PersistedState, RegistryBackend, RegistryFile, RegistrySnapshot};
-use crate::registry::{ActivityEvent, RegistryError, Result};
+use crate::registry::{ActivityEvent, RegistryError, ReindexJob, Result};
 
 /// A unit of work handed to the backend's dedicated Postgres thread: it borrows the one `Client`,
 /// runs the query, and returns its own typed result to the caller over a private channel.
@@ -319,7 +319,12 @@ impl RegistryBackend for PostgresBackend {
             .map(serde_json::from_value)
             .transpose()?
             .unwrap_or_default();
-        Ok(core.into_persisted(activity, session_epochs))
+        let jobs = docs
+            .remove("jobs")
+            .map(serde_json::from_value)
+            .transpose()?
+            .unwrap_or_default();
+        Ok(core.into_persisted(activity, session_epochs, jobs))
     }
 
     fn persist_registry(&self, snapshot: RegistrySnapshot) -> Result<()> {
@@ -333,6 +338,10 @@ impl RegistryBackend for PostgresBackend {
 
     fn persist_sessions(&self, sessions: &BTreeMap<String, i64>) -> Result<()> {
         self.persist_doc("sessions", serde_json::to_value(sessions)?)
+    }
+
+    fn persist_jobs(&self, jobs: &BTreeMap<String, ReindexJob>) -> Result<()> {
+        self.persist_doc("jobs", serde_json::to_value(jobs)?)
     }
 
     fn poll_version(&self) -> Result<Option<i64>> {

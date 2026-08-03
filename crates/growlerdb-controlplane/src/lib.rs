@@ -11,7 +11,8 @@ pub use backend::{JsonFileBackend, PersistedState, RegistryBackend, RegistrySnap
 #[cfg(feature = "postgres")]
 pub use postgres_backend::PostgresBackend;
 pub use registry::{
-    glob_match, ActivityEvent, ApiToken, IndexEntry, IndexStatus, IndexSummary, NodeId, Registry,
-    RegistryError, Result, SavedQuery, ShardAssignment, Unit, UnitHolders, WindowAnnounce,
-    WindowAssignment, NODE_HEARTBEAT_TTL_MS, NODE_REANNOUNCE_INTERVAL_MS,
+    glob_match, ActivityEvent, ApiToken, IndexEntry, IndexStatus, IndexSummary, JobKind, JobState,
+    NodeId, Registry, RegistryError, ReindexJob, Result, SavedQuery, ShardAssignment,
+    ShardJobStatus, ShardPhase, Unit, UnitHolders, WindowAnnounce, WindowAssignment,
+    NODE_HEARTBEAT_TTL_MS, NODE_REANNOUNCE_INTERVAL_MS,
 };

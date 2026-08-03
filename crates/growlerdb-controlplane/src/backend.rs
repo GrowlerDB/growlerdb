@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
-use crate::registry::{ActivityEvent, ApiToken, IndexEntry, RegistryError, Result, SavedQuery};
+use crate::registry::{
+    ActivityEvent, ApiToken, IndexEntry, RegistryError, ReindexJob, Result, SavedQuery,
+};
 
 /// On-disk schema version for the registry envelope, so a future format change can be detected and
 /// migrated instead of mis-parsed. Shared by every backend.
@@ -34,6 +36,9 @@ pub struct PersistedState {
     pub index_bindings: BTreeMap<String, Vec<String>>,
     pub activity: BTreeMap<String, Vec<ActivityEvent>>,
     pub session_epochs: BTreeMap<String, i64>,
+    /// Coordinated reindex/alter jobs: `id → `[`ReindexJob`]. A separate `jobs.json` sidecar (like
+    /// the activity log) — progress/observability state, not catalog truth.
+    pub jobs: BTreeMap<String, ReindexJob>,
 }
 
 /// The core catalog snapshot a mutation hands the backend to persist — the seven durable maps of the
@@ -70,6 +75,14 @@ pub trait RegistryBackend: Send + Sync {
 
     /// Durably persist the session-epoch sidecar. Best-effort at the call site.
     fn persist_sessions(&self, sessions: &BTreeMap<String, i64>) -> Result<()>;
+
+    /// Durably persist the reindex-jobs sidecar. Best-effort at the call site (a failure is logged,
+    /// never fails the reindex the job records). Default no-op: a backend that doesn't persist jobs
+    /// keeps them in-memory only — on that backend a control-plane restart simply forgets in-flight
+    /// jobs, which is safe (the reindex's own generation CAS is the durable source of truth).
+    fn persist_jobs(&self, _jobs: &BTreeMap<String, ReindexJob>) -> Result<()> {
+        Ok(())
+    }
 
     // ---- leadership & change-polling (for N-replica HA over a shared store) -------------------
     // The defaults model the local single-writer file: unconditionally the leader (its `flock` made
@@ -178,6 +191,7 @@ impl RegistryFile {
         self,
         activity: BTreeMap<String, Vec<ActivityEvent>>,
         session_epochs: BTreeMap<String, i64>,
+        jobs: BTreeMap<String, ReindexJob>,
     ) -> PersistedState {
         PersistedState {
             indexes: self.indexes,
@@ -189,6 +203,7 @@ impl RegistryFile {
             index_bindings: self.index_bindings,
             activity,
             session_epochs,
+            jobs,
         }
     }
 }
@@ -200,6 +215,7 @@ pub struct JsonFileBackend {
     path: PathBuf,
     activity_path: PathBuf,
     session_epochs_path: PathBuf,
+    jobs_path: PathBuf,
     /// Held for the backend's lifetime to keep the exclusive `flock`; released on drop / exit.
     _lock: File,
 }
@@ -221,10 +237,12 @@ impl JsonFileBackend {
             .map_err(|_| RegistryError::Locked(lock_path))?;
         let activity_path = path.with_file_name("activity.json");
         let session_epochs_path = path.with_file_name("sessions.json");
+        let jobs_path = path.with_file_name("jobs.json");
         Ok(Self {
             path,
             activity_path,
             session_epochs_path,
+            jobs_path,
             _lock: lock,
         })
     }
@@ -247,7 +265,11 @@ impl RegistryBackend for JsonFileBackend {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
-        Ok(core.into_persisted(activity, session_epochs))
+        let jobs = std::fs::read(&self.jobs_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        Ok(core.into_persisted(activity, session_epochs, jobs))
     }
 
     fn persist_registry(&self, snapshot: RegistrySnapshot) -> Result<()> {
@@ -265,6 +287,12 @@ impl RegistryBackend for JsonFileBackend {
     fn persist_sessions(&self, sessions: &BTreeMap<String, i64>) -> Result<()> {
         let json = serde_json::to_vec_pretty(sessions)?;
         growlerdb_core::durable::write_keeping_prev(&self.session_epochs_path, &json)?;
+        Ok(())
+    }
+
+    fn persist_jobs(&self, jobs: &BTreeMap<String, ReindexJob>) -> Result<()> {
+        let json = serde_json::to_vec_pretty(jobs)?;
+        growlerdb_core::durable::write_keeping_prev(&self.jobs_path, &json)?;
         Ok(())
     }
 }
