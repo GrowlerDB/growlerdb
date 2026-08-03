@@ -875,6 +875,26 @@ impl LocalIndexStore {
         Ok(())
     }
 
+    /// Open the **staged next generation** built by [`build_staging_generation`] (not yet promoted)
+    /// as a writable [`Shard`], so a reindex **write catch-up** can apply the source delta that
+    /// accumulated during the unfenced build onto the staged generation before the cutover — leaving
+    /// it stamped at ~head so the promoted generation doesn't regress the live checkpoint. The
+    /// canonical live shard is untouched; a later [`promote_generation`](Self::promote_generation)
+    /// swaps the caught-up staging in. Errors if no staged generation exists (nothing to catch up).
+    ///
+    /// [`build_staging_generation`]: Self::build_staging_generation
+    pub fn open_staging(&self, id: &ShardId, index: &ResolvedIndex) -> Result<Shard> {
+        let canonical = self.root.join(id.rel_path());
+        let staging = sibling(&canonical, "reindex");
+        if !staging.exists() {
+            return Err(StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no staged generation to catch up",
+            )));
+        }
+        self.build_shard(staging, index)
+    }
+
     /// Resolve an interrupted [`reindex`](Self::reindex) for `id` — call before opening the
     /// shard at startup. Keyed off the durable `*.commit` marker:
     ///

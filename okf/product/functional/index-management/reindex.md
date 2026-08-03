@@ -29,9 +29,33 @@ as **build-all → cut-over-all**, so a build failure never half-swaps the index
    epoch) — the atomic cutover marker. Gateways converge to the new generation on their next
    `GetIndex` poll.
 
-Each node's phase is BUILD / PROMOTE / DISCARD; the write-fence is held across BUILD..PROMOTE so writes
-can't advance a shard past its build snapshot. Reads stay up throughout; writes pause only for the brief
-final drain, not the whole rebuild.
+Each node's phase is BUILD / PROMOTE / DISCARD. Reads stay up throughout, and — see **write catch-up**
+below — writes are **not** paused for the rebuild; the write-fence is engaged only for the brief cutover
+swap.
+
+## Write catch-up (zero write-downtime)
+
+The BUILD runs **unfenced**: writes keep flowing to the live generation while the (long) rebuild runs, so
+there is no whole-op write pause. A per-node `staged` single-flight flag (not the write-fence) guards the
+staging directory across BUILD..PROMOTE. The write-fence is engaged only for the **brief cutover** in
+PROMOTE, so an in-flight write can't land on the generation being swapped aside.
+
+Because the live generation advances during the unfenced build, the cutover must not lose or skip those
+writes. Two paths, both **exactly-once, no `CheckpointGap`, no whole-op pause**:
+
+- **Changelog (delete-aware) indexes:** the staged generation is promoted at the build snapshot; the
+  connector resumes from that checkpoint and **replays the build-window delta through its normal
+  delete-aware changelog** (`from ≤ current` ⇒ `Apply`, never `Gap`; upserts idempotent, deletes applied).
+  Correct for delete/rewrite tables, with a brief post-cutover replay.
+- **Append-only (`AppendFastPath`) indexes:** before the swap, the node **pre-applies the source rows
+  appended since the build** onto the staged generation and stamps it at the caught-up **head**
+  ([`read_documents_appended_since_ordered`](/system/runtime/components/node.md) under the cutover fence),
+  so the promoted generation doesn't regress the live checkpoint and the connector has ~nothing to replay
+  (seamless cutover).
+
+Stamping the staged generation *ahead* of the data it actually contains would silently skip rows, so the
+append path only stamps at head after it has applied the delta; the changelog path stamps honestly at the
+build snapshot and lets the connector's replay do the delete-aware catch-up.
 
 ## Async jobs
 
@@ -65,6 +89,7 @@ exactly one orchestration implementation behind both doors.
 
 ## Notes
 
-**Remaining work:** write catch-up (replay the build→cutover delta so writes never pause, removing the
-brief final fence) and windowed-index reindex (event-time windows, not buckets) are follow-ups; today the
-final drain briefly fences writes and a windowed index is Unimplemented.
+**Remaining work:** a node-side delete-aware bounded changelog reader would let **changelog** indexes also
+skip the brief post-cutover replay (append-only indexes already do, via the append catch-up) — a latency
+optimization, not a correctness gap; it is blocked on iceberg-rust gaining an incremental-changelog scan.
+Windowed-index reindex (event-time windows, not buckets) is still Unimplemented.
