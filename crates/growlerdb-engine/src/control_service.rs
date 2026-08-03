@@ -7,31 +7,34 @@ use std::sync::Arc;
 use std::collections::BTreeMap;
 
 use growlerdb_controlplane::{
-    ApiToken, IndexEntry, Registry, RegistryError, SavedQuery, ShardAssignment,
+    ApiToken, IndexEntry, JobKind, JobState, Registry, RegistryError, ReindexJob, SavedQuery,
+    ShardAssignment, ShardPhase,
 };
 use growlerdb_core::{BucketMap, IndexDefinition, Reassignment, ResolvedIndex, Source};
 use growlerdb_proto::v1::admin_client::AdminClient;
 use growlerdb_proto::v1::{
     ActivityEvent as WireActivity, AliasEntry, AlterControlRequest, AlterControlResponse,
-    ApiTokenMeta, ApplyReshardRequest, ApplyReshardResponse, BucketMove, CreateIndexRequest,
-    CreateIndexResponse, CreateTokenRequest, CreateTokenResponse, DeleteSavedQueryRequest,
-    DeleteSavedQueryResponse, DescribeSourceRequest, DescribeSourceResponse, DropAliasRequest,
-    DropAliasResponse, DropIndexRequest, DropIndexResponse, Error as WireError, FieldMapping,
-    GetCheckpointRequest, GetIndexRequest, GetIndexResponse, GetLicenseRequest, GetLicenseResponse,
-    IndexIngestion, IndexSummary as WireSummary, IngestionStatusRequest, IngestionStatusResponse,
+    ApiTokenMeta, ApplyReshardRequest, ApplyReshardResponse, BucketMove, CancelReindexJobRequest,
+    CancelReindexRequest, CreateIndexRequest, CreateIndexResponse, CreateTokenRequest,
+    CreateTokenResponse, DeleteSavedQueryRequest, DeleteSavedQueryResponse, DescribeSourceRequest,
+    DescribeSourceResponse, DropAliasRequest, DropAliasResponse, DropIndexRequest,
+    DropIndexResponse, Error as WireError, FieldMapping, GetCheckpointRequest, GetIndexRequest,
+    GetIndexResponse, GetLicenseRequest, GetLicenseResponse, GetReindexJobRequest, IndexIngestion,
+    IndexSummary as WireSummary, IngestionStatusRequest, IngestionStatusResponse,
     ListActivityRequest, ListActivityResponse, ListAliasesRequest, ListAliasesResponse,
-    ListIndexesRequest, ListIndexesResponse, ListRolesRequest, ListRolesResponse,
-    ListSavedQueriesRequest, ListSavedQueriesResponse, ListTokensRequest, ListTokensResponse,
-    ListUsersRequest, ListUsersResponse, LoginRequest, LoginResponse, MoveBucketRequest,
-    MoveBucketResponse, NodeAssignments, PlanReshardRequest, PlanReshardResponse,
-    RegisterNodeRequest, RegisterNodeResponse, RegisterServedIndexRequest,
+    ListIndexesRequest, ListIndexesResponse, ListReindexJobsRequest, ListReindexJobsResponse,
+    ListRolesRequest, ListRolesResponse, ListSavedQueriesRequest, ListSavedQueriesResponse,
+    ListTokensRequest, ListTokensResponse, ListUsersRequest, ListUsersResponse, LoginRequest,
+    LoginResponse, MoveBucketRequest, MoveBucketResponse, NodeAssignments, PlanReshardRequest,
+    PlanReshardResponse, RegisterNodeRequest, RegisterNodeResponse, RegisterServedIndexRequest,
     RegisterServedIndexResponse, ReindexControlRequest, ReindexControlResponse,
-    ReindexIndexRequest, ReindexIndexResponse, ReindexPhase, ResolveUnitOwnerRequest,
-    ResolveUnitOwnerResponse, RevokeTokenRequest, RevokeTokenResponse, RoleBinding,
-    RoutingStrategy as WireRouting, SaveSavedQueryRequest, SaveSavedQueryResponse,
-    SavedQuery as WireSavedQuery, SetAliasRequest, SetAliasResponse, SetUserRolesRequest,
-    SetUserRolesResponse, ShardIngestion, ShardStatus, SourceFieldInfo,
-    SubscribeAssignmentsRequest, UnitAssignment, WindowingConfig,
+    ReindexIndexRequest, ReindexIndexResponse, ReindexJobShard, ReindexJobStatus, ReindexPhase,
+    ReindexStatusRequest, ResolveUnitOwnerRequest, ResolveUnitOwnerResponse, RevokeTokenRequest,
+    RevokeTokenResponse, RoleBinding, RoutingStrategy as WireRouting, SaveSavedQueryRequest,
+    SaveSavedQueryResponse, SavedQuery as WireSavedQuery, SetAliasRequest, SetAliasResponse,
+    SetUserRolesRequest, SetUserRolesResponse, ShardIngestion, ShardStatus, SourceFieldInfo,
+    StartJobResponse, StartReindexJobRequest, SubscribeAssignmentsRequest, UnitAssignment,
+    WindowingConfig,
 };
 use growlerdb_proto::{to_status, ControlPlane, ControlPlaneServer, WriteClient};
 use growlerdb_source::{IcebergConfig, IcebergReader};
@@ -619,6 +622,10 @@ fn registry_status(e: RegistryError) -> Status {
             Code::NotFound,
             WireError::new("NOT_FOUND", format!("saved query `{id}` not found")),
         ),
+        RegistryError::JobNotFound(id) => to_status(
+            Code::NotFound,
+            WireError::new("NOT_FOUND", format!("job `{id}` not found")),
+        ),
         RegistryError::AliasNameClash(name) => to_status(
             Code::InvalidArgument,
             WireError::new(
@@ -783,20 +790,47 @@ async fn reindex_shard_on_node(
     Ok(resp)
 }
 
-/// Drive a coordinated whole-index reindex across every shard: build all shards' next generation,
-/// abort+discard on any build failure (never a half-swap), promote all, then bump the routing
-/// generation (the atomic cutover). `def_json` (serde of the new `ResolvedIndex`) is passed to every
-/// shard so a schema-changing alter rebuilds from the new definition and the nodes adopt it; empty ⇒
-/// a plain reindex against each shard's served definition. Shared by `ReindexIndex` and `AlterIndex`.
-async fn run_coordinated_reindex(
-    registry: &growlerdb_controlplane::Registry,
+/// How often the coordinated driver polls a building shard's node for live doc-level progress.
+const REINDEX_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Poll one node's live reindex build progress (docs done/total) over its Admin gRPC.
+async fn reindex_status_on_node(
+    endpoint: &str,
     index: &str,
-    def_json: &str,
-) -> Result<ReindexControlResponse, Status> {
+) -> Result<growlerdb_proto::v1::ReindexStatusResponse, Status> {
+    let (channel, stamp) = growlerdb_proto::service_token::node_channel(endpoint.to_string())
+        .await
+        .map_err(|e| Status::unavailable(format!("connecting to node `{endpoint}`: {e}")))?;
+    let mut client = AdminClient::with_interceptor(channel, stamp);
+    Ok(client
+        .reindex_status(ReindexStatusRequest {
+            index: index.to_string(),
+        })
+        .await?
+        .into_inner())
+}
+
+/// Trip one node's reindex cancel flag over its Admin gRPC — the in-flight build aborts.
+async fn cancel_reindex_on_node(endpoint: &str, index: &str) -> Result<(), Status> {
+    let (channel, stamp) = growlerdb_proto::service_token::node_channel(endpoint.to_string())
+        .await
+        .map_err(|e| Status::unavailable(format!("connecting to node `{endpoint}`: {e}")))?;
+    let mut client = AdminClient::with_interceptor(channel, stamp);
+    client
+        .cancel_reindex(CancelReindexRequest {
+            index: index.to_string(),
+        })
+        .await?;
+    Ok(())
+}
+
+/// Validate that `index` can be coordinated-reindexed and return `(ordinal, primary endpoint)` for
+/// every shard — the driver's build plan. Fails **before** any job is created so a bad request never
+/// leaves a stray job behind. Windowed indexes route by event-time, not bucket owners → out of scope.
+fn plan_reindex_shards(registry: &Registry, index: &str) -> Result<Vec<(u32, String)>, Status> {
     let entry = registry
         .get(index)
         .ok_or_else(|| registry_status(RegistryError::NotFound(index.to_string())))?;
-    // Windowed indexes route by event-time, not bucket owners — out of scope here.
     if windowing_config(&entry.definition).is_some() {
         return Err(Status::unimplemented(
             "reindex of a windowed index is not yet supported (event-time windows, not buckets)",
@@ -810,14 +844,6 @@ async fn run_coordinated_reindex(
             "index `{index}` has no assigned shards to reindex"
         )));
     }
-    let current_gen = entry.generation;
-    // CURRENT bucket owners = an identity filter (each shard keeps exactly its docs; no topology change).
-    let owners = registry
-        .bucket_map(index)
-        .map(|m| m.owners().to_vec())
-        .unwrap_or_default();
-
-    // Resolve every shard's primary endpoint (ordinal → node).
     let mut shards: Vec<(u32, String)> = Vec::with_capacity(shard_map.len());
     for (ord, assignment) in &shard_map {
         let endpoint = assignment
@@ -832,94 +858,376 @@ async fn run_coordinated_reindex(
             })?;
         shards.push((*ord, endpoint));
     }
+    Ok(shards)
+}
 
-    // Phase 1 — BUILD every shard's next generation (staged, fenced, NOT promoted).
-    let mut built: Vec<(u32, String)> = Vec::new();
-    let mut build_err: Option<Status> = None;
-    for (ord, endpoint) in &shards {
-        match reindex_shard_on_node(
-            endpoint,
-            index,
-            &owners,
-            *ord,
-            ReindexPhase::Build,
-            def_json,
-        )
-        .await
-        {
-            Ok(_) => built.push((*ord, endpoint.clone())),
-            Err(e) => {
-                build_err = Some(e);
-                break;
+/// Whether the job still wants to proceed — `false` once a cancel is requested (or the job vanished,
+/// so there is nothing left to drive).
+fn job_wants_to_continue(registry: &Registry, job_id: &str) -> bool {
+    registry
+        .get_job(job_id)
+        .map(|j| !j.cancel_requested)
+        .unwrap_or(false)
+}
+
+/// Set one shard row's phase in a job (no-op if the ordinal isn't present).
+fn set_shard_phase(job: &mut ReindexJob, ordinal: u32, phase: ShardPhase) {
+    if let Some(s) = job.shards.iter_mut().find(|s| s.ordinal == ordinal) {
+        s.phase = phase;
+    }
+}
+
+/// The outcome of a single shard's build, distinguishing a deliberate cancel from a real failure so
+/// the driver can end the job Canceled vs Failed.
+enum BuildOutcome {
+    Ok,
+    Canceled,
+    Failed(Status),
+}
+
+/// Run one shard's BUILD while polling its node for live progress (folded into the job) and honoring
+/// a mid-build cancel. Returns once the build resolves.
+async fn build_shard_with_progress(
+    registry: &Arc<Registry>,
+    job_id: &str,
+    index: &str,
+    owners: &[u32],
+    ordinal: u32,
+    endpoint: &str,
+    def_json: &str,
+) -> BuildOutcome {
+    let build = reindex_shard_on_node(
+        endpoint,
+        index,
+        owners,
+        ordinal,
+        ReindexPhase::Build,
+        def_json,
+    );
+    tokio::pin!(build);
+    loop {
+        tokio::select! {
+            res = &mut build => {
+                return match res {
+                    Ok(_) => BuildOutcome::Ok,
+                    Err(status) if status.code() == Code::Cancelled => BuildOutcome::Canceled,
+                    // A build that failed while a cancel was in flight is a cancel, not a fault.
+                    Err(status) => {
+                        if !job_wants_to_continue(registry, job_id) {
+                            BuildOutcome::Canceled
+                        } else {
+                            BuildOutcome::Failed(status)
+                        }
+                    }
+                };
+            }
+            _ = tokio::time::sleep(REINDEX_POLL_INTERVAL) => {
+                if let Ok(st) = reindex_status_on_node(endpoint, index).await {
+                    registry.mutate_job(job_id, |j| {
+                        if let Some(s) = j.shards.iter_mut().find(|s| s.ordinal == ordinal) {
+                            s.docs_done = st.docs_done;
+                            s.docs_total = st.docs_total;
+                        }
+                    });
+                }
+                // A cancel requested mid-build: ping the node so the in-flight build aborts promptly
+                // (the CancelReindexJob handler also pings, but the driver re-pings in case of a race).
+                if !job_wants_to_continue(registry, job_id) {
+                    let _ = cancel_reindex_on_node(endpoint, index).await;
+                }
             }
         }
     }
-    // Any build failure ⇒ DISCARD every staged generation (release its fence) and abort — no shard
-    // was promoted, so the old generation is intact everywhere (never a half-swap).
-    if let Some(e) = build_err {
-        for (ord, endpoint) in &built {
-            if let Err(de) =
-                reindex_shard_on_node(endpoint, index, &owners, *ord, ReindexPhase::Discard, "")
-                    .await
-            {
-                tracing::warn!(index = %index, shard = ord, error = %de,
-                    "reindex: discard after a failed build failed — that shard's write-fence may need a manual clear");
+}
+
+/// DISCARD every already-built shard's staged generation (releasing its fence), marking each row
+/// Discarded — the shared unwind for an aborted or canceled job. Best-effort: a discard failure is
+/// logged, since the old generation is intact regardless (no shard was promoted).
+async fn discard_built(
+    registry: &Arc<Registry>,
+    job_id: &str,
+    index: &str,
+    owners: &[u32],
+    built: &[(u32, String)],
+) {
+    for (ord, endpoint) in built {
+        if let Err(e) =
+            reindex_shard_on_node(endpoint, index, owners, *ord, ReindexPhase::Discard, "").await
+        {
+            tracing::warn!(index = %index, shard = ord, error = %e,
+                "reindex: discard of a staged generation failed — its write-fence may need a manual clear");
+        }
+        registry.mutate_job(job_id, |j| set_shard_phase(j, *ord, ShardPhase::Discarded));
+    }
+}
+
+/// Drive a created reindex/alter **job** to a terminal state: BUILD every shard's next generation
+/// (folding live per-shard progress into the job), then PROMOTE all and bump the routing generation
+/// (the atomic cutover) — updating the job as it advances. Any build failure DISCARDs every staged
+/// generation and fails the job (never a half-swap); a cancel request DISCARDs + cancels. `def_json`
+/// (serde of the new `ResolvedIndex`) rebuilds from a schema-changing alter's new definition; empty ⇒
+/// a plain reindex against each shard's served definition. Runs inline (synchronous `ReindexIndex` /
+/// `AlterIndex`) or spawned (`StartReindexJob`).
+async fn drive_reindex_job(registry: Arc<Registry>, job_id: String, def_json: String) {
+    let Some(job) = registry.get_job(&job_id) else {
+        return;
+    };
+    let index = job.index.clone();
+    // The generation we plan the cutover CAS from, and the CURRENT bucket owners (identity filter:
+    // each shard keeps exactly its docs — no topology change).
+    let Some(entry) = registry.get(&index) else {
+        registry.mutate_job(&job_id, |j| {
+            j.state = JobState::Failed;
+            j.error = format!("index `{index}` vanished before the reindex started");
+        });
+        return;
+    };
+    let current_gen = entry.generation;
+    let owners = registry
+        .bucket_map(&index)
+        .map(|m| m.owners().to_vec())
+        .unwrap_or_default();
+    let shards: Vec<(u32, String)> = job
+        .shards
+        .iter()
+        .map(|s| (s.ordinal, s.node.clone()))
+        .collect();
+
+    let fail = |err: String| {
+        registry.mutate_job(&job_id, |j| {
+            j.state = JobState::Failed;
+            j.error = err;
+        });
+    };
+    let cancel = |registry: &Arc<Registry>| {
+        registry.mutate_job(&job_id, |j| {
+            j.state = JobState::Canceled;
+            j.error = "canceled by request".to_string();
+        });
+    };
+
+    // Phase 1 — BUILD every shard's next generation (staged, fenced, NOT promoted).
+    registry.mutate_job(&job_id, |j| j.state = JobState::Building);
+    let mut built: Vec<(u32, String)> = Vec::new();
+    for (ordinal, endpoint) in &shards {
+        if !job_wants_to_continue(&registry, &job_id) {
+            discard_built(&registry, &job_id, &index, &owners, &built).await;
+            cancel(&registry);
+            return;
+        }
+        registry.mutate_job(&job_id, |j| {
+            set_shard_phase(j, *ordinal, ShardPhase::Building)
+        });
+        match build_shard_with_progress(
+            &registry, &job_id, &index, &owners, *ordinal, endpoint, &def_json,
+        )
+        .await
+        {
+            BuildOutcome::Ok => {
+                built.push((*ordinal, endpoint.clone()));
+                // Publish the final count for this shard and mark it built (fenced, awaiting cutover).
+                registry.mutate_job(&job_id, |j| {
+                    if let Some(s) = j.shards.iter_mut().find(|s| s.ordinal == *ordinal) {
+                        s.phase = ShardPhase::Built;
+                        if s.docs_total > 0 {
+                            s.docs_done = s.docs_total;
+                        }
+                    }
+                });
+            }
+            BuildOutcome::Canceled => {
+                // The in-flight build aborted itself; discard it too, plus the already-built ones.
+                let _ = reindex_shard_on_node(
+                    endpoint,
+                    &index,
+                    &owners,
+                    *ordinal,
+                    ReindexPhase::Discard,
+                    "",
+                )
+                .await;
+                registry.mutate_job(&job_id, |j| {
+                    set_shard_phase(j, *ordinal, ShardPhase::Discarded)
+                });
+                discard_built(&registry, &job_id, &index, &owners, &built).await;
+                cancel(&registry);
+                return;
+            }
+            BuildOutcome::Failed(status) => {
+                discard_built(&registry, &job_id, &index, &owners, &built).await;
+                fail(format!(
+                    "build of shard {ordinal} failed (no cutover; old generation intact): {status}"
+                ));
+                return;
             }
         }
-        return Err(Status::internal(format!(
-            "reindex of `{index}` aborted during build (no cutover; old generation intact): {e}"
-        )));
+    }
+
+    // A cancel between the last build and the cutover still aborts cleanly (nothing is promoted yet).
+    if !job_wants_to_continue(&registry, &job_id) {
+        discard_built(&registry, &job_id, &index, &owners, &built).await;
+        cancel(&registry);
+        return;
     }
 
     // Phase 2 — PROMOTE every shard (brief fence-drain + atomic swap, releasing the fence).
-    let mut doc_count = 0u64;
-    for (i, (ord, endpoint)) in shards.iter().enumerate() {
+    registry.mutate_job(&job_id, |j| j.state = JobState::CuttingOver);
+    for (i, (ordinal, endpoint)) in shards.iter().enumerate() {
+        registry.mutate_job(&job_id, |j| {
+            set_shard_phase(j, *ordinal, ShardPhase::Promoting)
+        });
         match reindex_shard_on_node(
             endpoint,
-            index,
+            &index,
             &owners,
-            *ord,
+            *ordinal,
             ReindexPhase::Promote,
-            def_json,
+            &def_json,
         )
         .await
         {
-            Ok(resp) => doc_count += resp.doc_count,
+            Ok(resp) => {
+                // Record the shard's authoritative post-promote doc count (the definitive number a
+                // finished job reports; the live BUILD poll was only an estimate).
+                registry.mutate_job(&job_id, |j| {
+                    if let Some(s) = j.shards.iter_mut().find(|s| s.ordinal == *ordinal) {
+                        s.phase = ShardPhase::Promoted;
+                        s.docs_done = resp.doc_count;
+                        if s.docs_total < resp.doc_count {
+                            s.docs_total = resp.doc_count;
+                        }
+                    }
+                });
+            }
             Err(e) => {
-                // Rare promote-phase partial failure: discard the not-yet-promoted remainder (release
-                // their fences) so the op is retryable; already-promoted shards keep the new
-                // generation (queryable, mixed-generation; a retry converges). The common BUILD-phase
-                // failure never reaches here, so it never half-swaps.
+                // Rare promote-phase partial failure: discard the not-yet-promoted remainder so the op
+                // is retryable; already-promoted shards keep the new generation (queryable,
+                // mixed-generation; a retry converges). The common BUILD-phase failure never reaches
+                // here, so it never half-swaps.
                 for (o, ep) in &shards[i..] {
                     let _ =
-                        reindex_shard_on_node(ep, index, &owners, *o, ReindexPhase::Discard, "")
+                        reindex_shard_on_node(ep, &index, &owners, *o, ReindexPhase::Discard, "")
                             .await;
                 }
-                return Err(Status::internal(format!(
-                    "reindex of `{index}` failed promoting shard {ord} after {i}/{} shards; \
-                     discarded the rest (index is queryable, mixed-generation; retry to converge): {e}",
+                fail(format!(
+                    "promote of shard {ordinal} failed after {i}/{} shards; discarded the rest \
+                     (index is queryable, mixed-generation; retry to converge): {e}",
                     shards.len()
-                )));
+                ));
+                return;
             }
         }
     }
 
-    // Phase 3 — atomic cutover marker: bump the routing generation (CAS vs the generation we planned
-    // from, so a concurrent reindex/reshard is a loud PLACEMENT_CONFLICT). Gateways converge on poll.
-    let generation = registry
-        .set_generation(index, current_gen, current_gen + 1)
-        .map_err(registry_status)?;
-    registry.record_activity(
-        index,
-        "reindex",
-        format!("reindexed {} shards", shards.len()),
-    );
+    // Phase 3 — atomic cutover: bump the routing generation (CAS vs the generation we planned from,
+    // so a concurrent reindex/reshard is a loud PLACEMENT_CONFLICT). Gateways converge on poll.
+    match registry.set_generation(&index, current_gen, current_gen + 1) {
+        Ok(generation) => {
+            registry.record_activity(
+                &index,
+                "reindex",
+                format!("reindexed {} shards (job {job_id})", shards.len()),
+            );
+            registry.mutate_job(&job_id, |j| {
+                j.state = JobState::Done;
+                j.generation = generation;
+            });
+        }
+        Err(e) => fail(format!("cutover failed at the generation CAS: {e}")),
+    }
+}
 
-    Ok(ReindexControlResponse {
-        generation,
-        shards: shards.len() as u32,
-        doc_count,
-    })
+/// Run a coordinated reindex/alter **synchronously**: create the job, drive it inline to a terminal
+/// state, then map that outcome to the legacy `ReindexControlResponse`. This is the synchronous
+/// `ReindexIndex` / `AlterIndex` path over the same driver `StartReindexJob` spawns — one
+/// orchestration implementation, two doors.
+async fn run_coordinated_reindex(
+    registry: &Arc<Registry>,
+    index: &str,
+    def_json: &str,
+) -> Result<ReindexControlResponse, Status> {
+    let shards = plan_reindex_shards(registry, index)?;
+    let kind = if def_json.is_empty() {
+        JobKind::Reindex
+    } else {
+        JobKind::Alter
+    };
+    let job = registry.create_job(kind, index, shards);
+    drive_reindex_job(registry.clone(), job.id.clone(), def_json.to_string()).await;
+    let done = registry
+        .get_job(&job.id)
+        .ok_or_else(|| Status::internal("reindex job vanished mid-run"))?;
+    match done.state {
+        JobState::Done => Ok(ReindexControlResponse {
+            generation: done.generation,
+            shards: done.shards.len() as u32,
+            doc_count: done.docs_done(),
+        }),
+        JobState::Canceled => Err(Status::cancelled(done.error)),
+        _ => Err(Status::internal(if done.error.is_empty() {
+            format!("reindex of `{index}` failed")
+        } else {
+            done.error
+        })),
+    }
+}
+
+/// Map a registry [`ReindexJob`] to its wire status.
+fn job_to_wire(job: &ReindexJob) -> ReindexJobStatus {
+    ReindexJobStatus {
+        id: job.id.clone(),
+        index: job.index.clone(),
+        kind: job_kind_str(job.kind).to_string(),
+        state: job_state_str(job.state).to_string(),
+        shards: job
+            .shards
+            .iter()
+            .map(|s| ReindexJobShard {
+                ordinal: s.ordinal,
+                node: s.node.clone(),
+                phase: shard_phase_str(s.phase).to_string(),
+                docs_done: s.docs_done,
+                docs_total: s.docs_total,
+            })
+            .collect(),
+        docs_done: job.docs_done(),
+        docs_total: job.docs_total(),
+        generation: job.generation,
+        cancel_requested: job.cancel_requested,
+        error: job.error.clone(),
+        created_ms: job.created_ms,
+        updated_ms: job.updated_ms,
+    }
+}
+
+fn job_kind_str(k: JobKind) -> &'static str {
+    match k {
+        JobKind::Reindex => "reindex",
+        JobKind::Alter => "alter",
+    }
+}
+
+fn job_state_str(s: JobState) -> &'static str {
+    match s {
+        JobState::Pending => "pending",
+        JobState::Building => "building",
+        JobState::CatchingUp => "catching_up",
+        JobState::CuttingOver => "cutting_over",
+        JobState::Done => "done",
+        JobState::Failed => "failed",
+        JobState::Canceled => "canceled",
+    }
+}
+
+fn shard_phase_str(p: ShardPhase) -> &'static str {
+    match p {
+        ShardPhase::Pending => "pending",
+        ShardPhase::Building => "building",
+        ShardPhase::Built => "built",
+        ShardPhase::Promoting => "promoting",
+        ShardPhase::Promoted => "promoted",
+        ShardPhase::Discarded => "discarded",
+    }
 }
 
 #[tonic::async_trait]
@@ -1152,6 +1460,79 @@ impl ControlPlane for ControlPlaneService {
         run_coordinated_reindex(&self.registry, &index, "")
             .await
             .map(Response::new)
+    }
+
+    async fn start_reindex_job(
+        &self,
+        request: Request<StartReindexJobRequest>,
+    ) -> Result<Response<StartJobResponse>, Status> {
+        self.gate("StartReindexJob", &request)?;
+        let index = request.into_inner().index;
+        // One coordinated reindex per index at a time: a second would race the first's build + cutover
+        // CAS. Refuse loudly rather than let the loser fail deep in the driver.
+        if self
+            .registry
+            .list_jobs()
+            .iter()
+            .any(|j| j.index == index && !j.state.is_terminal())
+        {
+            return Err(Status::failed_precondition(format!(
+                "a reindex job is already running for `{index}`"
+            )));
+        }
+        // Validate + resolve the shard plan up front so a bad request fails before a job exists.
+        let shards = plan_reindex_shards(&self.registry, &index)?;
+        let job = self.registry.create_job(JobKind::Reindex, &index, shards);
+        // Drive it in the background; the caller polls GetReindexJob.
+        tokio::spawn(drive_reindex_job(
+            self.registry.clone(),
+            job.id.clone(),
+            String::new(),
+        ));
+        Ok(Response::new(StartJobResponse { job_id: job.id }))
+    }
+
+    async fn get_reindex_job(
+        &self,
+        request: Request<GetReindexJobRequest>,
+    ) -> Result<Response<ReindexJobStatus>, Status> {
+        self.gate("GetReindexJob", &request)?;
+        let id = request.into_inner().job_id;
+        let job = self
+            .registry
+            .get_job(&id)
+            .ok_or_else(|| registry_status(RegistryError::JobNotFound(id)))?;
+        Ok(Response::new(job_to_wire(&job)))
+    }
+
+    async fn list_reindex_jobs(
+        &self,
+        request: Request<ListReindexJobsRequest>,
+    ) -> Result<Response<ListReindexJobsResponse>, Status> {
+        self.gate("ListReindexJobs", &request)?;
+        let jobs = self.registry.list_jobs().iter().map(job_to_wire).collect();
+        Ok(Response::new(ListReindexJobsResponse { jobs }))
+    }
+
+    async fn cancel_reindex_job(
+        &self,
+        request: Request<CancelReindexJobRequest>,
+    ) -> Result<Response<ReindexJobStatus>, Status> {
+        self.gate("CancelReindexJob", &request)?;
+        let id = request.into_inner().job_id;
+        // Flag the job; the driver observes it between phases and unwinds cleanly.
+        let job = self
+            .registry
+            .request_job_cancel(&id)
+            .map_err(registry_status)?;
+        // Proactively interrupt any in-flight build so the cancel takes effect promptly rather than
+        // waiting for the current shard's full rebuild.
+        for s in &job.shards {
+            if s.phase == ShardPhase::Building {
+                let _ = cancel_reindex_on_node(&s.node, &job.index).await;
+            }
+        }
+        Ok(Response::new(job_to_wire(&job)))
     }
 
     async fn alter_index(
@@ -3821,6 +4202,9 @@ mod tests {
         /// When set: signal `entered` on a reindex call, then wait for `release` — lets a test
         /// deterministically interleave a concurrent placement commit mid-build.
         gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+        /// Tripped by `CancelReindex` (and it releases a gated build): a gated BUILD then returns
+        /// CANCELLED, mirroring a real node's populate-loop abort so the cancel path can be tested.
+        cancel: Arc<std::sync::atomic::AtomicBool>,
     }
 
     #[tonic::async_trait]
@@ -3853,9 +4237,22 @@ mod tests {
             if self.fail_build && req.phase == growlerdb_proto::v1::ReindexPhase::Build as i32 {
                 return Err(Status::internal("stub build failure"));
             }
-            if let Some((entered, release)) = &self.gate {
-                entered.notify_one();
-                release.notified().await;
+            // Gate only the build phases (FULL / BUILD) — a PROMOTE/DISCARD the driver sends after
+            // releasing must not block, or the cancel/abort unwind would deadlock.
+            let is_build = req.phase == growlerdb_proto::v1::ReindexPhase::Full as i32
+                || req.phase == growlerdb_proto::v1::ReindexPhase::Build as i32;
+            if is_build {
+                if let Some((entered, release)) = &self.gate {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+            }
+            // A cancel that arrived during a gated BUILD aborts it with CANCELLED, as a real node
+            // does when its populate loop observes the flag.
+            if req.phase == growlerdb_proto::v1::ReindexPhase::Build as i32
+                && self.cancel.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(Status::cancelled("stub build canceled"));
             }
             Ok(Response::new(growlerdb_proto::v1::ReindexIndexResponse {
                 doc_count: 3,
@@ -3866,14 +4263,22 @@ mod tests {
             &self,
             _r: Request<growlerdb_proto::v1::ReindexStatusRequest>,
         ) -> Result<Response<growlerdb_proto::v1::ReindexStatusResponse>, Status> {
-            Ok(Response::new(
-                growlerdb_proto::v1::ReindexStatusResponse::default(),
-            ))
+            Ok(Response::new(growlerdb_proto::v1::ReindexStatusResponse {
+                building: !self.cancel.load(std::sync::atomic::Ordering::SeqCst),
+                docs_done: 1,
+                docs_total: 3,
+                cancel_requested: self.cancel.load(std::sync::atomic::Ordering::SeqCst),
+            }))
         }
         async fn cancel_reindex(
             &self,
             _r: Request<growlerdb_proto::v1::CancelReindexRequest>,
         ) -> Result<Response<growlerdb_proto::v1::CancelReindexResponse>, Status> {
+            self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Wake a gated build so it observes the cancel and returns promptly.
+            if let Some((_, release)) = &self.gate {
+                release.notify_one();
+            }
             Ok(Response::new(
                 growlerdb_proto::v1::CancelReindexResponse::default(),
             ))
@@ -4080,6 +4485,107 @@ mod tests {
             "no cutover on a build failure"
         );
         // Shard 0 built, then got a DISCARD (fence released); it was never promoted.
+        let build = ReindexPhase::Build as i32;
+        let discard = ReindexPhase::Discard as i32;
+        let phases: Vec<i32> = phase0.lock().unwrap().iter().map(|(_, p)| *p).collect();
+        assert_eq!(phases, vec![build, discard]);
+    }
+
+    /// Poll a reindex job by id until it reaches a terminal state (or time out the test).
+    async fn poll_job_to_terminal(svc: &ControlPlaneService, id: &str) -> ReindexJobStatus {
+        for _ in 0..200 {
+            let j = svc
+                .get_reindex_job(Request::new(GetReindexJobRequest {
+                    job_id: id.to_string(),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            if matches!(j.state.as_str(), "done" | "failed" | "canceled") {
+                return j;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("job {id} did not reach a terminal state");
+    }
+
+    /// The async path: StartReindexJob returns a job id immediately; the background driver builds all
+    /// shards, promotes all, and bumps the generation — pollable to `done` with the doc count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_reindex_job_starts_polls_and_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path());
+        let def_json = serde_json::to_string(&resolved("docs")).unwrap();
+        let ep0 = spawn_stub_node(StubNodeAdmin::default()).await;
+        let ep1 = spawn_stub_node(StubNodeAdmin::default()).await;
+        register(&svc, &def_json, &ep0, 2, 0).await;
+        register(&svc, &def_json, &ep1, 2, 1).await;
+
+        let start = svc
+            .start_reindex_job(Request::new(StartReindexJobRequest {
+                index: "docs".into(),
+            }))
+            .await
+            .expect("start returns immediately")
+            .into_inner();
+        assert!(!start.job_id.is_empty());
+
+        // A second start is refused while the first is running or done-recorded is fine; here we just
+        // poll the first to completion.
+        let done = poll_job_to_terminal(&svc, &start.job_id).await;
+        assert_eq!(done.state, "done");
+        assert_eq!(done.generation, 1);
+        assert_eq!(done.docs_done, 6, "Σ per-shard promoted doc counts");
+        assert!(done.shards.iter().all(|s| s.phase == "promoted"));
+        assert_eq!(svc.registry.generation("docs"), Some(1));
+    }
+
+    /// Canceling an in-flight job discards every staged generation (releasing the fences), never cuts
+    /// over (generation unchanged), and ends the job `canceled`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_reindex_job_cancels_mid_build_and_discards() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path());
+        let def_json = serde_json::to_string(&resolved("docs")).unwrap();
+        // Shard 0's build blocks on the gate (records its phases) so we can cancel mid-build; shard 1
+        // is never reached.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let phase0 = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s0 = StubNodeAdmin {
+            phases: phase0.clone(),
+            gate: Some((entered.clone(), release.clone())),
+            ..Default::default()
+        };
+        let ep0 = spawn_stub_node(s0).await;
+        let ep1 = spawn_stub_node(StubNodeAdmin::default()).await;
+        register(&svc, &def_json, &ep0, 2, 0).await;
+        register(&svc, &def_json, &ep1, 2, 1).await;
+
+        let start = svc
+            .start_reindex_job(Request::new(StartReindexJobRequest {
+                index: "docs".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        // Wait until shard 0's build is in flight, then cancel — the handler pings the node, which
+        // releases the gated build with CANCELLED.
+        entered.notified().await;
+        svc.cancel_reindex_job(Request::new(CancelReindexJobRequest {
+            job_id: start.job_id.clone(),
+        }))
+        .await
+        .unwrap();
+
+        let done = poll_job_to_terminal(&svc, &start.job_id).await;
+        assert_eq!(done.state, "canceled");
+        assert_eq!(
+            svc.registry.generation("docs"),
+            Some(0),
+            "no cutover on cancel"
+        );
+        // Shard 0 built, then got a DISCARD (staged generation dropped, fence released).
         let build = ReindexPhase::Build as i32;
         let discard = ReindexPhase::Discard as i32;
         let phases: Vec<i32> = phase0.lock().unwrap().iter().map(|(_, p)| *p).collect();
