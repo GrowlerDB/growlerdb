@@ -43,5 +43,9 @@ How an Iceberg row becomes an indexed document.
 
 ## Notes
 
-The definition is versioned with the index; schema evolution adds new fields to new segments in place,
-while type/analyzer changes need a [reindex](/product/functional/index-management/reindex.md).
+The definition is versioned with the index. A segment's Tantivy schema is fixed at build time, so a
+schema change is applied by [reindex](/product/functional/index-management/reindex.md): adding or
+removing a mapped field, or changing a field's type/analyzer/`fast`/`cached`/`indexed`, all rebuild.
+Only metadata (rename, `sensitive`, `max_bytes`) is in place — see
+[alter](/product/functional/index-management/alter.md). New keys *within* a VARIANT field are the
+exception: they flatten into the existing variant index with no schema change.
