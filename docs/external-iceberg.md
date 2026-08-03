@@ -130,9 +130,7 @@ These are constraints of the current engine. Plan around them:
 - REST catalogs only. The engine builds an Iceberg `RestCatalog`; AWS Glue, Hadoop, and non-REST
   Nessie modes are not supported for the query/hydration side. (The Spark connector can read other
   catalog types, but hydration needs REST, so the end-to-end loop requires a REST catalog.)
-- Static S3 keys only. The engine authenticates to S3 with a static access key plus secret key. There
-  is no IAM instance-role, STS, or assume-role support on the engine side, so supply
-  `GROWLERDB_S3_ACCESS_KEY`/`SECRET_KEY`.
+- Static S3 keys only. The engine currently authenticates to S3 using a static access key and secret key. While native support for IAM instance profiles, STS, and Kubernetes service accounts is planned for an upcoming release, you must supply static credentials for now using `GROWLERDB_S3_ACCESS_KEY` and `GROWLERDB_S3_SECRET_KEY`.
 - Path-style S3 access is forced on by the engine. It is required for MinIO and still works with
   AWS S3 today; strict virtual-hosted-only setups aren't supported.
 - Rotate the secrets. `GROWLERDB_SERVICE_TOKEN` (mesh auth) and `GROWLERDB_AUTH_SECRET` (gateway
