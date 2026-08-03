@@ -275,6 +275,14 @@ impl IndexRoute {
 pub trait RouteResolver: Send + Sync {
     /// Resolve `index` into its route, or `Ok(None)` if no such index is registered.
     async fn resolve(&self, index: &str) -> Result<Option<Arc<IndexRoute>>, String>;
+
+    /// The control-plane endpoint this resolver is backed by, if any. Lets the gateway forward a
+    /// **multi-shard** admin op (a coordinated reindex) to the control plane, which orchestrates the
+    /// build-all → cut-over across shards. `None` for a static/non-CP resolver, so a multi-shard
+    /// admin op over such a gateway stays `Unimplemented`.
+    fn control_plane(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// The Gateway's hot-swappable routing: one [`Node`] per shard + the [`ShardRouter`] that places
@@ -2011,11 +2019,31 @@ impl Gateway {
             .await?;
         let rs = route.routing();
         if rs.shards.len() != 1 {
-            return Err(Status::unimplemented(format!(
-                "reindex over a {}-shard gateway is not supported; reindex each shard's Node \
-                 directly (distributed reindex orchestration is future work)",
-                rs.shards.len()
-            )));
+            // Multi-shard: forward to the control plane's coordinated reindex (build every shard's
+            // next generation, then cut over atomically). Needs a CP-backed resolver; a static
+            // multi-shard gateway (no CP) still can't orchestrate it.
+            let Some(cp) = self.resolver.as_ref().and_then(|r| r.control_plane()) else {
+                return Err(Status::unimplemented(format!(
+                    "reindex over a {}-shard gateway without a control plane is not supported",
+                    rs.shards.len()
+                )));
+            };
+            let token = growlerdb_proto::service_token::service_token_from_env();
+            let mut client = growlerdb_proto::service_token::connect(cp, None, token.as_deref())
+                .await
+                .map_err(|e| {
+                    Status::unavailable(format!("connecting to control plane `{cp}`: {e}"))
+                })?;
+            let resp = client
+                .reindex_index(growlerdb_proto::v1::ReindexControlRequest { index })
+                .await?
+                .into_inner();
+            // Map the coordinated result onto the node reindex response: doc_count is the total
+            // across shards; `snapshot` carries the new routing generation (the cutover marker).
+            return Ok(Response::new(ReindexIndexResponse {
+                doc_count: resp.doc_count,
+                snapshot: resp.generation,
+            }));
         }
         rs.shards[0].reindex_index(req).await
     }

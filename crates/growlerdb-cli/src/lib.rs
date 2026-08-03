@@ -4913,6 +4913,10 @@ struct CpRouteResolver {
 
 #[tonic::async_trait]
 impl growlerdb_engine::RouteResolver for CpRouteResolver {
+    fn control_plane(&self) -> Option<&str> {
+        Some(&self.cp)
+    }
+
     async fn resolve(
         &self,
         index: &str,
