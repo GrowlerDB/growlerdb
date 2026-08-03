@@ -219,6 +219,23 @@ impl Engine {
                 .default_definition(table, name, &source_schema)?
                 .resolve(&source_schema)?,
         };
+        self.index_shard_with(resolved, table, shards, shard_ordinal)
+            .await
+    }
+
+    /// Build (or rebuild) a shard from `table` using an **already-resolved** definition — the CP
+    /// registry's authoritative definition on a cluster boot (`growlerdb index --control-plane`),
+    /// rather than one re-derived from the source. Shares [`index_shard`](Self::index_shard)'s body:
+    /// wipe+reindex on a schema change, persist `index.json`, then build the shard's ordinal slice.
+    /// Loading the registry definition here (not a stale local one) is what lets a node boot after a
+    /// durable alter without a `SchemaChanged` against the reindexed on-disk segments.
+    pub async fn index_shard_with(
+        &self,
+        resolved: ResolvedIndex,
+        table: &str,
+        shards: u32,
+        shard_ordinal: u32,
+    ) -> Result<IndexOutcome, EngineError> {
         let index_name = resolved.name.clone();
 
         // A full build: if a persisted index for this name has a *different* derived schema, reopening
@@ -275,6 +292,10 @@ impl Engine {
                 doc_count: 0,
             });
         }
+        // A pool node building a unit on (re)assignment may hold on-disk segments from an earlier
+        // definition (e.g. this def is the CP's post-alter one); wipe+reindex on a schema change so
+        // `create_shard` never opens the stale segments at a mismatched schema (SchemaChanged).
+        self.reindex_on_schema_change(&resolved.name, resolved)?;
         let reader = IcebergReader::connect(&self.iceberg).await?;
         let (snapshot, doc_count) = self
             .build_from_source(&reader, table, resolved, None)
@@ -815,6 +836,16 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Persist a **CP-authoritative** resolved definition to `index.json` without building — how a
+    /// pool node's `--define-only --control-plane` writes the registry definition on boot (a durable
+    /// alter's post-change def) instead of one re-derived from the source, so its later
+    /// build-on-assignment / `serve` opens the on-disk index at the definition the reindexed segments
+    /// were built with. Reconciles a schema change first (wipe stale segments) for the same reason.
+    pub fn adopt_resolved_definition(&self, resolved: &ResolvedIndex) -> Result<(), EngineError> {
+        self.reindex_on_schema_change(&resolved.name, resolved)?;
+        self.persist_definition(&resolved.name, resolved)
     }
 
     /// Persist a resolved definition so `search` can reopen the shard later.

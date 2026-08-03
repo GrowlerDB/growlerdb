@@ -145,6 +145,41 @@ async fn connect_cp(
     }
 }
 
+/// Load an index's **authoritative resolved definition** from the control-plane registry — the boot
+/// source of truth in cluster mode (the definition a durable alter last committed, tracked by the
+/// registry's `definition_version`). `Ok(None)` when the control plane doesn't have the index yet
+/// (first boot: NOT_FOUND) or the registry row predates `definition_json` — the caller then keeps its
+/// local / re-derived def. `Err` only on a real connection failure, so a misconfigured endpoint
+/// surfaces loudly rather than silently booting a stale definition.
+async fn fetch_cp_definition(
+    cp: &str,
+    name: &str,
+) -> anyhow::Result<Option<growlerdb_core::ResolvedIndex>> {
+    use growlerdb_proto::v1::GetIndexRequest;
+    let mut client = connect_cp(cp, false).await?;
+    let resp = match client
+        .get_index(GetIndexRequest {
+            name: name.to_string(),
+        })
+        .await
+    {
+        Ok(r) => r.into_inner(),
+        Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
+        Err(status) => {
+            return Err(anyhow::anyhow!(
+                "GetIndex(`{name}`) from control plane `{cp}`: {status}"
+            ))
+        }
+    };
+    if resp.definition_json.is_empty() {
+        return Ok(None); // legacy registry row written before definition_json existed
+    }
+    let resolved = serde_json::from_str(&resp.definition_json).map_err(|e| {
+        anyhow::anyhow!("control plane returned an unparseable definition for `{name}`: {e}")
+    })?;
+    Ok(Some(resolved))
+}
+
 #[derive(Parser)]
 #[command(
     name = "growlerdb",
@@ -200,6 +235,13 @@ enum Command {
         /// and defeats control-plane placement). Ignores `--shards`/`--shard-ordinal`.
         #[arg(long, default_value_t = false)]
         define_only: bool,
+        /// Control-plane `host:port`. On a cluster boot, load the index's **authoritative
+        /// definition** from the registry (the definition a durable alter last committed) instead of
+        /// re-deriving from the source — so the on-disk index opens/builds at the right schema and a
+        /// node booting after an alter doesn't hit SchemaChanged. Falls back to the local/derived def
+        /// when the control plane doesn't have the index yet (first boot). Requires `--name`.
+        #[arg(long)]
+        control_plane: Option<String>,
     },
     /// Search an index and print ranked document coordinates.
     Search {
@@ -919,7 +961,39 @@ pub async fn run() -> anyhow::Result<()> {
             shards,
             shard_ordinal,
             define_only,
+            control_plane,
         } => {
+            // Cluster boot: prefer the control plane's authoritative definition (the def a durable
+            // alter last committed) over a locally re-derived one, so the on-disk index opens/builds
+            // at the schema its reindexed segments were built with. `None` (first boot / not
+            // registered / no --control-plane) falls back to the re-derive path below.
+            let cp_def = match (control_plane.as_deref(), name.as_deref()) {
+                (Some(cp), Some(n)) => fetch_cp_definition(cp, n).await?,
+                _ => None,
+            };
+            if let Some(resolved) = cp_def {
+                let index_name = resolved.name.clone();
+                if define_only {
+                    engine.adopt_resolved_definition(&resolved)?;
+                    println!(
+                        "defined `{index_name}` from the control-plane definition: index.json written, no shards built"
+                    );
+                } else {
+                    let outcome = engine
+                        .index_shard_with(resolved, &table, shards, shard_ordinal)
+                        .await?;
+                    let scope = if shards > 1 {
+                        format!(" (shard {shard_ordinal}/{shards})")
+                    } else {
+                        String::new()
+                    };
+                    println!(
+                        "indexed `{}`{} from the control-plane definition: {} documents at snapshot {}",
+                        outcome.name, scope, outcome.doc_count, outcome.snapshot.0
+                    );
+                }
+                return Ok(());
+            }
             let def_yaml = def.map(std::fs::read_to_string).transpose()?;
             if define_only {
                 let outcome = engine

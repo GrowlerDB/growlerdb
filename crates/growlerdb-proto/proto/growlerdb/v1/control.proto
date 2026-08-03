@@ -245,6 +245,12 @@ message GetIndexResponse {
   // Definition version. Bumped when an in-place alter updates the definition, so nodes observe the
   // change and reload their served definition. 0 for a never-altered index.
   uint64 definition_version = 10;
+  // The registry's **full resolved definition** (serde JSON of `ResolvedIndex`) — the cluster's
+  // authoritative index definition. A node loads this on boot (in cluster mode) instead of a stale
+  // local `index.json` / re-derived def, so it opens/builds the on-disk index at the definition a
+  // durable alter last committed (matching the reindexed segments) rather than hitting SchemaChanged.
+  // Empty only for a legacy registry row written before this field existed.
+  string definition_json = 11;
 }
 
 // One bucket's reassignment in a reshard plan: which shard a bucket moves from/to.

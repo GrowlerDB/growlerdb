@@ -24,8 +24,18 @@ source of truth, not a node's local copy. A reindex-requiring apply then runs a 
 shard, cutting over atomically to the new-schema generation; the response reports `applied`,
 `reindex_triggered`, and the new `generation`.
 
+## Boot-time definition reload
+
+A node that boots after a durable alter **loads the registry's definition from the control plane**
+rather than rebuilding from a stale local `index.json` (or one re-derived from the source). `GetIndex`
+carries the authoritative resolved definition (`definition_json`, tracked by `definition_version`), and
+in cluster mode the boot build step (`growlerdb index --control-plane` / `--define-only
+--control-plane`) uses it — so the on-disk index opens/builds at the schema its reindexed segments were
+built with, instead of hitting `SchemaChanged` against the altered on-disk index. `serve` /
+`serve-pool` then read that CP-authoritative `index.json`. On first boot (the index isn't registered
+yet) it falls back to the local / re-derived definition and registers it. This closes cross-restart
+durability for a durable alter across the sharded and placement-pool boot paths.
+
 ## Notes
 
-Schema-evolution rules live in the [data model](/system/storage/data-model.md). A node that boots
-after a durable alter must reload the new definition from the registry (`definition_version`) rather
-than rebuild from a stale local definition — a follow-up for full cross-restart durability.
+Schema-evolution rules live in the [data model](/system/storage/data-model.md).
