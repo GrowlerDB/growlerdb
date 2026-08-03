@@ -256,6 +256,15 @@ enum Command {
         /// Control-plane `host:port`.
         #[arg(long)]
         control_plane: String,
+        /// Start the job and return its id immediately instead of streaming progress to completion.
+        /// Poll it later with `growlerdb jobs get <id>` or cancel with `growlerdb jobs cancel <id>`.
+        #[arg(long)]
+        detach: bool,
+    },
+    /// Inspect and control async reindex jobs on the control plane.
+    Jobs {
+        #[command(subcommand)]
+        action: JobAction,
     },
     /// Back up an index's shard to object storage (S3/MinIO) for restore on node loss.
     /// Reads credentials from `GROWLERDB_S3_*` and the bucket from `GROWLERDB_BACKUP_BUCKET`.
@@ -584,30 +593,176 @@ enum Command {
     },
 }
 
+/// `growlerdb jobs …` — inspect and control async reindex jobs on the control plane.
+#[derive(Subcommand)]
+enum JobAction {
+    /// List reindex jobs, newest first.
+    List {
+        /// Control-plane `host:port`.
+        #[arg(long)]
+        control_plane: String,
+    },
+    /// Show one job's status (per-shard phase + progress).
+    Get {
+        /// Job id (from `growlerdb reindex --detach` or `jobs list`).
+        id: String,
+        /// Control-plane `host:port`.
+        #[arg(long)]
+        control_plane: String,
+    },
+    /// Request cancellation of a running job (staged generations are discarded; the old generation
+    /// stays live).
+    Cancel {
+        /// Job id.
+        id: String,
+        /// Control-plane `host:port`.
+        #[arg(long)]
+        control_plane: String,
+    },
+}
+
 /// Cluster reconcile backstop: fetch the index's shard map + bucket owners from the
 /// control plane, then fan a **shard-scoped** `ReconcileIndex` out to each shard's primary node —
 /// each node compares only the keys it owns (via the same bucket map the gateway/connector route by),
 /// so a reconcile can't pull another shard's keys into it. Prints per-shard drift + a total. Any
 /// unreachable shard, missing primary, or shard-level error makes the whole run exit non-zero, so a
 /// scheduled CronJob surfaces the failure instead of silently skipping a shard.
-/// Coordinated online reindex of a (multi-shard) index: dial the control plane's `ReindexIndex`,
-/// which builds every shard's next generation from source, then cuts over atomically. A build
-/// failure aborts before any cutover (the old generation stays live). The server-side orchestration
-/// owns the atomic generation cutover, so — unlike the client-fanned reconcile — this is one RPC.
-async fn reindex_cluster(control_plane: &str, index: &str) -> anyhow::Result<()> {
-    use growlerdb_proto::v1::ReindexControlRequest;
+/// Coordinated online reindex of a (multi-shard) index over the control plane's **async job** API:
+/// `StartReindexJob` returns immediately, and the driver builds every shard's next generation from
+/// source, then cuts over atomically (a build failure aborts before any cutover — the old generation
+/// stays live). By default this streams per-shard progress to the terminal until the job finishes;
+/// `--detach` starts it and prints the job id to poll later.
+async fn reindex_cluster(control_plane: &str, index: &str, detach: bool) -> anyhow::Result<()> {
+    use growlerdb_proto::v1::{GetReindexJobRequest, StartReindexJobRequest};
     let mut cp = connect_cp(control_plane, false).await?;
-    let resp = cp
-        .reindex_index(ReindexControlRequest {
+    let started = cp
+        .start_reindex_job(StartReindexJobRequest {
             index: index.to_string(),
         })
         .await
-        .map_err(|e| anyhow::anyhow!("ReindexIndex(`{index}`): {e}"))?
+        .map_err(|e| anyhow::anyhow!("StartReindexJob(`{index}`): {e}"))?
         .into_inner();
-    println!(
-        "reindexed `{index}`: {} shard(s) rebuilt and cut over, generation {}, {} document(s)",
-        resp.shards, resp.generation, resp.doc_count
-    );
+    let job_id = started.job_id;
+
+    if detach {
+        println!(
+            "started reindex job `{job_id}` for `{index}` (poll: growlerdb jobs get {job_id})"
+        );
+        return Ok(());
+    }
+
+    // Stream progress: poll the job until it reaches a terminal state.
+    let mut last_line = String::new();
+    loop {
+        let job = cp
+            .get_reindex_job(GetReindexJobRequest {
+                job_id: job_id.clone(),
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("GetReindexJob(`{job_id}`): {e}"))?
+            .into_inner();
+        // Print a status line only when it changes, so a fast rebuild doesn't spam the terminal.
+        let line = format!(
+            "  {} — {}/{} shards, {}/{} docs",
+            job.state,
+            job.shards
+                .iter()
+                .filter(|s| s.phase == "promoted" || s.phase == "built")
+                .count(),
+            job.shards.len(),
+            job.docs_done,
+            job.docs_total
+        );
+        if line != last_line {
+            println!("{line}");
+            last_line = line;
+        }
+        match job.state.as_str() {
+            "done" => {
+                println!(
+                    "reindexed `{index}`: {} shard(s) cut over, generation {}, {} document(s)",
+                    job.shards.len(),
+                    job.generation,
+                    job.docs_done
+                );
+                return Ok(());
+            }
+            "failed" => {
+                anyhow::bail!("reindex of `{index}` failed: {}", job.error);
+            }
+            "canceled" => {
+                anyhow::bail!("reindex of `{index}` was canceled: {}", job.error);
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
+        }
+    }
+}
+
+/// `growlerdb jobs …`: list / poll / cancel async reindex jobs over the control plane.
+async fn jobs_cmd(action: JobAction) -> anyhow::Result<()> {
+    use growlerdb_proto::v1::{
+        CancelReindexJobRequest, GetReindexJobRequest, ListReindexJobsRequest, ReindexJobStatus,
+    };
+
+    /// One-line human summary of a job.
+    fn summarize(job: &ReindexJobStatus) {
+        println!(
+            "{}  {}  {}  {}/{} docs  gen {}{}",
+            job.id,
+            job.index,
+            job.state,
+            job.docs_done,
+            job.docs_total,
+            job.generation,
+            if job.error.is_empty() {
+                String::new()
+            } else {
+                format!("  ({})", job.error)
+            }
+        );
+    }
+
+    match action {
+        JobAction::List { control_plane } => {
+            let mut cp = connect_cp(&control_plane, false).await?;
+            let jobs = cp
+                .list_reindex_jobs(ListReindexJobsRequest {})
+                .await
+                .map_err(|e| anyhow::anyhow!("ListReindexJobs: {e}"))?
+                .into_inner()
+                .jobs;
+            if jobs.is_empty() {
+                println!("no reindex jobs");
+            }
+            for job in &jobs {
+                summarize(job);
+            }
+        }
+        JobAction::Get { id, control_plane } => {
+            let mut cp = connect_cp(&control_plane, false).await?;
+            let job = cp
+                .get_reindex_job(GetReindexJobRequest { job_id: id.clone() })
+                .await
+                .map_err(|e| anyhow::anyhow!("GetReindexJob(`{id}`): {e}"))?
+                .into_inner();
+            summarize(&job);
+            for s in &job.shards {
+                println!(
+                    "  shard {} @ {} — {} ({}/{} docs)",
+                    s.ordinal, s.node, s.phase, s.docs_done, s.docs_total
+                );
+            }
+        }
+        JobAction::Cancel { id, control_plane } => {
+            let mut cp = connect_cp(&control_plane, false).await?;
+            let job = cp
+                .cancel_reindex_job(CancelReindexJobRequest { job_id: id.clone() })
+                .await
+                .map_err(|e| anyhow::anyhow!("CancelReindexJob(`{id}`): {e}"))?
+                .into_inner();
+            println!("cancel requested for job `{}` ({})", job.id, job.state);
+        }
+    }
     Ok(())
 }
 
@@ -852,8 +1007,12 @@ pub async fn run() -> anyhow::Result<()> {
         Command::Reindex {
             index,
             control_plane,
+            detach,
         } => {
-            reindex_cluster(&control_plane, &index).await?;
+            reindex_cluster(&control_plane, &index, detach).await?;
+        }
+        Command::Jobs { action } => {
+            jobs_cmd(action).await?;
         }
         Command::Backup { index, prefix } => {
             backup_cmd(&cli.data_dir, &index, prefix.as_deref()).await?;
