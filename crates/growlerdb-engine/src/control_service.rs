@@ -772,6 +772,9 @@ async fn reindex_shard_on_node(
             index: index.to_string(),
             bucket_owners: owners.to_vec(),
             shard_ordinal: ordinal,
+            // The reshard data step uses the one-shot node reindex (fence + build + promote in a
+            // single call); the phased BUILD/PROMOTE flow is for a coordinated whole-index reindex.
+            ..Default::default()
         })
         .await?;
     Ok(())

@@ -117,11 +117,28 @@ message ReindexIndexRequest {
   // ordinal in the new layout. Empty `bucket_owners` ⇒ a normal full reindex (every doc kept).
   repeated uint32 bucket_owners = 2;
   uint32 shard_ordinal = 3;
+  // Phase of a coordinated reindex. FULL (default) is the one-shot node path — fence + build +
+  // promote in a single call — used by single-shard/embedded reindex. The control plane drives a
+  // MULTI-shard reindex in phases so it can build EVERY shard's next generation before cutting over
+  // any (so a build failure never half-swaps the index): BUILD engages the write-fence and builds
+  // the staged generation, leaving it fenced but NOT promoted; PROMOTE cuts the staged generation
+  // over and releases the fence; DISCARD drops the staged generation and releases the fence (abort).
+  // The fence is held across BUILD..PROMOTE so writes can't advance the shard past the build
+  // snapshot (which the swap would otherwise drop).
+  ReindexPhase phase = 4;
+}
+
+// Phase of a node reindex — see `ReindexIndexRequest.phase`.
+enum ReindexPhase {
+  REINDEX_PHASE_FULL = 0;     // one-shot: build + promote in a single fenced call (default)
+  REINDEX_PHASE_BUILD = 1;    // engage the fence + build the staged generation, leave it fenced
+  REINDEX_PHASE_PROMOTE = 2;  // cut the staged generation over, release the fence
+  REINDEX_PHASE_DISCARD = 3;  // discard the staged generation, release the fence (abort)
 }
 
 message ReindexIndexResponse {
-  uint64 doc_count = 1;   // documents in the rebuilt index
-  uint64 snapshot = 2;    // the rebuilt index's commit snapshot
+  uint64 doc_count = 1;   // documents in the rebuilt index (0 for DISCARD)
+  uint64 snapshot = 2;    // the rebuilt index's commit snapshot (the build snapshot for BUILD)
 }
 
 // Reconcile the served shard against the source's current snapshot: the drift backstop that both
