@@ -9,8 +9,19 @@ build.
 
 ## Install
 
-No package index yet — vendor the `growlerdb/` directory, or add this folder to your
-`PYTHONPATH`.
+```sh
+pip install growlerdb
+```
+
+Not on PyPI yet? Until it lands there, install the wheel attached to the
+[latest GitHub Release](https://github.com/GrowlerDB/growlerdb/releases/latest) directly:
+
+```sh
+pip install https://github.com/GrowlerDB/growlerdb/releases/latest/download/growlerdb-0.1.0-py3-none-any.whl
+```
+
+Or, for local development, install this directory in editable mode (`pip install -e clients/python`).
+The client is pure-Python and dependency-free, so there is nothing to compile.
 
 ## Usage
 

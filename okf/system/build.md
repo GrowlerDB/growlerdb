@@ -40,6 +40,14 @@ required so the local embedder links its native ONNX Runtime (`ort`) the same wa
 `cross` container's older glibc can't, so the **binaries require glibc 2.38+** at runtime (the ONNX
 prebuilt's floor, same as the image).
 
+**Integration artifacts** ship in the same release so a consumer never has to clone + build: the
+**JVM connector fat jars** (Spark + Trino, version-stamped, with checksums) and the **Python client**
+wheel + sdist are attached to the GitHub Release, a **pre-configured Spark connector image**
+(`ghcr.io/growlerdb/growlerdb-connector`, the fat jar baked in) is pushed with released tags, and the
+Python client optionally publishes to **PyPI** via Trusted Publishing (OIDC) when the `PUBLISH_PYPI`
+repo variable is set. The Python client and the JVM connectors carry their **own** versions
+independent of the tag-derived engine version.
+
 **Versioning** is **tag-derived** ([D29](/system/decisions/d29-release-versioning.md)): the git tag
 is the source of truth, stamped into the image, the chart `appVersion`, the binaries, and the CLI
 `--version` at build time, while the tree stays `0.0.0`. A dispatch computes the next version

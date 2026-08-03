@@ -37,24 +37,31 @@ ORDER BY m.growlerdb_score DESC;
 
 ## Requirements
 
-- **Trino 470** (`trino-spi` 470).
-- **JDK 23** (`maven.compiler.release=23`; pinned via `mise` — see `mise.toml`). Trino 470 runs on
-  Java 23+, so this connector is built and loaded against that runtime — a newer line than the Spark
-  connector's JDK 21.
+- **Trino 483** (`trino-spi` 483).
+- **JDK 25** (`maven.compiler.release=25`; pinned via `mise` — see `mise.toml`). Trino 483's SPI is
+  compiled for Java 25, so this connector is built and loaded against that runtime — a newer line
+  than the Spark connector's JDK 21.
 - A reachable **GrowlerDB read endpoint** (a `growlerdb gateway` gRPC address).
 
-## Build
+## Get the jar (no build)
+
+Download the fat jar attached to a [GitHub Release](https://github.com/GrowlerDB/growlerdb/releases/latest)
+(`growlerdb-trino-connector-<version>.jar`, with a `.sha256`) — a single self-contained plugin jar,
+no host-side Java/Maven build.
+
+## Build (from source)
 
 ```sh
 cd connector-trino
-mise install                 # JDK 23 + Maven
-mise exec -- mvn -q package   # → target/growlerdb-trino-connector-<version>.jar
+mise install                 # JDK 25 + Maven
+mise exec -- mvn -q package   # → target/growlerdb-trino-connector-<version>.jar (fat jar)
 ```
 
 ## Install into Trino
 
-1. Create a plugin directory `plugin/growlerdb/` in your Trino install and copy the built jar (and its
-   runtime dependencies) into it — the standard Trino plugin layout.
+1. Create a plugin directory `plugin/growlerdb/` in your Trino install and copy the fat jar into it —
+   the standard Trino plugin layout. The jar bundles its gRPC runtime, so no other dependency jars
+   are needed.
 2. Add a catalog file `etc/catalog/growlerdb.properties` with just:
 
    ```properties

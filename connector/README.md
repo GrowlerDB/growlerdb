@@ -35,7 +35,17 @@ cluster.
 - **Spark 4.1** (`4.1.3`) + **Iceberg 1.11** (`1.11.0`, `iceberg-spark-runtime-4.1_2.13`) — `provided` (supplied by `spark-submit`). The Iceberg spark-runtime jar is coupled to the Spark **minor** line; the pom's `spark.compat.version` tracks it.
 - **gRPC-Java** stubs generated from the shared `growlerdb.v1` protos in [`crates/growlerdb-proto/proto/`](../crates/growlerdb-proto/proto/growlerdb/v1) — single source of truth with the Rust server.
 
-## Build
+## Get the jar (no build)
+
+You do not need Java/Maven on your host to run the connector:
+
+- **Download the fat jar** attached to a [GitHub Release](https://github.com/GrowlerDB/growlerdb/releases/latest)
+  (`growlerdb-connector-<version>.jar`, with a `.sha256`) and pass it to `spark-submit`.
+- **Or use the pre-configured image** `ghcr.io/growlerdb/growlerdb-connector:<version>` — an
+  `apache/spark` image with the fat jar baked in at `/opt/growlerdb/connector.jar`, so you
+  `spark-submit` without assembling a classpath.
+
+## Build (from source)
 
 ```sh
 cd connector

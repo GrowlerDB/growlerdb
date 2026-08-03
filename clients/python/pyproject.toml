@@ -1,0 +1,38 @@
+# Packaging manifest for the first-party Python client. Dependency-free (stdlib only),
+# so there is nothing to compile — a pure-Python wheel + sdist. The version is read from
+# growlerdb/__init__.py (__version__), which stays the client's own SemVer, independent of
+# the tag-derived engine release (see RELEASING.md).
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "growlerdb"
+dynamic = ["version"]
+description = "First-party, dependency-free Python client for the GrowlerDB Engine API."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "GrowlerDB", email = "support@growlerdb.com" }]
+keywords = ["growlerdb", "search", "retrieval", "iceberg", "full-text-search", "vector-search"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Database :: Front-Ends",
+  "Topic :: Text Processing :: Indexing",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://growlerdb.com"
+Documentation = "https://growlerdb.com/docs"
+Repository = "https://github.com/GrowlerDB/growlerdb"
+Issues = "https://github.com/GrowlerDB/growlerdb/issues"
+
+[tool.setuptools]
+packages = ["growlerdb"]
+
+[tool.setuptools.dynamic]
+version = { attr = "growlerdb.__version__" }

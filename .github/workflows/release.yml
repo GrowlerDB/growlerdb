@@ -235,21 +235,138 @@ jobs:
           name: bin-${{ matrix.target }}
           path: dist/*
 
+  # Integration artifacts: the JVM connector fat jars, so a data engineer can download a ready-to-run
+  # jar from the Release instead of cloning + building Java. Spark (JDK 21) and Trino (JDK 25) each
+  # carry their own mise toolchain. The jars are version-stamped to the release tag (`versions:set`),
+  # like the tag-derived binaries — the in-tree pom stays 0.0.0.
+  connectors:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
+      - name: Cache Maven repository
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.m2/repository
+          key: m2-release-${{ hashFiles('connector/pom.xml', 'connector-trino/pom.xml') }}
+          restore-keys: m2-
+      - name: Build the Spark connector fat jar (JDK 21)
+        working-directory: connector
+        run: |
+          mise install
+          mise exec -- mvn -B -q versions:set -DnewVersion="${VERSION}" -DgenerateBackupPoms=false
+          mise exec -- mvn -B -q -DskipTests package
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+      - name: Build the Trino connector fat jar (JDK 25)
+        working-directory: connector-trino
+        run: |
+          mise install
+          mise exec -- mvn -B -q versions:set -DnewVersion="${VERSION}" -DgenerateBackupPoms=false
+          mise exec -- mvn -B -q -DskipTests package
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+      - name: Stage + checksum the jars
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          mkdir -p dist
+          cp "connector/target/growlerdb-connector-${VERSION}.jar" dist/
+          cp "connector-trino/target/growlerdb-trino-connector-${VERSION}.jar" dist/
+          ( cd dist && for j in *.jar; do sha256sum "$j" > "$j.sha256"; done )
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: connector-jars
+          path: dist/*
+          if-no-files-found: error
+
+  # Package the pure-Python client (stdlib-only → a universal wheel + sdist). The client keeps its
+  # OWN SemVer (growlerdb/__init__.py `__version__`), independent of the tag-derived engine version
+  # (see RELEASING.md), so it is not stamped here.
+  python-client:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the wheel + sdist
+        working-directory: clients/python
+        run: |
+          python3 -m pip install --upgrade build
+          python3 -m build --outdir dist .
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-client
+          path: clients/python/dist/*
+          if-no-files-found: error
+
+  # Publish the Python client to PyPI via Trusted Publishing (OIDC, no stored token). Opt-in: set the
+  # repo variable PUBLISH_PYPI=true once the PyPI project + trusted publisher are configured (see
+  # RELEASING.md). Until then the wheel/sdist still ship as Release assets, so `pip install <url>`
+  # works. A failure here never blocks the Release (this job is not in `release`'s `needs`).
+  pypi:
+    needs: [version, python-client]
+    if: ${{ vars.PUBLISH_PYPI == 'true' }}
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # OIDC token for PyPI Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: python-client
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+
+  # A pre-configured Spark image with the connector fat jar baked in, so ingestion runs without a
+  # host-side Java/Maven build (TASK-296 AC#4). Same Dockerfile as the scale-test `:dev` image; here
+  # it gets released tags. amd64 only — Spark clusters are amd64, matching the scale image.
+  connector-image:
+    needs: version
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ghcr.io/${{ needs.version.outputs.owner_lc }}/growlerdb-connector
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build + push the connector image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: deploy/k8s/streaming/connector.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ needs.version.outputs.version }}
+            ${{ env.IMAGE }}:${{ needs.version.outputs.major }}.${{ needs.version.outputs.minor }}
+            ${{ env.IMAGE }}:${{ needs.version.outputs.major }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha,scope=connector-image
+          cache-to: type=gha,scope=connector-image,mode=max
+
   release:
-    needs: [version, merge, helm, binaries]
+    needs: [version, merge, helm, binaries, connectors, python-client]
     runs-on: ubuntu-latest
     steps:
       # Only the release assets — NOT the internal digests-* or docker/build-push-action's
-      # auto-uploaded *.dockerbuild build records (downloading those flaked the job).
+      # auto-uploaded *.dockerbuild build records (downloading those flaked the job). Binaries, the
+      # SBOM, the connector fat jars, and the Python wheel/sdist (all named `growlerdb-*`).
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
-          pattern: "{bin-*,sbom}"
+          pattern: "{bin-*,sbom,connector-jars,python-client}"
       - name: Publish the GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: v${{ needs.version.outputs.version }}
           generate_release_notes: true
+          # `growlerdb-*` covers the binaries, connector jars (growlerdb[-trino]-connector-*.jar),
+          # and the Python wheel/sdist (growlerdb-*.whl / growlerdb-*.tar.gz) plus their .sha256.
           files: |
             artifacts/**/growlerdb-*
             artifacts/**/sbom.cdx.json

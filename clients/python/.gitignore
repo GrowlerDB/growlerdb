@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+
+# Packaging build artifacts (python -m build)
+/dist/
+/build/
+*.egg-info/
