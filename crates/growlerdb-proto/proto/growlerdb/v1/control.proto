@@ -500,6 +500,16 @@ message GetLicenseResponse {
 }
 
 // Cluster-wide index lifecycle over the registry.
+// Coordinated whole-index reindex (see ControlPlane.ReindexIndex).
+message ReindexControlRequest {
+  string index = 1;
+}
+message ReindexControlResponse {
+  uint64 generation = 1;  // the index's routing generation after the atomic cutover
+  uint32 shards = 2;      // shards rebuilt and cut over
+  uint64 doc_count = 3;   // total documents across the rebuilt shards
+}
+
 service ControlPlane {
   rpc CreateIndex(CreateIndexRequest) returns (CreateIndexResponse);
   rpc DropIndex(DropIndexRequest) returns (DropIndexResponse);
@@ -519,6 +529,11 @@ service ControlPlane {
   rpc ApplyReshard(ApplyReshardRequest) returns (ApplyReshardResponse);
   // Move one bucket off a busy shard to a quieter one online — skew relief without a reshard.
   rpc MoveBucket(MoveBucketRequest) returns (MoveBucketResponse);
+  // Coordinated whole-index reindex across ALL shards: build every shard's next generation from
+  // source (unchanged bucket owners), then cut over atomically by bumping the routing generation.
+  // A build failure discards every staged generation and never cuts over (no half-swap). This is
+  // the multi-shard counterpart the single-shard node reindex can't do alone.
+  rpc ReindexIndex(ReindexControlRequest) returns (ReindexControlResponse);
   // Source-schema introspection for the create-index form.
   rpc DescribeSource(DescribeSourceRequest) returns (DescribeSourceResponse);
   // A serving node self-registers its locally-built index + shard assignment.

@@ -25,7 +25,8 @@ use growlerdb_proto::v1::{
     ListUsersRequest, ListUsersResponse, LoginRequest, LoginResponse, MoveBucketRequest,
     MoveBucketResponse, NodeAssignments, PlanReshardRequest, PlanReshardResponse,
     RegisterNodeRequest, RegisterNodeResponse, RegisterServedIndexRequest,
-    RegisterServedIndexResponse, ReindexIndexRequest, ResolveUnitOwnerRequest,
+    RegisterServedIndexResponse, ReindexControlRequest, ReindexControlResponse,
+    ReindexIndexRequest, ReindexIndexResponse, ReindexPhase, ResolveUnitOwnerRequest,
     ResolveUnitOwnerResponse, RevokeTokenRequest, RevokeTokenResponse, RoleBinding,
     RoutingStrategy as WireRouting, SaveSavedQueryRequest, SaveSavedQueryResponse,
     SavedQuery as WireSavedQuery, SetAliasRequest, SetAliasResponse, SetUserRolesRequest,
@@ -761,23 +762,23 @@ async fn reindex_shard_on_node(
     index: &str,
     owners: &[u32],
     ordinal: u32,
-) -> Result<(), Status> {
+    phase: ReindexPhase,
+) -> Result<ReindexIndexResponse, Status> {
     // Mesh dial: stamp the shared service token (env) — the node's data plane enforces it.
     let (channel, stamp) = growlerdb_proto::service_token::node_channel(endpoint.to_string())
         .await
         .map_err(|e| Status::unavailable(format!("connecting to node `{endpoint}`: {e}")))?;
     let mut client = AdminClient::with_interceptor(channel, stamp);
-    client
+    let resp = client
         .reindex_index(ReindexIndexRequest {
             index: index.to_string(),
             bucket_owners: owners.to_vec(),
             shard_ordinal: ordinal,
-            // The reshard data step uses the one-shot node reindex (fence + build + promote in a
-            // single call); the phased BUILD/PROMOTE flow is for a coordinated whole-index reindex.
-            ..Default::default()
+            phase: phase as i32,
         })
-        .await?;
-    Ok(())
+        .await?
+        .into_inner();
+    Ok(resp)
 }
 
 #[tonic::async_trait]
@@ -944,7 +945,9 @@ impl ControlPlane for ControlPlaneService {
         // 2. Build the new shards from source (filtered) BEFORE the cutover — the old shards are
         //    untouched and still complete, so reads via the current map never miss.
         for (ord, endpoint) in &growth.build {
-            reindex_shard_on_node(endpoint, &req.index, &owners, *ord).await?;
+            // Reshard uses the one-shot node reindex (fence + build + promote in one call); the
+            // phased flow is for a coordinated whole-index reindex (ControlPlane::reindex_index).
+            reindex_shard_on_node(endpoint, &req.index, &owners, *ord, ReindexPhase::Full).await?;
         }
 
         // 3. Cutover: commit the new bucket map atomically — compare-and-swap against the map
@@ -959,8 +962,10 @@ impl ControlPlane for ControlPlaneService {
         //    only reclaims space). Safe post-cutover: those buckets no longer route to old shards.
         let mut trimmed = Vec::new();
         for (ord, endpoint) in &growth.trim {
-            match reindex_shard_on_node(endpoint, &req.index, &owners, *ord).await {
-                Ok(()) => trimmed.push(*ord),
+            match reindex_shard_on_node(endpoint, &req.index, &owners, *ord, ReindexPhase::Full)
+                .await
+            {
+                Ok(_) => trimmed.push(*ord),
                 Err(e) => tracing::warn!(
                     index = %req.index,
                     shard = ord,
@@ -992,6 +997,139 @@ impl ControlPlane for ControlPlaneService {
                 .collect(),
             built_shards: growth.build.iter().map(|(o, _)| *o).collect(),
             trimmed_shards: trimmed,
+        }))
+    }
+
+    async fn reindex_index(
+        &self,
+        request: Request<ReindexControlRequest>,
+    ) -> Result<Response<ReindexControlResponse>, Status> {
+        self.gate("ReindexIndex", &request)?;
+        let index = request.into_inner().index;
+
+        // Windowed indexes route by event-time, not bucket owners, so the per-shard bucket-owner
+        // filter can't rebuild them — out of scope here (a dedicated windowed reindex is future work).
+        let entry = self
+            .registry
+            .get(&index)
+            .ok_or_else(|| registry_status(RegistryError::NotFound(index.clone())))?;
+        if windowing_config(&entry.definition).is_some() {
+            return Err(Status::unimplemented(
+                "reindex of a windowed index is not yet supported (event-time windows, not buckets)",
+            ));
+        }
+
+        let shard_map = self
+            .registry
+            .shard_map(&index)
+            .ok_or_else(|| registry_status(RegistryError::NotFound(index.clone())))?;
+        if shard_map.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "index `{index}` has no assigned shards to reindex"
+            )));
+        }
+        let current_gen = entry.generation;
+        // Pass the CURRENT bucket owners so each shard keeps exactly the docs it already owns (an
+        // identity filter — no topology change). Empty ⇒ legacy single-shard, filter is a no-op.
+        let owners = self
+            .registry
+            .bucket_map(&index)
+            .map(|m| m.owners().to_vec())
+            .unwrap_or_default();
+
+        // Resolve every shard's primary endpoint (ordinal → node).
+        let mut shards: Vec<(u32, String)> = Vec::with_capacity(shard_map.len());
+        for (ord, assignment) in &shard_map {
+            let endpoint = assignment
+                .primary
+                .as_ref()
+                .map(|n| n.0.clone())
+                .filter(|e| !e.is_empty())
+                .ok_or_else(|| {
+                    Status::failed_precondition(format!(
+                        "shard {ord} of `{index}` has no primary; cannot reindex"
+                    ))
+                })?;
+            shards.push((*ord, endpoint));
+        }
+
+        // Phase 1 — BUILD every shard's next generation from source (staged, fenced, NOT promoted).
+        // The live generation keeps serving throughout.
+        let mut built: Vec<(u32, String)> = Vec::new();
+        let mut build_err: Option<Status> = None;
+        for (ord, endpoint) in &shards {
+            match reindex_shard_on_node(endpoint, &index, &owners, *ord, ReindexPhase::Build).await
+            {
+                Ok(_) => built.push((*ord, endpoint.clone())),
+                Err(e) => {
+                    build_err = Some(e);
+                    break;
+                }
+            }
+        }
+        // Any build failure ⇒ DISCARD every staged generation (releasing its held fence) and abort.
+        // No shard was promoted, so the old generation is intact everywhere — never a half-swap.
+        if let Some(e) = build_err {
+            for (ord, endpoint) in &built {
+                if let Err(de) =
+                    reindex_shard_on_node(endpoint, &index, &owners, *ord, ReindexPhase::Discard)
+                        .await
+                {
+                    tracing::warn!(index = %index, shard = ord, error = %de,
+                        "reindex: discard after a failed build failed — that shard's write-fence may need a manual clear");
+                }
+            }
+            return Err(Status::internal(format!(
+                "reindex of `{index}` aborted during build (no cutover; old generation intact): {e}"
+            )));
+        }
+
+        // Phase 2 — PROMOTE every shard: brief per-shard fence-drain + atomic swap, releasing the
+        // fence. Builds all succeeded, so this is fast; the promote window across shards is bounded.
+        let mut doc_count = 0u64;
+        for (i, (ord, endpoint)) in shards.iter().enumerate() {
+            match reindex_shard_on_node(endpoint, &index, &owners, *ord, ReindexPhase::Promote)
+                .await
+            {
+                Ok(resp) => doc_count += resp.doc_count,
+                Err(e) => {
+                    // Rare promote-phase partial failure: release the fences on the shards not yet
+                    // promoted (discard their staged gen) so the op is retryable. Already-promoted
+                    // shards keep the new generation — the index is mixed-generation but every shard
+                    // still serves valid data, and a retry converges. (The common BUILD-phase
+                    // failure never reaches here, so it never half-swaps.)
+                    for (o, ep) in &shards[i..] {
+                        let _ =
+                            reindex_shard_on_node(ep, &index, &owners, *o, ReindexPhase::Discard)
+                                .await;
+                    }
+                    return Err(Status::internal(format!(
+                        "reindex of `{index}` failed promoting shard {ord} after {i}/{} shards; \
+                         discarded the rest (index is queryable, mixed-generation; retry to converge): {e}",
+                        shards.len()
+                    )));
+                }
+            }
+        }
+
+        // Phase 3 — atomic cutover marker: bump the routing generation (compare-and-swap against the
+        // generation we planned from, so a concurrent reindex/reshard is a loud PLACEMENT_CONFLICT).
+        // Gateways converge to the new generation on their next GetIndex poll.
+        let generation = self
+            .registry
+            .set_generation(&index, current_gen, current_gen + 1)
+            .map_err(registry_status)?;
+
+        self.registry.record_activity(
+            &index,
+            "reindex",
+            format!("reindexed {} shards", shards.len()),
+        );
+
+        Ok(Response::new(ReindexControlResponse {
+            generation,
+            shards: shards.len() as u32,
+            doc_count,
         }))
     }
 
@@ -1043,14 +1181,28 @@ impl ControlPlane for ControlPlaneService {
 
         // 1. Build the target shard to **include** the bucket — the source shard is untouched and
         //    still serves it, so reads never miss; the brief overlap is deduped by the Gateway.
-        reindex_shard_on_node(&to_endpoint, &req.index, &owners, req.to_shard).await?;
+        reindex_shard_on_node(
+            &to_endpoint,
+            &req.index,
+            &owners,
+            req.to_shard,
+            ReindexPhase::Full,
+        )
+        .await?;
         // 2. Cutover: commit the relocated map — CAS against the map this move was planned from
         //    (see apply_reshard), so a reshard finishing mid-move can't be silently reverted.
         self.registry
             .set_bucket_map(&req.index, Some(&map), &new_map)
             .map_err(registry_status)?;
         // 3. Trim the source shard (best-effort) — it no longer owns the bucket.
-        if let Err(e) = reindex_shard_on_node(&from_endpoint, &req.index, &owners, from_shard).await
+        if let Err(e) = reindex_shard_on_node(
+            &from_endpoint,
+            &req.index,
+            &owners,
+            from_shard,
+            ReindexPhase::Full,
+        )
+        .await
         {
             tracing::warn!(
                 index = %req.index,
@@ -3560,6 +3712,11 @@ mod tests {
     struct StubNodeAdmin {
         /// `(shard_ordinal, owners.len())` per reindex call, in arrival order.
         reindexed: Arc<std::sync::Mutex<Vec<(u32, usize)>>>,
+        /// `(shard_ordinal, phase i32)` per reindex call — lets the coordinated-reindex tests assert
+        /// the BUILD → PROMOTE (or DISCARD-on-abort) sequence.
+        phases: Arc<std::sync::Mutex<Vec<(u32, i32)>>>,
+        /// When true, a BUILD-phase reindex returns an error — to drive the abort path.
+        fail_build: bool,
         /// When set: signal `entered` on a reindex call, then wait for `release` — lets a test
         /// deterministically interleave a concurrent placement commit mid-build.
         gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
@@ -3588,12 +3745,19 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((req.shard_ordinal, req.bucket_owners.len()));
+            self.phases
+                .lock()
+                .unwrap()
+                .push((req.shard_ordinal, req.phase));
+            if self.fail_build && req.phase == growlerdb_proto::v1::ReindexPhase::Build as i32 {
+                return Err(Status::internal("stub build failure"));
+            }
             if let Some((entered, release)) = &self.gate {
                 entered.notify_one();
                 release.notified().await;
             }
             Ok(Response::new(growlerdb_proto::v1::ReindexIndexResponse {
-                doc_count: 0,
+                doc_count: 3,
                 snapshot: 1,
             }))
         }
@@ -3660,6 +3824,7 @@ mod tests {
         let stub = |log: &Arc<std::sync::Mutex<Vec<(u32, usize)>>>| StubNodeAdmin {
             reindexed: log.clone(),
             gate: None,
+            ..Default::default()
         };
 
         // The index's original two nodes announce → the balanced(2) map is adopted.
@@ -3717,6 +3882,92 @@ mod tests {
             .all(|(_, n)| *n == growlerdb_core::routing::NUM_BUCKETS as usize));
     }
 
+    /// Coordinated whole-index reindex: every shard BUILDs its next generation, then every shard
+    /// PROMOTEs (all builds precede any promote), and the routing generation is bumped once at cutover.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coordinated_reindex_builds_all_then_promotes_all_and_bumps_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path());
+        let def_json = serde_json::to_string(&resolved("docs")).unwrap();
+        // Both shards record into ONE shared phase log so we can assert the global ordering.
+        let phaselog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mk = || StubNodeAdmin {
+            phases: phaselog.clone(),
+            ..Default::default()
+        };
+        let ep0 = spawn_stub_node(mk()).await;
+        let ep1 = spawn_stub_node(mk()).await;
+        register(&svc, &def_json, &ep0, 2, 0).await;
+        register(&svc, &def_json, &ep1, 2, 1).await;
+        assert_eq!(svc.registry.generation("docs"), Some(0));
+
+        let resp = svc
+            .reindex_index(Request::new(ReindexControlRequest {
+                index: "docs".into(),
+            }))
+            .await
+            .expect("coordinated reindex succeeds")
+            .into_inner();
+        assert_eq!(resp.shards, 2);
+        assert_eq!(resp.generation, 1, "routing generation bumped at cutover");
+        assert_eq!(
+            resp.doc_count, 6,
+            "aggregates promote doc_count (3 per shard)"
+        );
+        assert_eq!(svc.registry.generation("docs"), Some(1));
+
+        // BUILD both shards, THEN PROMOTE both — never a mixed build/promote interleave, no DISCARD.
+        let build = ReindexPhase::Build as i32;
+        let promote = ReindexPhase::Promote as i32;
+        let seq = phaselog.lock().unwrap().clone();
+        assert_eq!(
+            seq,
+            vec![(0, build), (1, build), (0, promote), (1, promote)]
+        );
+    }
+
+    /// A build-phase failure on any shard aborts the reindex: every already-built shard is DISCARDed
+    /// (releasing its held fence), the generation is NOT bumped, and no shard is promoted — so the
+    /// old generation is intact everywhere (never a half-swap).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coordinated_reindex_aborts_and_discards_when_a_build_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path());
+        let def_json = serde_json::to_string(&resolved("docs")).unwrap();
+        let phase0 = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Shard 0 builds fine (and records its phases); shard 1 fails its build.
+        let s0 = StubNodeAdmin {
+            phases: phase0.clone(),
+            ..Default::default()
+        };
+        let s1 = StubNodeAdmin {
+            fail_build: true,
+            ..Default::default()
+        };
+        let ep0 = spawn_stub_node(s0).await;
+        let ep1 = spawn_stub_node(s1).await;
+        register(&svc, &def_json, &ep0, 2, 0).await;
+        register(&svc, &def_json, &ep1, 2, 1).await;
+
+        let err = svc
+            .reindex_index(Request::new(ReindexControlRequest {
+                index: "docs".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::Internal);
+        assert_eq!(
+            svc.registry.generation("docs"),
+            Some(0),
+            "no cutover on a build failure"
+        );
+        // Shard 0 built, then got a DISCARD (fence released); it was never promoted.
+        let build = ReindexPhase::Build as i32;
+        let discard = ReindexPhase::Discard as i32;
+        let phases: Vec<i32> = phase0.lock().unwrap().iter().map(|(_, p)| *p).collect();
+        assert_eq!(phases, vec![build, discard]);
+    }
+
     /// A real bucket move end to end: build on the target, cut the map over, trim the source — and
     /// routing reflects the relocation.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3728,6 +3979,7 @@ mod tests {
         let stub = |log: &Arc<std::sync::Mutex<Vec<(u32, usize)>>>| StubNodeAdmin {
             reindexed: log.clone(),
             gate: None,
+            ..Default::default()
         };
         let ep0 = spawn_stub_node(stub(&log)).await;
         let ep1 = spawn_stub_node(stub(&log)).await;
@@ -3781,6 +4033,7 @@ mod tests {
         let gated = || StubNodeAdmin {
             reindexed: Arc::default(),
             gate: Some((entered.clone(), release.clone())),
+            ..Default::default()
         };
         let ep0 = spawn_stub_node(gated()).await;
         let ep1 = spawn_stub_node(gated()).await;
