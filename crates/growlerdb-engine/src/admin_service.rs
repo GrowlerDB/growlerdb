@@ -15,7 +15,7 @@ use growlerdb_proto::v1::{
     BackupIndexResponse, BackupStatusRequest, BackupStatusResponse, CompactIndexRequest,
     CompactIndexResponse, DescribeIndexRequest, DescribeIndexResponse, IndexStats,
     ReconcileIndexRequest, ReconcileIndexResponse, ReindexIndexRequest, ReindexIndexResponse,
-    VectorFieldStat,
+    ReindexPhase, VectorFieldStat,
 };
 use growlerdb_proto::{Admin, AdminServer};
 use growlerdb_source::{IcebergConfig, IcebergReader};
@@ -431,6 +431,50 @@ impl Admin for AdminService {
             Status::unimplemented("this node was started without source access for reindex")
         })?;
 
+        // PROMOTE / DISCARD act on the generation a prior BUILD staged (reading no source) and
+        // release the write-fence BUILD engaged. The control plane drives the coordinated
+        // multi-shard flow: BUILD every shard, then PROMOTE all — or DISCARD all on any failure —
+        // so a build failure never half-swaps the index.
+        let phase = req.phase();
+        if let ReindexPhase::Promote = phase {
+            let resolved = ctx
+                .resolved
+                .read()
+                .expect("definition lock not poisoned")
+                .clone();
+            let store = ctx.store.clone();
+            let shard_id = ctx.shard_id.clone();
+            let promoted = run_blocking(move || store.promote_generation(&shard_id, &resolved))
+                .await?
+                .map_err(internal)?;
+            let snapshot = promoted.current_snapshot().map_err(internal)?;
+            let doc_count = promoted.num_docs().map_err(internal)?;
+            // Install the promoted generation as the live shard, then release the fence — writes
+            // resume against the new generation.
+            self.shard.swap(Arc::new(promoted));
+            ctx.fence.release();
+            tracing::info!(index = %self.index, snapshot, "reindex: promoted the staged generation");
+            return Ok(Response::new(ReindexIndexResponse {
+                doc_count,
+                snapshot,
+            }));
+        }
+        if let ReindexPhase::Discard = phase {
+            let store = ctx.store.clone();
+            let shard_id = ctx.shard_id.clone();
+            run_blocking(move || store.discard_staging(&shard_id))
+                .await?
+                .map_err(internal)?;
+            ctx.fence.release();
+            tracing::info!(index = %self.index, "reindex: discarded the staged generation");
+            return Ok(Response::new(ReindexIndexResponse {
+                doc_count: 0,
+                snapshot: 0,
+            }));
+        }
+        // FULL (one-shot) or BUILD (stage only, leave fenced for a later PROMOTE).
+        let build_only = matches!(phase, ReindexPhase::Build);
+
         // Fence: engaging is the single-flight guard (a second reindex is refused) AND
         // it makes the Write service reject new writes for the duration — so the connector can't
         // advance the shard past the rebuild snapshot, a delta the swap would otherwise drop.
@@ -439,7 +483,10 @@ impl Admin for AdminService {
                 "a reindex is already in progress for this index",
             ));
         }
-        let _fence_guard = ReindexGuard::new(ctx.fence.clone());
+        // Held across BUILD..PROMOTE: for BUILD we disarm this guard on success so the fence stays
+        // engaged until the control plane PROMOTEs/DISCARDs; any error before then drops it, so a
+        // failed build never leaves writes fenced.
+        let fence_guard = ReindexGuard::new(ctx.fence.clone());
 
         // Rebuild against the current definition (an applied in-place alter may have moved it).
         let resolved = ctx
@@ -511,14 +558,14 @@ impl Admin for AdminService {
         let table = ctx.table.clone();
         let index_name = self.index.clone();
         let handle = tokio::runtime::Handle::current();
-        let (promoted, doc_count) =
-            run_blocking(move || -> Result<(Shard, u64), StoreError> {
+        let (promoted_opt, doc_count) =
+            run_blocking(move || -> Result<(Option<Shard>, u64), StoreError> {
                 let mut doc_count = 0u64;
-                let promoted = store.reindex(&shard_id, &resolved, |shard| {
-                    // Sub-commit each streamed chunk in bounded slices with progress — a single
-                    // giant commit balloons peak memory and gives no signal on a long op.
-                    // Every commit carries the rebuild checkpoint; a per-commit seq keeps each
-                    // batch_id unique.
+                // Populate the staging shard from the source — shared by the FULL (build+promote)
+                // and BUILD (stage-only) paths. Sub-commit each streamed chunk in bounded slices so
+                // peak memory is O(one chunk); every commit carries the rebuild checkpoint and a
+                // per-commit seq keeps each batch_id unique.
+                let populate = |shard: &Shard| -> Result<(), StoreError> {
                     let mut seq = 0u64;
                     handle
                         .block_on(
@@ -554,27 +601,50 @@ impl Admin for AdminService {
                     }
                     if doc_count == 0 {
                         // Genuinely empty source: still stamp the checkpoint so the shard isn't behind.
-                        IndexWriter::write(
-                            shard,
-                            &reindex_commit(Vec::new(), checkpoint, sequence, 0),
-                        )?;
+                        IndexWriter::write(shard, &reindex_commit(Vec::new(), checkpoint, sequence, 0))?;
                     }
                     Ok(())
-                })?;
-                Ok((promoted, doc_count))
+                };
+                if build_only {
+                    // Stage the next generation without cutting over — the live shard keeps serving
+                    // and the fence stays engaged until the control plane PROMOTEs/DISCARDs.
+                    store.build_staging_generation(&shard_id, &resolved, populate)?;
+                    Ok((None, doc_count))
+                } else {
+                    let promoted = store.reindex(&shard_id, &resolved, populate)?;
+                    Ok((Some(promoted), doc_count))
+                }
             })
             .await?
             .map_err(internal)?;
 
-        let snapshot = promoted.current_snapshot().map_err(internal)?;
-        // Install the rebuilt shard as the live one — every service sees it at once.
-        self.shard.swap(Arc::new(promoted));
-        tracing::info!(index = %self.index, snapshot, "reindex: promoted the rebuilt shard");
-
-        Ok(Response::new(ReindexIndexResponse {
-            doc_count,
-            snapshot,
-        }))
+        match promoted_opt {
+            Some(promoted) => {
+                let snapshot = promoted.current_snapshot().map_err(internal)?;
+                // Install the rebuilt shard as the live one — every service sees it at once.
+                self.shard.swap(Arc::new(promoted));
+                tracing::info!(index = %self.index, snapshot, "reindex: promoted the rebuilt shard");
+                // fence_guard drops here → the fence is released (FULL is self-contained).
+                Ok(Response::new(ReindexIndexResponse {
+                    doc_count,
+                    snapshot,
+                }))
+            }
+            None => {
+                // BUILD: keep the fence engaged so writes stay blocked until the control plane
+                // PROMOTEs/DISCARDs this staged generation — disarm the RAII guard to hold it.
+                std::mem::forget(fence_guard);
+                tracing::info!(
+                    index = %self.index,
+                    snapshot = snapshot_id,
+                    "reindex: staged the next generation (fenced, awaiting cutover)"
+                );
+                Ok(Response::new(ReindexIndexResponse {
+                    doc_count,
+                    snapshot: snapshot_id as u64,
+                }))
+            }
+        }
     }
 
     #[tracing::instrument(name = "admin.reconcile_index", skip_all, err)]
