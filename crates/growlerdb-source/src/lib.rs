@@ -308,11 +308,18 @@ impl IcebergReader {
         &self,
         table: &str,
         since_snapshot: Option<i64>,
-    ) -> Result<(ReadResult, i64)> {
+    ) -> Result<(ReadResult, i64, Option<i64>)> {
         let ident = TableIdent::from_strs(table.split('.'))?;
         let tbl = self.catalog.load_table(&ident).await?;
         let schema = Arc::new(schema_to_arrow_schema(tbl.metadata().current_schema())?);
         let current_snapshot = tbl.metadata().current_snapshot_id().unwrap_or(0);
+        // The head's lineage sequence number, captured in the same table load so a catch-up can stamp
+        // an ordered checkpoint without a second metadata read (no TOCTOU). `None` on a v1 table / an
+        // empty table (no order available).
+        let current_sequence = tbl
+            .metadata()
+            .current_snapshot()
+            .map(|s| s.sequence_number());
 
         // Files already present at the checkpoint snapshot are excluded; what remains
         // in the current plan is exactly what was appended after it.
@@ -324,6 +331,7 @@ impl IcebergReader {
                         batches: Vec::new(),
                     },
                     current_snapshot,
+                    current_sequence,
                 ));
             }
             Some(s) => {
@@ -350,7 +358,11 @@ impl IcebergReader {
             .try_collect()
             .await?;
         let batches = read_tasks(tbl.file_io().clone(), tasks, &prior).await?;
-        Ok((ReadResult { schema, batches }, current_snapshot))
+        Ok((
+            ReadResult { schema, batches },
+            current_snapshot,
+            current_sequence,
+        ))
     }
 
     /// Read a table's [`SourceSchema`] — its top-level leaf fields plus the key
@@ -741,12 +753,36 @@ impl IcebergReader {
         index: &ResolvedIndex,
         since_snapshot: Option<i64>,
     ) -> Result<DocumentBatch> {
-        let (read, snapshot_id) = self.read_appended_since(table, since_snapshot).await?;
+        let (read, snapshot_id, _seq) = self.read_appended_since(table, since_snapshot).await?;
         let mut docs = Vec::with_capacity(read.row_count());
         for lb in &read.batches {
             batch_to_docs(index, &lb.batch, &lb.data_file, lb.start_row, &mut docs);
         }
         Ok(DocumentBatch { docs, snapshot_id })
+    }
+
+    /// As [`read_documents_appended_since`](Self::read_documents_appended_since), but also carrying
+    /// the head snapshot's lineage **sequence number** — so a reindex **write catch-up** (append
+    /// fast-path) can stamp the staged generation with an *ordered* [`SourceCheckpoint`] at the exact
+    /// head it caught up to. The sequence is captured in the same table load as the read (no TOCTOU);
+    /// `sequence_number = None` on a v1 / empty table, where the checkpoint carries no order.
+    pub async fn read_documents_appended_since_ordered(
+        &self,
+        table: &str,
+        index: &ResolvedIndex,
+        since_snapshot: Option<i64>,
+    ) -> Result<OrderedDocumentBatch> {
+        let (read, snapshot_id, sequence_number) =
+            self.read_appended_since(table, since_snapshot).await?;
+        let mut docs = Vec::with_capacity(read.row_count());
+        for lb in &read.batches {
+            batch_to_docs(index, &lb.batch, &lb.data_file, lb.start_row, &mut docs);
+        }
+        Ok(OrderedDocumentBatch {
+            docs,
+            snapshot_id,
+            sequence_number,
+        })
     }
 }
 
@@ -791,6 +827,18 @@ pub struct DocumentBatch {
     pub docs: Vec<LocatedDoc>,
     /// The Iceberg snapshot id these documents were read from.
     pub snapshot_id: i64,
+}
+
+/// As [`DocumentBatch`], but carrying the head snapshot's lineage **sequence number** — so a reindex
+/// catch-up can stamp an *ordered* [`SourceCheckpoint`](growlerdb_core::SourceCheckpoint) at the head
+/// it read to. See [`IcebergReader::read_documents_appended_since_ordered`].
+pub struct OrderedDocumentBatch {
+    /// The documents, each with its source location.
+    pub docs: Vec<LocatedDoc>,
+    /// The Iceberg snapshot id these documents were read from.
+    pub snapshot_id: i64,
+    /// The head snapshot's lineage sequence number (`None` = v1 / empty table, no order).
+    pub sequence_number: Option<i64>,
 }
 
 /// Read each `FileScanTask` into [`LocatedBatch`]es, skipping any whose data file is
