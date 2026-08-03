@@ -246,6 +246,17 @@ enum Command {
         /// Index name.
         index: String,
     },
+    /// Coordinated online reindex of a (multi-shard) index via the control plane: build every
+    /// shard's next generation from source, then cut over atomically (bump the routing generation).
+    /// A build failure on any shard aborts before cutover, leaving the old generation intact. For a
+    /// single embedded shard use `rebuild`.
+    Reindex {
+        /// Index name.
+        index: String,
+        /// Control-plane `host:port`.
+        #[arg(long)]
+        control_plane: String,
+    },
     /// Back up an index's shard to object storage (S3/MinIO) for restore on node loss.
     /// Reads credentials from `GROWLERDB_S3_*` and the bucket from `GROWLERDB_BACKUP_BUCKET`.
     Backup {
@@ -579,6 +590,27 @@ enum Command {
 /// so a reconcile can't pull another shard's keys into it. Prints per-shard drift + a total. Any
 /// unreachable shard, missing primary, or shard-level error makes the whole run exit non-zero, so a
 /// scheduled CronJob surfaces the failure instead of silently skipping a shard.
+/// Coordinated online reindex of a (multi-shard) index: dial the control plane's `ReindexIndex`,
+/// which builds every shard's next generation from source, then cuts over atomically. A build
+/// failure aborts before any cutover (the old generation stays live). The server-side orchestration
+/// owns the atomic generation cutover, so — unlike the client-fanned reconcile — this is one RPC.
+async fn reindex_cluster(control_plane: &str, index: &str) -> anyhow::Result<()> {
+    use growlerdb_proto::v1::ReindexControlRequest;
+    let mut cp = connect_cp(control_plane, false).await?;
+    let resp = cp
+        .reindex_index(ReindexControlRequest {
+            index: index.to_string(),
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("ReindexIndex(`{index}`): {e}"))?
+        .into_inner();
+    println!(
+        "reindexed `{index}`: {} shard(s) rebuilt and cut over, generation {}, {} document(s)",
+        resp.shards, resp.generation, resp.doc_count
+    );
+    Ok(())
+}
+
 async fn reconcile_cluster(control_plane: &str, index: &str, full: bool) -> anyhow::Result<()> {
     use growlerdb_proto::v1::admin_client::AdminClient;
     use growlerdb_proto::v1::{GetIndexRequest, ReconcileIndexRequest, ReconcileIndexResponse};
@@ -816,6 +848,12 @@ pub async fn run() -> anyhow::Result<()> {
                 "rebuilt `{}`: {} documents at snapshot {}",
                 out.name, out.doc_count, out.snapshot.0
             );
+        }
+        Command::Reindex {
+            index,
+            control_plane,
+        } => {
+            reindex_cluster(&control_plane, &index).await?;
         }
         Command::Backup { index, prefix } => {
             backup_cmd(&cli.data_dir, &index, prefix.as_deref()).await?;
