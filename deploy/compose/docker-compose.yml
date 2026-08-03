@@ -370,6 +370,67 @@ services:
       timeout: 3s
       retries: 60
 
+  # ---- Classic multi-shard cluster (profile `sharded`) --------------------------------------------
+  # Two nodes serving a 2-shard `docs` index for testing coordinated multi-shard reindex/alter:
+  # each builds its ordinal from `growlerdb.docs` (filtered) and `serve`s it, self-registering with
+  # the control plane so it adopts a balanced(2) bucket map and the gateway fronts it multi-shard.
+  # Bring up with `--profile stack --profile seed --profile sharded`. The `until` loop tolerates the
+  # seed landing after these boot.
+  node-s0:
+    profiles: ["sharded"]
+    <<: *growlerdb-image
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        until growlerdb index growlerdb.docs --name docs --shards 2 --shard-ordinal 0; do echo "node-s0: waiting for growlerdb.docs..."; sleep 3; done &&
+        growlerdb serve docs --shards 2 --shard-ordinal 0
+        --addr 0.0.0.0:50051 --metrics-addr 0.0.0.0:9102
+        --register http://controlplane:50071 --advertise-addr http://node-s0:50051
+    environment:
+      <<: *growlerdb-env
+    depends_on:
+      polaris:
+        condition: service_started
+      controlplane:
+        condition: service_healthy
+    ports:
+      - "50151:50051"
+      - "9112:9102"
+    volumes:
+      - docs-s0-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9102/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+  node-s1:
+    profiles: ["sharded"]
+    <<: *growlerdb-image
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        until growlerdb index growlerdb.docs --name docs --shards 2 --shard-ordinal 1; do echo "node-s1: waiting for growlerdb.docs..."; sleep 3; done &&
+        growlerdb serve docs --shards 2 --shard-ordinal 1
+        --addr 0.0.0.0:50051 --metrics-addr 0.0.0.0:9102
+        --register http://controlplane:50071 --advertise-addr http://node-s1:50051
+    environment:
+      <<: *growlerdb-env
+    depends_on:
+      polaris:
+        condition: service_started
+      controlplane:
+        condition: service_healthy
+    ports:
+      - "50152:50051"
+      - "9113:9102"
+    volumes:
+      - docs-s1-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9102/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+
   # ---- Placement pool (D52/D53): the demo's HIGH-AVAILABILITY serving tier -------------------------
   # Two INTERCHANGEABLE pool nodes with an IDENTICAL config serve docs + catalog + movies over the
   # control plane at R=2 (1 primary + 1 read replica per unit — `GROWLERDB_REPLICATION_FACTOR=2` on the
@@ -851,6 +912,8 @@ volumes:
   minio-data:
   cp-data:
   node-data:
+  docs-s0-data:
+  docs-s1-data:
   pool-a-data:
   pool-b-data:
   node-events-data:
