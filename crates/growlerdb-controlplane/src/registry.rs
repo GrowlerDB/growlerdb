@@ -171,6 +171,16 @@ pub struct IndexEntry {
     /// ([`Registry::plan_reshard`]) moves whole buckets.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bucket_owners: Vec<u32>,
+    /// Routing generation (epoch). Bumped by [`Registry::set_generation`] on an atomic reindex
+    /// cutover so gateways converge on the freshly-built generation via their `GetIndex` poll.
+    /// `#[serde(default)]` so registries written before generations existed load as `0`.
+    #[serde(default)]
+    pub generation: u64,
+    /// Definition version. Bumped by [`Registry::set_definition`] when an in-place alter replaces the
+    /// definition, so nodes observe the change and reload their served copy. `#[serde(default)]` so
+    /// older registries load as `0`.
+    #[serde(default)]
+    pub definition_version: u64,
 }
 
 /// A compact listing row (name + status) for [`Registry::list`].
@@ -826,6 +836,8 @@ impl Registry {
                 shards: BTreeMap::new(),
                 windows: BTreeMap::new(),
                 bucket_owners: Vec::new(),
+                generation: 0,
+                definition_version: 0,
             },
         );
         drop(map); // release the data lock before the fsync
@@ -1716,6 +1728,70 @@ impl Registry {
         entry.bucket_owners = map.owners().to_vec();
         drop(indexes);
         self.persist_snapshot()
+    }
+
+    // ---- reindex generation (epoch) & definition version -----------------------
+
+    /// `index`'s current routing generation, or `None` for an unknown index.
+    pub fn generation(&self, index: &str) -> Option<u64> {
+        self.read_map().get(index).map(|e| e.generation)
+    }
+
+    /// Bump `index`'s routing generation — the **atomic reindex cutover** — as a compare-and-swap:
+    /// `expected` must match the stored generation or the write is refused with
+    /// [`PlacementConflict`](RegistryError::PlacementConflict). Modeled on [`set_bucket_map`]: the
+    /// orchestrator reads the generation, runs a minutes-long build of the next generation on every
+    /// shard, and commits here; the CAS makes two concurrent cutovers (or a cutover racing a reshard)
+    /// fail loudly instead of silently reverting one another. Returns the new generation.
+    ///
+    /// [`set_bucket_map`]: Self::set_bucket_map
+    pub fn set_generation(&self, index: &str, expected: u64, new: u64) -> Result<u64> {
+        let mut indexes = self.write_map();
+        let entry = indexes
+            .get_mut(index)
+            .ok_or_else(|| RegistryError::NotFound(index.to_string()))?;
+        if entry.generation != expected {
+            return Err(RegistryError::PlacementConflict(format!(
+                "the generation of `{index}` changed while this reindex ran — re-plan and retry"
+            )));
+        }
+        entry.generation = new;
+        drop(indexes);
+        self.persist_snapshot()?;
+        Ok(new)
+    }
+
+    /// `index`'s current definition version, or `None` for an unknown index.
+    pub fn definition_version(&self, index: &str) -> Option<u64> {
+        self.read_map().get(index).map(|e| e.definition_version)
+    }
+
+    /// Replace `index`'s resolved definition (an **in-place alter**) and bump its definition version,
+    /// as a compare-and-swap on the version: `expected` must match or the write is refused. Nodes
+    /// observe the bumped version (via `GetIndex`) and reload their served definition, so an applied
+    /// alter is durable across restart — unlike the old node-local in-memory apply. Returns the new
+    /// version.
+    pub fn set_definition(
+        &self,
+        index: &str,
+        expected: u64,
+        definition: ResolvedIndex,
+    ) -> Result<u64> {
+        let mut indexes = self.write_map();
+        let entry = indexes
+            .get_mut(index)
+            .ok_or_else(|| RegistryError::NotFound(index.to_string()))?;
+        if entry.definition_version != expected {
+            return Err(RegistryError::PlacementConflict(format!(
+                "the definition of `{index}` changed while this alter ran — re-plan and retry"
+            )));
+        }
+        entry.definition = definition;
+        entry.definition_version = expected + 1;
+        let new = entry.definition_version;
+        drop(indexes);
+        self.persist_snapshot()?;
+        Ok(new)
     }
 
     /// Adopt a [balanced](BucketMap::balanced) bucket map over `shard_count` if the index has none
@@ -3144,6 +3220,95 @@ mod tests {
         .unwrap()
         .resolve(&src)
         .unwrap()
+    }
+
+    /// A two-field variant definition, so a `set_definition` test can prove the stored definition
+    /// actually changed (not just its version).
+    fn resolved_two_field(name: &str) -> ResolvedIndex {
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("body", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        IndexDefinition::from_yaml(&format!(
+            "name: {name}\nsource: {{ iceberg: {{ catalog: g, table: g.{name} }} }}\nmapping: {{ selection: EXPLICIT, fields: [ {{ path: id, type: KEYWORD }}, {{ path: body, type: TEXT }} ] }}\n",
+        ))
+        .unwrap()
+        .resolve(&src)
+        .unwrap()
+    }
+
+    #[test]
+    fn set_generation_is_a_persisted_compare_and_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        {
+            let reg = Registry::open(&path).unwrap();
+            reg.create(resolved("logs")).unwrap();
+            assert_eq!(
+                reg.generation("logs"),
+                Some(0),
+                "fresh index starts at gen 0"
+            );
+
+            // CAS success advances the epoch and returns the new value.
+            assert_eq!(reg.set_generation("logs", 0, 1).unwrap(), 1);
+            assert_eq!(reg.generation("logs"), Some(1));
+
+            // A stale `expected` (a concurrent cutover already bumped it) is refused, not clobbered.
+            assert!(matches!(
+                reg.set_generation("logs", 0, 2),
+                Err(RegistryError::PlacementConflict(_))
+            ));
+            assert_eq!(
+                reg.generation("logs"),
+                Some(1),
+                "conflict left the epoch intact"
+            );
+
+            // Unknown index → NotFound.
+            assert!(matches!(
+                reg.set_generation("nope", 0, 1),
+                Err(RegistryError::NotFound(_))
+            ));
+        }
+        // The bump survives a reopen (persisted, not just in-memory).
+        let reg2 = Registry::open(&path).unwrap();
+        assert_eq!(reg2.generation("logs"), Some(1));
+    }
+
+    #[test]
+    fn set_definition_is_a_persisted_compare_and_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        let wider = resolved_two_field("logs");
+        {
+            let reg = Registry::open(&path).unwrap();
+            reg.create(resolved("logs")).unwrap();
+            assert_eq!(reg.definition_version("logs"), Some(0));
+
+            // CAS success bumps the version and replaces the stored definition.
+            assert_eq!(reg.set_definition("logs", 0, wider.clone()).unwrap(), 1);
+            assert_eq!(reg.definition_version("logs"), Some(1));
+            assert_eq!(
+                reg.get("logs").unwrap().definition,
+                wider,
+                "the stored definition is the new one"
+            );
+
+            // Stale `expected` is refused.
+            assert!(matches!(
+                reg.set_definition("logs", 0, resolved("logs")),
+                Err(RegistryError::PlacementConflict(_))
+            ));
+            assert_eq!(reg.definition_version("logs"), Some(1));
+        }
+        let reg2 = Registry::open(&path).unwrap();
+        assert_eq!(reg2.definition_version("logs"), Some(1));
+        assert_eq!(reg2.get("logs").unwrap().definition, wider);
     }
 
     #[test]

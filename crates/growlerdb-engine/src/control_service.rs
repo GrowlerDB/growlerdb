@@ -874,6 +874,10 @@ impl ControlPlane for ControlPlaneService {
             // Windowing config for a windowed index — lets a live-CP gateway build a window router +
             // prune; `None` for an ordinal index.
             windowing: windowing_config(&entry.definition),
+            // Routing generation (reindex cutover epoch) + definition version (in-place alter),
+            // so a gateway/node converges on the current build + served definition via this poll.
+            generation: entry.generation,
+            definition_version: entry.definition_version,
         }))
     }
 

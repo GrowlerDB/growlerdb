@@ -239,6 +239,12 @@ message GetIndexResponse {
   // Windowing config for a windowed index: set iff this index is windowed, so a live-CP
   // gateway can build a window router + prune. Absent for an ordinal index.
   WindowingConfig windowing = 8;
+  // Routing generation (epoch). Bumped atomically on a reindex cutover so a gateway converges on
+  // the new generation via its GetIndex poll. 0 for a never-reindexed index.
+  uint64 generation = 9;
+  // Definition version. Bumped when an in-place alter updates the definition, so nodes observe the
+  // change and reload their served definition. 0 for a never-altered index.
+  uint64 definition_version = 10;
 }
 
 // One bucket's reassignment in a reshard plan: which shard a bucket moves from/to.
