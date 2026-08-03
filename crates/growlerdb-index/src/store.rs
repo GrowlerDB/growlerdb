@@ -744,31 +744,54 @@ impl LocalIndexStore {
         })
     }
 
-    /// **Reindex** a shard durably: build a fresh replacement at a staging sibling
-    /// directory, populate it via `populate` (e.g. a full read from the source), then
-    /// atomically swap it into place and reopen it at the canonical path. Returns the
-    /// promoted shard so the caller can install it in its `ShardHandle`.
+    /// **Reindex** a shard durably in one shot: [`build_staging_generation`] then
+    /// [`promote_generation`]. Builds a fresh replacement at a staging sibling, populates it via
+    /// `populate` (e.g. a full source read), then atomically swaps it in and reopens it at the
+    /// canonical path, returning the promoted shard. A crash leaves recoverable state that
+    /// [`recover_reindex`] resolves on the next open. Retired shards' in-flight readers/PITs keep
+    /// their files alive via open-fd inode refs, so dropping the backup is safe.
     ///
-    /// The swap renames the old shard aside to a `*.old` backup, then the staging shard into
-    /// the canonical path, then drops the backup — so the canonical index is never the only
-    /// copy mid-swap. A crash leaves recoverable state that [`recover_reindex`] resolves on
-    /// the next open. The retired shard's in-flight readers/PITs keep their files alive via
-    /// open-fd inode refs, so removing the backup is safe.
+    /// Multi-shard reindex calls the two halves separately so it can build every shard's next
+    /// generation and only cut over once all succeed (see [`build_staging_generation`]).
     ///
-    /// **Crash durability:** before the swap, the staging contents are fsynced and a
-    /// durable `*.commit` marker is written. The marker's presence is the promise that staging
-    /// is fully durable and safe to promote, so [`recover_reindex`] can roll a completed-but-
-    /// unswapped reindex forward and a torn (pre-commit) one back — without ever deleting the
-    /// only good copy. Every rename is followed by a parent-dir fsync so the dir entries persist.
-    ///
+    /// [`build_staging_generation`]: Self::build_staging_generation
+    /// [`promote_generation`]: Self::promote_generation
     /// [`recover_reindex`]: Self::recover_reindex
     pub fn reindex<F>(&self, id: &ShardId, index: &ResolvedIndex, populate: F) -> Result<Shard>
     where
         F: FnOnce(&Shard) -> Result<()>,
     {
+        self.build_staging_generation(id, index, populate)?;
+        self.promote_generation(id, index)
+    }
+
+    /// Build the **next generation** of a shard into its staging sibling directory and populate it
+    /// via `populate` (a full source read, optionally filtered), leaving it **durable but not
+    /// promoted** — the live canonical shard is untouched and still serves. A later
+    /// [`promote_generation`] cuts over, or [`discard_staging`] drops it.
+    ///
+    /// This is the build half of [`reindex`], split out so a multi-shard reindex can build every
+    /// shard's next generation and cut over only once **all** succeed — the atomic cutover is the
+    /// control plane's single decision, not a per-node one, so this must NOT auto-promote. No commit
+    /// marker is written here, so a crash between build and promote is a torn attempt that
+    /// [`recover_reindex`] discards: the old generation stays authoritative and the reindex is
+    /// retried (identical crash semantics to the one-shot path, whose commit marker is likewise only
+    /// written at promote).
+    ///
+    /// [`promote_generation`]: Self::promote_generation
+    /// [`discard_staging`]: Self::discard_staging
+    /// [`recover_reindex`]: Self::recover_reindex
+    pub fn build_staging_generation<F>(
+        &self,
+        id: &ShardId,
+        index: &ResolvedIndex,
+        populate: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&Shard) -> Result<()>,
+    {
         let canonical = self.root.join(id.rel_path());
         let staging = sibling(&canonical, "reindex");
-        let backup = sibling(&canonical, "old");
         let marker = sibling(&canonical, "commit");
         let parent = canonical
             .parent()
@@ -791,10 +814,34 @@ impl LocalIndexStore {
             populate(&staged)?;
         }
 
-        // Make staging durable, THEN write the commit marker — its existence means "staging is
-        // safe to promote" (recovery relies on that ordering).
+        // Make staging durable. The commit marker is deliberately NOT written here — it is written
+        // by `promote_generation` at cutover, so recovery never promotes an uncommitted build.
         durable::sync_dir(&staging)?;
         durable::sync_dir(&parent)?;
+        Ok(())
+    }
+
+    /// Cut over to a staged next generation built by [`build_staging_generation`]: write the durable
+    /// `*.commit` marker (the promise [`recover_reindex`] rolls forward on), swap the old shard aside
+    /// to a `*.old` backup and the staging shard into the canonical path, reopen it, then drop the
+    /// backup. Returns the promoted shard so the caller can install it. The swap ordering + marker
+    /// are identical to the one-shot [`reindex`], so a crash mid-swap recovers exactly as before.
+    ///
+    /// [`build_staging_generation`]: Self::build_staging_generation
+    /// [`recover_reindex`]: Self::recover_reindex
+    pub fn promote_generation(&self, id: &ShardId, index: &ResolvedIndex) -> Result<Shard> {
+        let canonical = self.root.join(id.rel_path());
+        let staging = sibling(&canonical, "reindex");
+        let backup = sibling(&canonical, "old");
+        let marker = sibling(&canonical, "commit");
+        let parent = canonical
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.root.clone());
+
+        // The marker's existence means "staging is safe to promote" — write it durably before any
+        // rename (the following parent fsyncs persist its dir entry), so recovery rolls forward from
+        // any point in the swap below.
         durable::write(&marker, REINDEX_COMMIT_MARKER)?;
 
         // Swap: old → backup, new → canonical; fsync the parent after each rename so the dir
@@ -811,6 +858,21 @@ impl LocalIndexStore {
         let _ = std::fs::remove_file(&marker);
         durable::sync_dir(&parent)?;
         Ok(promoted)
+    }
+
+    /// Discard a staged next generation built by [`build_staging_generation`] without promoting it —
+    /// e.g. a multi-shard reindex the control plane aborted because a sibling shard failed, or a
+    /// cancelled job. The live canonical shard is untouched; only the staging sibling is removed. No
+    /// commit marker exists for an unpromoted build, so nothing else needs unwinding.
+    ///
+    /// [`build_staging_generation`]: Self::build_staging_generation
+    pub fn discard_staging(&self, id: &ShardId) -> Result<()> {
+        let canonical = self.root.join(id.rel_path());
+        let staging = sibling(&canonical, "reindex");
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging)?;
+        }
+        Ok(())
     }
 
     /// Resolve an interrupted [`reindex`](Self::reindex) for `id` — call before opening the
@@ -7364,6 +7426,106 @@ mod reindex_tests {
         assert_eq!(promoted.location_store().len(), 2);
         let loc = promoted.locate(&key).unwrap().expect("layered locate");
         assert_eq!(loc.iceberg_file, "f");
+    }
+
+    #[test]
+    fn two_phase_build_then_promote_matches_reindex() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalIndexStore::open(tmp.path()).unwrap();
+        let id = ShardId::single("docs");
+        let resolved = resolved();
+        let shard = store.create_shard(&id, &resolved).unwrap();
+        write(&shard, &["a", "b"], 1);
+        drop(shard);
+
+        // Build the next generation without cutting over — the live shard still serves the old set.
+        store
+            .build_staging_generation(&id, &resolved, |s| {
+                write(s, &["c", "d", "e"], 2);
+                Ok(())
+            })
+            .unwrap();
+        let canonical = tmp.path().join("docs").join("0");
+        assert!(sibling(&canonical, "reindex").exists(), "staging built");
+        assert!(
+            !sibling(&canonical, "commit").exists(),
+            "no commit marker before promote"
+        );
+        let live = store.open_shard(&id, &resolved).unwrap();
+        assert_eq!(
+            live.num_docs().unwrap(),
+            2,
+            "old generation still serves pre-cutover"
+        );
+        drop(live);
+
+        // Cut over.
+        let promoted = store.promote_generation(&id, &resolved).unwrap();
+        assert_eq!(promoted.num_docs().unwrap(), 3);
+        drop(promoted);
+        let reopened = store.open_shard(&id, &resolved).unwrap();
+        assert_eq!(reopened.num_docs().unwrap(), 3);
+        assert!(!sibling(&canonical, "reindex").exists());
+        assert!(!sibling(&canonical, "old").exists());
+        assert!(!sibling(&canonical, "commit").exists());
+    }
+
+    #[test]
+    fn discard_staging_leaves_the_live_generation_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalIndexStore::open(tmp.path()).unwrap();
+        let id = ShardId::single("docs");
+        let resolved = resolved();
+        let shard = store.create_shard(&id, &resolved).unwrap();
+        write(&shard, &["a", "b"], 1);
+        drop(shard);
+
+        store
+            .build_staging_generation(&id, &resolved, |s| {
+                write(s, &["c", "d", "e"], 2);
+                Ok(())
+            })
+            .unwrap();
+        store.discard_staging(&id).unwrap();
+
+        let canonical = tmp.path().join("docs").join("0");
+        assert!(
+            !sibling(&canonical, "reindex").exists(),
+            "staging discarded"
+        );
+        let reopened = store.open_shard(&id, &resolved).unwrap();
+        assert_eq!(reopened.num_docs().unwrap(), 2, "old generation intact");
+    }
+
+    #[test]
+    fn recover_discards_a_built_but_unpromoted_generation() {
+        // A crash after build_staging but before promote: no commit marker, so recovery treats the
+        // staging as a torn attempt and discards it — the old generation stays authoritative and the
+        // reindex is retried. This is why build_staging must not auto-promote.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalIndexStore::open(tmp.path()).unwrap();
+        let id = ShardId::single("docs");
+        let resolved = resolved();
+        let shard = store.create_shard(&id, &resolved).unwrap();
+        write(&shard, &["a", "b"], 1);
+        drop(shard);
+
+        store
+            .build_staging_generation(&id, &resolved, |s| {
+                write(s, &["c", "d", "e"], 2);
+                Ok(())
+            })
+            .unwrap();
+        let canonical = tmp.path().join("docs").join("0");
+        assert!(sibling(&canonical, "reindex").exists());
+
+        store.recover_reindex(&id).unwrap();
+        assert!(
+            !sibling(&canonical, "reindex").exists(),
+            "uncommitted staging discarded on recovery"
+        );
+        let reopened = store.open_shard(&id, &resolved).unwrap();
+        assert_eq!(reopened.num_docs().unwrap(), 2, "old generation preserved");
     }
 
     #[test]
