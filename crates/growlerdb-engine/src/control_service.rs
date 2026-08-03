@@ -12,13 +12,13 @@ use growlerdb_controlplane::{
 use growlerdb_core::{BucketMap, IndexDefinition, Reassignment, ResolvedIndex, Source};
 use growlerdb_proto::v1::admin_client::AdminClient;
 use growlerdb_proto::v1::{
-    ActivityEvent as WireActivity, AliasEntry, ApiTokenMeta, ApplyReshardRequest,
-    ApplyReshardResponse, BucketMove, CreateIndexRequest, CreateIndexResponse, CreateTokenRequest,
-    CreateTokenResponse, DeleteSavedQueryRequest, DeleteSavedQueryResponse, DescribeSourceRequest,
-    DescribeSourceResponse, DropAliasRequest, DropAliasResponse, DropIndexRequest,
-    DropIndexResponse, Error as WireError, FieldMapping, GetCheckpointRequest, GetIndexRequest,
-    GetIndexResponse, GetLicenseRequest, GetLicenseResponse, IndexIngestion,
-    IndexSummary as WireSummary, IngestionStatusRequest, IngestionStatusResponse,
+    ActivityEvent as WireActivity, AliasEntry, AlterControlRequest, AlterControlResponse,
+    ApiTokenMeta, ApplyReshardRequest, ApplyReshardResponse, BucketMove, CreateIndexRequest,
+    CreateIndexResponse, CreateTokenRequest, CreateTokenResponse, DeleteSavedQueryRequest,
+    DeleteSavedQueryResponse, DescribeSourceRequest, DescribeSourceResponse, DropAliasRequest,
+    DropAliasResponse, DropIndexRequest, DropIndexResponse, Error as WireError, FieldMapping,
+    GetCheckpointRequest, GetIndexRequest, GetIndexResponse, GetLicenseRequest, GetLicenseResponse,
+    IndexIngestion, IndexSummary as WireSummary, IngestionStatusRequest, IngestionStatusResponse,
     ListActivityRequest, ListActivityResponse, ListAliasesRequest, ListAliasesResponse,
     ListIndexesRequest, ListIndexesResponse, ListRolesRequest, ListRolesResponse,
     ListSavedQueriesRequest, ListSavedQueriesResponse, ListTokensRequest, ListTokensResponse,
@@ -763,6 +763,7 @@ async fn reindex_shard_on_node(
     owners: &[u32],
     ordinal: u32,
     phase: ReindexPhase,
+    definition_json: &str,
 ) -> Result<ReindexIndexResponse, Status> {
     // Mesh dial: stamp the shared service token (env) — the node's data plane enforces it.
     let (channel, stamp) = growlerdb_proto::service_token::node_channel(endpoint.to_string())
@@ -775,10 +776,150 @@ async fn reindex_shard_on_node(
             bucket_owners: owners.to_vec(),
             shard_ordinal: ordinal,
             phase: phase as i32,
+            definition_json: definition_json.to_string(),
         })
         .await?
         .into_inner();
     Ok(resp)
+}
+
+/// Drive a coordinated whole-index reindex across every shard: build all shards' next generation,
+/// abort+discard on any build failure (never a half-swap), promote all, then bump the routing
+/// generation (the atomic cutover). `def_json` (serde of the new `ResolvedIndex`) is passed to every
+/// shard so a schema-changing alter rebuilds from the new definition and the nodes adopt it; empty ⇒
+/// a plain reindex against each shard's served definition. Shared by `ReindexIndex` and `AlterIndex`.
+async fn run_coordinated_reindex(
+    registry: &growlerdb_controlplane::Registry,
+    index: &str,
+    def_json: &str,
+) -> Result<ReindexControlResponse, Status> {
+    let entry = registry
+        .get(index)
+        .ok_or_else(|| registry_status(RegistryError::NotFound(index.to_string())))?;
+    // Windowed indexes route by event-time, not bucket owners — out of scope here.
+    if windowing_config(&entry.definition).is_some() {
+        return Err(Status::unimplemented(
+            "reindex of a windowed index is not yet supported (event-time windows, not buckets)",
+        ));
+    }
+    let shard_map = registry
+        .shard_map(index)
+        .ok_or_else(|| registry_status(RegistryError::NotFound(index.to_string())))?;
+    if shard_map.is_empty() {
+        return Err(Status::failed_precondition(format!(
+            "index `{index}` has no assigned shards to reindex"
+        )));
+    }
+    let current_gen = entry.generation;
+    // CURRENT bucket owners = an identity filter (each shard keeps exactly its docs; no topology change).
+    let owners = registry
+        .bucket_map(index)
+        .map(|m| m.owners().to_vec())
+        .unwrap_or_default();
+
+    // Resolve every shard's primary endpoint (ordinal → node).
+    let mut shards: Vec<(u32, String)> = Vec::with_capacity(shard_map.len());
+    for (ord, assignment) in &shard_map {
+        let endpoint = assignment
+            .primary
+            .as_ref()
+            .map(|n| n.0.clone())
+            .filter(|e| !e.is_empty())
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "shard {ord} of `{index}` has no primary; cannot reindex"
+                ))
+            })?;
+        shards.push((*ord, endpoint));
+    }
+
+    // Phase 1 — BUILD every shard's next generation (staged, fenced, NOT promoted).
+    let mut built: Vec<(u32, String)> = Vec::new();
+    let mut build_err: Option<Status> = None;
+    for (ord, endpoint) in &shards {
+        match reindex_shard_on_node(
+            endpoint,
+            index,
+            &owners,
+            *ord,
+            ReindexPhase::Build,
+            def_json,
+        )
+        .await
+        {
+            Ok(_) => built.push((*ord, endpoint.clone())),
+            Err(e) => {
+                build_err = Some(e);
+                break;
+            }
+        }
+    }
+    // Any build failure ⇒ DISCARD every staged generation (release its fence) and abort — no shard
+    // was promoted, so the old generation is intact everywhere (never a half-swap).
+    if let Some(e) = build_err {
+        for (ord, endpoint) in &built {
+            if let Err(de) =
+                reindex_shard_on_node(endpoint, index, &owners, *ord, ReindexPhase::Discard, "")
+                    .await
+            {
+                tracing::warn!(index = %index, shard = ord, error = %de,
+                    "reindex: discard after a failed build failed — that shard's write-fence may need a manual clear");
+            }
+        }
+        return Err(Status::internal(format!(
+            "reindex of `{index}` aborted during build (no cutover; old generation intact): {e}"
+        )));
+    }
+
+    // Phase 2 — PROMOTE every shard (brief fence-drain + atomic swap, releasing the fence).
+    let mut doc_count = 0u64;
+    for (i, (ord, endpoint)) in shards.iter().enumerate() {
+        match reindex_shard_on_node(
+            endpoint,
+            index,
+            &owners,
+            *ord,
+            ReindexPhase::Promote,
+            def_json,
+        )
+        .await
+        {
+            Ok(resp) => doc_count += resp.doc_count,
+            Err(e) => {
+                // Rare promote-phase partial failure: discard the not-yet-promoted remainder (release
+                // their fences) so the op is retryable; already-promoted shards keep the new
+                // generation (queryable, mixed-generation; a retry converges). The common BUILD-phase
+                // failure never reaches here, so it never half-swaps.
+                for (o, ep) in &shards[i..] {
+                    let _ =
+                        reindex_shard_on_node(ep, index, &owners, *o, ReindexPhase::Discard, "")
+                            .await;
+                }
+                return Err(Status::internal(format!(
+                    "reindex of `{index}` failed promoting shard {ord} after {i}/{} shards; \
+                     discarded the rest (index is queryable, mixed-generation; retry to converge): {e}",
+                    shards.len()
+                )));
+            }
+        }
+    }
+
+    // Phase 3 — atomic cutover marker: bump the routing generation (CAS vs the generation we planned
+    // from, so a concurrent reindex/reshard is a loud PLACEMENT_CONFLICT). Gateways converge on poll.
+    let generation = registry
+        .set_generation(index, current_gen, current_gen + 1)
+        .map_err(registry_status)?;
+    registry.record_activity(
+        index,
+        "reindex",
+        format!("reindexed {} shards", shards.len()),
+    );
+
+    Ok(ReindexControlResponse {
+        generation,
+        shards: shards.len() as u32,
+        doc_count,
+    })
 }
 
 #[tonic::async_trait]
@@ -947,7 +1088,8 @@ impl ControlPlane for ControlPlaneService {
         for (ord, endpoint) in &growth.build {
             // Reshard uses the one-shot node reindex (fence + build + promote in one call); the
             // phased flow is for a coordinated whole-index reindex (ControlPlane::reindex_index).
-            reindex_shard_on_node(endpoint, &req.index, &owners, *ord, ReindexPhase::Full).await?;
+            reindex_shard_on_node(endpoint, &req.index, &owners, *ord, ReindexPhase::Full, "")
+                .await?;
         }
 
         // 3. Cutover: commit the new bucket map atomically — compare-and-swap against the map
@@ -962,7 +1104,7 @@ impl ControlPlane for ControlPlaneService {
         //    only reclaims space). Safe post-cutover: those buckets no longer route to old shards.
         let mut trimmed = Vec::new();
         for (ord, endpoint) in &growth.trim {
-            match reindex_shard_on_node(endpoint, &req.index, &owners, *ord, ReindexPhase::Full)
+            match reindex_shard_on_node(endpoint, &req.index, &owners, *ord, ReindexPhase::Full, "")
                 .await
             {
                 Ok(_) => trimmed.push(*ord),
@@ -1006,131 +1148,88 @@ impl ControlPlane for ControlPlaneService {
     ) -> Result<Response<ReindexControlResponse>, Status> {
         self.gate("ReindexIndex", &request)?;
         let index = request.into_inner().index;
+        // A plain reindex rebuilds against each shard's currently-served definition (no def passed).
+        run_coordinated_reindex(&self.registry, &index, "")
+            .await
+            .map(Response::new)
+    }
 
-        // Windowed indexes route by event-time, not bucket owners, so the per-shard bucket-owner
-        // filter can't rebuild them — out of scope here (a dedicated windowed reindex is future work).
+    async fn alter_index(
+        &self,
+        request: Request<AlterControlRequest>,
+    ) -> Result<Response<AlterControlResponse>, Status> {
+        self.gate("AlterIndex", &request)?;
+        let req = request.into_inner();
+
+        // Resolve the candidate against the source schema (same path as create_index), then diff it
+        // against the registry's current definition to build the alter plan.
         let entry = self
             .registry
-            .get(&index)
-            .ok_or_else(|| registry_status(RegistryError::NotFound(index.clone())))?;
-        if windowing_config(&entry.definition).is_some() {
-            return Err(Status::unimplemented(
-                "reindex of a windowed index is not yet supported (event-time windows, not buckets)",
-            ));
-        }
-
-        let shard_map = self
-            .registry
-            .shard_map(&index)
-            .ok_or_else(|| registry_status(RegistryError::NotFound(index.clone())))?;
-        if shard_map.is_empty() {
-            return Err(Status::failed_precondition(format!(
-                "index `{index}` has no assigned shards to reindex"
-            )));
-        }
-        let current_gen = entry.generation;
-        // Pass the CURRENT bucket owners so each shard keeps exactly the docs it already owns (an
-        // identity filter — no topology change). Empty ⇒ legacy single-shard, filter is a no-op.
-        let owners = self
-            .registry
-            .bucket_map(&index)
-            .map(|m| m.owners().to_vec())
-            .unwrap_or_default();
-
-        // Resolve every shard's primary endpoint (ordinal → node).
-        let mut shards: Vec<(u32, String)> = Vec::with_capacity(shard_map.len());
-        for (ord, assignment) in &shard_map {
-            let endpoint = assignment
-                .primary
-                .as_ref()
-                .map(|n| n.0.clone())
-                .filter(|e| !e.is_empty())
-                .ok_or_else(|| {
-                    Status::failed_precondition(format!(
-                        "shard {ord} of `{index}` has no primary; cannot reindex"
-                    ))
-                })?;
-            shards.push((*ord, endpoint));
-        }
-
-        // Phase 1 — BUILD every shard's next generation from source (staged, fenced, NOT promoted).
-        // The live generation keeps serving throughout.
-        let mut built: Vec<(u32, String)> = Vec::new();
-        let mut build_err: Option<Status> = None;
-        for (ord, endpoint) in &shards {
-            match reindex_shard_on_node(endpoint, &index, &owners, *ord, ReindexPhase::Build).await
-            {
-                Ok(_) => built.push((*ord, endpoint.clone())),
-                Err(e) => {
-                    build_err = Some(e);
-                    break;
-                }
-            }
-        }
-        // Any build failure ⇒ DISCARD every staged generation (releasing its held fence) and abort.
-        // No shard was promoted, so the old generation is intact everywhere — never a half-swap.
-        if let Some(e) = build_err {
-            for (ord, endpoint) in &built {
-                if let Err(de) =
-                    reindex_shard_on_node(endpoint, &index, &owners, *ord, ReindexPhase::Discard)
-                        .await
-                {
-                    tracing::warn!(index = %index, shard = ord, error = %de,
-                        "reindex: discard after a failed build failed — that shard's write-fence may need a manual clear");
-                }
-            }
-            return Err(Status::internal(format!(
-                "reindex of `{index}` aborted during build (no cutover; old generation intact): {e}"
-            )));
-        }
-
-        // Phase 2 — PROMOTE every shard: brief per-shard fence-drain + atomic swap, releasing the
-        // fence. Builds all succeeded, so this is fast; the promote window across shards is bounded.
-        let mut doc_count = 0u64;
-        for (i, (ord, endpoint)) in shards.iter().enumerate() {
-            match reindex_shard_on_node(endpoint, &index, &owners, *ord, ReindexPhase::Promote)
+            .get(&req.index)
+            .ok_or_else(|| registry_status(RegistryError::NotFound(req.index.clone())))?;
+        let candidate_def = IndexDefinition::from_yaml(&req.definition_yaml)
+            .map_err(|e| Status::invalid_argument(format!("invalid definition: {e}")))?;
+        let Source::Iceberg(src) = &candidate_def.source;
+        let table = src.table.clone();
+        let internal = |e: String| to_status(Code::Internal, WireError::new("INTERNAL", e));
+        let source = if candidate_def.declares_variant() {
+            growlerdb_source::shared_hydrator()
+                .read_source_schema(&table)
                 .await
-            {
-                Ok(resp) => doc_count += resp.doc_count,
-                Err(e) => {
-                    // Rare promote-phase partial failure: release the fences on the shards not yet
-                    // promoted (discard their staged gen) so the op is retryable. Already-promoted
-                    // shards keep the new generation — the index is mixed-generation but every shard
-                    // still serves valid data, and a retry converges. (The common BUILD-phase
-                    // failure never reaches here, so it never half-swaps.)
-                    for (o, ep) in &shards[i..] {
-                        let _ =
-                            reindex_shard_on_node(ep, &index, &owners, *o, ReindexPhase::Discard)
-                                .await;
-                    }
-                    return Err(Status::internal(format!(
-                        "reindex of `{index}` failed promoting shard {ord} after {i}/{} shards; \
-                         discarded the rest (index is queryable, mixed-generation; retry to converge): {e}",
-                        shards.len()
-                    )));
-                }
-            }
+                .map_err(|e| internal(e.to_string()))?
+        } else {
+            IcebergReader::connect(&self.iceberg)
+                .await
+                .map_err(|e| internal(e.to_string()))?
+                .read_source_schema(&table)
+                .await
+                .map_err(|e| internal(e.to_string()))?
+        };
+        let candidate = candidate_def
+            .resolve(&source)
+            .map_err(|e| Status::invalid_argument(format!("definition does not resolve: {e}")))?;
+        let plan = entry.definition.alter_to(&candidate);
+
+        let mut resp = AlterControlResponse {
+            is_noop: plan.is_noop(),
+            requires_reindex: plan.requires_reindex(),
+            reindex_reasons: plan.reindex_reasons.clone(),
+            in_place_changes: plan.in_place.clone(),
+            applied: false,
+            reindex_triggered: false,
+            generation: entry.generation,
+        };
+        // Dry-run (or a no-op): just return the plan.
+        if !req.apply || plan.is_noop() {
+            return Ok(Response::new(resp));
         }
 
-        // Phase 3 — atomic cutover marker: bump the routing generation (compare-and-swap against the
-        // generation we planned from, so a concurrent reindex/reshard is a loud PLACEMENT_CONFLICT).
-        // Gateways converge to the new generation on their next GetIndex poll.
-        let generation = self
-            .registry
-            .set_generation(&index, current_gen, current_gen + 1)
+        // Apply: update the registry definition durably (CAS on the definition version), so it
+        // survives restart and every shard reindexes/serves against the same new definition.
+        self.registry
+            .set_definition(&req.index, entry.definition_version, candidate.clone())
             .map_err(registry_status)?;
+        resp.applied = true;
 
+        // A reindex-requiring change: run a coordinated reindex from the NEW definition, cutting
+        // over atomically to the new-schema generation. In-place-only changes just take the durable
+        // definition update (nodes reload it; some are restart-scoped, as on the single-shard path).
+        if plan.requires_reindex() {
+            let def_json = serde_json::to_string(&candidate)
+                .map_err(|e| internal(format!("serialize definition: {e}")))?;
+            let out = run_coordinated_reindex(&self.registry, &req.index, &def_json).await?;
+            resp.reindex_triggered = true;
+            resp.generation = out.generation;
+        }
         self.registry.record_activity(
-            &index,
-            "reindex",
-            format!("reindexed {} shards", shards.len()),
+            &req.index,
+            "index.altered",
+            format!(
+                "altered `{}` (reindex={})",
+                req.index, resp.reindex_triggered
+            ),
         );
-
-        Ok(Response::new(ReindexControlResponse {
-            generation,
-            shards: shards.len() as u32,
-            doc_count,
-        }))
+        Ok(Response::new(resp))
     }
 
     async fn move_bucket(
@@ -1187,6 +1286,7 @@ impl ControlPlane for ControlPlaneService {
             &owners,
             req.to_shard,
             ReindexPhase::Full,
+            "",
         )
         .await?;
         // 2. Cutover: commit the relocated map — CAS against the map this move was planned from
@@ -1201,6 +1301,7 @@ impl ControlPlane for ControlPlaneService {
             &owners,
             from_shard,
             ReindexPhase::Full,
+            "",
         )
         .await
         {

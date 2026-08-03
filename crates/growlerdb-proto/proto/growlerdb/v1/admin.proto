@@ -126,6 +126,11 @@ message ReindexIndexRequest {
   // The fence is held across BUILD..PROMOTE so writes can't advance the shard past the build
   // snapshot (which the swap would otherwise drop).
   ReindexPhase phase = 4;
+  // Resolved index definition (serde JSON of `ResolvedIndex`) to rebuild against, INSTEAD of the
+  // node's currently-served definition — set by a durable alter that changes the schema, so the
+  // rebuild uses the new mapping and the node adopts it as its served definition at PROMOTE. Empty
+  // ⇒ rebuild against the current served definition (a plain reindex). Carried on BUILD/PROMOTE/FULL.
+  string definition_json = 5;
 }
 
 // Phase of a node reindex — see `ReindexIndexRequest.phase`.

@@ -2062,11 +2062,37 @@ impl Gateway {
             .await?;
         let rs = route.routing();
         if rs.shards.len() != 1 {
-            return Err(Status::unimplemented(format!(
-                "alter over a {}-shard gateway is not supported; alter each shard's Node directly \
-                 (distributed alter orchestration is future work)",
-                rs.shards.len()
-            )));
+            // Multi-shard: forward to the control plane's durable alter (update the definition; for a
+            // reindex-requiring change, reindex from it across all shards and cut over atomically).
+            let Some(cp) = self.resolver.as_ref().and_then(|r| r.control_plane()) else {
+                return Err(Status::unimplemented(format!(
+                    "alter over a {}-shard gateway without a control plane is not supported",
+                    rs.shards.len()
+                )));
+            };
+            let dto = req.into_inner();
+            let token = growlerdb_proto::service_token::service_token_from_env();
+            let mut client = growlerdb_proto::service_token::connect(cp, None, token.as_deref())
+                .await
+                .map_err(|e| {
+                    Status::unavailable(format!("connecting to control plane `{cp}`: {e}"))
+                })?;
+            let out = client
+                .alter_index(growlerdb_proto::v1::AlterControlRequest {
+                    index: dto.index,
+                    definition_yaml: dto.definition_yaml,
+                    apply: dto.apply,
+                })
+                .await?
+                .into_inner();
+            return Ok(Response::new(AlterIndexResponse {
+                plan: Some(growlerdb_proto::v1::AlterPlan {
+                    is_noop: out.is_noop,
+                    requires_reindex: out.requires_reindex,
+                    reindex_reasons: out.reindex_reasons,
+                    in_place_changes: out.in_place_changes,
+                }),
+            }));
         }
         rs.shards[0].alter_index(req).await
     }

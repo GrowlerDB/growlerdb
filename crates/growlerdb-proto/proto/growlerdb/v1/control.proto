@@ -500,6 +500,25 @@ message GetLicenseResponse {
 }
 
 // Cluster-wide index lifecycle over the registry.
+// Durable, cluster-wide alter (see ControlPlane.AlterIndex): diff a candidate definition against
+// the registry's, and — with apply — update the registry definition (durable, survives restart) and,
+// for a reindex-requiring change, run a coordinated reindex from the NEW definition, cutting over
+// atomically. Distinct from the node AdminService.AlterIndex (node-local, non-durable, plan-only).
+message AlterControlRequest {
+  string index = 1;
+  string definition_yaml = 2;  // candidate index-definition YAML
+  bool apply = 3;              // false ⇒ dry-run plan; true ⇒ apply (durable; reindex if required)
+}
+message AlterControlResponse {
+  bool is_noop = 1;
+  bool requires_reindex = 2;
+  repeated string reindex_reasons = 3;   // changes that force a rebuild
+  repeated string in_place_changes = 4;  // metadata-only changes
+  bool applied = 5;                      // the registry definition was durably updated
+  bool reindex_triggered = 6;            // a coordinated reindex from the new definition ran
+  uint64 generation = 7;                 // routing generation after a triggered reindex (else current)
+}
+
 // Coordinated whole-index reindex (see ControlPlane.ReindexIndex).
 message ReindexControlRequest {
   string index = 1;
@@ -534,6 +553,9 @@ service ControlPlane {
   // A build failure discards every staged generation and never cuts over (no half-swap). This is
   // the multi-shard counterpart the single-shard node reindex can't do alone.
   rpc ReindexIndex(ReindexControlRequest) returns (ReindexControlResponse);
+  // Durable cluster-wide alter: update the registry definition and, for a reindex-requiring change,
+  // run a coordinated reindex from the new definition. Multi-shard counterpart to the node alter.
+  rpc AlterIndex(AlterControlRequest) returns (AlterControlResponse);
   // Source-schema introspection for the create-index form.
   rpc DescribeSource(DescribeSourceRequest) returns (DescribeSourceResponse);
   // A serving node self-registers its locally-built index + shard assignment.

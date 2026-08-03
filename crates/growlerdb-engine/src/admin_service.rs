@@ -436,12 +436,24 @@ impl Admin for AdminService {
         // multi-shard flow: BUILD every shard, then PROMOTE all — or DISCARD all on any failure —
         // so a build failure never half-swaps the index.
         let phase = req.phase();
+        // A durable schema-changing alter passes the NEW resolved definition to rebuild against (and
+        // adopt at PROMOTE); empty ⇒ rebuild against the served definition (a plain reindex).
+        let new_def: Option<ResolvedIndex> = if req.definition_json.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_str(&req.definition_json)
+                    .map_err(|e| Status::invalid_argument(format!("bad definition_json: {e}")))?,
+            )
+        };
         if let ReindexPhase::Promote = phase {
-            let resolved = ctx
-                .resolved
-                .read()
-                .expect("definition lock not poisoned")
-                .clone();
+            // Reopen the promoted shard with the (possibly new) definition it was staged under.
+            let resolved = new_def.clone().unwrap_or_else(|| {
+                ctx.resolved
+                    .read()
+                    .expect("definition lock not poisoned")
+                    .clone()
+            });
             let store = ctx.store.clone();
             let shard_id = ctx.shard_id.clone();
             let promoted = run_blocking(move || store.promote_generation(&shard_id, &resolved))
@@ -452,6 +464,11 @@ impl Admin for AdminService {
             // Install the promoted generation as the live shard, then release the fence — writes
             // resume against the new generation.
             self.shard.swap(Arc::new(promoted));
+            // Adopt the new definition as the served baseline (a schema-changing alter), so later
+            // writes/reindexes use it. Durable because the CP registry is the source of truth.
+            if let Some(def) = new_def {
+                *ctx.resolved.write().expect("definition lock not poisoned") = def;
+            }
             ctx.fence.release();
             tracing::info!(index = %self.index, snapshot, "reindex: promoted the staged generation");
             return Ok(Response::new(ReindexIndexResponse {
@@ -488,12 +505,13 @@ impl Admin for AdminService {
         // failed build never leaves writes fenced.
         let fence_guard = ReindexGuard::new(ctx.fence.clone());
 
-        // Rebuild against the current definition (an applied in-place alter may have moved it).
-        let resolved = ctx
-            .resolved
-            .read()
-            .expect("definition lock not poisoned")
-            .clone();
+        // Rebuild against the NEW definition when a durable alter supplied one, else the served one.
+        let resolved = new_def.clone().unwrap_or_else(|| {
+            ctx.resolved
+                .read()
+                .expect("definition lock not poisoned")
+                .clone()
+        });
 
         // Reshard filter: a non-empty bucket map means rebuild this shard keeping only the
         // docs it owns under the new map — the per-node data step of an online reshard. Empty ⇒ a
@@ -623,6 +641,10 @@ impl Admin for AdminService {
                 let snapshot = promoted.current_snapshot().map_err(internal)?;
                 // Install the rebuilt shard as the live one — every service sees it at once.
                 self.shard.swap(Arc::new(promoted));
+                // FULL from a durable alter: adopt the new definition as the served baseline.
+                if let Some(def) = new_def {
+                    *ctx.resolved.write().expect("definition lock not poisoned") = def;
+                }
                 tracing::info!(index = %self.index, snapshot, "reindex: promoted the rebuilt shard");
                 // fence_guard drops here → the fence is released (FULL is self-contained).
                 Ok(Response::new(ReindexIndexResponse {
