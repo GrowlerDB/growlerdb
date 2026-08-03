@@ -3,6 +3,7 @@
 //! rebuilds from source and durably swaps the shard live, fencing writes so the checkpoint can't regress.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use growlerdb_core::{
@@ -12,10 +13,11 @@ use growlerdb_core::{
 use growlerdb_index::{LocalIndexStore, Shard, ShardId, StoreError};
 use growlerdb_proto::v1::{
     AlterIndexRequest, AlterIndexResponse, AlterPlan as WireAlterPlan, BackupIndexRequest,
-    BackupIndexResponse, BackupStatusRequest, BackupStatusResponse, CompactIndexRequest,
-    CompactIndexResponse, DescribeIndexRequest, DescribeIndexResponse, IndexStats,
-    ReconcileIndexRequest, ReconcileIndexResponse, ReindexIndexRequest, ReindexIndexResponse,
-    ReindexPhase, VectorFieldStat,
+    BackupIndexResponse, BackupStatusRequest, BackupStatusResponse, CancelReindexRequest,
+    CancelReindexResponse, CompactIndexRequest, CompactIndexResponse, DescribeIndexRequest,
+    DescribeIndexResponse, IndexStats, ReconcileIndexRequest, ReconcileIndexResponse,
+    ReindexIndexRequest, ReindexIndexResponse, ReindexPhase, ReindexStatusRequest,
+    ReindexStatusResponse, VectorFieldStat,
 };
 use growlerdb_proto::{Admin, AdminServer};
 use growlerdb_source::{IcebergConfig, IcebergReader};
@@ -43,6 +45,25 @@ struct SourceContext {
     /// service rejects new writes (no rebuild-window delta to drop) and a second reindex is
     /// refused (single-flight). Shared with the Node's [`WriteService`](crate::WriteService).
     fence: ReindexFence,
+    /// Live build progress + cancel signal for the reindex currently staging on this node — read by
+    /// [`ReindexStatus`](Admin::reindex_status) and tripped by [`CancelReindex`](Admin::cancel_reindex).
+    progress: Arc<ReindexProgress>,
+}
+
+/// The doc-level progress counter + cancel flag for one node's reindex. A node serves one shard of
+/// one index, so a single instance suffices. The populate loop stores `docs_done` and checks
+/// `cancel` each committed chunk; the coordinated multi-shard driver polls `ReindexStatus` to
+/// assemble a job's `docs_done / docs_total` and trips `cancel` via `CancelReindex`.
+#[derive(Default)]
+struct ReindexProgress {
+    /// A BUILD/FULL is actively populating a staged generation.
+    building: AtomicBool,
+    /// Documents committed into the staging generation so far this build.
+    docs_done: AtomicU64,
+    /// Source snapshot record count the build targets (0 = unknown / no build).
+    docs_total: AtomicU64,
+    /// Tripped by `CancelReindex`; the populate loop aborts the build when it observes this.
+    cancel: AtomicBool,
 }
 
 /// The accumulated outcome of a count-gated reconcile: counts over the divergent
@@ -151,6 +172,7 @@ impl AdminService {
             iceberg,
             table: table.into(),
             fence,
+            progress: Arc::new(ReindexProgress::default()),
         }));
         self
     }
@@ -580,13 +602,25 @@ impl Admin for AdminService {
         // read is driven on that same blocking thread via `block_on`; its sync sink writes each
         // bounded chunk straight into the staging shard (mirrors `Engine::build_from_source`), so
         // peak rebuild memory is O(one chunk), not O(table).
+        // Arm the live progress counter for this build: reset docs_done, fix docs_total to the
+        // source snapshot's record count, and clear any stale cancel flag from a prior op. The
+        // coordinated driver polls `ReindexStatus` off these atomics; the populate loop below bumps
+        // `docs_done` and aborts if `cancel` is tripped.
+        let progress = ctx.progress.clone();
+        progress.docs_done.store(0, Ordering::Relaxed);
+        progress
+            .docs_total
+            .store(records.unwrap_or(0).max(0) as u64, Ordering::Relaxed);
+        progress.cancel.store(false, Ordering::Relaxed);
+        progress.building.store(true, Ordering::Relaxed);
+
         let store = ctx.store.clone();
         let shard_id = ctx.shard_id.clone();
         let table = ctx.table.clone();
         let index_name = self.index.clone();
         let handle = tokio::runtime::Handle::current();
-        let (promoted_opt, doc_count) =
-            run_blocking(move || -> Result<(Option<Shard>, u64), StoreError> {
+        let build_progress = progress.clone();
+        let build = run_blocking(move || -> Result<(Option<Shard>, u64), StoreError> {
                 let mut doc_count = 0u64;
                 // Populate the staging shard from the source — shared by the FULL (build+promote)
                 // and BUILD (stage-only) paths. Sub-commit each streamed chunk in bounded slices so
@@ -603,6 +637,13 @@ impl Admin for AdminService {
                                     docs.retain(|d| router.owns(&d.doc.key, *ordinal));
                                 }
                                 doc_count += docs.len() as u64;
+                                // Publish live progress and honor a cancel requested between chunks:
+                                // abort the streamed read so the build unwinds (the fence is released
+                                // and the coordinated driver DISCARDs the staged generation).
+                                build_progress.docs_done.store(doc_count, Ordering::Relaxed);
+                                if build_progress.cancel.load(Ordering::Relaxed) {
+                                    return Err("reindex canceled".to_string());
+                                }
                                 for chunk in docs.chunks(REINDEX_COMMIT_CHUNK) {
                                     seq += 1;
                                     IndexWriter::write(
@@ -642,8 +683,26 @@ impl Admin for AdminService {
                     Ok((Some(promoted), doc_count))
                 }
             })
-            .await?
-            .map_err(internal)?;
+            .await;
+        // The build is over (success or abort): stop advertising it as in-flight before we
+        // interpret the result, so a concurrent `ReindexStatus` never reports a finished build as
+        // still building.
+        progress.building.store(false, Ordering::Relaxed);
+        let (promoted_opt, doc_count) = match build? {
+            Ok(v) => v,
+            Err(e) => {
+                // A cancel abort is a deliberate stop, not a failure: report it as CANCELLED so the
+                // coordinated driver marks the job Canceled (and DISCARDs the staged generations)
+                // rather than Failed. The fence_guard drops here, releasing the write-fence.
+                if progress.cancel.load(Ordering::Relaxed) {
+                    return Err(Status::cancelled(format!(
+                        "reindex of `{}` canceled",
+                        self.index
+                    )));
+                }
+                return Err(internal(e));
+            }
+        };
 
         match promoted_opt {
             Some(promoted) => {
@@ -676,6 +735,46 @@ impl Admin for AdminService {
                 }))
             }
         }
+    }
+
+    #[tracing::instrument(name = "admin.reindex_status", skip_all, err)]
+    async fn reindex_status(
+        &self,
+        request: Request<ReindexStatusRequest>,
+    ) -> Result<Response<ReindexStatusResponse>, Status> {
+        auth::authorize(&self.auth, "ReindexStatus", &request)?;
+        let req = request.into_inner();
+        check_served(&req.index, &self.index)?;
+        let ctx = self.source.as_ref().ok_or_else(|| {
+            Status::unimplemented("this node was started without source access for reindex")
+        })?;
+        let p = &ctx.progress;
+        Ok(Response::new(ReindexStatusResponse {
+            building: p.building.load(Ordering::Relaxed),
+            docs_done: p.docs_done.load(Ordering::Relaxed),
+            docs_total: p.docs_total.load(Ordering::Relaxed),
+            cancel_requested: p.cancel.load(Ordering::Relaxed),
+        }))
+    }
+
+    #[tracing::instrument(name = "admin.cancel_reindex", skip_all, err)]
+    async fn cancel_reindex(
+        &self,
+        request: Request<CancelReindexRequest>,
+    ) -> Result<Response<CancelReindexResponse>, Status> {
+        auth::authorize(&self.auth, "CancelReindex", &request)?;
+        let req = request.into_inner();
+        check_served(&req.index, &self.index)?;
+        let ctx = self.source.as_ref().ok_or_else(|| {
+            Status::unimplemented("this node was started without source access for reindex")
+        })?;
+        // Trip the flag the populate loop checks each chunk. A build in flight aborts (returning
+        // CANCELLED from ReindexIndex); with no build active this is a harmless ack — the next BUILD
+        // clears the flag before it starts, so a stale cancel can never kill a fresh build.
+        let was_building = ctx.progress.building.load(Ordering::Relaxed);
+        ctx.progress.cancel.store(true, Ordering::Relaxed);
+        tracing::info!(index = %self.index, was_building, "reindex: cancel requested");
+        Ok(Response::new(CancelReindexResponse { was_building }))
     }
 
     #[tracing::instrument(name = "admin.reconcile_index", skip_all, err)]
@@ -1471,6 +1570,73 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reindex_status_and_cancel_without_source_are_unimplemented() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path()); // built via `new` ⇒ no source context
+        let s = svc
+            .reindex_status(Request::new(ReindexStatusRequest {
+                index: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(s.code(), Code::Unimplemented);
+        let c = svc
+            .cancel_reindex(Request::new(CancelReindexRequest {
+                index: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(c.code(), Code::Unimplemented);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_trips_the_flag_that_reindex_status_reports() {
+        // CancelReindex sets the abort flag the populate loop observes; ReindexStatus reads it back.
+        // No build is in flight here, so it's a harmless ack (`was_building = false`) whose only
+        // visible effect is the flag — which the next BUILD would clear before starting.
+        let (resolved, _src) = alter_fixtures();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalIndexStore::open(tmp.path()).unwrap();
+        let shard_id = ShardId::single("docs");
+        let shard = store.create_shard(&shard_id, &resolved).unwrap();
+        let svc = AdminService::new(Arc::new(shard), "docs").with_source(
+            resolved,
+            store,
+            shard_id,
+            IcebergConfig::local(),
+            "g.docs",
+            ReindexFence::new(),
+        );
+
+        let before = svc
+            .reindex_status(Request::new(ReindexStatusRequest {
+                index: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!before.building && !before.cancel_requested && before.docs_done == 0);
+
+        let ack = svc
+            .cancel_reindex(Request::new(CancelReindexRequest {
+                index: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!ack.was_building);
+
+        let after = svc
+            .reindex_status(Request::new(ReindexStatusRequest {
+                index: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(after.cancel_requested);
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -3862,6 +3862,22 @@ mod tests {
                 snapshot: 1,
             }))
         }
+        async fn reindex_status(
+            &self,
+            _r: Request<growlerdb_proto::v1::ReindexStatusRequest>,
+        ) -> Result<Response<growlerdb_proto::v1::ReindexStatusResponse>, Status> {
+            Ok(Response::new(
+                growlerdb_proto::v1::ReindexStatusResponse::default(),
+            ))
+        }
+        async fn cancel_reindex(
+            &self,
+            _r: Request<growlerdb_proto::v1::CancelReindexRequest>,
+        ) -> Result<Response<growlerdb_proto::v1::CancelReindexResponse>, Status> {
+            Ok(Response::new(
+                growlerdb_proto::v1::CancelReindexResponse::default(),
+            ))
+        }
         async fn reconcile_index(
             &self,
             _r: Request<growlerdb_proto::v1::ReconcileIndexRequest>,
@@ -3983,8 +3999,9 @@ mod tests {
             .all(|(_, n)| *n == growlerdb_core::routing::NUM_BUCKETS as usize));
     }
 
-    /// Coordinated whole-index reindex: every shard BUILDs its next generation, then every shard
-    /// PROMOTEs (all builds precede any promote), and the routing generation is bumped once at cutover.
+    /// Coordinated whole-index reindex: every shard runs BUILD for its next generation, then every
+    /// shard runs PROMOTE (all builds precede any promote), and the routing generation is bumped
+    /// once at cutover.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn coordinated_reindex_builds_all_then_promotes_all_and_bumps_generation() {
         let tmp = tempfile::tempdir().unwrap();

@@ -11,11 +11,12 @@ use std::sync::{Arc, RwLock};
 use growlerdb_proto::v1::Error as WireError;
 use growlerdb_proto::v1::{
     AggregateRequest, AggregateResponse, AlterIndexRequest, AlterIndexResponse, BackupIndexRequest,
-    BackupIndexResponse, BackupStatusRequest, BackupStatusResponse, ClosePitRequest,
-    ClosePitResponse, CompactIndexRequest, CompactIndexResponse, DescribeIndexRequest,
-    DescribeIndexResponse, ExplainRequest, ExplainResponse, ExportRequest, GetByKeyRequest,
-    GetByKeyResponse, OpenPitRequest, OpenPitResponse, ReconcileIndexRequest,
-    ReconcileIndexResponse, ReindexIndexRequest, ReindexIndexResponse, SearchRequest,
+    BackupIndexResponse, BackupStatusRequest, BackupStatusResponse, CancelReindexRequest,
+    CancelReindexResponse, ClosePitRequest, ClosePitResponse, CompactIndexRequest,
+    CompactIndexResponse, DescribeIndexRequest, DescribeIndexResponse, ExplainRequest,
+    ExplainResponse, ExportRequest, GetByKeyRequest, GetByKeyResponse, OpenPitRequest,
+    OpenPitResponse, ReconcileIndexRequest, ReconcileIndexResponse, ReindexIndexRequest,
+    ReindexIndexResponse, ReindexStatusRequest, ReindexStatusResponse, SearchRequest,
     SearchResponse, SemanticSearchRequest, SuggestRequest, SuggestResponse,
 };
 use growlerdb_proto::{
@@ -329,6 +330,24 @@ impl Admin for WindowedAdminService {
         &self,
         _request: Request<ReindexIndexRequest>,
     ) -> Result<Response<ReindexIndexResponse>, Status> {
+        Err(Status::unimplemented(
+            "reindex is not supported over a distributed windowed index",
+        ))
+    }
+
+    async fn reindex_status(
+        &self,
+        _request: Request<ReindexStatusRequest>,
+    ) -> Result<Response<ReindexStatusResponse>, Status> {
+        Err(Status::unimplemented(
+            "reindex is not supported over a distributed windowed index",
+        ))
+    }
+
+    async fn cancel_reindex(
+        &self,
+        _request: Request<CancelReindexRequest>,
+    ) -> Result<Response<CancelReindexResponse>, Status> {
         Err(Status::unimplemented(
             "reindex is not supported over a distributed windowed index",
         ))

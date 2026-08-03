@@ -149,6 +149,32 @@ message ReindexIndexResponse {
   uint64 snapshot = 2;    // the rebuilt index's commit snapshot (the build snapshot for BUILD)
 }
 
+// Live build progress of the reindex currently staging on this node — the doc-level counter the
+// coordinated multi-shard reindex polls per shard so a job can report `docs_done / docs_total`.
+// `docs_total` is the source table's snapshot record count fixed when the BUILD began (0 when no
+// build is active or the source count is unknown). Cheap: reads a few atomics, no shard I/O.
+message ReindexStatusRequest {
+  string index = 1;  // empty ⇒ the served index
+}
+message ReindexStatusResponse {
+  // Whether a BUILD is currently populating a staged generation on this node. When false the
+  // counters describe the last build (or are zero if none ran since boot).
+  bool building = 1;
+  uint64 docs_done = 2;   // documents committed into the staging generation so far
+  uint64 docs_total = 3;  // source snapshot record count the build targets (0 = unknown)
+  bool cancel_requested = 4; // a CancelReindex tripped the abort flag the populate loop observes
+}
+
+// Trip the per-node cancel flag the reindex populate loop checks each committed chunk: an in-flight
+// BUILD aborts (returning CANCELLED), so the coordinated driver can DISCARD every staged generation
+// and release the fences. A no-op ack when no build is active. Idempotent.
+message CancelReindexRequest {
+  string index = 1;  // empty ⇒ the served index
+}
+message CancelReindexResponse {
+  bool was_building = 1; // true iff a build was in progress when the flag was tripped
+}
+
 // Reconcile the served shard against the source's current snapshot: the drift backstop that both
 // detects and repairs silently lost/orphaned rows regardless of cause. Shard-scoped like a reshard
 // reindex — `bucket_owners` + `shard_ordinal` restrict the comparison to the keys THIS shard owns,
@@ -224,6 +250,11 @@ service Admin {
   rpc AlterIndex(AlterIndexRequest) returns (AlterIndexResponse);
   // Rebuild the index from its source and durably swap it live.
   rpc ReindexIndex(ReindexIndexRequest) returns (ReindexIndexResponse);
+  // Live doc-level build progress of an in-flight reindex — polled per shard by the coordinated
+  // driver so an async reindex job can report `docs_done / docs_total`.
+  rpc ReindexStatus(ReindexStatusRequest) returns (ReindexStatusResponse);
+  // Cancel an in-flight reindex build on this node: trip the populate loop's abort flag.
+  rpc CancelReindex(CancelReindexRequest) returns (CancelReindexResponse);
   // Reconcile the served shard against the source and repair drift (backstop).
   rpc ReconcileIndex(ReconcileIndexRequest) returns (ReconcileIndexResponse);
   // Compact the served shard's segments.
