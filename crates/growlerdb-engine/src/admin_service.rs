@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 
 use growlerdb_core::{
     BucketMap, CommitBatch, CompositeKey, IndexDefinition, IndexWriter, LocatedDoc, ResolvedIndex,
-    ShardRouter, SourceCheckpoint, SourceSchema,
+    ScanMode, ShardRouter, SourceCheckpoint, SourceSchema,
 };
 use growlerdb_index::{LocalIndexStore, Shard, ShardId, StoreError};
 use growlerdb_proto::v1::{
@@ -24,6 +24,7 @@ use growlerdb_source::{IcebergConfig, IcebergReader};
 use tonic::{Request, Response, Status};
 
 use crate::auth::{self, default_auth, SharedAuth};
+use crate::engine::scan_mode;
 use crate::fence::{ReindexFence, ReindexGuard};
 use crate::service_util::{check_served, internal, run_blocking};
 use crate::shard_handle::ShardHandle;
@@ -41,10 +42,17 @@ struct SourceContext {
     shard_id: ShardId,
     iceberg: IcebergConfig,
     table: String,
-    /// Shared reindex write-fence: engaged for the duration of a reindex so the Write
-    /// service rejects new writes (no rebuild-window delta to drop) and a second reindex is
-    /// refused (single-flight). Shared with the Node's [`WriteService`](crate::WriteService).
+    /// Shared reindex write-fence: engaged **only for the brief cutover** (PROMOTE/FULL swap) so the
+    /// Write service rejects the in-flight write that would otherwise land on the about-to-be-swapped
+    /// generation. The rebuild BUILD runs **unfenced** — writes keep flowing to the live generation,
+    /// and the connector replays the build-window delta after cutover (or the append catch-up
+    /// pre-applies it). Shared with the Node's [`WriteService`](crate::WriteService).
     fence: ReindexFence,
+    /// **Build single-flight**: a staged generation is pending between BUILD and its PROMOTE/DISCARD.
+    /// Set when BUILD (or FULL) starts and held until the cutover completes, so a second reindex is
+    /// refused. Distinct from `fence` — this guards the staging directory across the *unfenced* build,
+    /// where the write-fence (now cutover-only) no longer serves as the single-flight guard.
+    staged: std::sync::atomic::AtomicBool,
     /// Live build progress + cancel signal for the reindex currently staging on this node — read by
     /// [`ReindexStatus`](Admin::reindex_status) and tripped by [`CancelReindex`](Admin::cancel_reindex).
     progress: Arc<ReindexProgress>,
@@ -64,6 +72,29 @@ struct ReindexProgress {
     docs_total: AtomicU64,
     /// Tripped by `CancelReindex`; the populate loop aborts the build when it observes this.
     cancel: AtomicBool,
+}
+
+/// RAII single-flight guard over [`SourceContext::staged`]: clears the flag on drop unless
+/// [`disarm`](Self::disarm)ed. A failed BUILD drops it (freeing the build slot for a retry); a
+/// successful BUILD disarms it so the staged generation stays claimed until its PROMOTE/DISCARD.
+struct StagedGuard(Option<Arc<SourceContext>>);
+
+impl StagedGuard {
+    fn new(ctx: Arc<SourceContext>) -> Self {
+        Self(Some(ctx))
+    }
+    /// Keep the staging slot claimed past this scope (a successful build awaiting cutover).
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for StagedGuard {
+    fn drop(&mut self) {
+        if let Some(ctx) = self.0.take() {
+            ctx.staged.store(false, Ordering::Relaxed);
+        }
+    }
 }
 
 /// The accumulated outcome of a count-gated reconcile: counts over the divergent
@@ -172,6 +203,7 @@ impl AdminService {
             iceberg,
             table: table.into(),
             fence,
+            staged: std::sync::atomic::AtomicBool::new(false),
             progress: Arc::new(ReindexProgress::default()),
         }));
         self
@@ -180,6 +212,94 @@ impl AdminService {
     /// Wrap as a mountable tonic [`AdminServer`].
     pub fn into_server(self) -> AdminServer<Self> {
         AdminServer::new(self)
+    }
+
+    /// **Write catch-up before the cutover** (append fast-path only). The BUILD ran unfenced, so the
+    /// live generation advanced while it built; this pre-applies the source rows appended since the
+    /// staged generation's checkpoint onto the staging shard and stamps it at the caught-up **head**,
+    /// so the promoted generation is at ~head and the connector resumes with `from <= current` — no
+    /// `CheckpointGap`, and (near-)nothing to replay after cutover. Runs **under the cutover
+    /// write-fence**, so the live checkpoint it aligns past cannot advance meanwhile.
+    ///
+    /// A **no-op for a changelog index**: the node has no bounded delete-aware delta reader, so the
+    /// staged generation stays at the build snapshot and the connector's delete-aware changelog replay
+    /// (resuming from that checkpoint) brings the new generation up to head after cutover — correct,
+    /// just with a brief post-cutover replay.
+    async fn catch_up_before_promote(
+        &self,
+        ctx: &Arc<SourceContext>,
+        resolved: &ResolvedIndex,
+        req: &ReindexIndexRequest,
+    ) -> Result<(), Status> {
+        if scan_mode(resolved) != ScanMode::AppendFastPath {
+            return Ok(());
+        }
+        // Same reshard filter as the build: keep only the rows this shard owns.
+        let filter: Option<(ShardRouter, u32)> = if req.bucket_owners.is_empty() {
+            None
+        } else {
+            let map = BucketMap::from_owners(req.bucket_owners.clone())
+                .map_err(|e| Status::invalid_argument(format!("bucket map: {e}")))?;
+            Some((
+                ShardRouter::bucketed(resolved.routing_strategy(), map),
+                req.shard_ordinal,
+            ))
+        };
+        let reader = IcebergReader::connect(&ctx.iceberg)
+            .await
+            .map_err(internal)?;
+        let store = ctx.store.clone();
+        let shard_id = ctx.shard_id.clone();
+        let table = ctx.table.clone();
+        let resolved = resolved.clone();
+        let index_name = self.index.clone();
+        let handle = tokio::runtime::Handle::current();
+        run_blocking(move || -> Result<(), StoreError> {
+            // Reopen the staged generation and read where it currently sits (the build snapshot).
+            let staging = store.open_staging(&shard_id, &resolved)?;
+            let since = staging.current_checkpoint()?.map(|cp| cp.snapshot_id());
+            // Read the source rows appended since, with the head's lineage sequence for an ordered stamp.
+            let batch = handle
+                .block_on(reader.read_documents_appended_since_ordered(&table, &resolved, since))
+                .map_err(|e| StoreError::Source(e.to_string()))?;
+            let head_id = batch.snapshot_id;
+            let head_cp = match batch.sequence_number {
+                Some(seq) => SourceCheckpoint::iceberg_ordered(head_id, seq),
+                None => SourceCheckpoint::iceberg(head_id),
+            };
+            let mut docs = batch.docs;
+            if let Some((router, ord)) = &filter {
+                docs.retain(|d| router.owns(&d.doc.key, *ord));
+            }
+            let appended = docs.len();
+            // Apply the delta in bounded chunks (each a bootstrap-style batch stamped at the head), so
+            // continuity `Apply`s them onto the staged generation and advances its checkpoint to head.
+            for (i, chunk) in docs.chunks(REINDEX_COMMIT_CHUNK).enumerate() {
+                IndexWriter::write(
+                    &staging,
+                    &CommitBatch::from_upserts(
+                        chunk.to_vec(),
+                        head_cp.clone(),
+                        format!("reindex-catchup-{head_id}-{i}"),
+                    ),
+                )?;
+            }
+            if appended == 0 {
+                // No appended rows, but still advance the staged checkpoint to head so the promoted
+                // generation doesn't sit behind the live one (which would gap the connector's resume).
+                IndexWriter::write(
+                    &staging,
+                    &CommitBatch::from_upserts(Vec::new(), head_cp, format!("reindex-catchup-{head_id}-cp")),
+                )?;
+            }
+            tracing::info!(index = %index_name, appended, head = head_id, "reindex: append catch-up before cutover");
+            // Dropping `staging` flushes + closes its writer, so promote_generation swaps in the
+            // caught-up data.
+            Ok(())
+        })
+        .await?
+        .map_err(internal)?;
+        Ok(())
     }
 
     /// Per-partition count-gated reconcile. Returns `Some(result)` when the gate applied
@@ -485,6 +605,18 @@ impl Admin for AdminService {
                     .expect("definition lock not poisoned")
                     .clone()
             });
+            // Engage the write-fence for the **cutover only** (the BUILD ran unfenced): the fence
+            // rejects the in-flight write that would otherwise land on the generation we are about to
+            // swap aside. A failing promote drops the guard, releasing it.
+            if !ctx.fence.engage() {
+                return Err(Status::failed_precondition(
+                    "a reindex cutover is already in progress for this index",
+                ));
+            }
+            let fence_guard = ReindexGuard::new(ctx.fence.clone());
+            // Append fast-path catch-up: pre-apply the source delta since the build so the staged
+            // generation is stamped at ~head and the connector has ~nothing to replay after cutover.
+            self.catch_up_before_promote(ctx, &resolved, &req).await?;
             let store = ctx.store.clone();
             let shard_id = ctx.shard_id.clone();
             let promoted = run_blocking(move || store.promote_generation(&shard_id, &resolved))
@@ -492,15 +624,17 @@ impl Admin for AdminService {
                 .map_err(internal)?;
             let snapshot = promoted.current_snapshot().map_err(internal)?;
             let doc_count = promoted.num_docs().map_err(internal)?;
-            // Install the promoted generation as the live shard, then release the fence — writes
-            // resume against the new generation.
+            // Install the promoted generation as the live shard.
             self.shard.swap(Arc::new(promoted));
             // Adopt the new definition as the served baseline (a schema-changing alter), so later
             // writes/reindexes use it. Durable because the CP registry is the source of truth.
             if let Some(def) = new_def {
                 *ctx.resolved.write().expect("definition lock not poisoned") = def;
             }
-            ctx.fence.release();
+            // Cutover done: release the fence and clear the build single-flight slot.
+            drop(fence_guard);
+            ctx.staged
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(index = %self.index, snapshot, "reindex: promoted the staged generation");
             return Ok(Response::new(ReindexIndexResponse {
                 doc_count,
@@ -513,28 +647,42 @@ impl Admin for AdminService {
             run_blocking(move || store.discard_staging(&shard_id))
                 .await?
                 .map_err(internal)?;
+            // Release the cutover fence if a failed promote left it engaged, and free the build slot.
             ctx.fence.release();
+            ctx.staged
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(index = %self.index, "reindex: discarded the staged generation");
             return Ok(Response::new(ReindexIndexResponse {
                 doc_count: 0,
                 snapshot: 0,
             }));
         }
-        // FULL (one-shot) or BUILD (stage only, leave fenced for a later PROMOTE).
+        // FULL (one-shot) or BUILD (stage only; a later PROMOTE cuts it over).
         let build_only = matches!(phase, ReindexPhase::Build);
 
-        // Fence: engaging is the single-flight guard (a second reindex is refused) AND
-        // it makes the Write service reject new writes for the duration — so the connector can't
-        // advance the shard past the rebuild snapshot, a delta the swap would otherwise drop.
-        if !ctx.fence.engage() {
+        // Build single-flight: claim the staging slot (a second reindex is refused). Unlike the old
+        // model this does NOT engage the write-fence — the BUILD runs **unfenced**, so writes keep
+        // flowing to the live generation and the connector replays the build-window delta after
+        // cutover (or the append catch-up pre-applies it). The fence is engaged only for the brief
+        // cutover in PROMOTE/FULL.
+        if ctx
+            .staged
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
             return Err(Status::failed_precondition(
                 "a reindex is already in progress for this index",
             ));
         }
-        // Held across BUILD..PROMOTE: for BUILD we disarm this guard on success so the fence stays
-        // engaged until the control plane PROMOTEs/DISCARDs; any error before then drops it, so a
-        // failed build never leaves writes fenced.
-        let fence_guard = ReindexGuard::new(ctx.fence.clone());
+        // RAII: clear the staging slot on any early return (a failed build), so a retry can proceed.
+        // A successful BUILD disarms it so the slot stays claimed until PROMOTE/DISCARD; FULL clears
+        // it explicitly after its own cutover below.
+        let staged_guard = StagedGuard::new(ctx.clone());
 
         // Rebuild against the NEW definition when a durable alter supplied one, else the served one.
         let resolved = new_def.clone().unwrap_or_else(|| {
@@ -620,7 +768,9 @@ impl Admin for AdminService {
         let index_name = self.index.clone();
         let handle = tokio::runtime::Handle::current();
         let build_progress = progress.clone();
-        let build = run_blocking(move || -> Result<(Option<Shard>, u64), StoreError> {
+        // The build closure takes the definition by move; keep the original for the FULL cutover below.
+        let build_resolved = resolved.clone();
+        let build = run_blocking(move || -> Result<u64, StoreError> {
                 let mut doc_count = 0u64;
                 // Populate the staging shard from the source — shared by the FULL (build+promote)
                 // and BUILD (stage-only) paths. Sub-commit each streamed chunk in bounded slices so
@@ -630,7 +780,7 @@ impl Admin for AdminService {
                     let mut seq = 0u64;
                     handle
                         .block_on(
-                            reader.read_documents_streamed(&table, &resolved, |mut docs| {
+                            reader.read_documents_streamed(&table, &build_resolved, |mut docs| {
                                 // Reshard: drop docs this shard no longer owns under the new
                                 // map, so the rebuilt shard holds only its post-reshard buckets.
                                 if let Some((router, ordinal)) = &reshard_filter {
@@ -673,27 +823,22 @@ impl Admin for AdminService {
                     }
                     Ok(())
                 };
-                if build_only {
-                    // Stage the next generation without cutting over — the live shard keeps serving
-                    // and the fence stays engaged until the control plane PROMOTEs/DISCARDs.
-                    store.build_staging_generation(&shard_id, &resolved, populate)?;
-                    Ok((None, doc_count))
-                } else {
-                    let promoted = store.reindex(&shard_id, &resolved, populate)?;
-                    Ok((Some(promoted), doc_count))
-                }
+                // Stage the next generation WITHOUT promoting — both BUILD and FULL build the staging
+                // shard unfenced; the cutover (swap) happens below, under the brief write-fence.
+                store.build_staging_generation(&shard_id, &build_resolved, populate)?;
+                Ok(doc_count)
             })
             .await;
         // The build is over (success or abort): stop advertising it as in-flight before we
         // interpret the result, so a concurrent `ReindexStatus` never reports a finished build as
         // still building.
         progress.building.store(false, Ordering::Relaxed);
-        let (promoted_opt, doc_count) = match build? {
+        let doc_count = match build? {
             Ok(v) => v,
             Err(e) => {
                 // A cancel abort is a deliberate stop, not a failure: report it as CANCELLED so the
-                // coordinated driver marks the job Canceled (and DISCARDs the staged generations)
-                // rather than Failed. The fence_guard drops here, releasing the write-fence.
+                // coordinated driver marks the job Canceled (and DISCARDs the staged generation)
+                // rather than Failed. `staged_guard` drops here, freeing the build slot.
                 if progress.cancel.load(Ordering::Relaxed) {
                     return Err(Status::cancelled(format!(
                         "reindex of `{}` canceled",
@@ -704,37 +849,52 @@ impl Admin for AdminService {
             }
         };
 
-        match promoted_opt {
-            Some(promoted) => {
-                let snapshot = promoted.current_snapshot().map_err(internal)?;
-                // Install the rebuilt shard as the live one — every service sees it at once.
-                self.shard.swap(Arc::new(promoted));
-                // FULL from a durable alter: adopt the new definition as the served baseline.
-                if let Some(def) = new_def {
-                    *ctx.resolved.write().expect("definition lock not poisoned") = def;
-                }
-                tracing::info!(index = %self.index, snapshot, "reindex: promoted the rebuilt shard");
-                // fence_guard drops here → the fence is released (FULL is self-contained).
-                Ok(Response::new(ReindexIndexResponse {
-                    doc_count,
-                    snapshot,
-                }))
-            }
-            None => {
-                // BUILD: keep the fence engaged so writes stay blocked until the control plane
-                // PROMOTEs/DISCARDs this staged generation — disarm the RAII guard to hold it.
-                std::mem::forget(fence_guard);
-                tracing::info!(
-                    index = %self.index,
-                    snapshot = snapshot_id,
-                    "reindex: staged the next generation (fenced, awaiting cutover)"
-                );
-                Ok(Response::new(ReindexIndexResponse {
-                    doc_count,
-                    snapshot: snapshot_id as u64,
-                }))
-            }
+        if build_only {
+            // BUILD: leave the staged generation for a later coordinated PROMOTE — keep the slot
+            // claimed by disarming the guard. Nothing is fenced; writes kept flowing throughout.
+            staged_guard.disarm();
+            tracing::info!(
+                index = %self.index,
+                snapshot = snapshot_id,
+                "reindex: staged the next generation (unfenced, awaiting cutover)"
+            );
+            return Ok(Response::new(ReindexIndexResponse {
+                doc_count,
+                snapshot: snapshot_id as u64,
+            }));
         }
+
+        // FULL (one-shot embedded): cut over here. Engage the write-fence for the brief cutover, run
+        // the append catch-up, promote + swap, then release the fence and free the build slot.
+        if !ctx.fence.engage() {
+            return Err(Status::failed_precondition(
+                "a reindex cutover is already in progress for this index",
+            ));
+        }
+        let fence_guard = ReindexGuard::new(ctx.fence.clone());
+        self.catch_up_before_promote(ctx, &resolved, &req).await?;
+        let store = ctx.store.clone();
+        let shard_id = ctx.shard_id.clone();
+        let promote_def = resolved.clone();
+        let promoted = run_blocking(move || store.promote_generation(&shard_id, &promote_def))
+            .await?
+            .map_err(internal)?;
+        let snapshot = promoted.current_snapshot().map_err(internal)?;
+        let doc_count = promoted.num_docs().map_err(internal)?;
+        self.shard.swap(Arc::new(promoted));
+        // FULL from a durable alter: adopt the new definition as the served baseline.
+        if let Some(def) = new_def {
+            *ctx.resolved.write().expect("definition lock not poisoned") = def;
+        }
+        drop(fence_guard);
+        staged_guard.disarm();
+        ctx.staged
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(index = %self.index, snapshot, "reindex: promoted the rebuilt shard");
+        Ok(Response::new(ReindexIndexResponse {
+            doc_count,
+            snapshot,
+        }))
     }
 
     #[tracing::instrument(name = "admin.reindex_status", skip_all, err)]
@@ -1560,8 +1720,14 @@ mod tests {
             ReindexFence::new(),
         );
 
-        // Simulate a reindex already running (the fence is engaged).
-        assert!(svc.source.as_ref().unwrap().fence.engage());
+        // Simulate a reindex already staged (the build single-flight slot is claimed). A second
+        // BUILD is refused rather than trampling the shared staging dir. (The BUILD now runs
+        // unfenced, so `staged` — not the write-fence — is the single-flight guard.)
+        svc.source
+            .as_ref()
+            .unwrap()
+            .staged
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let err = svc
             .reindex_index(Request::new(ReindexIndexRequest {
                 index: String::new(),
@@ -1570,6 +1736,51 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn discard_frees_the_build_slot_and_releases_the_cutover_fence() {
+        // DISCARD is the abort/unwind: it frees the build single-flight slot and releases the
+        // write-fence a failed cutover may have left engaged — so writes resume and a retry can build.
+        let (resolved, _src) = alter_fixtures();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalIndexStore::open(tmp.path()).unwrap();
+        let shard_id = ShardId::single("docs");
+        let shard = store.create_shard(&shard_id, &resolved).unwrap();
+        let fence = ReindexFence::new();
+        let svc = AdminService::new(Arc::new(shard), "docs").with_source(
+            resolved,
+            store,
+            shard_id,
+            IcebergConfig::local(),
+            "g.docs",
+            fence.clone(),
+        );
+        // Simulate a staged generation whose cutover engaged the fence and then failed.
+        svc.source
+            .as_ref()
+            .unwrap()
+            .staged
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(fence.engage());
+
+        svc.reindex_index(Request::new(ReindexIndexRequest {
+            index: String::new(),
+            phase: ReindexPhase::Discard as i32,
+            ..Default::default()
+        }))
+        .await
+        .expect("discard succeeds");
+
+        assert!(!fence.is_engaged(), "discard released the cutover fence");
+        assert!(
+            !svc.source
+                .as_ref()
+                .unwrap()
+                .staged
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "discard freed the build single-flight slot"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

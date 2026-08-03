@@ -869,7 +869,7 @@ fn shard_build_filter(
 }
 
 /// The scan mode of a resolved index's source.
-fn scan_mode(resolved: &ResolvedIndex) -> ScanMode {
+pub(crate) fn scan_mode(resolved: &ResolvedIndex) -> ScanMode {
     match &resolved.source {
         Source::Iceberg(s) => s.scan,
     }
