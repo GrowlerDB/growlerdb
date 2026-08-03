@@ -9,8 +9,10 @@ timestamp: 2026-07-04T14:22:00
 # Reindex
 
 Rebuild an index from its Iceberg source — after a definition change, a source recreation, or to move
-to a new shard layout. `POST /v1/index:reindex` (CLI `growlerdb reindex --control-plane`), served by
-the gateway (which forwards a multi-shard index to the control plane) or a single embedded node.
+to a new shard layout. Run it **asynchronously as a job** (`POST /v1/jobs` → a job id, the first-class
+path for a long-running multi-shard rebuild) or **synchronously** (`POST /v1/index:reindex`, served by
+the gateway which forwards a multi-shard index to the control plane, or a single embedded node). Both
+drive the same orchestration.
 
 ## Coordinated multi-shard reindex
 
@@ -31,6 +33,26 @@ Each node's phase is BUILD / PROMOTE / DISCARD; the write-fence is held across B
 can't advance a shard past its build snapshot. Reads stay up throughout; writes pause only for the brief
 final drain, not the whole rebuild.
 
+## Async jobs
+
+A coordinated reindex is long-running, so the control plane models it as a durable **job**: `POST /v1/jobs`
+returns `202` with a job id immediately, and the driver advances it through
+`pending → building → cutting_over → done` (or `failed` / `canceled`), recording each shard's phase and
+live `docs_done / docs_total` as it builds.
+
+- **Poll** `GET /v1/jobs/{id}` (or `GET /v1/jobs` for the list) for per-shard progress; the CLI
+  `growlerdb reindex --control-plane` streams it to the terminal, `--detach` returns the id, and
+  `growlerdb jobs list|get|cancel` manage jobs.
+- **Cancel** `DELETE /v1/jobs/{id}` trips a per-node flag the build's populate loop observes; the
+  in-flight build aborts, every staged generation is discarded (fences released), and the old generation
+  is left intact (no cutover).
+- **Crash-safe**: the jobs registry is durable; a job found non-terminal after a control-plane restart is
+  failed (its driver died), and since the cutover is a single generation compare-and-swap the index's old
+  generation is always intact. One coordinated reindex per index runs at a time.
+
+The synchronous `ReindexIndex` / `AlterIndex` RPCs create a job and await the same driver, so there is
+exactly one orchestration implementation behind both doors.
+
 ## Behavior
 
 - **Per-node single-flight**: a node rejects a concurrent reindex on its shard (412). No-source → 501;
@@ -43,6 +65,6 @@ final drain, not the whole rebuild.
 
 ## Notes
 
-**Remaining work:** an async job model (start → id, poll progress, cancel) and write catch-up (replay
-the build→cutover delta so writes never pause, removing the brief final fence) are follow-ups; today
-the trigger is synchronous and the final drain briefly fences writes.
+**Remaining work:** write catch-up (replay the build→cutover delta so writes never pause, removing the
+brief final fence) and windowed-index reindex (event-time windows, not buckets) are follow-ups; today the
+final drain briefly fences writes and a windowed index is Unimplemented.

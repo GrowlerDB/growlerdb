@@ -187,6 +187,23 @@ async fn list_get_drop_indexes_over_rest() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reindex_jobs_surface_over_rest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = control_app(&["docs"], tmp.path()).await;
+
+    // No jobs yet → an empty list.
+    let resp = app.clone().oneshot(get("/v1/jobs")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(text(resp).await, "{\"jobs\":[]}");
+
+    // Polling / canceling an unknown job id → 404 (NOT_FOUND), not a 500.
+    let resp = app.clone().oneshot(get("/v1/jobs/nope")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = app.clone().oneshot(delete("/v1/jobs/nope")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ingestion_status_over_rest() {
     let tmp = tempfile::tempdir().unwrap();
     let app = control_app(&["docs"], tmp.path()).await;
