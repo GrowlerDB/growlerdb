@@ -103,6 +103,30 @@
         </executions>
       </plugin>
 
+      <!-- Fat jar: bundle the gRPC/protobuf runtime so the plugin is a single self-contained
+           artifact (drop one jar into plugin/growlerdb/), excluding the `provided` trino-spi the
+           server supplies. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.6.2</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals><goal>shade</goal></goals>
+            <configuration>
+              <transformers>
+                <!-- Merge META-INF/services across bundled jars, else the multiple
+                     io.grpc.NameResolverProvider service files collide (last wins) and the `dns`
+                     resolver is dropped — a `host:port` channel then fails to resolve. Same reason
+                     as the Spark connector's shade config. -->
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+              </transformers>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>

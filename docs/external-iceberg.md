@@ -76,9 +76,12 @@ and add `--def /index.yaml` to its command.
 ## Part 2: ingest ongoing changes with the connector
 
 Part 1 indexes a snapshot. To keep the index current as your table changes, run the Spark
-connector, a `spark-submit` job that streams the Iceberg changelog into the node. Build the fat jar
-first (`cd connector && mise exec -- mvn -q -DskipTests package` → `target/growlerdb-connector-<version>.jar`),
-then submit it pointed at your table:
+connector, a `spark-submit` job that streams the Iceberg changelog into the node. You do not need
+Java/Maven on your host: download the fat jar (`growlerdb-connector-<version>.jar`) from a
+[GitHub Release](https://github.com/GrowlerDB/growlerdb/releases/latest), or use the pre-configured
+`ghcr.io/growlerdb/growlerdb-connector` image (the jar baked in at `/opt/growlerdb/connector.jar`).
+To build from source instead: `cd connector && mise exec -- mvn -q -DskipTests package` →
+`target/growlerdb-connector-<version>.jar`. Then submit it pointed at your table:
 
 ```sh
 spark-submit \

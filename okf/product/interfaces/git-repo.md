@@ -14,8 +14,10 @@ The GitHub repository is how users and contributors engage the open-source proje
 
 ## What you can do here
 
-- **Consume releases** — signed multi-arch container images, the Helm chart (OCI), and release
-  binaries with checksums, cut from SemVer tags.
+- **Consume releases** — signed multi-arch container images, the Helm chart (OCI), release binaries
+  with checksums, the JVM **connector fat jars** (Spark + Trino) and a pre-configured **connector
+  image**, and the **Python client** (wheel/sdist on the Release; PyPI when enabled) — cut from
+  SemVer tags. See [system/build](/system/build.md).
 - **Report issues** and request features via the **issue forms** (bug / feature), or open a
   **Discussion** for questions (see [how issues are handled](/quality/issues.md)). Security reports go
   privately through [GitHub Security Advisories](https://github.com/GrowlerDB/growlerdb/security/advisories/new).

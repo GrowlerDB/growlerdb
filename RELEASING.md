@@ -103,9 +103,29 @@ release workflow. One-time checklist:
   GitHub Release. Built on **native per-arch runners** (not `cross`) so the bundled local embedder
   links its native ONNX Runtime — the binaries require **glibc 2.38+** at runtime (same floor as the
   container image).
+- **Connector fat jars** — `growlerdb-connector-X.Y.Z.jar` (Spark) and
+  `growlerdb-trino-connector-X.Y.Z.jar` (Trino), each with a `.sha256`, attached to the GitHub
+  Release. Version-stamped to the tag (`versions:set`); the in-tree pom stays `0.0.0`.
+- **Pre-configured connector image** → `ghcr.io/growlerdb/growlerdb-connector` (an `apache/spark`
+  image with the Spark connector fat jar baked in), tagged `X.Y.Z` / `X.Y` / `X` / `latest` — run
+  ingestion without a host-side Java build. amd64 only (Spark clusters are amd64).
+- **Python client** — the pure-Python wheel + sdist (`growlerdb-*.whl` / `.tar.gz`) attached to the
+  GitHub Release, so `pip install <release-asset-url>` works immediately. It also publishes to
+  **PyPI** when the `PUBLISH_PYPI` repo variable is `true` (see below); the client keeps its own
+  SemVer (`clients/python/growlerdb/__init__.py`), independent of the tag-derived engine version.
 
-Client libraries (PyPI / crates.io) publish from their own subtrees once their versions are bumped;
-add those jobs as the client packages stabilize.
+### One-time: enable PyPI publishing
+
+The `pypi` job is opt-in so releases don't fail before the project exists. To turn it on:
+
+1. Claim the `growlerdb` project on PyPI and add a **Trusted Publisher** (GitHub Actions, this repo,
+   workflow `release.yml`, environment `pypi`) — no API token is stored.
+2. Create a repo **environment** named `pypi` (optionally with required reviewers).
+3. Set the repo **variable** `PUBLISH_PYPI=true` (Settings → Secrets and variables → Actions →
+   Variables). The next release then uploads the wheel/sdist to PyPI via OIDC.
+
+Connector jars can additionally go to **Maven Central** (Sonatype coordinates + signing) as a later
+step; the GitHub Release jars are the lighter first distribution.
 
 ## Verifying a release (consumers)
 
