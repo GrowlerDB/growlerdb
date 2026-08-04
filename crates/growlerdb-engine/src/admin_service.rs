@@ -1254,9 +1254,15 @@ fn empty_rebuild_abort_reason(doc_count: u64, records: Option<i64>) -> Option<St
     }
 }
 
-/// Headroom multiplier over the current index size for the free-disk precheck: the old, staging,
-/// and (briefly) backup copies coexist during the swap.
-const REINDEX_DISK_HEADROOM: u64 = 3;
+/// Free-disk headroom multiplier over the current index size for the reindex precheck.
+///
+/// The cutover swap never triples the data on disk: it `rename`s the old shard aside to a `*.old`
+/// backup and the staging shard into place (both O(1), same filesystem), then drops the backup — so
+/// the physical peak is ≈2× (1× live + 1× staging), only 1× of it *new*. The reindex therefore needs
+/// ≈1× the index size in *free* space for the staging copy; we require 2× to also absorb the
+/// transient scratch a Tantivy segment merge can hold mid-build. (Requiring 3× — 4× total — falsely
+/// blocked any index larger than a quarter of its disk, even with over half the disk free.)
+const REINDEX_DISK_HEADROOM: u64 = 2;
 
 /// The free-disk report for a shard's reindex: the current on-disk size, the ≈headroom `needed`
 /// estimate, the free bytes at its filesystem, and whether it fits. `probed = false` when the

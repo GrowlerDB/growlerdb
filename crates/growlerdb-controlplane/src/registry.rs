@@ -2029,6 +2029,48 @@ impl Registry {
         Ok(new)
     }
 
+    /// **Atomic reindex cutover commit.** Bumps the routing generation (CAS on `expected_gen`) and,
+    /// for a schema-changing alter, commits the new resolved `definition` (CAS on its
+    /// `expected_definition_version`) in the *same* locked mutation and *single* persist — so the
+    /// registry never advertises a schema its on-disk shards don't have. The driver reaches here only
+    /// after every shard has built and promoted, so a failed rebuild leaves both the definition and
+    /// the generation untouched (no split-brain, no boot-time `SchemaChanged` on a node that reloads
+    /// this definition). If either CAS loses to a concurrent op, nothing is written and the whole
+    /// cutover is refused. Pass `definition = None` for a plain reindex (generation-only), which is
+    /// then exactly [`set_generation`](Self::set_generation). Returns the new generation.
+    pub fn commit_reindex_cutover(
+        &self,
+        index: &str,
+        definition: Option<(u64, ResolvedIndex)>,
+        expected_gen: u64,
+        new_gen: u64,
+    ) -> Result<u64> {
+        let mut indexes = self.write_map();
+        let entry = indexes
+            .get_mut(index)
+            .ok_or_else(|| RegistryError::NotFound(index.to_string()))?;
+        if entry.generation != expected_gen {
+            return Err(RegistryError::PlacementConflict(format!(
+                "the generation of `{index}` changed while this reindex ran — re-plan and retry"
+            )));
+        }
+        if let Some((expected_def_ver, _)) = &definition {
+            if entry.definition_version != *expected_def_ver {
+                return Err(RegistryError::PlacementConflict(format!(
+                    "the definition of `{index}` changed while this alter ran — re-plan and retry"
+                )));
+            }
+        }
+        entry.generation = new_gen;
+        if let Some((_, def)) = definition {
+            entry.definition = def;
+            entry.definition_version += 1;
+        }
+        drop(indexes);
+        self.persist_snapshot()?;
+        Ok(new_gen)
+    }
+
     /// `index`'s current definition version, or `None` for an unknown index.
     pub fn definition_version(&self, index: &str) -> Option<u64> {
         self.read_map().get(index).map(|e| e.definition_version)
@@ -3717,6 +3759,65 @@ mod tests {
             assert_eq!(reg.definition_version("logs"), Some(1));
         }
         let reg2 = Registry::open(&path).unwrap();
+        assert_eq!(reg2.definition_version("logs"), Some(1));
+        assert_eq!(reg2.get("logs").unwrap().definition, wider);
+    }
+
+    #[test]
+    fn commit_reindex_cutover_moves_definition_and_generation_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        let wider = resolved_two_field("logs");
+        {
+            let reg = Registry::open(&path).unwrap();
+            reg.create(resolved("logs")).unwrap();
+
+            // A plain-reindex cutover (no definition) is exactly a generation CAS.
+            assert_eq!(reg.commit_reindex_cutover("logs", None, 0, 1).unwrap(), 1);
+            assert_eq!(reg.generation("logs"), Some(1));
+            assert_eq!(
+                reg.definition_version("logs"),
+                Some(0),
+                "definition untouched"
+            );
+
+            // An alter cutover commits the new definition AND bumps the generation atomically.
+            assert_eq!(
+                reg.commit_reindex_cutover("logs", Some((0, wider.clone())), 1, 2)
+                    .unwrap(),
+                2
+            );
+            assert_eq!(reg.generation("logs"), Some(2));
+            assert_eq!(reg.definition_version("logs"), Some(1));
+            assert_eq!(reg.get("logs").unwrap().definition, wider);
+
+            // A stale generation is refused and writes NOTHING — neither the gen nor the definition.
+            assert!(matches!(
+                reg.commit_reindex_cutover("logs", Some((1, resolved("logs"))), 1, 3),
+                Err(RegistryError::PlacementConflict(_))
+            ));
+            assert_eq!(reg.generation("logs"), Some(2), "gen intact after refusal");
+            assert_eq!(
+                reg.definition_version("logs"),
+                Some(1),
+                "def intact after refusal"
+            );
+
+            // A stale definition version is likewise refused with no partial write (gen untouched).
+            assert!(matches!(
+                reg.commit_reindex_cutover("logs", Some((0, resolved("logs"))), 2, 3),
+                Err(RegistryError::PlacementConflict(_))
+            ));
+            assert_eq!(
+                reg.generation("logs"),
+                Some(2),
+                "no partial gen bump on def conflict"
+            );
+            assert_eq!(reg.get("logs").unwrap().definition, wider, "def intact");
+        }
+        // Both survive a reopen (one persisted snapshot per successful commit).
+        let reg2 = Registry::open(&path).unwrap();
+        assert_eq!(reg2.generation("logs"), Some(2));
         assert_eq!(reg2.definition_version("logs"), Some(1));
         assert_eq!(reg2.get("logs").unwrap().definition, wider);
     }

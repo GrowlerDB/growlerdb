@@ -862,12 +862,25 @@ async fn precheck_reindex_disk(index: &str, units: &[(u32, i64, String)]) -> Res
             format!("shard {ordinal}")
         }
     };
-    let mut short: Vec<String> = Vec::new();
+    // Probe every unit's node CONCURRENTLY: a wide shard/window fan-out shouldn't serialize the
+    // pre-run check into seconds of round-trips before the job even starts.
+    let mut set = tokio::task::JoinSet::new();
     for (ordinal, window, endpoint) in units {
-        match reindex_precheck_on_node(endpoint, index, *window).await {
+        let (index, endpoint, ordinal, window) =
+            (index.to_string(), endpoint.clone(), *ordinal, *window);
+        set.spawn(async move {
+            let res = reindex_precheck_on_node(&endpoint, &index, window).await;
+            (ordinal, window, endpoint, res)
+        });
+    }
+    let mut short: Vec<String> = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        let (ordinal, window, endpoint, res) =
+            joined.map_err(|e| Status::internal(format!("disk precheck task panicked: {e}")))?;
+        match res {
             Ok(r) if r.probed && !r.ok => short.push(format!(
                 "{} on {endpoint}: need ~{} bytes, only {} free",
-                unit_label(*ordinal, *window),
+                unit_label(ordinal, window),
                 r.needed_bytes,
                 r.free_bytes
             )),
@@ -879,6 +892,8 @@ async fn precheck_reindex_disk(index: &str, units: &[(u32, i64, String)]) -> Res
             }
         }
     }
+    // Deterministic message regardless of probe completion order (the fan-out finishes out of order).
+    short.sort();
     if !short.is_empty() {
         return Err(Status::failed_precondition(format!(
             "insufficient free disk to reindex `{index}` on {} node(s): {}",
@@ -1099,6 +1114,26 @@ async fn drive_reindex_job(registry: Arc<Registry>, job_id: String, def_json: St
         return;
     };
     let current_gen = entry.generation;
+    // The definition version the cutover CAS commits against (for a schema-changing alter): captured
+    // at job start, so a concurrent alter that commits mid-rebuild makes this cutover fail loudly
+    // rather than clobber it. Unused for a plain reindex (`def_json` empty).
+    let current_def_ver = entry.definition_version;
+    // For a schema-changing alter, `def_json` is the serialized new `ResolvedIndex` — the definition
+    // to commit at the cutover. Parse it UP FRONT so a malformed definition fails before any build.
+    let alter_def: Option<ResolvedIndex> = if def_json.is_empty() {
+        None
+    } else {
+        match serde_json::from_str(&def_json) {
+            Ok(def) => Some(def),
+            Err(e) => {
+                registry.mutate_job(&job_id, |j| {
+                    j.state = JobState::Failed;
+                    j.error = format!("could not parse the alter definition: {e}");
+                });
+                return;
+            }
+        }
+    };
     // Windowed indexes have no routing-generation epoch — each window promotes as a node-local swap
     // and the gateway converges by placement fingerprint. So the cutover CAS is skipped for windowed.
     let windowed = windowing_config(&entry.definition).is_some();
@@ -1271,6 +1306,15 @@ async fn drive_reindex_job(registry: Arc<Registry>, job_id: String, def_json: St
     // Windowed: no generation epoch — each window promoted as a node-local swap already, so just
     // finalize the job.
     if windowed {
+        // No generation epoch to bump — but a schema-changing alter still commits its new definition
+        // here, as the final cutover step, so it lands only after every window rebuilt (never up
+        // front, where a failed rebuild would strand the registry ahead of the on-disk windows).
+        if let Some(def) = alter_def {
+            if let Err(e) = registry.set_definition(&index, current_def_ver, def) {
+                fail(format!("cutover failed at the definition CAS: {e}"));
+                return;
+            }
+        }
         registry.record_activity(
             &index,
             "reindex",
@@ -1279,7 +1323,12 @@ async fn drive_reindex_job(registry: Arc<Registry>, job_id: String, def_json: St
         registry.mutate_job(&job_id, |j| j.state = JobState::Done);
         return;
     }
-    match registry.set_generation(&index, current_gen, current_gen + 1) {
+    match registry.commit_reindex_cutover(
+        &index,
+        alter_def.map(|def| (current_def_ver, def)),
+        current_gen,
+        current_gen + 1,
+    ) {
         Ok(generation) => {
             registry.record_activity(
                 &index,
@@ -1771,22 +1820,30 @@ impl ControlPlane for ControlPlaneService {
             return Ok(Response::new(resp));
         }
 
-        // Apply: update the registry definition durably (CAS on the definition version), so it
-        // survives restart and every shard reindexes/serves against the same new definition.
-        self.registry
-            .set_definition(&req.index, entry.definition_version, candidate.clone())
-            .map_err(registry_status)?;
-        resp.applied = true;
-
-        // A reindex-requiring change: run a coordinated reindex from the NEW definition, cutting
-        // over atomically to the new-schema generation. In-place-only changes just take the durable
-        // definition update (nodes reload it; some are restart-scoped, as on the single-shard path).
+        // Apply. WHEN the new definition lands in the registry depends on whether a rebuild is needed:
+        //
+        //   * Reindex-requiring change: DEFER the definition commit to the cutover. The coordinated
+        //     reindex builds every shard from the new definition (passed as `def_json`, not read from
+        //     the registry) and commits the definition ATOMICALLY with the generation bump in its
+        //     final phase — only after every shard promoted. So a rebuild that fails (disk, timeout,
+        //     cancel, a node crash) leaves the registry on the OLD definition, matching the untouched
+        //     on-disk shards: no split-brain, and a node rebooting mid-rebuild reloads a definition
+        //     its shards actually satisfy (no boot-time `SchemaChanged`).
+        //
+        //   * In-place-only change: no rebuild, so the durable definition update IS the whole
+        //     operation and commits here (nodes reload it via `GetIndex`).
         if plan.requires_reindex() {
             let def_json = serde_json::to_string(&candidate)
                 .map_err(|e| internal(format!("serialize definition: {e}")))?;
             let out = run_coordinated_reindex(&self.registry, &req.index, &def_json).await?;
+            resp.applied = true;
             resp.reindex_triggered = true;
             resp.generation = out.generation;
+        } else {
+            self.registry
+                .set_definition(&req.index, entry.definition_version, candidate.clone())
+                .map_err(registry_status)?;
+            resp.applied = true;
         }
         self.registry.record_activity(
             &req.index,
@@ -4780,6 +4837,89 @@ mod tests {
         let discard = ReindexPhase::Discard as i32;
         let phases: Vec<i32> = phase0.lock().unwrap().iter().map(|(_, p)| *p).collect();
         assert_eq!(phases, vec![build, discard]);
+    }
+
+    /// A schema-changing alter commits its new definition ONLY at the atomic cutover — never up front.
+    /// So a rebuild that fails leaves the registry (and every node that reloads it) on the OLD
+    /// definition, matching the untouched on-disk shards: no split-brain, no boot-time `SchemaChanged`.
+    /// A successful alter commits the new definition together with the generation bump.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn alter_commits_the_new_definition_only_at_the_cutover() {
+        // A two-field candidate for "docs" — the alter's new schema, distinct from the registered one.
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("body", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        let candidate: ResolvedIndex = IndexDefinition::from_yaml(
+            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD }, { path: body, type: TEXT } ] }\n",
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+        let candidate_json = serde_json::to_string(&candidate).unwrap();
+
+        // Failed rebuild: shard 1's build errors → the whole alter cutover aborts, registry untouched.
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let svc = service(tmp.path());
+            let def_json = serde_json::to_string(&resolved("docs")).unwrap();
+            let ep0 = spawn_stub_node(StubNodeAdmin::default()).await;
+            let ep1 = spawn_stub_node(StubNodeAdmin {
+                fail_build: true,
+                ..Default::default()
+            })
+            .await;
+            register(&svc, &def_json, &ep0, 2, 0).await;
+            register(&svc, &def_json, &ep1, 2, 1).await;
+            assert_eq!(svc.registry.definition_version("docs"), Some(0));
+
+            let err = run_coordinated_reindex(&svc.registry, "docs", &candidate_json)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), Code::Internal);
+            assert_eq!(
+                svc.registry.definition_version("docs"),
+                Some(0),
+                "a failed alter must not advance the definition"
+            );
+            assert_eq!(
+                svc.registry.get("docs").unwrap().definition,
+                resolved("docs"),
+                "the old definition is still served"
+            );
+            assert_eq!(svc.registry.generation("docs"), Some(0), "no cutover");
+        }
+
+        // Successful rebuild: every shard builds + promotes → definition and generation move together.
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let svc = service(tmp.path());
+            let def_json = serde_json::to_string(&resolved("docs")).unwrap();
+            let ep0 = spawn_stub_node(StubNodeAdmin::default()).await;
+            let ep1 = spawn_stub_node(StubNodeAdmin::default()).await;
+            register(&svc, &def_json, &ep0, 2, 0).await;
+            register(&svc, &def_json, &ep1, 2, 1).await;
+
+            let out = run_coordinated_reindex(&svc.registry, "docs", &candidate_json)
+                .await
+                .unwrap();
+            assert_eq!(out.generation, 1);
+            assert_eq!(svc.registry.generation("docs"), Some(1));
+            assert_eq!(
+                svc.registry.definition_version("docs"),
+                Some(1),
+                "the new definition is committed at the cutover"
+            );
+            assert_eq!(
+                svc.registry.get("docs").unwrap().definition,
+                candidate,
+                "the committed definition is the alter candidate"
+            );
+        }
     }
 
     /// A disk-short node fails the reindex **up front** (before any build/job) with one clear error

@@ -20,13 +20,23 @@ change. A multi-shard index is applied by the [control plane](/system/runtime/co
   build time, so these can't be applied to existing segments. (Adding new keys *within* a VARIANT field
   is not a definition change — those flatten in place, no reindex.)
 
-**Apply is durable.** On apply, the control plane updates the **registry definition** (a compare-and-swap
-on its version), so the change survives restart — the registry is the source of truth, not a node's
-local copy. A **reindex-requiring** apply over the control plane then runs a coordinated
-[reindex](/product/functional/index-management/reindex.md) **from the new definition** across every
-shard (or window), cutting over atomically to the new-schema generation; the response reports
-`applied`, `reindex_triggered`, and the new `generation`. A single embedded node instead **guides**:
-it applies only the in-place changes and reports the reindex reasons for you to run a reindex.
+**Apply is durable.** The control plane commits the new **registry definition** as a compare-and-swap
+on its version, so the change survives restart — the registry is the source of truth, not a node's
+local copy. *When* that commit lands depends on whether a rebuild is needed:
+
+- An **in-place-only** apply commits the definition immediately (nodes reload it via `GetIndex`).
+- A **reindex-requiring** apply over the control plane defers the commit to the **cutover**. It runs a
+  coordinated [reindex](/product/functional/index-management/reindex.md) **from the new definition**
+  across every shard (or window) — the definition travels to the nodes as the reindex payload, not via
+  the registry — and commits the new definition **atomically with the generation bump** in the reindex's
+  final phase, only after every shard has promoted. So a rebuild that fails (disk, timeout, cancel, a
+  node crash) leaves the registry on the **old** definition, matching the untouched on-disk shards:
+  never a registry that advertises a schema the segments don't have, and never a node that reboots
+  mid-rebuild into a `SchemaChanged` against a definition it can't satisfy. The response reports
+  `applied`, `reindex_triggered`, and the new `generation`.
+
+A single embedded node instead **guides**: it applies only the in-place changes and reports the reindex
+reasons for you to run a reindex.
 
 ## Boot-time definition reload
 

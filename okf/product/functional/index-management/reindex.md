@@ -57,17 +57,24 @@ staging directory across BUILD..PROMOTE. The write-fence is engaged only for the
 PROMOTE, so an in-flight write can't land on the generation being swapped aside.
 
 Because the live generation advances during the unfenced build, the cutover must not lose or skip those
-writes. Two paths, both **exactly-once, no `CheckpointGap`, no whole-op pause**:
+writes. Two paths, both **exactly-once** and **without a whole-op write pause**:
 
-- **Changelog (delete-aware) indexes:** the staged generation is promoted at the build snapshot; the
-  connector resumes from that checkpoint and **replays the build-window delta through its normal
-  delete-aware changelog** (`from ≤ current` ⇒ `Apply`, never `Gap`; upserts idempotent, deletes applied).
-  Correct for delete/rewrite tables, with a brief post-cutover replay.
+- **Changelog (delete-aware) indexes:** the staged generation is promoted at the **build snapshot**, so
+  on cutover the live checkpoint rewinds to it. A batch connector (or the next scheduled run) resumes
+  from that checkpoint and **replays the build-window delta through its normal delete-aware changelog**
+  (`from ≤ current` ⇒ `Apply`; upserts idempotent, deletes applied). A *continuously streaming* connector
+  holds an in-memory cursor ahead of the rewound checkpoint, so its next micro-batch trips one
+  `CheckpointGap` — which is the **intended** signal, not a fault: it fails that micro-batch, and the
+  connector's [restart loop](/system/runtime/components/connector.md) re-reads its resume point from the
+  node's committed checkpoint (now the build snapshot) and replays from there. The `CheckpointGap` guard
+  is deliberately **not** relaxed to tolerate the rewind: a node that genuinely missed a write looks
+  identical locally, so silently accepting `from > current` would seal that loss. Net effect is a brief
+  self-healing stream restart plus the delete-aware replay — not a crash, no manual offset surgery.
 - **Append-only (`AppendFastPath`) indexes:** before the swap, the node **pre-applies the source rows
   appended since the build** onto the staged generation and stamps it at the caught-up **head**
   ([`read_documents_appended_since_ordered`](/system/runtime/components/node.md) under the cutover fence),
   so the promoted generation doesn't regress the live checkpoint and the connector has ~nothing to replay
-  (seamless cutover).
+  (seamless cutover, no `CheckpointGap`).
 
 Stamping the staged generation *ahead* of the data it actually contains would silently skip rows, so the
 append path only stamps at head after it has applied the delta; the changelog path stamps honestly at the
@@ -97,10 +104,13 @@ exactly one orchestration implementation behind both doors.
 
 - **Per-node single-flight**: a node rejects a concurrent reindex on its shard/window (412). No-source
   → 501; wrong-index → 404.
-- **Up-front disk precheck**: before creating the job the control plane asks every unit's node whether
-  it has room (≈3× the current shard size — the old, staging, and brief backup copies coexist during
-  the swap) and refuses the whole reindex with one clear error naming the short nodes, rather than
-  letting a rebuild fail hours in on a single shard. (The node's own build re-checks as a backstop.)
+- **Up-front disk precheck**: before creating the job the control plane asks every unit's node — all of
+  them **concurrently** — whether it has room, and refuses the whole reindex with one clear error naming
+  the short nodes, rather than letting a rebuild fail hours in on a single shard. The bar is **≈2× the
+  current shard size in free space**: the cutover swap `rename`s the old shard aside and the staging
+  shard into place (both O(1), never a third physical copy), so the disk peak is ≈2× total — 1× for the
+  staging copy plus headroom for a Tantivy segment merge's transient scratch. (The node's own build
+  re-checks as a backstop.)
 - The source-streaming read path keeps peak rebuild memory bounded (O(one chunk)).
 - A schema-changing [alter](/product/functional/index-management/alter.md) rebuilds from the **new**
   definition and cuts over to it; a plain reindex rebuilds against the served definition.
@@ -112,5 +122,10 @@ exactly one orchestration implementation behind both doors.
 **Remaining work:** a node-side delete-aware bounded changelog reader would let **changelog** indexes also
 skip the brief post-cutover replay (append-only indexes already do, via the append catch-up) — a latency
 optimization, not a correctness gap; it is blocked on iceberg-rust gaining an incremental-changelog scan.
-**Cold/parked windowed reindex** (revive → build → promote → re-park) is the other follow-up; today a
-windowed reindex covers hot windows and skips parked ones.
+**Cold/parked windowed reindex** (revive → build → promote → re-park) is another follow-up; today a
+windowed reindex covers hot windows and skips parked ones. **Multi-stage append catch-up** is a third:
+for an append-only index whose build ran for hours on a high-throughput cluster, the appended-since delta
+that the catch-up applies **under the cutover fence** can be large, extending the fenced window. A staged
+catch-up — an unfenced pre-pass to within a few seconds of head, then a brief fence for a tiny final
+pass — would keep the fence short regardless of build duration. A latency optimization, not a correctness
+gap: today's single fenced pass is exactly-once and correct, just fenced for the whole delta.
