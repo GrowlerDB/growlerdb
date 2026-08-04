@@ -4922,6 +4922,93 @@ mod tests {
         }
     }
 
+    /// The windowed cutover has no generation epoch, so a schema-changing alter commits its new
+    /// definition as the FINAL cutover step (after every hot window rebuilt) — same deferral guarantee
+    /// as the ordinal path: a failed window build leaves the registry on the old definition.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn windowed_alter_commits_the_new_definition_only_at_the_cutover() {
+        // A windowed candidate for "logs" with an extra field — the alter's new schema.
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("ingest", SourceType::Long),
+                SourceField::new("event", SourceType::Long),
+                SourceField::new("body", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        let candidate: ResolvedIndex = IndexDefinition::from_yaml(
+            "name: logs\nsource: { iceberg: { catalog: g, table: g.logs } }\nwindowing: { field: ingest, granularity: daily, event_time_field: event }\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD }, { path: ingest, format: epoch_us, fast: true }, { path: event, format: epoch_us, fast: true }, { path: body, type: TEXT } ] }\n",
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+        let candidate_json = serde_json::to_string(&candidate).unwrap();
+        let (w0, w1) = (1_700_000_000_000_i64, 1_700_086_400_000_i64);
+
+        // Failed window build → the alter aborts; the registry keeps the old definition.
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let svc = service(tmp.path());
+            let ep0 = spawn_stub_node(StubNodeAdmin::default()).await;
+            let ep1 = spawn_stub_node(StubNodeAdmin {
+                fail_build: true,
+                ..Default::default()
+            })
+            .await;
+            svc.registry.create(resolved_windowed("logs")).unwrap();
+            svc.registry.assign_window("logs", w0, &ep0).unwrap();
+            svc.registry.assign_window("logs", w1, &ep1).unwrap();
+            assert_eq!(svc.registry.definition_version("logs"), Some(0));
+
+            let err = run_coordinated_reindex(&svc.registry, "logs", &candidate_json)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), Code::Internal);
+            assert_eq!(
+                svc.registry.definition_version("logs"),
+                Some(0),
+                "a failed windowed alter must not advance the definition"
+            );
+            assert_eq!(
+                svc.registry.get("logs").unwrap().definition,
+                resolved_windowed("logs"),
+                "the old definition is still served"
+            );
+        }
+
+        // Every window builds + promotes → the new definition is committed (no generation epoch bump).
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let svc = service(tmp.path());
+            let ep0 = spawn_stub_node(StubNodeAdmin::default()).await;
+            let ep1 = spawn_stub_node(StubNodeAdmin::default()).await;
+            svc.registry.create(resolved_windowed("logs")).unwrap();
+            svc.registry.assign_window("logs", w0, &ep0).unwrap();
+            svc.registry.assign_window("logs", w1, &ep1).unwrap();
+
+            run_coordinated_reindex(&svc.registry, "logs", &candidate_json)
+                .await
+                .unwrap();
+            assert_eq!(
+                svc.registry.definition_version("logs"),
+                Some(1),
+                "the new definition is committed at the windowed cutover"
+            );
+            assert_eq!(
+                svc.registry.get("logs").unwrap().definition,
+                candidate,
+                "the committed definition is the alter candidate"
+            );
+            assert_eq!(
+                svc.registry.generation("logs"),
+                Some(0),
+                "windowed has no generation epoch to bump"
+            );
+        }
+    }
+
     /// A disk-short node fails the reindex **up front** (before any build/job) with one clear error
     /// naming it — the CP pre-run free-disk check.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
