@@ -29,12 +29,12 @@ use growlerdb_proto::v1::{
     PlanReshardResponse, RegisterNodeRequest, RegisterNodeResponse, RegisterServedIndexRequest,
     RegisterServedIndexResponse, ReindexControlRequest, ReindexControlResponse,
     ReindexIndexRequest, ReindexIndexResponse, ReindexJobShard, ReindexJobStatus, ReindexPhase,
-    ReindexStatusRequest, ResolveUnitOwnerRequest, ResolveUnitOwnerResponse, RevokeTokenRequest,
-    RevokeTokenResponse, RoleBinding, RoutingStrategy as WireRouting, SaveSavedQueryRequest,
-    SaveSavedQueryResponse, SavedQuery as WireSavedQuery, SetAliasRequest, SetAliasResponse,
-    SetUserRolesRequest, SetUserRolesResponse, ShardIngestion, ShardStatus, SourceFieldInfo,
-    StartJobResponse, StartReindexJobRequest, SubscribeAssignmentsRequest, UnitAssignment,
-    WindowingConfig,
+    ReindexPrecheckRequest, ReindexStatusRequest, ResolveUnitOwnerRequest,
+    ResolveUnitOwnerResponse, RevokeTokenRequest, RevokeTokenResponse, RoleBinding,
+    RoutingStrategy as WireRouting, SaveSavedQueryRequest, SaveSavedQueryResponse,
+    SavedQuery as WireSavedQuery, SetAliasRequest, SetAliasResponse, SetUserRolesRequest,
+    SetUserRolesResponse, ShardIngestion, ShardStatus, SourceFieldInfo, StartJobResponse,
+    StartReindexJobRequest, SubscribeAssignmentsRequest, UnitAssignment, WindowingConfig,
 };
 use growlerdb_proto::{to_status, ControlPlane, ControlPlaneServer, WriteClient};
 use growlerdb_source::{IcebergConfig, IcebergReader};
@@ -830,6 +830,65 @@ async fn cancel_reindex_on_node(endpoint: &str, index: &str, window: i64) -> Res
     Ok(())
 }
 
+/// Ask one node whether it has the free disk to reindex its shard/window over its Admin gRPC.
+async fn reindex_precheck_on_node(
+    endpoint: &str,
+    index: &str,
+    window: i64,
+) -> Result<growlerdb_proto::v1::ReindexPrecheckResponse, Status> {
+    let (channel, stamp) = growlerdb_proto::service_token::node_channel(endpoint.to_string())
+        .await
+        .map_err(|e| Status::unavailable(format!("connecting to node `{endpoint}`: {e}")))?;
+    let mut client = AdminClient::with_interceptor(channel, stamp);
+    Ok(client
+        .reindex_precheck(ReindexPrecheckRequest {
+            index: index.to_string(),
+            window,
+        })
+        .await?
+        .into_inner())
+}
+
+/// **Pre-run free-disk check** across every unit a reindex will build: ask each unit's node whether
+/// it has room (≈headroom × the current shard size), and refuse the whole reindex with ONE clear,
+/// up-front error naming the short nodes — instead of a job that fails hours into a multi-GB rebuild
+/// on a single shard. Called before the job is created. A node unreachable for the probe is treated as
+/// OK (don't block a reindex on a transient precheck hiccup; its BUILD does the authoritative check).
+async fn precheck_reindex_disk(index: &str, units: &[(u32, i64, String)]) -> Result<(), Status> {
+    let unit_label = |ordinal: u32, window: i64| {
+        if window != 0 {
+            format!("window {window}")
+        } else {
+            format!("shard {ordinal}")
+        }
+    };
+    let mut short: Vec<String> = Vec::new();
+    for (ordinal, window, endpoint) in units {
+        match reindex_precheck_on_node(endpoint, index, *window).await {
+            Ok(r) if r.probed && !r.ok => short.push(format!(
+                "{} on {endpoint}: need ~{} bytes, only {} free",
+                unit_label(*ordinal, *window),
+                r.needed_bytes,
+                r.free_bytes
+            )),
+            Ok(_) => {}
+            Err(e) => {
+                // A probe hiccup shouldn't block the reindex — the node's BUILD re-checks disk anyway.
+                tracing::warn!(index = %index, endpoint = %endpoint, error = %e,
+                    "reindex disk precheck probe failed — proceeding (the node's build re-checks)");
+            }
+        }
+    }
+    if !short.is_empty() {
+        return Err(Status::failed_precondition(format!(
+            "insufficient free disk to reindex `{index}` on {} node(s): {}",
+            short.len(),
+            short.join("; ")
+        )));
+    }
+    Ok(())
+}
+
 /// Validate that `index` can be coordinated-reindexed and return one unit per shard/window as
 /// `(ordinal, window, primary endpoint)` — the driver's build plan. Fails **before** any job is
 /// created so a bad request never leaves a stray job behind.
@@ -1246,6 +1305,8 @@ async fn run_coordinated_reindex(
     def_json: &str,
 ) -> Result<ReindexControlResponse, Status> {
     let shards = plan_reindex_shards(registry, index)?;
+    // Up-front free-disk check across every unit — fail fast with one clear error, not mid-rebuild.
+    precheck_reindex_disk(index, &shards).await?;
     let kind = if def_json.is_empty() {
         JobKind::Reindex
     } else {
@@ -1604,6 +1665,9 @@ impl ControlPlane for ControlPlaneService {
         }
         // Validate + resolve the shard plan up front so a bad request fails before a job exists.
         let shards = plan_reindex_shards(&self.registry, &index)?;
+        // Up-front free-disk check across every unit — fail fast (202 never returned) with one clear
+        // error naming the short nodes, rather than a job that dies mid-rebuild on one shard.
+        precheck_reindex_disk(&index, &shards).await?;
         let job = self.registry.create_job(JobKind::Reindex, &index, shards);
         // Drive it in the background; the caller polls GetReindexJob.
         tokio::spawn(drive_reindex_job(
@@ -4415,6 +4479,9 @@ mod tests {
         /// Tripped by `CancelReindex` (and it releases a gated build): a gated BUILD then returns
         /// CANCELLED, mirroring a real node's populate-loop abort so the cancel path can be tested.
         cancel: Arc<std::sync::atomic::AtomicBool>,
+        /// When true, `ReindexPrecheck` reports `ok = false` (disk-short) — drives the CP's up-front
+        /// disk-precheck refusal.
+        disk_short: bool,
     }
 
     #[tonic::async_trait]
@@ -4491,6 +4558,20 @@ mod tests {
             }
             Ok(Response::new(
                 growlerdb_proto::v1::CancelReindexResponse::default(),
+            ))
+        }
+        async fn reindex_precheck(
+            &self,
+            _r: Request<growlerdb_proto::v1::ReindexPrecheckRequest>,
+        ) -> Result<Response<growlerdb_proto::v1::ReindexPrecheckResponse>, Status> {
+            Ok(Response::new(
+                growlerdb_proto::v1::ReindexPrecheckResponse {
+                    ok: !self.disk_short,
+                    free_bytes: if self.disk_short { 10 } else { 1_000_000 },
+                    needed_bytes: 100,
+                    index_bytes: 33,
+                    probed: true,
+                },
             ))
         }
         async fn reconcile_index(
@@ -4699,6 +4780,47 @@ mod tests {
         let discard = ReindexPhase::Discard as i32;
         let phases: Vec<i32> = phase0.lock().unwrap().iter().map(|(_, p)| *p).collect();
         assert_eq!(phases, vec![build, discard]);
+    }
+
+    /// A disk-short node fails the reindex **up front** (before any build/job) with one clear error
+    /// naming it — the CP pre-run free-disk check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reindex_refused_up_front_when_a_node_is_disk_short() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path());
+        let def_json = serde_json::to_string(&resolved("docs")).unwrap();
+        let phase0 = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Shard 0 has room (records phases so we can assert it never built); shard 1 is disk-short.
+        let s0 = StubNodeAdmin {
+            phases: phase0.clone(),
+            ..Default::default()
+        };
+        let s1 = StubNodeAdmin {
+            disk_short: true,
+            ..Default::default()
+        };
+        let ep0 = spawn_stub_node(s0).await;
+        let ep1 = spawn_stub_node(s1).await;
+        register(&svc, &def_json, &ep0, 2, 0).await;
+        register(&svc, &def_json, &ep1, 2, 1).await;
+
+        let err = svc
+            .reindex_index(Request::new(ReindexControlRequest {
+                index: "docs".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(
+            err.message().contains("free disk") && err.message().contains(&ep1),
+            "the error names the disk-short node: {}",
+            err.message()
+        );
+        // Refused before building anything and before any cutover: no phases recorded, no generation
+        // bump, and no job left behind.
+        assert!(phase0.lock().unwrap().is_empty(), "no shard was built");
+        assert_eq!(svc.registry.generation("docs"), Some(0));
+        assert!(svc.registry.list_jobs().is_empty(), "no job created");
     }
 
     /// Poll a reindex job by id until it reaches a terminal state (or time out the test).

@@ -13,8 +13,9 @@ use growlerdb_proto::v1::{
     CompactIndexResponse, DescribeIndexRequest, DescribeIndexResponse, ExplainRequest,
     ExplainResponse, ExportRequest, GetByKeyRequest, GetByKeyResponse, OpenPitRequest,
     OpenPitResponse, ReconcileIndexRequest, ReconcileIndexResponse, ReindexIndexRequest,
-    ReindexIndexResponse, ReindexStatusRequest, ReindexStatusResponse, SearchRequest,
-    SearchResponse, SemanticSearchRequest, SuggestRequest, SuggestResponse,
+    ReindexIndexResponse, ReindexPrecheckRequest, ReindexPrecheckResponse, ReindexStatusRequest,
+    ReindexStatusResponse, SearchRequest, SearchResponse, SemanticSearchRequest, SuggestRequest,
+    SuggestResponse,
 };
 use growlerdb_proto::{
     Admin, AdminServer, Lookup, LookupServer, Search, SearchServer, Suggest, SuggestServer,
@@ -177,6 +178,13 @@ impl Admin for GatewayAdmin {
         _req: Request<CancelReindexRequest>,
     ) -> Result<Response<CancelReindexResponse>, Status> {
         Err(not_routed("CancelReindex"))
+    }
+
+    async fn reindex_precheck(
+        &self,
+        _req: Request<ReindexPrecheckRequest>,
+    ) -> Result<Response<ReindexPrecheckResponse>, Status> {
+        Err(not_routed("ReindexPrecheck"))
     }
 
     async fn reconcile_index(

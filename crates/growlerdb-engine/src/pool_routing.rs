@@ -16,9 +16,10 @@ use growlerdb_proto::v1::{
     CompactIndexResponse, DescribeIndexRequest, DescribeIndexResponse, ExplainRequest,
     ExplainResponse, ExportRequest, GetByKeyRequest, GetByKeyResponse, GetCheckpointRequest,
     GetCheckpointResponse, OpenPitRequest, OpenPitResponse, ReconcileIndexRequest,
-    ReconcileIndexResponse, ReindexIndexRequest, ReindexIndexResponse, ReindexStatusRequest,
-    ReindexStatusResponse, SearchRequest, SearchResponse, SemanticSearchRequest, SuggestRequest,
-    SuggestResponse, WriteRequest, WriteResponse,
+    ReconcileIndexResponse, ReindexIndexRequest, ReindexIndexResponse, ReindexPrecheckRequest,
+    ReindexPrecheckResponse, ReindexStatusRequest, ReindexStatusResponse, SearchRequest,
+    SearchResponse, SemanticSearchRequest, SuggestRequest, SuggestResponse, WriteRequest,
+    WriteResponse,
 };
 use growlerdb_proto::{
     Admin, AdminServer, Lookup, LookupServer, Search, SearchServer, Suggest, SuggestServer, Write,
@@ -363,6 +364,15 @@ impl Admin for PoolAdminService {
         &self,
         _request: Request<CancelReindexRequest>,
     ) -> Result<Response<CancelReindexResponse>, Status> {
+        Err(Status::unimplemented(
+            "reindex is not supported on a pool node",
+        ))
+    }
+
+    async fn reindex_precheck(
+        &self,
+        _request: Request<ReindexPrecheckRequest>,
+    ) -> Result<Response<ReindexPrecheckResponse>, Status> {
         Err(Status::unimplemented(
             "reindex is not supported on a pool node",
         ))

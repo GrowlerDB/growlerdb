@@ -182,6 +182,23 @@ message CancelReindexResponse {
   bool was_building = 1; // true iff a build was in progress when the flag was tripped
 }
 
+// Free-disk **precheck** for a shard/window's reindex — the control plane calls this on every unit's
+// node BEFORE creating a job, so an operator gets one up-front error naming the short nodes instead of
+// a reindex failing hours into a multi-GB rebuild on one shard. Cheap: a recursive size sum of the
+// shard dir + one statvfs. `ok = false` ⇒ free disk plausibly can't hold the rebuild (the old,
+// staging, and brief backup copies coexist during the swap).
+message ReindexPrecheckRequest {
+  string index = 1;  // empty ⇒ the served index
+  int64 window = 2;  // windowed index: the window to check (0 for ordinal)
+}
+message ReindexPrecheckResponse {
+  bool ok = 1;              // free_bytes >= needed_bytes (or the free-disk probe was unavailable)
+  uint64 free_bytes = 2;    // free disk at the shard dir's filesystem (0 if the probe failed)
+  uint64 needed_bytes = 3;  // headroom estimate: ~3x the current shard size
+  uint64 index_bytes = 4;   // the shard's current on-disk size
+  bool probed = 5;          // whether the free-disk probe succeeded (false ⇒ check skipped, ok=true)
+}
+
 // Reconcile the served shard against the source's current snapshot: the drift backstop that both
 // detects and repairs silently lost/orphaned rows regardless of cause. Shard-scoped like a reshard
 // reindex — `bucket_owners` + `shard_ordinal` restrict the comparison to the keys THIS shard owns,
@@ -262,6 +279,9 @@ service Admin {
   rpc ReindexStatus(ReindexStatusRequest) returns (ReindexStatusResponse);
   // Cancel an in-flight reindex build on this node: trip the populate loop's abort flag.
   rpc CancelReindex(CancelReindexRequest) returns (CancelReindexResponse);
+  // Free-disk precheck for a shard/window's reindex — the coordinated driver calls it on every unit
+  // up front so a disk-short node fails the start with a clear error, not mid-rebuild.
+  rpc ReindexPrecheck(ReindexPrecheckRequest) returns (ReindexPrecheckResponse);
   // Reconcile the served shard against the source and repair drift (backstop).
   rpc ReconcileIndex(ReconcileIndexRequest) returns (ReconcileIndexResponse);
   // Compact the served shard's segments.
