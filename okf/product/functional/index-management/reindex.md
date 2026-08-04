@@ -33,6 +33,22 @@ Each node's phase is BUILD / PROMOTE / DISCARD. Reads stay up throughout, and �
 below — writes are **not** paused for the rebuild; the write-fence is engaged only for the brief cutover
 swap.
 
+## Windowed reindex
+
+A **windowed** index shards by ingest-time window rather than ordinal, so it is reindexed **one window
+at a time**: the driver enumerates the registry's `window_map` and drives BUILD → PROMOTE per window,
+each rebuilt from source **filtered to that window's ingest-time window** (`window_of(doc[field])`, the
+windowed analog of the reshard bucket filter). There is no routing-generation epoch for a windowed
+index — each window promotes as a node-local shard swap and the gateway converges by placement
+fingerprint — so the cutover skips the generation compare-and-swap. Windowed cutover uses the
+connector-replay model (the staged window is stamped at the build snapshot; the connector resumes from
+the server-min committed checkpoint and replays per window), so it needs no per-window write-fence.
+
+**Cold/parked windows are skipped** (a read-through window has no local writer; the planner reports how
+many it skipped). Reindexing a parked window — revive → build → promote → re-park — is a follow-up. So
+after a schema-changing alter on a windowed index, already-parked windows stay at the old schema until
+revived.
+
 ## Write catch-up (zero write-downtime)
 
 The BUILD runs **unfenced**: writes keep flowing to the live generation while the (long) rebuild runs, so
@@ -92,4 +108,5 @@ exactly one orchestration implementation behind both doors.
 **Remaining work:** a node-side delete-aware bounded changelog reader would let **changelog** indexes also
 skip the brief post-cutover replay (append-only indexes already do, via the append catch-up) — a latency
 optimization, not a correctness gap; it is blocked on iceberg-rust gaining an incremental-changelog scan.
-Windowed-index reindex (event-time windows, not buckets) is still Unimplemented.
+**Cold/parked windowed reindex** (revive → build → promote → re-park) is the other follow-up; today a
+windowed reindex covers hot windows and skips parked ones.

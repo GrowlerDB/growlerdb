@@ -337,6 +337,8 @@ struct StartJobRespDto {
 #[derive(serde::Serialize)]
 struct JobShardDto {
     ordinal: u32,
+    /// Windowed index: this unit's time-window id (0 for an ordinal shard).
+    window: i64,
     node: String,
     phase: String,
     docs_done: u64,
@@ -371,6 +373,7 @@ impl From<v1::ReindexJobStatus> for JobStatusDto {
                 .into_iter()
                 .map(|s| JobShardDto {
                     ordinal: s.ordinal,
+                    window: s.window,
                     node: s.node,
                     phase: s.phase,
                     docs_done: s.docs_done,

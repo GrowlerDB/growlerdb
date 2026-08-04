@@ -106,6 +106,15 @@ impl TimeWindowing {
         epoch_us.div_euclid(w) * w
     }
 
+    /// The **window id** a document falls in — its ingest-time [`field`](Self::field) value normalized
+    /// to canonical micros via `format` (`None` = a native `DATE`, already micros), then
+    /// [`window_of`](Self::window_of). A missing/unparseable value falls into window `0` (mirroring
+    /// [`partition_batch`](Self::partition_batch)). Lets a per-window reindex keep only the docs that
+    /// belong to the window it rebuilds — the windowed analog of the reshard bucket filter.
+    pub fn doc_window(&self, doc: &Document, format: Option<TimeFormat>) -> i64 {
+        self.window_of(field_micros(doc, &self.field, format).unwrap_or(0))
+    }
+
     /// Whether the window starting at `window_start` overlaps the inclusive time range
     /// `[lo, hi]` (either bound `None` = unbounded). Used to prune which window shards a
     /// time-filtered query must touch: the window covers `[window_start, window_start + len)`.

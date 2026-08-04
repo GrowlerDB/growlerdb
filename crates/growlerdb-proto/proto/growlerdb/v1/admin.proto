@@ -134,6 +134,11 @@ message ReindexIndexRequest {
   // rebuild uses the new mapping and the node adopts it as its served definition at PROMOTE. Empty
   // ⇒ rebuild against the current served definition (a plain reindex). Carried on BUILD/PROMOTE/FULL.
   string definition_json = 5;
+  // Windowed index selector: the time-window id (epoch-micros of the window start) to reindex, so
+  // the node routes BUILD/PROMOTE/DISCARD to that window's shard and the rebuild keeps only the docs
+  // whose ingest-time window equals it. 0 for an ordinal (hash/partition) index, which uses
+  // `bucket_owners`/`shard_ordinal` instead. A windowed reindex is driven one window at a time.
+  int64 window = 6;
 }
 
 // Phase of a node reindex — see `ReindexIndexRequest.phase`.
@@ -155,6 +160,7 @@ message ReindexIndexResponse {
 // build is active or the source count is unknown). Cheap: reads a few atomics, no shard I/O.
 message ReindexStatusRequest {
   string index = 1;  // empty ⇒ the served index
+  int64 window = 2;  // windowed index: the window whose build progress to read (0 for ordinal)
 }
 message ReindexStatusResponse {
   // Whether a BUILD is currently populating a staged generation on this node. When false the
@@ -170,6 +176,7 @@ message ReindexStatusResponse {
 // and release the fences. A no-op ack when no build is active. Idempotent.
 message CancelReindexRequest {
   string index = 1;  // empty ⇒ the served index
+  int64 window = 2;  // windowed index: the window whose in-flight build to cancel (0 for ordinal)
 }
 message CancelReindexResponse {
   bool was_building = 1; // true iff a build was in progress when the flag was tripped

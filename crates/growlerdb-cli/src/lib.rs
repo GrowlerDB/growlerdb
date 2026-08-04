@@ -789,9 +789,15 @@ async fn jobs_cmd(action: JobAction) -> anyhow::Result<()> {
                 .into_inner();
             summarize(&job);
             for s in &job.shards {
+                // A windowed job's units are identified by window (ordinal 0); an ordinal job's by shard.
+                let unit = if s.window != 0 {
+                    format!("window {}", s.window)
+                } else {
+                    format!("shard {}", s.ordinal)
+                };
                 println!(
-                    "  shard {} @ {} — {} ({}/{} docs)",
-                    s.ordinal, s.node, s.phase, s.docs_done, s.docs_total
+                    "  {} @ {} — {} ({}/{} docs)",
+                    unit, s.node, s.phase, s.docs_done, s.docs_total
                 );
             }
         }
@@ -2431,7 +2437,10 @@ async fn serve_windowed(
             // Each window shard backs an in-process `LocalNode` (embedded REST Gateway) plus the gRPC
             // window multiplexers over the *same* swappable handle. The handle is returned so a HOT
             // window can be auto-compacted.
-            let build = |shard: Arc<growlerdb_index::Shard>| -> (
+            let build = |shard: Arc<growlerdb_index::Shard>,
+                         w: i64,
+                         hot: bool|
+             -> (
                 Arc<dyn Node>,
                 SearchService,
                 SuggestService,
@@ -2452,6 +2461,25 @@ async fn serve_windowed(
                     AdminService::new(handle.clone(), &index_s),
                 )
                 .shared();
+                // The gRPC window-multiplexer's admin gets **source access on a HOT window**, so a
+                // coordinated per-window reindex can rebuild that window's shard from source (filtered
+                // to its ingest-time window) and swap it live. A COLD (read-through, no-writer) window
+                // isn't reindexable in place — the planner skips it — so its admin stays source-less.
+                // A fresh per-window ReindexFence backs the reindex's single-flight/RAII; windowed
+                // cutover correctness comes from the connector's resume-and-replay (stamp at the build
+                // snapshot), not a write-fence, so the fence needn't be shared with the write path.
+                let admin = if hot {
+                    AdminService::new(handle.clone(), &index_s).with_source(
+                        resolved.clone(),
+                        store.clone(),
+                        ShardId::window(&index_s, w),
+                        IcebergConfig::from_env(),
+                        table.clone(),
+                        growlerdb_engine::ReindexFence::new(),
+                    )
+                } else {
+                    AdminService::new(handle.clone(), &index_s)
+                };
                 (
                     node,
                     SearchService::new(handle.clone()),
@@ -2462,7 +2490,7 @@ async fn serve_windowed(
                         table.clone(),
                         resolved.clone(),
                     ),
-                    AdminService::new(handle.clone(), &index_s),
+                    admin,
                     handle,
                 )
             };
@@ -2503,7 +2531,7 @@ async fn serve_windowed(
                         )?);
                         // Cold = read-through, no writer → never compacted, but its handle is kept so
                         // an access-driven pre-warm loop can promote it back to hot.
-                        let (node, search, suggest, lookup, admin, handle) = build(shard);
+                        let (node, search, suggest, lookup, admin, handle) = build(shard, w, false);
                         cold_handles.push((w, handle));
                         (
                             node,
@@ -2518,7 +2546,7 @@ async fn serve_windowed(
                         let shard =
                             Arc::new(store.open_shard(&ShardId::window(&index_s, w), &resolved)?);
                         let zone = shard.event_bounds()?;
-                        let (node, search, suggest, lookup, admin, handle) = build(shard);
+                        let (node, search, suggest, lookup, admin, handle) = build(shard, w, true);
                         hot_handles.push((w, handle)); // hot → eligible for auto-compaction
                         (node, search, suggest, lookup, admin, zone)
                     }

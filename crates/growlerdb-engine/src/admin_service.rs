@@ -231,6 +231,13 @@ impl AdminService {
         resolved: &ResolvedIndex,
         req: &ReindexIndexRequest,
     ) -> Result<(), Status> {
+        // A windowed reindex uses the connector-replay model (the staged window is stamped at the
+        // build snapshot; the connector resumes from the server-min committed checkpoint and replays
+        // per window). The append fast-path reader isn't window-aware, so skip catch-up for windowed —
+        // stamping the window at head would risk skipping the build-window delta for that window.
+        if resolved.windowing.is_some() {
+            return Ok(());
+        }
         if scan_mode(resolved) != ScanMode::AppendFastPath {
             return Ok(());
         }
@@ -706,7 +713,24 @@ impl Admin for AdminService {
                 req.shard_ordinal,
             ))
         };
-        let filtering = reshard_filter.is_some();
+        // Window filter: a windowed reindex rebuilds ONE window's shard, so keep only the docs whose
+        // ingest-time window equals `req.window` (the windowed analog of the reshard bucket filter).
+        // `(TimeWindowing, window_id, window-field TimeFormat)`; `None` for an ordinal index.
+        let window_filter: Option<(
+            growlerdb_core::TimeWindowing,
+            i64,
+            Option<growlerdb_core::TimeFormat>,
+        )> = resolved.windowing.as_ref().map(|w| {
+            let fmt = resolved
+                .fields
+                .iter()
+                .find(|f| f.path == w.field)
+                .and_then(|f| f.format);
+            (w.clone(), req.window, fmt)
+        });
+        // A filtered shard (reshard bucket OR window) may legitimately end up empty, so the
+        // empty-rebuild data-loss guard is skipped when filtering.
+        let filtering = reshard_filter.is_some() || window_filter.is_some();
 
         // Stream the source into the rebuild: the staging shard is populated chunk by
         // chunk straight off the Iceberg scan, so peak memory is O(one streamed chunk), not
@@ -785,6 +809,11 @@ impl Admin for AdminService {
                                 // map, so the rebuilt shard holds only its post-reshard buckets.
                                 if let Some((router, ordinal)) = &reshard_filter {
                                     docs.retain(|d| router.owns(&d.doc.key, *ordinal));
+                                }
+                                // Windowed: keep only the docs whose ingest-time window is the one
+                                // this per-window shard rebuilds (the windowed analog of the above).
+                                if let Some((windowing, window, fmt)) = &window_filter {
+                                    docs.retain(|d| windowing.doc_window(&d.doc, *fmt) == *window);
                                 }
                                 doc_count += docs.len() as u64;
                                 // Publish live progress and honor a cancel requested between chunks:
@@ -1790,6 +1819,7 @@ mod tests {
         let s = svc
             .reindex_status(Request::new(ReindexStatusRequest {
                 index: String::new(),
+                window: 0,
             }))
             .await
             .unwrap_err();
@@ -1797,6 +1827,7 @@ mod tests {
         let c = svc
             .cancel_reindex(Request::new(CancelReindexRequest {
                 index: String::new(),
+                window: 0,
             }))
             .await
             .unwrap_err();
@@ -1825,6 +1856,7 @@ mod tests {
         let before = svc
             .reindex_status(Request::new(ReindexStatusRequest {
                 index: String::new(),
+                window: 0,
             }))
             .await
             .unwrap()
@@ -1834,6 +1866,7 @@ mod tests {
         let ack = svc
             .cancel_reindex(Request::new(CancelReindexRequest {
                 index: String::new(),
+                window: 0,
             }))
             .await
             .unwrap()
@@ -1843,6 +1876,7 @@ mod tests {
         let after = svc
             .reindex_status(Request::new(ReindexStatusRequest {
                 index: String::new(),
+                window: 0,
             }))
             .await
             .unwrap()

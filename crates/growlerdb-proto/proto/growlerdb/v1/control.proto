@@ -564,6 +564,7 @@ message ReindexJobShard {
   string phase = 3;        // pending | building | built | promoting | promoted | discarded
   uint64 docs_done = 4;    // documents committed into this shard's staged generation so far
   uint64 docs_total = 5;   // source snapshot record count this shard's build targets (0 = unknown)
+  int64 window = 6;        // windowed index: this unit's time-window id (0 for an ordinal shard)
 }
 
 // The pollable status of a coordinated reindex/alter job.
