@@ -137,22 +137,39 @@ and what a query can do with it (`indexed` = term-queryable, `fast` = range/sort
 the schema clients compose valid queries from (console pickers, the MCP `describe_index` tool).
 
 ### `POST /v1/index:reindex`
-Rebuild an index from its source and atomically swap it live (`{ "index": "<name>" }`; empty ⇒
-the served index). Returns `{ "doc_count", "snapshot" }` of the rebuilt index. Writes are briefly
-fenced on the owning Node for the duration, and the rebuild is single-flight: a second
-concurrent reindex returns `412`. Single-shard (embedded) deployments only: a multi-shard
-gateway returns `501` (distributed reindex orchestration is future work; reindex each shard's Node
-directly). This is the Engine-side trigger behind the console's reindex button.
+Rebuild an index from its source and cut over atomically (`{ "index": "<name>" }`; empty ⇒ the served
+index), **synchronously** to completion — for a long multi-shard rebuild prefer the async job API
+(`POST /v1/jobs`, below). A multi-shard rebuild is coordinated by the control plane: build every
+shard's next generation, then promote all and bump the routing generation — a build failure discards
+every staged generation (never a half-swap). A **windowed** index rebuilds one window at a time.
+**Zero write-downtime**: the build runs unfenced (writes keep flowing to the live generation) and the
+write-fence engages only for the brief cutover swap, with the build-window delta reconciled
+exactly-once (no `CheckpointGap`). The rebuild is single-flight — a second concurrent reindex returns
+`412`. Before starting, the control plane runs an up-front free-disk check across every shard and
+refuses with `412` naming the short nodes, rather than failing mid-rebuild. This is the Engine-side
+trigger behind the console's reindex button.
+
+### `POST /v1/jobs` — async reindex jobs
+Start a coordinated reindex as a background **job**: returns `202` with `{ "job_id" }` immediately.
+Poll `GET /v1/jobs/{id}` for its `state` (`pending` → `building` → `cutting_over` → `done`, or
+`failed` / `canceled`) plus per-shard/window progress (`docs_done` / `docs_total`, `generation`);
+`GET /v1/jobs` lists jobs newest-first. `DELETE /v1/jobs/{id}` requests cancellation — the in-flight
+build aborts, every staged generation is discarded, and the live generation is left intact
+(idempotent on a finished job). Jobs are durable (they survive a control-plane restart — a job still
+running when the control plane died is reported `failed`, the old generation intact) and one reindex
+runs per index at a time. `growlerdb reindex --control-plane` streams a job's progress in the
+terminal (`--detach` to just print the id); `growlerdb jobs list|get|cancel` manage them.
 
 ### `POST /v1/index:alter`
-Plan (and optionally apply in-place) an **index-definition change** (`{ "index", "definition_yaml",
-"apply" }`; empty `index` ⇒ the served index). Diffs the candidate definition against the served one
-and returns `{ "is_noop", "requires_reindex", "reindex_reasons", "in_place_changes", "applied" }`.
-Metadata-only changes (rename, `sensitive` flip, `max_bytes` redeclare) are in-place and applied
-live when `apply` is `true`; changes that alter the indexed representation (fields, types, analyzers,
-`fast`/`cached`, key, source) set `requires_reindex` with human-readable `reindex_reasons` and are
-not applied, so run `/v1/index:reindex` for those. Single-shard (embedded) only: a multi-shard
-gateway returns `501`; a node started without source access returns `501`.
+Plan (and optionally apply) an **index-definition change** (`{ "index", "definition_yaml", "apply" }`;
+empty `index` ⇒ the served index). Diffs the candidate against the current definition and returns
+`{ "is_noop", "requires_reindex", "reindex_reasons", "in_place_changes", "applied", "reindex_triggered",
+"generation" }`. When `apply` is `true` the control plane updates the registry definition **durably**
+(it survives restart — a node booting afterward loads the new definition from the registry, not a
+stale local copy). A metadata-only change (rename, `sensitive` flip, `max_bytes` redeclare) takes
+effect live; a change that alters the indexed representation (fields, types, analyzers, `fast`/`cached`,
+key, source) **triggers a coordinated reindex** from the new definition and cuts over to it
+(`reindex_triggered`, with the new `generation`). A node started without source access returns `501`.
 
 ## Aggregations & facets
 

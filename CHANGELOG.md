@@ -6,6 +6,25 @@ All notable changes to GrowlerDB are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Coordinated, zero-downtime reindex.** Rebuilding an index from its Iceberg source is now an async
+  job coordinated by the control plane across every shard (or window). `POST /v1/jobs` starts it and
+  returns a job id (`202`); `GET /v1/jobs/{id}` polls per-shard progress and `DELETE /v1/jobs/{id}`
+  cancels. Writes are no longer paused for the rebuild: the build runs unfenced and only the brief
+  cutover swaps behind a fence, with the build-window delta reconciled exactly once (no lost writes,
+  no checkpoint gap). A build failure discards every staged generation and never half-swaps the index.
+  Jobs are durable across a control-plane restart. `growlerdb reindex --control-plane` streams a job's
+  progress (`--detach` prints the id), and `growlerdb jobs list|get|cancel` manage them.
+- **Windowed indexes reindex per window**, each rebuilt from source filtered to its ingest-time window
+  and cut over independently (cold/parked windows are skipped for now).
+- **A durable alter survives a node restart.** After an alter changes an index definition, a node that
+  reboots loads the new definition from the control-plane registry instead of a stale local copy, so it
+  opens the already-reindexed shard without a schema-mismatch error.
+- **Up-front reindex disk check.** Before a reindex starts, the control plane verifies every shard node
+  has room for the rebuild (about 3x the shard size) and refuses with a clear error naming any
+  short node, instead of failing partway through.
+
 ## [0.8.0] - 2026-07-31
 
 A console-UX and serving-reliability release: Observability becomes fleet-first with per-index
