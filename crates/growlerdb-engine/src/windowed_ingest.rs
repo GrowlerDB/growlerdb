@@ -18,6 +18,7 @@ use growlerdb_proto::{to_status, Write, WriteServer};
 use growlerdb_source::IcebergConfig;
 use tonic::{Code, Request, Response, Status};
 
+use crate::fence::ReindexFence;
 use crate::gateway::Gateway;
 use crate::shard_handle::ShardHandle;
 use crate::windowed_routing::{
@@ -310,10 +311,23 @@ impl WindowedWriteService {
                     self.resolved.clone(),
                 ),
             );
+        // Source-capable admin for this (hot) window, so a coordinated per-window reindex can rebuild
+        // + swap it. Fresh per-window ReindexFence (windowed cutover relies on connector replay, not a
+        // write-fence — see serve_windowed's `build`). ShardId::window ties the reindex to this window.
         self.admin
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(window, AdminService::new(handle.clone(), &self.index_name));
+            .insert(
+                window,
+                AdminService::new(handle.clone(), &self.index_name).with_source(
+                    self.resolved.clone(),
+                    self.store.clone(),
+                    ShardId::window(&self.index_name, window),
+                    self.iceberg.clone(),
+                    self.table.clone(),
+                    ReindexFence::new(),
+                ),
+            );
         self.windows
             .write()
             .unwrap_or_else(|e| e.into_inner())

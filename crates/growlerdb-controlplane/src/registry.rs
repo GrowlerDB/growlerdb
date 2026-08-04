@@ -444,7 +444,12 @@ pub enum ShardPhase {
 /// progress the driver folds in from the node's `ReindexStatus` poll.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShardJobStatus {
+    /// Ordinal shard number (hash/partition index); 0 for a windowed unit.
     pub ordinal: u32,
+    /// Time-window id (windowed index); 0 for an ordinal unit. Together with `ordinal` this uniquely
+    /// identifies the unit within the job (a windowed job's rows all have `ordinal = 0`).
+    #[serde(default)]
+    pub window: i64,
     /// The shard primary's endpoint the driver is driving.
     pub node: String,
     pub phase: ShardPhase,
@@ -1440,7 +1445,12 @@ impl Registry {
     /// Register a new **reindex/alter job** in `Pending`, one `ShardJobStatus` row per `(ordinal,
     /// node)` the driver will drive. Returns the created job (with its server-assigned id). Durable:
     /// the job survives a restart (a non-terminal one found on load is failed — see `with_backend`).
-    pub fn create_job(&self, kind: JobKind, index: &str, shards: Vec<(u32, String)>) -> ReindexJob {
+    pub fn create_job(
+        &self,
+        kind: JobKind,
+        index: &str,
+        units: Vec<(u32, i64, String)>,
+    ) -> ReindexJob {
         let now = now_ms();
         let id = format!(
             "job-{}-{}",
@@ -1453,10 +1463,11 @@ impl Registry {
             index: index.to_string(),
             kind,
             state: JobState::Pending,
-            shards: shards
+            shards: units
                 .into_iter()
-                .map(|(ordinal, node)| ShardJobStatus {
+                .map(|(ordinal, window, node)| ShardJobStatus {
                     ordinal,
+                    window,
                     node,
                     phase: ShardPhase::Pending,
                     docs_done: 0,
@@ -3138,7 +3149,7 @@ mod tests {
         let job = reg.create_job(
             JobKind::Reindex,
             "docs",
-            vec![(0, "n0".into()), (1, "n1".into())],
+            vec![(0, 0, "n0".into()), (1, 0, "n1".into())],
         );
         assert_eq!(job.state, JobState::Pending);
         assert_eq!(job.shards.len(), 2);
@@ -3173,9 +3184,9 @@ mod tests {
         {
             let reg = Registry::with_backend(Box::new(store.clone())).unwrap();
             pending_id = reg
-                .create_job(JobKind::Reindex, "docs", vec![(0, "n0".into())])
+                .create_job(JobKind::Reindex, "docs", vec![(0, 0, "n0".into())])
                 .id;
-            let done = reg.create_job(JobKind::Reindex, "docs", vec![(0, "n0".into())]);
+            let done = reg.create_job(JobKind::Reindex, "docs", vec![(0, 0, "n0".into())]);
             done_id = done.id.clone();
             reg.mutate_job(&done_id, |j| {
                 j.state = JobState::Done;
@@ -3195,7 +3206,7 @@ mod tests {
     #[test]
     fn request_cancel_flags_a_running_job_and_no_ops_a_terminal_one() {
         let reg = Registry::with_backend(Box::new(InMemoryBackend::default())).unwrap();
-        let job = reg.create_job(JobKind::Reindex, "docs", vec![(0, "n0".into())]);
+        let job = reg.create_job(JobKind::Reindex, "docs", vec![(0, 0, "n0".into())]);
         assert!(reg.request_job_cancel(&job.id).unwrap().cancel_requested);
         assert!(matches!(
             reg.request_job_cancel("nope"),

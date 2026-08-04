@@ -764,11 +764,13 @@ fn plan_growth_reshard(
 /// Drive a **filtered reindex** on the node serving one shard: connect its Admin gRPC and rebuild
 /// the shard from source keeping only the buckets it owns under `owners`. The per-node data step of
 /// a reshard, reusing the write-fenced reindex.
+#[allow(clippy::too_many_arguments)]
 async fn reindex_shard_on_node(
     endpoint: &str,
     index: &str,
     owners: &[u32],
     ordinal: u32,
+    window: i64,
     phase: ReindexPhase,
     definition_json: &str,
 ) -> Result<ReindexIndexResponse, Status> {
@@ -784,6 +786,7 @@ async fn reindex_shard_on_node(
             shard_ordinal: ordinal,
             phase: phase as i32,
             definition_json: definition_json.to_string(),
+            window,
         })
         .await?
         .into_inner();
@@ -797,6 +800,7 @@ const REINDEX_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mil
 async fn reindex_status_on_node(
     endpoint: &str,
     index: &str,
+    window: i64,
 ) -> Result<growlerdb_proto::v1::ReindexStatusResponse, Status> {
     let (channel, stamp) = growlerdb_proto::service_token::node_channel(endpoint.to_string())
         .await
@@ -805,13 +809,14 @@ async fn reindex_status_on_node(
     Ok(client
         .reindex_status(ReindexStatusRequest {
             index: index.to_string(),
+            window,
         })
         .await?
         .into_inner())
 }
 
 /// Trip one node's reindex cancel flag over its Admin gRPC — the in-flight build aborts.
-async fn cancel_reindex_on_node(endpoint: &str, index: &str) -> Result<(), Status> {
+async fn cancel_reindex_on_node(endpoint: &str, index: &str, window: i64) -> Result<(), Status> {
     let (channel, stamp) = growlerdb_proto::service_token::node_channel(endpoint.to_string())
         .await
         .map_err(|e| Status::unavailable(format!("connecting to node `{endpoint}`: {e}")))?;
@@ -819,22 +824,65 @@ async fn cancel_reindex_on_node(endpoint: &str, index: &str) -> Result<(), Statu
     client
         .cancel_reindex(CancelReindexRequest {
             index: index.to_string(),
+            window,
         })
         .await?;
     Ok(())
 }
 
-/// Validate that `index` can be coordinated-reindexed and return `(ordinal, primary endpoint)` for
-/// every shard — the driver's build plan. Fails **before** any job is created so a bad request never
-/// leaves a stray job behind. Windowed indexes route by event-time, not bucket owners → out of scope.
-fn plan_reindex_shards(registry: &Registry, index: &str) -> Result<Vec<(u32, String)>, Status> {
+/// Validate that `index` can be coordinated-reindexed and return one unit per shard/window as
+/// `(ordinal, window, primary endpoint)` — the driver's build plan. Fails **before** any job is
+/// created so a bad request never leaves a stray job behind.
+///
+/// A **windowed** index enumerates its `window_map` (one unit per HOT window; `ordinal = 0`, `window`
+/// = the window id); **cold/parked** windows are skipped (they have no local writer — reindexing them
+/// needs a revive→build→re-park cycle, a follow-up). An **ordinal** index enumerates its `shard_map`
+/// (one unit per shard; `window = 0`). Either way each unit needs a primary to drive.
+fn plan_reindex_shards(
+    registry: &Registry,
+    index: &str,
+) -> Result<Vec<(u32, i64, String)>, Status> {
     let entry = registry
         .get(index)
         .ok_or_else(|| registry_status(RegistryError::NotFound(index.to_string())))?;
+    let primary_endpoint = |assignment: &ShardAssignment, unit: &str| {
+        assignment
+            .primary
+            .as_ref()
+            .map(|n| n.0.clone())
+            .filter(|e| !e.is_empty())
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "{unit} of `{index}` has no primary; cannot reindex"
+                ))
+            })
+    };
     if windowing_config(&entry.definition).is_some() {
-        return Err(Status::unimplemented(
-            "reindex of a windowed index is not yet supported (event-time windows, not buckets)",
-        ));
+        let window_map = registry
+            .window_map(index)
+            .ok_or_else(|| registry_status(RegistryError::NotFound(index.to_string())))?;
+        let mut units: Vec<(u32, i64, String)> = Vec::new();
+        let mut cold_skipped = 0usize;
+        for (window, wa) in &window_map {
+            if wa.cold {
+                // A parked window is read-through with no local writer; skip it (see the doc above).
+                cold_skipped += 1;
+                continue;
+            }
+            let endpoint = primary_endpoint(&wa.assignment, &format!("window {window}"))?;
+            units.push((0, *window, endpoint));
+        }
+        if units.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "index `{index}` has no hot windows to reindex ({cold_skipped} cold windows skipped; \
+                 cold-window reindex is a follow-up)"
+            )));
+        }
+        if cold_skipped > 0 {
+            tracing::info!(index = %index, cold_skipped,
+                "windowed reindex: skipping cold (parked) windows — reindexing hot windows only");
+        }
+        return Ok(units);
     }
     let shard_map = registry
         .shard_map(index)
@@ -844,19 +892,10 @@ fn plan_reindex_shards(registry: &Registry, index: &str) -> Result<Vec<(u32, Str
             "index `{index}` has no assigned shards to reindex"
         )));
     }
-    let mut shards: Vec<(u32, String)> = Vec::with_capacity(shard_map.len());
+    let mut shards: Vec<(u32, i64, String)> = Vec::with_capacity(shard_map.len());
     for (ord, assignment) in &shard_map {
-        let endpoint = assignment
-            .primary
-            .as_ref()
-            .map(|n| n.0.clone())
-            .filter(|e| !e.is_empty())
-            .ok_or_else(|| {
-                Status::failed_precondition(format!(
-                    "shard {ord} of `{index}` has no primary; cannot reindex"
-                ))
-            })?;
-        shards.push((*ord, endpoint));
+        let endpoint = primary_endpoint(assignment, &format!("shard {ord}"))?;
+        shards.push((*ord, 0, endpoint));
     }
     Ok(shards)
 }
@@ -870,9 +909,14 @@ fn job_wants_to_continue(registry: &Registry, job_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Set one shard row's phase in a job (no-op if the ordinal isn't present).
-fn set_shard_phase(job: &mut ReindexJob, ordinal: u32, phase: ShardPhase) {
-    if let Some(s) = job.shards.iter_mut().find(|s| s.ordinal == ordinal) {
+/// Set one unit's phase in a job (no-op if the `(ordinal, window)` isn't present). A windowed job's
+/// rows all have `ordinal = 0`, so the window disambiguates them; an ordinal job's have `window = 0`.
+fn set_shard_phase(job: &mut ReindexJob, ordinal: u32, window: i64, phase: ShardPhase) {
+    if let Some(s) = job
+        .shards
+        .iter_mut()
+        .find(|s| s.ordinal == ordinal && s.window == window)
+    {
         s.phase = phase;
     }
 }
@@ -887,12 +931,14 @@ enum BuildOutcome {
 
 /// Run one shard's BUILD while polling its node for live progress (folded into the job) and honoring
 /// a mid-build cancel. Returns once the build resolves.
+#[allow(clippy::too_many_arguments)]
 async fn build_shard_with_progress(
     registry: &Arc<Registry>,
     job_id: &str,
     index: &str,
     owners: &[u32],
     ordinal: u32,
+    window: i64,
     endpoint: &str,
     def_json: &str,
 ) -> BuildOutcome {
@@ -901,6 +947,7 @@ async fn build_shard_with_progress(
         index,
         owners,
         ordinal,
+        window,
         ReindexPhase::Build,
         def_json,
     );
@@ -922,9 +969,9 @@ async fn build_shard_with_progress(
                 };
             }
             _ = tokio::time::sleep(REINDEX_POLL_INTERVAL) => {
-                if let Ok(st) = reindex_status_on_node(endpoint, index).await {
+                if let Ok(st) = reindex_status_on_node(endpoint, index, window).await {
                     registry.mutate_job(job_id, |j| {
-                        if let Some(s) = j.shards.iter_mut().find(|s| s.ordinal == ordinal) {
+                        if let Some(s) = j.shards.iter_mut().find(|s| s.ordinal == ordinal && s.window == window) {
                             s.docs_done = st.docs_done;
                             s.docs_total = st.docs_total;
                         }
@@ -933,7 +980,7 @@ async fn build_shard_with_progress(
                 // A cancel requested mid-build: ping the node so the in-flight build aborts promptly
                 // (the CancelReindexJob handler also pings, but the driver re-pings in case of a race).
                 if !job_wants_to_continue(registry, job_id) {
-                    let _ = cancel_reindex_on_node(endpoint, index).await;
+                    let _ = cancel_reindex_on_node(endpoint, index, window).await;
                 }
             }
         }
@@ -948,16 +995,26 @@ async fn discard_built(
     job_id: &str,
     index: &str,
     owners: &[u32],
-    built: &[(u32, String)],
+    built: &[(u32, i64, String)],
 ) {
-    for (ord, endpoint) in built {
-        if let Err(e) =
-            reindex_shard_on_node(endpoint, index, owners, *ord, ReindexPhase::Discard, "").await
+    for (ord, window, endpoint) in built {
+        if let Err(e) = reindex_shard_on_node(
+            endpoint,
+            index,
+            owners,
+            *ord,
+            *window,
+            ReindexPhase::Discard,
+            "",
+        )
+        .await
         {
-            tracing::warn!(index = %index, shard = ord, error = %e,
+            tracing::warn!(index = %index, shard = ord, window, error = %e,
                 "reindex: discard of a staged generation failed — its write-fence may need a manual clear");
         }
-        registry.mutate_job(job_id, |j| set_shard_phase(j, *ord, ShardPhase::Discarded));
+        registry.mutate_job(job_id, |j| {
+            set_shard_phase(j, *ord, *window, ShardPhase::Discarded)
+        });
     }
 }
 
@@ -983,14 +1040,18 @@ async fn drive_reindex_job(registry: Arc<Registry>, job_id: String, def_json: St
         return;
     };
     let current_gen = entry.generation;
+    // Windowed indexes have no routing-generation epoch — each window promotes as a node-local swap
+    // and the gateway converges by placement fingerprint. So the cutover CAS is skipped for windowed.
+    let windowed = windowing_config(&entry.definition).is_some();
     let owners = registry
         .bucket_map(&index)
         .map(|m| m.owners().to_vec())
         .unwrap_or_default();
-    let shards: Vec<(u32, String)> = job
+    // Each unit: (ordinal, window, endpoint). Ordinal jobs have window = 0; windowed jobs ordinal = 0.
+    let units: Vec<(u32, i64, String)> = job
         .shards
         .iter()
-        .map(|s| (s.ordinal, s.node.clone()))
+        .map(|s| (s.ordinal, s.window, s.node.clone()))
         .collect();
 
     let fail = |err: String| {
@@ -1005,29 +1066,41 @@ async fn drive_reindex_job(registry: Arc<Registry>, job_id: String, def_json: St
             j.error = "canceled by request".to_string();
         });
     };
+    // How a unit reads in a log/error message ("shard 2" or "window 17…").
+    let unit_label = |ordinal: u32, window: i64| {
+        if windowed {
+            format!("window {window}")
+        } else {
+            format!("shard {ordinal}")
+        }
+    };
 
-    // Phase 1 — BUILD every shard's next generation (staged, fenced, NOT promoted).
+    // Phase 1 — BUILD every unit's next generation (staged, NOT promoted).
     registry.mutate_job(&job_id, |j| j.state = JobState::Building);
-    let mut built: Vec<(u32, String)> = Vec::new();
-    for (ordinal, endpoint) in &shards {
+    let mut built: Vec<(u32, i64, String)> = Vec::new();
+    for (ordinal, window, endpoint) in &units {
         if !job_wants_to_continue(&registry, &job_id) {
             discard_built(&registry, &job_id, &index, &owners, &built).await;
             cancel(&registry);
             return;
         }
         registry.mutate_job(&job_id, |j| {
-            set_shard_phase(j, *ordinal, ShardPhase::Building)
+            set_shard_phase(j, *ordinal, *window, ShardPhase::Building)
         });
         match build_shard_with_progress(
-            &registry, &job_id, &index, &owners, *ordinal, endpoint, &def_json,
+            &registry, &job_id, &index, &owners, *ordinal, *window, endpoint, &def_json,
         )
         .await
         {
             BuildOutcome::Ok => {
-                built.push((*ordinal, endpoint.clone()));
-                // Publish the final count for this shard and mark it built (fenced, awaiting cutover).
+                built.push((*ordinal, *window, endpoint.clone()));
+                // Publish the final count for this unit and mark it built (awaiting cutover).
                 registry.mutate_job(&job_id, |j| {
-                    if let Some(s) = j.shards.iter_mut().find(|s| s.ordinal == *ordinal) {
+                    if let Some(s) = j
+                        .shards
+                        .iter_mut()
+                        .find(|s| s.ordinal == *ordinal && s.window == *window)
+                    {
                         s.phase = ShardPhase::Built;
                         if s.docs_total > 0 {
                             s.docs_done = s.docs_total;
@@ -1042,12 +1115,13 @@ async fn drive_reindex_job(registry: Arc<Registry>, job_id: String, def_json: St
                     &index,
                     &owners,
                     *ordinal,
+                    *window,
                     ReindexPhase::Discard,
                     "",
                 )
                 .await;
                 registry.mutate_job(&job_id, |j| {
-                    set_shard_phase(j, *ordinal, ShardPhase::Discarded)
+                    set_shard_phase(j, *ordinal, *window, ShardPhase::Discarded)
                 });
                 discard_built(&registry, &job_id, &index, &owners, &built).await;
                 cancel(&registry);
@@ -1056,7 +1130,8 @@ async fn drive_reindex_job(registry: Arc<Registry>, job_id: String, def_json: St
             BuildOutcome::Failed(status) => {
                 discard_built(&registry, &job_id, &index, &owners, &built).await;
                 fail(format!(
-                    "build of shard {ordinal} failed (no cutover; old generation intact): {status}"
+                    "build of {} failed (no cutover; old generation intact): {status}",
+                    unit_label(*ordinal, *window)
                 ));
                 return;
             }
@@ -1070,27 +1145,32 @@ async fn drive_reindex_job(registry: Arc<Registry>, job_id: String, def_json: St
         return;
     }
 
-    // Phase 2 — PROMOTE every shard (brief fence-drain + atomic swap, releasing the fence).
+    // Phase 2 — PROMOTE every unit (brief fence-drain + atomic swap).
     registry.mutate_job(&job_id, |j| j.state = JobState::CuttingOver);
-    for (i, (ordinal, endpoint)) in shards.iter().enumerate() {
+    for (i, (ordinal, window, endpoint)) in units.iter().enumerate() {
         registry.mutate_job(&job_id, |j| {
-            set_shard_phase(j, *ordinal, ShardPhase::Promoting)
+            set_shard_phase(j, *ordinal, *window, ShardPhase::Promoting)
         });
         match reindex_shard_on_node(
             endpoint,
             &index,
             &owners,
             *ordinal,
+            *window,
             ReindexPhase::Promote,
             &def_json,
         )
         .await
         {
             Ok(resp) => {
-                // Record the shard's authoritative post-promote doc count (the definitive number a
+                // Record the unit's authoritative post-promote doc count (the definitive number a
                 // finished job reports; the live BUILD poll was only an estimate).
                 registry.mutate_job(&job_id, |j| {
-                    if let Some(s) = j.shards.iter_mut().find(|s| s.ordinal == *ordinal) {
+                    if let Some(s) = j
+                        .shards
+                        .iter_mut()
+                        .find(|s| s.ordinal == *ordinal && s.window == *window)
+                    {
                         s.phase = ShardPhase::Promoted;
                         s.docs_done = resp.doc_count;
                         if s.docs_total < resp.doc_count {
@@ -1101,32 +1181,51 @@ async fn drive_reindex_job(registry: Arc<Registry>, job_id: String, def_json: St
             }
             Err(e) => {
                 // Rare promote-phase partial failure: discard the not-yet-promoted remainder so the op
-                // is retryable; already-promoted shards keep the new generation (queryable,
-                // mixed-generation; a retry converges). The common BUILD-phase failure never reaches
-                // here, so it never half-swaps.
-                for (o, ep) in &shards[i..] {
-                    let _ =
-                        reindex_shard_on_node(ep, &index, &owners, *o, ReindexPhase::Discard, "")
-                            .await;
+                // is retryable; already-promoted units keep the new generation (queryable, mixed;
+                // a retry converges). The common BUILD-phase failure never reaches here, so it never
+                // half-swaps.
+                for (o, w, ep) in &units[i..] {
+                    let _ = reindex_shard_on_node(
+                        ep,
+                        &index,
+                        &owners,
+                        *o,
+                        *w,
+                        ReindexPhase::Discard,
+                        "",
+                    )
+                    .await;
                 }
                 fail(format!(
-                    "promote of shard {ordinal} failed after {i}/{} shards; discarded the rest \
+                    "promote of {} failed after {i}/{} units; discarded the rest \
                      (index is queryable, mixed-generation; retry to converge): {e}",
-                    shards.len()
+                    unit_label(*ordinal, *window),
+                    units.len()
                 ));
                 return;
             }
         }
     }
 
-    // Phase 3 — atomic cutover: bump the routing generation (CAS vs the generation we planned from,
-    // so a concurrent reindex/reshard is a loud PLACEMENT_CONFLICT). Gateways converge on poll.
+    // Phase 3 — cutover marker. Ordinal: bump the routing generation (CAS vs the planned generation,
+    // so a concurrent reindex/reshard is a loud PLACEMENT_CONFLICT; gateways converge on poll).
+    // Windowed: no generation epoch — each window promoted as a node-local swap already, so just
+    // finalize the job.
+    if windowed {
+        registry.record_activity(
+            &index,
+            "reindex",
+            format!("reindexed {} windows (job {job_id})", units.len()),
+        );
+        registry.mutate_job(&job_id, |j| j.state = JobState::Done);
+        return;
+    }
     match registry.set_generation(&index, current_gen, current_gen + 1) {
         Ok(generation) => {
             registry.record_activity(
                 &index,
                 "reindex",
-                format!("reindexed {} shards (job {job_id})", shards.len()),
+                format!("reindexed {} shards (job {job_id})", units.len()),
             );
             registry.mutate_job(&job_id, |j| {
                 j.state = JobState::Done;
@@ -1188,6 +1287,7 @@ fn job_to_wire(job: &ReindexJob) -> ReindexJobStatus {
                 phase: shard_phase_str(s.phase).to_string(),
                 docs_done: s.docs_done,
                 docs_total: s.docs_total,
+                window: s.window,
             })
             .collect(),
         docs_done: job.docs_done(),
@@ -1402,8 +1502,16 @@ impl ControlPlane for ControlPlaneService {
         for (ord, endpoint) in &growth.build {
             // Reshard uses the one-shot node reindex (fence + build + promote in one call); the
             // phased flow is for a coordinated whole-index reindex (ControlPlane::reindex_index).
-            reindex_shard_on_node(endpoint, &req.index, &owners, *ord, ReindexPhase::Full, "")
-                .await?;
+            reindex_shard_on_node(
+                endpoint,
+                &req.index,
+                &owners,
+                *ord,
+                0,
+                ReindexPhase::Full,
+                "",
+            )
+            .await?;
         }
 
         // 3. Cutover: commit the new bucket map atomically — compare-and-swap against the map
@@ -1418,8 +1526,16 @@ impl ControlPlane for ControlPlaneService {
         //    only reclaims space). Safe post-cutover: those buckets no longer route to old shards.
         let mut trimmed = Vec::new();
         for (ord, endpoint) in &growth.trim {
-            match reindex_shard_on_node(endpoint, &req.index, &owners, *ord, ReindexPhase::Full, "")
-                .await
+            match reindex_shard_on_node(
+                endpoint,
+                &req.index,
+                &owners,
+                *ord,
+                0,
+                ReindexPhase::Full,
+                "",
+            )
+            .await
             {
                 Ok(_) => trimmed.push(*ord),
                 Err(e) => tracing::warn!(
@@ -1535,7 +1651,7 @@ impl ControlPlane for ControlPlaneService {
         // waiting for the current shard's full rebuild.
         for s in &job.shards {
             if s.phase == ShardPhase::Building {
-                let _ = cancel_reindex_on_node(&s.node, &job.index).await;
+                let _ = cancel_reindex_on_node(&s.node, &job.index, s.window).await;
             }
         }
         Ok(Response::new(job_to_wire(&job)))
@@ -1672,6 +1788,7 @@ impl ControlPlane for ControlPlaneService {
             &req.index,
             &owners,
             req.to_shard,
+            0,
             ReindexPhase::Full,
             "",
         )
@@ -1687,6 +1804,7 @@ impl ControlPlane for ControlPlaneService {
             &req.index,
             &owners,
             from_shard,
+            0,
             ReindexPhase::Full,
             "",
         )
@@ -3118,6 +3236,53 @@ mod tests {
             .unwrap()
             .into_inner();
         assert!(ord.windowing.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn windowed_reindex_plan_enumerates_hot_windows_and_skips_cold() {
+        // A windowed reindex plan enumerates one unit per HOT window (ordinal 0, the window id, its
+        // primary) and skips cold/parked windows (deferred — no local writer).
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path());
+        svc.registry.create(resolved_windowed("logs")).unwrap();
+        let (w0, w1, w2) = (
+            1_700_000_000_000_i64,
+            1_700_086_400_000_i64,
+            1_700_172_800_000_i64,
+        );
+        svc.registry.assign_window("logs", w0, "node-a").unwrap();
+        svc.registry.assign_window("logs", w1, "node-b").unwrap();
+        svc.registry.assign_window("logs", w2, "node-c").unwrap();
+        // Park w1 → the plan must skip it.
+        svc.registry.set_window_cold("logs", w1, true).unwrap();
+
+        let plan = plan_reindex_shards(&svc.registry, "logs").expect("windowed plan");
+        let mut windows: Vec<i64> = plan
+            .iter()
+            .map(|(ord, w, _)| {
+                assert_eq!(*ord, 0, "windowed units carry ordinal 0");
+                *w
+            })
+            .collect();
+        windows.sort();
+        assert_eq!(
+            windows,
+            vec![w0, w2],
+            "hot windows enumerated, cold w1 skipped"
+        );
+        let endpoint = |w: i64| {
+            plan.iter()
+                .find(|(_, ww, _)| *ww == w)
+                .map(|(_, _, e)| e.clone())
+        };
+        assert_eq!(endpoint(w0).as_deref(), Some("node-a"));
+        assert_eq!(endpoint(w2).as_deref(), Some("node-c"));
+
+        // All windows cold → nothing to reindex (FailedPrecondition, not a silent empty plan).
+        svc.registry.set_window_cold("logs", w0, true).unwrap();
+        svc.registry.set_window_cold("logs", w2, true).unwrap();
+        let err = plan_reindex_shards(&svc.registry, "logs").unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
     }
 
     #[tokio::test(flavor = "current_thread")]
