@@ -12,17 +12,21 @@ Evolve an existing index. `POST /v1/index:alter` **dry-runs a plan** or **applie
 change. A multi-shard index is applied by the [control plane](/system/runtime/components/control-plane.md)
 (the gateway forwards it); a single embedded node applies its own.
 
-- **In-place** — metadata-only changes (an index rename, the `sensitive` flag, a `max_bytes`
-  redeclaration). Nothing stored or indexed differs.
-- **Reindex-requiring** — adding/removing a mapped field, or a type/analyzer/`fast`/`cached`/`indexed`
-  change: a segment's schema is fixed at build time, so these can't apply to existing segments.
+- **In-place** — metadata-only changes apply without a rebuild: an index **rename**, a **`sensitive`**
+  flip, and a **`max_bytes`** redeclaration. Nothing stored or indexed differs.
+- **Reindex-requiring** — everything else needs a rebuild: **adding or removing** a mapped field, any
+  field **type/analyzer/`record`/`fieldnorms`/`fast`/`indexed`/`cached`/vector/variant** change, and
+  **key/`source`/`shard_count`/`location_strategy`** changes. A segment's Tantivy schema is fixed at
+  build time, so these can't be applied to existing segments. (Adding new keys *within* a VARIANT field
+  is not a definition change — those flatten in place, no reindex.)
 
-**Apply is durable and drives the reindex.** On apply, the control plane updates the **registry
-definition** (a compare-and-swap on its version), so the change survives restart — the registry is the
-source of truth, not a node's local copy. A reindex-requiring apply then runs a coordinated
+**Apply is durable.** On apply, the control plane updates the **registry definition** (a compare-and-swap
+on its version), so the change survives restart — the registry is the source of truth, not a node's
+local copy. A **reindex-requiring** apply over the control plane then runs a coordinated
 [reindex](/product/functional/index-management/reindex.md) **from the new definition** across every
-shard, cutting over atomically to the new-schema generation; the response reports `applied`,
-`reindex_triggered`, and the new `generation`.
+shard (or window), cutting over atomically to the new-schema generation; the response reports
+`applied`, `reindex_triggered`, and the new `generation`. A single embedded node instead **guides**:
+it applies only the in-place changes and reports the reindex reasons for you to run a reindex.
 
 ## Boot-time definition reload
 
