@@ -16,8 +16,8 @@ use growlerdb_proto::v1::{
     BackupIndexResponse, BackupStatusRequest, BackupStatusResponse, CancelReindexRequest,
     CancelReindexResponse, CompactIndexRequest, CompactIndexResponse, DescribeIndexRequest,
     DescribeIndexResponse, IndexStats, ReconcileIndexRequest, ReconcileIndexResponse,
-    ReindexIndexRequest, ReindexIndexResponse, ReindexPhase, ReindexStatusRequest,
-    ReindexStatusResponse, VectorFieldStat,
+    ReindexIndexRequest, ReindexIndexResponse, ReindexPhase, ReindexPrecheckRequest,
+    ReindexPrecheckResponse, ReindexStatusRequest, ReindexStatusResponse, VectorFieldStat,
 };
 use growlerdb_proto::{Admin, AdminServer};
 use growlerdb_source::{IcebergConfig, IcebergReader};
@@ -966,6 +966,29 @@ impl Admin for AdminService {
         Ok(Response::new(CancelReindexResponse { was_building }))
     }
 
+    #[tracing::instrument(name = "admin.reindex_precheck", skip_all, err)]
+    async fn reindex_precheck(
+        &self,
+        request: Request<ReindexPrecheckRequest>,
+    ) -> Result<Response<ReindexPrecheckResponse>, Status> {
+        auth::authorize(&self.auth, "ReindexPrecheck", &request)?;
+        let req = request.into_inner();
+        check_served(&req.index, &self.index)?;
+        let ctx = self.source.as_ref().ok_or_else(|| {
+            Status::unimplemented("this node was started without source access for reindex")
+        })?;
+        let shard_dir = ctx.store.shard_path(&ctx.shard_id);
+        // dir_size walks the shard tree (I/O) → the blocking pool.
+        let r = run_blocking(move || reindex_disk_report(&shard_dir)).await?;
+        Ok(Response::new(ReindexPrecheckResponse {
+            ok: r.ok,
+            free_bytes: r.free_bytes,
+            needed_bytes: r.needed_bytes,
+            index_bytes: r.index_bytes,
+            probed: r.probed,
+        }))
+    }
+
     #[tracing::instrument(name = "admin.reconcile_index", skip_all, err)]
     async fn reconcile_index(
         &self,
@@ -1235,21 +1258,57 @@ fn empty_rebuild_abort_reason(doc_count: u64, records: Option<i64>) -> Option<St
 /// and (briefly) backup copies coexist during the swap.
 const REINDEX_DISK_HEADROOM: u64 = 3;
 
-/// Refuse a reindex up front if free disk plausibly can't hold the rebuild — better than failing
-/// hours in. Compares ≈`REINDEX_DISK_HEADROOM`× the current index size to the free space
-/// at the shard's parent dir. A probe failure (`None`) skips the check rather than blocking.
-fn precheck_free_disk(shard_dir: &Path) -> Result<(), String> {
-    let size = dir_size(shard_dir);
-    let need = size.saturating_mul(REINDEX_DISK_HEADROOM);
+/// The free-disk report for a shard's reindex: the current on-disk size, the ≈headroom `needed`
+/// estimate, the free bytes at its filesystem, and whether it fits. `probed = false` when the
+/// free-disk probe was unavailable — the check is then skipped (`ok = true`), never blocking a
+/// reindex on a probe failure. The node's BUILD-time [`precheck_free_disk`] and the control plane's
+/// pre-run [`ReindexPrecheck`](Admin::reindex_precheck) both read this.
+struct DiskReport {
+    ok: bool,
+    free_bytes: u64,
+    needed_bytes: u64,
+    index_bytes: u64,
+    probed: bool,
+}
+
+fn reindex_disk_report(shard_dir: &Path) -> DiskReport {
+    let index_bytes = dir_size(shard_dir);
+    let needed_bytes = index_bytes.saturating_mul(REINDEX_DISK_HEADROOM);
     let probe_at = shard_dir.parent().unwrap_or(shard_dir);
     match free_disk_bytes(probe_at) {
-        Some(free) if free < need => Err(format!(
-            "insufficient free disk for reindex: need ~{need} bytes (≈{REINDEX_DISK_HEADROOM}× the \
-             {size}-byte index), only {free} free at {}",
-            probe_at.display()
-        )),
-        _ => Ok(()),
+        Some(free_bytes) => DiskReport {
+            ok: free_bytes >= needed_bytes,
+            free_bytes,
+            needed_bytes,
+            index_bytes,
+            probed: true,
+        },
+        None => DiskReport {
+            ok: true,
+            free_bytes: 0,
+            needed_bytes,
+            index_bytes,
+            probed: false,
+        },
     }
+}
+
+/// Refuse a reindex up front if free disk plausibly can't hold the rebuild — better than failing
+/// hours in. Compares ≈`REINDEX_DISK_HEADROOM`× the current index size to the free space
+/// at the shard's parent dir. A probe failure skips the check rather than blocking.
+fn precheck_free_disk(shard_dir: &Path) -> Result<(), String> {
+    let r = reindex_disk_report(shard_dir);
+    if !r.ok {
+        return Err(format!(
+            "insufficient free disk for reindex: need ~{} bytes (≈{REINDEX_DISK_HEADROOM}× the \
+             {}-byte index), only {} free at {}",
+            r.needed_bytes,
+            r.index_bytes,
+            r.free_bytes,
+            shard_dir.parent().unwrap_or(shard_dir).display()
+        ));
+    }
+    Ok(())
 }
 
 /// Total size in bytes of the files under `dir` (recursive); 0 if absent/unreadable.

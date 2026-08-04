@@ -95,8 +95,12 @@ exactly one orchestration implementation behind both doors.
 
 ## Behavior
 
-- **Per-node single-flight**: a node rejects a concurrent reindex on its shard (412). No-source → 501;
-  wrong-index → 404; a windowed index → Unimplemented (event-time, not buckets — a follow-up).
+- **Per-node single-flight**: a node rejects a concurrent reindex on its shard/window (412). No-source
+  → 501; wrong-index → 404.
+- **Up-front disk precheck**: before creating the job the control plane asks every unit's node whether
+  it has room (≈3× the current shard size — the old, staging, and brief backup copies coexist during
+  the swap) and refuses the whole reindex with one clear error naming the short nodes, rather than
+  letting a rebuild fail hours in on a single shard. (The node's own build re-checks as a backstop.)
 - The source-streaming read path keeps peak rebuild memory bounded (O(one chunk)).
 - A schema-changing [alter](/product/functional/index-management/alter.md) rebuilds from the **new**
   definition and cuts over to it; a plain reindex rebuilds against the served definition.

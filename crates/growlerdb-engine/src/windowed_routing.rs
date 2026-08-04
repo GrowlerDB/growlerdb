@@ -16,8 +16,9 @@ use growlerdb_proto::v1::{
     CompactIndexResponse, DescribeIndexRequest, DescribeIndexResponse, ExplainRequest,
     ExplainResponse, ExportRequest, GetByKeyRequest, GetByKeyResponse, OpenPitRequest,
     OpenPitResponse, ReconcileIndexRequest, ReconcileIndexResponse, ReindexIndexRequest,
-    ReindexIndexResponse, ReindexStatusRequest, ReindexStatusResponse, SearchRequest,
-    SearchResponse, SemanticSearchRequest, SuggestRequest, SuggestResponse,
+    ReindexIndexResponse, ReindexPrecheckRequest, ReindexPrecheckResponse, ReindexStatusRequest,
+    ReindexStatusResponse, SearchRequest, SearchResponse, SemanticSearchRequest, SuggestRequest,
+    SuggestResponse,
 };
 use growlerdb_proto::{
     error_details, to_status, Admin, AdminServer, Lookup, LookupServer, Search, SearchServer,
@@ -351,6 +352,14 @@ impl Admin for WindowedAdminService {
     ) -> Result<Response<CancelReindexResponse>, Status> {
         let svc = self.route(request.get_ref().window)?;
         Admin::cancel_reindex(&svc, request).await
+    }
+
+    async fn reindex_precheck(
+        &self,
+        request: Request<ReindexPrecheckRequest>,
+    ) -> Result<Response<ReindexPrecheckResponse>, Status> {
+        let svc = self.route(request.get_ref().window)?;
+        Admin::reindex_precheck(&svc, request).await
     }
 
     async fn reconcile_index(
