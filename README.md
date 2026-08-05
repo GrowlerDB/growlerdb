@@ -46,7 +46,7 @@ builds + serves an index over each, and opens the console:
 just stack
 ```
 
-Open the console at **<http://localhost:8081>**, sign in with **`demo` / `demo`**, and search from
+Open the console at **<http://localhost:8081>**, sign in with **`demo` / `demo-growlerdb`**, and search from
 the UI. It **opens on the `movies` index** (a `VECTOR` index), so lexical, **semantic**, and **hybrid**
 search are one click away.
 
@@ -54,7 +54,7 @@ Or hit the API directly.
 
 ```sh
 token=$(curl -s localhost:8081/v1/login -H 'content-type: application/json' \
-  -d '{"username":"demo","password":"demo"}' | jq -r .token)
+  -d '{"username":"demo","password":"demo-growlerdb"}' | jq -r .token)
 
 curl -s localhost:8081/v1/search -H "authorization: Bearer $token" \
   -H 'content-type: application/json' \

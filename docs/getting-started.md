@@ -94,7 +94,7 @@ Open <http://localhost:8081> and you'll get a login form. Sign in with the baked
 | Field | Value |
 |---|---|
 | Username | `demo` |
-| Password | `demo` |
+| Password | `demo-growlerdb` |
 
 ![GrowlerDB console: the closed-mode sign-in gate shown before authentication; sign in with the demo credential](img/console-login.png)
 
@@ -111,7 +111,7 @@ it in a shell variable; the `curl` examples below send it as `-H "authorization:
 
 ```sh
 TOKEN=$(curl -s localhost:8081/v1/login -H 'content-type: application/json' \
-  -d '{"username":"demo","password":"demo"}' | jq -r .token)
+  -d '{"username":"demo","password":"demo-growlerdb"}' | jq -r .token)
 ```
 
 ## 3. Your first search (REST)
@@ -495,13 +495,13 @@ an Admin-scoped operation: in [`rbac.rs`](https://github.com/GrowlerDB/growlerdb
 `operator` (Search, IndexRead, Ops, not Admin). So the demo token can't reindex; it gets a `403`
 (`` `ReindexIndex` requires the `admin` scope ``). Use the built-in admin user instead.
 
-The demo stack seeds a built-in `admin` user with a well-known password (`admin`), set via
+The demo stack seeds a built-in `admin` user with a well-known password (`admin-growlerdb`), set via
 `GROWLERDB_ADMIN_PASSWORD` in `deploy/compose/docker-compose.yml`, a deliberately well-known demo
 credential, not a production account. Log in as `admin` for an admin-scoped token:
 
 ```sh
 ADMIN_TOKEN=$(curl -s localhost:8081/v1/login -H 'content-type: application/json' \
-  -d '{"username":"admin","password":"admin"}' | jq -r .token)
+  -d '{"username":"admin","password":"admin-growlerdb"}' | jq -r .token)
 ```
 
 Now reindex `catalog` with the admin bearer. GrowlerDB re-reads the Iceberg table (all 11 rows) and
@@ -568,7 +568,7 @@ Once the gateway is up, log in again for a token that can query it:
 
 ```sh
 TOKEN=$(curl -s localhost:8081/v1/login -H 'content-type: application/json' \
-  -d '{"username":"demo","password":"demo"}' | jq -r .token)
+  -d '{"username":"demo","password":"demo-growlerdb"}' | jq -r .token)
 ```
 
 Now, without reindexing, search the live index for readings that are still arriving:

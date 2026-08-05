@@ -49,7 +49,7 @@ makers*:
 
 ```sh
 TOKEN=$(curl -s localhost:8081/v1/login -H 'content-type: application/json' \
-  -d '{"username":"demo","password":"demo"}' | jq -r .token)
+  -d '{"username":"demo","password":"demo-growlerdb"}' | jq -r .token)
 
 # Lexical: exact terms only, misses films that never spell it out this way.
 curl -s localhost:8081/v1/search -H 'content-type: application/json' \

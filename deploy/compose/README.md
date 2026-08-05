@@ -76,7 +76,7 @@ Services (all on the compose network; published to the host):
 | **gateway** | public Engine API + the **console UI** (built-in auth, all-indexes routing) | **console `http://localhost:8081`**, REST `/v1`, gRPC `:50061` |
 | **pool-a** / **pool-b** | HA placement pool (`pool` profile): interchangeable nodes that build + serve whichever of `docs` / `catalog` / `movies` (`movies` is the console default **`VECTOR`** index) the control plane places on them at R=2 | gRPC `:50051` / `:50052`, health `:9102` / `:9104` |
 | **node** | single windowed serve target for the streaming demo only (`pipeline` profile) | gRPC `:50051`, health `:9102` |
-| **controlplane** | cluster index registry + `/v1/login` (seeds `demo`/`demo` + `admin`/`admin`) | gRPC `:50071`, health `:9101` |
+| **controlplane** | cluster index registry + `/v1/login` (seeds `demo`/`demo-growlerdb` + `admin`/`admin-growlerdb`) | gRPC `:50071`, health `:9101` |
 | **lgtm** | Grafana + Loki/Tempo/Mimir + OTLP | Grafana `http://localhost:3000`, OTLP `:4318` |
 
 Open the **console at http://localhost:8081** — the gateway serves the built Svelte UI
