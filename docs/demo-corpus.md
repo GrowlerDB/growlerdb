@@ -7,11 +7,12 @@ parent: Getting started
 
 # The movie demo corpus
 
-The seeded demo tables are deliberately tiny (3 + 10 rows), enough to learn the API but too small to
-*feel* retrieval quality. The opt-in movie corpus loads a slice of Wikipedia movie plots
-(CC-BY-SA-4.0; a decade-balanced set of recognizable films, 1980s–2010s) into the lakehouse and
-stands up a vector-enabled `movies` index over them. At this scale semantic, lexical, and hybrid
-visibly differ, facets mean something, and an MCP-connected agent has real substance to answer from.
+`just stack` already serves the default `movies` index over a small slice of Wikipedia movie plots —
+enough to start exploring semantic, lexical, and hybrid search. This page's opt-in `just demo-data`
+step upgrades that index to the **full** movie corpus: a larger, decade-balanced set of recognizable
+films (1980s–2010s, CC-BY-SA-4.0) loaded into the lakehouse as `growlerdb.movies`. At that scale the
+three search modes visibly differ, the facets (genre, origin, decade) mean something, and an
+MCP-connected agent has real substance to answer from.
 
 With the stack up (`just stack`):
 
