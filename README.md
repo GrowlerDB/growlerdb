@@ -40,7 +40,9 @@ every-field-type `growlerdb.catalog`, and an **Iceberg v3 `events`** table with 
 builds + serves an index over each, and opens the console:
 
 ```sh
-# build + start everything (needs Docker + just); ~10 min on first build
+# start everything (needs Docker + just) — pulls the released images (engine + connector),
+# so no host build; first run is a few minutes (image pulls + the local index/embedding builds).
+# To run YOUR checkout instead, `just stack-dev` (builds the engine + connector from source).
 just stack
 ```
 

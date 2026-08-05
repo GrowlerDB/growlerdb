@@ -29,10 +29,14 @@ source loader), `pipeline` (the streaming demo with Redpanda). Long-running serv
 
 The GrowlerDB services default to the **latest published release image** (`GROWLERDB_IMAGE`
 overrides, e.g. to pin a version or point at a locally-built tag), so a first `just stack` is a pull,
-not a ~10-minute source build. To run the **working checkout** end to end instead — engine binary +
-console, so `/v1/config`, the UI, and search all reflect local changes — **`just stack-dev`** pins
-`GROWLERDB_IMAGE` to a local-only tag, which makes the pull miss and builds the shared image from
-`deploy/Dockerfile`.
+not a ~10-minute source build. The **Spark connector** follows the same pattern via its own
+`GROWLERDB_CONNECTOR_IMAGE` (default `ghcr.io/growlerdb/growlerdb-connector:latest`, the release
+`connector-image` job's fat-jar-baked image) — so `just stack` needs **no host JDK/Maven** to feed the
+variant (and streaming) demos; it pulls the connector, never `mvn package`s it. To run the **working
+checkout** end to end instead — engine binary + console AND the connector — **`just stack-dev`** pins
+both `GROWLERDB_IMAGE` and `GROWLERDB_CONNECTOR_IMAGE` to local-only tags, which makes each pull miss
+and builds the shared image from `deploy/Dockerfile` and the connector from `connector.Dockerfile`
+(JDK 21 lives in that build stage, so still nothing on the host).
 
 **External lakehouse (`external.yml`):** a companion file (`deploy/compose/external.yml` + `.env`) runs
 only GrowlerDB (control-plane + node + gateway, off the published image) against a user's **own**

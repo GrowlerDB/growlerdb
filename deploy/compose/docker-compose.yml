@@ -22,6 +22,17 @@ x-growlerdb-image: &growlerdb-image
   # staying down — the Compose analogue of the k8s pods' implicit always-restart + liveness probes.
   restart: unless-stopped
 
+# The Spark connector runs from a prebuilt image with the fat jar baked in (published by the release
+# `connector-image` job), so `just stack` needs NO host-side Java/Maven build. Mirrors the engine
+# image: pull the published image by default; `just stack-dev` sets `GROWLERDB_CONNECTOR_IMAGE` to a
+# local-only tag so the pull misses and `docker compose build` builds the jar from your checkout via
+# `connector.Dockerfile`. No `restart:` here — each connector service sets its own.
+x-growlerdb-connector-image: &growlerdb-connector-image
+  image: ${GROWLERDB_CONNECTOR_IMAGE:-ghcr.io/growlerdb/growlerdb-connector:latest}
+  build:
+    context: ../..
+    dockerfile: deploy/k8s/streaming/connector.Dockerfile
+
 x-growlerdb-env: &growlerdb-env
   # Point the binary at the in-network Polaris + MinIO (overrides IcebergConfig defaults).
   GROWLERDB_CATALOG_URI: http://polaris:8181/api/catalog
@@ -206,15 +217,13 @@ services:
       - "8181:8181"   # Iceberg REST
 
   # Changelog read in Spark **local mode** against a temp Iceberg table
-  # (Hadoop catalog) — self-contained, no MinIO/Polaris. Runs the prebuilt fat jar
-  # (`cd connector && mise exec -- mvn package`) via spark-submit; the app creates a
-  # table, applies INSERT/UPDATE/DELETE, reads the changelog, and exits non-zero on
-  # mismatch — so `--exit-code-from spark` gives pass/fail. Enable with: --profile spark
+  # (Hadoop catalog) — self-contained, no MinIO/Polaris. Runs the baked connector image's fat jar
+  # (`/opt/growlerdb/connector.jar`) via spark-submit; the app creates a table, applies
+  # INSERT/UPDATE/DELETE, reads the changelog, and exits non-zero on mismatch — so
+  # `--exit-code-from spark` gives pass/fail. Enable with: --profile spark
   spark:
     profiles: ["spark"]
-    image: apache/spark:4.1.3
-    volumes:
-      - ../../connector/target/growlerdb-connector-0.0.0.jar:/opt/growlerdb/connector.jar:ro
+    <<: *growlerdb-connector-image
     entrypoint: ["/opt/spark/bin/spark-submit"]
     command:
       - --master
@@ -654,9 +663,7 @@ services:
     # a transient failure self-heals: on restart it re-reads the Node's committed checkpoint and
     # resumes exactly-once, instead of leaving ingestion frozen while the source keeps growing.
     restart: on-failure
-    image: apache/spark:4.1.3
-    volumes:
-      - ../../connector/target/growlerdb-connector-0.0.0.jar:/opt/growlerdb/connector.jar:ro
+    <<: *growlerdb-connector-image
     environment:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
@@ -846,10 +853,8 @@ services:
   # (--variant-spec) — into the node. Mirrors the `connector` service's Spark/REST-catalog wiring.
   connector-events:
     profiles: ["variant"]
-    image: apache/spark:4.1.3
+    <<: *growlerdb-connector-image
     restart: on-failure
-    volumes:
-      - ../../connector/target/growlerdb-connector-0.0.0.jar:/opt/growlerdb/connector.jar:ro
     environment:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
