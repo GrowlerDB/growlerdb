@@ -6,7 +6,7 @@ All notable changes to GrowlerDB are documented here. The format is based on
 
 ## [Unreleased]
 
-## [0.9.0] - 2026-08-04
+## [0.9.0] - 2026-08-05
 
 The **reindex** release. Rebuilding an index from its Iceberg source is now a first-class, coordinated
 operation with **zero write-downtime**: an async job across every shard and window, durable across a
