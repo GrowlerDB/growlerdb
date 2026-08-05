@@ -11,7 +11,9 @@ COPY crates/growlerdb-proto/proto ./crates/growlerdb-proto/proto
 WORKDIR /repo/connector
 RUN mvn -q -B -DskipTests package
 
-FROM apache/spark:4.0.0
+# Base MUST match the connector pom's `spark.version` (the jar's `provided` Spark is not bundled), and
+# the Compose `just stack` runtime — both 4.1.3.
+FROM apache/spark:4.1.3
 COPY --from=build /repo/connector/target/growlerdb-connector-0.0.0.jar /opt/growlerdb/connector.jar
 # Drop root — the Spark image ships a `spark` user (UID 185); the jar is world-readable so submit works.
 USER spark

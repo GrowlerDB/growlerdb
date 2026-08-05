@@ -14,7 +14,7 @@ GrowlerDB runs with its dependencies (MinIO object storage, Apache Polaris catal
 LGTM observability stack, all on one host. The integration tests run against this setup too.
 
 ```sh
-just stack          # build + start everything; seeds a sample growlerdb.docs table
+just stack          # pull + start everything (no host build); seeds a sample growlerdb.docs table
 just stack-down     # tear it down (removes volumes)
 ```
 

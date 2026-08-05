@@ -129,15 +129,19 @@ ui-reload:
       --profile stack --profile pipeline up -d --no-deps --force-recreate gateway
 
 # Streaming demo: generator → Redpanda → Iceberg → Spark connector → GrowlerDB index.
-# Brings up the deps + bootstraps Polaris, builds the connector fat jar, then runs the full stack
-# serving `telemetry_stream` plus the producer pipeline. The GrowlerDB image is built once and
-# reused (no `--build`); run `just build-image` to rebuild after Rust changes. Watch ingest rate in
-# Grafana (rate(growlerdb_ingested_docs_total)) and lag in the console Ingestion screen
+# Brings up the deps + bootstraps Polaris, pulls the connector image (fat jar baked in — no host
+# JDK/Maven; falls back to building it via connector.Dockerfile), then runs the full stack serving
+# `telemetry_stream` plus the producer pipeline. The GrowlerDB image is built once and reused (no
+# `--build`); run `just build-image` to rebuild after Rust changes. Watch ingest rate in Grafana
+# (rate(growlerdb_ingested_docs_total)) and lag in the console Ingestion screen
 # (<http://localhost:8081>). See deploy/compose/pipeline/README.md. Tear down with `just pipeline-down`.
 pipeline:
     docker compose -f deploy/compose/docker-compose.yml up -d minio createbuckets polaris
     deploy/compose/setup-polaris.sh
-    cd connector && mise exec -- mvn -q -DskipTests package
+    docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/pipeline.override.yml \
+      --profile stack --profile pipeline pull -q connector \
+      || docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/pipeline.override.yml \
+      --profile stack --profile pipeline build connector
     docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/pipeline.override.yml \
       --profile stack --profile pipeline up -d
 
@@ -149,10 +153,13 @@ pipeline-down:
     docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/pipeline.override.yml \
       --profile stack --profile pipeline down -v
 
-# run the changelog-read demo in Spark local mode (builds the jar first).
-# Self-contained (Hadoop catalog) — no MinIO/Polaris. Pass/fail via the exit code.
+# run the changelog-read demo in Spark local mode (runs the baked connector image — no host build;
+# falls back to building it via connector.Dockerfile). To exercise a LOCAL connector change instead,
+# use `just connector-it` / `just connector-e2e`. Self-contained (Hadoop catalog) — no MinIO/Polaris.
+# Pass/fail via the exit code.
 spark:
-    cd connector && mise exec -- mvn -q -DskipTests package
+    docker compose -f deploy/compose/docker-compose.yml --profile spark pull -q spark \
+      || docker compose -f deploy/compose/docker-compose.yml --profile spark build spark
     docker compose -f deploy/compose/docker-compose.yml --profile spark up --exit-code-from spark spark
     docker compose -f deploy/compose/docker-compose.yml --profile spark down
 
@@ -176,13 +183,16 @@ connector-e2e:
 stack:
     @deploy/compose/stack-up.sh
 
-# Pins GROWLERDB_IMAGE to a local-only tag so the `pull` misses and compose builds the shared image
-# (engine binary + console) from deploy/Dockerfile. Every service (gateway, nodes) then runs your
-# code, so `/v1/config`, the console, and search all reflect the branch. First build is a full Rust
-# compile (cached after); re-run to pick up further changes.
-# Same as `just stack`, but runs YOUR checkout (engine + console) instead of the released image.
+# Pins GROWLERDB_IMAGE and GROWLERDB_CONNECTOR_IMAGE to local-only tags so both `pull`s miss and
+# compose builds them from your checkout: the shared engine image (binary + console) from
+# deploy/Dockerfile, and the Spark connector image (fat jar) from connector.Dockerfile. Every service
+# then runs your code, so `/v1/config`, the console, search, AND the connector reflect the branch.
+# First build is a full Rust compile + a JDK-21 Maven package (cached after); re-run to pick up changes.
+# Same as `just stack`, but runs YOUR checkout (engine + console + connector) instead of released images.
 stack-dev:
-    GROWLERDB_IMAGE=growlerdb-local:dev {{ just_executable() }} stack
+    GROWLERDB_IMAGE=growlerdb-local:dev \
+    GROWLERDB_CONNECTOR_IMAGE=growlerdb-connector-local:dev \
+    {{ just_executable() }} stack
 
 # Mint a demo bearer and print paste-ready MCP connect snippets (Claude Code one-liner, the
 # checked-in .mcp.json export, generic HTTP config, Claude Desktop bridge). Re-run to re-mint.

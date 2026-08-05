@@ -44,12 +44,12 @@ Publishing the site (Pages) and pointing the domain is part of going public — 
 Deep design/system knowledge lives here in the OKF; the website is the user-facing docs surface.
 
 The **getting-started** quickstart is validated end-to-end on a fresh box (Ubuntu 24.04 + macOS):
-the core walkthrough (§1–§8) needs only **Docker + Compose v2 + `just` + `jq`** (dual-OS prereqs), on a
-**host or VM — not a container** (Docker bind mounts don't resolve there), with **~4 GB RAM**. The
-streaming demo (§9) additionally needs **`mise`** on the host to build the Spark connector jar (JDK 21
-+ Maven). `just stack` builds the
-shared `growlerdb-local:dev` image **once** before starting the control-plane/node/gateway, avoiding
-a same-tag parallel-build race on Docker's containerd store; `setup-polaris.sh` parses the Polaris
+the whole walkthrough — **including** the streaming demo (§9) — needs only **Docker + Compose v2 +
+`just` + `jq`** (dual-OS prereqs), on a **host or VM — not a container** (Docker bind mounts don't
+resolve there), with **~4 GB RAM**. No host JDK/Maven: the Spark connector runs from a prebuilt image
+(fat jar baked in) just like the engine. `just stack` **pulls** the released engine and connector
+images before starting the control-plane/node/gateway (a first run is a pull, not a source build);
+`setup-polaris.sh` parses the Polaris
 token with `sed` (no python3 dependency). CI's `e2e` runs the engine in-process, so it doesn't
 exercise the `--profile stack` build path — this quickstart is what covers it.
 

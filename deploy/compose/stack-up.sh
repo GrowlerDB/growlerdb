@@ -78,10 +78,11 @@ done
 step 5 6 "Variant index 'events' (Iceberg v3 — Spark-seeded, connector-fed, Trino-hydrated)"
 # Unlike the pyiceberg-seeded, self-cold-building indexes above, a variant table is Spark-seeded
 # (format-version=3), connector-fed (released iceberg-rust can't scan a variant table — D49 — so the
-# node skips the native build) and Trino-hydrated. So: build the connector jar (needs JDK 21 via mise),
-# bring up Trino, Spark-seed the table, serve `events`, then populate it via the connector. All variant
-# commands run with the full profile set active so node-events' cross-profile deps resolve.
-( cd connector && mise exec -- mvn -q -DskipTests package )
+# node skips the native build) and Trino-hydrated. So: pull the connector image (the fat jar baked in,
+# so no host-side JDK/Maven build — `just stack-dev` builds it from your checkout instead), bring up
+# Trino, Spark-seed the table, serve `events`, then populate it via the connector. All variant commands
+# run with the full profile set active so node-events' cross-profile deps resolve.
+dc --profile variant pull -q connector-events || dc --profile variant build connector-events
 dc --profile trino up -d --quiet-pull trino
 VARIANT_PROFILES=(--profile stack --profile pool --profile trino --profile variant)
 dc "${VARIANT_PROFILES[@]}" run --rm seed-events

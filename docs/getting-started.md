@@ -9,17 +9,16 @@ has_children: true
 
 This tutorial takes you from nothing to your first search against an Iceberg table, using the local
 Compose stack (GrowlerDB, MinIO object storage, the Apache Polaris catalog, and the LGTM
-observability stack). It takes about 10 minutes, mostly the first image build.
+observability stack). It takes a few minutes — mostly pulling the images and building the sample
+indexes (embeddings run on the host CPU); there's no source build on the default path.
 
 ## Prerequisites
 
 You need Docker with the Compose v2 plugin, [`just`](https://github.com/casey/just), and `jq` (the
-REST examples pipe JSON through it). The core walkthrough (§1–§10) runs entirely in containers, with
-no language toolchains required. The streaming demo (§11) is the one exception: it builds the Spark
-connector jar on the host, which needs [`mise`](https://mise.jdx.dev) (it provisions JDK 21 and Maven
-on demand). You'll install `mise` in §11, so you don't need it before then. Run the demo on a Linux
-host or a VM, or on macOS with Docker Desktop, not inside a container (Docker bind mounts won't
-resolve there). About 4 GB of RAM is enough.
+REST examples pipe JSON through it). The whole tutorial — including the streaming demo (§11) — runs
+entirely in containers from prebuilt images (the engine and the Spark connector are both pulled), with
+no host language toolchains required. Run it on a Linux host or a VM, or on macOS with Docker Desktop,
+not inside a container (Docker bind mounts won't resolve there). About 4 GB of RAM is enough.
 
 ### Ubuntu / Debian
 
@@ -64,7 +63,7 @@ From the repo root:
 just stack
 ```
 
-This builds the GrowlerDB image, brings up MinIO and Polaris, and seeds sample Iceberg tables:
+This pulls the released GrowlerDB image, brings up MinIO and Polaris, and seeds sample Iceberg tables:
 `growlerdb.docs` (3 rows), the richer `growlerdb.catalog` (10 rows), and a small `growlerdb.movies`
 slice (300 Wikipedia movie plots). It then starts the control plane, a node per index, the gateway,
 and Grafana/LGTM; each node builds and serves its index and registers with the control plane, and the
@@ -554,22 +553,14 @@ Iceberg → the connector → a live `telemetry_stream` index), so you can watch
 as it arrives, with no reindex step. It's a self-contained stack (a different node config than the
 `movies`/`docs`/`catalog` batch demo), so stop the batch stack first:
 
-> **This step builds the Spark connector jar on your host** (not in a container), so it needs
-> [`mise`](https://mise.jdx.dev), which provisions JDK 21 and Maven on demand. Install it once and
-> restart your shell before running `just pipeline`:
->
-> ```sh
-> curl https://mise.run | sh      # then restart your shell (or `source` your profile)
-> ```
-
 ```sh
 just stack-down          # free port 8081 + the node from the batch demo
-just pipeline            # deps + Polaris bootstrap + build the connector jar + bring it all up
+just pipeline            # deps + Polaris bootstrap + pull the connector image + bring it all up
 ```
 
-`just pipeline` builds the connector jar on first run (a minute or two), then starts the generator,
-sink, and Spark connector. Give it about 30 s for the first micro-batch to land and the node to build
-the `telemetry_stream` index; the gateway comes up once that node is ready.
+`just pipeline` pulls the connector image (fat jar baked in — no host build) on first run, then starts
+the generator, sink, and Spark connector. Give it about 30 s for the first micro-batch to land and the
+node to build the `telemetry_stream` index; the gateway comes up once that node is ready.
 
 Tearing down the batch stack invalidated your earlier `$TOKEN`: a fresh stack signs session tokens
 with a new key, and here the demo user is re-seeded scoped to `telemetry_stream` (not `movies`/`docs`/`catalog`).
