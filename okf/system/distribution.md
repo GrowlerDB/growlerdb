@@ -42,6 +42,15 @@ and a bucket move) can't last-write-wins revert each other — the loser gets a 
 `PLACEMENT_CONFLICT` (`FAILED_PRECONDITION`) and re-plans. The gateway **hot-reloads** the map so a
 reshard is online end-to-end.
 
+## Reindex generation (epoch)
+
+Alongside the bucket map, an index carries a **routing generation** (`u64`) in the registry. A
+coordinated [reindex](/product/functional/index-management/reindex.md) builds every shard's next
+generation, then bumps this epoch in one compare-and-swap (`set_generation`) as the atomic cutover
+marker — folded into the gateway's routing fingerprint so it converges on its next `GetIndex` poll.
+Like the bucket-map CAS, a concurrent reindex/reshard racing the bump gets a loud `PLACEMENT_CONFLICT`
+rather than a silent revert.
+
 ## Notes
 
 Routing logic is mirrored in the connector (`ShardRouter`) with golden-vector parity. Core in

@@ -8,12 +8,14 @@ use std::sync::Arc;
 
 use growlerdb_proto::v1::{
     AggregateRequest, AggregateResponse, AlterIndexRequest, AlterIndexResponse, BackupIndexRequest,
-    BackupIndexResponse, BackupStatusRequest, BackupStatusResponse, ClosePitRequest,
-    ClosePitResponse, CompactIndexRequest, CompactIndexResponse, DescribeIndexRequest,
-    DescribeIndexResponse, ExplainRequest, ExplainResponse, ExportRequest, GetByKeyRequest,
-    GetByKeyResponse, OpenPitRequest, OpenPitResponse, ReconcileIndexRequest,
-    ReconcileIndexResponse, ReindexIndexRequest, ReindexIndexResponse, SearchRequest,
-    SearchResponse, SemanticSearchRequest, SuggestRequest, SuggestResponse,
+    BackupIndexResponse, BackupStatusRequest, BackupStatusResponse, CancelReindexRequest,
+    CancelReindexResponse, ClosePitRequest, ClosePitResponse, CompactIndexRequest,
+    CompactIndexResponse, DescribeIndexRequest, DescribeIndexResponse, ExplainRequest,
+    ExplainResponse, ExportRequest, GetByKeyRequest, GetByKeyResponse, OpenPitRequest,
+    OpenPitResponse, ReconcileIndexRequest, ReconcileIndexResponse, ReindexIndexRequest,
+    ReindexIndexResponse, ReindexPrecheckRequest, ReindexPrecheckResponse, ReindexStatusRequest,
+    ReindexStatusResponse, SearchRequest, SearchResponse, SemanticSearchRequest, SuggestRequest,
+    SuggestResponse,
 };
 use growlerdb_proto::{
     Admin, AdminServer, Lookup, LookupServer, Search, SearchServer, Suggest, SuggestServer,
@@ -160,6 +162,29 @@ impl Admin for GatewayAdmin {
         _req: Request<ReindexIndexRequest>,
     ) -> Result<Response<ReindexIndexResponse>, Status> {
         Err(not_routed("ReindexIndex"))
+    }
+
+    async fn reindex_status(
+        &self,
+        _req: Request<ReindexStatusRequest>,
+    ) -> Result<Response<ReindexStatusResponse>, Status> {
+        // Per-node op: the coordinated driver polls each shard's node directly, not through the
+        // gateway.
+        Err(not_routed("ReindexStatus"))
+    }
+
+    async fn cancel_reindex(
+        &self,
+        _req: Request<CancelReindexRequest>,
+    ) -> Result<Response<CancelReindexResponse>, Status> {
+        Err(not_routed("CancelReindex"))
+    }
+
+    async fn reindex_precheck(
+        &self,
+        _req: Request<ReindexPrecheckRequest>,
+    ) -> Result<Response<ReindexPrecheckResponse>, Status> {
+        Err(not_routed("ReindexPrecheck"))
     }
 
     async fn reconcile_index(

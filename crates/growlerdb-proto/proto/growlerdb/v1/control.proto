@@ -239,6 +239,18 @@ message GetIndexResponse {
   // Windowing config for a windowed index: set iff this index is windowed, so a live-CP
   // gateway can build a window router + prune. Absent for an ordinal index.
   WindowingConfig windowing = 8;
+  // Routing generation (epoch). Bumped atomically on a reindex cutover so a gateway converges on
+  // the new generation via its GetIndex poll. 0 for a never-reindexed index.
+  uint64 generation = 9;
+  // Definition version. Bumped when an in-place alter updates the definition, so nodes observe the
+  // change and reload their served definition. 0 for a never-altered index.
+  uint64 definition_version = 10;
+  // The registry's **full resolved definition** (serde JSON of `ResolvedIndex`) — the cluster's
+  // authoritative index definition. A node loads this on boot (in cluster mode) instead of a stale
+  // local `index.json` / re-derived def, so it opens/builds the on-disk index at the definition a
+  // durable alter last committed (matching the reindexed segments) rather than hitting SchemaChanged.
+  // Empty only for a legacy registry row written before this field existed.
+  string definition_json = 11;
 }
 
 // One bucket's reassignment in a reshard plan: which shard a bucket moves from/to.
@@ -494,6 +506,87 @@ message GetLicenseResponse {
 }
 
 // Cluster-wide index lifecycle over the registry.
+// Durable, cluster-wide alter (see ControlPlane.AlterIndex): diff a candidate definition against
+// the registry's, and — with apply — update the registry definition (durable, survives restart) and,
+// for a reindex-requiring change, run a coordinated reindex from the NEW definition, cutting over
+// atomically. Distinct from the node AdminService.AlterIndex (node-local, non-durable, plan-only).
+message AlterControlRequest {
+  string index = 1;
+  string definition_yaml = 2;  // candidate index-definition YAML
+  bool apply = 3;              // false ⇒ dry-run plan; true ⇒ apply (durable; reindex if required)
+}
+message AlterControlResponse {
+  bool is_noop = 1;
+  bool requires_reindex = 2;
+  repeated string reindex_reasons = 3;   // changes that force a rebuild
+  repeated string in_place_changes = 4;  // metadata-only changes
+  bool applied = 5;                      // the registry definition was durably updated
+  bool reindex_triggered = 6;            // a coordinated reindex from the new definition ran
+  uint64 generation = 7;                 // routing generation after a triggered reindex (else current)
+}
+
+// Coordinated whole-index reindex (see ControlPlane.ReindexIndex).
+message ReindexControlRequest {
+  string index = 1;
+}
+message ReindexControlResponse {
+  uint64 generation = 1;  // the index's routing generation after the atomic cutover
+  uint32 shards = 2;      // shards rebuilt and cut over
+  uint64 doc_count = 3;   // total documents across the rebuilt shards
+}
+
+// --- Async reindex jobs ---
+// A coordinated reindex is long-running, so the first-class way to run one is asynchronously: start
+// returns a job id immediately, and the caller polls progress / cancels via the job. The synchronous
+// ReindexIndex above is the same driver awaited to completion (for scripts / the embedded path).
+
+// Start a coordinated reindex as a background job. Returns immediately with the job id; poll
+// GetReindexJob for per-shard progress. FAILED_PRECONDITION if a job is already running for `index`.
+message StartReindexJobRequest {
+  string index = 1;
+}
+message StartJobResponse {
+  string job_id = 1;  // server-assigned handle: poll/cancel it via GetReindexJob / CancelReindexJob
+}
+
+message GetReindexJobRequest {
+  string job_id = 1;
+}
+message ListReindexJobsRequest {}
+message CancelReindexJobRequest {
+  string job_id = 1;
+}
+
+// One shard's live status within a reindex job.
+message ReindexJobShard {
+  uint32 ordinal = 1;
+  string node = 2;         // the shard primary endpoint the driver is driving
+  string phase = 3;        // pending | building | built | promoting | promoted | discarded
+  uint64 docs_done = 4;    // documents committed into this shard's staged generation so far
+  uint64 docs_total = 5;   // source snapshot record count this shard's build targets (0 = unknown)
+  int64 window = 6;        // windowed index: this unit's time-window id (0 for an ordinal shard)
+}
+
+// The pollable status of a coordinated reindex/alter job.
+message ReindexJobStatus {
+  string id = 1;
+  string index = 2;
+  string kind = 3;              // reindex | alter
+  string state = 4;             // pending | building | catching_up | cutting_over | done | failed | canceled
+  repeated ReindexJobShard shards = 5;
+  uint64 docs_done = 6;         // Σ shard docs_done (the progress numerator)
+  uint64 docs_total = 7;        // Σ shard docs_total (the denominator; 0 while unknown)
+  uint64 generation = 8;        // routing generation after cutover (0 until done)
+  bool cancel_requested = 9;    // a cancel was requested; the driver is aborting
+  string error = 10;            // failure / cancel detail ("" otherwise)
+  int64 created_ms = 11;
+  int64 updated_ms = 12;
+}
+
+message ListReindexJobsResponse {
+  repeated ReindexJobStatus jobs = 1;  // newest first
+}
+
 service ControlPlane {
   rpc CreateIndex(CreateIndexRequest) returns (CreateIndexResponse);
   rpc DropIndex(DropIndexRequest) returns (DropIndexResponse);
@@ -513,6 +606,24 @@ service ControlPlane {
   rpc ApplyReshard(ApplyReshardRequest) returns (ApplyReshardResponse);
   // Move one bucket off a busy shard to a quieter one online — skew relief without a reshard.
   rpc MoveBucket(MoveBucketRequest) returns (MoveBucketResponse);
+  // Coordinated whole-index reindex across ALL shards: build every shard's next generation from
+  // source (unchanged bucket owners), then cut over atomically by bumping the routing generation.
+  // A build failure discards every staged generation and never cuts over (no half-swap). This is
+  // the multi-shard counterpart the single-shard node reindex can't do alone.
+  rpc ReindexIndex(ReindexControlRequest) returns (ReindexControlResponse);
+  // Start a coordinated reindex as a background job (the first-class async path): returns a job id
+  // immediately; poll GetReindexJob for per-shard progress, cancel via CancelReindexJob.
+  rpc StartReindexJob(StartReindexJobRequest) returns (StartJobResponse);
+  // Poll one reindex job's status (per-shard phase + docs_done/docs_total).
+  rpc GetReindexJob(GetReindexJobRequest) returns (ReindexJobStatus);
+  // List reindex jobs, newest first.
+  rpc ListReindexJobs(ListReindexJobsRequest) returns (ListReindexJobsResponse);
+  // Request cancellation of a running job: staged generations are discarded and the fences released;
+  // the old generation is left intact. Idempotent (a terminal job is returned unchanged).
+  rpc CancelReindexJob(CancelReindexJobRequest) returns (ReindexJobStatus);
+  // Durable cluster-wide alter: update the registry definition and, for a reindex-requiring change,
+  // run a coordinated reindex from the new definition. Multi-shard counterpart to the node alter.
+  rpc AlterIndex(AlterControlRequest) returns (AlterControlResponse);
   // Source-schema introspection for the create-index form.
   rpc DescribeSource(DescribeSourceRequest) returns (DescribeSourceResponse);
   // A serving node self-registers its locally-built index + shard assignment.

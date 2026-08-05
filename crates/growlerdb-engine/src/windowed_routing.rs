@@ -11,12 +11,14 @@ use std::sync::{Arc, RwLock};
 use growlerdb_proto::v1::Error as WireError;
 use growlerdb_proto::v1::{
     AggregateRequest, AggregateResponse, AlterIndexRequest, AlterIndexResponse, BackupIndexRequest,
-    BackupIndexResponse, BackupStatusRequest, BackupStatusResponse, ClosePitRequest,
-    ClosePitResponse, CompactIndexRequest, CompactIndexResponse, DescribeIndexRequest,
-    DescribeIndexResponse, ExplainRequest, ExplainResponse, ExportRequest, GetByKeyRequest,
-    GetByKeyResponse, OpenPitRequest, OpenPitResponse, ReconcileIndexRequest,
-    ReconcileIndexResponse, ReindexIndexRequest, ReindexIndexResponse, SearchRequest,
-    SearchResponse, SemanticSearchRequest, SuggestRequest, SuggestResponse,
+    BackupIndexResponse, BackupStatusRequest, BackupStatusResponse, CancelReindexRequest,
+    CancelReindexResponse, ClosePitRequest, ClosePitResponse, CompactIndexRequest,
+    CompactIndexResponse, DescribeIndexRequest, DescribeIndexResponse, ExplainRequest,
+    ExplainResponse, ExportRequest, GetByKeyRequest, GetByKeyResponse, OpenPitRequest,
+    OpenPitResponse, ReconcileIndexRequest, ReconcileIndexResponse, ReindexIndexRequest,
+    ReindexIndexResponse, ReindexPrecheckRequest, ReindexPrecheckResponse, ReindexStatusRequest,
+    ReindexStatusResponse, SearchRequest, SearchResponse, SemanticSearchRequest, SuggestRequest,
+    SuggestResponse,
 };
 use growlerdb_proto::{
     error_details, to_status, Admin, AdminServer, Lookup, LookupServer, Search, SearchServer,
@@ -280,11 +282,11 @@ impl Lookup for WindowedLookupService {
     }
 }
 
-/// The **admin** (DescribeIndex) counterpart to [`WindowedSearchService`]: an `Admin` service over a
-/// node's `window id → AdminService` map, dispatching a describe to the window its
-/// [`DescribeIndexRequest::window`] selector names, so the Gateway can fan a describe to every window
-/// and sum the per-window stats. Alter/reindex are cluster-shape ops that don't apply per-window →
-/// `Unimplemented`.
+/// The **admin** counterpart to [`WindowedSearchService`]: an `Admin` service over a node's
+/// `window id → AdminService` map, dispatching each op to the window its request's `window` selector
+/// names — a describe (so the Gateway sums per-window stats) or a per-window reindex BUILD/PROMOTE/
+/// DISCARD (the coordinated driver reindexes a windowed index one window at a time). Alter stays
+/// `Unimplemented` (a cluster-shape op, not per-window).
 pub struct WindowedAdminService {
     windows: SharedAdminWindows,
 }
@@ -327,11 +329,37 @@ impl Admin for WindowedAdminService {
 
     async fn reindex_index(
         &self,
-        _request: Request<ReindexIndexRequest>,
+        request: Request<ReindexIndexRequest>,
     ) -> Result<Response<ReindexIndexResponse>, Status> {
-        Err(Status::unimplemented(
-            "reindex is not supported over a distributed windowed index",
-        ))
+        // Windowed reindex is driven one window at a time: route BUILD/PROMOTE/DISCARD to the
+        // window's per-window AdminService, which rebuilds that window's shard filtered to its
+        // ingest-time window (the coordinated driver iterates the index's windows).
+        let svc = self.route(request.get_ref().window)?;
+        Admin::reindex_index(&svc, request).await
+    }
+
+    async fn reindex_status(
+        &self,
+        request: Request<ReindexStatusRequest>,
+    ) -> Result<Response<ReindexStatusResponse>, Status> {
+        let svc = self.route(request.get_ref().window)?;
+        Admin::reindex_status(&svc, request).await
+    }
+
+    async fn cancel_reindex(
+        &self,
+        request: Request<CancelReindexRequest>,
+    ) -> Result<Response<CancelReindexResponse>, Status> {
+        let svc = self.route(request.get_ref().window)?;
+        Admin::cancel_reindex(&svc, request).await
+    }
+
+    async fn reindex_precheck(
+        &self,
+        request: Request<ReindexPrecheckRequest>,
+    ) -> Result<Response<ReindexPrecheckResponse>, Status> {
+        let svc = self.route(request.get_ref().window)?;
+        Admin::reindex_precheck(&svc, request).await
     }
 
     async fn reconcile_index(

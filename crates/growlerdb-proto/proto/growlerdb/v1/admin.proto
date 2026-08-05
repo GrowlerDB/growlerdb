@@ -105,6 +105,9 @@ message AlterPlan {
 
 message AlterIndexResponse {
   AlterPlan plan = 1;
+  bool applied = 2;            // the definition change was applied (durable via the control plane)
+  bool reindex_triggered = 3;  // a coordinated reindex from the new definition ran (control plane)
+  uint64 generation = 4;       // routing generation after a triggered reindex
 }
 
 // Reindex an index: rebuild it from the source and durably swap it live.
@@ -117,11 +120,83 @@ message ReindexIndexRequest {
   // ordinal in the new layout. Empty `bucket_owners` ⇒ a normal full reindex (every doc kept).
   repeated uint32 bucket_owners = 2;
   uint32 shard_ordinal = 3;
+  // Phase of a coordinated reindex. FULL (default) is the one-shot node path — fence + build +
+  // promote in a single call — used by single-shard/embedded reindex. The control plane drives a
+  // MULTI-shard reindex in phases so it can build EVERY shard's next generation before cutting over
+  // any (so a build failure never half-swaps the index): BUILD engages the write-fence and builds
+  // the staged generation, leaving it fenced but NOT promoted; PROMOTE cuts the staged generation
+  // over and releases the fence; DISCARD drops the staged generation and releases the fence (abort).
+  // The fence is held across BUILD..PROMOTE so writes can't advance the shard past the build
+  // snapshot (which the swap would otherwise drop).
+  ReindexPhase phase = 4;
+  // Resolved index definition (serde JSON of `ResolvedIndex`) to rebuild against, INSTEAD of the
+  // node's currently-served definition — set by a durable alter that changes the schema, so the
+  // rebuild uses the new mapping and the node adopts it as its served definition at PROMOTE. Empty
+  // ⇒ rebuild against the current served definition (a plain reindex). Carried on BUILD/PROMOTE/FULL.
+  string definition_json = 5;
+  // Windowed index selector: the time-window id (epoch-micros of the window start) to reindex, so
+  // the node routes BUILD/PROMOTE/DISCARD to that window's shard and the rebuild keeps only the docs
+  // whose ingest-time window equals it. 0 for an ordinal (hash/partition) index, which uses
+  // `bucket_owners`/`shard_ordinal` instead. A windowed reindex is driven one window at a time.
+  int64 window = 6;
+}
+
+// Phase of a node reindex — see `ReindexIndexRequest.phase`.
+enum ReindexPhase {
+  REINDEX_PHASE_FULL = 0;     // one-shot: build + promote in a single fenced call (default)
+  REINDEX_PHASE_BUILD = 1;    // engage the fence + build the staged generation, leave it fenced
+  REINDEX_PHASE_PROMOTE = 2;  // cut the staged generation over, release the fence
+  REINDEX_PHASE_DISCARD = 3;  // discard the staged generation, release the fence (abort)
 }
 
 message ReindexIndexResponse {
-  uint64 doc_count = 1;   // documents in the rebuilt index
-  uint64 snapshot = 2;    // the rebuilt index's commit snapshot
+  uint64 doc_count = 1;   // documents in the rebuilt index (0 for DISCARD)
+  uint64 snapshot = 2;    // the rebuilt index's commit snapshot (the build snapshot for BUILD)
+}
+
+// Live build progress of the reindex currently staging on this node — the doc-level counter the
+// coordinated multi-shard reindex polls per shard so a job can report `docs_done / docs_total`.
+// `docs_total` is the source table's snapshot record count fixed when the BUILD began (0 when no
+// build is active or the source count is unknown). Cheap: reads a few atomics, no shard I/O.
+message ReindexStatusRequest {
+  string index = 1;  // empty ⇒ the served index
+  int64 window = 2;  // windowed index: the window whose build progress to read (0 for ordinal)
+}
+message ReindexStatusResponse {
+  // Whether a BUILD is currently populating a staged generation on this node. When false the
+  // counters describe the last build (or are zero if none ran since boot).
+  bool building = 1;
+  uint64 docs_done = 2;   // documents committed into the staging generation so far
+  uint64 docs_total = 3;  // source snapshot record count the build targets (0 = unknown)
+  bool cancel_requested = 4; // a CancelReindex tripped the abort flag the populate loop observes
+}
+
+// Trip the per-node cancel flag the reindex populate loop checks each committed chunk: an in-flight
+// BUILD aborts (returning CANCELLED), so the coordinated driver can DISCARD every staged generation
+// and release the fences. A no-op ack when no build is active. Idempotent.
+message CancelReindexRequest {
+  string index = 1;  // empty ⇒ the served index
+  int64 window = 2;  // windowed index: the window whose in-flight build to cancel (0 for ordinal)
+}
+message CancelReindexResponse {
+  bool was_building = 1; // true iff a build was in progress when the flag was tripped
+}
+
+// Free-disk **precheck** for a shard/window's reindex — the control plane calls this on every unit's
+// node BEFORE creating a job, so an operator gets one up-front error naming the short nodes instead of
+// a reindex failing hours into a multi-GB rebuild on one shard. Cheap: a recursive size sum of the
+// shard dir + one statvfs. `ok = false` ⇒ free disk plausibly can't hold the rebuild (the old,
+// staging, and brief backup copies coexist during the swap).
+message ReindexPrecheckRequest {
+  string index = 1;  // empty ⇒ the served index
+  int64 window = 2;  // windowed index: the window to check (0 for ordinal)
+}
+message ReindexPrecheckResponse {
+  bool ok = 1;              // free_bytes >= needed_bytes (or the free-disk probe was unavailable)
+  uint64 free_bytes = 2;    // free disk at the shard dir's filesystem (0 if the probe failed)
+  uint64 needed_bytes = 3;  // headroom estimate: ~3x the current shard size
+  uint64 index_bytes = 4;   // the shard's current on-disk size
+  bool probed = 5;          // whether the free-disk probe succeeded (false ⇒ check skipped, ok=true)
 }
 
 // Reconcile the served shard against the source's current snapshot: the drift backstop that both
@@ -199,6 +274,14 @@ service Admin {
   rpc AlterIndex(AlterIndexRequest) returns (AlterIndexResponse);
   // Rebuild the index from its source and durably swap it live.
   rpc ReindexIndex(ReindexIndexRequest) returns (ReindexIndexResponse);
+  // Live doc-level build progress of an in-flight reindex — polled per shard by the coordinated
+  // driver so an async reindex job can report `docs_done / docs_total`.
+  rpc ReindexStatus(ReindexStatusRequest) returns (ReindexStatusResponse);
+  // Cancel an in-flight reindex build on this node: trip the populate loop's abort flag.
+  rpc CancelReindex(CancelReindexRequest) returns (CancelReindexResponse);
+  // Free-disk precheck for a shard/window's reindex — the coordinated driver calls it on every unit
+  // up front so a disk-short node fails the start with a clear error, not mid-rebuild.
+  rpc ReindexPrecheck(ReindexPrecheckRequest) returns (ReindexPrecheckResponse);
   // Reconcile the served shard against the source and repair drift (backstop).
   rpc ReconcileIndex(ReconcileIndexRequest) returns (ReconcileIndexResponse);
   // Compact the served shard's segments.

@@ -145,6 +145,41 @@ async fn connect_cp(
     }
 }
 
+/// Load an index's **authoritative resolved definition** from the control-plane registry — the boot
+/// source of truth in cluster mode (the definition a durable alter last committed, tracked by the
+/// registry's `definition_version`). `Ok(None)` when the control plane doesn't have the index yet
+/// (first boot: NOT_FOUND) or the registry row predates `definition_json` — the caller then keeps its
+/// local / re-derived def. `Err` only on a real connection failure, so a misconfigured endpoint
+/// surfaces loudly rather than silently booting a stale definition.
+async fn fetch_cp_definition(
+    cp: &str,
+    name: &str,
+) -> anyhow::Result<Option<growlerdb_core::ResolvedIndex>> {
+    use growlerdb_proto::v1::GetIndexRequest;
+    let mut client = connect_cp(cp, false).await?;
+    let resp = match client
+        .get_index(GetIndexRequest {
+            name: name.to_string(),
+        })
+        .await
+    {
+        Ok(r) => r.into_inner(),
+        Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
+        Err(status) => {
+            return Err(anyhow::anyhow!(
+                "GetIndex(`{name}`) from control plane `{cp}`: {status}"
+            ))
+        }
+    };
+    if resp.definition_json.is_empty() {
+        return Ok(None); // legacy registry row written before definition_json existed
+    }
+    let resolved = serde_json::from_str(&resp.definition_json).map_err(|e| {
+        anyhow::anyhow!("control plane returned an unparseable definition for `{name}`: {e}")
+    })?;
+    Ok(Some(resolved))
+}
+
 #[derive(Parser)]
 #[command(
     name = "growlerdb",
@@ -200,6 +235,13 @@ enum Command {
         /// and defeats control-plane placement). Ignores `--shards`/`--shard-ordinal`.
         #[arg(long, default_value_t = false)]
         define_only: bool,
+        /// Control-plane `host:port`. On a cluster boot, load the index's **authoritative
+        /// definition** from the registry (the definition a durable alter last committed) instead of
+        /// re-deriving from the source — so the on-disk index opens/builds at the right schema and a
+        /// node booting after an alter doesn't hit SchemaChanged. Falls back to the local/derived def
+        /// when the control plane doesn't have the index yet (first boot). Requires `--name`.
+        #[arg(long)]
+        control_plane: Option<String>,
     },
     /// Search an index and print ranked document coordinates.
     Search {
@@ -245,6 +287,26 @@ enum Command {
     Rebuild {
         /// Index name.
         index: String,
+    },
+    /// Coordinated online reindex of a (multi-shard) index via the control plane: build every
+    /// shard's next generation from source, then cut over atomically (bump the routing generation).
+    /// A build failure on any shard aborts before cutover, leaving the old generation intact. For a
+    /// single embedded shard use `rebuild`.
+    Reindex {
+        /// Index name.
+        index: String,
+        /// Control-plane `host:port`.
+        #[arg(long)]
+        control_plane: String,
+        /// Start the job and return its id immediately instead of streaming progress to completion.
+        /// Poll it later with `growlerdb jobs get <id>` or cancel with `growlerdb jobs cancel <id>`.
+        #[arg(long)]
+        detach: bool,
+    },
+    /// Inspect and control async reindex jobs on the control plane.
+    Jobs {
+        #[command(subcommand)]
+        action: JobAction,
     },
     /// Back up an index's shard to object storage (S3/MinIO) for restore on node loss.
     /// Reads credentials from `GROWLERDB_S3_*` and the bucket from `GROWLERDB_BACKUP_BUCKET`.
@@ -573,12 +635,185 @@ enum Command {
     },
 }
 
+/// `growlerdb jobs …` — inspect and control async reindex jobs on the control plane.
+#[derive(Subcommand)]
+enum JobAction {
+    /// List reindex jobs, newest first.
+    List {
+        /// Control-plane `host:port`.
+        #[arg(long)]
+        control_plane: String,
+    },
+    /// Show one job's status (per-shard phase + progress).
+    Get {
+        /// Job id (from `growlerdb reindex --detach` or `jobs list`).
+        id: String,
+        /// Control-plane `host:port`.
+        #[arg(long)]
+        control_plane: String,
+    },
+    /// Request cancellation of a running job (staged generations are discarded; the old generation
+    /// stays live).
+    Cancel {
+        /// Job id.
+        id: String,
+        /// Control-plane `host:port`.
+        #[arg(long)]
+        control_plane: String,
+    },
+}
+
 /// Cluster reconcile backstop: fetch the index's shard map + bucket owners from the
 /// control plane, then fan a **shard-scoped** `ReconcileIndex` out to each shard's primary node —
 /// each node compares only the keys it owns (via the same bucket map the gateway/connector route by),
 /// so a reconcile can't pull another shard's keys into it. Prints per-shard drift + a total. Any
 /// unreachable shard, missing primary, or shard-level error makes the whole run exit non-zero, so a
 /// scheduled CronJob surfaces the failure instead of silently skipping a shard.
+/// Coordinated online reindex of a (multi-shard) index over the control plane's **async job** API:
+/// `StartReindexJob` returns immediately, and the driver builds every shard's next generation from
+/// source, then cuts over atomically (a build failure aborts before any cutover — the old generation
+/// stays live). By default this streams per-shard progress to the terminal until the job finishes;
+/// `--detach` starts it and prints the job id to poll later.
+async fn reindex_cluster(control_plane: &str, index: &str, detach: bool) -> anyhow::Result<()> {
+    use growlerdb_proto::v1::{GetReindexJobRequest, StartReindexJobRequest};
+    let mut cp = connect_cp(control_plane, false).await?;
+    let started = cp
+        .start_reindex_job(StartReindexJobRequest {
+            index: index.to_string(),
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("StartReindexJob(`{index}`): {e}"))?
+        .into_inner();
+    let job_id = started.job_id;
+
+    if detach {
+        println!(
+            "started reindex job `{job_id}` for `{index}` (poll: growlerdb jobs get {job_id})"
+        );
+        return Ok(());
+    }
+
+    // Stream progress: poll the job until it reaches a terminal state.
+    let mut last_line = String::new();
+    loop {
+        let job = cp
+            .get_reindex_job(GetReindexJobRequest {
+                job_id: job_id.clone(),
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("GetReindexJob(`{job_id}`): {e}"))?
+            .into_inner();
+        // Print a status line only when it changes, so a fast rebuild doesn't spam the terminal.
+        let line = format!(
+            "  {} — {}/{} shards, {}/{} docs",
+            job.state,
+            job.shards
+                .iter()
+                .filter(|s| s.phase == "promoted" || s.phase == "built")
+                .count(),
+            job.shards.len(),
+            job.docs_done,
+            job.docs_total
+        );
+        if line != last_line {
+            println!("{line}");
+            last_line = line;
+        }
+        match job.state.as_str() {
+            "done" => {
+                println!(
+                    "reindexed `{index}`: {} shard(s) cut over, generation {}, {} document(s)",
+                    job.shards.len(),
+                    job.generation,
+                    job.docs_done
+                );
+                return Ok(());
+            }
+            "failed" => {
+                anyhow::bail!("reindex of `{index}` failed: {}", job.error);
+            }
+            "canceled" => {
+                anyhow::bail!("reindex of `{index}` was canceled: {}", job.error);
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
+        }
+    }
+}
+
+/// `growlerdb jobs …`: list / poll / cancel async reindex jobs over the control plane.
+async fn jobs_cmd(action: JobAction) -> anyhow::Result<()> {
+    use growlerdb_proto::v1::{
+        CancelReindexJobRequest, GetReindexJobRequest, ListReindexJobsRequest, ReindexJobStatus,
+    };
+
+    /// One-line human summary of a job.
+    fn summarize(job: &ReindexJobStatus) {
+        println!(
+            "{}  {}  {}  {}/{} docs  gen {}{}",
+            job.id,
+            job.index,
+            job.state,
+            job.docs_done,
+            job.docs_total,
+            job.generation,
+            if job.error.is_empty() {
+                String::new()
+            } else {
+                format!("  ({})", job.error)
+            }
+        );
+    }
+
+    match action {
+        JobAction::List { control_plane } => {
+            let mut cp = connect_cp(&control_plane, false).await?;
+            let jobs = cp
+                .list_reindex_jobs(ListReindexJobsRequest {})
+                .await
+                .map_err(|e| anyhow::anyhow!("ListReindexJobs: {e}"))?
+                .into_inner()
+                .jobs;
+            if jobs.is_empty() {
+                println!("no reindex jobs");
+            }
+            for job in &jobs {
+                summarize(job);
+            }
+        }
+        JobAction::Get { id, control_plane } => {
+            let mut cp = connect_cp(&control_plane, false).await?;
+            let job = cp
+                .get_reindex_job(GetReindexJobRequest { job_id: id.clone() })
+                .await
+                .map_err(|e| anyhow::anyhow!("GetReindexJob(`{id}`): {e}"))?
+                .into_inner();
+            summarize(&job);
+            for s in &job.shards {
+                // A windowed job's units are identified by window (ordinal 0); an ordinal job's by shard.
+                let unit = if s.window != 0 {
+                    format!("window {}", s.window)
+                } else {
+                    format!("shard {}", s.ordinal)
+                };
+                println!(
+                    "  {} @ {} — {} ({}/{} docs)",
+                    unit, s.node, s.phase, s.docs_done, s.docs_total
+                );
+            }
+        }
+        JobAction::Cancel { id, control_plane } => {
+            let mut cp = connect_cp(&control_plane, false).await?;
+            let job = cp
+                .cancel_reindex_job(CancelReindexJobRequest { job_id: id.clone() })
+                .await
+                .map_err(|e| anyhow::anyhow!("CancelReindexJob(`{id}`): {e}"))?
+                .into_inner();
+            println!("cancel requested for job `{}` ({})", job.id, job.state);
+        }
+    }
+    Ok(())
+}
+
 async fn reconcile_cluster(control_plane: &str, index: &str, full: bool) -> anyhow::Result<()> {
     use growlerdb_proto::v1::admin_client::AdminClient;
     use growlerdb_proto::v1::{GetIndexRequest, ReconcileIndexRequest, ReconcileIndexResponse};
@@ -732,7 +967,39 @@ pub async fn run() -> anyhow::Result<()> {
             shards,
             shard_ordinal,
             define_only,
+            control_plane,
         } => {
+            // Cluster boot: prefer the control plane's authoritative definition (the def a durable
+            // alter last committed) over a locally re-derived one, so the on-disk index opens/builds
+            // at the schema its reindexed segments were built with. `None` (first boot / not
+            // registered / no --control-plane) falls back to the re-derive path below.
+            let cp_def = match (control_plane.as_deref(), name.as_deref()) {
+                (Some(cp), Some(n)) => fetch_cp_definition(cp, n).await?,
+                _ => None,
+            };
+            if let Some(resolved) = cp_def {
+                let index_name = resolved.name.clone();
+                if define_only {
+                    engine.adopt_resolved_definition(&resolved)?;
+                    println!(
+                        "defined `{index_name}` from the control-plane definition: index.json written, no shards built"
+                    );
+                } else {
+                    let outcome = engine
+                        .index_shard_with(resolved, &table, shards, shard_ordinal)
+                        .await?;
+                    let scope = if shards > 1 {
+                        format!(" (shard {shard_ordinal}/{shards})")
+                    } else {
+                        String::new()
+                    };
+                    println!(
+                        "indexed `{}`{} from the control-plane definition: {} documents at snapshot {}",
+                        outcome.name, scope, outcome.doc_count, outcome.snapshot.0
+                    );
+                }
+                return Ok(());
+            }
             let def_yaml = def.map(std::fs::read_to_string).transpose()?;
             if define_only {
                 let outcome = engine
@@ -816,6 +1083,16 @@ pub async fn run() -> anyhow::Result<()> {
                 "rebuilt `{}`: {} documents at snapshot {}",
                 out.name, out.doc_count, out.snapshot.0
             );
+        }
+        Command::Reindex {
+            index,
+            control_plane,
+            detach,
+        } => {
+            reindex_cluster(&control_plane, &index, detach).await?;
+        }
+        Command::Jobs { action } => {
+            jobs_cmd(action).await?;
         }
         Command::Backup { index, prefix } => {
             backup_cmd(&cli.data_dir, &index, prefix.as_deref()).await?;
@@ -2160,7 +2437,10 @@ async fn serve_windowed(
             // Each window shard backs an in-process `LocalNode` (embedded REST Gateway) plus the gRPC
             // window multiplexers over the *same* swappable handle. The handle is returned so a HOT
             // window can be auto-compacted.
-            let build = |shard: Arc<growlerdb_index::Shard>| -> (
+            let build = |shard: Arc<growlerdb_index::Shard>,
+                         w: i64,
+                         hot: bool|
+             -> (
                 Arc<dyn Node>,
                 SearchService,
                 SuggestService,
@@ -2181,6 +2461,25 @@ async fn serve_windowed(
                     AdminService::new(handle.clone(), &index_s),
                 )
                 .shared();
+                // The gRPC window-multiplexer's admin gets **source access on a HOT window**, so a
+                // coordinated per-window reindex can rebuild that window's shard from source (filtered
+                // to its ingest-time window) and swap it live. A COLD (read-through, no-writer) window
+                // isn't reindexable in place — the planner skips it — so its admin stays source-less.
+                // A fresh per-window ReindexFence backs the reindex's single-flight/RAII; windowed
+                // cutover correctness comes from the connector's resume-and-replay (stamp at the build
+                // snapshot), not a write-fence, so the fence needn't be shared with the write path.
+                let admin = if hot {
+                    AdminService::new(handle.clone(), &index_s).with_source(
+                        resolved.clone(),
+                        store.clone(),
+                        ShardId::window(&index_s, w),
+                        IcebergConfig::from_env(),
+                        table.clone(),
+                        growlerdb_engine::ReindexFence::new(),
+                    )
+                } else {
+                    AdminService::new(handle.clone(), &index_s)
+                };
                 (
                     node,
                     SearchService::new(handle.clone()),
@@ -2191,7 +2490,7 @@ async fn serve_windowed(
                         table.clone(),
                         resolved.clone(),
                     ),
-                    AdminService::new(handle.clone(), &index_s),
+                    admin,
                     handle,
                 )
             };
@@ -2232,7 +2531,7 @@ async fn serve_windowed(
                         )?);
                         // Cold = read-through, no writer → never compacted, but its handle is kept so
                         // an access-driven pre-warm loop can promote it back to hot.
-                        let (node, search, suggest, lookup, admin, handle) = build(shard);
+                        let (node, search, suggest, lookup, admin, handle) = build(shard, w, false);
                         cold_handles.push((w, handle));
                         (
                             node,
@@ -2247,7 +2546,7 @@ async fn serve_windowed(
                         let shard =
                             Arc::new(store.open_shard(&ShardId::window(&index_s, w), &resolved)?);
                         let zone = shard.event_bounds()?;
-                        let (node, search, suggest, lookup, admin, handle) = build(shard);
+                        let (node, search, suggest, lookup, admin, handle) = build(shard, w, true);
                         hot_handles.push((w, handle)); // hot → eligible for auto-compaction
                         (node, search, suggest, lookup, admin, zone)
                     }
@@ -4875,6 +5174,10 @@ struct CpRouteResolver {
 
 #[tonic::async_trait]
 impl growlerdb_engine::RouteResolver for CpRouteResolver {
+    fn control_plane(&self) -> Option<&str> {
+        Some(&self.cp)
+    }
+
     async fn resolve(
         &self,
         index: &str,

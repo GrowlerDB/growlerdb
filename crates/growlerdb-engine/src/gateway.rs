@@ -275,6 +275,14 @@ impl IndexRoute {
 pub trait RouteResolver: Send + Sync {
     /// Resolve `index` into its route, or `Ok(None)` if no such index is registered.
     async fn resolve(&self, index: &str) -> Result<Option<Arc<IndexRoute>>, String>;
+
+    /// The control-plane endpoint this resolver is backed by, if any. Lets the gateway forward a
+    /// **multi-shard** admin op (a coordinated reindex) to the control plane, which orchestrates the
+    /// build-all → cut-over across shards. `None` for a static/non-CP resolver, so a multi-shard
+    /// admin op over such a gateway stays `Unimplemented`.
+    fn control_plane(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// The Gateway's hot-swappable routing: one [`Node`] per shard + the [`ShardRouter`] that places
@@ -2011,11 +2019,31 @@ impl Gateway {
             .await?;
         let rs = route.routing();
         if rs.shards.len() != 1 {
-            return Err(Status::unimplemented(format!(
-                "reindex over a {}-shard gateway is not supported; reindex each shard's Node \
-                 directly (distributed reindex orchestration is future work)",
-                rs.shards.len()
-            )));
+            // Multi-shard: forward to the control plane's coordinated reindex (build every shard's
+            // next generation, then cut over atomically). Needs a CP-backed resolver; a static
+            // multi-shard gateway (no CP) still can't orchestrate it.
+            let Some(cp) = self.resolver.as_ref().and_then(|r| r.control_plane()) else {
+                return Err(Status::unimplemented(format!(
+                    "reindex over a {}-shard gateway without a control plane is not supported",
+                    rs.shards.len()
+                )));
+            };
+            let token = growlerdb_proto::service_token::service_token_from_env();
+            let mut client = growlerdb_proto::service_token::connect(cp, None, token.as_deref())
+                .await
+                .map_err(|e| {
+                    Status::unavailable(format!("connecting to control plane `{cp}`: {e}"))
+                })?;
+            let resp = client
+                .reindex_index(growlerdb_proto::v1::ReindexControlRequest { index })
+                .await?
+                .into_inner();
+            // Map the coordinated result onto the node reindex response: doc_count is the total
+            // across shards; `snapshot` carries the new routing generation (the cutover marker).
+            return Ok(Response::new(ReindexIndexResponse {
+                doc_count: resp.doc_count,
+                snapshot: resp.generation,
+            }));
         }
         rs.shards[0].reindex_index(req).await
     }
@@ -2034,11 +2062,40 @@ impl Gateway {
             .await?;
         let rs = route.routing();
         if rs.shards.len() != 1 {
-            return Err(Status::unimplemented(format!(
-                "alter over a {}-shard gateway is not supported; alter each shard's Node directly \
-                 (distributed alter orchestration is future work)",
-                rs.shards.len()
-            )));
+            // Multi-shard: forward to the control plane's durable alter (update the definition; for a
+            // reindex-requiring change, reindex from it across all shards and cut over atomically).
+            let Some(cp) = self.resolver.as_ref().and_then(|r| r.control_plane()) else {
+                return Err(Status::unimplemented(format!(
+                    "alter over a {}-shard gateway without a control plane is not supported",
+                    rs.shards.len()
+                )));
+            };
+            let dto = req.into_inner();
+            let token = growlerdb_proto::service_token::service_token_from_env();
+            let mut client = growlerdb_proto::service_token::connect(cp, None, token.as_deref())
+                .await
+                .map_err(|e| {
+                    Status::unavailable(format!("connecting to control plane `{cp}`: {e}"))
+                })?;
+            let out = client
+                .alter_index(growlerdb_proto::v1::AlterControlRequest {
+                    index: dto.index,
+                    definition_yaml: dto.definition_yaml,
+                    apply: dto.apply,
+                })
+                .await?
+                .into_inner();
+            return Ok(Response::new(AlterIndexResponse {
+                plan: Some(growlerdb_proto::v1::AlterPlan {
+                    is_noop: out.is_noop,
+                    requires_reindex: out.requires_reindex,
+                    reindex_reasons: out.reindex_reasons,
+                    in_place_changes: out.in_place_changes,
+                }),
+                applied: out.applied,
+                reindex_triggered: out.reindex_triggered,
+                generation: out.generation,
+            }));
         }
         rs.shards[0].alter_index(req).await
     }
@@ -2403,6 +2460,7 @@ mod tests {
                     reindex_reasons: vec![],
                     in_place_changes: vec!["sentinel".into()],
                 }),
+                ..Default::default()
             }))
         }
     }

@@ -11,13 +11,15 @@ use std::sync::{Arc, RwLock};
 
 use growlerdb_proto::v1::{
     AggregateRequest, AggregateResponse, AlterIndexRequest, AlterIndexResponse, BackupIndexRequest,
-    BackupIndexResponse, BackupStatusRequest, BackupStatusResponse, ClosePitRequest,
-    ClosePitResponse, CompactIndexRequest, CompactIndexResponse, DescribeIndexRequest,
-    DescribeIndexResponse, ExplainRequest, ExplainResponse, ExportRequest, GetByKeyRequest,
-    GetByKeyResponse, GetCheckpointRequest, GetCheckpointResponse, OpenPitRequest, OpenPitResponse,
-    ReconcileIndexRequest, ReconcileIndexResponse, ReindexIndexRequest, ReindexIndexResponse,
-    SearchRequest, SearchResponse, SemanticSearchRequest, SuggestRequest, SuggestResponse,
-    WriteRequest, WriteResponse,
+    BackupIndexResponse, BackupStatusRequest, BackupStatusResponse, CancelReindexRequest,
+    CancelReindexResponse, ClosePitRequest, ClosePitResponse, CompactIndexRequest,
+    CompactIndexResponse, DescribeIndexRequest, DescribeIndexResponse, ExplainRequest,
+    ExplainResponse, ExportRequest, GetByKeyRequest, GetByKeyResponse, GetCheckpointRequest,
+    GetCheckpointResponse, OpenPitRequest, OpenPitResponse, ReconcileIndexRequest,
+    ReconcileIndexResponse, ReindexIndexRequest, ReindexIndexResponse, ReindexPrecheckRequest,
+    ReindexPrecheckResponse, ReindexStatusRequest, ReindexStatusResponse, SearchRequest,
+    SearchResponse, SemanticSearchRequest, SuggestRequest, SuggestResponse, WriteRequest,
+    WriteResponse,
 };
 use growlerdb_proto::{
     Admin, AdminServer, Lookup, LookupServer, Search, SearchServer, Suggest, SuggestServer, Write,
@@ -344,6 +346,33 @@ impl Admin for PoolAdminService {
         &self,
         _request: Request<ReindexIndexRequest>,
     ) -> Result<Response<ReindexIndexResponse>, Status> {
+        Err(Status::unimplemented(
+            "reindex is not supported on a pool node",
+        ))
+    }
+
+    async fn reindex_status(
+        &self,
+        _request: Request<ReindexStatusRequest>,
+    ) -> Result<Response<ReindexStatusResponse>, Status> {
+        Err(Status::unimplemented(
+            "reindex is not supported on a pool node",
+        ))
+    }
+
+    async fn cancel_reindex(
+        &self,
+        _request: Request<CancelReindexRequest>,
+    ) -> Result<Response<CancelReindexResponse>, Status> {
+        Err(Status::unimplemented(
+            "reindex is not supported on a pool node",
+        ))
+    }
+
+    async fn reindex_precheck(
+        &self,
+        _request: Request<ReindexPrecheckRequest>,
+    ) -> Result<Response<ReindexPrecheckResponse>, Status> {
         Err(Status::unimplemented(
             "reindex is not supported on a pool node",
         ))

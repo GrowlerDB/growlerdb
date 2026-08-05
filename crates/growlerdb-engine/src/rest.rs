@@ -128,6 +128,11 @@ pub fn control_router(client: CpClient) -> Router {
             axum::routing::delete(drop_alias_handler),
         )
         .route("/v1/source:describe", post(describe_source_handler))
+        .route("/v1/jobs", get(list_jobs_handler).post(start_job_handler))
+        .route(
+            "/v1/jobs/{id}",
+            get(get_job_handler).delete(cancel_job_handler),
+        )
         .route("/v1/index:activity", post(list_activity_handler))
         .route("/v1/ingestion", get(ingestion_status_handler))
         .route("/v1/ingestion/{name}", get(ingestion_status_one_handler))
@@ -315,6 +320,152 @@ async fn list_indexes_handler(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(IndexListDto::from(resp.into_inner())))
+}
+
+// --- Async reindex jobs -----------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct StartJobDto {
+    index: String,
+}
+
+#[derive(serde::Serialize)]
+struct StartJobRespDto {
+    job_id: String,
+}
+
+#[derive(serde::Serialize)]
+struct JobShardDto {
+    ordinal: u32,
+    /// Windowed index: this unit's time-window id (0 for an ordinal shard).
+    window: i64,
+    node: String,
+    phase: String,
+    docs_done: u64,
+    docs_total: u64,
+}
+
+#[derive(serde::Serialize)]
+struct JobStatusDto {
+    id: String,
+    index: String,
+    kind: String,
+    state: String,
+    shards: Vec<JobShardDto>,
+    docs_done: u64,
+    docs_total: u64,
+    generation: u64,
+    cancel_requested: bool,
+    error: String,
+    created_ms: i64,
+    updated_ms: i64,
+}
+
+impl From<v1::ReindexJobStatus> for JobStatusDto {
+    fn from(j: v1::ReindexJobStatus) -> Self {
+        Self {
+            id: j.id,
+            index: j.index,
+            kind: j.kind,
+            state: j.state,
+            shards: j
+                .shards
+                .into_iter()
+                .map(|s| JobShardDto {
+                    ordinal: s.ordinal,
+                    window: s.window,
+                    node: s.node,
+                    phase: s.phase,
+                    docs_done: s.docs_done,
+                    docs_total: s.docs_total,
+                })
+                .collect(),
+            docs_done: j.docs_done,
+            docs_total: j.docs_total,
+            generation: j.generation,
+            cancel_requested: j.cancel_requested,
+            error: j.error,
+            created_ms: j.created_ms,
+            updated_ms: j.updated_ms,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct JobListDto {
+    jobs: Vec<JobStatusDto>,
+}
+
+/// `POST /v1/jobs` — start a coordinated reindex as a background job. **202 Accepted** + the job id;
+/// poll `GET /v1/jobs/{id}` for per-shard progress. `409`/`412` if one is already running for the index.
+async fn start_job_handler(
+    State(client): State<ControlClient>,
+    headers: HeaderMap,
+    Json(dto): Json<StartJobDto>,
+) -> Result<(StatusCode, Json<StartJobRespDto>), ApiError> {
+    let req = grpc_request(v1::StartReindexJobRequest { index: dto.index }, &headers);
+    let resp = client
+        .clone()
+        .start_reindex_job(req)
+        .await
+        .map_err(ApiError::from)?
+        .into_inner();
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(StartJobRespDto {
+            job_id: resp.job_id,
+        }),
+    ))
+}
+
+/// `GET /v1/jobs` — list reindex jobs, newest first.
+async fn list_jobs_handler(
+    State(client): State<ControlClient>,
+    headers: HeaderMap,
+) -> Result<Json<JobListDto>, ApiError> {
+    let req = grpc_request(v1::ListReindexJobsRequest {}, &headers);
+    let resp = client
+        .clone()
+        .list_reindex_jobs(req)
+        .await
+        .map_err(ApiError::from)?
+        .into_inner();
+    Ok(Json(JobListDto {
+        jobs: resp.jobs.into_iter().map(JobStatusDto::from).collect(),
+    }))
+}
+
+/// `GET /v1/jobs/{id}` — poll one reindex job's status.
+async fn get_job_handler(
+    State(client): State<ControlClient>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<JobStatusDto>, ApiError> {
+    let req = grpc_request(v1::GetReindexJobRequest { job_id: id }, &headers);
+    let resp = client
+        .clone()
+        .get_reindex_job(req)
+        .await
+        .map_err(ApiError::from)?
+        .into_inner();
+    Ok(Json(JobStatusDto::from(resp)))
+}
+
+/// `DELETE /v1/jobs/{id}` — request cancellation. Returns the job (now `cancel_requested`); the
+/// driver discards staged generations and ends it Canceled. Idempotent on a terminal job.
+async fn cancel_job_handler(
+    State(client): State<ControlClient>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<JobStatusDto>, ApiError> {
+    let req = grpc_request(v1::CancelReindexJobRequest { job_id: id }, &headers);
+    let resp = client
+        .clone()
+        .cancel_reindex_job(req)
+        .await
+        .map_err(ApiError::from)?
+        .into_inner();
+    Ok(Json(JobStatusDto::from(resp)))
 }
 
 /// Scale-limit license status for the console settings page. The `*_nodes` fields count distinct
@@ -1479,13 +1630,18 @@ async fn alter_handler(
         .await
         .map_err(ApiError::from)?
         .into_inner();
+    let applied = resp.applied;
+    let reindex_triggered = resp.reindex_triggered;
+    let generation = resp.generation;
     let plan = resp.plan.unwrap_or_default();
     Ok(Json(AlterPlanDto {
         is_noop: plan.is_noop,
         requires_reindex: plan.requires_reindex,
         reindex_reasons: plan.reindex_reasons,
         in_place_changes: plan.in_place_changes,
-        applied: dto.apply && !plan.requires_reindex && !plan.is_noop,
+        applied,
+        reindex_triggered,
+        generation,
     }))
 }
 
@@ -2188,9 +2344,13 @@ struct AlterPlanDto {
     reindex_reasons: Vec<String>,
     /// Metadata-only changes safe to apply live.
     in_place_changes: Vec<String>,
-    /// Whether the in-place changes were applied (true only on `apply` for a non-reindex,
-    /// non-noop plan).
+    /// Whether the definition change was applied (durably, via the control plane on a multi-shard
+    /// index; a live in-place change on a single-shard node).
     applied: bool,
+    /// Whether a coordinated reindex from the new definition ran (a reindex-requiring apply).
+    reindex_triggered: bool,
+    /// Routing generation after a triggered reindex (0 if none).
+    generation: u64,
 }
 
 #[derive(Serialize)]

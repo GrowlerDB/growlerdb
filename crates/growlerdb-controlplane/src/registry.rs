@@ -171,6 +171,16 @@ pub struct IndexEntry {
     /// ([`Registry::plan_reshard`]) moves whole buckets.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bucket_owners: Vec<u32>,
+    /// Routing generation (epoch). Bumped by [`Registry::set_generation`] on an atomic reindex
+    /// cutover so gateways converge on the freshly-built generation via their `GetIndex` poll.
+    /// `#[serde(default)]` so registries written before generations existed load as `0`.
+    #[serde(default)]
+    pub generation: u64,
+    /// Definition version. Bumped by [`Registry::set_definition`] when an in-place alter replaces the
+    /// definition, so nodes observe the change and reload their served copy. `#[serde(default)]` so
+    /// older registries load as `0`.
+    #[serde(default)]
+    pub definition_version: u64,
 }
 
 /// A compact listing row (name + status) for [`Registry::list`].
@@ -330,6 +340,9 @@ pub enum RegistryError {
     /// An update/delete named a saved query that doesn't exist (or isn't the caller's).
     #[error("saved query `{0}` not found")]
     SavedQueryNotFound(String),
+    /// No reindex/alter job with this id — an unknown or already-pruned handle.
+    #[error("job `{0}` not found")]
+    JobNotFound(String),
     /// A stored bucket map failed validation — wrong length or a gap. Indicates a corrupt/hand-edited
     /// registry, since maps are only ever written through validated paths.
     #[error("invalid bucket map: {0}")]
@@ -369,6 +382,121 @@ struct ActivityFlush {
     /// In-memory events exist that a debounce window skipped writing — flush them on shutdown.
     dirty: bool,
 }
+
+/// What a [`ReindexJob`] is driving: a plain whole-index reindex, or a durable alter (definition
+/// change) whose reindex-requiring part rebuilds from the new schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobKind {
+    Reindex,
+    Alter,
+}
+
+/// The lifecycle state of a coordinated reindex/alter [`ReindexJob`]. A job advances
+/// `Pending → Building → (CatchingUp) → CuttingOver → Done`, or ends `Failed` / `Canceled`.
+/// `CatchingUp` (write catch-up) is reserved for the zero-downtime slice; the current driver goes
+/// straight `Building → CuttingOver`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobState {
+    /// Created; the driver has not started building shards yet.
+    Pending,
+    /// Building every shard's next generation from source (fenced, not promoted).
+    Building,
+    /// Replaying the write delta onto the staged generation (reserved; not yet driven).
+    CatchingUp,
+    /// All shards built; promoting them and bumping the routing generation (the atomic cutover).
+    CuttingOver,
+    /// Cut over: the new generation is live.
+    Done,
+    /// Aborted by an error; the old generation is intact (no half-swap).
+    Failed,
+    /// Canceled by the operator; staged generations were discarded, the old generation is intact.
+    Canceled,
+}
+
+impl JobState {
+    /// A terminal state never transitions again — the driver is done and a poll is final.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, JobState::Done | JobState::Failed | JobState::Canceled)
+    }
+}
+
+/// Per-shard phase within a [`ReindexJob`], so a poll shows exactly where each shard stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShardPhase {
+    /// Not started.
+    Pending,
+    /// The node is populating its staged generation (live `docs_done / docs_total`).
+    Building,
+    /// Staged generation built, fenced, awaiting the cutover.
+    Built,
+    /// Being promoted (fence drain + swap).
+    Promoting,
+    /// Promoted to the new generation.
+    Promoted,
+    /// Staged generation discarded (build abort / cancel); the old generation still serves.
+    Discarded,
+}
+
+/// One shard's live status within a [`ReindexJob`] — its owning node plus the phase and doc-level
+/// progress the driver folds in from the node's `ReindexStatus` poll.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShardJobStatus {
+    /// Ordinal shard number (hash/partition index); 0 for a windowed unit.
+    pub ordinal: u32,
+    /// Time-window id (windowed index); 0 for an ordinal unit. Together with `ordinal` this uniquely
+    /// identifies the unit within the job (a windowed job's rows all have `ordinal = 0`).
+    #[serde(default)]
+    pub window: i64,
+    /// The shard primary's endpoint the driver is driving.
+    pub node: String,
+    pub phase: ShardPhase,
+    /// Documents committed into this shard's staged generation so far.
+    pub docs_done: u64,
+    /// Source snapshot record count this shard's build targets (0 = unknown / not yet building).
+    pub docs_total: u64,
+}
+
+/// A durable **reindex/alter job**: the control plane's record of one coordinated, cluster-wide
+/// rebuild so the operator can start it asynchronously, poll per-shard progress, and cancel it. The
+/// driver mutates it as it advances the shards; it survives a control-plane restart (a non-terminal
+/// job found on load is failed, since its driver died — the old generation is always intact).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReindexJob {
+    /// Server-assigned handle: `job-<ms>-<counter>`.
+    pub id: String,
+    pub index: String,
+    pub kind: JobKind,
+    pub state: JobState,
+    /// Per-shard progress rows (empty until the driver resolves the shard map).
+    pub shards: Vec<ShardJobStatus>,
+    /// Routing generation after the cutover (0 until `Done`).
+    pub generation: u64,
+    /// Set by a cancel request; the driver observes it between phases and aborts cleanly.
+    pub cancel_requested: bool,
+    /// Failure / cancel detail (`""` otherwise).
+    pub error: String,
+    pub created_ms: i64,
+    pub updated_ms: i64,
+}
+
+impl ReindexJob {
+    /// Total documents built across all shards so far (the numerator a poll shows).
+    pub fn docs_done(&self) -> u64 {
+        self.shards.iter().map(|s| s.docs_done).sum()
+    }
+
+    /// Total documents the build targets across all shards (the denominator; 0 while unknown).
+    pub fn docs_total(&self) -> u64 {
+        self.shards.iter().map(|s| s.docs_total).sum()
+    }
+}
+
+/// Max reindex jobs retained in the registry — oldest terminal jobs are pruned past this so the
+/// sidecar stays bounded. Non-terminal jobs are never pruned.
+const JOBS_RETAIN: usize = 200;
 
 /// Registry result alias.
 pub type Result<T> = std::result::Result<T, RegistryError>;
@@ -475,6 +603,15 @@ pub struct Registry {
     /// so dead-owner actions are suppressed and entitlement counting fails closed. Re-armed to `-1` on
     /// leadership promotion.
     grace_anchor_ms: std::sync::atomic::AtomicI64,
+    /// Coordinated reindex/alter **jobs**: `id → `[`ReindexJob`]. Durable via the `jobs.json` sidecar
+    /// so an async reindex is pollable and survives a restart. Lock is independent, acquired last
+    /// (never nested under a catalog lock).
+    jobs: RwLock<BTreeMap<String, ReindexJob>>,
+    /// Serializes job-sidecar writes so two concurrent job mutations can't persist out of order and
+    /// lose one — taken off the `jobs` data lock, like `sessions_flush`.
+    jobs_flush: std::sync::Mutex<()>,
+    /// Monotonic suffix for generated job ids; with a ms timestamp it is unique across restarts.
+    next_job: std::sync::atomic::AtomicU64,
 }
 
 impl Registry {
@@ -500,7 +637,18 @@ impl Registry {
             index_bindings,
             activity,
             session_epochs,
+            mut jobs,
         } = backend.load()?;
+        // Crash-safety: a non-terminal job found on load was driven by a task that died with the
+        // previous process, so it will never advance — fail it. The reindex's own generation CAS is
+        // the durable source of truth, so the index's old generation is intact (never a half-swap);
+        // the operator simply restarts the reindex. (Persisted lazily on the next job mutation.)
+        for job in jobs.values_mut() {
+            if !job.state.is_terminal() {
+                job.state = JobState::Failed;
+                job.error = "control plane restarted during the job".to_string();
+            }
+        }
         // Build the hash→id lookup from the loaded tokens (derived, not persisted).
         let token_by_hash: std::collections::HashMap<String, String> = tokens
             .iter()
@@ -530,6 +678,9 @@ impl Registry {
             placement_listener: RwLock::new(None),
             last_placement_hash: std::sync::Mutex::new(0),
             grace_anchor_ms: std::sync::atomic::AtomicI64::new(-1),
+            jobs: RwLock::new(jobs),
+            jobs_flush: std::sync::Mutex::new(()),
+            next_job: std::sync::atomic::AtomicU64::new(0),
         };
         // Seed the placement fingerprint from the loaded state so the first mutation only notifies
         // if it actually changed placement (there's no listener yet at construction anyway).
@@ -739,6 +890,17 @@ impl Registry {
             .session_epochs
             .write()
             .unwrap_or_else(|e| e.into_inner()) = s.session_epochs;
+        // Fail any non-terminal job the store still holds (see `with_backend`): a standby that just
+        // promoted over a dead leader inherits the dead leader's in-flight jobs, whose drivers are
+        // gone. The old generation is intact, so failing them is safe and the operator retries.
+        let mut jobs = s.jobs;
+        for job in jobs.values_mut() {
+            if !job.state.is_terminal() {
+                job.state = JobState::Failed;
+                job.error = "control plane restarted during the job".to_string();
+            }
+        }
+        *self.jobs.write().unwrap_or_else(|e| e.into_inner()) = jobs;
         self.rebuild_token_index();
         // Memory now mirrors the store exactly — any change a failed persist's rollback couldn't
         // undo is gone, so persists are safe again.
@@ -826,6 +988,8 @@ impl Registry {
                 shards: BTreeMap::new(),
                 windows: BTreeMap::new(),
                 bucket_owners: Vec::new(),
+                generation: 0,
+                definition_version: 0,
             },
         );
         drop(map); // release the data lock before the fsync
@@ -1276,6 +1440,122 @@ impl Registry {
         }
     }
 
+    // ---- coordinated reindex/alter jobs -------------------------------------------------------
+
+    /// Register a new **reindex/alter job** in `Pending`, one `ShardJobStatus` row per `(ordinal,
+    /// node)` the driver will drive. Returns the created job (with its server-assigned id). Durable:
+    /// the job survives a restart (a non-terminal one found on load is failed — see `with_backend`).
+    pub fn create_job(
+        &self,
+        kind: JobKind,
+        index: &str,
+        units: Vec<(u32, i64, String)>,
+    ) -> ReindexJob {
+        let now = now_ms();
+        let id = format!(
+            "job-{}-{}",
+            now,
+            self.next_job
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let job = ReindexJob {
+            id: id.clone(),
+            index: index.to_string(),
+            kind,
+            state: JobState::Pending,
+            shards: units
+                .into_iter()
+                .map(|(ordinal, window, node)| ShardJobStatus {
+                    ordinal,
+                    window,
+                    node,
+                    phase: ShardPhase::Pending,
+                    docs_done: 0,
+                    docs_total: 0,
+                })
+                .collect(),
+            generation: 0,
+            cancel_requested: false,
+            error: String::new(),
+            created_ms: now,
+            updated_ms: now,
+        };
+        {
+            let mut jobs = self.jobs.write().unwrap_or_else(|e| e.into_inner());
+            jobs.insert(id, job.clone());
+            prune_jobs(&mut jobs);
+        }
+        self.flush_jobs();
+        job
+    }
+
+    /// One job by id (a clone), or `None` if unknown/pruned.
+    pub fn get_job(&self, id: &str) -> Option<ReindexJob> {
+        self.jobs
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()
+    }
+
+    /// All jobs, newest first (by creation time) — what the console's Jobs view renders.
+    pub fn list_jobs(&self) -> Vec<ReindexJob> {
+        let mut jobs: Vec<ReindexJob> = self
+            .jobs
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        jobs.sort_by(|a, b| b.created_ms.cmp(&a.created_ms).then(b.id.cmp(&a.id)));
+        jobs
+    }
+
+    /// Apply `f` to the job under the write lock, stamp `updated_ms`, and durably persist. The
+    /// workhorse the driver uses for every state / shard-phase / progress update. Returns the updated
+    /// job, or `None` if it was pruned/unknown (a canceled+pruned job the driver still references).
+    pub fn mutate_job(&self, id: &str, f: impl FnOnce(&mut ReindexJob)) -> Option<ReindexJob> {
+        let updated = {
+            let mut jobs = self.jobs.write().unwrap_or_else(|e| e.into_inner());
+            let job = jobs.get_mut(id)?;
+            f(job);
+            job.updated_ms = now_ms();
+            job.clone()
+        };
+        self.flush_jobs();
+        Some(updated)
+    }
+
+    /// Request cancellation of a job: set its `cancel_requested` flag (the driver observes it between
+    /// phases and aborts cleanly). Idempotent — canceling a terminal job is a no-op that returns it
+    /// unchanged. [`JobNotFound`](RegistryError::JobNotFound) for an unknown id.
+    pub fn request_job_cancel(&self, id: &str) -> Result<ReindexJob> {
+        let updated = {
+            let mut jobs = self.jobs.write().unwrap_or_else(|e| e.into_inner());
+            let job = jobs
+                .get_mut(id)
+                .ok_or_else(|| RegistryError::JobNotFound(id.to_string()))?;
+            if !job.state.is_terminal() {
+                job.cancel_requested = true;
+                job.updated_ms = now_ms();
+            }
+            job.clone()
+        };
+        self.flush_jobs();
+        Ok(updated)
+    }
+
+    /// Durably persist the jobs sidecar off the `jobs` data lock, serialized under `jobs_flush` so
+    /// concurrent mutations can't write out of order. Best-effort: a failure is logged and never
+    /// fails the reindex the job records (the generation CAS is the real durability boundary).
+    fn flush_jobs(&self) {
+        let _flush = self.jobs_flush.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = self.jobs.read().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Err(e) = self.backend.persist_jobs(&snapshot) {
+            tracing::warn!(error = %e, "failed to persist reindex jobs");
+        }
+    }
+
     /// The subject's **session epoch** (epoch ms): a session JWT with `iat` before this is stale and
     /// must be rejected. `0` means no revocation is in effect for this subject.
     pub fn session_epoch(&self, subject: &str) -> i64 {
@@ -1716,6 +1996,112 @@ impl Registry {
         entry.bucket_owners = map.owners().to_vec();
         drop(indexes);
         self.persist_snapshot()
+    }
+
+    // ---- reindex generation (epoch) & definition version -----------------------
+
+    /// `index`'s current routing generation, or `None` for an unknown index.
+    pub fn generation(&self, index: &str) -> Option<u64> {
+        self.read_map().get(index).map(|e| e.generation)
+    }
+
+    /// Bump `index`'s routing generation — the **atomic reindex cutover** — as a compare-and-swap:
+    /// `expected` must match the stored generation or the write is refused with
+    /// [`PlacementConflict`](RegistryError::PlacementConflict). Modeled on [`set_bucket_map`]: the
+    /// orchestrator reads the generation, runs a minutes-long build of the next generation on every
+    /// shard, and commits here; the CAS makes two concurrent cutovers (or a cutover racing a reshard)
+    /// fail loudly instead of silently reverting one another. Returns the new generation.
+    ///
+    /// [`set_bucket_map`]: Self::set_bucket_map
+    pub fn set_generation(&self, index: &str, expected: u64, new: u64) -> Result<u64> {
+        let mut indexes = self.write_map();
+        let entry = indexes
+            .get_mut(index)
+            .ok_or_else(|| RegistryError::NotFound(index.to_string()))?;
+        if entry.generation != expected {
+            return Err(RegistryError::PlacementConflict(format!(
+                "the generation of `{index}` changed while this reindex ran — re-plan and retry"
+            )));
+        }
+        entry.generation = new;
+        drop(indexes);
+        self.persist_snapshot()?;
+        Ok(new)
+    }
+
+    /// **Atomic reindex cutover commit.** Bumps the routing generation (CAS on `expected_gen`) and,
+    /// for a schema-changing alter, commits the new resolved `definition` (CAS on its
+    /// `expected_definition_version`) in the *same* locked mutation and *single* persist — so the
+    /// registry never advertises a schema its on-disk shards don't have. The driver reaches here only
+    /// after every shard has built and promoted, so a failed rebuild leaves both the definition and
+    /// the generation untouched (no split-brain, no boot-time `SchemaChanged` on a node that reloads
+    /// this definition). If either CAS loses to a concurrent op, nothing is written and the whole
+    /// cutover is refused. Pass `definition = None` for a plain reindex (generation-only), which is
+    /// then exactly [`set_generation`](Self::set_generation). Returns the new generation.
+    pub fn commit_reindex_cutover(
+        &self,
+        index: &str,
+        definition: Option<(u64, ResolvedIndex)>,
+        expected_gen: u64,
+        new_gen: u64,
+    ) -> Result<u64> {
+        let mut indexes = self.write_map();
+        let entry = indexes
+            .get_mut(index)
+            .ok_or_else(|| RegistryError::NotFound(index.to_string()))?;
+        if entry.generation != expected_gen {
+            return Err(RegistryError::PlacementConflict(format!(
+                "the generation of `{index}` changed while this reindex ran — re-plan and retry"
+            )));
+        }
+        if let Some((expected_def_ver, _)) = &definition {
+            if entry.definition_version != *expected_def_ver {
+                return Err(RegistryError::PlacementConflict(format!(
+                    "the definition of `{index}` changed while this alter ran — re-plan and retry"
+                )));
+            }
+        }
+        entry.generation = new_gen;
+        if let Some((_, def)) = definition {
+            entry.definition = def;
+            entry.definition_version += 1;
+        }
+        drop(indexes);
+        self.persist_snapshot()?;
+        Ok(new_gen)
+    }
+
+    /// `index`'s current definition version, or `None` for an unknown index.
+    pub fn definition_version(&self, index: &str) -> Option<u64> {
+        self.read_map().get(index).map(|e| e.definition_version)
+    }
+
+    /// Replace `index`'s resolved definition (an **in-place alter**) and bump its definition version,
+    /// as a compare-and-swap on the version: `expected` must match or the write is refused. Nodes
+    /// observe the bumped version (via `GetIndex`) and reload their served definition, so an applied
+    /// alter is durable across restart — unlike the old node-local in-memory apply. Returns the new
+    /// version.
+    pub fn set_definition(
+        &self,
+        index: &str,
+        expected: u64,
+        definition: ResolvedIndex,
+    ) -> Result<u64> {
+        let mut indexes = self.write_map();
+        let entry = indexes
+            .get_mut(index)
+            .ok_or_else(|| RegistryError::NotFound(index.to_string()))?;
+        if entry.definition_version != expected {
+            return Err(RegistryError::PlacementConflict(format!(
+                "the definition of `{index}` changed while this alter ran — re-plan and retry"
+            )));
+        }
+        entry.definition = definition;
+        entry.definition_version = expected + 1;
+        let new = entry.definition_version;
+        drop(indexes);
+        self.persist_snapshot()?;
+        Ok(new)
     }
 
     /// Adopt a [balanced](BucketMap::balanced) bucket map over `shard_count` if the index has none
@@ -2670,6 +3056,26 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Bound the jobs map: while it exceeds [`JOBS_RETAIN`], drop the oldest **terminal** job (a
+/// completed/failed/canceled record). Non-terminal jobs are never pruned — a running reindex must
+/// stay observable. Called under the `jobs` write lock.
+fn prune_jobs(jobs: &mut BTreeMap<String, ReindexJob>) {
+    while jobs.len() > JOBS_RETAIN {
+        let oldest = jobs
+            .values()
+            .filter(|j| j.state.is_terminal())
+            .min_by(|a, b| a.created_ms.cmp(&b.created_ms).then(a.id.cmp(&b.id)))
+            .map(|j| j.id.clone());
+        match oldest {
+            Some(id) => {
+                jobs.remove(&id);
+            }
+            // Every job is non-terminal (all still running) — nothing safe to drop.
+            None => break,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2692,6 +3098,7 @@ mod tests {
         index_bindings: BTreeMap<String, Vec<String>>,
         activity: BTreeMap<String, Vec<ActivityEvent>>,
         session_epochs: BTreeMap<String, i64>,
+        jobs: BTreeMap<String, ReindexJob>,
     }
 
     #[derive(Clone, Default)]
@@ -2710,6 +3117,7 @@ mod tests {
                 index_bindings: s.index_bindings.clone(),
                 activity: s.activity.clone(),
                 session_epochs: s.session_epochs.clone(),
+                jobs: s.jobs.clone(),
             })
         }
         fn persist_registry(&self, snap: RegistrySnapshot) -> Result<()> {
@@ -2729,6 +3137,10 @@ mod tests {
         }
         fn persist_sessions(&self, sessions: &BTreeMap<String, i64>) -> Result<()> {
             self.0.lock().unwrap().session_epochs = sessions.clone();
+            Ok(())
+        }
+        fn persist_jobs(&self, jobs: &BTreeMap<String, ReindexJob>) -> Result<()> {
+            self.0.lock().unwrap().jobs = jobs.clone();
             Ok(())
         }
     }
@@ -2771,6 +3183,119 @@ mod tests {
         // concern, not the file lock's).
         let reg3 = Registry::with_backend(Box::new(store)).unwrap();
         assert!(reg3.get("docs").is_some());
+    }
+
+    #[test]
+    fn create_poll_and_mutate_a_reindex_job() {
+        let reg = Registry::with_backend(Box::new(InMemoryBackend::default())).unwrap();
+        let job = reg.create_job(
+            JobKind::Reindex,
+            "docs",
+            vec![(0, 0, "n0".into()), (1, 0, "n1".into())],
+        );
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.shards.len(), 2);
+        assert_eq!(reg.get_job(&job.id).unwrap().state, JobState::Pending);
+
+        // A driver-style update: advance to Building and fold in one shard's live progress.
+        reg.mutate_job(&job.id, |j| {
+            j.state = JobState::Building;
+            j.shards[0].phase = ShardPhase::Building;
+            j.shards[0].docs_done = 10;
+            j.shards[0].docs_total = 100;
+        })
+        .unwrap();
+        let got = reg.get_job(&job.id).unwrap();
+        assert_eq!(got.state, JobState::Building);
+        assert_eq!(got.docs_done(), 10);
+        assert_eq!(got.docs_total(), 100);
+
+        // list_jobs is newest-first.
+        let job2 = reg.create_job(JobKind::Alter, "docs", vec![]);
+        let list = reg.list_jobs();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, job2.id);
+    }
+
+    #[test]
+    fn a_nonterminal_job_is_failed_on_reopen_but_a_done_job_survives() {
+        // Crash-safety: reopening the store over the same jobs fails an in-flight (non-terminal) job
+        // — its driver died — while a completed job round-trips intact.
+        let store = InMemoryBackend::default();
+        let (pending_id, done_id);
+        {
+            let reg = Registry::with_backend(Box::new(store.clone())).unwrap();
+            pending_id = reg
+                .create_job(JobKind::Reindex, "docs", vec![(0, 0, "n0".into())])
+                .id;
+            let done = reg.create_job(JobKind::Reindex, "docs", vec![(0, 0, "n0".into())]);
+            done_id = done.id.clone();
+            reg.mutate_job(&done_id, |j| {
+                j.state = JobState::Done;
+                j.generation = 7;
+            })
+            .unwrap();
+        }
+        let reopened = Registry::with_backend(Box::new(store)).unwrap();
+        let failed = reopened.get_job(&pending_id).unwrap();
+        assert_eq!(failed.state, JobState::Failed);
+        assert!(failed.error.contains("restarted"));
+        let survived = reopened.get_job(&done_id).unwrap();
+        assert_eq!(survived.state, JobState::Done);
+        assert_eq!(survived.generation, 7);
+    }
+
+    #[test]
+    fn request_cancel_flags_a_running_job_and_no_ops_a_terminal_one() {
+        let reg = Registry::with_backend(Box::new(InMemoryBackend::default())).unwrap();
+        let job = reg.create_job(JobKind::Reindex, "docs", vec![(0, 0, "n0".into())]);
+        assert!(reg.request_job_cancel(&job.id).unwrap().cancel_requested);
+        assert!(matches!(
+            reg.request_job_cancel("nope"),
+            Err(RegistryError::JobNotFound(_))
+        ));
+        // Canceling a terminal job is a no-op that returns it unchanged.
+        reg.mutate_job(&job.id, |j| j.state = JobState::Canceled)
+            .unwrap();
+        assert_eq!(
+            reg.request_job_cancel(&job.id).unwrap().state,
+            JobState::Canceled
+        );
+    }
+
+    #[test]
+    fn prune_drops_oldest_terminal_jobs_and_keeps_running_ones() {
+        let mut jobs = BTreeMap::new();
+        let mk = |id: &str, created: i64, state: JobState| ReindexJob {
+            id: id.into(),
+            index: "docs".into(),
+            kind: JobKind::Reindex,
+            state,
+            shards: vec![],
+            generation: 0,
+            cancel_requested: false,
+            error: String::new(),
+            created_ms: created,
+            updated_ms: created,
+        };
+        // JOBS_RETAIN terminal jobs + 3 running, over the cap: the 3 oldest terminal drop, the
+        // running ones always stay.
+        for i in 0..JOBS_RETAIN as i64 {
+            jobs.insert(
+                format!("t{i:04}"),
+                mk(&format!("t{i:04}"), i, JobState::Done),
+            );
+        }
+        for i in 0..3 {
+            let id = format!("r{i}");
+            jobs.insert(id.clone(), mk(&id, 10_000 + i, JobState::Building));
+        }
+        prune_jobs(&mut jobs);
+        assert_eq!(jobs.len(), JOBS_RETAIN);
+        assert!((0..3).all(|i| jobs.contains_key(&format!("r{i}"))));
+        // The three oldest terminals (t0000..t0002) were the ones dropped.
+        assert!(!jobs.contains_key("t0000"));
+        assert!(jobs.contains_key("t0003"));
     }
 
     /// An [`InMemoryBackend`] with fault + leadership toggles: persist/load failures on demand and
@@ -2836,6 +3361,9 @@ mod tests {
                 return Err(RegistryError::Backend("injected sessions failure".into()));
             }
             self.0.store.persist_sessions(sessions)
+        }
+        fn persist_jobs(&self, jobs: &BTreeMap<String, ReindexJob>) -> Result<()> {
+            self.0.store.persist_jobs(jobs)
         }
         fn try_become_leader(&self) -> Result<bool> {
             Ok(self
@@ -3144,6 +3672,154 @@ mod tests {
         .unwrap()
         .resolve(&src)
         .unwrap()
+    }
+
+    /// A two-field variant definition, so a `set_definition` test can prove the stored definition
+    /// actually changed (not just its version).
+    fn resolved_two_field(name: &str) -> ResolvedIndex {
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("body", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        IndexDefinition::from_yaml(&format!(
+            "name: {name}\nsource: {{ iceberg: {{ catalog: g, table: g.{name} }} }}\nmapping: {{ selection: EXPLICIT, fields: [ {{ path: id, type: KEYWORD }}, {{ path: body, type: TEXT }} ] }}\n",
+        ))
+        .unwrap()
+        .resolve(&src)
+        .unwrap()
+    }
+
+    #[test]
+    fn set_generation_is_a_persisted_compare_and_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        {
+            let reg = Registry::open(&path).unwrap();
+            reg.create(resolved("logs")).unwrap();
+            assert_eq!(
+                reg.generation("logs"),
+                Some(0),
+                "fresh index starts at gen 0"
+            );
+
+            // CAS success advances the epoch and returns the new value.
+            assert_eq!(reg.set_generation("logs", 0, 1).unwrap(), 1);
+            assert_eq!(reg.generation("logs"), Some(1));
+
+            // A stale `expected` (a concurrent cutover already bumped it) is refused, not clobbered.
+            assert!(matches!(
+                reg.set_generation("logs", 0, 2),
+                Err(RegistryError::PlacementConflict(_))
+            ));
+            assert_eq!(
+                reg.generation("logs"),
+                Some(1),
+                "conflict left the epoch intact"
+            );
+
+            // Unknown index → NotFound.
+            assert!(matches!(
+                reg.set_generation("nope", 0, 1),
+                Err(RegistryError::NotFound(_))
+            ));
+        }
+        // The bump survives a reopen (persisted, not just in-memory).
+        let reg2 = Registry::open(&path).unwrap();
+        assert_eq!(reg2.generation("logs"), Some(1));
+    }
+
+    #[test]
+    fn set_definition_is_a_persisted_compare_and_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        let wider = resolved_two_field("logs");
+        {
+            let reg = Registry::open(&path).unwrap();
+            reg.create(resolved("logs")).unwrap();
+            assert_eq!(reg.definition_version("logs"), Some(0));
+
+            // CAS success bumps the version and replaces the stored definition.
+            assert_eq!(reg.set_definition("logs", 0, wider.clone()).unwrap(), 1);
+            assert_eq!(reg.definition_version("logs"), Some(1));
+            assert_eq!(
+                reg.get("logs").unwrap().definition,
+                wider,
+                "the stored definition is the new one"
+            );
+
+            // Stale `expected` is refused.
+            assert!(matches!(
+                reg.set_definition("logs", 0, resolved("logs")),
+                Err(RegistryError::PlacementConflict(_))
+            ));
+            assert_eq!(reg.definition_version("logs"), Some(1));
+        }
+        let reg2 = Registry::open(&path).unwrap();
+        assert_eq!(reg2.definition_version("logs"), Some(1));
+        assert_eq!(reg2.get("logs").unwrap().definition, wider);
+    }
+
+    #[test]
+    fn commit_reindex_cutover_moves_definition_and_generation_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        let wider = resolved_two_field("logs");
+        {
+            let reg = Registry::open(&path).unwrap();
+            reg.create(resolved("logs")).unwrap();
+
+            // A plain-reindex cutover (no definition) is exactly a generation CAS.
+            assert_eq!(reg.commit_reindex_cutover("logs", None, 0, 1).unwrap(), 1);
+            assert_eq!(reg.generation("logs"), Some(1));
+            assert_eq!(
+                reg.definition_version("logs"),
+                Some(0),
+                "definition untouched"
+            );
+
+            // An alter cutover commits the new definition AND bumps the generation atomically.
+            assert_eq!(
+                reg.commit_reindex_cutover("logs", Some((0, wider.clone())), 1, 2)
+                    .unwrap(),
+                2
+            );
+            assert_eq!(reg.generation("logs"), Some(2));
+            assert_eq!(reg.definition_version("logs"), Some(1));
+            assert_eq!(reg.get("logs").unwrap().definition, wider);
+
+            // A stale generation is refused and writes NOTHING — neither the gen nor the definition.
+            assert!(matches!(
+                reg.commit_reindex_cutover("logs", Some((1, resolved("logs"))), 1, 3),
+                Err(RegistryError::PlacementConflict(_))
+            ));
+            assert_eq!(reg.generation("logs"), Some(2), "gen intact after refusal");
+            assert_eq!(
+                reg.definition_version("logs"),
+                Some(1),
+                "def intact after refusal"
+            );
+
+            // A stale definition version is likewise refused with no partial write (gen untouched).
+            assert!(matches!(
+                reg.commit_reindex_cutover("logs", Some((0, resolved("logs"))), 2, 3),
+                Err(RegistryError::PlacementConflict(_))
+            ));
+            assert_eq!(
+                reg.generation("logs"),
+                Some(2),
+                "no partial gen bump on def conflict"
+            );
+            assert_eq!(reg.get("logs").unwrap().definition, wider, "def intact");
+        }
+        // Both survive a reopen (one persisted snapshot per successful commit).
+        let reg2 = Registry::open(&path).unwrap();
+        assert_eq!(reg2.generation("logs"), Some(2));
+        assert_eq!(reg2.definition_version("logs"), Some(1));
+        assert_eq!(reg2.get("logs").unwrap().definition, wider);
     }
 
     #[test]

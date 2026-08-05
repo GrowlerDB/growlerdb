@@ -3,25 +3,28 @@
 //! rebuilds from source and durably swaps the shard live, fencing writes so the checkpoint can't regress.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use growlerdb_core::{
     BucketMap, CommitBatch, CompositeKey, IndexDefinition, IndexWriter, LocatedDoc, ResolvedIndex,
-    ShardRouter, SourceCheckpoint, SourceSchema,
+    ScanMode, ShardRouter, SourceCheckpoint, SourceSchema,
 };
 use growlerdb_index::{LocalIndexStore, Shard, ShardId, StoreError};
 use growlerdb_proto::v1::{
     AlterIndexRequest, AlterIndexResponse, AlterPlan as WireAlterPlan, BackupIndexRequest,
-    BackupIndexResponse, BackupStatusRequest, BackupStatusResponse, CompactIndexRequest,
-    CompactIndexResponse, DescribeIndexRequest, DescribeIndexResponse, IndexStats,
-    ReconcileIndexRequest, ReconcileIndexResponse, ReindexIndexRequest, ReindexIndexResponse,
-    VectorFieldStat,
+    BackupIndexResponse, BackupStatusRequest, BackupStatusResponse, CancelReindexRequest,
+    CancelReindexResponse, CompactIndexRequest, CompactIndexResponse, DescribeIndexRequest,
+    DescribeIndexResponse, IndexStats, ReconcileIndexRequest, ReconcileIndexResponse,
+    ReindexIndexRequest, ReindexIndexResponse, ReindexPhase, ReindexPrecheckRequest,
+    ReindexPrecheckResponse, ReindexStatusRequest, ReindexStatusResponse, VectorFieldStat,
 };
 use growlerdb_proto::{Admin, AdminServer};
 use growlerdb_source::{IcebergConfig, IcebergReader};
 use tonic::{Request, Response, Status};
 
 use crate::auth::{self, default_auth, SharedAuth};
+use crate::engine::scan_mode;
 use crate::fence::{ReindexFence, ReindexGuard};
 use crate::service_util::{check_served, internal, run_blocking};
 use crate::shard_handle::ShardHandle;
@@ -39,10 +42,59 @@ struct SourceContext {
     shard_id: ShardId,
     iceberg: IcebergConfig,
     table: String,
-    /// Shared reindex write-fence: engaged for the duration of a reindex so the Write
-    /// service rejects new writes (no rebuild-window delta to drop) and a second reindex is
-    /// refused (single-flight). Shared with the Node's [`WriteService`](crate::WriteService).
+    /// Shared reindex write-fence: engaged **only for the brief cutover** (PROMOTE/FULL swap) so the
+    /// Write service rejects the in-flight write that would otherwise land on the about-to-be-swapped
+    /// generation. The rebuild BUILD runs **unfenced** — writes keep flowing to the live generation,
+    /// and the connector replays the build-window delta after cutover (or the append catch-up
+    /// pre-applies it). Shared with the Node's [`WriteService`](crate::WriteService).
     fence: ReindexFence,
+    /// **Build single-flight**: a staged generation is pending between BUILD and its PROMOTE/DISCARD.
+    /// Set when BUILD (or FULL) starts and held until the cutover completes, so a second reindex is
+    /// refused. Distinct from `fence` — this guards the staging directory across the *unfenced* build,
+    /// where the write-fence (now cutover-only) no longer serves as the single-flight guard.
+    staged: std::sync::atomic::AtomicBool,
+    /// Live build progress + cancel signal for the reindex currently staging on this node — read by
+    /// [`ReindexStatus`](Admin::reindex_status) and tripped by [`CancelReindex`](Admin::cancel_reindex).
+    progress: Arc<ReindexProgress>,
+}
+
+/// The doc-level progress counter + cancel flag for one node's reindex. A node serves one shard of
+/// one index, so a single instance suffices. The populate loop stores `docs_done` and checks
+/// `cancel` each committed chunk; the coordinated multi-shard driver polls `ReindexStatus` to
+/// assemble a job's `docs_done / docs_total` and trips `cancel` via `CancelReindex`.
+#[derive(Default)]
+struct ReindexProgress {
+    /// A BUILD/FULL is actively populating a staged generation.
+    building: AtomicBool,
+    /// Documents committed into the staging generation so far this build.
+    docs_done: AtomicU64,
+    /// Source snapshot record count the build targets (0 = unknown / no build).
+    docs_total: AtomicU64,
+    /// Tripped by `CancelReindex`; the populate loop aborts the build when it observes this.
+    cancel: AtomicBool,
+}
+
+/// RAII single-flight guard over [`SourceContext::staged`]: clears the flag on drop unless
+/// [`disarm`](Self::disarm)ed. A failed BUILD drops it (freeing the build slot for a retry); a
+/// successful BUILD disarms it so the staged generation stays claimed until its PROMOTE/DISCARD.
+struct StagedGuard(Option<Arc<SourceContext>>);
+
+impl StagedGuard {
+    fn new(ctx: Arc<SourceContext>) -> Self {
+        Self(Some(ctx))
+    }
+    /// Keep the staging slot claimed past this scope (a successful build awaiting cutover).
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for StagedGuard {
+    fn drop(&mut self) {
+        if let Some(ctx) = self.0.take() {
+            ctx.staged.store(false, Ordering::Relaxed);
+        }
+    }
 }
 
 /// The accumulated outcome of a count-gated reconcile: counts over the divergent
@@ -151,6 +203,8 @@ impl AdminService {
             iceberg,
             table: table.into(),
             fence,
+            staged: std::sync::atomic::AtomicBool::new(false),
+            progress: Arc::new(ReindexProgress::default()),
         }));
         self
     }
@@ -158,6 +212,101 @@ impl AdminService {
     /// Wrap as a mountable tonic [`AdminServer`].
     pub fn into_server(self) -> AdminServer<Self> {
         AdminServer::new(self)
+    }
+
+    /// **Write catch-up before the cutover** (append fast-path only). The BUILD ran unfenced, so the
+    /// live generation advanced while it built; this pre-applies the source rows appended since the
+    /// staged generation's checkpoint onto the staging shard and stamps it at the caught-up **head**,
+    /// so the promoted generation is at ~head and the connector resumes with `from <= current` — no
+    /// `CheckpointGap`, and (near-)nothing to replay after cutover. Runs **under the cutover
+    /// write-fence**, so the live checkpoint it aligns past cannot advance meanwhile.
+    ///
+    /// A **no-op for a changelog index**: the node has no bounded delete-aware delta reader, so the
+    /// staged generation stays at the build snapshot and the connector's delete-aware changelog replay
+    /// (resuming from that checkpoint) brings the new generation up to head after cutover — correct,
+    /// just with a brief post-cutover replay.
+    async fn catch_up_before_promote(
+        &self,
+        ctx: &Arc<SourceContext>,
+        resolved: &ResolvedIndex,
+        req: &ReindexIndexRequest,
+    ) -> Result<(), Status> {
+        // A windowed reindex uses the connector-replay model (the staged window is stamped at the
+        // build snapshot; the connector resumes from the server-min committed checkpoint and replays
+        // per window). The append fast-path reader isn't window-aware, so skip catch-up for windowed —
+        // stamping the window at head would risk skipping the build-window delta for that window.
+        if resolved.windowing.is_some() {
+            return Ok(());
+        }
+        if scan_mode(resolved) != ScanMode::AppendFastPath {
+            return Ok(());
+        }
+        // Same reshard filter as the build: keep only the rows this shard owns.
+        let filter: Option<(ShardRouter, u32)> = if req.bucket_owners.is_empty() {
+            None
+        } else {
+            let map = BucketMap::from_owners(req.bucket_owners.clone())
+                .map_err(|e| Status::invalid_argument(format!("bucket map: {e}")))?;
+            Some((
+                ShardRouter::bucketed(resolved.routing_strategy(), map),
+                req.shard_ordinal,
+            ))
+        };
+        let reader = IcebergReader::connect(&ctx.iceberg)
+            .await
+            .map_err(internal)?;
+        let store = ctx.store.clone();
+        let shard_id = ctx.shard_id.clone();
+        let table = ctx.table.clone();
+        let resolved = resolved.clone();
+        let index_name = self.index.clone();
+        let handle = tokio::runtime::Handle::current();
+        run_blocking(move || -> Result<(), StoreError> {
+            // Reopen the staged generation and read where it currently sits (the build snapshot).
+            let staging = store.open_staging(&shard_id, &resolved)?;
+            let since = staging.current_checkpoint()?.map(|cp| cp.snapshot_id());
+            // Read the source rows appended since, with the head's lineage sequence for an ordered stamp.
+            let batch = handle
+                .block_on(reader.read_documents_appended_since_ordered(&table, &resolved, since))
+                .map_err(|e| StoreError::Source(e.to_string()))?;
+            let head_id = batch.snapshot_id;
+            let head_cp = match batch.sequence_number {
+                Some(seq) => SourceCheckpoint::iceberg_ordered(head_id, seq),
+                None => SourceCheckpoint::iceberg(head_id),
+            };
+            let mut docs = batch.docs;
+            if let Some((router, ord)) = &filter {
+                docs.retain(|d| router.owns(&d.doc.key, *ord));
+            }
+            let appended = docs.len();
+            // Apply the delta in bounded chunks (each a bootstrap-style batch stamped at the head), so
+            // continuity `Apply`s them onto the staged generation and advances its checkpoint to head.
+            for (i, chunk) in docs.chunks(REINDEX_COMMIT_CHUNK).enumerate() {
+                IndexWriter::write(
+                    &staging,
+                    &CommitBatch::from_upserts(
+                        chunk.to_vec(),
+                        head_cp.clone(),
+                        format!("reindex-catchup-{head_id}-{i}"),
+                    ),
+                )?;
+            }
+            if appended == 0 {
+                // No appended rows, but still advance the staged checkpoint to head so the promoted
+                // generation doesn't sit behind the live one (which would gap the connector's resume).
+                IndexWriter::write(
+                    &staging,
+                    &CommitBatch::from_upserts(Vec::new(), head_cp, format!("reindex-catchup-{head_id}-cp")),
+                )?;
+            }
+            tracing::info!(index = %index_name, appended, head = head_id, "reindex: append catch-up before cutover");
+            // Dropping `staging` flushes + closes its writer, so promote_generation swaps in the
+            // caught-up data.
+            Ok(())
+        })
+        .await?
+        .map_err(internal)?;
+        Ok(())
     }
 
     /// Per-partition count-gated reconcile. Returns `Some(result)` when the gate applied
@@ -409,13 +558,22 @@ impl Admin for AdminService {
         let candidate = resolve_candidate(&req.definition_yaml, &source)?;
         let plan = wire_plan(&baseline, &candidate);
 
+        let mut applied = false;
         if req.apply {
-            // Apply in-place changes durably, then advance the in-memory baseline so later
-            // alters/reindexes see the new definition.
-            let applied = apply_in_place(&baseline, candidate)?;
-            *ctx.resolved.write().expect("definition lock not poisoned") = applied;
+            // Apply in-place changes, then advance the in-memory baseline so later alters/reindexes
+            // see the new definition. (Reindex-requiring/restart-required changes error out above.)
+            let updated = apply_in_place(&baseline, candidate)?;
+            *ctx.resolved.write().expect("definition lock not poisoned") = updated;
+            applied = true;
         }
-        Ok(Response::new(AlterIndexResponse { plan: Some(plan) }))
+        Ok(Response::new(AlterIndexResponse {
+            plan: Some(plan),
+            applied,
+            // The node path applies only in-place/no-op changes live; a reindex-requiring change is
+            // driven by the control plane (durable alter), not here.
+            reindex_triggered: false,
+            generation: 0,
+        }))
     }
 
     async fn reindex_index(
@@ -431,22 +589,115 @@ impl Admin for AdminService {
             Status::unimplemented("this node was started without source access for reindex")
         })?;
 
-        // Fence: engaging is the single-flight guard (a second reindex is refused) AND
-        // it makes the Write service reject new writes for the duration — so the connector can't
-        // advance the shard past the rebuild snapshot, a delta the swap would otherwise drop.
-        if !ctx.fence.engage() {
+        // PROMOTE / DISCARD act on the generation a prior BUILD staged (reading no source) and
+        // release the write-fence BUILD engaged. The control plane drives the coordinated
+        // multi-shard flow: BUILD every shard, then PROMOTE all — or DISCARD all on any failure —
+        // so a build failure never half-swaps the index.
+        let phase = req.phase();
+        // A durable schema-changing alter passes the NEW resolved definition to rebuild against (and
+        // adopt at PROMOTE); empty ⇒ rebuild against the served definition (a plain reindex).
+        let new_def: Option<ResolvedIndex> = if req.definition_json.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_str(&req.definition_json)
+                    .map_err(|e| Status::invalid_argument(format!("bad definition_json: {e}")))?,
+            )
+        };
+        if let ReindexPhase::Promote = phase {
+            // Reopen the promoted shard with the (possibly new) definition it was staged under.
+            let resolved = new_def.clone().unwrap_or_else(|| {
+                ctx.resolved
+                    .read()
+                    .expect("definition lock not poisoned")
+                    .clone()
+            });
+            // Engage the write-fence for the **cutover only** (the BUILD ran unfenced): the fence
+            // rejects the in-flight write that would otherwise land on the generation we are about to
+            // swap aside. A failing promote drops the guard, releasing it.
+            if !ctx.fence.engage() {
+                return Err(Status::failed_precondition(
+                    "a reindex cutover is already in progress for this index",
+                ));
+            }
+            let fence_guard = ReindexGuard::new(ctx.fence.clone());
+            // Append fast-path catch-up: pre-apply the source delta since the build so the staged
+            // generation is stamped at ~head and the connector has ~nothing to replay after cutover.
+            self.catch_up_before_promote(ctx, &resolved, &req).await?;
+            let store = ctx.store.clone();
+            let shard_id = ctx.shard_id.clone();
+            let promoted = run_blocking(move || store.promote_generation(&shard_id, &resolved))
+                .await?
+                .map_err(internal)?;
+            let snapshot = promoted.current_snapshot().map_err(internal)?;
+            let doc_count = promoted.num_docs().map_err(internal)?;
+            // Install the promoted generation as the live shard.
+            self.shard.swap(Arc::new(promoted));
+            // Adopt the new definition as the served baseline (a schema-changing alter), so later
+            // writes/reindexes use it. Durable because the CP registry is the source of truth.
+            if let Some(def) = new_def {
+                *ctx.resolved.write().expect("definition lock not poisoned") = def;
+            }
+            // Cutover done: release the fence and clear the build single-flight slot.
+            drop(fence_guard);
+            ctx.staged
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(index = %self.index, snapshot, "reindex: promoted the staged generation");
+            return Ok(Response::new(ReindexIndexResponse {
+                doc_count,
+                snapshot,
+            }));
+        }
+        if let ReindexPhase::Discard = phase {
+            let store = ctx.store.clone();
+            let shard_id = ctx.shard_id.clone();
+            run_blocking(move || store.discard_staging(&shard_id))
+                .await?
+                .map_err(internal)?;
+            // Release the cutover fence if a failed promote left it engaged, and free the build slot.
+            ctx.fence.release();
+            ctx.staged
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(index = %self.index, "reindex: discarded the staged generation");
+            return Ok(Response::new(ReindexIndexResponse {
+                doc_count: 0,
+                snapshot: 0,
+            }));
+        }
+        // FULL (one-shot) or BUILD (stage only; a later PROMOTE cuts it over).
+        let build_only = matches!(phase, ReindexPhase::Build);
+
+        // Build single-flight: claim the staging slot (a second reindex is refused). Unlike the old
+        // model this does NOT engage the write-fence — the BUILD runs **unfenced**, so writes keep
+        // flowing to the live generation and the connector replays the build-window delta after
+        // cutover (or the append catch-up pre-applies it). The fence is engaged only for the brief
+        // cutover in PROMOTE/FULL.
+        if ctx
+            .staged
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
             return Err(Status::failed_precondition(
                 "a reindex is already in progress for this index",
             ));
         }
-        let _fence_guard = ReindexGuard::new(ctx.fence.clone());
+        // RAII: clear the staging slot on any early return (a failed build), so a retry can proceed.
+        // A successful BUILD disarms it so the slot stays claimed until PROMOTE/DISCARD; FULL clears
+        // it explicitly after its own cutover below.
+        let staged_guard = StagedGuard::new(ctx.clone());
 
-        // Rebuild against the current definition (an applied in-place alter may have moved it).
-        let resolved = ctx
-            .resolved
-            .read()
-            .expect("definition lock not poisoned")
-            .clone();
+        // Rebuild against the NEW definition when a durable alter supplied one, else the served one.
+        let resolved = new_def.clone().unwrap_or_else(|| {
+            ctx.resolved
+                .read()
+                .expect("definition lock not poisoned")
+                .clone()
+        });
 
         // Reshard filter: a non-empty bucket map means rebuild this shard keeping only the
         // docs it owns under the new map — the per-node data step of an online reshard. Empty ⇒ a
@@ -462,7 +713,24 @@ impl Admin for AdminService {
                 req.shard_ordinal,
             ))
         };
-        let filtering = reshard_filter.is_some();
+        // Window filter: a windowed reindex rebuilds ONE window's shard, so keep only the docs whose
+        // ingest-time window equals `req.window` (the windowed analog of the reshard bucket filter).
+        // `(TimeWindowing, window_id, window-field TimeFormat)`; `None` for an ordinal index.
+        let window_filter: Option<(
+            growlerdb_core::TimeWindowing,
+            i64,
+            Option<growlerdb_core::TimeFormat>,
+        )> = resolved.windowing.as_ref().map(|w| {
+            let fmt = resolved
+                .fields
+                .iter()
+                .find(|f| f.path == w.field)
+                .and_then(|f| f.format);
+            (w.clone(), req.window, fmt)
+        });
+        // A filtered shard (reshard bucket OR window) may legitimately end up empty, so the
+        // empty-rebuild data-loss guard is skipped when filtering.
+        let filtering = reshard_filter.is_some() || window_filter.is_some();
 
         // Stream the source into the rebuild: the staging shard is populated chunk by
         // chunk straight off the Iceberg scan, so peak memory is O(one streamed chunk), not
@@ -506,29 +774,55 @@ impl Admin for AdminService {
         // read is driven on that same blocking thread via `block_on`; its sync sink writes each
         // bounded chunk straight into the staging shard (mirrors `Engine::build_from_source`), so
         // peak rebuild memory is O(one chunk), not O(table).
+        // Arm the live progress counter for this build: reset docs_done, fix docs_total to the
+        // source snapshot's record count, and clear any stale cancel flag from a prior op. The
+        // coordinated driver polls `ReindexStatus` off these atomics; the populate loop below bumps
+        // `docs_done` and aborts if `cancel` is tripped.
+        let progress = ctx.progress.clone();
+        progress.docs_done.store(0, Ordering::Relaxed);
+        progress
+            .docs_total
+            .store(records.unwrap_or(0).max(0) as u64, Ordering::Relaxed);
+        progress.cancel.store(false, Ordering::Relaxed);
+        progress.building.store(true, Ordering::Relaxed);
+
         let store = ctx.store.clone();
         let shard_id = ctx.shard_id.clone();
         let table = ctx.table.clone();
         let index_name = self.index.clone();
         let handle = tokio::runtime::Handle::current();
-        let (promoted, doc_count) =
-            run_blocking(move || -> Result<(Shard, u64), StoreError> {
+        let build_progress = progress.clone();
+        // The build closure takes the definition by move; keep the original for the FULL cutover below.
+        let build_resolved = resolved.clone();
+        let build = run_blocking(move || -> Result<u64, StoreError> {
                 let mut doc_count = 0u64;
-                let promoted = store.reindex(&shard_id, &resolved, |shard| {
-                    // Sub-commit each streamed chunk in bounded slices with progress — a single
-                    // giant commit balloons peak memory and gives no signal on a long op.
-                    // Every commit carries the rebuild checkpoint; a per-commit seq keeps each
-                    // batch_id unique.
+                // Populate the staging shard from the source — shared by the FULL (build+promote)
+                // and BUILD (stage-only) paths. Sub-commit each streamed chunk in bounded slices so
+                // peak memory is O(one chunk); every commit carries the rebuild checkpoint and a
+                // per-commit seq keeps each batch_id unique.
+                let populate = |shard: &Shard| -> Result<(), StoreError> {
                     let mut seq = 0u64;
                     handle
                         .block_on(
-                            reader.read_documents_streamed(&table, &resolved, |mut docs| {
+                            reader.read_documents_streamed(&table, &build_resolved, |mut docs| {
                                 // Reshard: drop docs this shard no longer owns under the new
                                 // map, so the rebuilt shard holds only its post-reshard buckets.
                                 if let Some((router, ordinal)) = &reshard_filter {
                                     docs.retain(|d| router.owns(&d.doc.key, *ordinal));
                                 }
+                                // Windowed: keep only the docs whose ingest-time window is the one
+                                // this per-window shard rebuilds (the windowed analog of the above).
+                                if let Some((windowing, window, fmt)) = &window_filter {
+                                    docs.retain(|d| windowing.doc_window(&d.doc, *fmt) == *window);
+                                }
                                 doc_count += docs.len() as u64;
+                                // Publish live progress and honor a cancel requested between chunks:
+                                // abort the streamed read so the build unwinds (the fence is released
+                                // and the coordinated driver DISCARDs the staged generation).
+                                build_progress.docs_done.store(doc_count, Ordering::Relaxed);
+                                if build_progress.cancel.load(Ordering::Relaxed) {
+                                    return Err("reindex canceled".to_string());
+                                }
                                 for chunk in docs.chunks(REINDEX_COMMIT_CHUNK) {
                                     seq += 1;
                                     IndexWriter::write(
@@ -554,26 +848,144 @@ impl Admin for AdminService {
                     }
                     if doc_count == 0 {
                         // Genuinely empty source: still stamp the checkpoint so the shard isn't behind.
-                        IndexWriter::write(
-                            shard,
-                            &reindex_commit(Vec::new(), checkpoint, sequence, 0),
-                        )?;
+                        IndexWriter::write(shard, &reindex_commit(Vec::new(), checkpoint, sequence, 0))?;
                     }
                     Ok(())
-                })?;
-                Ok((promoted, doc_count))
+                };
+                // Stage the next generation WITHOUT promoting — both BUILD and FULL build the staging
+                // shard unfenced; the cutover (swap) happens below, under the brief write-fence.
+                store.build_staging_generation(&shard_id, &build_resolved, populate)?;
+                Ok(doc_count)
             })
+            .await;
+        // The build is over (success or abort): stop advertising it as in-flight before we
+        // interpret the result, so a concurrent `ReindexStatus` never reports a finished build as
+        // still building.
+        progress.building.store(false, Ordering::Relaxed);
+        let doc_count = match build? {
+            Ok(v) => v,
+            Err(e) => {
+                // A cancel abort is a deliberate stop, not a failure: report it as CANCELLED so the
+                // coordinated driver marks the job Canceled (and DISCARDs the staged generation)
+                // rather than Failed. `staged_guard` drops here, freeing the build slot.
+                if progress.cancel.load(Ordering::Relaxed) {
+                    return Err(Status::cancelled(format!(
+                        "reindex of `{}` canceled",
+                        self.index
+                    )));
+                }
+                return Err(internal(e));
+            }
+        };
+
+        if build_only {
+            // BUILD: leave the staged generation for a later coordinated PROMOTE — keep the slot
+            // claimed by disarming the guard. Nothing is fenced; writes kept flowing throughout.
+            staged_guard.disarm();
+            tracing::info!(
+                index = %self.index,
+                snapshot = snapshot_id,
+                "reindex: staged the next generation (unfenced, awaiting cutover)"
+            );
+            return Ok(Response::new(ReindexIndexResponse {
+                doc_count,
+                snapshot: snapshot_id as u64,
+            }));
+        }
+
+        // FULL (one-shot embedded): cut over here. Engage the write-fence for the brief cutover, run
+        // the append catch-up, promote + swap, then release the fence and free the build slot.
+        if !ctx.fence.engage() {
+            return Err(Status::failed_precondition(
+                "a reindex cutover is already in progress for this index",
+            ));
+        }
+        let fence_guard = ReindexGuard::new(ctx.fence.clone());
+        self.catch_up_before_promote(ctx, &resolved, &req).await?;
+        let store = ctx.store.clone();
+        let shard_id = ctx.shard_id.clone();
+        let promote_def = resolved.clone();
+        let promoted = run_blocking(move || store.promote_generation(&shard_id, &promote_def))
             .await?
             .map_err(internal)?;
-
         let snapshot = promoted.current_snapshot().map_err(internal)?;
-        // Install the rebuilt shard as the live one — every service sees it at once.
+        let doc_count = promoted.num_docs().map_err(internal)?;
         self.shard.swap(Arc::new(promoted));
+        // FULL from a durable alter: adopt the new definition as the served baseline.
+        if let Some(def) = new_def {
+            *ctx.resolved.write().expect("definition lock not poisoned") = def;
+        }
+        drop(fence_guard);
+        staged_guard.disarm();
+        ctx.staged
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(index = %self.index, snapshot, "reindex: promoted the rebuilt shard");
-
         Ok(Response::new(ReindexIndexResponse {
             doc_count,
             snapshot,
+        }))
+    }
+
+    #[tracing::instrument(name = "admin.reindex_status", skip_all, err)]
+    async fn reindex_status(
+        &self,
+        request: Request<ReindexStatusRequest>,
+    ) -> Result<Response<ReindexStatusResponse>, Status> {
+        auth::authorize(&self.auth, "ReindexStatus", &request)?;
+        let req = request.into_inner();
+        check_served(&req.index, &self.index)?;
+        let ctx = self.source.as_ref().ok_or_else(|| {
+            Status::unimplemented("this node was started without source access for reindex")
+        })?;
+        let p = &ctx.progress;
+        Ok(Response::new(ReindexStatusResponse {
+            building: p.building.load(Ordering::Relaxed),
+            docs_done: p.docs_done.load(Ordering::Relaxed),
+            docs_total: p.docs_total.load(Ordering::Relaxed),
+            cancel_requested: p.cancel.load(Ordering::Relaxed),
+        }))
+    }
+
+    #[tracing::instrument(name = "admin.cancel_reindex", skip_all, err)]
+    async fn cancel_reindex(
+        &self,
+        request: Request<CancelReindexRequest>,
+    ) -> Result<Response<CancelReindexResponse>, Status> {
+        auth::authorize(&self.auth, "CancelReindex", &request)?;
+        let req = request.into_inner();
+        check_served(&req.index, &self.index)?;
+        let ctx = self.source.as_ref().ok_or_else(|| {
+            Status::unimplemented("this node was started without source access for reindex")
+        })?;
+        // Trip the flag the populate loop checks each chunk. A build in flight aborts (returning
+        // CANCELLED from ReindexIndex); with no build active this is a harmless ack — the next BUILD
+        // clears the flag before it starts, so a stale cancel can never kill a fresh build.
+        let was_building = ctx.progress.building.load(Ordering::Relaxed);
+        ctx.progress.cancel.store(true, Ordering::Relaxed);
+        tracing::info!(index = %self.index, was_building, "reindex: cancel requested");
+        Ok(Response::new(CancelReindexResponse { was_building }))
+    }
+
+    #[tracing::instrument(name = "admin.reindex_precheck", skip_all, err)]
+    async fn reindex_precheck(
+        &self,
+        request: Request<ReindexPrecheckRequest>,
+    ) -> Result<Response<ReindexPrecheckResponse>, Status> {
+        auth::authorize(&self.auth, "ReindexPrecheck", &request)?;
+        let req = request.into_inner();
+        check_served(&req.index, &self.index)?;
+        let ctx = self.source.as_ref().ok_or_else(|| {
+            Status::unimplemented("this node was started without source access for reindex")
+        })?;
+        let shard_dir = ctx.store.shard_path(&ctx.shard_id);
+        // dir_size walks the shard tree (I/O) → the blocking pool.
+        let r = run_blocking(move || reindex_disk_report(&shard_dir)).await?;
+        Ok(Response::new(ReindexPrecheckResponse {
+            ok: r.ok,
+            free_bytes: r.free_bytes,
+            needed_bytes: r.needed_bytes,
+            index_bytes: r.index_bytes,
+            probed: r.probed,
         }))
     }
 
@@ -842,25 +1254,67 @@ fn empty_rebuild_abort_reason(doc_count: u64, records: Option<i64>) -> Option<St
     }
 }
 
-/// Headroom multiplier over the current index size for the free-disk precheck: the old, staging,
-/// and (briefly) backup copies coexist during the swap.
-const REINDEX_DISK_HEADROOM: u64 = 3;
+/// Free-disk headroom multiplier over the current index size for the reindex precheck.
+///
+/// The cutover swap never triples the data on disk: it `rename`s the old shard aside to a `*.old`
+/// backup and the staging shard into place (both O(1), same filesystem), then drops the backup — so
+/// the physical peak is ≈2× (1× live + 1× staging), only 1× of it *new*. The reindex therefore needs
+/// ≈1× the index size in *free* space for the staging copy; we require 2× to also absorb the
+/// transient scratch a Tantivy segment merge can hold mid-build. (Requiring 3× — 4× total — falsely
+/// blocked any index larger than a quarter of its disk, even with over half the disk free.)
+const REINDEX_DISK_HEADROOM: u64 = 2;
+
+/// The free-disk report for a shard's reindex: the current on-disk size, the ≈headroom `needed`
+/// estimate, the free bytes at its filesystem, and whether it fits. `probed = false` when the
+/// free-disk probe was unavailable — the check is then skipped (`ok = true`), never blocking a
+/// reindex on a probe failure. The node's BUILD-time [`precheck_free_disk`] and the control plane's
+/// pre-run [`ReindexPrecheck`](Admin::reindex_precheck) both read this.
+struct DiskReport {
+    ok: bool,
+    free_bytes: u64,
+    needed_bytes: u64,
+    index_bytes: u64,
+    probed: bool,
+}
+
+fn reindex_disk_report(shard_dir: &Path) -> DiskReport {
+    let index_bytes = dir_size(shard_dir);
+    let needed_bytes = index_bytes.saturating_mul(REINDEX_DISK_HEADROOM);
+    let probe_at = shard_dir.parent().unwrap_or(shard_dir);
+    match free_disk_bytes(probe_at) {
+        Some(free_bytes) => DiskReport {
+            ok: free_bytes >= needed_bytes,
+            free_bytes,
+            needed_bytes,
+            index_bytes,
+            probed: true,
+        },
+        None => DiskReport {
+            ok: true,
+            free_bytes: 0,
+            needed_bytes,
+            index_bytes,
+            probed: false,
+        },
+    }
+}
 
 /// Refuse a reindex up front if free disk plausibly can't hold the rebuild — better than failing
 /// hours in. Compares ≈`REINDEX_DISK_HEADROOM`× the current index size to the free space
-/// at the shard's parent dir. A probe failure (`None`) skips the check rather than blocking.
+/// at the shard's parent dir. A probe failure skips the check rather than blocking.
 fn precheck_free_disk(shard_dir: &Path) -> Result<(), String> {
-    let size = dir_size(shard_dir);
-    let need = size.saturating_mul(REINDEX_DISK_HEADROOM);
-    let probe_at = shard_dir.parent().unwrap_or(shard_dir);
-    match free_disk_bytes(probe_at) {
-        Some(free) if free < need => Err(format!(
-            "insufficient free disk for reindex: need ~{need} bytes (≈{REINDEX_DISK_HEADROOM}× the \
-             {size}-byte index), only {free} free at {}",
-            probe_at.display()
-        )),
-        _ => Ok(()),
+    let r = reindex_disk_report(shard_dir);
+    if !r.ok {
+        return Err(format!(
+            "insufficient free disk for reindex: need ~{} bytes (≈{REINDEX_DISK_HEADROOM}× the \
+             {}-byte index), only {} free at {}",
+            r.needed_bytes,
+            r.index_bytes,
+            r.free_bytes,
+            shard_dir.parent().unwrap_or(shard_dir).display()
+        ));
     }
+    Ok(())
 }
 
 /// Total size in bytes of the files under `dir` (recursive); 0 if absent/unreadable.
@@ -1360,8 +1814,14 @@ mod tests {
             ReindexFence::new(),
         );
 
-        // Simulate a reindex already running (the fence is engaged).
-        assert!(svc.source.as_ref().unwrap().fence.engage());
+        // Simulate a reindex already staged (the build single-flight slot is claimed). A second
+        // BUILD is refused rather than trampling the shared staging dir. (The BUILD now runs
+        // unfenced, so `staged` — not the write-fence — is the single-flight guard.)
+        svc.source
+            .as_ref()
+            .unwrap()
+            .staged
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let err = svc
             .reindex_index(Request::new(ReindexIndexRequest {
                 index: String::new(),
@@ -1370,6 +1830,123 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn discard_frees_the_build_slot_and_releases_the_cutover_fence() {
+        // DISCARD is the abort/unwind: it frees the build single-flight slot and releases the
+        // write-fence a failed cutover may have left engaged — so writes resume and a retry can build.
+        let (resolved, _src) = alter_fixtures();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalIndexStore::open(tmp.path()).unwrap();
+        let shard_id = ShardId::single("docs");
+        let shard = store.create_shard(&shard_id, &resolved).unwrap();
+        let fence = ReindexFence::new();
+        let svc = AdminService::new(Arc::new(shard), "docs").with_source(
+            resolved,
+            store,
+            shard_id,
+            IcebergConfig::local(),
+            "g.docs",
+            fence.clone(),
+        );
+        // Simulate a staged generation whose cutover engaged the fence and then failed.
+        svc.source
+            .as_ref()
+            .unwrap()
+            .staged
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(fence.engage());
+
+        svc.reindex_index(Request::new(ReindexIndexRequest {
+            index: String::new(),
+            phase: ReindexPhase::Discard as i32,
+            ..Default::default()
+        }))
+        .await
+        .expect("discard succeeds");
+
+        assert!(!fence.is_engaged(), "discard released the cutover fence");
+        assert!(
+            !svc.source
+                .as_ref()
+                .unwrap()
+                .staged
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "discard freed the build single-flight slot"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reindex_status_and_cancel_without_source_are_unimplemented() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path()); // built via `new` ⇒ no source context
+        let s = svc
+            .reindex_status(Request::new(ReindexStatusRequest {
+                index: String::new(),
+                window: 0,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(s.code(), Code::Unimplemented);
+        let c = svc
+            .cancel_reindex(Request::new(CancelReindexRequest {
+                index: String::new(),
+                window: 0,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(c.code(), Code::Unimplemented);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_trips_the_flag_that_reindex_status_reports() {
+        // CancelReindex sets the abort flag the populate loop observes; ReindexStatus reads it back.
+        // No build is in flight here, so it's a harmless ack (`was_building = false`) whose only
+        // visible effect is the flag — which the next BUILD would clear before starting.
+        let (resolved, _src) = alter_fixtures();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalIndexStore::open(tmp.path()).unwrap();
+        let shard_id = ShardId::single("docs");
+        let shard = store.create_shard(&shard_id, &resolved).unwrap();
+        let svc = AdminService::new(Arc::new(shard), "docs").with_source(
+            resolved,
+            store,
+            shard_id,
+            IcebergConfig::local(),
+            "g.docs",
+            ReindexFence::new(),
+        );
+
+        let before = svc
+            .reindex_status(Request::new(ReindexStatusRequest {
+                index: String::new(),
+                window: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!before.building && !before.cancel_requested && before.docs_done == 0);
+
+        let ack = svc
+            .cancel_reindex(Request::new(CancelReindexRequest {
+                index: String::new(),
+                window: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!ack.was_building);
+
+        let after = svc
+            .reindex_status(Request::new(ReindexStatusRequest {
+                index: String::new(),
+                window: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(after.cancel_requested);
     }
 
     #[tokio::test(flavor = "current_thread")]
