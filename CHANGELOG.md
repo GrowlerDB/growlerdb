@@ -6,6 +6,17 @@ All notable changes to GrowlerDB are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-04
+
+The **reindex** release. Rebuilding an index from its Iceberg source is now a first-class, coordinated
+operation with **zero write-downtime**: an async job across every shard and window, durable across a
+control-plane restart, with an up-front disk check. It also ships first-class **distribution
+artifacts** — a Python client, the connector fat jars, and a pre-built connector image.
+
+**Upgrading:** drop-in — the on-disk index format is unchanged, so no rebuild and no data loss, and
+defaults are unchanged. The reindex and alter job APIs are **additive**; existing search, indexing,
+and ingestion are untouched.
+
 ### Added
 
 - **Coordinated, zero-downtime reindex.** Rebuilding an index from its Iceberg source is now an async
@@ -20,10 +31,17 @@ All notable changes to GrowlerDB are documented here. The format is based on
   and cut over independently (cold/parked windows are skipped for now).
 - **A durable alter survives a node restart.** After an alter changes an index definition, a node that
   reboots loads the new definition from the control-plane registry instead of a stale local copy, so it
-  opens the already-reindexed shard without a schema-mismatch error.
+  opens the already-reindexed shard without a schema-mismatch error. A schema-changing alter commits its
+  new definition only at the atomic cutover, so a rebuild that fails leaves the registry on the old
+  definition — never advertising a schema the on-disk shards don't have.
 - **Up-front reindex disk check.** Before a reindex starts, the control plane verifies every shard node
-  has room for the rebuild (about 3x the shard size) and refuses with a clear error naming any
-  short node, instead of failing partway through.
+  has room for the rebuild (about 2x the shard size — the cutover swaps directories by rename, so the
+  data is never tripled on disk) and refuses with a clear error naming any short node, instead of
+  failing partway through. The nodes are probed concurrently, so the check stays fast across many shards.
+- **First-class distribution artifacts.** Every release now publishes a pure-Python client
+  (`pip`-installable, PyPI-ready), the **Spark and Trino connector fat jars**, and a **pre-built
+  `ghcr.io/growlerdb/growlerdb-connector` image** (the Spark connector baked into an `apache/spark`
+  base), so streaming ingestion runs without a host-side Java/Maven build.
 
 ## [0.8.0] - 2026-07-31
 
@@ -604,7 +622,8 @@ The initial public (Beta) surface.
   into the image, chart `appVersion`, binaries, and CLI `--version` while the tree stays `0.0.0`;
   the image gets an immutable `X.Y.Z` plus moving `X.Y`/`X`/`latest`. See [RELEASING.md](RELEASING.md).
 
-[Unreleased]: https://github.com/GrowlerDB/growlerdb/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/GrowlerDB/growlerdb/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.5.0...v0.6.0
