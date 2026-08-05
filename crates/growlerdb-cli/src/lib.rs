@@ -5970,8 +5970,8 @@ fn seed_builtin_users(
     if let Ok(demo_user) = std::env::var("GROWLERDB_DEMO_USER") {
         let demo_user = demo_user.trim().to_string();
         if !demo_user.is_empty() && !registry.has_credential(&demo_user) {
-            let demo_password =
-                std::env::var("GROWLERDB_DEMO_PASSWORD").unwrap_or_else(|_| "demo".to_string());
+            let demo_password = std::env::var("GROWLERDB_DEMO_PASSWORD")
+                .unwrap_or_else(|_| "demo-growlerdb".to_string());
             let demo_roles = vec!["reader".to_string(), "operator".to_string()];
             let demo_indexes: Vec<String> = std::env::var("GROWLERDB_DEMO_INDEXES")
                 .unwrap_or_else(|_| "docs,catalog".to_string())

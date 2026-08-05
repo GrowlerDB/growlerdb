@@ -64,7 +64,7 @@ for _ in $(seq 1 40); do
   # (curl exit 7) from aborting the script under `set -e`/`pipefail`; the loop just retries.
   if [ -z "$token" ]; then
     token=$(curl -fsS -m 5 http://localhost:8081/v1/login \
-      -H 'content-type: application/json' -d '{"username":"demo","password":"demo"}' 2>/dev/null \
+      -H 'content-type: application/json' -d '{"username":"demo","password":"demo-growlerdb"}' 2>/dev/null \
       | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p') || true
   fi
   if [ -n "$token" ] && curl -fsS -m 5 http://localhost:8081/v1/search \
@@ -93,7 +93,7 @@ dc "${VARIANT_PROFILES[@]}" run --rm connector-events
 step 6 6 "Ready"
 cat <<'EOF'
 
-    Console:           http://localhost:8081  (demo/demo)  — opens on 'movies' (try Semantic/Hybrid)
+    Console:           http://localhost:8081  (demo/demo-growlerdb)  — opens on 'movies' (try Semantic/Hybrid)
     Indexes:           movies · catalog · docs · events (Iceberg v3 variant: flatten + shapes)
     Grafana:           http://localhost:3000
     Connect an agent:  just mcp-connect   (MCP over HTTP — Claude or any MCP client)

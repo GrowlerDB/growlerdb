@@ -42,15 +42,15 @@ client.
 ## Get a demo token
 
 Against the local demo stack (`just stack`, gateway at `http://localhost:8081`), log in with the
-seeded `demo` / `demo` credentials:
+seeded `demo` / `demo-growlerdb` credentials:
 
 ```sh
 curl -s http://localhost:8081/v1/login \
   -H 'content-type: application/json' \
-  -d '{"username":"demo","password":"demo"}' | jq -r .token
+  -d '{"username":"demo","password":"demo-growlerdb"}' | jq -r .token
 ```
 
-Or let the server do it for you: `growlerdb mcp --username demo --password demo`.
+Or let the server do it for you: `growlerdb mcp --username demo --password demo-growlerdb`.
 
 ## Claude Desktop config
 

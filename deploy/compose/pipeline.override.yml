@@ -8,7 +8,7 @@
 services:
   # The streaming demo serves only `telemetry_stream`, so scope the baked-in demo user to it (the
   # base stack scopes `demo` to docs,catalog). Without this a `demo`-token search on telemetry_stream
-  # is rejected by per-index RBAC (403). Same well-known demo/demo credential; admin/admin still works.
+  # is rejected by per-index RBAC (403). Same well-known demo/demo-growlerdb credential; admin/admin-growlerdb still works.
   controlplane:
     environment:
       GROWLERDB_DEMO_INDEXES: telemetry_stream

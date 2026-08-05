@@ -8,7 +8,7 @@ set -euo pipefail
 
 GATEWAY="${GATEWAY:-http://localhost:8081}"
 MCP_USER="${MCP_USER:-demo}"
-MCP_PASS="${MCP_PASS:-demo}"
+MCP_PASS="${MCP_PASS:-demo-growlerdb}"
 
 echo "waiting for the gateway at $GATEWAY..."
 up=""
