@@ -11,7 +11,7 @@ growlerdb-core.workspace = true
 growlerdb-embed.workspace = true
 growlerdb-controlplane.workspace = true
 growlerdb-backup.workspace = true
-opendal = { version = "0.57", features = ["services-s3", "services-fs"] }
+opendal = { version = "0.58", features = ["services-s3", "services-fs"] }
 growlerdb-index.workspace = true
 growlerdb-source.workspace = true
 growlerdb-proto.workspace = true
