@@ -837,9 +837,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.4"
+version = "4.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d91e0c145792ef73a6ad36d27c75ac09f1832222a3c209689d90f534685ee5b7"
+checksum = "301b56658598e48f3648647ac6fc887be7e7108eddfa4e9b63fcf3ec58c0cadf"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -847,9 +847,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.6.2"
+version = "4.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f09628afdcc538b57f3c6341e9c8e9970f18e4a481690a64974d7023bd33548b"
+checksum = "94a65403d1a1bd28f7dc68eb8506e8874808ee5eecb59298de588e2e1407a078"
 dependencies = [
  "anstream",
  "anstyle",
@@ -2545,9 +2545,9 @@ dependencies = [
 
 [[package]]
 name = "iceberg"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4ed93c6be93e47ba2d8928b8cefe972932668940478f6be93eca6ade52c4e8a"
+checksum = "6e50fb53c7480f414911ab76b6e14c0042d54ad5c30f6ac2bf2f52a487a25716"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2602,9 +2602,9 @@ dependencies = [
 
 [[package]]
 name = "iceberg-catalog-rest"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e1b94fd46e309f0a728c32f9f7005a230937d4c8b039a85258074ec40c45614"
+checksum = "d1500a26a9b18f286a319e914ce7290dddb7e2eef810edf535afc4ce0c8a6f45"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2622,9 +2622,9 @@ dependencies = [
 
 [[package]]
 name = "iceberg-storage-opendal"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cbf3a44173031681bbb0775299bb487b0c3aa937cb55959325ea980757acb1e1"
+checksum = "983efbae430ed40c074af69a8b0aff99bee73e54686cf26ecde97f84127812a2"
 dependencies = [
  "anyhow",
  "async-trait",
