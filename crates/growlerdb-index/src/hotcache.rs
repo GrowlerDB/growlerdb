@@ -124,7 +124,6 @@ mod tests {
         }
         opendal::Operator::new(opendal::services::Fs::default().root(&store_root.to_string_lossy()))
             .unwrap()
-            .finish()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

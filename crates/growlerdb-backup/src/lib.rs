@@ -136,7 +136,7 @@ pub fn s3_store(cfg: &S3Config) -> Result<Operator> {
     if let Some(ep) = &cfg.endpoint {
         b = b.endpoint(ep);
     }
-    Ok(with_retry(Operator::new(b)?.finish()))
+    Ok(with_retry(Operator::new(b)?))
 }
 
 /// Hidden directory (under the fs store root) where [`fs_store`] stages writes before the atomic
@@ -160,7 +160,7 @@ pub fn fs_store(root: impl AsRef<Path>) -> Result<Operator> {
     let b = opendal::services::Fs::default()
         .root(&root.to_string_lossy())
         .atomic_write_dir(&atomic.to_string_lossy());
-    Ok(with_retry(Operator::new(b)?.finish()))
+    Ok(with_retry(Operator::new(b)?))
 }
 
 /// Back up `shard` (named `index`/`shard`) to `store` under `prefix`. `staging` is a scratch dir —
