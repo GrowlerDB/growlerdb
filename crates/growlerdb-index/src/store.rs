@@ -7913,8 +7913,7 @@ mod window_store_tests {
         let op = opendal::Operator::new(
             opendal::services::Fs::default().root(&store_root.path().to_string_lossy()),
         )
-        .unwrap()
-        .finish();
+        .unwrap();
         let cache = crate::range_cache::RangeCache::new(8 * 1024 * 1024);
         let aux_dir = window_dir.clone();
         let counts = tokio::task::spawn_blocking(move || {
