@@ -771,8 +771,7 @@ mod tests {
         let op = opendal::Operator::new(
             opendal::services::Fs::default().root(&store_root.path().to_string_lossy()),
         )
-        .unwrap()
-        .finish();
+        .unwrap();
         let handle = svc
             .window_handles()
             .into_iter()
