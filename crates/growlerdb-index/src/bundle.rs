@@ -224,8 +224,7 @@ mod tests {
         let op = opendal::Operator::new(
             opendal::services::Fs::default().root(&store_root.path().to_string_lossy()),
         )
-        .unwrap()
-        .finish();
+        .unwrap();
 
         // Bundle them into one object + a layout manifest.
         let layout = build(&op, "cold/w1", "cold/split.bundle", "cold/split.manifest")
@@ -306,8 +305,7 @@ mod tests {
         let op = opendal::Operator::new(
             opendal::services::Fs::default().root(&store_root.path().to_string_lossy()),
         )
-        .unwrap()
-        .finish();
+        .unwrap();
         build(&op, "cold/w1", "cold/split.bundle", "cold/split.manifest")
             .await
             .unwrap();
@@ -366,8 +364,7 @@ mod tests {
         let op = opendal::Operator::new(
             opendal::services::Fs::default().root(&store_root.path().to_string_lossy()),
         )
-        .unwrap()
-        .finish();
+        .unwrap();
 
         let layout = build_from_dir(
             &op,

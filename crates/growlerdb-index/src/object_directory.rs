@@ -421,8 +421,7 @@ mod tests {
         let op = opendal::Operator::new(
             opendal::services::Fs::default().root(&store_root.path().to_string_lossy()),
         )
-        .unwrap()
-        .finish();
+        .unwrap();
         // Open + search in synchronous context (spawn_blocking) — mirrors the Search service, and
         // the blocking operator's `block_on` requires a sync (not async) caller.
         let (beta, delta) = tokio::task::spawn_blocking(move || {
@@ -479,8 +478,7 @@ mod tests {
         let op = opendal::Operator::new(
             opendal::services::Fs::default().root(&store_root.path().to_string_lossy()),
         )
-        .unwrap()
-        .finish();
+        .unwrap();
         let cache = RangeCache::new(8 * 1024 * 1024);
 
         let stats = tokio::task::spawn_blocking(move || {
