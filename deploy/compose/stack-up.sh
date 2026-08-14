@@ -82,9 +82,12 @@ step 5 6 "Variant index 'events' (Iceberg v3 — Spark-seeded, connector-fed, Tr
 # so no host-side JDK/Maven build — `just stack-dev` builds it from your checkout instead), bring up
 # Trino, Spark-seed the table, serve `events`, then populate it via the connector. All variant commands
 # run with the full profile set active so node-events' cross-profile deps resolve.
-dc --profile variant pull -q connector-events || dc --profile variant build connector-events
-dc --profile trino up -d --quiet-pull trino
 VARIANT_PROFILES=(--profile stack --profile pool --profile trino --profile variant)
+# Pull/build with the full profile set active too: connector-events (variant) shares a compose
+# project with node-events (variant), whose depends_on reaches trino/model-fetch — so a bare
+# `--profile variant` leaves those undefined and compose rejects the project before pulling.
+dc "${VARIANT_PROFILES[@]}" pull -q connector-events || dc "${VARIANT_PROFILES[@]}" build connector-events
+dc --profile trino up -d --quiet-pull trino
 dc "${VARIANT_PROFILES[@]}" run --rm seed-events
 dc "${VARIANT_PROFILES[@]}" up -d --force-recreate node-events
 dc "${VARIANT_PROFILES[@]}" run --rm connector-events
