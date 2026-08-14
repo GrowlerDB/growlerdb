@@ -48,9 +48,9 @@ just stack-dev
 
 Use `just stack-dev` to build and deploy local source changes.
 
-Once the stack is running, open the console at **<http://localhost:8081>**, 
-sign in with **`demo` / `demo-growlerdb`**, and search from the UI. 
-The console opens on the `movies` vector index for trying out 
+Once the stack is running, open the console at **<http://localhost:8081>**,
+sign in with **`demo` / `demo-growlerdb`**, and search from the UI.
+The console opens on the `movies` vector index for trying out
 lexical, semantic, and hybrid searches.
 
 Or hit the API directly.
