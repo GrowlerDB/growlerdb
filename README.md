@@ -37,18 +37,21 @@ every-field-type `growlerdb.catalog`, and an Iceberg v3 `events` table with a `v
 demo stack builds and serves an index over each.
 
 ```sh
-# start everything (needs Docker + just)
-# pulls the released images (engine + connector)
-# first run is a few minutes (image pulls + the local index/embedding builds).
-# use `just stack-dev` to build the engine + connector from local source.
 just stack
 ```
 
 Requires Docker + just. Pulls the released GrowlerDB images (engine + connector).
-Use `just stack-dev` to build and deploy local source.
 
-Open the console at **<http://localhost:8081>**, sign in with **`demo` / `demo-growlerdb`**, and search from
-the UI. It opens on the `movies` vector index for trying out lexical, semantic, and hybrid searches.
+```sh
+just stack-dev
+```
+
+Use `just stack-dev` to build and deploy local source changes.
+
+Once the stack is running, open the console at **<http://localhost:8081>**,
+sign in with **`demo` / `demo-growlerdb`**, and search from the UI.
+The console opens on the `movies` vector index for trying out
+lexical, semantic, and hybrid searches.
 
 Or hit the API directly.
 
