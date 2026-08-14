@@ -8,7 +8,7 @@
 
 GrowlerDB keeps Apache Iceberg as the system of record and maintains a fast, derived
 index — full-text, vector, and hybrid — of your data. Search returns the matching primary keys
-(document coordinates), which resolve back to the authoritative rows in Iceberg. Iceberg v3 `variant` 
+(document coordinates), which resolve back to the authoritative rows in Iceberg. Iceberg v3 `variant`
 columns supported.
 
 ![The GrowlerDB console — full-text search over an Iceberg table, returning ranked coordinates](docs/img/console-search.png)
@@ -33,7 +33,7 @@ isn't) the right fit.
 
 Bring up the whole stack (GrowlerDB + MinIO + Polaris + LGTM), including four sample Iceberg
 tables — `growlerdb.movies` (a small Wikipedia movie-plots slice), `growlerdb.docs`, the
-every-field-type `growlerdb.catalog`, and an Iceberg v3 `events` table with a `variant` column. The 
+every-field-type `growlerdb.catalog`, and an Iceberg v3 `events` table with a `variant` column. The
 demo stack builds and serves an index over each.
 
 ```sh
@@ -44,9 +44,8 @@ demo stack builds and serves an index over each.
 just stack
 ```
 
-Requires Docker + just. Pulls the released GrowlerDB images (engine + connector). 
+Requires Docker + just. Pulls the released GrowlerDB images (engine + connector).
 Use `just stack-dev` to build and deploy local source.
-
 
 Open the console at **<http://localhost:8081>**, sign in with **`demo` / `demo-growlerdb`**, and search from
 the UI. It opens on the `movies` vector index for trying out lexical, semantic, and hybrid searches.
@@ -88,7 +87,7 @@ just stack-down
 - **Iceberg v3 `variant` columns** — index semi-structured `variant` data two ways: a schema-less
   flatten mode (every leaf becomes a searchable `path = value` term, plus an optional analyzed
   text catch-all) and declared, typed shapes selected per row by a discriminator path. Ships
-  end-to-end today via the Spark connector. 
+  end-to-end today via the Spark connector.
   See [variant fields](okf/product/functional/index-management/variant.md).
 - **Query language** — native structured AST + a Lucene/KQL string parser.
 - **Distributed** — control plane (registry), stateful searcher/index nodes, and a scatter-gather
