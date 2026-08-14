@@ -2,17 +2,14 @@
 
 ![GrowlerDB — full-text, vector, and hybrid search over your data](docs/img/social-preview.png)
 
-**Full-text, vector, and hybrid search over your data** — open-source retrieval over Apache Iceberg (with more sources on the roadmap).
-
 [![CI](https://github.com/GrowlerDB/growlerdb/actions/workflows/ci.yml/badge.svg)](https://github.com/GrowlerDB/growlerdb/actions/workflows/ci.yml)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/GrowlerDB/growlerdb?sort=semver)](https://github.com/GrowlerDB/growlerdb/releases)
 
 GrowlerDB keeps Apache Iceberg as the system of record and maintains a fast, derived
-index — **full-text, vector, and hybrid** — of your data. Search returns the matching **primary keys
-(document coordinates)**, which resolve back to the authoritative rows in Iceberg. That now reaches
-**Iceberg v3 `variant`** columns too — semi-structured data whose paths aren't in the table schema
-becomes searchable (see [Features](#features)).
+index — full-text, vector, and hybrid — of your data. Search returns the matching primary keys
+(document coordinates), which resolve back to the authoritative rows in Iceberg. Iceberg v3 `variant`
+columns supported.
 
 ![The GrowlerDB console — full-text search over an Iceberg table, returning ranked coordinates](docs/img/console-search.png)
 
@@ -20,13 +17,13 @@ becomes searchable (see [Features](#features)).
 
 - **No second copy of your data.** Your lakehouse stays the system of record; the index is a derived,
   rebuildable artifact — not a parallel datastore to provision, reconcile, and keep from drifting.
-- **The lake is the source of truth.** A search returns **coordinates**; hydration returns the live,
+- **The lake is the source of truth.** A text search returns the coordinates then the hydration fetches the live,
   catalog-governed Iceberg row — not a search-time `_source` copy that goes stale.
 - **No reindex-the-world migrations.** Point an index at a table and go; the changelog connector keeps
-  it current from the Iceberg changelog. No `_bulk` re-load to stand up or re-shard.
+  it current from the Iceberg changelog.
 
-And **vs. Trino / Spark full-text-on-Iceberg**: those scan the table (seconds at scale); GrowlerDB
-answers from a real inverted index in **single-digit milliseconds** and hydrates only the matching rows
+Trino / Spark full-text-on-Iceberg scan the table (seconds at scale); GrowlerDB
+answers from a real inverted index in single-digit milliseconds and hydrates only the matching rows
 — [directional numbers](https://docs.growlerdb.com/performance) put it ~2–3× faster than Elasticsearch
 on filtered search and ~50–170× faster than a Trino scan. See the full
 [**comparison & positioning**](https://docs.growlerdb.com/comparison) page for when GrowlerDB is (and
@@ -34,21 +31,24 @@ isn't) the right fit.
 
 ## Try it (one command)
 
-Bring up the **whole stack** (GrowlerDB + MinIO + Polaris + LGTM), which seeds four sample Iceberg
+Bring up the whole stack (GrowlerDB + MinIO + Polaris + LGTM), including four sample Iceberg
 tables — `growlerdb.movies` (a small Wikipedia movie-plots slice), `growlerdb.docs`, the
-every-field-type `growlerdb.catalog`, and an **Iceberg v3 `events`** table with a `variant` column —
-builds + serves an index over each, and opens the console:
+every-field-type `growlerdb.catalog`, and an Iceberg v3 `events` table with a `variant` column. The
+demo stack builds and serves an index over each.
 
 ```sh
-# start everything (needs Docker + just) — pulls the released images (engine + connector),
-# so no host build; first run is a few minutes (image pulls + the local index/embedding builds).
-# To run YOUR checkout instead, `just stack-dev` (builds the engine + connector from source).
+# start everything (needs Docker + just)
+# pulls the released images (engine + connector)
+# first run is a few minutes (image pulls + the local index/embedding builds).
+# use `just stack-dev` to build the engine + connector from local source.
 just stack
 ```
 
+Requires Docker + just. Pulls the released GrowlerDB images (engine + connector).
+Use `just stack-dev` to build and deploy local source.
+
 Open the console at **<http://localhost:8081>**, sign in with **`demo` / `demo-growlerdb`**, and search from
-the UI. It **opens on the `movies` index** (a `VECTOR` index), so lexical, **semantic**, and **hybrid**
-search are one click away.
+the UI. It opens on the `movies` vector index for trying out lexical, semantic, and hybrid searches.
 
 Or hit the API directly.
 
@@ -79,16 +79,16 @@ just stack-down
 
 ## Features
 
-- **Search over your data** — index a source table; search returns coordinates that **hydrate to
-  authoritative rows from your source** (`/v1/search` → `/v1/keys:get`).
+- **Search over your data** — index a source table; search returns coordinates that hydrate to
+  authoritative rows from your source (`/v1/search` → `/v1/keys:get`).
 - **Full-text, vector & hybrid retrieval** — lexical (Lucene/KQL), semantic (local-default
   embeddings), and hybrid (RRF) search, with an optional reranker and a read-only **MCP server** for
   AI agents.
 - **Iceberg v3 `variant` columns** — index semi-structured `variant` data two ways: a schema-less
-  **flatten** mode (every leaf becomes a searchable `path = value` term, plus an optional analyzed
-  text catch-all) and declared, typed **shapes** selected per row by a discriminator path. Ships
-  end-to-end today via the Spark connector (hydration for variant tables runs through Trino until the
-  native read path lands). See [variant fields](okf/product/functional/index-management/variant.md).
+  flatten mode (every leaf becomes a searchable `path = value` term, plus an optional analyzed
+  text catch-all) and declared, typed shapes selected per row by a discriminator path. Ships
+  end-to-end today via the Spark connector.
+  See [variant fields](okf/product/functional/index-management/variant.md).
 - **Query language** — native structured AST + a Lucene/KQL string parser.
 - **Distributed** — control plane (registry), stateful searcher/index nodes, and a scatter-gather
   Gateway; hash/partition sharding.
@@ -102,30 +102,26 @@ just stack-down
 
 ![GrowlerDB architecture — your data lands in Apache Iceberg (the system of record); the Spark Structured Streaming connector reads the Iceberg changelog and streams batches to a high-availability pool of interchangeable nodes that build Tantivy segments, each unit replicated (R=2); a client query hits the gateway, which scatter-gathers across the pool — failing reads over to a replica if a node is down — and hydrates the ranked keys back to authoritative Iceberg rows. The control plane and gateway run replicated too.](docs/img/architecture.png)
 
-GrowlerDB sits between your **Apache Iceberg** tables and your users. Iceberg stays the **system of
-record**; GrowlerDB maintains a fast, derived index and resolves matches back to the authoritative
-rows over two paths:
+**Ingest** — the **Connector** (Spark Structured Streaming) reads the Iceberg changelog and streams
+document batches over gRPC to the **pool**, whose nodes build local **Tantivy** segments with a
+**redb** locator (key → file + row position).
+**Query** — a client (Console, SDK, or the OpenSearch `_search` adapter) calls the **Gateway**,
+which scatter-gathers across the pool, merges the top-K into ranked **coordinates** (primary keys),
+and **hydrates** them back to authoritative rows from Iceberg.
 
-- **Ingest** — the **Connector** (Spark Structured Streaming) reads the Iceberg changelog and streams
-  document batches over gRPC to the **pool**, whose nodes build local **Tantivy** segments with a
-  **redb** locator (key → file + row position).
-- **Query** — a client (Console, SDK, or the OpenSearch `_search` adapter) calls the **Gateway**,
-  which scatter-gathers across the pool, merges the top-K into ranked **coordinates** (primary keys),
-  and **hydrates** them back to authoritative rows from Iceberg.
-
-**Highly available by default.** Serving runs on a **placement pool** of interchangeable nodes: the
-**Control Plane** distributes each index's units across the pool with a **replication factor** (one
-primary + read replicas), so a node loss is a **zero-gap read failover** — the gateway routes reads to
+Highly available by default. Serving runs on a placement pool of interchangeable nodes: the
+Control Plane distributes each index's units across the pool with a replication factor (one
+primary + read replicas), so a node loss is a zero-gap read failover — the gateway routes reads to
 a live replica and the pool self-heals. You point N identical nodes at the pool and the control plane
-does the placement; there is no per-node designation. The control plane itself runs as **N replicas**
-and the gateway is **stateless and replicated**, so no component is a single point of failure. Every
-service emits **OpenTelemetry** to the bundled **LGTM** stack (Grafana · Prometheus · Loki · Tempo).
+does the placement; there is no per-node designation. The control plane itself runs as N replicas
+and the gateway is stateless and replicated, so no component is a single point of failure. Every
+service emits OpenTelemetry to the bundled LGTM stack (Grafana · Prometheus · Loki · Tempo).
 
 Full walkthrough: **[system architecture](okf/system/architecture.md)** · [deployment topologies](https://docs.growlerdb.com/deployment)
 
 ## Documentation
 
-Full docs are the **GitHub Pages site at <https://docs.growlerdb.com/>** (built from
+Full docs are the GitHub Pages site at <https://docs.growlerdb.com/> (built from
 [`docs/`](docs/)):
 
 - [Getting started](https://docs.growlerdb.com/getting-started) — zero to first search.
@@ -170,17 +166,17 @@ just run -- --help      # run the growlerdb CLI
 
 ## Open source & commercial
 
-GrowlerDB is **open core**. The full engine — distributed search/hydration, AuthN/RBAC, the console,
-and everything in this repo — is **open source under AGPL-3.0**, free for internal and self-hosted
-production use up to the **open-source scale limit** (currently **3 nodes**). No sign-up, no
+GrowlerDB is open core. The full engine — distributed search/hydration, AuthN/RBAC, the console,
+and everything in this repo — is open source under AGPL-3.0, free for self-hosted
+production use up to the open-source scale limit (currently 3 nodes). No sign-up, no
 phone-home; entitlements are verified offline, and beyond the limit existing nodes keep running —
 only *new* capacity is gated.
 
 A **[commercial license](COMM-LICENSE.md)** from **GrowlerDB LLC** covers what the AGPL doesn't:
-operating **beyond the node limit**, **embedding / OEM** without copyleft, **AGPL-incompatible use**,
-and **enterprise add-ons** (SSO/SAML/SCIM, audit logging, cross-region DR, managed multi-tenancy),
-distributed separately from this AGPL core. Usage is shown in the console's **Settings → Enterprise
-license**.
+operating beyond the node limit, embedding / OEM without copyleft, AGPL-incompatible use,
+and enterprise add-ons (SSO/SAML/SCIM, audit logging, cross-region DR, managed multi-tenancy),
+distributed separately from this AGPL core. Usage is shown in the console's Settings → Enterprise
+license.
 
 **📬 Talk to us** — for commercial/OEM licensing, enterprise features, or operating at scale, email
 **[support@growlerdb.com](mailto:support@growlerdb.com)** with your use case. (Pricing isn't public
@@ -189,5 +185,5 @@ yet — reach out and we'll scope the right agreement with you.)
 ## License & contributing
 
 AGPL-3.0-only (see [LICENSE](LICENSE)); a [commercial license](COMM-LICENSE.md) is available as
-described above. Contributions are under a **license-grant [CLA](CLA.md)** — see
+described above. Contributions are under a license-grant [CLA](CLA.md) — see
 [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md).
