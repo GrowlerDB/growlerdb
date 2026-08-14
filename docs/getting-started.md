@@ -483,7 +483,7 @@ docker compose -f deploy/compose/docker-compose.yml exec trino trino --execute \
   "INSERT INTO iceberg.growlerdb.catalog VALUES ('cat-11','Trino Insert Roundtrip','insert a row through trino then reindex growlerdb to make it searchable end to end','tutorial','alice',BIGINT '1234',DOUBLE '4.5',BIGINT '1719792000000','10.0.5.11',false)"
 ```
 
-`1719792000000` is `2024-07-01` in epoch-milliseconds (the `published` field's `format: epoch_ms`).
+`1719792000000` is `2024-07-01` in epoch-milliseconds, matching the Iceberg source table's raw storage representation configured as `format: epoch_ms` (which GrowlerDB automatically scales to its native microsecond resolution during ingestion).
 The row is now in Iceberg, and a Trino `SELECT ... WHERE id = 'cat-11'` shows it immediately, but the
 `catalog` index doesn't know about it yet. A search for it still returns nothing until we reindex.
 
@@ -627,14 +627,14 @@ curl -s localhost:8081/v1/search -H "authorization: Bearer $TOKEN" -H 'content-t
 
 # Range + exact on typed SHAPE paths (LONG / KEYWORD / BOOL):
 curl -s localhost:8081/v1/search -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
-  -d '{"index":"events","query":"payload.number:[1000 TO 2000]","sort":[{"field":"payload.number","order":"desc"}]}' | jq '.hits[].coordinates'
+  -d '{"index":"events","query":"payload.number:[1000 TO 2000]","sort":[{"field":"payload.number","desc":true}]}' | jq '.hits[].coordinates'
 
 # Hydrate a hit — the whole variant comes back as JSON (fetched via Trino):
 curl -s localhost:8081/v1/search -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
   -d '{"index":"events","query":"payload.number:1347","hydrate":true}' | jq '.hits[0].row.payload'
 
 # Hybrid (lexical + vector) over the shaped VECTOR `payload.title_vec`:
-curl -s "localhost:8081/v1/search:hybrid" -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+curl -s localhost:8081/v1/search:hybrid -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
   -d '{"index":"events","vector_field":"payload.title_vec","query_text":"connect the SQL query engine","k":3}' | jq '.hits[].coordinates'
 ```
 
