@@ -22,7 +22,7 @@ columns supported.
 - **No reindex-the-world migrations.** Point an index at a table and go; the changelog connector keeps
   it current from the Iceberg changelog.
 
-**Trino / Spark full-text-on-Iceberg** scan the table (seconds at scale); GrowlerDB
+Trino / Spark full-text-on-Iceberg scan the table (seconds at scale); GrowlerDB
 answers from a real inverted index in single-digit milliseconds and hydrates only the matching rows
 — [directional numbers](https://docs.growlerdb.com/performance) put it ~2–3× faster than Elasticsearch
 on filtered search and ~50–170× faster than a Trino scan. See the full
