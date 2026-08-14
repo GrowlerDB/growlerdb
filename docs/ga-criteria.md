@@ -38,14 +38,14 @@ the gap honestly.
 | Health/readiness probes + graceful shutdown | ✅ Met | `growlerdb-telemetry`; probes gate Compose/Helm |
 | Observability (traces/metrics/logs, SLI dashboards) | ✅ Met | M4; LGTM + Grafana SLIs |
 | Resource/DoS guards (page-fetch ceiling, cost guards) | ✅ Met | Gateway limits; segment cost guards |
-| Backup/restore + node rebuild-from-Iceberg | ✅ Met | Shipped + live-verified; recovery is bounded by rebuild time, never data loss |
-| Replica sync (segment shipping) | ✅ Met | Segment-shipping shipped + live-verified (single-shard; windowed / multi-shard replica sets are post-GA) |
+| Backup/restore + node rebuild-from-Iceberg | ✅ Met | Shipped + verified on an internal test cluster (E2E/CI); recovery is bounded by rebuild time, never data loss |
+| Replica sync (segment shipping) | ✅ Met | Segment-shipping shipped + verified on an internal test cluster (single-shard; windowed / multi-shard replica sets are post-GA) |
 
 ## Performance
 
 | Criterion | Status | Evidence |
 |---|---|---|
-| Representative benchmark suite + published numbers | ⚠️ Partial | Directional numbers are published ([Performance](performance), GrowlerDB vs Elasticsearch 8.15 vs Trino on 1M rows). Also validated at scale on k3s: empty-start windowed topology with CP-driven placement, exact source↔index convergence (Trino distinct == index docs), ingest keep-up to ~19k rows/s, sub-linear windowed top-K, and bounded commit latency under large snapshots. The formal at-scale benchmark suite (staged step-ups, storage milestones, and an Iceberg/Trino comparison) is the one performance item before a 1.0 claim |
+| Representative benchmark suite + published numbers | ⚠️ Partial | Directional numbers are published ([Performance](performance), GrowlerDB vs Elasticsearch 8.15 vs Trino on 1M rows). Also exercised on an internal k3s test cluster (not production traffic): empty-start windowed topology with CP-driven placement, exact source↔index convergence (Trino distinct == index docs), ingest keep-up to ~19k rows/s, sub-linear windowed top-K, and bounded commit latency under large snapshots. The formal at-scale benchmark suite (staged step-ups, storage milestones, and an Iceberg/Trino comparison) is the one performance item before a 1.0 claim |
 
 ## Release & docs
 
@@ -57,7 +57,8 @@ the gap honestly.
 
 ## Summary
 
-The P1 GA surface is in place, tested, and validated at scale on real hardware: the core search
+The P1 GA surface is in place, tested, and validated on an internal test cluster (Hetzner k3s; not
+production traffic): the core search
 loop, distribution, security and multi-tenancy (including verified tenant isolation), observability,
 the console, the OpenSearch adapter, the release pipeline, and backup/restore plus single-shard
 replica sync. Three items remain before a confident 1.0. The formal at-scale benchmark suite is the

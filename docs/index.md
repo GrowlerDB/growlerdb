@@ -14,6 +14,11 @@ GrowlerDB keeps a fast, derived index locally and returns matching primary keys 
 [Get started](getting-started){: .btn .btn-primary .fs-5 .mb-4 .mb-md-0 .mr-2 }
 [View on GitHub](https://github.com/GrowlerDB/growlerdb){: .btn .fs-5 .mb-4 .mb-md-0 }
 
+GrowlerDB is pre-1.0 and under active development — the engine is feature-complete for its core
+surface but has not been run in production. See the [GA criteria](ga-criteria) and
+[roadmap](roadmap) for what's done and what's still ahead.
+{: .fs-3 .fw-300 }
+
 ---
 
 ## The model in one minute

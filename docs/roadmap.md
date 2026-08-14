@@ -22,9 +22,9 @@ internal [GA criteria](ga-criteria): what's shipped, what's known-limited, and w
   backup/restore, single-shard read replicas, and reconciliation that converges the index to the source.
 - Release: SemVer, signed multi-arch (amd64 + arm64) images with SBOM, and a published Helm chart.
 
-Validated at scale on real hardware (Hetzner k3s): empty-start windowed placement, exact
-source↔index convergence, ingest keep-up, sub-linear windowed top-K, and bounded commit latency
-under large source snapshots.
+Validated on an internal test cluster (Hetzner k3s; not production traffic): empty-start windowed
+placement, exact source↔index convergence, ingest keep-up, sub-linear windowed top-K, and bounded
+commit latency under large source snapshots.
 
 ## Open source vs Enterprise
 
