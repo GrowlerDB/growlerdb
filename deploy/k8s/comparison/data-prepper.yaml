@@ -1,14 +1,17 @@
 # Data Prepper: Iceberg CDC source -> OpenSearch sink. Reads the SAME growlerdb.http_logs Iceberg
 # table (Polaris REST + MinIO) as GrowlerDB/Trino and streams row-level changes into OpenSearch.
-# This fleet's resources count AGAINST OpenSearch's budget (fairness charter). Schema verified vs
-# Data Prepper 2.15 docs; the catalog map is passed verbatim to Iceberg CatalogUtil.loadCatalog(),
-# so those keys are standard Iceberg catalog/S3FileIO props. RISKS to confirm against the running
-# 2.15 container (it logs a plugin schema error on a bad key):
-#   - polling_interval placement (docs: source-level; RFC: per-table) — using source-level.
-#   - Polaris credential vending: with scope PRINCIPAL_ROLE:ALL Polaris may vend S3 creds and ignore
-#     the explicit s3.* keys; for self-hosted MinIO the explicit keys authenticate. Pick one path.
-#   - oauth2 token endpoint defaults to {uri}/v1/oauth/tokens (correct for Polaris); set explicitly if auth fails.
-#   - Iceberg source is CoW-ONLY — the http_logs table must be written Copy-on-Write.
+# This fleet's resources count AGAINST OpenSearch's budget (fairness charter).
+# VERIFIED end-to-end against Data Prepper 2.15.1 in a local smoke (Polaris + MinIO + OpenSearch on
+# the compose network): CDC initial-load converged exactly (500 source rows -> 500 OpenSearch docs,
+# _id = request_id). What the smoke settled:
+#   - The iceberg source is EXPERIMENTAL — must be enabled in data-prepper-config.yaml (below).
+#   - catalog is PER-TABLE, not top-level (top-level source.iceberg only accepts
+#     polling_interval/acknowledgments/tables); polling_interval IS source-level.
+#   - Explicit s3.* keys authenticate against MinIO (Polaris did not force credential vending here).
+# Benign warnings seen (safe to ignore): Iceberg OAuth2 "missing oauth2-server-uri, defaulting to
+# {uri}/v1/oauth/tokens" (correct for Polaris), and Polaris REPORT_READ_METRICS "Forbidden"
+# (scan-metrics reporting only; no effect on data flow).
+# Still true at real scale: the iceberg source is CoW-ONLY — the http_logs table must be CoW.
 apiVersion: v1
 kind: ConfigMap
 metadata: { name: data-prepper-pipeline, namespace: growlerdb }
@@ -18,22 +21,25 @@ data:
     iceberg-cdc-pipeline:
       source:
         iceberg:
-          catalog:
-            type: "rest"
-            uri: "http://polaris:8181/api/catalog"
-            warehouse: "growlerdb"
-            credential: "root:s3cr3t"
-            scope: "PRINCIPAL_ROLE:ALL"
-            io-impl: "org.apache.iceberg.aws.s3.S3FileIO"
-            client.region: "us-east-1"
-            s3.endpoint: "http://minio:9000"
-            s3.access-key-id: "minioadmin"
-            s3.secret-access-key: "minioadmin"
-            s3.path-style-access: "true"
+          # catalog is PER-TABLE (verified vs 2.15.1: top-level source.iceberg accepts only
+          # [polling_interval, acknowledgments, tables]). The catalog map is passed verbatim to
+          # Iceberg CatalogUtil.loadCatalog(), so these are standard Iceberg catalog/S3FileIO props.
           tables:
             - table_name: "growlerdb.http_logs"
               identifier_columns: ["request_id"]
               disable_export: false   # false = initial full load THEN CDC; true = CDC-only
+              catalog:
+                type: "rest"
+                uri: "http://polaris:8181/api/catalog"
+                warehouse: "growlerdb"
+                credential: "root:s3cr3t"
+                scope: "PRINCIPAL_ROLE:ALL"
+                io-impl: "org.apache.iceberg.aws.s3.S3FileIO"
+                client.region: "us-east-1"
+                s3.endpoint: "http://minio:9000"
+                s3.access-key-id: "minioadmin"
+                s3.secret-access-key: "minioadmin"
+                s3.path-style-access: "true"
           polling_interval: "PT30S"
           acknowledgments: true
       sink:
@@ -51,6 +57,10 @@ data:
     ssl: false
     metricRegistries:
       - Prometheus
+    # The Iceberg source is an EXPERIMENTAL plugin — without this it fails at startup with
+    # "Unable to create experimental plugin iceberg" (verified against 2.15.1).
+    experimental:
+      enable_all: true
 ---
 apiVersion: apps/v1
 kind: Deployment
