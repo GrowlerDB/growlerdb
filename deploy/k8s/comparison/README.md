@@ -64,6 +64,6 @@ in the plan; the plan's fairness charter #2 will be updated to say "sequential o
       schema; the flagged risks (polling_interval placement, Polaris cred vending, metrics path,
       CoW-only) are inline comments to confirm against the running container at deploy.
 - [x] Autocomplete parity — resolved above (`user_id` completion field + `/v1/suggest`).
-- [ ] Pin exact OpenSearch + Data Prepper image versions in the report (currently 2.19.1 / 2.15.0 —
-      verify the Data Prepper 2.15 tag exists and pairs with the OpenSearch image).
+- [x] Pin OpenSearch + Data Prepper images: OpenSearch **2.19.1** (smoke-verified) + Data Prepper
+      **2.15.1** (latest 2.15.x; both tags confirmed on Docker Hub). Restate the exact tags in the report.
 - [ ] `_bulk` fallback path (labeled) in case the CDC source underperforms.
