@@ -60,9 +60,11 @@ in the plan; the plan's fairness charter #2 will be updated to say "sequential o
 
 ## TODO (tracked)
 
-- [x] Data Prepper Iceberg-source pipeline — `data-prepper.yaml` written from the verified 2.15
-      schema; the flagged risks (polling_interval placement, Polaris cred vending, metrics path,
-      CoW-only) are inline comments to confirm against the running container at deploy.
+- [x] Data Prepper Iceberg-source pipeline — `data-prepper.yaml` **verified end-to-end** in a local
+      smoke (Polaris + MinIO + OpenSearch, real 500-row Iceberg table): CDC converged exactly
+      (500 -> 500, _id = request_id) and completion-field autocomplete populated via copy_to. Fixes
+      the smoke found: experimental plugin must be enabled; `catalog` is per-table. CoW-only remains
+      the standing constraint to honor at scale.
 - [x] Autocomplete parity — resolved above (`user_id` completion field + `/v1/suggest`).
 - [x] Pin OpenSearch + Data Prepper images: OpenSearch **2.19.1** (smoke-verified) + Data Prepper
       **2.15.1** (latest 2.15.x; both tags confirmed on Docker Hub). Restate the exact tags in the report.
