@@ -47,7 +47,7 @@ data:
           "region":           { "type": "keyword" },
           "response_time_ms": { "type": "long" },
           "response_size":    { "type": "long" },
-          "user_id_suggest":  { "type": "completion" }
+          "user_id_suggest":  { "type": "completion", "analyzer": "keyword", "search_analyzer": "keyword" }
         }
       }
     }

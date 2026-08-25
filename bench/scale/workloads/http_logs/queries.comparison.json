@@ -112,6 +112,6 @@
     "kind": "autocomplete",
     "note": "Endpoints differ by system (disclosed). GrowlerDB: native /v1/suggest term-dict scan. OpenSearch: dedicated completion FST field. Both do whole-value prefix typeahead on user_id.",
     "growlerdb_suggest": { "index": "http_logs", "field": "user_id", "text": "user_025", "limit": 10 },
-    "opensearch_suggest": { "suggest": { "s": { "prefix": "user_025", "completion": { "field": "user_id_suggest", "size": 10 } } } }
+    "opensearch_suggest": { "suggest": { "s": { "prefix": "user_025", "completion": { "field": "user_id_suggest", "size": 10, "skip_duplicates": true } } } }
   }
 ]
