@@ -84,10 +84,12 @@ python bench/scale/compare_run.py --plan --scale shakedown
 python bench/scale/compare_run.py --scale shakedown
 python bench/scale/compare_run.py --scale full
 
-# 2. (optional) export raw logs + push corpus/results to the Hetzner bucket
-python bench/scale/corpus_export.py --seeds 42,43,44,45,46,47 --rows-per-shard 20000000
-HETZNER_S3_ENDPOINT=... HETZNER_S3_KEY=... HETZNER_S3_SECRET=... HETZNER_S3_BUCKET=growlerdb-bench-artifacts \
-  RUN_ID=2026-...-50gb bash bench/scale/artifacts.sh push
+# 2. export raw logs + push corpus/results to the Hetzner bucket (bucket `growlerdb` @ nbg1, verified)
+#    endpoint/bucket default correctly; creds auto-read from ~/.ssh/hetzner-gdb-storage. Keep the
+#    NDJSON dir under the repo (a Docker-shared path) for the mc upload mount. Port-forward MinIO first.
+python bench/scale/corpus_export.py --seeds 42,43,44,45,46,47 --rows-per-shard 20000000 --out-dir bench/scale/ndjson
+kubectl -n growlerdb port-forward svc/minio 9000:9000 &   # for the Iceberg warehouse mirror
+NDJSON_DIR=bench/scale/ndjson RUN_ID=2026-...-50gb bash bench/scale/artifacts.sh push
 ```
 
 `--phase <name>` reruns a single phase (generate / growlerdb / transition / opensearch / finalize) for
