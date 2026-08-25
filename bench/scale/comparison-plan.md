@@ -131,8 +131,11 @@ documented in the published report.
   seeded/reproducible; added the methodology doc [`synthetic-corpus.md`](synthetic-corpus.md) and the
   `corpus_stats.py` validation report. Schema/queries unchanged from Phase 1 (the generated corpus
   keeps the 17-field `http_logs` shape everything was built against).
-- **Phase 2 — Run A @ ~50 GB `http_logs`:** provision → ingest all systems → convergence
-  → query-type latency matrix → QPS sweeps → storage → capture + RUNLOG row + `scale-results.md`.
+- **Phase 2 — Run A @ ~50 GB `http_logs`:** orchestrated by `compare_run.py` (sequential: generate
+  once → GrowlerDB phase → transition → OpenSearch phase → finalize). **10 GB shakedown first**
+  (`--scale shakedown`) to shake out cluster-specific selectors, then `--scale full`. Corpus + result
+  artifacts persist to a Hetzner Object Storage bucket (`corpus_export.py` + `artifacts.sh`). Output:
+  RUNLOG row + `scale-results.md`. See `deploy/k8s/comparison/README.md` for the runbook.
 - **Phase 4 — analysis & docs:** new `docs/benchmarks.md` next to Performance (nav_order ~10, bump
   the tail); update `comparison.md` (measured replaces directional), `ga-criteria.md`, `roadmap.md`,
   and OKF `scale-results.md`/`scale-test-plan.md`. Fairness charter summarized on the page. Label

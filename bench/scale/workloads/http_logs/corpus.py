@@ -41,7 +41,7 @@ WRITE_PROPERTIES = {
 BATCH = int(os.environ.get("BENCH_BATCH", "50000"))
 ROWS = int(os.environ.get("BENCH_ROWS", "1000000"))
 SEED = int(os.environ.get("BENCH_SEED", "42"))
-SPAN_DAYS = int(os.environ.get("SPAN_DAYS", "30"))
+SPAN_DAYS = int(os.environ.get("SPAN_DAYS", "7"))  # 7-day span: at ~50 GB → ~215 req/s avg, ~340 peak
 BASE_TS = 1699920000  # 2023-11-14T00:00:00Z — midnight-aligned so hour offsets map to the diurnal curve
 
 # --- value spaces (ordered hot -> cold where Zipf-weighted by rank) --------------------------------

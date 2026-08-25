@@ -68,6 +68,39 @@ the **native `/v1/suggest`** (also fronted by the gateway) — there is no `_sea
 route. Local smoke confirmed both: driver ran all query kinds 0-error against a built `http_logs`
 index, and `topk_hydrated` showed the expected hydration-path latency (the `_source`-vs-hydrate cost).
 
+## Running the comparison
+
+Orchestrated by [`bench/scale/compare_run.py`](../../../bench/scale/compare_run.py) (sequential:
+generate once → GrowlerDB phase → transition → OpenSearch phase → finalize). Shakedown first.
+
+```sh
+# 0. provision + bring up GrowlerDB stack (deps, observability, Trino, generator @ SPAN_DAYS=7, http_logs)
+cd deploy/iac && terraform apply            # 6x ccx43, non-windowed http_logs (terraform.tfvars)
+export KUBECONFIG=deploy/iac/kubeconfig.yaml
+SPAN_DAYS=7 WORKLOAD=http_logs IMAGE_TAG=<dev-sha> deploy/k8s/scale-up.sh
+
+# 1. dry-run the orchestration (touches nothing), then the 10 GB shakedown, then the 50 GB run
+python bench/scale/compare_run.py --plan --scale shakedown
+python bench/scale/compare_run.py --scale shakedown
+python bench/scale/compare_run.py --scale full
+
+# 2. (optional) export raw logs + push corpus/results to the Hetzner bucket
+python bench/scale/corpus_export.py --seeds 42,43,44,45,46,47 --rows-per-shard 20000000
+HETZNER_S3_ENDPOINT=... HETZNER_S3_KEY=... HETZNER_S3_SECRET=... HETZNER_S3_BUCKET=growlerdb-bench-artifacts \
+  RUN_ID=2026-...-50gb bash bench/scale/artifacts.sh push
+```
+
+`--phase <name>` reruns a single phase (generate / growlerdb / transition / opensearch / finalize) for
+resumability.
+
+**Shakedown must confirm these cluster-specific bits** (the orchestrator's kubectl selectors are best
+guesses from the Helm chart — verify names on the first run and correct `compare_run.py`):
+generator Deployment name (`growlerdb-generator`), node StatefulSet label
+(`app.kubernetes.io/component=node`), gateway/Prometheus Service names (`gdb-growlerdb-gateway`,
+`prometheus`), the maintenance CronJob name (`growlerdb-maintenance`), and an **OpenSearch mode for
+`convergence_check.py`** (currently GrowlerDB/Trino only — add an `--engine opensearch` count check).
+Also confirm the Data Prepper metrics path (`/metrics/prometheus`) once the pod is up.
+
 ## TODO (tracked)
 
 - [x] **Corpus (Phase 1.5) — DONE.** Generated `http_logs` at ~50 GB (no permissive real dataset fit
@@ -83,4 +116,10 @@ index, and `topk_hydrated` showed the expected hydration-path latency (the `_sou
 - [x] Autocomplete parity — resolved above (`user_id` completion field + `/v1/suggest`).
 - [x] Pin OpenSearch + Data Prepper images: OpenSearch **2.19.1** (smoke-verified) + Data Prepper
       **2.15.1** (latest 2.15.x; both tags confirmed on Docker Hub). Restate the exact tags in the report.
+- [x] Run orchestration — `compare_run.py` (sequential flow, `--scale` shakedown/full, `--plan`),
+      `up.sh`/`down.sh` deploy wiring, `corpus_export.py` (raw-log NDJSON) + `artifacts.sh` (bucket
+      push/restore, env-driven). tfvars set to 6× ccx43 / http_logs.
+- [ ] Shakedown-verify the cluster-specific selectors (see "Running the comparison" above) and add an
+      `--engine opensearch` mode to `convergence_check.py`.
 - [ ] `_bulk` fallback path (labeled) in case the CDC source underperforms.
+- [ ] Hetzner artifact bucket + S3 credentials (Kira to create when it's time).

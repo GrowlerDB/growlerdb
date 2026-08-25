@@ -46,8 +46,8 @@ a search workload — so the generator models skew explicitly and this report ch
 - **host / referer / region / protocol / query** — weighted categoricals (e.g. `-` is the common
   referer; `us-east-1` the common region; HTTP/2 the common protocol).
 - **timestamp** — diurnal (hour-of-day) intensity curve (night trough, mid-day/evening peaks) and a
-  weekly curve (weekday vs. weekend dip), sampled over `SPAN_DAYS` (default 30). `BASE_TS` is
-  midnight-aligned so the hour offset maps to the diurnal curve.
+  weekly curve (weekday vs. weekend dip), sampled over `SPAN_DAYS` (default 7 — one full week).
+  `BASE_TS` is midnight-aligned so the hour offset maps to the diurnal curve.
 
 The exponents/weights (Zipf `s`, lognormal `mu`/`sigma`, status/method tables, diurnal/weekly curves)
 are the tunable parameters, defined at the top of `corpus.py`. They are consistent with published
@@ -60,7 +60,8 @@ target distribution differs.
   output (IDs included; no `uuid4`). Verified in `corpus_stats.py`.
 - **Parameters (env):** `BENCH_ROWS` (rows at fraction 1.0), `BENCH_SEED`, `SPAN_DAYS`,
   `BENCH_BATCH` (Iceberg write batch).
-- **Scale to a target size.** ~350–450 B/row uncompressed → **~50 GB ≈ 120–140M rows**. The k8s
+- **Scale to a target size.** ~350–450 B/row uncompressed → **~50 GB ≈ 120–140M rows**. Over the
+  default 7-day span that models **~215 req/s average** (~340 at peak hours, ~35 overnight). The k8s
   generator runs multiple pods, each with a distinct `BENCH_SEED` (disjoint data), streaming to the
   same Iceberg table — so throughput scales horizontally; single-process Python speed is not the cap.
 
@@ -79,8 +80,8 @@ what matters, not the exact percentages):
 | response_size | p50 12 KB, p99 123 KB, max 1.4 MB; 2.9% zero (304s) | lognormal long tail |
 | response_time | p50 40 ms, p99 428 ms | lognormal |
 | latency correlation | 5xx 208 ms vs non-5xx 65 ms | 5xx slower |
-| diurnal | peak hour 18 (6.6%) vs trough hour 3 (0.7%) | ~10× day/night swing |
-| weekly | Sat/Sun lowest | weekend dip |
+| diurnal | midday/evening peak (~6.6%/hr) vs ~03:00 trough (~0.7%/hr) | ~10× day/night swing |
+| weekly | weekdays ~16% each, Sat 9.8% / Sun 9.1% | weekend dip |
 | kind → status | static 15% 304; api 4% 400 | cache/error by path kind |
 
 ## Not modeled
