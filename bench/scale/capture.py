@@ -348,11 +348,14 @@ def run(args):
             )
         else:
             captured["logs"] = {"skipped": "set LOKI_URL to dump pod logs"}
-        if args.results and os.path.exists(args.results):
-            dest = os.path.join(out_dir, "results.json")
-            with open(args.results) as src, open(dest, "w") as dst:
-                dst.write(src.read())
-            captured["results_json"] = True
+        # Fold in the harness result JSONs (GrowlerDB-only + the comparison + freshness drivers).
+        for arg_val, fname, key in ((args.results, "results.json", "results_json"),
+                                    (args.comparison, "comparison-report.json", "comparison_json"),
+                                    (args.freshness, "freshness-report.json", "freshness_json")):
+            if arg_val and os.path.exists(arg_val):
+                with open(arg_val) as src, open(os.path.join(out_dir, fname), "w") as dst:
+                    dst.write(src.read())
+                captured[key] = True
         if args.screenshots:
             captured["screenshots"] = capture_screenshots(
                 args.grafana, out_dir, args.max_screenshots,
@@ -402,7 +405,7 @@ def selftest():
         args = argparse.Namespace(
             purpose="cold-tier validation | on-cluster", prom="http://x", loki="", grafana="",
             step="15s", window_min=63, started_epoch=None, param=[("shards", "6"), ("nodes", "6")],
-            results=None, screenshots=False, max_screenshots=12, max_run_mb=200,
+            results=None, comparison=None, freshness=None, screenshots=False, max_screenshots=12, max_run_mb=200,
             log_limit=5000, cost="$4.20", dry_run=True, out_root=os.path.join(tmp, "runs"),
             ledger=ledger, allow_over_budget=False,
         )
@@ -448,6 +451,10 @@ def main(argv=None):
                     metavar="K=V", help="extra audit parameter (repeatable)")
     ap.add_argument("--results", default=os.environ.get("RESULTS", ""),
                     help="harness results.json to fold into the run dir")
+    ap.add_argument("--comparison", default=os.environ.get("COMPARISON", ""),
+                    help="compare_query.py comparison-report.json to fold into the run dir")
+    ap.add_argument("--freshness", default=os.environ.get("FRESHNESS", ""),
+                    help="compare_freshness.py freshness-report.json to fold into the run dir")
     ap.add_argument("--cost", default=os.environ.get("RUN_COST", ""), help="recorded run cost")
     ap.add_argument("--screenshots", action="store_true",
                     help="also render bounded Grafana dashboard images (opt-in; out of git)")
