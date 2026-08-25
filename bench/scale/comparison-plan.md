@@ -24,7 +24,7 @@ deferred to a later round (they need embeddings at scale and a kNN harness on bo
 | System | Role | Ingest path | Notes |
 |---|---|---|---|
 | GrowlerDB | subject | streaming changelog connector | non-windowed `http_logs` for parity |
-| OpenSearch + Data Prepper 2.15 | primary competitor | Iceberg CDC source (snapshot-poll, **CoW-only**, experimental) | `_bulk` fallback if CDC underperforms, **labeled as such** |
+| OpenSearch + Data Prepper 2.15 | primary comparison | Iceberg CDC source (snapshot-poll, **CoW-only**, experimental) | `_bulk` fallback if CDC underperforms, **labeled as such** |
 | Trino 483 | Iceberg-scan baseline | reads the same table | already wired in `compare_trino.py`; re-baseline from 470 |
 
 Elasticsearch and Quickwit were considered and **cut this round** on cost/scope.
@@ -51,9 +51,13 @@ Elasticsearch and Quickwit were considered and **cut this round** on cost/scope.
 **prefix/autocomplete**, and top-K returning documents in three modes: coordinates-only, cached
 fields, and full retrieval (GrowlerDB hydrate-from-Iceberg vs OpenSearch `_source`).
 
-**Autocomplete parity:** fix ONE OpenSearch approach (e.g. `search_as_you_type` / edge-ngram or a
-`match_bool_prefix` field) against GrowlerDB `/v1/suggest` (`suggest_prefix`/`suggest_fuzzy`), and
-disclose it — field-type choice materially changes results, so it must be pinned, not tuned per run.
+**Autocomplete parity (resolved):** whole-value prefix typeahead on `user_id`, each system on its
+intended path — GrowlerDB's native `POST /v1/suggest` (a bounded live term-dictionary scan; the
+OpenSearch compat adapter has no suggest route) vs an OpenSearch dedicated `completion` FST field.
+This is a real architectural asymmetry (GrowlerDB reuses the index; OpenSearch builds an extra
+structure), disclosed and reported with the completion field's added storage — like `_source`
+-vs-hydrate. The harness hits two different endpoints per system, also disclosed. See
+`deploy/k8s/comparison/README.md` and the `autocomplete_user_id` query.
 
 ## Metrics
 
@@ -73,9 +77,11 @@ documented in the published report.
 
 1. **Same source.** Identical CoW Iceberg table, catalog, snapshot history, and commit cadence for
    all systems.
-2. **Equal total budget.** Same aggregate CPU/RAM/disk given to each system; each partitions it as
-   it likes; report per-unit-work, not per-node. Data Prepper capacity counts **against** OpenSearch's
-   budget, not free on the side.
+2. **Equal total budget, run sequentially.** Each system is benchmarked on the **identical full
+   cluster**, one at a time (bring up → ingest → query + QPS matrix → capture → tear down → next),
+   not concurrently on shared nodes (which lets one starve the other). This is the cleanest reading of
+   "equal budget" at the cost of ingesting 100 GB twice. Data Prepper capacity counts **against**
+   OpenSearch's budget, not free on the side. See `deploy/k8s/comparison/README.md`.
 3. **Config parity.** Same analyzers/tokenizers per field, same shard/replica counts, matching field
    types. `refresh_interval` is **fixed and disclosed** (raising it lifts bulk throughput but worsens
    freshness — a disclosed trade, not a per-run tuning knob).
@@ -113,15 +119,15 @@ documented in the published report.
 - **Phase 0 — pre-flight:** DONE (quota probe, sizing, cost, dataset/hardware decisions).
 - **Phase 1 — harness build-out (local/CI, lexical only):** neutral open-loop query driver across
   GrowlerDB + OpenSearch + Trino; OpenSearch + Data Prepper k8s manifests under an equal-budget
-  profile (`deploy/k8s/competitors/`); sentinel-row freshness harness; expanded lexical `queries.json`
-  incl. the autocomplete shape; concurrency-sweep runner; competitor metrics folded into
+  profile (`deploy/k8s/comparison/`); sentinel-row freshness harness; expanded lexical `queries.json`
+  incl. the autocomplete shape; concurrency-sweep runner; comparison-system metrics folded into
   `capture.py`. Smoke on Compose at small scale before any cloud run.
 - **Phase 2 — Run A @ 100 GB:** provision → ingest all systems → convergence → query-type latency
   matrix → QPS sweeps → storage → capture + RUNLOG row + `scale-results.md` update.
 - **Phase 4 — analysis & docs:** new `docs/benchmarks.md` next to Performance (nav_order ~10, bump
   the tail); update `comparison.md` (measured replaces directional), `ga-criteria.md`, `roadmap.md`,
   and OKF `scale-results.md`/`scale-test-plan.md`. Fairness charter summarized on the page. Honest
-  labeling throughout (measured vs modeled, experimental competitor versions, every caveat).
+  labeling throughout (measured vs modeled, experimental comparison-system versions, every caveat).
 
 ## Cost & timeline
 

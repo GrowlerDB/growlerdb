@@ -1,0 +1,117 @@
+[
+  {
+    "name": "match_all_count",
+    "weight": 1,
+    "kind": "count",
+    "body": { "query": { "match_all": {} }, "size": 0 }
+  },
+  {
+    "name": "term_status",
+    "weight": 3,
+    "kind": "term",
+    "body": { "query": { "term": { "status": "200" } }, "size": 0 }
+  },
+  {
+    "name": "term_method",
+    "weight": 2,
+    "kind": "term",
+    "body": { "query": { "term": { "method": "GET" } }, "size": 0 }
+  },
+  {
+    "name": "term_user_id",
+    "weight": 2,
+    "kind": "term",
+    "body": { "query": { "term": { "user_id": "user_02500" } }, "size": 0 }
+  },
+  {
+    "name": "cidr_client_ip",
+    "weight": 2,
+    "kind": "ip_cidr",
+    "body": { "query": { "term": { "client_ip": "211.0.0.0/8" } }, "size": 0 }
+  },
+  {
+    "name": "range_response_time",
+    "weight": 3,
+    "kind": "range",
+    "body": { "query": { "range": { "response_time_ms": { "gte": 500 } } }, "size": 0 }
+  },
+  {
+    "name": "range_response_size",
+    "weight": 2,
+    "kind": "range",
+    "body": { "query": { "range": { "response_size": { "gte": 1000000 } } }, "size": 0 }
+  },
+  {
+    "name": "match_user_agent",
+    "weight": 3,
+    "kind": "match",
+    "body": { "query": { "match": { "user_agent": "Mobile" } }, "size": 0 }
+  },
+  {
+    "name": "phrase_path",
+    "weight": 2,
+    "kind": "phrase",
+    "body": { "query": { "match_phrase": { "path": "api v1 checkout" } }, "size": 0 }
+  },
+  {
+    "name": "bool_must_filter",
+    "weight": 2,
+    "kind": "boolean",
+    "body": {
+      "query": {
+        "bool": {
+          "must": [{ "match": { "user_agent": "Chrome" } }],
+          "filter": [{ "term": { "status": "200" } }, { "range": { "response_time_ms": { "gte": 100 } } }]
+        }
+      },
+      "size": 0
+    }
+  },
+  {
+    "name": "bool_should",
+    "weight": 1,
+    "kind": "boolean",
+    "body": {
+      "query": {
+        "bool": {
+          "should": [{ "match": { "user_agent": "Safari" } }, { "match": { "user_agent": "Firefox" } }],
+          "minimum_should_match": 1
+        }
+      },
+      "size": 0
+    }
+  },
+  {
+    "name": "topk_hydrated",
+    "weight": 3,
+    "kind": "retrieval",
+    "body": {
+      "query": {
+        "bool": {
+          "must": [{ "match": { "user_agent": "Chrome" } }],
+          "filter": [{ "term": { "status": "200" } }]
+        }
+      },
+      "size": 20,
+      "sort": [{ "response_time_ms": "desc" }]
+    }
+  },
+  {
+    "name": "topk_recent",
+    "weight": 2,
+    "kind": "retrieval",
+    "body": {
+      "query": { "term": { "status": "500" } },
+      "size": 20,
+      "sort": [{ "ts": "desc" }]
+    }
+  },
+  {
+    "name": "autocomplete_user_id",
+    "weight": 2,
+    "kind": "autocomplete",
+    "note": "Endpoints differ by system (disclosed). GrowlerDB: native /v1/suggest term-dict scan. OpenSearch: dedicated completion FST field. Both do whole-value prefix typeahead on user_id.",
+    "growlerdb_suggest": { "index": "http_logs", "field": "user_id", "text": "user_025", "limit": 10 },
+    "opensearch_suggest": { "suggest": { "s": { "prefix": "user_025", "completion": { "field": "user_id_suggest", "size": 10 } } } }
+  }
+]

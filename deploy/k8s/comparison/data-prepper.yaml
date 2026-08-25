@@ -1,0 +1,86 @@
+# Data Prepper: Iceberg CDC source -> OpenSearch sink. Reads the SAME growlerdb.http_logs Iceberg
+# table (Polaris REST + MinIO) as GrowlerDB/Trino and streams row-level changes into OpenSearch.
+# This fleet's resources count AGAINST OpenSearch's budget (fairness charter). Schema verified vs
+# Data Prepper 2.15 docs; the catalog map is passed verbatim to Iceberg CatalogUtil.loadCatalog(),
+# so those keys are standard Iceberg catalog/S3FileIO props. RISKS to confirm against the running
+# 2.15 container (it logs a plugin schema error on a bad key):
+#   - polling_interval placement (docs: source-level; RFC: per-table) — using source-level.
+#   - Polaris credential vending: with scope PRINCIPAL_ROLE:ALL Polaris may vend S3 creds and ignore
+#     the explicit s3.* keys; for self-hosted MinIO the explicit keys authenticate. Pick one path.
+#   - oauth2 token endpoint defaults to {uri}/v1/oauth/tokens (correct for Polaris); set explicitly if auth fails.
+#   - Iceberg source is CoW-ONLY — the http_logs table must be written Copy-on-Write.
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: data-prepper-pipeline, namespace: growlerdb }
+data:
+  pipelines.yaml: |
+    version: "2"
+    iceberg-cdc-pipeline:
+      source:
+        iceberg:
+          catalog:
+            type: "rest"
+            uri: "http://polaris:8181/api/catalog"
+            warehouse: "growlerdb"
+            credential: "root:s3cr3t"
+            scope: "PRINCIPAL_ROLE:ALL"
+            io-impl: "org.apache.iceberg.aws.s3.S3FileIO"
+            client.region: "us-east-1"
+            s3.endpoint: "http://minio:9000"
+            s3.access-key-id: "minioadmin"
+            s3.secret-access-key: "minioadmin"
+            s3.path-style-access: "true"
+          tables:
+            - table_name: "growlerdb.http_logs"
+              identifier_columns: ["request_id"]
+              disable_export: false   # false = initial full load THEN CDC; true = CDC-only
+          polling_interval: "PT30S"
+          acknowledgments: true
+      sink:
+        - opensearch:
+            hosts: ["http://opensearch:9200"]   # security plugin disabled on the OS side
+            index: "http_logs"
+            action: '${getMetadata("bulk_action")}'      # index | delete, set by the source
+            document_id: '${getMetadata("document_id")}' # request_id value
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: data-prepper-config, namespace: growlerdb }
+data:
+  data-prepper-config.yaml: |
+    ssl: false
+    metricRegistries:
+      - Prometheus
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: data-prepper, namespace: growlerdb, labels: { app: data-prepper } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: data-prepper } }
+  template:
+    metadata: { labels: { app: data-prepper } }
+    spec:
+      containers:
+        - name: data-prepper
+          image: opensearchproject/data-prepper:2.15.0
+          env:
+            - { name: JAVA_OPTS, value: "-Xms6g -Xmx6g" }
+          ports:
+            - { name: api, containerPort: 4900 } # core API + Prometheus metrics (/metrics/sys, /metrics/prometheus)
+          resources:
+            requests: { cpu: "4", memory: 8Gi }
+            limits: { cpu: "8", memory: 16Gi }
+          volumeMounts:
+            - { name: pipeline, mountPath: /usr/share/data-prepper/pipelines/pipelines.yaml, subPath: pipelines.yaml }
+            - { name: config, mountPath: /usr/share/data-prepper/config/data-prepper-config.yaml, subPath: data-prepper-config.yaml }
+      volumes:
+        - { name: pipeline, configMap: { name: data-prepper-pipeline } }
+        - { name: config, configMap: { name: data-prepper-config } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: data-prepper, namespace: growlerdb, labels: { app: data-prepper } }
+spec:
+  selector: { app: data-prepper }
+  ports: [{ name: api, port: 4900, targetPort: 4900 }]
