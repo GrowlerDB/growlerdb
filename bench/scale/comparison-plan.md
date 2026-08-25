@@ -31,18 +31,15 @@ Elasticsearch and Quickwit were considered and **cut this round** on cost/scope.
 
 ## Dataset
 
-- **Corpus:** the **real OpenSearch Benchmark `http_logs`** dataset — actual HTTP web-access logs
-  (~247M events, ~31 GB uncompressed), downloaded and loaded into Iceberg. Chosen over the synthetic
-  generator so the numbers reflect real data. **This changes the schema:** real OSB `http_logs` is a
-  simpler ~5-field record (timestamp, client IP, request line, status, size) rather than the
-  synthetic 17-field row — so `index.yaml`, the OpenSearch mapping, and `queries.comparison.json` are
-  rebuilt for the real schema (see the schema/loader work tracked in `deploy/k8s/comparison/README.md`).
-  Index:source ratios still report against the raw-uncompressed size (OKF convention).
+- **Corpus:** a **generated `http_logs`** corpus at **~50 GB uncompressed** (~120–140M rows). No
+  permissively-licensed real dataset fit all of log-shaped + commercial-use + 30–100 GB, so the corpus
+  is synthetic — but modeled on real web traffic (Zipf path/IP/user popularity, ~87% 200, lognormal
+  sizes/latency, diurnal/weekly timestamps, path-conditioned status/method/size). The generation
+  methodology + a distribution-validation report are documented and open in
+  [`synthetic-corpus.md`](synthetic-corpus.md); the generator is `workloads/http_logs/corpus.py`.
+  Seeded → reproducible; parallel generator pods (distinct `BENCH_SEED`) shard to 50 GB.
 - **Table:** **Copy-on-Write** Iceberg (mandatory — OpenSearch Data Prepper CDC rejects
-  Merge-on-Read at startup), **non-windowed**. Real OSB docs have **no natural primary key**, so the
-  loader adds a **synthesized surrogate key** (stable row ordinal / hash) as the Iceberg identifier —
-  used as GrowlerDB's composite key and Data Prepper's `identifier_columns`; the table is
-  hash-routed by that surrogate key.
+  Merge-on-Read at startup), **non-windowed**, hash-routed by `request_id` (the generated primary key).
 - **Why non-windowed for the head-to-head:** apples-to-apples (a single evolving logs index is what
   OpenSearch would run; no GrowlerDB-only windowing/cold-tier that OpenSearch can't match);
   conservative for GrowlerDB (no partition-pruning tailwind); and the maintenance CronJob is
@@ -117,10 +114,9 @@ documented in the published report.
 - Probe (2026-08-24): 1× ccx43 provisioned + destroyed cleanly, no quota error → dedicated quota is
   ≥16 cores. The full 96-core headroom is confirmed at `terraform apply` (fails fast, no real spend).
 - Index data (GrowlerDB Tantivy segments, OpenSearch shards) on **local NVMe**; MinIO/Iceberg on a
-  cheap Hetzner volume. Est. footprint at ~31 GB raw (real OSB `http_logs`): Iceberg parquet ~5–15 GB,
-  GrowlerDB index ~11–15 GB, **OpenSearch index (with `_source`) ~31–50 GB**, staging/backups ~15 GB —
-  trivially fits the ~2,160 GB total local NVMe. (6× ccx43 is now sized for CPU/throughput parity, not
-  storage; the cluster could shrink, but keeping it holds the head-to-head hardware identical.)
+  cheap Hetzner volume. Est. footprint at ~50 GB raw: Iceberg parquet ~10–25 GB, GrowlerDB index
+  ~18–24 GB, **OpenSearch index (with `_source`) ~50–75 GB**, staging/backups ~25 GB — fits the
+  ~2,160 GB total local NVMe with headroom.
 
 ## Phases
 
@@ -129,26 +125,24 @@ documented in the published report.
   open-loop driver (`compare_query.py`), OpenSearch + Data Prepper manifests (`deploy/k8s/comparison/`),
   sentinel-row freshness harness (`compare_freshness.py`), `queries.comparison.json`, concurrency
   sweep, `capture.py` fold-in. Both engines' query paths + the Data Prepper CDC pipeline were
-  smoke-verified locally (Polaris + MinIO + OpenSearch, real Iceberg table). **Real-data reschema
-  (below) revises `corpus.py`/`index.yaml`/mapping/queries for the OSB schema — a Phase-1.5 slice.**
-- **Phase 1.5 — real-data reschema:** rebuild the http_logs loader to download + parse the real OSB
-  `http_logs` corpus into a CoW Iceberg table with a synthesized surrogate key; rewrite `index.yaml`,
-  the OpenSearch mapping, and `queries.comparison.json` for the ~5-field schema; re-smoke both engines
-  on a small slice.
-- **Phase 2 — Run A @ real OSB `http_logs` (~31 GB):** provision → ingest all systems → convergence
+  smoke-verified locally (Polaris + MinIO + OpenSearch, real Iceberg table).
+- **Phase 1.5 — generator realism:** DONE. Enhanced `corpus.py` with realistic distributions (Zipf
+  path/IP/user, ~87% 200, lognormal sizes/latency, diurnal/weekly time, path-conditioned fields),
+  seeded/reproducible; added the methodology doc [`synthetic-corpus.md`](synthetic-corpus.md) and the
+  `corpus_stats.py` validation report. Schema/queries unchanged from Phase 1 (the generated corpus
+  keeps the 17-field `http_logs` shape everything was built against).
+- **Phase 2 — Run A @ ~50 GB `http_logs`:** provision → ingest all systems → convergence
   → query-type latency matrix → QPS sweeps → storage → capture + RUNLOG row + `scale-results.md`.
 - **Phase 4 — analysis & docs:** new `docs/benchmarks.md` next to Performance (nav_order ~10, bump
   the tail); update `comparison.md` (measured replaces directional), `ga-criteria.md`, `roadmap.md`,
-  and OKF `scale-results.md`/`scale-test-plan.md`. Fairness charter summarized on the page. Honest
-  labeling throughout (measured vs modeled, experimental comparison-system versions, every caveat).
+  and OKF `scale-results.md`/`scale-test-plan.md`. Fairness charter summarized on the page. Label
+  measured vs modeled and pin the comparison-system versions.
 
 ## Cost & timeline
 
-- At ~31 GB (real OSB `http_logs`, not 100 GB synthetic) the run is much shorter: ingest ~247M rows
-  ≈ ~1.5 h/engine, so a full run (provision → load → both engines → sweeps → capture → teardown) is
-  ~8–14 h ≈ **~$40–70** at $75/day. Add a cheap 10 GB shakedown + iteration buffer → **program
-  ≈ $80–140 cloud** (down from the 100 GB estimate). First-run friction still applies — budget for a
-  restart or two.
+- At ~50 GB (~120–140M rows), a full run (provision → generate/load → both engines → sweeps →
+  capture → teardown) is ~12–18 h ≈ **~$60–100** at $75/day. Add a cheap 10 GB shakedown + iteration
+  buffer → **program ≈ $100–160 cloud**. First-run friction still applies — budget for a restart or two.
 - Engineering: harness ~4–7 working days, then the run, then docs. **~1–2 weeks to published
   numbers** — so an imminent HN post should keep the "directional" framing and land these as a
   follow-up rather than rush.

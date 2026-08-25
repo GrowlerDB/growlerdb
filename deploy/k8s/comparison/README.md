@@ -70,12 +70,10 @@ index, and `topk_hydrated` showed the expected hydration-path latency (the `_sou
 
 ## TODO (tracked)
 
-- [ ] **Real-data reschema (Phase 1.5).** Switch off the synthetic generator to the **real OSB
-      `http_logs`** corpus (~247M docs / ~31 GB): loader downloads + parses it into a CoW Iceberg
-      table with a **synthesized surrogate key** (no natural PK); rewrite `index.yaml`, the OpenSearch
-      mapping (this file), and `queries.comparison.json` for the ~5-field schema (timestamp, client
-      IP, request line, status, size); re-smoke both engines on a small slice. Autocomplete field
-      moves off `user_id` (not in the real schema).
+- [x] **Corpus (Phase 1.5) — DONE.** Generated `http_logs` at ~50 GB (no permissive real dataset fit
+      log-shaped + commercial + scale). `corpus.py` enhanced with realistic distributions; methodology
+      + validation report in `bench/scale/synthetic-corpus.md`. Schema/mapping/queries unchanged (the
+      generated corpus keeps the 17-field shape), so autocomplete stays on `user_id`.
 
 - [x] Data Prepper Iceberg-source pipeline — `data-prepper.yaml` **verified end-to-end** in a local
       smoke (Polaris + MinIO + OpenSearch, real 500-row Iceberg table): CDC converged exactly
