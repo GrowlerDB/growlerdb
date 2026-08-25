@@ -58,6 +58,16 @@ in the plan; the plan's fairness charter #2 will be updated to say "sequential o
 | `response_time_ms`,`response_size` LONG fast | `long` |
 | `request_id` (key-only, not searchable) | document `_id` via Data Prepper `identifier_columns` |
 
+## GrowlerDB query path (smoke-verified)
+
+The neutral driver queries GrowlerDB through its OpenSearch `_search` adapter, which is **off by
+default** and lives on the **gateway** (`gateway --opensearch`), not on `serve`'s embedded REST
+front. The scale deploy already enables it (`gateway.opensearch: true` in
+`deploy/helm/growlerdb/values-scale.yaml`), so the comparison run gets it for free. Autocomplete uses
+the **native `/v1/suggest`** (also fronted by the gateway) — there is no `_search`-adapter suggest
+route. Local smoke confirmed both: driver ran all query kinds 0-error against a built `http_logs`
+index, and `topk_hydrated` showed the expected hydration-path latency (the `_source`-vs-hydrate cost).
+
 ## TODO (tracked)
 
 - [x] Data Prepper Iceberg-source pipeline — `data-prepper.yaml` **verified end-to-end** in a local
