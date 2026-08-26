@@ -60,10 +60,23 @@ target distribution differs.
   output (IDs included; no `uuid4`). Verified in `corpus_stats.py`.
 - **Parameters (env):** `BENCH_ROWS` (rows at fraction 1.0), `BENCH_SEED`, `SPAN_DAYS`,
   `BENCH_BATCH` (Iceberg write batch).
+- **Parallel generation → per-pod seed.** The k8s generator is a Deployment, so every replica shares
+  one pod spec. Because the corpus is now *seeded*, replicas with the same `BENCH_SEED` would emit
+  *identical* ids/data (the old `uuid4` gave disjointness for free; seeding removed that). So each pod
+  derives a **distinct `BENCH_SEED` from its `HOSTNAME`** (`sha256(HOSTNAME)`, set before `import
+  corpus` — see `deploy/k8s/streaming/generator.template.yaml`) → replicas produce disjoint ids/data
+  and throughput scales ~linearly with pod count. Set `BENCH_SEED` explicitly to pin one reproducible
+  single-pod generator.
+- **Reproducibility across a full run is via the archived artifact, not the seed alone.** Per-pod
+  seeds are `HOSTNAME`-derived and pod names vary run to run, so a multi-pod run is *not* seed-for-seed
+  reproducible. The reproducible record of a run is the exported corpus in the Hetzner bucket
+  (`corpus_export.py` / `artifacts.sh`), which is what a re-analysis or a re-run loads.
+- **Ingest rate.** The template defaults to a demo pace (`BATCH=10`, `SLEEP_S=5` ≈ 2 rows/s) so the
+  readiness gate is cheap; `compare_run.py` cranks it to `BATCH=25000`/`SLEEP_S=1` (overridable via
+  `GEN_BATCH`/`GEN_SLEEP_S`) for the run. One pod caps ~6–7k rows/s, so 50 GB (~125M rows) needs
+  several pods (`--generators N` / `GENERATORS=N`).
 - **Scale to a target size.** ~350–450 B/row uncompressed → **~50 GB ≈ 120–140M rows**. Over the
-  default 7-day span that models **~215 req/s average** (~340 at peak hours, ~35 overnight). The k8s
-  generator runs multiple pods, each with a distinct `BENCH_SEED` (disjoint data), streaming to the
-  same Iceberg table — so throughput scales horizontally; single-process Python speed is not the cap.
+  default 7-day span that models **~215 req/s average** (~340 at peak hours, ~35 overnight).
 
 ## Validation report
 
