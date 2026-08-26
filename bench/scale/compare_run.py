@@ -36,6 +36,19 @@ MAINTENANCE_CRONJOB = "growlerdb-iceberg-maintenance"  # name in maintenance.yam
 
 ROW_BYTES = 400  # ~uncompressed bytes/row (see synthetic-corpus.md) — target_rows = target_gb*1e9/ROW_BYTES
 SCALES = {"smoke": 1, "shakedown": 10, "full": 50}  # GB; smoke = fast full-flow validation
+
+# Phase timeouts (seconds) scale with data volume — shakedown values are tight, full-run values allow
+# for the ~50 GB reality. The load matters most for two slow steps: the Data Prepper CDC *initial load*
+# (conv_os_wait — the run's single slowest phase, hours at 50 GB, not minutes) and the Spark compaction
+# rewrite (compact — the CronJob's own 1800s cap is fine hourly but too tight for a 50 GB rewrite, so
+# compact_source raises the one-shot Job's deadline to this). conv_*_wait is the in-Job
+# convergence_check --wait-timeout; the Job itself gets +CONV_MARGIN for clone/pip/count/final-poll.
+CONV_MARGIN = 900
+SCALE_TIMEOUTS = {
+    "smoke":     {"conv_gdb_wait": 300,  "conv_os_wait": 900,   "compact": 900,  "query_job": 1200, "fresh_job": 900},
+    "shakedown": {"conv_gdb_wait": 1200, "conv_os_wait": 3000,  "compact": 1800, "query_job": 3600, "fresh_job": 1800},
+    "full":      {"conv_gdb_wait": 3600, "conv_os_wait": 14400, "compact": 5400, "query_job": 5400, "fresh_job": 3600},
+}
 GEN_BATCH = int(os.environ.get("GEN_BATCH", "25000"))    # generator rows/commit (override demo 10)
 GEN_SLEEP_S = int(os.environ.get("GEN_SLEEP_S", "1"))    # seconds between commits (override demo 5)
 
@@ -203,45 +216,50 @@ def phase_generate(target_rows):
 
 # --- GrowlerDB phase ----------------------------------------------------------------------------
 
-def compact_source(scale):
+def compact_source(scale, deadline):
     """Compact the non-windowed source so the Trino/Iceberg baseline reads a fair layout (not thousands
     of tiny streaming files). scale-up.sh doesn't deploy the maintenance CronJob (it's in the streaming
-    bundle, not observability), so apply it here, then trigger a one-shot Job from it and wait."""
-    log("compact — deploy the maintenance CronJob + trigger a one-shot compaction of the source")
-    sh(f"kubectl -n {NS} apply -f {MAINTENANCE_YAML}", check=False)
+    bundle, not observability), so apply it here, trigger a one-shot Job from it, raise that Job's
+    deadline to the scale budget (the CronJob's jobTemplate caps at 1800s — fine hourly, too tight for a
+    50 GB rewrite), then wait."""
+    log(f"compact — deploy the maintenance CronJob + trigger a one-shot compaction (deadline {deadline}s)")
     job = f"compact-{scale}"
-    sh(f"kubectl -n {NS} delete job {job} --ignore-not-found", check=False)
-    sh(f"kubectl -n {NS} create job --from=cronjob/{MAINTENANCE_CRONJOB} {job}", check=False)
+    kubectl(["apply", "-f", str(MAINTENANCE_YAML)], check=False)
+    kubectl(["delete", "job", job, "--ignore-not-found"], check=False)
+    kubectl(["create", "job", f"--from=cronjob/{MAINTENANCE_CRONJOB}", job], check=False)
+    kubectl(["patch", "job", job, "--type", "merge",
+             "-p", json.dumps({"spec": {"activeDeadlineSeconds": deadline}})], check=False)
     if not DRY:
-        wait_job(job, timeout_s=1900)  # maintenance.yaml activeDeadlineSeconds is 1800
+        wait_job(job, timeout_s=deadline + 300)
 
 
 def phase_growlerdb(scale):
     log("PHASE growlerdb — converge, compact, query matrix, freshness, capture")
+    t = SCALE_TIMEOUTS[scale]
     # convergence gate: index docs == source DISTINCT id (in-cluster Job; Trino via REST). Wait for the
     # connector to drain to the frozen source before gating.
     run_driver_job("conv-gdb",
                    f"ID_COL={ID_COL} TABLE={TABLE} INDEX={INDEX} python convergence_check.py "
-                   f"--engine growlerdb --wait-timeout 1200 --poll 15",
-                   timeout_s=1500)
-    compact_source(scale)
+                   f"--engine growlerdb --wait-timeout {t['conv_gdb_wait']} --poll 15",
+                   timeout_s=t["conv_gdb_wait"] + CONV_MARGIN)
+    compact_source(scale, t["compact"])
     run_driver_job(
         "query-gdb",
         "python compare_query.py run http_logs --engines growlerdb "
         "--qps 200 --duration 120 --sweep 50,100,200,400,800 --sweep-duration 30 --out /tmp/out.json",
-        result_path="/tmp/out.json", local_out=f"{HERE}/gdb-query.json", timeout_s=3600)
+        result_path="/tmp/out.json", local_out=f"{HERE}/gdb-query.json", timeout_s=t["query_job"])
     # Trino/Iceberg-scan baseline (fairness axis 1): GrowlerDB search+hydrate vs Iceberg table scan
     # over the SAME table, post-compaction. Best-effort (check=False) — an informative baseline, not a
     # gate. Predicates target the non-windowed http_logs schema (status/user_id/path; no day pruning).
     run_driver_job(
         "trino-gdb",
         f"OUT=/tmp/out.json INDEX={INDEX} TRINO_TABLE={TABLE} python compare_trino.py",
-        result_path="/tmp/out.json", local_out=f"{HERE}/gdb-trino.json", timeout_s=1800, check=False)
+        result_path="/tmp/out.json", local_out=f"{HERE}/gdb-trino.json", timeout_s=t["query_job"], check=False)
     run_driver_job(
         "fresh-gdb",
         "python compare_freshness.py run http_logs --engines growlerdb --iterations 20 --out /tmp/out.json",
         pip="pyyaml pyiceberg pyarrow", result_path="/tmp/out.json",
-        local_out=f"{HERE}/gdb-freshness.json", timeout_s=1800, check=False)
+        local_out=f"{HERE}/gdb-freshness.json", timeout_s=t["fresh_job"], check=False)
     capture(scale, "GrowlerDB", f"{HERE}/gdb-query.json", f"{HERE}/gdb-freshness.json")
 
 
@@ -255,22 +273,24 @@ def phase_transition():
 
 def phase_opensearch(scale):
     log("PHASE opensearch — wait for CDC initial load convergence, query matrix, freshness, capture")
+    t = SCALE_TIMEOUTS[scale]
     # convergence gate: OpenSearch _count == source DISTINCT id (Data Prepper CDC initial load complete).
-    # Wait — the initial load of the whole table takes time — and gate on it (querying mid-load is unfair).
+    # The initial load of the whole table is the run's slowest step (hours at 50 GB) — conv_os_wait is
+    # sized for it so a slow-but-healthy CDC load doesn't false-fail the gate. Querying mid-load is unfair.
     run_driver_job("conv-os",
                    f"ID_COL={ID_COL} TABLE={TABLE} INDEX={INDEX} python convergence_check.py "
-                   f"--engine opensearch --wait-timeout 3000 --poll 30",
-                   timeout_s=3300)
+                   f"--engine opensearch --wait-timeout {t['conv_os_wait']} --poll 30",
+                   timeout_s=t["conv_os_wait"] + CONV_MARGIN)
     run_driver_job(
         "query-os",
         "python compare_query.py run http_logs --engines opensearch "
         "--qps 200 --duration 120 --sweep 50,100,200,400,800 --sweep-duration 30 --out /tmp/out.json",
-        result_path="/tmp/out.json", local_out=f"{HERE}/os-query.json", timeout_s=3600)
+        result_path="/tmp/out.json", local_out=f"{HERE}/os-query.json", timeout_s=t["query_job"])
     run_driver_job(
         "fresh-os",
         "python compare_freshness.py run http_logs --engines opensearch --iterations 20 --out /tmp/out.json",
         pip="pyyaml pyiceberg pyarrow", result_path="/tmp/out.json",
-        local_out=f"{HERE}/os-freshness.json", timeout_s=1800, check=False)
+        local_out=f"{HERE}/os-freshness.json", timeout_s=t["fresh_job"], check=False)
     capture(scale, "OpenSearch", f"{HERE}/os-query.json", f"{HERE}/os-freshness.json")
 
 

@@ -82,6 +82,12 @@ persists host-side for `capture.py`). `compare_run.py` renders, applies, waits o
 Job; `compare_run.py --self-check` renders + validates the manifest offline. The only host-side step
 is the final `capture.py` metrics scrape (read-only Prometheus, not a load path).
 
+Phase timeouts scale with `--scale` (`SCALE_TIMEOUTS` in `compare_run.py`): the tight shakedown values
+would false-fail a 50 GB run, whose two slow steps are the **Data Prepper CDC initial load** (the
+run's single slowest phase — hours, not minutes; the `conv-os` gate waits up to 4 h at `full`) and the
+**Spark compaction rewrite** (`compact_source` raises the one-shot Job's deadline past the CronJob's
+1800s cap — 90 min at `full`). A full run is ~12–18 h end-to-end; the 10 GB shakedown ~2–4 h.
+
 ## Running the comparison
 
 Orchestrated by [`bench/scale/compare_run.py`](../../../bench/scale/compare_run.py) (sequential:
