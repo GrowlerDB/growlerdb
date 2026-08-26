@@ -120,14 +120,18 @@ spec:
               until curl -sf "http://opensearch:9200/_cluster/health?wait_for_status=yellow&timeout=5s"; do
                 echo "waiting for opensearch..."; sleep 5
               done
-              # Idempotent: create only if absent.
-              if curl -sf -o /dev/null "http://opensearch:9200/http_logs"; then
-                echo "index http_logs already exists"; exit 0
+              # Create an INDEX TEMPLATE, not the index directly: the parity mapping must apply no
+              # matter who creates `http_logs` first — the setup Job or Data Prepper's sink. Creating
+              # the index directly loses that race (Data Prepper auto-creates it with a DYNAMIC mapping
+              # → status=text not keyword, client_ip=text not ip, no completion field). A template wins
+              # regardless of creator. Idempotent.
+              if curl -sf -o /dev/null "http://opensearch:9200/_index_template/http_logs"; then
+                echo "index template http_logs already exists"; exit 0
               fi
-              curl -sf -X PUT "http://opensearch:9200/http_logs" \
-                -H 'content-type: application/json' \
-                --data-binary @/mapping/http_logs.json
-              echo "created index http_logs"
+              BODY=$(printf '{"index_patterns":["http_logs"],"template":%s}' "$(cat /mapping/http_logs.json)")
+              curl -sf -X PUT "http://opensearch:9200/_index_template/http_logs" \
+                -H 'content-type: application/json' -d "$BODY"
+              echo "created index template http_logs"
           volumeMounts: [{ name: mapping, mountPath: /mapping }]
       volumes:
         - { name: mapping, configMap: { name: opensearch-index-mapping } }

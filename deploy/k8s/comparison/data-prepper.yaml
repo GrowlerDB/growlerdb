@@ -71,6 +71,12 @@ spec:
   template:
     metadata: { labels: { app: data-prepper } }
     spec:
+      # Don't ingest until the parity index template exists, or Data Prepper's sink auto-creates
+      # http_logs with a dynamic mapping (wrong types + no completion field) before the setup Job wins.
+      initContainers:
+        - name: wait-template
+          image: curlimages/curl:8.11.1
+          command: ["sh", "-c", "until curl -sf -o /dev/null http://opensearch:9200/_index_template/http_logs; do echo 'waiting for http_logs index template'; sleep 3; done"]
       containers:
         - name: data-prepper
           image: opensearchproject/data-prepper:2.15.1
