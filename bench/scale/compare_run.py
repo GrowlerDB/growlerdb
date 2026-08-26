@@ -28,6 +28,8 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 ROW_BYTES = 400  # ~uncompressed bytes/row (see synthetic-corpus.md) — target_rows = target_gb*1e9/ROW_BYTES
 SCALES = {"shakedown": 10, "full": 50}
+GEN_BATCH = int(os.environ.get("GEN_BATCH", "25000"))    # generator rows/commit (override demo 10)
+GEN_SLEEP_S = int(os.environ.get("GEN_SLEEP_S", "1"))    # seconds between commits (override demo 5)
 
 NS = os.environ.get("NAMESPACE", "growlerdb")
 GATEWAY_URL = os.environ.get("GROWLERDB_OS_URL", "http://localhost:8081")
@@ -94,8 +96,9 @@ def wait_source_rows(target_rows, timeout_s=6 * 3600):
 
 def phase_generate(target_rows):
     log(f"PHASE generate — fill Iceberg source to ~{target_rows:,} rows (SPAN_DAYS=7)")
-    # scale-up.sh started the generator; ensure the span is 7d and wait for the target, then stop.
-    # (SPAN_DAYS is baked into the generator env by scale-up.sh; set it there before bring-up.)
+    # The generator template defaults to BATCH=10/SLEEP_S=5 (demo pace ~2 rows/s). Crank it to a
+    # scale rate for the run (like staged_run.py does) before waiting for the target.
+    sh(f"kubectl -n {NS} set env deploy/growlerdb-generator BATCH={GEN_BATCH} SLEEP_S={GEN_SLEEP_S}", check=False)
     wait_source_rows(target_rows)
 
 
