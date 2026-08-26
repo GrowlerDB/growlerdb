@@ -50,6 +50,7 @@ in the plan; the plan's fairness charter #2 will be updated to say "sequential o
 
 | GrowlerDB | OpenSearch |
 |---|---|
+| `trace_id` KEYWORD (X-Request-ID) | `keyword` |
 | `ts` LONG fast | `long` |
 | `method`,`status`,`user_id`,`region` KEYWORD | `keyword` |
 | `path`,`user_agent` TEXT (positions) | `text` (positions default) |
@@ -119,16 +120,20 @@ Job from it). Also confirm the Data Prepper metrics path (`/metrics/prometheus`)
 The **Trino/Iceberg-scan baseline (`compare_trino.py`)** runs as a driver Job in `phase_growlerdb`
 (best-effort), after compaction: GrowlerDB search+hydrate vs an Iceberg table scan over the same table.
 Predicates target the non-windowed `http_logs` schema (`status`/`user_id`/`path`; no `day` pruning —
-the table is unpartitioned). The unique-key bloom (`request_id`) is Iceberg's best skip but is not
-paired: `request_id` is key-only in GrowlerDB (not searchable), so there is no point-lookup-by-id query
-to put opposite it — disclosed.
+the table is unpartitioned). The **headline pair is a point lookup on `trace_id`** (the searchable
+X-Request-ID): GrowlerDB's indexed exact-term lookup vs a Trino equality skipped by the `trace_id`
+parquet bloom filter — search's canonical strength against Iceberg at its selective best. The value is
+resolved live (`SELECT trace_id … LIMIT 1`) since seeds vary per pod. (`request_id` stays key-only, so
+it is the identity/`_id`, not a searched term — `trace_id` is what a real request-correlation lookup
+hits.)
 
 ## TODO (tracked)
 
 - [x] **Corpus (Phase 1.5) — DONE.** Generated `http_logs` at ~50 GB (no permissive real dataset fit
       log-shaped + commercial + scale). `corpus.py` enhanced with realistic distributions; methodology
       + validation report in `bench/scale/synthetic-corpus.md`. Schema/mapping/queries unchanged (the
-      generated corpus keeps the 17-field shape), so autocomplete stays on `user_id`.
+      generated corpus keeps the shape — now 18 fields with the searchable `trace_id`), so autocomplete
+      stays on `user_id`.
 
 - [x] Data Prepper Iceberg-source pipeline — `data-prepper.yaml` **verified end-to-end** in a local
       smoke (Polaris + MinIO + OpenSearch, real 500-row Iceberg table): CDC converged exactly

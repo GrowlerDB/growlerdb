@@ -39,6 +39,7 @@ data:
       },
       "mappings": {
         "properties": {
+          "trace_id":         { "type": "keyword" },
           "ts":               { "type": "long" },
           "method":           { "type": "keyword" },
           "status":           { "type": "keyword" },

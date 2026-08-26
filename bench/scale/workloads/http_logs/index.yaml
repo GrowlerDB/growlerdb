@@ -19,6 +19,10 @@ key:
 mapping:
   selection: EXPLICIT
   fields:
+    # trace_id is the LB/proxy-injected X-Request-ID — a searchable KEYWORD (whole-value exact match)
+    # for request correlation, distinct from the key-only `request_id`. Near-unique, so its term dict is
+    # large (a disclosed cost, mirrored on OpenSearch); it enables the point-lookup-vs-Iceberg-bloom pair.
+    - { path: trace_id, type: KEYWORD }
     - { path: ts, type: LONG, fast: true } # range / sort
     - { path: method, type: KEYWORD }
     - { path: status, type: KEYWORD }

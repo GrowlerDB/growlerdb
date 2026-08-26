@@ -17,11 +17,13 @@ a search workload — so the generator models skew explicitly and this report ch
 
 ## Schema
 
-17 fields (source-of-record columns plus the searchable subset). `request_id` is the primary key.
+18 fields (source-of-record columns plus the searchable subset). `request_id` is the primary key
+(key-only: identity + hydration locator, not a searched term). `trace_id` is a distinct, *searchable*
+correlation id.
 
-`request_id`, `ts` (epoch seconds), `method`, `host`, `path`, `query`, `protocol`, `status`,
-`response_size`, `response_time_ms`, `client_ip`, `user_agent`, `referer`, `user_id`, `session_id`,
-`region`, `tags`.
+`request_id`, `trace_id`, `ts` (epoch seconds), `method`, `host`, `path`, `query`, `protocol`,
+`status`, `response_size`, `response_time_ms`, `client_ip`, `user_agent`, `referer`, `user_id`,
+`session_id`, `region`, `tags`.
 
 ## Distribution model
 
@@ -45,6 +47,12 @@ a search workload — so the generator models skew explicitly and this report ch
   in realistic minority proportions.
 - **host / referer / region / protocol / query** — weighted categoricals (e.g. `-` is the common
   referer; `us-east-1` the common region; HTTP/2 the common protocol).
+- **trace_id** — a near-unique UUID-shaped value per row, modeling a load-balancer/proxy-injected
+  `X-Request-ID` (Envoy/nginx `X-Request-ID`, ALB `X-Amzn-Trace-Id`, …). Indexed as a searchable
+  `KEYWORD` (whole-value exact match) in both engines and bloom-filtered in parquet, so the benchmark
+  can measure an exact request-correlation point lookup — search's canonical strength — against an
+  Iceberg bloom-skipped scan. Its term dictionary is large (≈ one entry per row); that storage cost is
+  real and paid by *both* engines, and reported (like `_source`-vs-hydrate).
 - **timestamp** — diurnal (hour-of-day) intensity curve (night trough, mid-day/evening peaks) and a
   weekly curve (weekday vs. weekend dip), sampled over `SPAN_DAYS` (default 7 — one full week).
   `BASE_TS` is midnight-aligned so the hour offset maps to the diurnal curve.

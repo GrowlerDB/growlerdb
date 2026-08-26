@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import time
+import urllib.error
 import urllib.request
 
 NS = os.environ.get("NAMESPACE", "growlerdb")
@@ -31,6 +32,7 @@ ITERS = int(os.environ.get("ITERS", "5"))
 # searchable term), so there is no GrowlerDB point-lookup-by-id query to put opposite it (disclosed).
 
 # (label, GrowlerDB native query, Trino SQL) — equivalent predicates over iceberg.growlerdb.<TABLE>.
+# main() prepends a point-lookup on a LIVE-resolved trace_id (a real value, since seeds vary per pod).
 PAIRS = [
     ("term status=500 [status bloom]", 'status:"500"',
      f"SELECT request_id FROM {TABLE} WHERE status='500' LIMIT 20"),
@@ -39,6 +41,13 @@ PAIRS = [
     ("text path~checkout [full scan]", "path:checkout",
      f"SELECT request_id FROM {TABLE} WHERE path LIKE '%checkout%' LIMIT 20"),
 ]
+
+
+def point_lookup_pair(tid):
+    """The headline pair: GrowlerDB indexed exact-term lookup vs Trino equality skipped by the trace_id
+    parquet bloom filter — search's canonical strength, and Iceberg at its selective best."""
+    return ("point lookup trace_id [trace_id bloom]", f'trace_id:"{tid}"',
+            f"SELECT request_id FROM {TABLE} WHERE trace_id='{tid}'")
 
 
 def growlerdb(query):
@@ -57,33 +66,50 @@ def growlerdb(query):
 
 
 def _trino_http(sql, timeout=120):
-    """Execute one SQL statement through the Trino REST API (POST /v1/statement, follow nextUri)."""
+    """Execute one SQL statement through the Trino REST API (POST /v1/statement, follow nextUri).
+    Returns the collected data rows."""
     req = urllib.request.Request(
         f"{TRINO_URL}/v1/statement", data=sql.encode(),
         headers={"X-Trino-User": "bench", "X-Trino-Catalog": "iceberg", "X-Trino-Schema": "growlerdb"})
+    rows = []
     with urllib.request.urlopen(req, timeout=timeout) as r:
         page = json.loads(r.read())
     while True:
         if page.get("error"):
             raise RuntimeError(page["error"].get("message", "trino error"))
+        rows.extend(page.get("data") or [])
         nxt = page.get("nextUri")
         if not nxt:
-            return
+            return rows
         with urllib.request.urlopen(nxt, timeout=timeout) as r:
             page = json.loads(r.read())
 
 
 def _trino_exec(sql, timeout=120):
-    subprocess.run(
+    """Same via `kubectl exec deploy/trino`; returns stdout lines (CSV)."""
+    out = subprocess.run(
         ["kubectl", "-n", NS, "exec", "deploy/trino", "--", "trino", "--server", "localhost:8080",
-         "--catalog", "iceberg", "--schema", "growlerdb", "--execute", sql],
+         "--catalog", "iceberg", "--schema", "growlerdb", "--output-format", "CSV", "--execute", sql],
         capture_output=True, text=True, timeout=timeout, check=False)
+    return [ln.strip().strip('"') for ln in (out.stdout or "").splitlines() if ln.strip()]
 
 
 def trino(sql):
     t = time.perf_counter()
     _trino_http(sql) if TRINO_URL else _trino_exec(sql)
     return (time.perf_counter() - t) * 1000.0
+
+
+def trino_scalar(sql):
+    """First cell of a query's result, or None — used to resolve a live trace_id for the point lookup."""
+    try:
+        if TRINO_URL:
+            rows = _trino_http(sql, timeout=60)
+            return rows[0][0] if rows and rows[0] else None
+        rows = _trino_exec(sql, timeout=60)
+        return rows[0] if rows else None
+    except (urllib.error.URLError, subprocess.SubprocessError, OSError, RuntimeError):
+        return None
 
 
 def p50(xs):
@@ -94,8 +120,13 @@ def p50(xs):
 def main():
     print(f"# GrowlerDB (search+hydrate) vs Trino (Iceberg scan) over iceberg.growlerdb.{TABLE} "
           f"({'REST' if TRINO_URL else 'kubectl-exec'}, {ITERS} iters/query)", flush=True)
+    # Resolve a real trace_id (seeds vary per pod, so no value can be hardcoded) for the point-lookup.
+    tid = trino_scalar(f"SELECT trace_id FROM {TABLE} LIMIT 1")
+    pairs = ([point_lookup_pair(tid)] if tid else []) + PAIRS
+    if not tid:
+        print("# could not resolve a live trace_id — skipping the point-lookup pair", flush=True)
     rows = []
-    for label, gq, tsql in PAIRS:
+    for label, gq, tsql in pairs:
         g = [growlerdb(gq) for _ in range(ITERS)]
         t = [trino(tsql) for _ in range(ITERS)]
         row = {"query": label, "growlerdb_p50_ms": round(p50(g), 1), "trino_p50_ms": round(p50(t), 1),

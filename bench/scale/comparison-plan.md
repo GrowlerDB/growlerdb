@@ -51,7 +51,9 @@ Elasticsearch and Quickwit were considered and **cut this round** on cost/scope.
 
 ## Query types (this round)
 
-`match_all`, `term`, `phrase` (match_phrase), `boolean` (bool must/should/filter), `range`,
+`match_all`, `term`, **exact-id point lookup** (`trace_id`, the searchable X-Request-ID — the
+request-correlation lookup real log search leans on, and the pair measured against Iceberg's `trace_id`
+bloom in `compare_trino.py`), `phrase` (match_phrase), `boolean` (bool must/should/filter), `range`,
 **prefix/autocomplete**, and top-K returning documents in three modes: coordinates-only, cached
 fields, and full retrieval (GrowlerDB hydrate-from-Iceberg vs OpenSearch `_source`).
 
@@ -116,7 +118,8 @@ documented in the published report.
 - Index data (GrowlerDB Tantivy segments, OpenSearch shards) on **local NVMe**; MinIO/Iceberg on a
   cheap Hetzner volume. Est. footprint at ~50 GB raw: Iceberg parquet ~10–25 GB, GrowlerDB index
   ~18–24 GB, **OpenSearch index (with `_source`) ~50–75 GB**, staging/backups ~25 GB — fits the
-  ~2,160 GB total local NVMe with headroom.
+  ~2,160 GB total local NVMe with headroom. The searchable near-unique `trace_id` adds a large keyword
+  term dictionary to **both** indexes (≈ one entry/row) — a disclosed cost, reported alongside latency.
 
 ## Phases
 
@@ -130,7 +133,8 @@ documented in the published report.
   path/IP/user, ~87% 200, lognormal sizes/latency, diurnal/weekly time, path-conditioned fields),
   seeded/reproducible; added the methodology doc [`synthetic-corpus.md`](synthetic-corpus.md) and the
   `corpus_stats.py` validation report. Schema/queries unchanged from Phase 1 (the generated corpus
-  keeps the 17-field `http_logs` shape everything was built against).
+  keeps the `http_logs` shape everything was built against, now 18 fields with the searchable
+  `trace_id`).
 - **Phase 2 — Run A @ ~50 GB `http_logs`:** orchestrated by `compare_run.py` (sequential: generate
   once → GrowlerDB phase → transition → OpenSearch phase → finalize). Load/convergence/freshness
   drivers run as **in-cluster Jobs** (rendered from `deploy/k8s/comparison/driver-job.template.yaml`),
@@ -166,7 +170,8 @@ documented in the published report.
   hydration-across-compaction as a measurement, not an assumed invariant.
 - **Trino baseline** moves 470 → 483 this round; re-baseline and note it. `compare_trino.py` was
   refreshed for the non-windowed `http_logs` schema (status/user_id/path predicates, no `day` pruning —
-  the table is unpartitioned) and runs as a driver Job in the GrowlerDB phase, post-compaction. The
-  unique-key bloom (`request_id`) can't be paired — it's key-only in GrowlerDB, not searchable
-  (disclosed).
+  the table is unpartitioned) and runs as a driver Job in the GrowlerDB phase, post-compaction. Its
+  headline pair is a **point lookup on `trace_id`** (the searchable X-Request-ID, bloom-filtered):
+  GrowlerDB's indexed exact-term lookup vs a Trino equality skipped by the `trace_id` bloom — Iceberg
+  at its selective best. (`request_id` stays key-only — identity/`_id`, not a searched term.)
 - **Coordinated omission** — see fairness charter #6.

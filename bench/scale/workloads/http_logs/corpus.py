@@ -32,9 +32,12 @@ except ImportError:
 
 # Parquet bloom filters so a GrowlerDB-vs-Iceberg comparison is FAIR (TASK-343): this table is
 # UNPARTITIONED (hash-routed by request_id), so a bloom filter on the equality columns is Iceberg's
-# only row-group skip — without it every `request_id=`/`status=` predicate full-scans.
+# only row-group skip — without it every `request_id=`/`status=`/`trace_id=` predicate full-scans.
+# `trace_id` (the searchable X-Request-ID) carries a bloom so the point-lookup pair measures
+# GrowlerDB's indexed lookup against Iceberg at its best (bloom-skipped scan), not a full scan.
 WRITE_PROPERTIES = {
     "write.parquet.bloom-filter-enabled.column.request_id": "true",
+    "write.parquet.bloom-filter-enabled.column.trace_id": "true",
     "write.parquet.bloom-filter-enabled.column.status": "true",
 }
 
@@ -171,7 +174,7 @@ def _rows(n, model, rng):
     """One batch of realistic access-log rows. Path is drawn first (Zipf); status/method/size/latency
     are conditioned on the path kind; timestamps follow the diurnal + weekly curve over SPAN_DAYS."""
     paths_idx = [bisect(_PATH_CUM, rng.random() * _PATH_CUM[-1]) for _ in range(n)]
-    request_id, ts, method, host, path, query, protocol = [], [], [], [], [], [], []
+    request_id, trace_id, ts, method, host, path, query, protocol = [], [], [], [], [], [], [], []
     status, response_size, response_time_ms, client_ip = [], [], [], []
     user_agent, referer, user_id, session_id, region, tags = [], [], [], [], [], []
     for i in range(n):
@@ -186,6 +189,9 @@ def _rows(n, model, rng):
         day = _pick(rng, range(SPAN_DAYS), model["day_cum"])
         hour = _pick(rng, range(24), _HOUR_CUM)
         request_id.append(f"{rng.getrandbits(128):032x}")  # seeded, not uuid4 → byte-reproducible
+        tid = rng.getrandbits(128)  # searchable X-Request-ID (LB/proxy-injected), UUID-shaped keyword
+        trace_id.append(f"{tid >> 96:08x}-{tid >> 80 & 0xffff:04x}-{tid >> 64 & 0xffff:04x}-"
+                        f"{tid >> 48 & 0xffff:04x}-{tid & 0xffffffffffff:012x}")
         ts.append(BASE_TS + day * 86400 + hour * 3600 + rng.randrange(3600))
         method.append(mt)
         host.append(_pick(rng, HOSTS, _HOST_CUM))
@@ -203,10 +209,11 @@ def _rows(n, model, rng):
         region.append(_pick(rng, REGIONS, _REGION_CUM))
         tags.append("prod,web" if kind != "api" else "prod,api")
     return {
-        "request_id": request_id, "ts": ts, "method": method, "host": host, "path": path,
-        "query": query, "protocol": protocol, "status": status, "response_size": response_size,
-        "response_time_ms": response_time_ms, "client_ip": client_ip, "user_agent": user_agent,
-        "referer": referer, "user_id": user_id, "session_id": session_id, "region": region, "tags": tags,
+        "request_id": request_id, "trace_id": trace_id, "ts": ts, "method": method, "host": host,
+        "path": path, "query": query, "protocol": protocol, "status": status,
+        "response_size": response_size, "response_time_ms": response_time_ms, "client_ip": client_ip,
+        "user_agent": user_agent, "referer": referer, "user_id": user_id, "session_id": session_id,
+        "region": region, "tags": tags,
     }
 
 
@@ -241,7 +248,7 @@ def _schema():
     import pyarrow as pa
 
     return pa.schema([
-        ("request_id", pa.string()), ("ts", pa.int64()), ("method", pa.string()),
+        ("request_id", pa.string()), ("trace_id", pa.string()), ("ts", pa.int64()), ("method", pa.string()),
         ("host", pa.string()), ("path", pa.string()), ("query", pa.string()),
         ("protocol", pa.string()), ("status", pa.string()), ("response_size", pa.int64()),
         ("response_time_ms", pa.int64()), ("client_ip", pa.string()), ("user_agent", pa.string()),
