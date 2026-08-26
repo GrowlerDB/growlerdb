@@ -24,6 +24,14 @@
     "body": { "query": { "term": { "user_id": "user_02500" } }, "size": 0 }
   },
   {
+    "name": "point_lookup_trace_id",
+    "weight": 2,
+    "kind": "term",
+    "note": "Exact request-correlation lookup on the searchable X-Request-ID (trace_id). The value is resolved LIVE per engine (seeds vary per pod, so no id can be hardcoded) via `resolve`. Same shape both engines (GrowlerDB indexed term vs OpenSearch keyword term); also paired against the Iceberg trace_id bloom in compare_trino.py.",
+    "resolve": { "field": "trace_id" },
+    "body": { "query": { "term": { "trace_id": "__RESOLVE__" } }, "size": 0 }
+  },
+  {
     "name": "cidr_client_ip",
     "weight": 2,
     "kind": "ip_cidr",

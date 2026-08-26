@@ -52,8 +52,10 @@ Elasticsearch and Quickwit were considered and **cut this round** on cost/scope.
 ## Query types (this round)
 
 `match_all`, `term`, **exact-id point lookup** (`trace_id`, the searchable X-Request-ID — the
-request-correlation lookup real log search leans on, and the pair measured against Iceberg's `trace_id`
-bloom in `compare_trino.py`), `phrase` (match_phrase), `boolean` (bool must/should/filter), `range`,
+request-correlation lookup real log search leans on; measured both as a per-type GrowlerDB-vs-OpenSearch
+row in the open-loop driver, its value resolved live per engine since seeds vary per pod, and as a pair
+against Iceberg's `trace_id` bloom in `compare_trino.py`), `phrase` (match_phrase), `boolean` (bool
+must/should/filter), `range`,
 **prefix/autocomplete**, and top-K returning documents in three modes: coordinates-only, cached
 fields, and full retrieval (GrowlerDB hydrate-from-Iceberg vs OpenSearch `_source`).
 

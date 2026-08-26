@@ -24,6 +24,7 @@ Endpoints (env): GROWLERDB_OS_URL (default http://localhost:8081), OPENSEARCH_UR
 
 import argparse
 import concurrent.futures
+import copy
 import json
 import os
 import sys
@@ -78,6 +79,57 @@ def _weighted_plan(queries):
     for q in queries:
         plan.extend([q] * int(q.get("weight", 1)))
     return plan
+
+
+def _post_json(url, body, token):
+    headers = {"content-type": "application/json"}
+    if token:
+        headers["authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST", headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _resolve_value(cfg, index, field):
+    """Fetch a live value for `field` via the shared _search path — a real value must exist (seeds vary
+    per pod, so it can't be hardcoded). Uses the same neutral endpoint as the benchmark itself. Returns
+    None if it can't be read; the caller then skips that query for this engine (never fails the run)."""
+    body = {"size": 1, "_source": [field], "query": {"match_all": {}}}
+    try:
+        payload = _post_json(f"{cfg['base']}/{index}/_search", body, cfg["token"])
+    except Exception:  # noqa: BLE001
+        return None
+    hits = (payload.get("hits") or {}).get("hits") or []
+    if not hits:
+        return None
+    for container in ("_source", "fields"):  # OpenSearch returns _source; tolerate a fields shape too
+        d = hits[0].get(container) or {}
+        if field in d:
+            v = d[field]
+            return v[0] if isinstance(v, list) else v
+    return None
+
+
+def _resolve_queries(engine, cfg, index, queries):
+    """Per-engine copy of the query set with any `resolve` placeholder filled from a live value. A query
+    with `"resolve": {"field": F}` has its `term.F` value replaced by a real F fetched from the engine
+    (e.g. the point-lookup on trace_id). Because the run is sequential (one engine per phase), each
+    engine resolves its own valid id — a point-lookup's latency doesn't depend on which existing id."""
+    out = []
+    for q in queries:
+        r = q.get("resolve")
+        if not r:
+            out.append(q)
+            continue
+        val = _resolve_value(cfg, index, r["field"])
+        if val is None:
+            print(f"  ! {engine}: could not resolve '{r['field']}' for '{q['name']}' — skipping it",
+                  file=sys.stderr)
+            continue
+        qc = copy.deepcopy(q)
+        qc["body"]["query"]["term"][r["field"]] = val
+        out.append(qc)
+    return out
 
 
 def run_open_loop(engine, cfg, index, plan, target_qps, duration, max_workers):
@@ -156,13 +208,14 @@ def cmd_run(args):
     # This driver runs the COMPARISON query set, not the default queries.json.
     qfile = wl.dir / "queries.comparison.json"
     queries = json.loads(qfile.read_text())
-    plan = _weighted_plan(queries)
     engines = _engines(args.engines.split(","))
     index = wl.index_name
 
     report = {"workload": wl.name, "index": index, "max_workers": args.max_workers, "engines": {}}
     for name, cfg in engines.items():
         print(f"== {name} ({cfg['base']}) ==", file=sys.stderr)
+        # Fill any `resolve` placeholder (e.g. point_lookup_trace_id) from a live value on this engine.
+        plan = _weighted_plan(_resolve_queries(name, cfg, index, queries))
         entry = run_open_loop(name, cfg, index, plan, args.qps, args.duration, args.max_workers)
         if args.sweep:
             rates = [int(x) for x in args.sweep.split(",")]
@@ -211,10 +264,29 @@ def cmd_selfcheck(args):
         o = request_for("opensearch", _engines(["opensearch"])["opensearch"], wl.index_name, ac[0])[0]
         assert g.endswith("/v1/suggest") and o.endswith("/_search"), "autocomplete routing wrong"
         print(f"autocomplete routing OK: growlerdb={g.rsplit('/',1)[1]} opensearch=_search")
+    # resolve queries: correct placeholder shape + drop-on-unresolvable (no network needed)
+    for q in queries:
+        r = q.get("resolve")
+        if not r:
+            continue
+        field = r["field"]
+        if field not in q.get("body", {}).get("query", {}).get("term", {}):
+            fails.append(f"{q['name']}: resolve field '{field}' is not a term in body")
+    resolvers = [q for q in queries if q.get("resolve")]
+    if resolvers:
+        dropped = _resolve_queries("x", {"base": "http://127.0.0.1:0", "token": ""}, wl.index_name, resolvers)
+        if dropped:
+            fails.append("unresolvable resolve-queries should be dropped, got " + str(len(dropped)))
+        else:
+            print(f"resolve OK: {len(resolvers)} live-resolved queries "
+                  f"({', '.join(q['name'] for q in resolvers)}); drop-on-unreachable works")
     kinds = sorted({q.get("kind") for q in queries})
     print(f"kinds covered: {kinds}")
     if fails:
-        print("FAIL:"); [print("  -", f) for f in fails]; sys.exit(1)
+        print("FAIL:")
+        for f in fails:
+            print("  -", f)
+        sys.exit(1)
     print("self-check OK")
 
 
