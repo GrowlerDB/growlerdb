@@ -58,6 +58,9 @@ metadata: { name: opensearch, namespace: growlerdb, labels: { app: opensearch } 
 spec:
   serviceName: opensearch-headless
   replicas: 3 # scale profile; override to 1 for the Compose/small smoke run
+  # Parallel: all masters start together so cluster_manager election completes. With the default
+  # OrderedReady, pod-0 never becomes Ready (needs pods 1/2 to form the cluster) → they never start.
+  podManagementPolicy: Parallel
   selector: { matchLabels: { app: opensearch } }
   template:
     metadata: { labels: { app: opensearch } }
