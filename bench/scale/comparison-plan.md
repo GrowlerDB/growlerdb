@@ -132,10 +132,13 @@ documented in the published report.
   `corpus_stats.py` validation report. Schema/queries unchanged from Phase 1 (the generated corpus
   keeps the 17-field `http_logs` shape everything was built against).
 - **Phase 2 — Run A @ ~50 GB `http_logs`:** orchestrated by `compare_run.py` (sequential: generate
-  once → GrowlerDB phase → transition → OpenSearch phase → finalize). **10 GB shakedown first**
-  (`--scale shakedown`) to shake out cluster-specific selectors, then `--scale full`. Corpus + result
-  artifacts persist to a Hetzner Object Storage bucket (`corpus_export.py` + `artifacts.sh`). Output:
-  RUNLOG row + `scale-results.md`. See `deploy/k8s/comparison/README.md` for the runbook.
+  once → GrowlerDB phase → transition → OpenSearch phase → finalize). Load/convergence/freshness
+  drivers run as **in-cluster Jobs** (rendered from `deploy/k8s/comparison/driver-job.template.yaml`),
+  never over `kubectl port-forward` — the shake-out proved a port-forwarded driver measures the tunnel,
+  not the engine. **10 GB shakedown first** (`--scale shakedown`) to shake out cluster-specific
+  selectors, then `--scale full`. Corpus + result artifacts persist to a Hetzner Object Storage bucket
+  (`corpus_export.py` + `artifacts.sh`). Output: RUNLOG row + `scale-results.md`. See
+  `deploy/k8s/comparison/README.md` for the runbook.
 - **Phase 4 — analysis & docs:** new `docs/benchmarks.md` next to Performance (nav_order ~10, bump
   the tail); update `comparison.md` (measured replaces directional), `ga-criteria.md`, `roadmap.md`,
   and OKF `scale-results.md`/`scale-test-plan.md`. Fairness charter summarized on the page. Label
@@ -155,8 +158,14 @@ documented in the published report.
 - **OpenSearch Data Prepper Iceberg CDC is experimental and CoW-only.** Fallback: labeled `_bulk`
   load so the ingest comparison still lands. Pin the exact Data Prepper/OpenSearch versions.
 - **Compaction CronJob (TASK-340)** targets the non-windowed table — a pro here (non-windowed run
-  compacts correctly); the windowed addendum would need a fix first.
+  compacts correctly); the windowed addendum would need a fix first. `scale-up.sh` does not deploy it
+  (it lives in the streaming bundle, not observability), so `compare_run.py`'s GrowlerDB phase applies
+  `maintenance.yaml` and triggers a one-shot compaction Job (`growlerdb-iceberg-maintenance`) before
+  the query matrix, so the fair-Trino source layout is compacted.
 - **Locator-heal persistence (TASK-339)** not demonstrably persistent post-compaction — report
   hydration-across-compaction as a measurement, not an assumed invariant.
-- **Trino baseline** moves 470 → 483 this round; re-baseline and note it.
+- **Trino baseline** moves 470 → 483 this round; re-baseline and note it. **Deferred this pass:**
+  `compare_trino.py`'s predicate set + day-pruning still target the old windowed schema
+  (`id`/`request`/`day`); non-windowed `http_logs` has `request_id`/`path` and no partitions, so the
+  baseline needs a predicate refresh before it runs as a driver Job. `phase_growlerdb` logs the skip.
 - **Coordinated omission** — see fairness charter #6.

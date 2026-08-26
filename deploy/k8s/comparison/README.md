@@ -68,6 +68,19 @@ the **native `/v1/suggest`** (also fronted by the gateway) — there is no `_sea
 route. Local smoke confirmed both: driver ran all query kinds 0-error against a built `http_logs`
 index, and `topk_hydrated` showed the expected hydration-path latency (the `_source`-vs-hydrate cost).
 
+## Driver Jobs — load runs IN-CLUSTER, never over port-forward
+
+The shake-out proved a `kubectl port-forward` load driver reports garbage (500ms/25s, timeouts): the
+localhost tunnel, not the engine, becomes the bottleneck. So every load/convergence/freshness driver
+runs as an **in-cluster Job** rendered from [`driver-job.template.yaml`](driver-job.template.yaml): an
+initContainer `git clone`s the branch under test, the main `python:3.12-slim` container `pip install`s
+the driver's deps and runs one `bench/scale` command against the in-cluster Services
+(`gdb-growlerdb-gateway:8080`, `opensearch:9200`, `trino:8080`, `prometheus:9090`), and the
+orchestrator reads the machine-readable result back from the pod's stdout (a marker-delimited JSON it
+persists host-side for `capture.py`). `compare_run.py` renders, applies, waits on, and slurps each
+Job; `compare_run.py --self-check` renders + validates the manifest offline. The only host-side step
+is the final `capture.py` metrics scrape (read-only Prometheus, not a load path).
+
 ## Running the comparison
 
 Orchestrated by [`bench/scale/compare_run.py`](../../../bench/scale/compare_run.py) (sequential:
@@ -97,11 +110,16 @@ resumability.
 
 **Shakedown must confirm these cluster-specific bits** (the orchestrator's kubectl selectors are best
 guesses from the Helm chart — verify names on the first run and correct `compare_run.py`):
-generator Deployment name (`growlerdb-generator`), node StatefulSet label
-(`app.kubernetes.io/component=node`), gateway/Prometheus Service names (`gdb-growlerdb-gateway`,
-`prometheus`), the maintenance CronJob name (`growlerdb-maintenance`), and an **OpenSearch mode for
-`convergence_check.py`** (currently GrowlerDB/Trino only — add an `--engine opensearch` count check).
-Also confirm the Data Prepper metrics path (`/metrics/prometheus`) once the pod is up.
+generator Deployment name (`growlerdb-generator`), node StatefulSet name (`gdb-growlerdb-node`),
+Service names the driver Jobs hit (`gdb-growlerdb-gateway:8080`, `opensearch:9200`, `trino:8080`,
+`prometheus:9090`), and the maintenance CronJob name (`growlerdb-iceberg-maintenance` — `compact_source`
+deploys `deploy/k8s/streaming/maintenance.yaml`, which scale-up.sh does not, then triggers a one-shot
+Job from it). Also confirm the Data Prepper metrics path (`/metrics/prometheus`) once the pod is up.
+
+The **Trino/Iceberg-scan baseline (`compare_trino.py`) is deferred this pass**: its predicate set +
+day-pruning target the old windowed schema (`id`/`request`/`day`), but non-windowed `http_logs` has
+`request_id`/`path` and no partitions — it needs a predicate refresh before it can run as a driver
+Job. `phase_growlerdb` logs the skip rather than launching a doomed Job.
 
 ## TODO (tracked)
 
@@ -121,7 +139,12 @@ Also confirm the Data Prepper metrics path (`/metrics/prometheus`) once the pod 
 - [x] Run orchestration — `compare_run.py` (sequential flow, `--scale` shakedown/full, `--plan`),
       `up.sh`/`down.sh` deploy wiring, `corpus_export.py` (raw-log NDJSON) + `artifacts.sh` (bucket
       push/restore, env-driven). tfvars set to 6× ccx43 / http_logs.
-- [ ] Shakedown-verify the cluster-specific selectors (see "Running the comparison" above) and add an
-      `--engine opensearch` mode to `convergence_check.py`.
+- [x] **`--engine opensearch` mode for `convergence_check.py` — DONE.** OpenSearch `_count` == source
+      `COUNT(DISTINCT request_id)`; the source count uses the Trino REST API (`TRINO_URL`) so the check
+      runs inside a driver Job (no kubectl). `phase_opensearch` gates on it.
+- [x] **In-cluster driver Jobs — DONE.** `driver-job.template.yaml` + `compare_run.py` render/apply/
+      wait/slurp; no port-forward in the load path. `compare_run.py --self-check` validates offline.
+- [ ] Shakedown-verify the cluster-specific selectors (see "Running the comparison" above).
+- [ ] Refresh `compare_trino.py` predicates for the non-windowed `http_logs` schema (deferred, above).
 - [ ] `_bulk` fallback path (labeled) in case the CDC source underperforms.
 - [ ] Hetzner artifact bucket + S3 credentials (Kira to create when it's time).
