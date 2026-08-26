@@ -70,35 +70,43 @@ def _poll_until_visible(name, cfg, index, token, commit_t, timeout, interval, ou
     out[name] = None  # timed out
 
 
-def _write_sentinel(mod, table, token):
+def _write_sentinel(mod, table, model, rng, token):
     """Append a single sentinel row (user_id=token) through the corpus write path. Returns the
-    commit instant (perf_counter after tbl.append returns = the Iceberg snapshot is committed)."""
+    commit instant (perf_counter after tbl.append returns = the Iceberg snapshot is committed).
+    `model`/`rng` are built once in cmd_run (the corpus row recipe: mod._rows(n, model, rng))."""
     import pyarrow as pa
 
     schema = mod._schema()
     catalog = mod._catalog()
-    cols = mod._rows(1, 0, mod._ip_gen())
+    cols = mod._rows(1, model, rng)
     cols[SENTINEL_FIELD] = [token]
-    cols["ts"] = [int(time.time())]
+    cols["ts"] = [int(time.time())]  # stamp NOW so end-to-end lag is measured from this commit
     tbl = catalog.load_table(table)
     tbl.append(pa.table(cols, schema=schema))
     return time.perf_counter()
 
 
 def cmd_run(args):
+    import random
+
     wl = Workload(args.workload)
     mod = wl.corpus_module()
-    if mod is None or not all(hasattr(mod, a) for a in ("_catalog", "_schema", "_rows", "_ip_gen")):
-        raise SystemExit(f"workload '{wl.name}': corpus.py lacks the _catalog/_schema/_rows/_ip_gen helpers")
+    if mod is None or not all(hasattr(mod, a) for a in ("_catalog", "_schema", "_rows", "_build_model")):
+        raise SystemExit(f"workload '{wl.name}': corpus.py lacks the _catalog/_schema/_rows/_build_model helpers")
     table = wl.meta.get("corpus", {}).get("table", f"growlerdb.{wl.name}")
     index = wl.index_name
     engines = _engines(args.engines.split(","))
+
+    # Sentinel content need not be reproducible (the user_id is overwritten with a unique token), so an
+    # unseeded RNG is fine; build the corpus model once (its ip/user pools are expensive to rebuild).
+    rng = random.Random()
+    model = mod._build_model(rng)
 
     per_engine = {n: [] for n in engines}
     timeouts = {n: 0 for n in engines}
     for i in range(args.iterations):
         token = f"sentinel-{i}-{uuid.uuid4().hex[:8]}"
-        commit_t = _write_sentinel(mod, table, token)
+        commit_t = _write_sentinel(mod, table, model, rng, token)
         out = {}
         threads = [threading.Thread(target=_poll_until_visible,
                                     args=(n, cfg, index, token, commit_t, args.timeout, args.interval, out))
@@ -134,7 +142,13 @@ def cmd_run(args):
 
 
 def cmd_selfcheck(args):
-    """No network/Iceberg: validate poll-query construction + lag math."""
+    """No network/Iceberg: validate poll-query construction, lag math, and the corpus write path.
+
+    The corpus-row assertions exercise exactly what _write_sentinel builds (mod._build_model + _rows +
+    the sentinel override), so a corpus refactor that renames those helpers fails here offline instead
+    of only at runtime in-cluster."""
+    import random
+
     wl = Workload(args.workload)
     # the sentinel field must be a searchable (non-key-only) field in the index
     paths = [m["path"] for m in wl.index["mapping"]["fields"]]
@@ -144,7 +158,25 @@ def cmd_selfcheck(args):
     # lag math: percentiles of a known set
     p = _percentiles([100.0, 200.0, 300.0])
     assert p["p50"] == 200.0 and p["max"] == 300.0, p
-    print(f"self-check OK: sentinel field '{SENTINEL_FIELD}' indexed; poll body + lag math valid")
+
+    # corpus write path: the helpers _write_sentinel/cmd_run call must exist and compose.
+    mod = wl.corpus_module()
+    missing = [a for a in ("_catalog", "_schema", "_rows", "_build_model") if not hasattr(mod, a)]
+    assert not missing, f"corpus.py missing helpers {missing} (would break _write_sentinel)"
+    rng = random.Random(0)
+    cols = mod._rows(1, mod._build_model(rng), rng)
+    assert all(len(v) == 1 for v in cols.values()), "corpus _rows(1, ...) must yield length-1 columns"
+    cols[SENTINEL_FIELD] = ["sentinel-0-abc"]
+    cols["ts"] = [1699920000]
+    assert cols[SENTINEL_FIELD] == ["sentinel-0-abc"] and len(cols["ts"]) == 1
+    try:  # if pyarrow is present, prove pa.table(cols, schema=_schema()) would accept these columns
+        import pyarrow  # noqa: F401
+        assert set(cols) == {f.name for f in mod._schema()}, "corpus columns != schema fields"
+        schema_checked = True
+    except ImportError:
+        schema_checked = False
+    print(f"self-check OK: sentinel field '{SENTINEL_FIELD}' indexed; poll body + lag math valid; "
+          f"corpus write path composes (schema match {'checked' if schema_checked else 'skipped — no pyarrow'})")
 
 
 def main():
