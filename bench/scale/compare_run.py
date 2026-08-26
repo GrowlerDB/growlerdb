@@ -27,7 +27,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 ROW_BYTES = 400  # ~uncompressed bytes/row (see synthetic-corpus.md) — target_rows = target_gb*1e9/ROW_BYTES
-SCALES = {"shakedown": 10, "full": 50}
+SCALES = {"smoke": 1, "shakedown": 10, "full": 50}  # GB; smoke = fast full-flow validation
 GEN_BATCH = int(os.environ.get("GEN_BATCH", "25000"))    # generator rows/commit (override demo 10)
 GEN_SLEEP_S = int(os.environ.get("GEN_SLEEP_S", "1"))    # seconds between commits (override demo 5)
 
@@ -107,7 +107,7 @@ def phase_growlerdb(scale):
     sh(f"python {HERE}/convergence_check.py")  # index docs == source DISTINCT id
     # compaction: the maintenance CronJob targets growlerdb.http_logs; trigger it now for a fair Trino.
     sh(f"kubectl -n {NS} create job --from=cronjob/growlerdb-maintenance compact-{scale} || true", check=False)
-    with port_forward("gdb-growlerdb-gateway", 8081, 8081), port_forward("prometheus", 9090, 9090):
+    with port_forward("gdb-growlerdb-gateway", 8081, 8080), port_forward("prometheus", 9090, 9090):
         sh(f"python {HERE}/compare_query.py run http_logs --engines growlerdb "
            f"--qps 200 --duration 120 --sweep 50,100,200,400,800 --sweep-duration 30 "
            f"--out {HERE}/gdb-query.json", {"GROWLERDB_OS_URL": GATEWAY_URL})
@@ -120,7 +120,7 @@ def phase_growlerdb(scale):
 
 def phase_transition():
     log("PHASE transition — scale GrowlerDB serving down, bring up OpenSearch + Data Prepper")
-    sh(f"kubectl -n {NS} scale statefulset --all --replicas=0 -l app.kubernetes.io/component=node", check=False)
+    sh(f"kubectl -n {NS} scale statefulset gdb-growlerdb-node --replicas=0", check=False)
     sh(f"NAMESPACE={NS} {REPO}/deploy/k8s/comparison/up.sh")
 
 
