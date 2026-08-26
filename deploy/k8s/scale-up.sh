@@ -129,7 +129,7 @@ helm upgrade --install gdb "$HELM_CHART" -f "$HELM_CHART/values-scale.yaml" -n "
   --set image.tag="$IMAGE_TAG" --set index.shards="$SHARDS" \
   --set index.windowed="$WINDOWED" \
   --set index.name="$INDEX" --set index.sourceTable="$TABLE" \
-  "${COLD_ARGS[@]}" "${LICENSE_ARGS[@]}" \
+  ${COLD_ARGS[@]+"${COLD_ARGS[@]}"} ${LICENSE_ARGS[@]+"${LICENSE_ARGS[@]}"} \
   --set-file index.definition="$INDEX_DEF"
 echo "waiting for $SHARDS node $([ "$WINDOWED" = true ] && echo pods || echo shards) to become Ready ..."
 for _ in $(seq 1 40); do
