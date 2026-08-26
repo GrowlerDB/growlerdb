@@ -1,64 +1,44 @@
 #!/usr/bin/env python3
-"""GrowlerDB vs Iceberg-alone (Trino) query comparison.
+"""GrowlerDB vs Iceberg-alone (Trino) query comparison — the scan baseline (fairness charter axis 1).
 
-Runs equivalent predicates as GrowlerDB search(+hydrate) and as Trino SQL table scans over the SAME
-Iceberg table, times both, and reports side-by-side latency. Run at each storage milestone
-to show where the index wins (selective predicates / point lookups) vs where a scan is
-comparable (full scans).
+Runs equivalent predicates as GrowlerDB search(+hydrate) and as Trino SQL over the SAME Iceberg table,
+times both, and reports side-by-side latency — where the index wins (selective predicates) vs where a
+scan is comparable. Honest framing: search + PK-hydrate vs table-scan, not a general OLAP benchmark.
 
-Runs from a kubectl-capable host: GrowlerDB via GATEWAY_URL (port-forward); Trino via `kubectl exec`.
-Honest framing: this is search + PK-hydrate vs table-scan, not a general OLAP benchmark.
+Endpoints: GrowlerDB via GATEWAY_URL (its native /v1/search + /v1/keys:get). Trino via TRINO_URL (the
+Trino REST API — this is what lets the comparison run inside a driver Job with no kubectl), else
+`kubectl exec deploy/trino` on a kubectl-capable host.
 """
-import json, os, subprocess, time, urllib.request
+import json
+import os
+import subprocess
+import time
+import urllib.request
 
 NS = os.environ.get("NAMESPACE", "growlerdb")
-GATEWAY = os.environ.get("GATEWAY_URL", "http://localhost:8080")
+GATEWAY = os.environ.get("GATEWAY_URL", "http://gdb-growlerdb-gateway:8080")
+TRINO_URL = os.environ.get("TRINO_URL", "")  # e.g. http://trino:8080 — enables the in-cluster HTTP path
 INDEX = os.environ.get("INDEX", "http_logs")
-# The Iceberg table the SQL scans — defaults to INDEX so a windowed run (http_logs_windowed) compares
-# against its own source table, not a hardcoded http_logs.
-TABLE = os.environ.get("TRINO_TABLE", INDEX)
+TABLE = os.environ.get("TRINO_TABLE", INDEX)  # Iceberg table under iceberg.growlerdb
 ITERS = int(os.environ.get("ITERS", "5"))
 
-# FAIRNESS (TASK-343): run this AFTER a compaction pass — on the uncompacted streaming layout
-# (thousands of tiny data files) Trino pays a pathological planning/open cost that has nothing to do
-# with the engine. And give Iceberg the skips it actually has: bloom filters on id/status (set by the
-# corpus's WRITE_PROPERTIES) let equality/point predicates skip row groups, and a `day` predicate
-# prunes partitions — the scan analog of GrowlerDB's window pruning. The `[full scan]` pairs are
-# deliberately unbounded (no `day`, no bloom-friendly shape) — the honest worst case; the
-# `[day-pruned]` pairs add the partition predicate so Iceberg is measured at its best, too.
+# FAIRNESS (TASK-343): run this AFTER a compaction pass — on the uncompacted streaming layout (thousands
+# of tiny files) Trino pays a pathological planning/open cost unrelated to the engine (compare_run's
+# GrowlerDB phase compacts first). http_logs is UNPARTITIONED (hash-routed by request_id) with parquet
+# bloom filters on request_id + status (corpus WRITE_PROPERTIES), so equality on those *can* skip row
+# groups; everything else is a full scan — the honest worst case for a scan. The unique-key bloom
+# (request_id) is Iceberg's best skip but can't be paired: request_id is KEY-ONLY in GrowlerDB (not a
+# searchable term), so there is no GrowlerDB point-lookup-by-id query to put opposite it (disclosed).
 
-# (label, GrowlerDB query, Trino SQL) — equivalent predicates over growlerdb.<TABLE>.
-STATIC_PAIRS = [
-    ("term status=404 [full scan]", 'status:"404"', f"SELECT id FROM {TABLE} WHERE status='404' LIMIT 20"),
-    ("text request~search [full scan]", "request:search", f"SELECT id FROM {TABLE} WHERE request LIKE '%search%' LIMIT 20"),
-    ("point lookup by id [bloom]", 'id:"req-500000"', f"SELECT * FROM {TABLE} WHERE id='req-500000'"),
+# (label, GrowlerDB native query, Trino SQL) — equivalent predicates over iceberg.growlerdb.<TABLE>.
+PAIRS = [
+    ("term status=500 [status bloom]", 'status:"500"',
+     f"SELECT request_id FROM {TABLE} WHERE status='500' LIMIT 20"),
+    ("term user_id [full scan]", 'user_id:"user_02500"',
+     f"SELECT request_id FROM {TABLE} WHERE user_id='user_02500' LIMIT 20"),
+    ("text path~checkout [full scan]", "path:checkout",
+     f"SELECT request_id FROM {TABLE} WHERE path LIKE '%checkout%' LIMIT 20"),
 ]
-
-
-def pruned_pairs(day):
-    """Partition-pruned variants: `day = <day>` restricts Trino to one day-partition — the scan analog
-    of GrowlerDB's window pruning, so the comparison isn't index-prune vs full-scan."""
-    return [
-        (f"term status=404 [day-pruned d{day}]", 'status:"404"',
-         f"SELECT id FROM {TABLE} WHERE day={day} AND status='404' LIMIT 20"),
-        (f"point lookup by id [day-pruned+bloom d{day}]", 'id:"req-500000"',
-         f"SELECT * FROM {TABLE} WHERE day={day} AND id='req-500000'"),
-    ]
-
-
-def resolve_prune_day():
-    """The day-partition the pruned pairs target — resolved LIVE (most-recent populated `day`, which
-    also mirrors the hot windows GrowlerDB's own recent queries hit) rather than a hardcoded era
-    constant that could point at an empty/aged-out partition. $PRUNE_DAY overrides; returns None (→
-    skip the pruned pairs) if Trino can't answer, so the run never silently scans an empty partition."""
-    env = os.environ.get("PRUNE_DAY")
-    if env:
-        return int(env)
-    out = trino_query(f"SELECT max(day) FROM {TABLE}")
-    try:
-        return int(out)
-    except (TypeError, ValueError):
-        return None
 
 
 def growlerdb(query):
@@ -76,27 +56,34 @@ def growlerdb(query):
     return (time.perf_counter() - t) * 1000.0
 
 
+def _trino_http(sql, timeout=120):
+    """Execute one SQL statement through the Trino REST API (POST /v1/statement, follow nextUri)."""
+    req = urllib.request.Request(
+        f"{TRINO_URL}/v1/statement", data=sql.encode(),
+        headers={"X-Trino-User": "bench", "X-Trino-Catalog": "iceberg", "X-Trino-Schema": "growlerdb"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        page = json.loads(r.read())
+    while True:
+        if page.get("error"):
+            raise RuntimeError(page["error"].get("message", "trino error"))
+        nxt = page.get("nextUri")
+        if not nxt:
+            return
+        with urllib.request.urlopen(nxt, timeout=timeout) as r:
+            page = json.loads(r.read())
+
+
 def _trino_exec(sql, timeout=120):
-    return subprocess.run(
-        ["kubectl", "-n", NS, "exec", "deploy/trino", "--",
-         "trino", "--server", "localhost:8080", "--catalog", "iceberg",
-         "--schema", "growlerdb", "--execute", sql],
-        capture_output=True, text=True, timeout=timeout)
+    subprocess.run(
+        ["kubectl", "-n", NS, "exec", "deploy/trino", "--", "trino", "--server", "localhost:8080",
+         "--catalog", "iceberg", "--schema", "growlerdb", "--execute", sql],
+        capture_output=True, text=True, timeout=timeout, check=False)
 
 
 def trino(sql):
     t = time.perf_counter()
-    _trino_exec(sql)
+    _trino_http(sql) if TRINO_URL else _trino_exec(sql)
     return (time.perf_counter() - t) * 1000.0
-
-
-def trino_query(sql):
-    """Run a Trino query and return its single scalar stdout value (stripped of quotes), or None."""
-    try:
-        out = (_trino_exec(sql, timeout=60).stdout or "").strip().strip('"')
-    except (subprocess.SubprocessError, OSError):
-        return None
-    return out or None
 
 
 def p50(xs):
@@ -105,23 +92,18 @@ def p50(xs):
 
 
 def main():
-    prune_day = resolve_prune_day()
-    pairs = list(STATIC_PAIRS)
-    if prune_day is not None:
-        pairs += pruned_pairs(prune_day)
-        print(f"# day-pruned pairs target day={prune_day} (most-recent populated partition)", flush=True)
-    else:
-        print("# skipping day-pruned pairs — could not resolve a populated `day` (set $PRUNE_DAY)", flush=True)
+    print(f"# GrowlerDB (search+hydrate) vs Trino (Iceberg scan) over iceberg.growlerdb.{TABLE} "
+          f"({'REST' if TRINO_URL else 'kubectl-exec'}, {ITERS} iters/query)", flush=True)
     rows = []
-    for label, gq, tsql in pairs:
+    for label, gq, tsql in PAIRS:
         g = [growlerdb(gq) for _ in range(ITERS)]
         t = [trino(tsql) for _ in range(ITERS)]
         row = {"query": label, "growlerdb_p50_ms": round(p50(g), 1), "trino_p50_ms": round(p50(t), 1),
                "speedup_x": round(p50(t) / max(p50(g), 0.1), 1)}
         rows.append(row)
-        print(f"{label:24s} GrowlerDB {row['growlerdb_p50_ms']:8.1f}ms  Trino {row['trino_p50_ms']:9.1f}ms  "
+        print(f"{label:34s} GrowlerDB {row['growlerdb_p50_ms']:8.1f}ms  Trino {row['trino_p50_ms']:9.1f}ms  "
               f"({row['speedup_x']}x)", flush=True)
-    report = {"index": INDEX, "table": TABLE, "iters": ITERS, "prune_day": prune_day, "comparisons": rows}
+    report = {"index": INDEX, "table": TABLE, "iters": ITERS, "comparisons": rows}
     if os.environ.get("OUT"):
         with open(os.environ["OUT"], "w") as f:
             json.dump(report, f, indent=2)

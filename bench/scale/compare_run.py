@@ -230,10 +230,13 @@ def phase_growlerdb(scale):
         "python compare_query.py run http_logs --engines growlerdb "
         "--qps 200 --duration 120 --sweep 50,100,200,400,800 --sweep-duration 30 --out /tmp/out.json",
         result_path="/tmp/out.json", local_out=f"{HERE}/gdb-query.json", timeout_s=3600)
-    # Trino/Iceberg-scan baseline: DEFERRED. compare_trino.py's predicate set + day-pruning target the
-    # old windowed schema (id/request/day); http_logs is non-windowed with request_id/path and no
-    # partitions, so it needs a predicate refresh before it can run in-cluster. Tracked in the plan.
-    log("skipping compare_trino baseline — predicate set needs a non-windowed http_logs refresh (plan risk)")
+    # Trino/Iceberg-scan baseline (fairness axis 1): GrowlerDB search+hydrate vs Iceberg table scan
+    # over the SAME table, post-compaction. Best-effort (check=False) — an informative baseline, not a
+    # gate. Predicates target the non-windowed http_logs schema (status/user_id/path; no day pruning).
+    run_driver_job(
+        "trino-gdb",
+        f"OUT=/tmp/out.json INDEX={INDEX} TRINO_TABLE={TABLE} python compare_trino.py",
+        result_path="/tmp/out.json", local_out=f"{HERE}/gdb-trino.json", timeout_s=1800, check=False)
     run_driver_job(
         "fresh-gdb",
         "python compare_freshness.py run http_logs --engines growlerdb --iterations 20 --out /tmp/out.json",

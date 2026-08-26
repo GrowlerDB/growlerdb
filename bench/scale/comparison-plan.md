@@ -164,8 +164,9 @@ documented in the published report.
   the query matrix, so the fair-Trino source layout is compacted.
 - **Locator-heal persistence (TASK-339)** not demonstrably persistent post-compaction — report
   hydration-across-compaction as a measurement, not an assumed invariant.
-- **Trino baseline** moves 470 → 483 this round; re-baseline and note it. **Deferred this pass:**
-  `compare_trino.py`'s predicate set + day-pruning still target the old windowed schema
-  (`id`/`request`/`day`); non-windowed `http_logs` has `request_id`/`path` and no partitions, so the
-  baseline needs a predicate refresh before it runs as a driver Job. `phase_growlerdb` logs the skip.
+- **Trino baseline** moves 470 → 483 this round; re-baseline and note it. `compare_trino.py` was
+  refreshed for the non-windowed `http_logs` schema (status/user_id/path predicates, no `day` pruning —
+  the table is unpartitioned) and runs as a driver Job in the GrowlerDB phase, post-compaction. The
+  unique-key bloom (`request_id`) can't be paired — it's key-only in GrowlerDB, not searchable
+  (disclosed).
 - **Coordinated omission** — see fairness charter #6.

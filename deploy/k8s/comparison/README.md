@@ -116,10 +116,12 @@ Service names the driver Jobs hit (`gdb-growlerdb-gateway:8080`, `opensearch:920
 deploys `deploy/k8s/streaming/maintenance.yaml`, which scale-up.sh does not, then triggers a one-shot
 Job from it). Also confirm the Data Prepper metrics path (`/metrics/prometheus`) once the pod is up.
 
-The **Trino/Iceberg-scan baseline (`compare_trino.py`) is deferred this pass**: its predicate set +
-day-pruning target the old windowed schema (`id`/`request`/`day`), but non-windowed `http_logs` has
-`request_id`/`path` and no partitions — it needs a predicate refresh before it can run as a driver
-Job. `phase_growlerdb` logs the skip rather than launching a doomed Job.
+The **Trino/Iceberg-scan baseline (`compare_trino.py`)** runs as a driver Job in `phase_growlerdb`
+(best-effort), after compaction: GrowlerDB search+hydrate vs an Iceberg table scan over the same table.
+Predicates target the non-windowed `http_logs` schema (`status`/`user_id`/`path`; no `day` pruning —
+the table is unpartitioned). The unique-key bloom (`request_id`) is Iceberg's best skip but is not
+paired: `request_id` is key-only in GrowlerDB (not searchable), so there is no point-lookup-by-id query
+to put opposite it — disclosed.
 
 ## TODO (tracked)
 
@@ -144,7 +146,9 @@ Job. `phase_growlerdb` logs the skip rather than launching a doomed Job.
       runs inside a driver Job (no kubectl). `phase_opensearch` gates on it.
 - [x] **In-cluster driver Jobs — DONE.** `driver-job.template.yaml` + `compare_run.py` render/apply/
       wait/slurp; no port-forward in the load path. `compare_run.py --self-check` validates offline.
+- [x] **`compare_trino.py` refreshed for non-windowed `http_logs` — DONE.** Predicates use
+      status/user_id/path (no `day`); Trino via REST (`TRINO_URL`) so it runs as a driver Job; wired
+      into `phase_growlerdb` post-compaction.
 - [ ] Shakedown-verify the cluster-specific selectors (see "Running the comparison" above).
-- [ ] Refresh `compare_trino.py` predicates for the non-windowed `http_logs` schema (deferred, above).
 - [ ] `_bulk` fallback path (labeled) in case the CDC source underperforms.
 - [ ] Hetzner artifact bucket + S3 credentials (Kira to create when it's time).
