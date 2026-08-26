@@ -7,6 +7,9 @@ kind: Service
 metadata: { name: opensearch-headless, namespace: growlerdb, labels: { app: opensearch } }
 spec:
   clusterIP: None
+  # Publish not-ready pods so discovery (seed_hosts) can resolve peers BEFORE the cluster forms —
+  # otherwise pods never become Ready (need the cluster) and the cluster never forms (need Ready DNS).
+  publishNotReadyAddresses: true
   selector: { app: opensearch }
   ports: [{ name: http, port: 9200 }, { name: transport, port: 9300 }]
 ---
