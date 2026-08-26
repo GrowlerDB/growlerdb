@@ -226,8 +226,8 @@ def main():
     p.add_argument("--engines", default="growlerdb,opensearch")
     p.add_argument("--qps", type=int, default=100, help="open-loop target arrival rate")
     p.add_argument("--duration", type=int, default=60)
-    p.add_argument("--max-workers", type=int, default=512, dest="max_workers",
-                   help="client concurrency ceiling; keep high so the client isn't the bottleneck")
+    p.add_argument("--max-workers", type=int, default=64, dest="max_workers",
+                   help="client concurrency ceiling; 512 bursts overwhelm an unguarded server (500/429)")
     p.add_argument("--sweep", default="", help="comma QPS list for a saturation sweep, e.g. 50,100,200,400,800")
     p.add_argument("--sweep-duration", type=int, default=20, dest="sweep_duration")
     p.add_argument("--out", default="comparison-report.json")
