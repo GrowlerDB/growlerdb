@@ -230,24 +230,26 @@ documented in the published report.
   GrowlerDB's indexed exact-term lookup vs a Trino equality skipped by the `trace_id` bloom — Iceberg
   at its selective best. (`request_id` stays key-only — identity/`_id`, not a searched term.)
 - **Coordinated omission** — see fairness charter #6.
-- **Duplicate `request_id`s from concurrent generation (OPEN — blocks exact convergence).** With
-  `GENERATORS>1`, parallel pods commit to the one Iceberg branch and ~**1.2–1.5% of rows end up
-  duplicated** (source `COUNT(*)` > `COUNT(DISTINCT request_id)`) — whole batches committed twice. Root
-  cause is **NOT the generator replaying** (separate, fixed restart-safety bug) and **NOT the pyiceberg
-  client** (a code read of pyiceberg 0.11.1 refuted this: `_do_commit` calls the catalog once, its
-  tenacity retry fires only on auth-token expiry — not 409/5xx/timeout — and every append carries an
-  `AssertRefSnapshotId` CAS so a re-send is rejected 409, never duplicated; the `commit.retry.num-retries`
-  property is a Java-Iceberg no-op pyiceberg never reads). Commit `d7fc862` (regenerate fresh rows in the
-  *outer* app retry) is harmless but was **not** the fix. By elimination the duplication is **server-side
-  — Polaris's own concurrent-commit handling (or an LB/ingress retrying commit POSTs)** — MEDIUM
-  confidence (Polaris not inspected). Consequence: GrowlerDB indexes per row (`COUNT(*)`) while OpenSearch
-  dedups by `_id`=request_id (`COUNT(DISTINCT)`), so the two index different counts and convergence can't
-  close. **Fix (confirmed dup-free, pick before the full run):** single-writer generation
-  (**`GENERATORS=1`** — structural guarantee: one writer → no branch conflicts → the server conflict path
-  never fires; ~3× slower generation, acceptable since the Ingest methodology makes generation a separate
-  up-front phase), **or** a post-generation **Spark dedup pass** (`ROW_NUMBER() OVER (PARTITION BY
-  request_id)=1`) in the settle step to keep parallel-gen speed. Gate `--scale full` on
-  `COUNT(*)==COUNT(DISTINCT request_id)`.
+- **Duplicate `request_id`s — ROOT-CAUSED by local reproduction; fix (`d7fc862`) already in the repo.**
+  Shakedown #2 had ~1.24% duplicate request_ids (source `COUNT(*)` > `COUNT(DISTINCT)`). A local
+  reproduction against real Polaris 1.6.0 + MinIO, driving the actual `corpus.py`, pinned it: the
+  **pre-`d7fc862` `_append_retry` re-committed the *same* batch on a false-negative commit** (an
+  intermediary/LB resend, or Polaris returning 409 for a commit it actually applied under load). With a
+  fault proxy injecting false-negatives: **pre-fix → 17.7% dup; current `d7fc862` (regenerate a FRESH
+  batch per retry) → 0.000% dup** — a false-negative then adds extra rows with *distinct* ids, so
+  `COUNT(*)==COUNT(DISTINCT)` holds. Ruled OUT by direct test: the generator alone (1/3/6 writers, no
+  fault) never dups (Polaris CAS is correct), pyiceberg 0.11.1 can't double-commit, and compaction
+  doesn't dup. **Timeline confirms:** `d7fc862` was committed 06:15 UTC, shakedown #2 ran 05:00 UTC —
+  #2 ran the buggy code. So **no `GENERATORS=1` and no dedup are needed**; `d7fc862` + `79758d6`
+  (restart-safe entropy, covers the 5xx/timeout→crash→restart path) make `GENERATORS>1` robust.
+  **STILL UNRESOLVED:** shakedown #3 ran WITH `d7fc862` (ConfigMap verified to carry it) yet I read
+  `doc_count` ~400k over distinct — but **mid-catch-up** (connector ~107s behind), and I never measured
+  the *settled* source `COUNT(*)` vs `COUNT(DISTINCT)`. Most likely a mid-flight over-read, not real
+  source dups, but it is not proven either way. **Before `--scale full`:** (1) add a deploy-time gate
+  asserting the running generator's `corpus.py` carries the fresh-per-attempt `make_cols` path (a stale
+  ConfigMap would silently reintroduce the bug); (2) let convergence SETTLE and assert
+  `COUNT(*)==COUNT(DISTINCT request_id)` on the static source before measuring. Do not declare the dup
+  issue closed until a settled run shows equality.
 - **GrowlerDB connector ingest throughput ceiling (measured ~21–24k docs/s, 6 shards/ccx43).** The
   streaming connector does **not** keep up with a generator burst of ~36k rows/s — it falls behind and
   accumulates lag (~130–150s / ~1M+ rows observed), then drains after the burst. For the benchmark this

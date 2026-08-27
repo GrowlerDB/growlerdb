@@ -123,6 +123,17 @@ for _ in $(seq 1 40); do
   kubectl -n "$NAMESPACE" logs deploy/growlerdb-generator --tail=-1 2>/dev/null | grep -q "created $TABLE" && { echo "  table created"; break; }
   sleep 6
 done
+# Guardrail: the generator's append-retry MUST regenerate FRESH rows per attempt (`make_cols`). The
+# pre-fix code re-committed the same batch on a false-negative commit → duplicate request_ids (~1.5%,
+# breaks convergence-by-distinct; root-caused by local repro). A stale ConfigMap silently reintroduces
+# it — assert the DEPLOYED code carries the fix before generating a whole corpus against it.
+if ! kubectl -n "$NAMESPACE" get configmap growlerdb-workload-corpus \
+     -o jsonpath='{.data.corpus\.py}' 2>/dev/null | grep -q "make_cols"; then
+  echo "FATAL: deployed generator corpus.py lacks the idempotent append-retry (make_cols) — dup risk." >&2
+  echo "  Re-render + re-apply the workload ConfigMap and rollout-restart the generator, then retry." >&2
+  exit 1
+fi
+echo "  generator corpus.py carries the idempotent append-retry (make_cols) ✓"
 fi  # end deps+generator (skipped for STAGE=serving)
 
 # STAGE=deps stops here: bring up observability (so Prometheus scrapes generation + the later cold
