@@ -38,6 +38,11 @@ from harness import Workload, _percentiles  # reuse workload loading + percentil
 GROWLERDB_OS_URL = os.environ.get("GROWLERDB_OS_URL", "http://localhost:8081")
 OPENSEARCH_URL = os.environ.get("OPENSEARCH_URL", "http://localhost:9200")
 GROWLERDB_TOKEN = os.environ.get("GROWLERDB_TOKEN", "")
+# Per-request ceiling: a query slower than this counts as a timeout error, not an open-ended wait. A
+# pathologically slow engine (e.g. hydration over an uncompacted table, ~30s/query) must yield
+# high-latency/timeout numbers, never hang the sweep by draining an unbounded backlog of in-flight
+# requests — the first live shakedown lost the whole GrowlerDB phase to exactly that hang.
+REQUEST_TIMEOUT_S = float(os.environ.get("REQUEST_TIMEOUT_S", "30"))
 
 # Lexical kinds share the OpenSearch _search body verbatim across engines.
 LEXICAL_KINDS = {"count", "term", "range", "match", "phrase", "boolean", "ip_cidr", "retrieval"}
@@ -70,7 +75,7 @@ def _post(url, body, token):
     if token:
         headers["authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST", headers=headers)
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S) as resp:
         resp.read()  # drain; we time the round-trip, not parse cost
 
 
@@ -164,15 +169,27 @@ def run_open_loop(engine, cfg, index, plan, target_qps, duration, max_workers):
         futures.append(ex.submit(one, q, next_t))
         next_t += interval
 
-    for fut in concurrent.futures.as_completed(futures):
-        name, kind, latency, service, err = fut.result()
-        s = stats[name]
-        s["kind"] = kind
-        s["latency"].append(latency)
-        s["service"].append(service)
-        if err:
-            s["errors"] += 1
-    ex.shutdown(wait=True)
+    # Bounded drain: after the arrival window, wait at most one request-timeout for in-flight requests
+    # to resolve, then stop. Requests still queued behind a slow engine are cancelled and counted as
+    # dropped rather than drained — this caps a level at duration + REQUEST_TIMEOUT_S instead of the
+    # hours a full backlog of slow queries would take.
+    pending = set(futures)
+    dropped = 0
+    try:
+        for fut in concurrent.futures.as_completed(futures, timeout=REQUEST_TIMEOUT_S + 5):
+            pending.discard(fut)
+            name, kind, latency, service, err = fut.result()
+            s = stats[name]
+            s["kind"] = kind
+            s["latency"].append(latency)
+            s["service"].append(service)
+            if err:
+                s["errors"] += 1
+    except concurrent.futures.TimeoutError:
+        dropped = len(pending)
+        print(f"  ! {engine} @ {target_qps} qps: {dropped} request(s) unresolved within "
+              f"{REQUEST_TIMEOUT_S + 5:.0f}s — cancelled (engine can't keep up)", file=sys.stderr)
+    ex.shutdown(wait=False, cancel_futures=True)
     elapsed = time.perf_counter() - start
 
     per_query = {}
@@ -187,6 +204,7 @@ def run_open_loop(engine, cfg, index, plan, target_qps, duration, max_workers):
         "engine": engine, "target_qps": target_qps,
         "achieved_qps": round(len(all_lat) / elapsed, 1) if elapsed else 0.0,
         "duration_s": round(elapsed, 1),
+        "dropped": dropped,  # scheduled requests cancelled unresolved (engine couldn't keep up)
         "overall_latency_ms": _percentiles(all_lat),
         "per_query": per_query,
     }
