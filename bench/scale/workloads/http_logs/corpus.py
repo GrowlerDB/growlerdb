@@ -284,14 +284,21 @@ def load(table="growlerdb.http_logs", fraction=1.0):
 
 def stream(table="growlerdb.http_logs", batch=10, sleep_s=5):
     """Append `batch` rows every `sleep_s` forever — the in-cluster streaming generator (the k8s
-    generator Deployment mounts this module and calls it). Creates the table if absent (never drops —
-    a restart resumes) and prints `created <table>` once, the readiness gate scale-up.sh waits on."""
+    generator Deployment mounts this module and calls it). Creates the table if absent (never drops)
+    and prints `created <table>` once, the readiness gate scale-up.sh waits on.
+
+    Restart-safe: the row stream is seeded with per-process entropy, so a container restart appends
+    FRESH rows rather than replaying the same seeded `request_id` sequence (which duplicated ~8% of
+    keys on the first live 3-generator run and broke count convergence). The model vocabulary stays
+    seeded by BENCH_SEED so each pod keeps a stable, disjoint term dictionary across restarts."""
     import pyarrow as pa
     from pyiceberg.schema import Schema
     from pyiceberg.types import LongType, NestedField, StringType
 
-    rng = random.Random(SEED)
+    rng = random.Random(SEED)  # stable per-pod vocabulary (users/paths/IPs) — survives restarts
     model = _build_model(rng)
+    # Row stream mixes non-deterministic per-process entropy so a restart does not replay ids/rows.
+    row_rng = random.Random(SEED ^ int.from_bytes(os.urandom(8), "big"))
     schema = _schema()
     catalog = _catalog()
     catalog.create_namespace_if_not_exists(table.split(".")[0])
@@ -304,7 +311,7 @@ def stream(table="growlerdb.http_logs", batch=10, sleep_s=5):
         print(f"created {table}", flush=True)
     n = 0
     while True:
-        cols = _rows(batch, model, rng)
+        cols = _rows(batch, model, row_rng)
         _append_retry(catalog, table, pa.table(cols, schema=schema))
         if _genmetrics is not None:  # report the real uncompressed bytes produced (TASK-342)
             _genmetrics.record_columns(cols, batch)
