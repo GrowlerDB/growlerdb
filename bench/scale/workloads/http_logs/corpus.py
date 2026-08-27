@@ -311,8 +311,7 @@ def stream(table="growlerdb.http_logs", batch=10, sleep_s=5):
         print(f"created {table}", flush=True)
     n = 0
     while True:
-        cols = _rows(batch, model, row_rng)
-        _append_retry(catalog, table, pa.table(cols, schema=schema))
+        cols = _append_retry(catalog, table, schema, lambda: _rows(batch, model, row_rng))
         if _genmetrics is not None:  # report the real uncompressed bytes produced (TASK-342)
             _genmetrics.record_columns(cols, batch)
         n += batch
@@ -320,18 +319,25 @@ def stream(table="growlerdb.http_logs", batch=10, sleep_s=5):
         time.sleep(sleep_s)
 
 
-def _append_retry(catalog, table, arrow_table, attempts=12):
-    """Append with optimistic-commit retry. Parallel generator pods (GENERATORS>1) all commit to the
-    one Iceberg branch, so pyiceberg raises CommitFailedException when another pod committed first —
-    expected contention, not an error. Reload the latest snapshot each attempt and retry with jittered
-    exponential backoff so the colliding pods desynchronize instead of crash-looping."""
+def _append_retry(catalog, table, schema, make_cols, attempts=12):
+    """Append one batch with optimistic-commit retry, returning the committed columns. Parallel
+    generator pods (GENERATORS>1) all commit to the one Iceberg branch, so pyiceberg raises
+    CommitFailedException when another pod committed first — expected contention, not an error. Reload
+    the latest snapshot each attempt and back off with jitter so colliding pods desynchronize.
+
+    Each attempt appends a FRESH batch (`make_cols()` → new random request_ids): Iceberg's append is
+    NOT idempotent under retry, so re-committing the same batch after a false-negative commit error
+    duplicates rows (~1% dup keys observed at scale). A failed attempt's data files are orphaned, not
+    committed, and reclaimed by the maintenance job's remove_orphan_files — never double-counted."""
+    import pyarrow as pa
     from pyiceberg.exceptions import CommitFailedException
 
     for i in range(attempts):
+        cols = make_cols()  # fresh rows per attempt — do NOT re-commit a batch a prior attempt may have landed
         tbl = catalog.load_table(table)  # re-read the latest snapshot before each commit attempt
         try:
-            tbl.append(arrow_table)
-            return
+            tbl.append(pa.table(cols, schema=schema))
+            return cols
         except CommitFailedException:
             if i == attempts - 1:
                 raise
