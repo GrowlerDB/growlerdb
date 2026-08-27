@@ -304,11 +304,28 @@ def stream(table="growlerdb.http_logs", batch=10, sleep_s=5):
         print(f"created {table}", flush=True)
     n = 0
     while True:
-        tbl = catalog.load_table(table)  # reload for the latest snapshot
         cols = _rows(batch, model, rng)
-        tbl.append(pa.table(cols, schema=schema))
+        _append_retry(catalog, table, pa.table(cols, schema=schema))
         if _genmetrics is not None:  # report the real uncompressed bytes produced (TASK-342)
             _genmetrics.record_columns(cols, batch)
         n += batch
         print(f"appended {batch} rows to {table} (total ~{n})", flush=True)
         time.sleep(sleep_s)
+
+
+def _append_retry(catalog, table, arrow_table, attempts=12):
+    """Append with optimistic-commit retry. Parallel generator pods (GENERATORS>1) all commit to the
+    one Iceberg branch, so pyiceberg raises CommitFailedException when another pod committed first —
+    expected contention, not an error. Reload the latest snapshot each attempt and retry with jittered
+    exponential backoff so the colliding pods desynchronize instead of crash-looping."""
+    from pyiceberg.exceptions import CommitFailedException
+
+    for i in range(attempts):
+        tbl = catalog.load_table(table)  # re-read the latest snapshot before each commit attempt
+        try:
+            tbl.append(arrow_table)
+            return
+        except CommitFailedException:
+            if i == attempts - 1:
+                raise
+            time.sleep(min(2.0, 0.1 * (2**i)) * (0.5 + random.random()))
