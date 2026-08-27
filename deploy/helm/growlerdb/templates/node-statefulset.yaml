@@ -62,9 +62,21 @@ spec:
               {{- else }}
               SHARD="${POD_NAME##*-}"
               if [ ! -f "/data/{{ .Values.index.name }}/index.json" ]; then
+              {{- if .Values.index.defineOnly }}
+                # Cold-sync (comparison benchmark): DEFINE the index but build NO shard data, so the
+                # node starts empty and the streaming connector performs the entire, MEASURED backfill
+                # of the (already-settled) source table on the metric-emitting write path — symmetric
+                # with OpenSearch's Data Prepper CDC. Without this the node boot-builds the full table
+                # AND a fresh connector re-streams it (double ingest). `--define-only` ignores
+                # --shards/--shard-ordinal (it writes the whole-index definition); `serve` below still
+                # scopes to this pod's ordinal.
+                growlerdb index {{ .Values.index.sourceTable }} --name {{ .Values.index.name }} --define-only{{ if .Values.index.definition }} \
+                  --def /etc/growlerdb/index-def.yaml{{ end }}
+              {{- else }}
                 growlerdb index {{ .Values.index.sourceTable }} --name {{ .Values.index.name }} \
                   --shards {{ .Values.index.shards }} --shard-ordinal "$SHARD"{{ if .Values.index.definition }} \
                   --def /etc/growlerdb/index-def.yaml{{ end }}
+              {{- end }}
               fi
               exec growlerdb serve {{ .Values.index.name }} \
                 --shards {{ .Values.index.shards }} --shard-ordinal "$SHARD" \

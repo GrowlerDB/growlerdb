@@ -82,6 +82,11 @@ index:
   # chart can't parse `definition`, so set this explicitly for a windowed workload. `shards` is then
   # the node-pool size (placement targets), not a hash-shard count. Default false = hash sharding.
   windowed: false
+  # Cold-sync (comparison benchmark, non-windowed only): when true, hash-sharded nodes DEFINE the index
+  # but build no shard data on boot — they start empty and the streaming connector performs the whole
+  # measured backfill (symmetric with Data Prepper CDC). Default false = boot-build the shard from the
+  # source table (the normal path; also correct when the connector streams a growing table live).
+  defineOnly: false
   # By default the node AUTO-MAPS the Iceberg schema (every column, inferred type). That can't infer
   # types the source doesn't carry — e.g. an `IP` field for CIDR queries, or `fast` fields required
   # by sort/range. Set `definition` to a VERBATIM GrowlerDB index definition (the index.yaml format —

@@ -189,11 +189,15 @@ documented in the published report.
   shake-out proved a port-forwarded driver measures the tunnel, not the engine. **10 GB shakedown
   first** (`--scale shakedown`), then `--scale full`. Corpus + result artifacts persist to a Hetzner
   Object Storage bucket. Output: RUNLOG row + `scale-results.md`. See `deploy/k8s/comparison/README.md`.
-  **Harness changes still required for this phase order** (as of the 2026-08-27 shakedowns, not yet
-  implemented): (a) hold the GrowlerDB connector/node build until generation settles, then time the
-  cold sync as a measured phase; (b) sample GrowlerDB `index_rate_dps`/`ingest_lag_ms` *during* the
-  sync (capture currently scrapes post-query, reading ~idle); (c) guarantee a **dup-free corpus** (see
-  Risks) so convergence closes exactly.
+  **Harness support for this phase order (IMPLEMENTED 2026-08-27):** (a) `scale-up.sh` gained
+  `STAGE=deps`/`serving` so generation runs with no GrowlerDB ingesting, and a `phase_gdb_coldsync`
+  (mirrors conv-os) deploys the serving stack `STAGE=serving DEFINE_ONLY=true` against the settled
+  table and times the cold sync; (b) `index.defineOnly` helm knob brings non-windowed nodes up empty
+  so the connector does the whole metric-emitting backfill; `capture.py` gained per-shard/connector
+  attribution series + `--started-epoch` scoping so the sync window is sampled live. **Still open:**
+  (c) a **dup-free corpus** — convergence gates on `COUNT(*)==COUNT(DISTINCT)`; the dup mechanism is
+  under active investigation (Risks). The `DEFINE_ONLY` non-windowed serve path is new — the shakedown
+  must confirm a node serves an empty define-only shard and the connector backfills it.
 - **Phase 4 — analysis & docs:** new `docs/benchmarks.md` next to Performance (nav_order ~10, bump
   the tail); update `comparison.md` (measured replaces directional), `ga-criteria.md`, `roadmap.md`,
   and OKF `scale-results.md`/`scale-test-plan.md`. Fairness charter summarized on the page. Label

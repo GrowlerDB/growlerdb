@@ -94,12 +94,18 @@ Orchestrated by [`bench/scale/compare_run.py`](../../../bench/scale/compare_run.
 generate once → GrowlerDB phase → transition → OpenSearch phase → finalize). Shakedown first.
 
 ```sh
-# 0. provision + bring up GrowlerDB stack (deps, observability, Trino, generator @ SPAN_DAYS=7, http_logs)
+# 0. provision + bring up ONLY the deps stage (deps, generator, observability, Trino) — NOT the
+#    GrowlerDB serving stack. STAGE=deps is load-bearing for the symmetric cold-sync ingest measurement:
+#    GrowlerDB must not ingest during generation. compare_run's gdb_coldsync phase then deploys the
+#    serving stack (STAGE=serving DEFINE_ONLY=true) against the settled table and TIMES the cold sync.
 cd deploy/iac && terraform apply            # 6x ccx43, non-windowed http_logs (terraform.tfvars)
 export KUBECONFIG=deploy/iac/kubeconfig.yaml
-SPAN_DAYS=7 WORKLOAD=http_logs IMAGE_TAG=<dev-sha> deploy/k8s/scale-up.sh
+STAGE=deps SPAN_DAYS=7 WORKLOAD=http_logs IMAGE_TAG=<dev-sha> deploy/k8s/scale-up.sh
 
-# 1. dry-run the orchestration (touches nothing), then the 10 GB shakedown, then the 50 GB run
+# 1. dry-run the orchestration (touches nothing), then the 10 GB shakedown, then the 50 GB run.
+#    Flow: generate → gdb_coldsync (measured) → growlerdb query → transition → opensearch (measured) → finalize.
+#    A dup-free corpus is required (convergence gates on COUNT(*)==COUNT(DISTINCT)); the dup mechanism
+#    is under investigation — until fixed, generate single-writer (GENERATORS unset/=1) or dedup.
 python bench/scale/compare_run.py --plan --scale shakedown
 python bench/scale/compare_run.py --scale shakedown
 python bench/scale/compare_run.py --scale full

@@ -44,10 +44,13 @@ SCALES = {"smoke": 1, "shakedown": 10, "full": 50}  # GB; smoke = fast full-flow
 # compact_source raises the one-shot Job's deadline to this). conv_*_wait is the in-Job
 # convergence_check --wait-timeout; the Job itself gets +CONV_MARGIN for clone/pip/count/final-poll.
 CONV_MARGIN = 900
+# conv_gdb_wait now covers a from-COLD connector backfill of the settled table (phase_gdb_coldsync),
+# not just a tail catch-up — sized like conv_os_wait (both are full initial syncs at the connector's
+# ~20k docs/s ceiling: 50 GB ≈ 125M rows ≈ ~1.7h, so 3h at full leaves margin).
 SCALE_TIMEOUTS = {
-    "smoke":     {"conv_gdb_wait": 300,  "conv_os_wait": 900,   "compact": 900,  "query_job": 1200, "fresh_job": 900},
-    "shakedown": {"conv_gdb_wait": 1200, "conv_os_wait": 3000,  "compact": 1800, "query_job": 3600, "fresh_job": 1800},
-    "full":      {"conv_gdb_wait": 3600, "conv_os_wait": 14400, "compact": 5400, "query_job": 5400, "fresh_job": 3600},
+    "smoke":     {"conv_gdb_wait": 600,   "conv_os_wait": 900,   "compact": 900,  "query_job": 1200, "fresh_job": 900},
+    "shakedown": {"conv_gdb_wait": 2400,  "conv_os_wait": 3000,  "compact": 1800, "query_job": 3600, "fresh_job": 1800},
+    "full":      {"conv_gdb_wait": 10800, "conv_os_wait": 14400, "compact": 5400, "query_job": 5400, "fresh_job": 3600},
 }
 GEN_BATCH = int(os.environ.get("GEN_BATCH", "25000"))    # generator rows/commit (override demo 10)
 GEN_SLEEP_S = int(os.environ.get("GEN_SLEEP_S", "1"))    # seconds between commits (override demo 5)
@@ -214,7 +217,32 @@ def phase_generate(target_rows):
     wait_source_rows(target_rows)
 
 
-# --- GrowlerDB phase ----------------------------------------------------------------------------
+# --- GrowlerDB cold-sync (ingest axis) ----------------------------------------------------------
+
+def phase_gdb_coldsync(scale):
+    """Deploy the GrowlerDB serving stack AGAINST the settled table and measure the cold full sync —
+    the symmetric ingest counterpart to phase_transition+conv-os for OpenSearch. Precondition: only the
+    `deps` stage is up (deps + generator + observability); GrowlerDB nodes/connector are NOT yet
+    deployed, so generation ran with nothing ingesting it. Here nodes come up EMPTY (DEFINE_ONLY) and
+    the streaming connector performs the entire backfill on the metric-emitting write path."""
+    log("PHASE gdb_coldsync — bring up GrowlerDB on the settled table, measure the cold full sync")
+    t = SCALE_TIMEOUTS[scale]
+    sh(f"STAGE=serving DEFINE_ONLY=true NAMESPACE={NS} {REPO}/deploy/k8s/scale-up.sh")
+    # Time to convergence (index docs == source DISTINCT id) IS the ingest headline: docs/s =
+    # source_count / elapsed. capture(started_epoch=start) scopes the metrics window to exactly the
+    # backfill so index_rate_dps + the per-shard/connector attribution series (capture.py) localize the
+    # ~20k docs/s ceiling. Querying mid-load would be unfair, so this gate blocks the query phase.
+    start = time.time()
+    run_driver_job("conv-gdb",
+                   f"ID_COL={ID_COL} TABLE={TABLE} INDEX={INDEX} python convergence_check.py "
+                   f"--engine growlerdb --wait-timeout {t['conv_gdb_wait']} --poll 15",
+                   timeout_s=t["conv_gdb_wait"] + CONV_MARGIN)
+    elapsed = time.time() - start
+    log(f"GrowlerDB cold-sync converged in {elapsed:.0f}s")
+    capture(scale, "GrowlerDB cold-sync", params={"cold_sync_secs": f"{elapsed:.0f}"}, started_epoch=start)
+
+
+# --- GrowlerDB query phase ----------------------------------------------------------------------
 
 def compact_source(scale, deadline):
     """Compact the non-windowed source so the Trino/Iceberg baseline reads a fair layout (not thousands
@@ -234,15 +262,19 @@ def compact_source(scale, deadline):
 
 
 def phase_growlerdb(scale):
-    log("PHASE growlerdb — converge, compact, query matrix, freshness, capture")
+    log("PHASE growlerdb — compact, warmup, query matrix, freshness, capture")
     t = SCALE_TIMEOUTS[scale]
-    # convergence gate: index docs == source DISTINCT id (in-cluster Job; Trino via REST). Wait for the
-    # connector to drain to the frozen source before gating.
-    run_driver_job("conv-gdb",
-                   f"ID_COL={ID_COL} TABLE={TABLE} INDEX={INDEX} python convergence_check.py "
-                   f"--engine growlerdb --wait-timeout {t['conv_gdb_wait']} --poll 15",
-                   timeout_s=t["conv_gdb_wait"] + CONV_MARGIN)
+    # Convergence already ran + passed in phase_gdb_coldsync (the ingest axis). Here: compact the
+    # source for a fair Trino baseline, then WARM the index before measuring.
     compact_source(scale, t["compact"])
+    # Warmup (best-effort): a short query pass so post-compaction locator-heal (stale locators →
+    # full-snapshot rehydrate scans, engine hydrate.rs) happens OFF the clock. Without it the first
+    # topk_hydrated queries pay 30s heal scans and the measured hydration latency is a transient, not
+    # steady state. Results discarded (no result_path).
+    run_driver_job(
+        "warmup-gdb",
+        "python compare_query.py run http_logs --engines growlerdb --qps 50 --duration 30 --out /tmp/out.json",
+        timeout_s=t["fresh_job"], check=False)
     run_driver_job(
         "query-gdb",
         "python compare_query.py run http_logs --engines growlerdb "
@@ -277,10 +309,15 @@ def phase_opensearch(scale):
     # convergence gate: OpenSearch _count == source DISTINCT id (Data Prepper CDC initial load complete).
     # The initial load of the whole table is the run's slowest step (hours at 50 GB) — conv_os_wait is
     # sized for it so a slow-but-healthy CDC load doesn't false-fail the gate. Querying mid-load is unfair.
+    # Timed + captured like phase_gdb_coldsync so the two ingest axes are measured identically.
+    start = time.time()
     run_driver_job("conv-os",
                    f"ID_COL={ID_COL} TABLE={TABLE} INDEX={INDEX} python convergence_check.py "
                    f"--engine opensearch --wait-timeout {t['conv_os_wait']} --poll 30",
                    timeout_s=t["conv_os_wait"] + CONV_MARGIN)
+    elapsed = time.time() - start
+    log(f"OpenSearch CDC cold-sync converged in {elapsed:.0f}s")
+    capture(scale, "OpenSearch cold-sync", params={"cold_sync_secs": f"{elapsed:.0f}"}, started_epoch=start)
     run_driver_job(
         "query-os",
         "python compare_query.py run http_logs --engines opensearch "
@@ -296,15 +333,25 @@ def phase_opensearch(scale):
 
 # --- capture (host-side; read-only Prometheus pull) ---------------------------------------------
 
-def capture(scale, phase_name, query_json, freshness_json):
-    """Fold the phase's result JSONs + a Prometheus metrics window into a run dir + ledger row.
+def capture(scale, phase_name, query_json="", freshness_json="", params=None, started_epoch=None):
+    """Fold a phase's result JSONs + a Prometheus metrics window into a run dir + ledger row.
 
     Runs host-side (the run dir must be local for the bucket push). PROM_URL must be reachable — a
     read-only scrape of already-recorded time series, NOT a load path, so a port-forward is fine here
-    (unlike the drivers). Set PROM_URL, or port-forward `svc/prometheus 9090:9090` before this."""
-    sh(f"python {HERE}/capture.py --purpose 'comparison {scale} — {phase_name} phase' "
-       f"--comparison {query_json} --freshness {freshness_json}",
-       {"PROM_URL": PROM_URL}, check=False)
+    (unlike the drivers). Set PROM_URL, or port-forward `svc/prometheus 9090:9090` before this.
+    query/freshness JSONs are optional (an ingest-only phase like the cold sync has neither);
+    `started_epoch` scopes the metrics window to exactly the phase (e.g. the cold-sync backfill), and
+    `params` records headline scalars (e.g. cold_sync_secs) into the audit + ledger."""
+    a = [f"--purpose 'comparison {scale} — {phase_name} phase'"]
+    if query_json:
+        a.append(f"--comparison {query_json}")
+    if freshness_json:
+        a.append(f"--freshness {freshness_json}")
+    if started_epoch is not None:
+        a.append(f"--started-epoch {started_epoch:.0f}")
+    for k, v in (params or {}).items():
+        a.append(f"--param {k}={v}")
+    sh(f"python {HERE}/capture.py " + " ".join(a), {"PROM_URL": PROM_URL}, check=False)
 
 
 def phase_finalize():
@@ -315,8 +362,10 @@ def phase_finalize():
         log("HETZNER_S3_* not set — skipping artifact push (create the bucket + set creds to enable)")
 
 
-PHASES = {"generate": phase_generate, "growlerdb": phase_growlerdb, "transition": phase_transition,
-          "opensearch": phase_opensearch, "finalize": phase_finalize}
+# Order matters (run-all iterates insertion order): generate the settled corpus → measure GrowlerDB's
+# cold sync → GrowlerDB query matrix → transition → measure OpenSearch's cold sync + query → finalize.
+PHASES = {"generate": phase_generate, "gdb_coldsync": phase_gdb_coldsync, "growlerdb": phase_growlerdb,
+          "transition": phase_transition, "opensearch": phase_opensearch, "finalize": phase_finalize}
 
 
 # --- offline self-check -------------------------------------------------------------------------
@@ -374,7 +423,8 @@ def main():
     order = list(PHASES) if args.phase == "all" else [args.phase]
     for name in order:
         fn = PHASES[name]
-        fn(target_rows) if name == "generate" else (fn(args.scale) if name in ("growlerdb", "opensearch") else fn())
+        fn(target_rows) if name == "generate" else (
+            fn(args.scale) if name in ("gdb_coldsync", "growlerdb", "opensearch") else fn())
     log("done" if not DRY else "plan complete (nothing executed)")
 
 

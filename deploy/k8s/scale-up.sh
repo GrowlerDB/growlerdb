@@ -34,6 +34,18 @@ WORKLOAD="${WORKLOAD:-http_logs}"
 NAMESPACE="${NAMESPACE:-growlerdb}"
 SHARDS="${SHARDS:-6}"
 GENERATORS="${GENERATORS:-1}"   # generator pod replicas — raise to parallelize ingest
+# STAGE splits the bring-up so ingest can be measured as a clean COLD sync (comparison-plan.md):
+#   deps    — deps + generator + observability, but NOT the GrowlerDB serving stack (nodes/connector),
+#             so generation runs with nothing ingesting it. compare_run's generate phase uses this.
+#   serving — the GrowlerDB serving stack ONLY (helm nodes + connector + verify), deployed AFTER the
+#             source table is generated and settled, so the connector cold-backfills a static table
+#             (mirrors bringing OpenSearch+Data Prepper up post-generation). This is the measured sync.
+#   all     — the original single-shot bring-up (unchanged default; GrowlerDB streams during generation).
+STAGE="${STAGE:-all}"
+# DEFINE_ONLY: bring nodes up EMPTY (define the index, skip the boot-build from source) so the
+# streaming connector performs the entire, measured cold backfill — symmetric with Data Prepper CDC and
+# keeping ingest on the metric-emitting connector write path. Default off (nodes boot-build as before).
+DEFINE_ONLY="${DEFINE_ONLY:-false}"
 IMAGE_TAG="${IMAGE_TAG:-dev}"
 GH_USER="${GH_USER:-}"
 GHCR_PAT="${GHCR_PAT:-}"
@@ -54,6 +66,11 @@ if [ "$IMAGE_TAG" = "latest" ]; then
 fi
 
 say() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
+
+deploy_observability() {
+  say "observability bundle (Prometheus / Grafana / node-exporter / kube-state / Trino / Loki+Promtail)"
+  kubectl apply -f "$HERE/observability/"
+}
 
 say "0/7 render the '$WORKLOAD' workload → generator/connector manifests + index def"
 # The render needs pyyaml; reuse the smoke venv pattern so the script runs on a bare host.
@@ -88,6 +105,8 @@ kubectl -n "$NAMESPACE" create secret docker-registry ghcr-pull \
   --docker-server=ghcr.io --docker-username="$GH_USER" --docker-password="$GHCR_PAT" \
   --dry-run=client -o yaml | kubectl apply -f -
 
+# --- deps + generator: run for `deps`/`all`, skip for `serving` (the source table already exists). ---
+if [ "$STAGE" != serving ]; then
 say "2/7 deps (MinIO / Polaris / Postgres) — the Iceberg catalog + object store"
 kubectl apply -k "$HERE/deps"   # kustomization pins namespace: growlerdb
 kubectl -n "$NAMESPACE" rollout status deploy/minio --timeout=180s
@@ -104,6 +123,15 @@ for _ in $(seq 1 40); do
   kubectl -n "$NAMESPACE" logs deploy/growlerdb-generator --tail=-1 2>/dev/null | grep -q "created $TABLE" && { echo "  table created"; break; }
   sleep 6
 done
+fi  # end deps+generator (skipped for STAGE=serving)
+
+# STAGE=deps stops here: bring up observability (so Prometheus scrapes generation + the later cold
+# sync) and exit WITHOUT the GrowlerDB serving stack, so generation runs with nothing ingesting it.
+if [ "$STAGE" = deps ]; then
+  deploy_observability
+  say "STAGE=deps complete — deps + generator + observability up; GrowlerDB serving stack NOT deployed"
+  exit 0
+fi
 
 say "4/7 GrowlerDB (helm) — $SHARDS $([ "$WINDOWED" = true ] && echo 'windowed nodes' || echo 'shards') serving $INDEX"
 # Cold-tiering (TASK-229): windowed runs exercise automatic park/revive. On by default for a windowed
@@ -127,7 +155,7 @@ if [ -n "${GROWLERDB_LICENSE:-}" ]; then
 fi
 helm upgrade --install gdb "$HELM_CHART" -f "$HELM_CHART/values-scale.yaml" -n "$NAMESPACE" \
   --set image.tag="$IMAGE_TAG" --set index.shards="$SHARDS" \
-  --set index.windowed="$WINDOWED" \
+  --set index.windowed="$WINDOWED" --set index.defineOnly="$DEFINE_ONLY" \
   --set index.name="$INDEX" --set index.sourceTable="$TABLE" \
   ${COLD_ARGS[@]+"${COLD_ARGS[@]}"} ${LICENSE_ARGS[@]+"${LICENSE_ARGS[@]}"} \
   --set-file index.definition="$INDEX_DEF"
@@ -157,8 +185,9 @@ deploy_connector() {
 kubectl -n "$NAMESPACE" rollout status deploy/gdb-growlerdb-gateway --timeout=300s
 [ "$WINDOWED" = true ] || deploy_connector
 
-say "6/7 observability bundle (Prometheus / Grafana / node-exporter / kube-state / Trino / Loki+Promtail)"
-kubectl apply -f "$HERE/observability/"
+# For STAGE=all, deploy observability here (original order). For STAGE=serving it is already up from
+# the deps stage, so skip it.
+[ "$STAGE" = all ] && deploy_observability
 
 say "7/7 verify — the gateway serves the $INDEX index"
 kubectl -n "$NAMESPACE" run scaleupcheck --rm -i --restart=Never --image=curlimages/curl -- \
