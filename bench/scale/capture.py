@@ -66,6 +66,27 @@ RANGE_METRICS = {
     "locator_remapped_rows": "max(growlerdb_locator_remapped_rows_total)",
     "cold_cache_hit_ratio": "sum(rate(growlerdb_cold_cache_hits_total[5m]))/clamp_min(sum(rate(growlerdb_cold_cache_lookups_total[5m])),1)",
     "node_cpu_cores": 'sum(rate(node_cpu_seconds_total{mode!="idle"}[2m]))',
+    # Ingest-bottleneck attribution (per-component). Cluster-summed series above can't localize a
+    # ceiling; these split it by shard-pod and pull the (already-scraped) connector metrics so a run
+    # can say WHAT limits ingest — connector vs node commit-path vs commit cadence vs shard-skew vs IO.
+    # Query split: retrieval (index only) vs hydration (Iceberg read) — the _search-adapter forces
+    # hydration on every query, so these two histograms separate engine-core cost from object-store cost.
+    "query_retrieval_p95": "histogram_quantile(0.95,sum(rate(growlerdb_query_retrieval_duration_seconds_bucket[2m]))by(le))",
+    "index_rate_dps_by_pod": "sum by (pod)(rate(growlerdb_ingested_docs_total[2m]))",
+    "commit_rate_by_pod": "sum by (pod)(rate(growlerdb_write_duration_seconds_count[2m]))",
+    "write_p95_by_pod": "histogram_quantile(0.95,sum by (le,pod)(rate(growlerdb_write_duration_seconds_bucket[2m])))",
+    "write_queue_depth_by_pod": "max by (pod)(growlerdb_write_queue_depth)",
+    "index_docs_by_pod": "sum by (pod)(growlerdb_index_docs)",
+    "connector_rows_read_dps": "rate(growlerdb_connector_rows_read_total[2m])",
+    "connector_trigger_rate": "rate(growlerdb_connector_triggers_total[2m])",
+    "connector_last_batch": "growlerdb_connector_last_trigger_rows",
+    "connector_shard_acks": "sum by (shard)(rate(growlerdb_connector_shard_acks_total[2m]))",
+    "connector_write_retries": "sum by (code)(rate(growlerdb_connector_write_retries_total[2m]))",
+    "connector_cpu_cores": 'sum(rate(container_cpu_usage_seconds_total{pod=~"growlerdb-connector.*"}[2m]))',
+    "node_cpu_by_pod": 'sum by (pod)(rate(container_cpu_usage_seconds_total{pod=~"gdb-growlerdb-node.*"}[2m]))',
+    "node_fs_write_by_pod": 'sum by (pod)(rate(container_fs_writes_bytes_total{pod=~"gdb-growlerdb-node.*"}[2m]))',
+    "node_disk_io_util": "max by (instance)(rate(node_disk_io_time_seconds_total[2m]))",
+    "minio_net_tx": 'sum(rate(container_network_transmit_bytes_total{pod=~"minio.*"}[2m]))',
 }
 
 # Loki log streams to dump (filename -> LogQL selector).

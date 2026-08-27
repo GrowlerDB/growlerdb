@@ -227,18 +227,23 @@ documented in the published report.
   at its selective best. (`request_id` stays key-only — identity/`_id`, not a searched term.)
 - **Coordinated omission** — see fairness charter #6.
 - **Duplicate `request_id`s from concurrent generation (OPEN — blocks exact convergence).** With
-  `GENERATORS>1`, parallel pods commit to the one Iceberg branch; under contention pyiceberg's
-  optimistic commit conflicts and its *internal* commit retry can re-apply a batch on a false-negative
-  catalog response → the same rows land twice. Observed **~1.2–1.5% duplicate request_ids** across the
-  2026-08-27 shakedowns. This is NOT the generator replaying (that was a separate, fixed restart-safety
-  bug) and it was **NOT fixed** by making the *outer* app-level retry regenerate fresh rows (commit
-  `d7fc862` — the duplication is a layer below it, inside pyiceberg). Consequence: source `COUNT(*)` >
-  `COUNT(DISTINCT)`, so GrowlerDB (indexes per row) and OpenSearch (dedups by `_id`) index different
-  counts and convergence can't close. **Design-around options (pick before the full run):** single-writer
-  generation (`GENERATORS=1` — no branch conflicts, so the retry path never fires; slower but the
-  Ingest methodology makes generation a separate up-front phase where that's acceptable), or a
-  post-generation **dedup pass** (Spark rewrite keeping one row per `request_id`) before the sync
-  phases. Do not run `--scale full` until the corpus is dup-free.
+  `GENERATORS>1`, parallel pods commit to the one Iceberg branch and ~**1.2–1.5% of rows end up
+  duplicated** (source `COUNT(*)` > `COUNT(DISTINCT request_id)`) — whole batches committed twice. Root
+  cause is **NOT the generator replaying** (separate, fixed restart-safety bug) and **NOT the pyiceberg
+  client** (a code read of pyiceberg 0.11.1 refuted this: `_do_commit` calls the catalog once, its
+  tenacity retry fires only on auth-token expiry — not 409/5xx/timeout — and every append carries an
+  `AssertRefSnapshotId` CAS so a re-send is rejected 409, never duplicated; the `commit.retry.num-retries`
+  property is a Java-Iceberg no-op pyiceberg never reads). Commit `d7fc862` (regenerate fresh rows in the
+  *outer* app retry) is harmless but was **not** the fix. By elimination the duplication is **server-side
+  — Polaris's own concurrent-commit handling (or an LB/ingress retrying commit POSTs)** — MEDIUM
+  confidence (Polaris not inspected). Consequence: GrowlerDB indexes per row (`COUNT(*)`) while OpenSearch
+  dedups by `_id`=request_id (`COUNT(DISTINCT)`), so the two index different counts and convergence can't
+  close. **Fix (confirmed dup-free, pick before the full run):** single-writer generation
+  (**`GENERATORS=1`** — structural guarantee: one writer → no branch conflicts → the server conflict path
+  never fires; ~3× slower generation, acceptable since the Ingest methodology makes generation a separate
+  up-front phase), **or** a post-generation **Spark dedup pass** (`ROW_NUMBER() OVER (PARTITION BY
+  request_id)=1`) in the settle step to keep parallel-gen speed. Gate `--scale full` on
+  `COUNT(*)==COUNT(DISTINCT request_id)`.
 - **GrowlerDB connector ingest throughput ceiling (measured ~21–24k docs/s, 6 shards/ccx43).** The
   streaming connector does **not** keep up with a generator burst of ~36k rows/s — it falls behind and
   accumulates lag (~130–150s / ~1M+ rows observed), then drains after the burst. For the benchmark this
@@ -246,12 +251,23 @@ documented in the published report.
   (~15.7k docs/s at 10 GB) as the ingest headline, and report freshness both under-load and at-rest.
   Worth a separate look at whether the ceiling is the single Spark connector, the nodes' indexing rate,
   or commit cadence — a faster connector would be a real GrowlerDB win to pursue.
-- **GrowlerDB `_search`-adapter query throughput (OPEN — blocks publishable query numbers).** At 10 GB
-  the in-cluster driver saw GrowlerDB sustain only **~15 qps** flat across 50→800 offered QPS with a
-  ~15s client-side p95, while the SAME driver did 800 qps against OpenSearch direct — yet GrowlerDB's
-  **engine-internal p95 was ~5ms** (Prometheus). So the ceiling is the serving *path* (the OpenSearch-
-  compat `_search` adapter on the gateway, or gateway↔node), and/or querying too soon after ingest+
-  compaction while nodes do background segment/locator work. Investigate cheaply before the full run:
-  native `/v1/search` vs the `_search` adapter throughput, and a quiesce/warm step before the query
-  matrix. Also: `topk_hydrated` uniformly hit the 30s timeout right after compaction — consistent with
-  the post-compaction locator-heal risk above; measure hydration-after-compaction explicitly.
+- **GrowlerDB query numbers were a MEASUREMENT ARTIFACT, not an engine limit (ROOT-CAUSED; drives a
+  harness fix).** At 10 GB the driver saw GrowlerDB flat at **~15 qps** (50→800 offered), ~15s client
+  p95, `topk_hydrated` all 30s-timeout — while engine-internal retrieval p95 was **~5ms**. Cause: the
+  OpenSearch-compat `_search` adapter **hard-codes `hydrate: true` on every request**
+  (`opensearch.rs:572`), so *every* query type — even `term`/`range`/`autocomplete` that need no
+  document — pays a full **hydrate-from-Iceberg** round-trip (a catalog `load_table` REST call + Parquet
+  point-reads per query per shard; `source/lib.rs:420-519`). That is throughput-bound by the catalog/
+  object store, not CPU → the flat qps. Native `/v1/search` defaults `hydrate=false` (`rest.rs:1922`).
+  The ~5ms metric is `growlerdb_query_retrieval_duration_seconds` (recorded *before* hydration); the
+  hydration cost lives in a **separate** histogram `growlerdb_hydration_duration_seconds` — so the
+  engine "looked fine" while every query hit object storage. Post-Iceberg-compaction **locator-heal**
+  makes it far worse (point-reads → full-snapshot scans; `hydrate.rs:67-78`), explaining the 15s stalls
+  and 30s topk timeouts. **Implication for fairness:** this IS the `_source`-vs-hydrate result (charter
+  #5) — but it must be measured **per query type**, not forced on all. **Harness fix:** drive GrowlerDB
+  index-only query types via **native `/v1/search` with `hydrate=false`** (vs OpenSearch `_search` with
+  `_source` off) and measure **full-document top-K separately** with hydration on (vs OpenSearch
+  `_source`), reporting storage footprint alongside — like the disclosed suggest-endpoint asymmetry.
+  Capture `retrieval` vs `hydration` vs `query{hydrated}` histograms + `stale_locators_total`. Confirm
+  with a one-boolean probe: native `/v1/search` hydrate=false (expect high qps @ ~5ms) vs hydrate=true
+  (expect the collapse).
