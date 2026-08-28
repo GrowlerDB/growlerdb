@@ -96,6 +96,21 @@ LOG_STREAMS = {
     "gateway": '{app="growlerdb-gateway"}',
 }
 
+# Avg uncompressed corpus row = the ONLY valid index:source denominator (never the compressed parquet
+# intermediary). Measured by corpus_stats.py `raw_row_bytes` (compact NDJSON, corpus_export.py format).
+# See synthetic-corpus.md. Override per run with --raw-row-bytes if the schema/generator changes.
+RAW_ROW_BYTES = 540.0
+
+
+def index_source_ratio_raw(index_bytes, rows, raw_row_bytes=RAW_ROW_BYTES):
+    """index:source on the RAW uncompressed basis: index_bytes / (rows * raw_row_bytes). Returns
+    (ratio, raw_source_bytes), or (None, None) if inputs are missing/zero. A ratio < 1 means the
+    index is smaller than the original corpus."""
+    if not index_bytes or not rows or not raw_row_bytes:
+        return None, None
+    raw_source_bytes = rows * raw_row_bytes
+    return index_bytes / raw_source_bytes, raw_source_bytes
+
 
 def iso(ts):
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -198,7 +213,7 @@ def last_value(prom_json):
         return None
 
 
-def capture_metrics(prom_url, start, end, step, out_dir):
+def capture_metrics(prom_url, start, end, step, out_dir, raw_row_bytes=RAW_ROW_BYTES):
     """Dump each metric's time-series to metrics/<name>.json. Returns {name: status} and a few
     headline last-values for the ledger summary."""
     mdir = os.path.join(out_dir, "metrics")
@@ -211,12 +226,19 @@ def capture_metrics(prom_url, start, end, step, out_dir):
                 json.dump(data, f)
             n = len(data.get("data", {}).get("result", []))
             status[name] = "ok" if n else "empty"
-            if name in ("index_docs", "query_latency_p95", "cold_cache_hit_ratio"):
+            if name in ("index_docs", "query_latency_p95", "cold_cache_hit_ratio",
+                        "index_bytes", "source_records"):
                 lv = last_value(data)
                 if lv is not None:
                     headline[name] = lv
         except Exception as e:
             status[name] = f"error: {type(e).__name__}"
+    # index:source on the raw uncompressed basis (rows * RAW_ROW_BYTES), never the compressed parquet.
+    rows = headline.get("source_records") or headline.get("index_docs")
+    ratio, raw_src = index_source_ratio_raw(headline.get("index_bytes"), rows, raw_row_bytes)
+    if ratio is not None:
+        headline["index_source_ratio_raw"] = ratio
+        headline["raw_source_bytes"] = raw_src
     return status, headline
 
 
@@ -299,6 +321,8 @@ def ledger_row(audit):
         summary_bits.append(f"p95={hl['query_latency_p95']*1000:.0f}ms")
     if "cold_cache_hit_ratio" in hl:
         summary_bits.append(f"cold_hit={hl['cold_cache_hit_ratio']:.2f}")
+    if "index_source_ratio_raw" in hl:
+        summary_bits.append(f"idx:src(raw)={hl['index_source_ratio_raw']:.2f}x")
     if audit.get("run_cost"):
         summary_bits.append(f"cost={audit['run_cost']}")
     summary = ", ".join(summary_bits) or "—"
@@ -361,7 +385,8 @@ def run(args):
     if args.dry_run:
         captured["mode"] = "dry-run (no metrics/logs/screenshots captured)"
     else:
-        m_status, headline = capture_metrics(args.prom, started, ended, args.step, out_dir)
+        m_status, headline = capture_metrics(args.prom, started, ended, args.step, out_dir,
+                                             args.raw_row_bytes)
         captured["metrics"] = m_status
         if args.loki:
             captured["logs"] = capture_logs(
@@ -420,6 +445,12 @@ def selftest():
     check(human_duration(3785) == "1h03m", f"human_duration hour: {human_duration(3785)}")
     check(human_duration(125) == "2m05s", f"human_duration min: {human_duration(125)}")
     check(human_duration(9) == "9s", "human_duration sec")
+    # index:source on the raw basis: GDB 4.21 GB index / (25.98M rows * 540 B) ≈ 0.30x (index < corpus).
+    r, src = index_source_ratio_raw(4.21e9, 25.98e6, 540.0)
+    check(abs(r - 0.300) < 0.01, f"index_source_ratio_raw {r}")
+    check(abs(src - 14.03e9) < 0.1e9, f"raw_source_bytes {src}")
+    check(index_source_ratio_raw(0, 100, 540) == (None, None), "ratio guards zero index")
+    check(index_source_ratio_raw(1e9, 0, 540) == (None, None), "ratio guards zero rows")
 
     with tempfile.TemporaryDirectory() as tmp:
         ledger = os.path.join(tmp, "RUNLOG.md")
@@ -428,7 +459,7 @@ def selftest():
             step="15s", window_min=63, started_epoch=None, param=[("shards", "6"), ("nodes", "6")],
             results=None, comparison=None, freshness=None, screenshots=False, max_screenshots=12, max_run_mb=200,
             log_limit=5000, cost="$4.20", dry_run=True, out_root=os.path.join(tmp, "runs"),
-            ledger=ledger, allow_over_budget=False,
+            ledger=ledger, allow_over_budget=False, raw_row_bytes=RAW_ROW_BYTES,
         )
         rc = run(args)
         check(rc == 0, f"run rc {rc}")
@@ -485,6 +516,9 @@ def main(argv=None):
                     help="exit 0 even if over --max-run-mb (default exits 2)")
     ap.add_argument("--log-limit", type=int, default=5000, help="max Loki lines per stream")
     ap.add_argument("--step", default="15s", help="Prometheus query_range step")
+    ap.add_argument("--raw-row-bytes", type=float, default=RAW_ROW_BYTES,
+                    help="avg uncompressed corpus row bytes for the index:source(raw) ratio "
+                         "(corpus_stats.py raw_row_bytes; NEVER the compressed parquet size)")
     ap.add_argument("--out-root", default=DEFAULT_RUNS_ROOT)
     ap.add_argument("--ledger", default=LEDGER)
     ap.add_argument("--prom", default=os.environ.get("PROM_URL", "http://localhost:9090"))

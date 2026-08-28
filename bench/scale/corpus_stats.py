@@ -44,6 +44,7 @@ def main():
     hour_c, wday_c, kind_status = Counter(), Counter(), {}
     sizes, rts, rt_5xx, rt_ok, nonzero_sizes = [], [], [], [], []
     n_done = 0
+    raw_bytes = 0  # exact uncompressed corpus size = the compact-NDJSON serialization corpus_export.py writes
     first_row = None
     while n_done < args.rows:
         b = min(50_000, args.rows - n_done)
@@ -51,6 +52,10 @@ def main():
         if first_row is None:
             first_row = {k: cols[k][0] for k in cols}
         for i in range(b):
+            # Match corpus_export.py byte-for-byte (compact separators + trailing newline) so
+            # `raw_row_bytes` is the true uncompressed corpus row size, the ONLY valid "source" basis
+            # for index:source ratios — never the compressed parquet intermediary. See synthetic-corpus.md.
+            raw_bytes += len(json.dumps({k: cols[k][i] for k in cols}, separators=(",", ":")).encode()) + 1
             st = cols["status"][i]; p = cols["path"][i]; sz = cols["response_size"][i]; rt = cols["response_time_ms"][i]
             status_c[st] += 1; method_c[cols["method"][i]] += 1; path_c[p] += 1
             ua_c[cols["user_agent"][i]] += 1; ip_c[cols["client_ip"][i]] += 1; user_c[cols["user_id"][i]] += 1
@@ -64,6 +69,7 @@ def main():
     tot = n_done
     rep = {
         "rows": tot, "seed": args.seed, "span_days": mod.SPAN_DAYS,
+        "raw_row_bytes": round(raw_bytes / tot, 1),  # avg uncompressed corpus row; the raw index:source basis
         "cardinality": {"path": len(path_c), "client_ip": len(ip_c), "user_id": len(user_c),
                         "user_agent": len(ua_c), "status": len(status_c)},
         "status_pct": {k: round(100.0 * v / tot, 2) for k, v in status_c.most_common()},
@@ -89,6 +95,8 @@ def main():
             json.dump(rep, f, indent=2)
 
     print(f"== synthetic http_logs corpus — validation report ({tot:,} rows, seed {args.seed}, span {mod.SPAN_DAYS}d) ==\n")
+    print(f"raw uncompressed row: {rep['raw_row_bytes']} B/row (compact NDJSON) "
+          f"-> raw corpus = rows * {rep['raw_row_bytes']} B; the ONLY valid index:source basis (not parquet)")
     print(f"cardinality: {rep['cardinality']}")
     print(f"\nstatus %: {rep['status_pct']}")
     print(f"  -> 200 share: {rep['status_pct'].get('200')}%  (target ~85-90%)")

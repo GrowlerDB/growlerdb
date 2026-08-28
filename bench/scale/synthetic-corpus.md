@@ -81,10 +81,17 @@ target distribution differs.
   (`corpus_export.py` / `artifacts.sh`), which is what a re-analysis or a re-run loads.
 - **Ingest rate.** The template defaults to a demo pace (`BATCH=10`, `SLEEP_S=5` ≈ 2 rows/s) so the
   readiness gate is cheap; `compare_run.py` cranks it to `BATCH=25000`/`SLEEP_S=1` (overridable via
-  `GEN_BATCH`/`GEN_SLEEP_S`) for the run. One pod caps ~6–7k rows/s, so 50 GB (~125M rows) needs
+  `GEN_BATCH`/`GEN_SLEEP_S`) for the run. One pod caps ~6–7k rows/s, so 50 GB (~93M rows) needs
   several pods (`--generators N` / `GENERATORS=N`).
-- **Scale to a target size.** ~350–450 B/row uncompressed → **~50 GB ≈ 120–140M rows**. Over the
-  default 7-day span that models **~215 req/s average** (~340 at peak hours, ~35 overnight).
+- **Raw uncompressed row size — the index:source basis.** Measured **~540 B/row** (the compact
+  NDJSON `corpus_export.py` writes — `corpus_stats.py` reports it as `raw_row_bytes`). This is the
+  **original uncompressed corpus**, and the ONLY valid denominator for an index:source storage ratio.
+  Never quote the Iceberg parquet size (compressed, ~60 B/row) as "source" — that is an internal,
+  compressed intermediary, not the corpus. (An earlier ~350–450 B/row estimate here understated it;
+  the field-name overhead of the 18-field JSON row is ~135 B/row on its own.)
+- **Scale to a target size.** ~540 B/row → **~50 GB ≈ 93M rows** (**~100 GB ≈ 185M rows**). Over the
+  default 7-day span, 50 GB models **~154 req/s average** (~250 at peak hours, ~25 overnight); the
+  req/s scales with the row count, so a larger target raises it proportionally.
 
 ## Validation report
 

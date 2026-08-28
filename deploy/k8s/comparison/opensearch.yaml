@@ -25,15 +25,17 @@ kind: ConfigMap
 metadata: { name: opensearch-index-mapping, namespace: growlerdb }
 data:
   # Parity mapping derived from bench/scale/workloads/http_logs/index.yaml. shards=6 matches
-  # GrowlerDB shard_count; refresh_interval fixed at the 1s default; standard analyzer (no stemming)
-  # matches GrowlerDB's default lexical. request_id is the document _id (Data Prepper
-  # identifier_columns), not a mapped field. TODO: add the autocomplete field to mirror /v1/suggest.
+  # GrowlerDB shard_count; replicas=0 matches GrowlerDB's single-primary run so the on-disk storage
+  # comparison is primary-vs-primary (both engines unreplicated — disclosed in the report);
+  # refresh_interval fixed at the 1s default; standard analyzer (no stemming) matches GrowlerDB's
+  # default lexical. request_id is the document _id (Data Prepper identifier_columns), not a mapped
+  # field. user_id_suggest is the dedicated completion FST mirroring GrowlerDB's suggest path.
   http_logs.json: |
     {
       "settings": {
         "index": {
           "number_of_shards": 6,
-          "number_of_replicas": 1,
+          "number_of_replicas": 0,
           "refresh_interval": "1s"
         }
       },
