@@ -2721,4 +2721,158 @@ mod tests {
             "AND-ing the row's ts sort-key value prunes to the single file that can hold it"
         );
     }
+
+    /// Reproduction (no cloud) of the **live** sort-key prune path — over a real **REST catalog**
+    /// (Polaris), the one difference from [`sort_key_hint_prunes_hydration_scan`] (which loads via
+    /// `StaticTable` off a metadata file). Settles the two candidate live root causes:
+    ///
+    /// - **(A) RestCatalog gap** — does `iceberg-rust`'s `RestCatalog::load_table` surface
+    ///   `default_sort_order()` (identity `ts`/`request_id`) the same as `StaticTable`? If Polaris /
+    ///   the REST response didn't round-trip the sort order, [`sort_field_names`] returns `[]` live →
+    ///   no hint → full scan. Asserted directly below.
+    /// - **(B) Key typing** — for the real `request_id` (a string identifier) key, does
+    ///   [`key_predicate`] emit a predicate that still carries the `ts` term? Asserted via the
+    ///   predicate's rendered form.
+    ///
+    /// Then the end-to-end proof: `plan_files` over the REST-loaded [`Table`] prunes 6 → 1 once the
+    /// `ts` hint is AND-ed on (vs 6 on the key alone).
+    ///
+    /// Stand the fixture up first (Polaris + MinIO, no cloud):
+    ///   `docker compose -p prunerepro up -d minio createbuckets polaris-db polaris-bootstrap polaris`
+    ///   `POLARIS=http://localhost:8181 bash deploy/compose/setup-polaris.sh`  (creates the `growlerdb` catalog)
+    ///   then create `growlerdb.{sorted,unsorted}` THROUGH the REST catalog with a declared
+    ///   `sort_order=[ts, request_id]` (see the investigation's `gen_rest_prune.py`).
+    /// Run it in-network (the catalog vends the `minio:9000` endpoint):
+    ///   `GROWLERDB_CATALOG_URI=http://polaris:8181/api/catalog cargo test -p growlerdb-source \
+    ///      -- --ignored rest_catalog_sort_key_hint_prunes_hydration_scan`
+    #[tokio::test]
+    #[ignore = "requires a local Polaris+MinIO REST catalog with growlerdb.{sorted,unsorted} (see gen_rest_prune.py)"]
+    async fn rest_catalog_sort_key_hint_prunes_hydration_scan() {
+        use growlerdb_core::{CompositeKey, Value};
+
+        const TARGET_RID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const TARGET_TS: i64 = 4500; // the target row's ts — inside only file 3's manifest range
+
+        let reader = IcebergReader::connect(&IcebergConfig::from_env())
+            .await
+            .expect("connect to REST catalog");
+
+        // (A) — the REST-loaded table's declared sort order surfaces as hint fields (metadata only, no
+        // S3): if this were empty live, there'd be no `ts` hint and the fallback would full-scan.
+        assert_eq!(
+            reader.sort_field_names("growlerdb.sorted").await.unwrap(),
+            vec!["ts".to_string(), "request_id".to_string()],
+            "(A) RestCatalog::load_table must surface default_sort_order() over REST — else no hint → full scan"
+        );
+        assert!(
+            reader
+                .sort_field_names("growlerdb.unsorted")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the unsorted twin has no declared order → no hint (the live full-scan symptom's cause)"
+        );
+
+        let ident = TableIdent::from_strs(["growlerdb", "sorted"]).unwrap();
+        let tbl = reader.catalog.load_table(&ident).await.expect("load_table");
+        let schema = tbl.metadata().current_schema();
+
+        // (B) — the real string `request_id` key: the predicate types AND still carries the `ts` term.
+        let key = CompositeKey::new(
+            vec![],
+            vec![("request_id".into(), Value::Str(TARGET_RID.into()))],
+        );
+        let ts_hint: Vec<(String, Value)> = vec![("ts".into(), Value::Int(TARGET_TS))];
+        let key_only = key_predicate(schema, &[(&key, &[])]).expect("key predicate");
+        let key_and_ts =
+            key_predicate(schema, &[(&key, ts_hint.as_slice())]).expect("key+ts predicate");
+        let rendered = format!("{key_and_ts}");
+        assert!(
+            rendered.contains("ts") && rendered.contains("request_id"),
+            "(B) predicate must carry BOTH the ts hint and the request_id key term, got: {rendered}"
+        );
+
+        async fn plan_count(tbl: &Table, predicate: Option<Predicate>) -> usize {
+            let mut b = tbl.scan().select_all();
+            if let Some(p) = predicate {
+                b = b.with_filter(p);
+            }
+            let tasks: Vec<FileScanTask> = b
+                .build()
+                .unwrap()
+                .plan_files()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            tasks.len()
+        }
+
+        // The end-to-end proof over REST — file-count delta (reads manifests from object storage).
+        let full = plan_count(&tbl, None).await;
+        let key_scan = plan_count(&tbl, Some(key_only)).await;
+        let hint_scan = plan_count(&tbl, Some(key_and_ts)).await;
+        assert_eq!(full, 6, "6 ts-disjoint data files in the snapshot");
+        assert_eq!(
+            key_scan, 6,
+            "the random request_id spans every file's min/max → key alone can't prune"
+        );
+        assert_eq!(
+            hint_scan, 1,
+            "over REST too, AND-ing the row's ts sort-key value prunes to the one file that holds it"
+        );
+
+        // The live differentiator: a topk hydrates a *batch* of keys at once → ONE OR-of-AND
+        // predicate. The ts hint only prunes when the batch's keys cluster in a narrow ts window.
+        // A clustered batch (both keys in file 3's ts range) still prunes to 1; a batch whose keys
+        // are spread across the whole timeline (one distinct key per file, each ts in a different
+        // file's range) matches EVERY file — the OR spans the space, so nothing prunes and the scan
+        // reads all 6 files. That is the live full-scan: a broad topk, not a narrow/recency one.
+        let clustered_keys = [
+            (
+                CompositeKey::new(
+                    vec![],
+                    vec![("request_id".into(), Value::Str(TARGET_RID.into()))],
+                ),
+                vec![("ts".into(), Value::Int(TARGET_TS))],
+            ),
+            (
+                CompositeKey::new(
+                    vec![],
+                    vec![("request_id".into(), Value::Str(format!("c{:031x}", 3)))],
+                ),
+                vec![("ts".into(), Value::Int(4600))], // file 3 range [4000,4900]
+            ),
+        ];
+        let clustered: Vec<(&CompositeKey, &[(String, Value)])> = clustered_keys
+            .iter()
+            .map(|(k, h)| (k, h.as_slice()))
+            .collect();
+        let clustered_scan = plan_count(&tbl, key_predicate(schema, &clustered)).await;
+        assert_eq!(
+            clustered_scan, 1,
+            "a topk batch clustered in one ts window still prunes to its file"
+        );
+
+        // One distinct key per file, ts spread across all 6 file ranges.
+        let spread_keys: Vec<(CompositeKey, Vec<(String, Value)>)> = (0..6)
+            .map(|i| {
+                (
+                    CompositeKey::new(
+                        vec![],
+                        vec![("request_id".into(), Value::Str(format!("c{i:031x}")))],
+                    ),
+                    vec![("ts".into(), Value::Int(1000 + i * 1000 + 600))],
+                )
+            })
+            .collect();
+        let spread: Vec<(&CompositeKey, &[(String, Value)])> =
+            spread_keys.iter().map(|(k, h)| (k, h.as_slice())).collect();
+        let spread_scan = plan_count(&tbl, key_predicate(schema, &spread)).await;
+        assert_eq!(
+            spread_scan, 6,
+            "a topk batch whose keys span the whole timeline can't prune — the OR matches every file (the live 30s full-scan)"
+        );
+    }
 }
