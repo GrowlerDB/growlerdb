@@ -2596,4 +2596,114 @@ mod tests {
             "MoR history delete must be honored (9 live rows, not 10 or 0)"
         );
     }
+
+    /// Reproduction (no cloud): the **sort-key hydration prune**, end to end. A local Iceberg table
+    /// with a declared sort order `[ts, request_id]` (identity — what Spark `WRITE ORDERED BY ts,
+    /// request_id` records) and 6 ts-disjoint data files, each a tight `ts` manifest min/max — the
+    /// post-compaction, ts-clustered layout the bench measured via Trino readable_metrics. The key
+    /// (`request_id`) is written to span the whole hex space in every file, so a request_id-only
+    /// predicate can never prune.
+    ///
+    /// Proves the mechanism: the pass-2 fallback's [`key_predicate`], once the row's own `ts`
+    /// sort-key value is AND-ed on as a prune hint, makes `plan_files` prune to the **one** file that
+    /// can hold the row (vs the full 6-file scan on the key alone). Also proves the *dependency* on a
+    /// declared sort order: [`sort_field_names_of`] reads `default_sort_order()` — the sorted table
+    /// yields the `ts` hint field, its unsorted twin (same data, same clustering, no sort order)
+    /// yields none → no hint → full scan, which is the live symptom's cause.
+    ///
+    /// Generate the fixture first (any pyiceberg + pyarrow venv):
+    ///   `NS_WAREHOUSE=/tmp/prunewh python3 tests/fixtures/gen_prune_fixture.py`
+    /// Then: `cargo test -p growlerdb-source -- --ignored sort_key_hint_prunes_hydration_scan`
+    #[tokio::test]
+    #[ignore = "requires the pyiceberg prune fixture at /tmp/prunewh (see gen_prune_fixture.py)"]
+    async fn sort_key_hint_prunes_hydration_scan() {
+        use growlerdb_core::{CompositeKey, Value};
+        use iceberg::io::FileIOBuilder;
+        use iceberg::table::StaticTable;
+        use iceberg_storage_opendal::OpenDalStorageFactory;
+
+        let wh = std::env::var("GDB_PRUNE_WAREHOUSE").unwrap_or_else(|_| "/tmp/prunewh".into());
+        async fn load(wh: &str, name: &str) -> Table {
+            let dir = format!("{wh}/ns/{name}/metadata");
+            let mut v: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("read fixture dir {dir}: {e}"))
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                .collect();
+            v.sort(); // version-prefixed (00000-, 00001-, …) → last is the current metadata
+            let meta = v
+                .last()
+                .expect("a metadata json")
+                .to_string_lossy()
+                .into_owned();
+            let file_io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::Fs)).build();
+            let ident = TableIdent::from_strs(["ns", name]).unwrap();
+            StaticTable::from_metadata_file(&meta, ident, file_io)
+                .await
+                .expect("static table")
+                .into_table()
+        }
+        async fn plan_count(tbl: &Table, predicate: Option<Predicate>) -> usize {
+            let mut b = tbl.scan().select_all();
+            if let Some(p) = predicate {
+                b = b.with_filter(p);
+            }
+            let tasks: Vec<FileScanTask> = b
+                .build()
+                .unwrap()
+                .plan_files()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            tasks.len()
+        }
+
+        let sorted = load(&wh, "sorted").await;
+        let unsorted = load(&wh, "unsorted").await;
+
+        // (1) default_sort_order() IS read: the identity sort columns resolve to their names.
+        assert_eq!(
+            sort_field_names_of(&sorted),
+            vec!["ts".to_string(), "request_id".to_string()],
+            "declared sort order [ts, request_id] must surface as hint fields"
+        );
+        assert!(
+            sort_field_names_of(&unsorted).is_empty(),
+            "no declared sort order → no hint fields → the live full-scan symptom"
+        );
+
+        // The stale key + its own ts sort-key value (the prune hint attach_prune_hints would build).
+        let key = CompositeKey::new(
+            vec![],
+            vec![(
+                "request_id".into(),
+                Value::Str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+            )],
+        );
+        let no_hint: &[(String, Value)] = &[];
+        let ts_hint: Vec<(String, Value)> = vec![("ts".into(), Value::Int(4500))];
+        let schema = sorted.metadata().current_schema();
+        let key_only = key_predicate(schema, &[(&key, no_hint)]);
+        let key_and_ts = key_predicate(schema, &[(&key, ts_hint.as_slice())]);
+        assert!(
+            key_only.is_some() && key_and_ts.is_some(),
+            "predicates build"
+        );
+
+        // (2) THE PROOF — the file-count delta.
+        let full = plan_count(&sorted, None).await;
+        let key_scan = plan_count(&sorted, key_only).await;
+        let hint_scan = plan_count(&sorted, key_and_ts).await;
+        assert_eq!(full, 6, "6 ts-disjoint data files in the snapshot");
+        assert_eq!(
+            key_scan, 6,
+            "the random key spans every file's min/max → key alone can't prune (the wall)"
+        );
+        assert_eq!(
+            hint_scan, 1,
+            "AND-ing the row's ts sort-key value prunes to the single file that can hold it"
+        );
+    }
 }
