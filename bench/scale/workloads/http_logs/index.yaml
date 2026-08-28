@@ -35,7 +35,11 @@ mapping:
     - { path: user_agent, type: TEXT }
     - { path: referer, type: TEXT, record: FREQ }
     - { path: client_ip, type: IP } # CIDR queries
-    - { path: user_id, type: KEYWORD }
+    # user_id drives the /v1/suggest autocomplete benchmark: `suggest: true` builds a per-segment
+    # prefix-completion sidecar so a short prefix answers from a precomputed top-K table (latency
+    # parity with OpenSearch's completion FST) instead of a live term-dictionary scan over this
+    # high-cardinality field.
+    - { path: user_id, type: KEYWORD, suggest: true }
     - { path: region, type: KEYWORD }
     - { path: response_time_ms, type: LONG, fast: true } # range / sort
     - { path: response_size, type: LONG, fast: true }

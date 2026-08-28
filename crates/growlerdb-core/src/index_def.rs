@@ -796,6 +796,7 @@ fn resolve_field(
         record: ovr.and_then(|o| o.record).unwrap_or(TextRecord::Position),
         fieldnorms: ovr.and_then(|o| o.fieldnorms).unwrap_or(true),
         cached: ovr.is_some_and(|o| o.cached),
+        suggest: ovr.is_some_and(|o| o.suggest),
         sensitive: ovr.is_some_and(|o| o.sensitive),
         max_bytes: ovr.and_then(|o| o.max_bytes),
         vector: None,
@@ -827,6 +828,7 @@ fn resolve_vector_field(f: &FieldMapping) -> Result<ResolvedField, DefError> {
     };
     reject(f.fast, "fast")?;
     reject(f.cached, "cached")?;
+    reject(f.suggest, "suggest")?;
     reject(f.sensitive, "sensitive")?;
     reject(f.analyzer.is_some(), "analyzer")?;
     reject(f.record.is_some(), "record")?;
@@ -868,6 +870,7 @@ fn resolve_vector_field(f: &FieldMapping) -> Result<ResolvedField, DefError> {
         record: TextRecord::Position,
         fieldnorms: true,
         cached: false,
+        suggest: false,
         sensitive: false,
         max_bytes: None,
         vector: Some(spec),
@@ -979,6 +982,7 @@ fn resolve_variant_field(f: &FieldMapping) -> Result<Vec<ResolvedField>, DefErro
         record: TextRecord::Position,
         fieldnorms: true,
         cached: false,
+        suggest: false,
         sensitive: false,
         max_bytes: None,
         vector: None,
@@ -1041,6 +1045,11 @@ pub struct FieldMapping {
     /// hit, so a page renders without hydration. Default false.
     #[serde(default)]
     pub cached: bool,
+    /// **Suggest** field — build a per-segment prefix-completion sidecar so `/v1/suggest`
+    /// answers from a precomputed top-K-by-frequency table instead of a live term-dict scan.
+    /// Only KEYWORD/TEXT fields are eligible; ignored (no sidecar) on other types. Default false.
+    #[serde(default)]
+    pub suggest: bool,
     /// **Sensitive** field (eventually catalog/Polaris-marked) — hard-blocked
     /// from caching; requesting `cached` on it is a resolve error. Default false.
     #[serde(default)]
@@ -1789,6 +1798,10 @@ pub struct ResolvedField {
     /// Cached display field — value stored in-index and returned with the hit.
     #[serde(default)]
     pub cached: bool,
+    /// Suggest field — a prefix-completion sidecar is built (KEYWORD/TEXT only). See
+    /// [`FieldMapping::suggest`].
+    #[serde(default)]
+    pub suggest: bool,
     /// Sensitive field — never cacheable. See [`FieldMapping::sensitive`].
     #[serde(default)]
     pub sensitive: bool,

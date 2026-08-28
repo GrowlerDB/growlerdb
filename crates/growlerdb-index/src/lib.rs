@@ -4,6 +4,7 @@
 //! See the Index API and on-disk schema design docs.
 
 pub mod bundle;
+pub mod completion;
 pub mod hotcache;
 pub mod location;
 pub mod object_directory;
@@ -13,6 +14,9 @@ mod sidecar;
 pub mod store;
 pub mod vector;
 
+pub use completion::{
+    SegmentCompletion, COMPLETION_PREFIX_DEPTH, COMPLETION_SUFFIX, COMPLETION_TOP_K,
+};
 pub use location::{LocationStore, ENTRY_BYTES, LOCATION_FILE};
 pub use object_directory::ObjectDirectory;
 pub use range_cache::{CacheStats, RangeCache};

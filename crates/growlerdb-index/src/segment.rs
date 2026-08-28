@@ -11,6 +11,9 @@ use std::net::{IpAddr, Ipv6Addr};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
+use crate::completion::{
+    CompletionBuilder, SegmentCompletion, COMPLETION_PREFIX_DEPTH, COMPLETION_SUFFIX,
+};
 use crate::vector::{SegmentAnn, StoredAnnIndex, ANN_SUFFIX};
 
 use growlerdb_core::{
@@ -117,6 +120,10 @@ pub enum IndexError {
     /// An ANN sidecar could not be parsed (bad frame / postcard decode).
     #[error("ann sidecar: {0}")]
     Vector(#[from] crate::vector::VectorIndexError),
+
+    /// A completion sidecar could not be parsed (bad frame / postcard decode).
+    #[error("completion sidecar: {0}")]
+    Sidecar(String),
 }
 
 /// Convenience result alias for the index crate.
@@ -155,6 +162,9 @@ pub struct IndexSchema {
     /// The VECTOR fields (ANN-build inputs), in definition order — each with its stored-bytes handle
     /// and [`VectorSpec`](growlerdb_core::VectorSpec). Empty for a non-vector index (ANN skipped).
     vector_fields: Vec<VectorFieldInfo>,
+    /// The `suggest`-flagged KEYWORD/TEXT fields (completion-sidecar inputs) — `(path, handle)` in
+    /// definition order. Empty when no field opts in (the completion sidecar is skipped).
+    suggest_fields: Vec<(String, Field)>,
     /// The VARIANT columns' flatten fields (D47), keyed by column — the reserved
     /// `<column>#terms` / `<column>#text` handles (each present iff that flatten mode is on).
     variant_fields: Vec<VariantFieldInfo>,
@@ -193,6 +203,8 @@ pub struct MappedFieldSummary {
     pub fast: bool,
     pub indexed: bool,
     pub cached: bool,
+    /// Whether the field has a prefix-completion sidecar (`/v1/suggest` fast path).
+    pub suggest: bool,
 }
 
 /// A VECTOR field's describe-facing summary: field path plus the embedding config a console needs
@@ -227,6 +239,7 @@ impl IndexSchema {
         let mut sortable_fields = Vec::new();
         let mut mapped_field_summaries = Vec::with_capacity(idx.fields.len());
         let mut vector_fields = Vec::new();
+        let mut suggest_fields = Vec::new();
         let mut variant_fields = Vec::new();
         for f in &idx.fields {
             // A VARIANT field carries no single typed Tantivy field — only its flatten index
@@ -262,6 +275,7 @@ impl IndexSchema {
                     // "indexed" for a variant = queryable via the flatten index.
                     indexed: terms || text,
                     cached: false,
+                    suggest: false,
                 });
                 continue;
             }
@@ -318,12 +332,19 @@ impl IndexSchema {
                 }
             }
             fields.push((f.path.clone(), handle, f.ty, f.format));
+            // Only KEYWORD/TEXT fields have a term dictionary to complete over; `suggest` on any
+            // other type is ignored (no sidecar), per the graceful-ignore contract.
+            let suggest = f.suggest && matches!(f.ty, FieldType::Keyword | FieldType::Text);
+            if suggest {
+                suggest_fields.push((f.path.clone(), handle));
+            }
             mapped_field_summaries.push(MappedFieldSummary {
                 name: f.path.clone(),
                 ty: format!("{:?}", f.ty).to_uppercase(),
                 fast: f.fast,
                 indexed: f.indexed,
                 cached: f.cached,
+                suggest,
             });
         }
         // Added after the mapped fields so internal handles never shift a user field's ordinal.
@@ -341,6 +362,7 @@ impl IndexSchema {
             tenant_field: idx.tenant_field().map(str::to_string),
             location_strategy: idx.location_strategy,
             vector_fields,
+            suggest_fields,
             variant_fields,
         }
     }
@@ -349,6 +371,18 @@ impl IndexSchema {
     /// When false the commit/compaction paths skip the ANN build entirely.
     pub fn has_vector_fields(&self) -> bool {
         !self.vector_fields.is_empty()
+    }
+
+    /// Whether any field opts into a prefix-completion sidecar — i.e. whether the commit/compaction
+    /// paths build a per-segment `<uuid>.cmp`. False → the completion build is skipped entirely.
+    pub fn has_suggest_fields(&self) -> bool {
+        !self.suggest_fields.is_empty()
+    }
+
+    /// Whether `name` is a `suggest`-flagged KEYWORD/TEXT field — the gate the suggest path checks
+    /// before attempting the completion-sidecar fast path.
+    pub fn is_suggest_field(&self, name: &str) -> bool {
+        self.suggest_fields.iter().any(|(p, _)| p == name)
     }
 
     /// Whether this index maps an Iceberg v3 **variant** column (D47) — the cheap, schema-only
@@ -613,6 +647,12 @@ fn ann_sidecar_name(segment_uuid: &str) -> String {
     format!("{segment_uuid}.{ANN_SUFFIX}")
 }
 
+/// The file name of a segment's completion sidecar: `<segment-uuid>.cmp`, beside the lexical segment
+/// files. One file per segment holds every `suggest` field's prefix table.
+pub fn completion_sidecar_name(segment_uuid: &str) -> String {
+    format!("{segment_uuid}.{COMPLETION_SUFFIX}")
+}
+
 /// Normalize an `IpAddr` to the IPv6 form Tantivy stores (IPv4 → v4-mapped v6).
 fn to_ipv6(ip: IpAddr) -> Ipv6Addr {
     match ip {
@@ -704,10 +744,11 @@ impl TantivySegmentCore {
         }
 
         writer.commit()?;
-        // Build the per-segment ANN sidecar(s) over the just-committed vectors.
-        if schema.has_vector_fields() {
+        // Build the per-segment ANN + completion sidecar(s) over the just-committed segment.
+        if schema.has_vector_fields() || schema.has_suggest_fields() {
             let reader = self.open(dir)?;
             reader.build_ann_sidecars(schema, dir)?;
+            reader.build_completion_sidecars(schema, dir)?;
         }
         Ok(batch.docs.len() as u64)
     }
@@ -1058,6 +1099,97 @@ impl SegmentReader {
             }
         }
         Ok(vectors)
+    }
+
+    /// Build the **per-segment completion sidecar(s)** for every `suggest` field in `schema`, writing
+    /// `<segment-uuid>.cmp` beside each Tantivy segment in `dir`. Idempotent (an existing sidecar is
+    /// skipped), so it can run after every commit; rebuilt for a new (merged) segment id on
+    /// compaction, mirroring [`build_ann_sidecars`](Self::build_ann_sidecars). Frequencies are the
+    /// dictionary's `doc_freq` (not liveness-filtered) — the accepted suggester contract.
+    pub fn build_completion_sidecars(&self, schema: &IndexSchema, dir: &Path) -> Result<()> {
+        if schema.suggest_fields.is_empty() {
+            return Ok(());
+        }
+        let searcher = self.reader.searcher();
+        for seg in searcher.segment_readers() {
+            let path = dir.join(completion_sidecar_name(&seg.segment_id().uuid_string()));
+            if path.exists() {
+                continue; // already built (content-stable per segment id)
+            }
+            let mut sidecar = SegmentCompletion::new();
+            for (name, handle) in &schema.suggest_fields {
+                let inverted = seg.inverted_index(*handle)?;
+                let mut builder = CompletionBuilder::new();
+                let mut stream = inverted
+                    .terms()
+                    .stream()
+                    .map_err(|e| IndexError::Tantivy(e.into()))?;
+                while stream.advance() {
+                    builder.add(stream.key(), stream.value().doc_freq as u64);
+                }
+                let table = builder.finish();
+                if !table.is_empty() {
+                    sidecar.insert(name.clone(), table);
+                }
+            }
+            if !sidecar.is_empty() {
+                std::fs::write(&path, sidecar.to_frame())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// **Prefix autocomplete from the completion sidecar**: the top-`limit` terms of `field` under
+    /// `prefix` by descending doc frequency (ties by term ascending) — read from each segment's
+    /// precomputed `<uuid>.cmp` instead of scanning the term dictionary. Returns `None` (fall back to
+    /// the live seek) when the sidecar can't answer: no local index dir, an empty/over-`P` prefix, or
+    /// **any** live segment missing its sidecar or a table for `field` (partial coverage would drop
+    /// terms and mis-rank). Same summed-across-segments frequency contract as [`prefix_terms`](
+    /// Self::prefix_terms), so a flagged field returns identical results to the live path.
+    pub fn suggest_prefix_sidecar(
+        &self,
+        field: &str,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Option<Vec<(String, u64)>>> {
+        let Some(dir) = self.index_dir.as_ref() else {
+            return Ok(None); // no local sidecar directory (e.g. cold read-through)
+        };
+        let (_, is_text) = self.resolve_field(Some(field))?;
+        let needle = if is_text {
+            prefix.to_lowercase()
+        } else {
+            prefix.to_string()
+        };
+        let needle = needle.as_bytes();
+        // A too-long prefix already selects few terms (cheap live) and isn't in the table; an empty
+        // prefix isn't keyed. Byte length matches the FST's byte-sorted prefix semantics.
+        if needle.is_empty() || needle.len() > COMPLETION_PREFIX_DEPTH {
+            return Ok(None);
+        }
+        let searcher = self.reader.searcher();
+        let mut totals: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        for seg in searcher.segment_readers() {
+            let path = dir.join(completion_sidecar_name(&seg.segment_id().uuid_string()));
+            let Ok(bytes) = std::fs::read(&path) else {
+                return Ok(None); // a live segment lacks its sidecar — fall back for completeness
+            };
+            let sidecar = SegmentCompletion::from_frame(&bytes).map_err(IndexError::Sidecar)?;
+            let Some(table) = sidecar.field(field) else {
+                return Ok(None); // sidecar doesn't cover this field — fall back
+            };
+            // An absent key means this segment holds no terms under the prefix (contributes nothing);
+            // a present key sums into the cross-segment total, matching the live path.
+            if let Some(entries) = table.get(needle) {
+                for (term, freq) in entries {
+                    *totals.entry(term.clone()).or_insert(0) += freq;
+                }
+            }
+        }
+        let mut ranked: Vec<(String, u64)> = totals.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        ranked.truncate(limit);
+        Ok(Some(ranked))
     }
 
     pub fn knn_search(

@@ -1828,10 +1828,11 @@ impl Shard {
         // writer (last upsert on a chunk boundary) is a harmless no-op fsync.
         flush_chunk!();
 
-        // Build the per-segment ANN sidecars over the just-committed vectors. Idempotent + skipped
-        // for a non-vector index; runs after the final flush so the reloaded searcher sees every new
-        // segment.
+        // Build the per-segment ANN + completion sidecars over the just-committed segments.
+        // Idempotent + skipped when the index has no such field; run after the final flush so the
+        // reloaded searcher sees every new segment.
         self.build_ann_sidecars()?;
+        self.build_completion_sidecars()?;
 
         // 2) redb: checkpoint + snapshot + batch ids + new file-table interns.
         let t_redb = std::time::Instant::now();
@@ -2394,10 +2395,11 @@ impl Shard {
                 .map_err(|e| StoreError::Segment(e.into()))?;
             drop(writer); // release the lock so ingest can commit before the next bounded pass
             self.core.reload().map_err(StoreError::Segment)?;
-            // A merge produced a new segment id → build its ANN sidecar. The merged-away segments'
-            // orphaned `.ann` sidecars may linger (harmless — `sealed_segments` lists only current
-            // segments, so backup never carries an orphan).
+            // A merge produced a new segment id → build its ANN + completion sidecars. The
+            // merged-away segments' orphaned sidecars may linger (harmless — `sealed_segments` lists
+            // only current segments, so backup never carries an orphan).
             self.build_ann_sidecars()?;
+            self.build_completion_sidecars()?;
         }
         Ok(())
     }
@@ -2570,6 +2572,18 @@ impl Shard {
             .map_err(StoreError::Segment)
     }
 
+    /// Build the per-segment completion sidecars (`<uuid>.cmp`) for the `suggest` fields. Idempotent
+    /// and a no-op when no field opts in. Must run with the live reader reloaded onto the target
+    /// commit, so it sees every new segment — same discipline as [`build_ann_sidecars`](Self::build_ann_sidecars).
+    fn build_completion_sidecars(&self) -> Result<()> {
+        if !self.schema.has_suggest_fields() {
+            return Ok(());
+        }
+        self.core
+            .build_completion_sidecars(&self.schema, &self.index_dir)
+            .map_err(StoreError::Segment)
+    }
+
     pub fn sealed_segments(&self) -> Result<Vec<SealedSegment>> {
         let segments = self.index.searchable_segments().map_err(IndexError::from)?;
         Ok(segments
@@ -2583,11 +2597,14 @@ impl Shard {
                     .into_iter()
                     .filter(|f| self.index_dir.join(f).exists())
                     .collect();
-                // The `.ann` sidecar isn't listed by `list_files` but belongs to this segment —
-                // register it so backup/restore carries it (content-stable, dedupes like the rest).
-                let ann = PathBuf::from(format!("{}.ann", meta.id().uuid_string()));
-                if self.index_dir.join(&ann).exists() {
-                    files.push(ann);
+                // The `.ann`/`.cmp` sidecars aren't listed by `list_files` but belong to this
+                // segment — register them so backup/restore carries them (content-stable, dedupes
+                // like the rest).
+                for suffix in ["ann", "cmp"] {
+                    let side = PathBuf::from(format!("{}.{suffix}", meta.id().uuid_string()));
+                    if self.index_dir.join(&side).exists() {
+                        files.push(side);
+                    }
                 }
                 files.sort();
                 SealedSegment {
@@ -2990,6 +3007,14 @@ impl Shard {
         prefix: &str,
         limit: usize,
     ) -> Result<Vec<(String, u64)>> {
+        // Completion fast path: for a `suggest`-flagged field with a short prefix, answer from the
+        // precomputed per-segment top-K table (no term-dict scan). `None` = the sidecar can't answer
+        // (cold, over-`P`/empty prefix, or partial coverage) → the live seek below, unchanged.
+        if self.schema.is_suggest_field(field) {
+            if let Some(ranked) = self.core.suggest_prefix_sidecar(field, prefix, limit)? {
+                return Ok(ranked);
+            }
+        }
         // Bounded multiple of the page so a broad prefix can't walk the whole vocabulary, while
         // leaving room to rank. `prefix_terms` already sums across segments.
         let scan_cap = limit.saturating_mul(64).max(1024);
@@ -4997,6 +5022,118 @@ mod suggest_tests {
         // A no-match prefix is empty; a non-string field errors.
         assert!(shard.suggest_prefix("city", "zzz", 10).unwrap().is_empty());
         assert!(shard.suggest_prefix("id", "x", 10).is_ok()); // id is KEYWORD → fine
+    }
+
+    /// A shard whose `city` field opts into the completion sidecar.
+    fn suggest_shard(tmp: &Path) -> Shard {
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("city", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        let idx = IndexDefinition::from_yaml(
+            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD }, { path: city, type: KEYWORD, suggest: true } ] }\n",
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+        LocalIndexStore::open(tmp)
+            .unwrap()
+            .create_shard(&ShardId::single("docs"), &idx)
+            .unwrap()
+    }
+
+    fn put_city(shard: &Shard, id: &str, city: &str, snap: i64, batch: &str) {
+        let key = CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]);
+        let mut f = BTreeMap::new();
+        f.insert("id".to_string(), Value::from(id));
+        f.insert("city".to_string(), Value::from(city));
+        let doc = LocatedDoc {
+            doc: Document::new(key, f),
+            iceberg_file: "f".into(),
+            row_position: 0,
+        };
+        IndexWriter::write(
+            shard,
+            &CommitBatch::from_upserts(vec![doc], SourceCheckpoint::iceberg(snap), batch),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn suggest_sidecar_built_and_answers_top_k_by_frequency() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard = suggest_shard(tmp.path());
+        put_city(&shard, "1", "berlin", 1, "b1");
+        put_city(&shard, "2", "berlin", 1, "b2");
+        put_city(&shard, "3", "bern", 1, "b3");
+        put_city(&shard, "4", "boston", 1, "b4");
+
+        // A `.cmp` sidecar exists (the fast path has data to read).
+        let has_cmp = std::fs::read_dir(shard.index_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.path().extension().is_some_and(|x| x == "cmp"));
+        assert!(has_cmp, "completion sidecar was not written");
+
+        // Same frequency-ranked contract as the live path: berlin(2) before bern(1).
+        assert_eq!(
+            shard.suggest_prefix("city", "ber", 10).unwrap(),
+            vec![("berlin".to_string(), 2), ("bern".to_string(), 1)]
+        );
+        // limit truncates the merged top-K: berlin(2) outranks bern(1)/boston(1).
+        assert_eq!(
+            shard.suggest_prefix("city", "b", 1).unwrap(),
+            vec![("berlin".to_string(), 2)]
+        );
+    }
+
+    #[test]
+    fn suggest_sidecar_merges_across_segments_for_global_top_k() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard = suggest_shard(tmp.path());
+        // Each put is a separate generation → a separate segment (NoMergePolicy). "berlin" lands in
+        // three segments (freq 1 each) and must sum to 3 across their per-segment sidecars.
+        put_city(&shard, "1", "berlin", 1, "b1");
+        put_city(&shard, "2", "berlin", 2, "b2");
+        put_city(&shard, "3", "bern", 3, "b3");
+        put_city(&shard, "4", "berlin", 4, "b4");
+
+        assert_eq!(
+            shard.suggest_prefix("city", "ber", 10).unwrap(),
+            vec![("berlin".to_string(), 3), ("bern".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn suggest_falls_back_for_long_prefix_and_unflagged_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard = suggest_shard(tmp.path());
+        // Two cities sharing a >P-byte prefix; a prefix longer than P isn't in the table → live seek.
+        put_city(&shard, "1", "abcdefghij_one", 1, "b1");
+        put_city(&shard, "2", "abcdefghij_two", 1, "b2");
+        put_city(&shard, "3", "abcdefghij_two", 1, "b3");
+        // 10-byte prefix (> P=8) — served correctly by the fallback live path.
+        assert_eq!(
+            shard.suggest_prefix("city", "abcdefghij", 10).unwrap(),
+            vec![
+                ("abcdefghij_two".to_string(), 2),
+                ("abcdefghij_one".to_string(), 1),
+            ]
+        );
+        // A short prefix (≤ P) is served by the sidecar, same answer.
+        assert_eq!(
+            shard.suggest_prefix("city", "abc", 10).unwrap(),
+            vec![
+                ("abcdefghij_two".to_string(), 2),
+                ("abcdefghij_one".to_string(), 1),
+            ]
+        );
+        // The unflagged `id` field has no sidecar → live path (never errors).
+        assert!(shard.suggest_prefix("id", "1", 10).is_ok());
     }
 
     #[test]
