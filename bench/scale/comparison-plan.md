@@ -221,8 +221,15 @@ documented in the published report.
   (it lives in the streaming bundle, not observability), so `compare_run.py`'s GrowlerDB phase applies
   `maintenance.yaml` and triggers a one-shot compaction Job (`growlerdb-iceberg-maintenance`) before
   the query matrix, so the fair-Trino source layout is compacted.
-- **Locator-heal persistence (TASK-339)** not demonstrably persistent post-compaction — report
-  hydration-across-compaction as a measurement, not an assumed invariant.
+- **Locator-heal across compaction (TASK-339) — hardened.** `rewrite_data_files` moves every row, so
+  all locators go stale at once. Two coupled fixes: (a) the background re-map (`engine/remap.rs`) now
+  **streams the rewritten files one at a time**, patching each file's slots immediately (bounded memory,
+  progressive heal, crash-safe) instead of accumulating the whole table (which OOM'd / never converged
+  at scale); (b) the lazy hydration fallback (`source/lib.rs scan_stale_index`) is **file-budgeted** so
+  an unprunable random-key scan can't be an O(snapshot)/hit stall (the 30s topk timeouts) — it serves
+  what it cheaply finds and leaves the rest to the re-map. `compare_run.py` gates the query matrix on
+  the re-map **settling** (`wait_remap_settled`, `locator_remapped_rows_total` plateau) so hydration is
+  measured healed, not mid-heal. Still report hydration-across-compaction as a measurement.
 - **Trino baseline** moves 470 → 483 this round; re-baseline and note it. `compare_trino.py` was
   refreshed for the non-windowed `http_logs` schema (status/user_id/path predicates, no `day` pruning —
   the table is unpartitioned) and runs as a driver Job in the GrowlerDB phase, post-compaction. Its
@@ -256,7 +263,12 @@ documented in the published report.
   is a *result*, not a bug: report GrowlerDB's cold-sync throughput (~21–24k docs/s) vs OpenSearch CDC
   (~15.7k docs/s at 10 GB) as the ingest headline, and report freshness both under-load and at-rest.
   Worth a separate look at whether the ceiling is the single Spark connector, the nodes' indexing rate,
-  or commit cadence — a faster connector would be a real GrowlerDB win to pursue.
+  or commit cadence — a faster connector would be a real GrowlerDB win to pursue. **Root-caused +
+  addressed:** the ceiling is the *single* `local[6]` Spark pipeline (serial read→map→blocking-write, no
+  double-buffering), not the engine/nodes (6% node CPU, no backpressure). The benchmark now deploys the
+  already-built **parallel connector SET** (`connector-set.yaml`, W=shard-count independent worker
+  pipelines, each owning a disjoint shard group) via `CONNECTOR_SET=true` in `scale-up.sh`, so cold-sync
+  ingest uses the idle node headroom — expected ~W× and comfortably past OpenSearch CDC's ~17.5k docs/s.
 - **GrowlerDB query numbers were a MEASUREMENT ARTIFACT, not an engine limit (ROOT-CAUSED; drives a
   harness fix).** At 10 GB the driver saw GrowlerDB flat at **~15 qps** (50→800 offered), ~15s client
   p95, `topk_hydrated` all 30s-timeout — while engine-internal retrieval p95 was **~5ms**. Cause: the

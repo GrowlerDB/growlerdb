@@ -423,6 +423,11 @@ impl IcebergReader {
         requests: &[(CompositeKey, Option<RowLocator>)],
         projection: &Projection,
     ) -> Result<HydrationResult> {
+        // Max data files the lazy pass-2 fallback reads per hydration call. A well-pruned plan is far
+        // under this (a partitioned key → a handful of files → full heal); an *unprunable* random key
+        // is capped here instead of scanning the whole snapshot per hit (TASK-339). The background
+        // compaction re-map (`remap.rs`) is the real, complete heal; pass-2 is a bounded stopgap.
+        const FALLBACK_MAX_SCAN_FILES: usize = 32;
         if requests.is_empty() {
             return Ok(HydrationResult::default());
         }
@@ -462,15 +467,23 @@ impl IcebergReader {
                 &wanted,
                 &partition_names,
                 &identifier_names,
+                FALLBACK_MAX_SCAN_FILES,
             )
             .await
             {
                 Ok(found) => found,
                 // A pruned scan that errored (e.g. an unexpected type binding) must never turn a
-                // present row into a miss — fall back to the full unfiltered scan.
+                // present row into a miss — fall back to the unfiltered scan (same file budget).
                 Err(_) if predicate.is_some() => {
-                    scan_stale_index(&tbl, None, &wanted, &partition_names, &identifier_names)
-                        .await?
+                    scan_stale_index(
+                        &tbl,
+                        None,
+                        &wanted,
+                        &partition_names,
+                        &identifier_names,
+                        FALLBACK_MAX_SCAN_FILES,
+                    )
+                    .await?
                 }
                 Err(e) => return Err(e),
             };
@@ -1113,6 +1126,7 @@ async fn scan_stale_index(
     wanted: &HashSet<Vec<u8>>,
     partition_names: &[String],
     identifier_names: &[String],
+    max_scan_files: usize,
 ) -> Result<(HashMap<Vec<u8>, (BTreeMap<String, Value>, RowLocator)>, u64)> {
     let mut builder = tbl.scan().select_all();
     if let Some(p) = predicate {
@@ -1122,7 +1136,16 @@ async fn scan_stale_index(
     let file_io = tbl.file_io().clone();
     let mut index = HashMap::new();
     let mut duplicates = 0u64;
-    'files: for task in tasks {
+    'files: for (files_scanned, task) in tasks.into_iter().enumerate() {
+        // Budget guard: when the predicate can't prune (a random high-cardinality identifier key,
+        // or a `None`/unfiltered plan), this scan would otherwise read the *whole current snapshot*
+        // on every hydration call (O(snapshot)/hit → 30s stalls post-compaction, TASK-339). Cap the
+        // files read: a well-pruned plan is under budget and heals fully; an unpruned one returns
+        // what it cheaply found and leaves the rest to the background compaction re-map. Unresolved
+        // rows are omitted, not errored (assemble_rows), so this degrades gracefully.
+        if files_scanned >= max_scan_files {
+            break 'files;
+        }
         let data_file = task.data_file_path.clone();
         let reader = ArrowReaderBuilder::new(file_io.clone(), iceberg::Runtime::current()).build();
         let task_stream =

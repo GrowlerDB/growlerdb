@@ -132,7 +132,18 @@ pub async fn remap_tick(
         snapshot_id: plan.snapshot_id,
         ..Default::default()
     };
-    let mut moved: Vec<(CompositeKey, RowLocator)> = Vec::new();
+    // Mark the disappeared files dead FIRST (per shard), before any added-file scan: hydration then
+    // skips the doomed pass-1 point reads for the whole heal window, and the dead flag is
+    // `remap_locations`' patch guard.
+    for (shard, disappeared) in shards.iter().zip(&disappeared_per_shard) {
+        outcome.files_marked_dead += shard.mark_files_dead(disappeared)?;
+    }
+    // Stream the rewrite's *added* files one at a time, patching each file's slots immediately rather
+    // than accumulating the whole rewritten table into one Vec: a whole-table compaction moves *every*
+    // row, so batching was O(table) memory (OOM at scale) and healed nothing until the last file was
+    // read. Per-file streaming bounds memory to one file's rows and heals progressively. Patches are
+    // idempotent last-wins and dead-file-guarded, so a crash mid-stream just re-heals next tick (an
+    // already-re-pointed slot is skipped as `already_live`).
     for task in plan.tasks.iter() {
         if baseline.contains(&task.data_file_path) {
             continue;
@@ -143,17 +154,15 @@ pub async fn remap_tick(
             outcome.files_skipped_deletes += 1;
             continue;
         }
-        moved.extend(scan_added_file(&plan.file_io, &task.data_file_path, key_fields).await?);
+        let moved = scan_added_file(&plan.file_io, &task.data_file_path, key_fields).await?;
+        outcome.rows_read += moved.len();
         outcome.files_scanned += 1;
-    }
-    outcome.rows_read = moved.len();
-
-    for (shard, disappeared) in shards.iter().zip(&disappeared_per_shard) {
-        let (marked, stats) = remap_shard(shard, disappeared, &moved)?;
-        outcome.files_marked_dead += marked;
-        outcome.stats.remapped += stats.remapped;
-        outcome.stats.skipped_no_live_doc += stats.skipped_no_live_doc;
-        outcome.stats.skipped_already_live += stats.skipped_already_live;
+        for shard in shards.iter() {
+            let stats = shard.remap_locations(&moved)?;
+            outcome.stats.remapped += stats.remapped;
+            outcome.stats.skipped_no_live_doc += stats.skipped_no_live_doc;
+            outcome.stats.skipped_already_live += stats.skipped_already_live;
+        }
     }
     state.last_snapshot = Some(plan.snapshot_id);
     state.prev_files = Some(current);

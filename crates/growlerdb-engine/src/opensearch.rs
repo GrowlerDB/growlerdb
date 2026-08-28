@@ -714,7 +714,10 @@ mod tests {
         assert!(wants_hydration(&None, None));
         assert!(wants_hydration(&Some(json!(true)), Some(10)));
         assert!(wants_hydration(&Some(json!(["method", "path"])), Some(10))); // field list still hydrates
-        assert!(wants_hydration(&Some(json!({ "includes": ["path"] })), Some(10)));
+        assert!(wants_hydration(
+            &Some(json!({ "includes": ["path"] })),
+            Some(10)
+        ));
         // ...while count-only and _source:false skip the Iceberg fetch.
         assert!(!wants_hydration(&Some(json!(false)), Some(10)));
         assert!(!wants_hydration(&None, Some(0)));
