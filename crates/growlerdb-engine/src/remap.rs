@@ -30,12 +30,13 @@ use growlerdb_source::{read_file_key_rows, FileIO, IcebergReader};
 
 use crate::error::EngineError;
 
-/// The poller's memory between ticks: the snapshot it last diffed at and that
-/// snapshot's live data-file set (so `added` is a plan-to-plan diff, not a guess).
+/// The poller's memory between ticks: the snapshot it last diffed, so an unchanged snapshot is a
+/// cheap no-op. The set of files still needing a heal is re-derived each tick from the shards'
+/// **persisted** interned/dead bitmap — never from in-memory state — so a poller restart mid-heal
+/// still finishes the heal (see [`remap_tick`]).
 #[derive(Debug, Default)]
 pub struct RemapState {
     last_snapshot: Option<i64>,
-    prev_files: Option<HashSet<String>>,
 }
 
 /// What one re-map pass did — the numbers behind `growlerdb_locator_remap_events_total`
@@ -77,11 +78,19 @@ pub fn remap_shard(
 /// against the shards' interned files and — when interned files disappeared (a rewrite) — mark
 /// them dead and re-map from the plan's added files.
 ///
-/// Returns `Ok(None)` when nothing happened (snapshot unchanged, or a pure append). `key_fields`
-/// is the index's composite key, used to project the added files' rows. Multiple `shards` (a
-/// windowed index's hot windows) share one plan fetch and key scan; each skips keys it doesn't
-/// hold. The first tick after boot has no previous plan, so `added` falls back to "plan files
-/// not interned by any shard" — a safe superset (foreign keys skipped, already-live slots not patched).
+/// Returns `Ok(None)` when nothing happened (snapshot unchanged, a pure append, or an already-
+/// finished heal). `key_fields` is the index's composite key, used to project the replacement
+/// files' rows. Multiple `shards` (a windowed index's hot windows) share one plan fetch and key
+/// scan; each skips keys it doesn't hold.
+///
+/// **Restart-safe by design.** The files still needing a heal are re-derived each tick from the
+/// shards' *persisted* interned/dead bitmap — the plan's files that no shard already holds a live
+/// slot into — not from in-memory prev-tick state. `mark_files_dead` is persisted but the heal that
+/// follows is not, so gating the heal on this-tick `disappeared` (interned-live files that just
+/// vanished) alone stranded a half-done heal forever: after a restart the dead files are excluded
+/// from `interned_live_files()`, so `disappeared` reads empty and the heal never ran again —
+/// hydration stayed on the slow pass-2 fallback. Deriving the work from the persisted bitmap lets
+/// the next tick (even in a fresh process) finish the heal.
 pub async fn remap_tick(
     reader: &IcebergReader,
     table: &str,
@@ -100,7 +109,7 @@ pub async fn remap_tick(
         .collect();
 
     // Interned, still-live files that vanished from the live set — per shard, since each shard
-    // interns only its own rows' files.
+    // interns only its own rows' files. These are newly rewritten, so mark them dead this tick.
     let disappeared_per_shard: Vec<Vec<String>> = shards
         .iter()
         .map(|s| {
@@ -110,43 +119,42 @@ pub async fn remap_tick(
                 .collect()
         })
         .collect();
-    if disappeared_per_shard.iter().all(Vec::is_empty) {
-        // Pure append (or unrelated change). Commit the observation so the next replace diffs
-        // against THIS plan.
+    let any_disappeared = disappeared_per_shard.iter().any(|d| !d.is_empty());
+    // Dead files present ⇒ a rewrite happened at some point whose heal may be unfinished (e.g. this
+    // process restarted mid-heal). With no dead files and nothing disappeared this tick it's a pure
+    // append / unrelated change — the early-out that keeps steady-state ingest off the scan path.
+    let any_dead = shards.iter().any(|s| s.dead_file_count() > 0);
+    if !any_disappeared && !any_dead {
         state.last_snapshot = Some(plan.snapshot_id);
-        state.prev_files = Some(current);
         return Ok(None);
     }
 
-    // The rewrite's *added* files: in the current plan but not the previous (first tick: not
-    // interned anywhere — see the doc comment). State commits only at the end, so a failed
-    // scan/patch is retried next tick rather than skipping the snapshot.
-    let baseline: HashSet<String> = match &state.prev_files {
-        Some(files) => files.clone(),
-        None => shards
-            .iter()
-            .flat_map(|s| s.interned_live_files())
-            .collect(),
-    };
+    // A shard already interns its live/original files, so those and any already-healed replacement
+    // are skipped below; only a plan file no shard has a live slot into is a heal candidate. Union
+    // across shards mirrors the "each skips keys it doesn't hold" fan-out of the patch loop.
+    let interned_live: HashSet<String> = shards
+        .iter()
+        .flat_map(|s| s.interned_live_files())
+        .collect();
+
     let mut outcome = RemapOutcome {
         snapshot_id: plan.snapshot_id,
         ..Default::default()
     };
-    // Mark the disappeared files dead FIRST (per shard), before any added-file scan: hydration then
-    // skips the doomed pass-1 point reads for the whole heal window, and the dead flag is
-    // `remap_locations`' patch guard.
+    // Mark the disappeared files dead FIRST (per shard), before any scan: hydration then skips the
+    // doomed pass-1 point reads for the heal window, and the dead flag is `remap_locations`' guard.
     for (shard, disappeared) in shards.iter().zip(&disappeared_per_shard) {
         outcome.files_marked_dead += shard.mark_files_dead(disappeared)?;
     }
-    // Stream the rewrite's *added* files one at a time, patching each file's slots immediately rather
-    // than accumulating the whole rewritten table into one Vec: a whole-table compaction moves *every*
+    // Stream the replacement files one at a time, patching each file's slots immediately rather than
+    // accumulating the whole rewritten table into one Vec: a whole-table compaction moves *every*
     // row, so batching was O(table) memory (OOM at scale) and healed nothing until the last file was
     // read. Per-file streaming bounds memory to one file's rows and heals progressively. Patches are
     // idempotent last-wins and dead-file-guarded, so a crash mid-stream just re-heals next tick (an
     // already-re-pointed slot is skipped as `already_live`).
     for task in plan.tasks.iter() {
-        if baseline.contains(&task.data_file_path) {
-            continue;
+        if interned_live.contains(&task.data_file_path) {
+            continue; // a shard already holds a live slot into this file — nothing to heal here
         }
         if !task.deletes.is_empty() {
             // Delete-bearing files have delete-shifted ingest positions but the key scan reads
@@ -165,7 +173,11 @@ pub async fn remap_tick(
         }
     }
     state.last_snapshot = Some(plan.snapshot_id);
-    state.prev_files = Some(current);
+    // Nothing marked and nothing scanned ⇒ a snapshot advance with no heal work (e.g. an append
+    // after the table has ever been compacted): report it as a no-op, not a re-map event.
+    if outcome.files_marked_dead == 0 && outcome.files_scanned == 0 {
+        return Ok(None);
+    }
     Ok(Some(outcome))
 }
 
