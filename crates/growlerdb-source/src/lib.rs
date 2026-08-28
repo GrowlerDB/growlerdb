@@ -1228,17 +1228,26 @@ fn key_predicate(
                 None => eq,
             });
         };
-        for (name, value) in key.partition.iter().chain(key.identifier.iter()) {
-            let datum = value_to_datum(schema, name, value)?;
-            push(&mut conj, name, datum);
-        }
-        // Hints only narrow: an unmappable hint is skipped, never widening incorrectly.
-        for (name, value) in hints.iter() {
+        // Every term only NARROWS a pure prune — each candidate row is re-verified against the exact
+        // composite key downstream — so an un-typeable term (key field OR hint) is SKIPPED, never
+        // fatal. Bailing to `None` on an un-typeable KEY field (the old `?`) discarded the whole
+        // predicate incl. the sort-key hint, so a table whose random key doesn't cleanly map to an
+        // Iceberg datum lost all pruning — the `ts` hint must survive that.
+        for (name, value) in key
+            .partition
+            .iter()
+            .chain(key.identifier.iter())
+            .chain(hints.iter())
+        {
             if let Some(datum) = value_to_datum(schema, name, value) {
                 push(&mut conj, name, datum);
             }
         }
-        per_key.push(conj?); // identifier is always non-empty, so conj is Some
+        // A key that mapped no term at all can't prune — drop it from the OR (an empty per-key clause
+        // would match everything). If every key drops out, the caller reads unfiltered (bounded).
+        if let Some(c) = conj {
+            per_key.push(c);
+        }
     }
     let mut it = per_key.into_iter();
     let first = it.next()?;
@@ -1874,9 +1883,11 @@ mod tests {
     }
 
     #[test]
-    fn key_predicate_is_none_for_a_date_key_with_intraday_micros() {
-        // A DATE column can only be pruned by an exact UTC-midnight value; anything else could
-        // build a predicate that *excludes* the row. None ⇒ safe unfiltered read.
+    fn key_predicate_skips_an_intraday_date_field_but_keeps_the_rest() {
+        // A DATE column can only be pruned by an exact UTC-midnight value; anything else could build
+        // a predicate that *excludes* the row, so that term is SKIPPED (value_to_datum → None). But
+        // skipping one term must not discard the whole predicate — the other key fields still prune
+        // (a pure superset filter, re-verified by the exact key), so `id="x"` survives.
         let schema = temporal_ice_schema();
         let not_midnight = 20_625 * MICROS_PER_DAY + 1;
         assert_eq!(
@@ -1887,7 +1898,11 @@ mod tests {
             vec![("day", Value::Ts(not_midnight))],
             vec![("id", Value::Str("x".into()))],
         );
-        assert!(key_predicate(&schema, &no_hint(&[&k])).is_none());
+        // Not None: the intraday `day` is skipped, `id="x"` still prunes.
+        assert!(key_predicate(&schema, &no_hint(&[&k])).is_some());
+        // A key whose ONLY field is the un-mappable intraday date maps no term → unfiltered (None).
+        let only_date = ckey(vec![("day", Value::Ts(not_midnight))], vec![]);
+        assert!(key_predicate(&schema, &no_hint(&[&only_date])).is_none());
     }
 
     #[test]
