@@ -18,9 +18,8 @@ use crate::vector::{SegmentAnn, StoredAnnIndex, ANN_SUFFIX};
 
 use growlerdb_core::{
     sort_has_score, CompositeKey, DocBatch, Document, FieldType, Highlight, HighlightFragment,
-    HighlightSegment, Hit, LocationStrategy, MatchOp, Query, ResolvedField, ResolvedIndex,
-    SearchAfter, Sort, SortOrder, SortValue, TextRecord, TimeFormat, Value as GValue,
-    SCORE_SORT_KEY,
+    HighlightSegment, Hit, MatchOp, Query, ResolvedField, ResolvedIndex, SearchAfter, Sort,
+    SortOrder, SortValue, TextRecord, TimeFormat, Value as GValue, SCORE_SORT_KEY,
 };
 use tantivy::aggregation::agg_req::Aggregations;
 use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
@@ -45,12 +44,6 @@ pub const KEY_FIELD: &str = "_key";
 /// Bytes-indexed `enc(CompositeKey)` field — delete-by-key plus the agg liveness keyset
 /// exclusion. Not stored (`_key` carries the same bytes for hits).
 const KEY_ENC_FIELD: &str = "_keyenc";
-/// u64 fast field holding a doc's **locator ID** — the reference layer of the [D30] layered
-/// locator. Indexes the shard's dense location array ([`crate::location`]) → the row's current
-/// `(file_id, row_position)`. Written on every upsert.
-///
-/// [D30]: ../../../okf/system/decisions/d30-layered-locator.md
-pub const LOC_ID_FIELD: &str = "_locid";
 
 /// Writer heap budget.
 pub const WRITER_HEAP_BYTES: usize = 50_000_000;
@@ -140,9 +133,6 @@ pub struct IndexSchema {
     key_field: Field,
     /// Bytes-indexed `enc(key)` field for the aggregation liveness exclusion.
     key_enc_field: Field,
-    /// u64 FAST locator-ID field ([`LOC_ID_FIELD`], the D30 reference layer), attached
-    /// to every upsert by the store's commit path.
-    loc_id_field: Field,
     /// (path, tantivy field, type, declared timestamp format) per mapped field, in definition
     /// order. The [`TimeFormat`] is set only for timestamp fields; it tells [`add_typed_value`] to
     /// normalize the source epoch to canonical micros at build.
@@ -155,10 +145,6 @@ pub struct IndexSchema {
     mapped_field_summaries: Vec<MappedFieldSummary>,
     /// The tenant-scoping field, if the index is tenant-scoped.
     tenant_field: Option<String>,
-    /// The index's **location strategy** (D30). Under [`Predicate`](LocationStrategy::Predicate) the
-    /// commit path never populates [`LOC_ID_FIELD`], yet the schema **keeps** the field either way
-    /// (see [`from_resolved`](Self::from_resolved)).
-    location_strategy: LocationStrategy,
     /// The VECTOR fields (ANN-build inputs), in definition order — each with its stored-bytes handle
     /// and [`VectorSpec`](growlerdb_core::VectorSpec). Empty for a non-vector index (ANN skipped).
     vector_fields: Vec<VectorFieldInfo>,
@@ -347,20 +333,14 @@ impl IndexSchema {
                 suggest,
             });
         }
-        // Added after the mapped fields so internal handles never shift a user field's ordinal.
-        // Declared for **every** strategy (a `PREDICATE` index just never populates it) so the
-        // schema shape is identical across strategies — avoiding the field-ordinal hazard.
-        let loc_id_field = builder.add_u64_field(LOC_ID_FIELD, FAST);
         Self {
             schema: builder.build(),
             key_field,
             key_enc_field,
-            loc_id_field,
             fields,
             sortable_fields,
             mapped_field_summaries,
             tenant_field: idx.tenant_field().map(str::to_string),
-            location_strategy: idx.location_strategy,
             vector_fields,
             suggest_fields,
             variant_fields,
@@ -390,12 +370,6 @@ impl IndexSchema {
     /// for the hydration fork on paths that hold only the [`IndexSchema`].
     pub fn has_variant_fields(&self) -> bool {
         !self.variant_fields.is_empty()
-    }
-
-    /// The index's [location strategy](LocationStrategy) (D30) — how the store's commit
-    /// path and the engine's hydration path locate source rows.
-    pub fn location_strategy(&self) -> LocationStrategy {
-        self.location_strategy
     }
 
     /// The tenant-scoping field, if this index is tenant-scoped — the field reads inject
@@ -456,12 +430,6 @@ impl IndexSchema {
     /// exclusion.
     pub fn key_enc_field(&self) -> Field {
         self.key_enc_field
-    }
-
-    /// The u64 FAST **locator-ID** field ([`LOC_ID_FIELD`], D30 reference layer) — the store
-    /// attaches each upsert's location-array id through this handle.
-    pub fn loc_id_field(&self) -> Field {
-        self.loc_id_field
     }
 
     /// Build the [`TantivyDocument`] for `doc`: the stored + indexed `enc(key)` and each mapped
@@ -853,48 +821,10 @@ impl SegmentReader {
         self.reader.searcher().num_docs()
     }
 
-    /// The **locator ID** (`_locid` fast field) of the live doc carrying `enc(key)`, or `None` when
-    /// no live doc has the key. The D30 write path's pre-commit **reuse lookup** — a key-term probe
-    /// per segment + one fast-field read — which keeps the location array O(live keys), not O(all
-    /// versions ever written).
-    pub fn live_loc_id(&self, key_enc: &[u8]) -> Result<Option<u64>> {
-        let schema = self.index.schema();
-        let Ok(key_enc_field) = schema.get_field(KEY_ENC_FIELD) else {
-            return Ok(None);
-        };
-        let term = Term::from_field_bytes(key_enc_field, key_enc);
-        let searcher = self.reader.searcher();
-        for segment in searcher.segment_readers() {
-            let inverted = segment.inverted_index(key_enc_field)?;
-            let Some(mut postings) = inverted
-                .read_postings(&term, IndexRecordOption::Basic)
-                .map_err(|e| IndexError::Tantivy(e.into()))?
-            else {
-                continue;
-            };
-            // Defensive: a segment with no `_locid` column can't contribute an id (should be
-            // unreachable — every upsert writes the field).
-            let Some(col) = segment.fast_fields().column_opt::<u64>(LOC_ID_FIELD)? else {
-                continue;
-            };
-            let alive = segment.alive_bitset();
-            let mut doc = postings.doc();
-            while doc != TERMINATED {
-                if alive.is_none_or(|b| b.is_alive(doc)) {
-                    if let Some(id) = col.first(doc) {
-                        return Ok(Some(id));
-                    }
-                }
-                doc = postings.advance();
-            }
-        }
-        Ok(None)
-    }
-
     /// The [`DocAddress`](tantivy::DocAddress) of the live doc carrying `key_enc`, or `None` when no
-    /// live doc has the key — the same identity-layer resolution [`live_loc_id`](Self::live_loc_id)
-    /// does, but exposing the address so a caller reads arbitrary **fast fields** (the sort-key prune
-    /// hints), not just `_locid`. The address is only valid for `searcher` (segment ords align).
+    /// live doc has the key — a key-term probe per segment resolving the identity layer, exposing the
+    /// address so a caller reads arbitrary **fast fields** (the sort-key prune hints). The address is
+    /// only valid for `searcher` (segment ords align).
     fn live_doc_address(
         &self,
         searcher: &tantivy::Searcher,
@@ -2892,7 +2822,7 @@ mapping:
 
         // No dynamic field growth: the Tantivy schema carries exactly the fixed fields —
         // id, the two flatten fields (payload#terms/#text), the shaped payload.number +
-        // payload.action, plus the internal _key/_keyenc/_locid. Never a per-leaf field.
+        // payload.action, plus the internal _key/_keyenc. Never a per-leaf field.
         let names: Vec<String> = schema
             .tantivy_schema()
             .fields()

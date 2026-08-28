@@ -1387,8 +1387,6 @@ mod tests {
             f.insert("id".to_string(), Value::from(id));
             LocatedDoc {
                 doc: Document::new(key, f),
-                iceberg_file: "f".into(),
-                row_position: 0,
             }
         };
         // Two commits → two generations; checkpoint at iceberg snapshot 7.
@@ -1419,8 +1417,6 @@ mod tests {
             f.insert("id".to_string(), Value::from(id));
             LocatedDoc {
                 doc: Document::new(key, f),
-                iceberg_file: "f".into(),
-                row_position: 0,
             }
         };
 

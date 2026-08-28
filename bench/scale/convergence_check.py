@@ -5,7 +5,7 @@ At steady state (after ingest drains) the engine's live doc count must equal the
 count. Two engines, one target:
 
   * ``--engine growlerdb`` (default) — index live-doc count == source DISTINCT id, plus a
-    sample-integrity check: a page of real hits each hydrates from Iceberg (the locator->row invariant).
+    sample-integrity check: a page of real hits each hydrates from Iceberg (the key->row invariant).
   * ``--engine opensearch`` — OpenSearch ``_count`` == source DISTINCT id. OpenSearch dedups by
     ``_id`` (= request_id, set by Data Prepper ``identifier_columns``), so the count IS the distinct
     target and there is no separate hydrate step to sample.
@@ -124,7 +124,7 @@ def opensearch_count():
 
 
 def growlerdb_sample(n):
-    """Take a page of real hits and hydrate each coordinate — the locator->row invariant. Keyed on
+    """Take a page of real hits and hydrate each coordinate — the key->row invariant. Keyed on
     coordinates, not an id term query: request_id is key-only (not searchable), so `id:"..."` can't
     sample. Net loss is caught by count convergence; this checks that live hits still hydrate."""
     hits = growlerdb_search("*", limit=n).get("hits", [])

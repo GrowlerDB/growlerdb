@@ -1,5 +1,5 @@
 //! **Object-storage backup & restore** for a shard's index. A backup ships a shard's consistent
-//! committed state (sealed Tantivy segments + `location.arr` + the `aux.redb` aux store + the index
+//! committed state (sealed Tantivy segments + the `aux.redb` aux store + the index
 //! definition) to object storage; a restore pulls it onto a replacement node, which replays the tail
 //! from the backed-up checkpoint. With no backup a shard is rebuilt from Iceberg — nothing is
 //! irreplaceable. Transport is [`opendal`] (S3/MinIO via `s3_store`, local fs via `fs_store`).
@@ -55,9 +55,8 @@ pub enum BackupError {
 type Result<T> = std::result::Result<T, BackupError>;
 
 /// The manifest **format version** this binary writes and consumes. Format **1** is the
-/// layered-locator shard format (the file list carries `location.arr` beside the segments and
-/// `aux.redb`). A future incompatible layout bumps this; [`read_manifest`] refuses newer formats
-/// rather than mis-restore.
+/// current shard format (the file list carries the Tantivy segments beside `aux.redb`). A future
+/// incompatible layout bumps this; [`read_manifest`] refuses newer formats rather than mis-restore.
 pub const MANIFEST_FORMAT: u32 = 1;
 
 /// Manifests written without a `format` field deserialize as format 1.
@@ -341,7 +340,7 @@ pub async fn revive(store: &Operator, prefix: &str, shard_dir: &Path) -> Result<
 }
 
 /// Evict a parked window's local Tantivy **bulk** (`window_dir/index`) while keeping the local
-/// `aux.redb` + `location.arr` (the cold footprint `open_cold_shard` still reads). The LAST step of a
+/// `aux.redb` (the cold footprint `open_cold_shard` still reads). The LAST step of a
 /// park — run only *after* the [`ColdMarker`] is durable, so a crash mid-park always leaves a
 /// fully-serving hot shard, never a markerless empty window.
 pub fn evict_local_index(window_dir: &Path) -> std::io::Result<()> {
@@ -466,7 +465,6 @@ async fn cold_park_to_store(
         bundle_key,
         bundle_manifest_key,
         aux_key: Some(format!("{base}/data/aux.redb")),
-        location_key: Some(format!("{base}/data/location.arr")),
     };
     std::fs::write(
         window_dir.join(growlerdb_index::COLD_MARKER),
@@ -527,7 +525,6 @@ pub async fn backup_replica_snapshot(
         bundle_key: None,
         bundle_manifest_key: None,
         aux_key: Some(format!("{base}/data/aux.redb")),
-        location_key: Some(format!("{base}/data/location.arr")),
     };
     store
         .write(
@@ -745,7 +742,7 @@ pub async fn refresh(store: &Operator, prefix: &str, dest: &Path) -> Result<Refr
     //
     // * A listed segment **404s** mid-download — the backup's GC (`prune_superseded`) pruned a
     //   file this now-stale manifest still names. Re-read and go again.
-    // * The pass **tears**: the mutable objects (`index/meta.json`, `aux.redb`, `location.arr`)
+    // * The pass **tears**: the mutable objects (`index/meta.json`, `aux.redb`)
     //   are fetched live while segments come from the manifest's list, so a backup landing mid-pass
     //   can pair a NEWER meta with the OLDER segment set. The manifest is the commit point (written
     //   last), so re-reading it after the pass and comparing snapshots detects any backup that
@@ -793,12 +790,10 @@ async fn refresh_once(
         manifest.files.iter().map(|f| f.path.as_str()).collect();
     for entry in &manifest.files {
         let dst = dest.join(&entry.path);
-        // The index meta + aux store change every commit — and `location.arr` is
-        // patched **in place** (same length, new bytes), so the size check can't
-        // detect a change; segment files are immutable.
+        // The index meta + aux store change every commit; segment files are immutable.
         let mutable = matches!(
             entry.path.as_str(),
-            "aux.redb" | "index/meta.json" | "index/.managed.json" | "location.arr"
+            "aux.redb" | "index/meta.json" | "index/.managed.json"
         );
         if !mutable
             && dst
@@ -907,8 +902,6 @@ mod tests {
         f.insert("body".to_string(), Value::from("text"));
         LocatedDoc {
             doc: Document::new(key, f),
-            iceberg_file: "f".into(),
-            row_position: 0,
         }
     }
 

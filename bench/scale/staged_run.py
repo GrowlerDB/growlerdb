@@ -109,7 +109,7 @@ def snapshot():
         # index:source vs COMPRESSED parquet — kept for continuity, but config-dependent (see below).
         "index_source_ratio": prom("sum(growlerdb_index_bytes) / max(growlerdb_source_bytes)"),
         # Per-component index bytes: term/postings/positions/fieldnorms (the inverted index), fast,
-        # store, locator, other — sums to index_bytes, so a ratio change is attributable to the
+        # store, other — sums to index_bytes, so a ratio change is attributable to the
         # structure that moved (positions dropped, key terms shrunk, ...).
         "index_bytes_component": prom_by("sum by (component) (growlerdb_index_bytes_component)", "component"),
         # Measurement context: a size sample between merges carries superseded docs (NoMergePolicy —

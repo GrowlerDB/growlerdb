@@ -165,14 +165,6 @@ public final class ConnectorJob {
       return new Result(startSnapshotId, -1L, 0, false);
     }
 
-    // From-empty (no committed checkpoint) ⇒ BACKFILL: a plain scan of the current snapshot carries
-    // each row's REAL (file, position), so hydration can pass-1 point-read instead of key-scanning
-    // (the placeholder locators the changelog path emits force a full scan). "All changes since
-    // empty" == the current snapshot, so no CDC delta is needed. Incremental sync keeps the changelog.
-    if (startSnapshotId == null) {
-      return runBackfill(spark, current, writeClient);
-    }
-
     // Lineage guard: a resume checkpoint that isn't an ancestor of head means the source was
     // dropped+recreated (or rolled back) — fail fast with an actionable error instead of Iceberg's
     // cryptic ancestry failure. The index is stale and must be reindexed.
@@ -248,114 +240,6 @@ public final class ConnectorJob {
     // expected counter then.
     ConnectorMetrics.recordTrigger(observed, expected, current);
     return new Result(current, lastCommitted[0], totalOps[0], true);
-  }
-
-  /**
-   * Backfill a from-empty index: plain-scan the current snapshot (projecting {@code _file}/{@code
-   * _pos}), map every row to an upsert carrying its REAL locator, and commit in bounded sub-batches.
-   *
-   * <p>Each sub-batch is a <b>bootstrap</b> batch (no {@code from} checkpoint, checkpoint = current) —
-   * the same "many distinct chunks at one fixed checkpoint" shape the Node's bulk build emits, which
-   * its continuity guard applies rather than no-ops. After the backfill the shard sits at {@code
-   * current}; the stream then resumes incrementally from there (no double-ingest, no gap).
-   *
-   * <p><b>Caveat:</b> unlike the changelog path, the plain scan has no per-row snapshot to checkpoint
-   * intermediate progress at (every row shares {@code current}), so the first sub-batch already
-   * advances the shard to {@code current}. A crash MID-backfill therefore doesn't resume where it
-   * stopped — the operator re-runs the backfill from empty (re-applying is idempotent per key: a
-   * settled table yields the same rows and the same real locators). Steady-state exactly-once is
-   * unaffected.
-   */
-  private Result runBackfill(SparkSession spark, long current, BatchWriter writeClient) {
-    Dataset<Row> scan =
-        ChangelogReader.backfillScan(
-            spark,
-            catalog,
-            table,
-            projectedColumns(),
-            variantExtractor == null ? null : variantExtractor.spec().column);
-
-    // Under-read gate: the plain scan must see the current snapshot's whole live row count
-    // (`total-records`) — an independent check that no data file was silently dropped. Absent from
-    // the summary ⇒ skip (same -1 semantics as the changelog gate). A DISTRIBUTED count so a large
-    // backfill can't OOM the driver.
-    long observed = scan.count();
-    long expected = totalRecords(spark, current);
-    try {
-      assertNotUnderRead(qualifiedName(), null, current, observed, expected);
-    } catch (IngestUnderReadException e) {
-      ConnectorMetrics.recordUnderRead();
-      throw e;
-    }
-
-    // Shard-group mode: drop rows other workers own AFTER the gate count, routing each row by its key
-    // exactly as the changelog path does — a set of W workers still partitions the table.
-    if (ownedFilter != null) {
-      scan = scan.filter(ownedFilter);
-    }
-
-    SnapshotLineage lineage = SnapshotLineage.forTable(spark, catalog + "." + table);
-    SourceCheckpoint checkpoint = lineage.checkpoint(current);
-    ChangelogMapper mapper = new ChangelogMapper(mapping, replaceSnapshotIds);
-    long[] lastCommitted = {-1L};
-    int[] totalOps = {0};
-    int[] seq = {0};
-    streamBackfillCommits(
-        ChangelogReader.backfillRowIterator(scan, projectedColumns(), current, variantExtractor),
-        maxCommitRows,
-        rows -> {
-          DocBatch batch =
-              mapper.toBatch(rows, null, checkpoint, backfillBatchId(current, seq[0]++), null);
-          lastCommitted[0] = writeClient.write(batch);
-          totalOps[0] += batch.getOpsCount();
-        });
-    ConnectorMetrics.recordTrigger(observed, expected, current);
-    return new Result(current, lastCommitted[0], totalOps[0], true);
-  }
-
-  /**
-   * Cut a backfill scan into bounded, row-count-capped commits (all upserts, one snapshot, so no
-   * snapshot-boundary alignment is needed — unlike {@link #streamCommits}). Feeds each closed chunk to
-   * {@code sink}. Always emits at least one commit (possibly empty) so an owned subset with no rows
-   * still advances the shard to the current snapshot. Pure (no Spark/RPC) so it's unit-testable.
-   */
-  static void streamBackfillCommits(
-      Iterator<ChangelogRow> rows, long maxCommitRows, Consumer<List<ChangelogRow>> sink) {
-    List<ChangelogRow> buf = new ArrayList<>();
-    boolean emitted = false;
-    while (rows.hasNext()) {
-      buf.add(rows.next());
-      if (buf.size() >= maxCommitRows) {
-        sink.accept(buf);
-        emitted = true;
-        buf = new ArrayList<>();
-      }
-    }
-    if (!buf.isEmpty() || !emitted) {
-      sink.accept(buf);
-    }
-  }
-
-  /** The current snapshot's {@code total-records} (its whole live row count), or {@code -1} when the
-   *  summary doesn't carry it — the backfill under-read gate's independent expected count. */
-  long totalRecords(SparkSession spark, long snapshotId) {
-    List<Row> r =
-        spark
-            .sql(
-                "SELECT summary['total-records'] FROM "
-                    + catalog
-                    + "."
-                    + table
-                    + ".snapshots WHERE snapshot_id = "
-                    + snapshotId)
-            .collectAsList();
-    return (r.isEmpty() || r.get(0).isNullAt(0)) ? -1 : Long.parseLong(r.get(0).getString(0));
-  }
-
-  /** Deterministic per-sub-batch id for a backfill — distinct {@code seq} so the Node dedups an exact
-   *  retry yet applies each distinct chunk (all share the {@code current} checkpoint). */
-  private String backfillBatchId(long current, int seq) {
-    return table + "@backfill@" + current + "#" + seq;
   }
 
   /**

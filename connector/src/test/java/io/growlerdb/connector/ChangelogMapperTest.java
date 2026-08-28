@@ -29,7 +29,7 @@ class ChangelogMapperTest {
     Map<String, Value> cols = new HashMap<>();
     cols.put("id", str(id));
     cols.put("body", str(body));
-    return new ChangelogRow(type, ordinal, snapshot, cols, "data/f0.parquet", ordinal);
+    return new ChangelogRow(type, ordinal, snapshot, cols);
   }
 
   private static ChangelogMapper mapper() {
@@ -49,7 +49,6 @@ class ChangelogMapperTest {
     assertTrue(op.hasUpsert());
     assertEquals("doc-1", upsertId(op));
     assertEquals("hello", op.getUpsert().getDoc().getFieldsMap().get("body").getStr());
-    assertEquals("data/f0.parquet", op.getUpsert().getIcebergFile());
   }
 
   @Test
@@ -59,7 +58,7 @@ class ChangelogMapperTest {
     Map<String, Value> keyOnly = new HashMap<>();
     keyOnly.put("id", str("doc-1"));
     ChangelogRow eqDelete =
-        new ChangelogRow(ChangeType.DELETE, 0, 1, keyOnly, "data/f0.parquet", 0);
+        new ChangelogRow(ChangeType.DELETE, 0, 1, keyOnly);
 
     DocBatch batch = mapper().toBatch(List.of(eqDelete), CP, "b1");
     assertEquals(1, batch.getOpsCount());

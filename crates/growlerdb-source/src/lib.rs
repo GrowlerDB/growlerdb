@@ -1,8 +1,7 @@
-//! Source connectors for GrowlerDB: an Iceberg batch reader that tags each batch with
-//! its source data file and starting row position, so the index can build a primary-key
-//! locator for hydration.
+//! Source connectors for GrowlerDB: an Iceberg batch reader that maps a table's rows to
+//! documents, and store-less hydration that re-finds a document's source row by key.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{
@@ -15,7 +14,7 @@ use arrow_schema::{DataType, Fields, Schema, SchemaRef, TimeUnit};
 use futures::{StreamExt, TryStreamExt};
 use growlerdb_core::{
     CompositeKey, Document, HydrateRequest, HydratedRow, LocatedDoc, Projection, ResolvedIndex,
-    RowLocator, SourceField, SourceSchema, SourceType, Value,
+    SourceField, SourceSchema, SourceType, Value,
 };
 use iceberg::arrow::{schema_to_arrow_schema, ArrowReaderBuilder};
 use iceberg::expr::{Predicate, Reference};
@@ -29,19 +28,16 @@ use iceberg_catalog_rest::RestCatalog;
 use iceberg_catalog_rest::RestCatalogBuilder;
 use iceberg_storage_opendal::OpenDalStorageFactory;
 
-mod key_scan;
 mod plan_cache;
-mod point_read;
 mod shared_reader;
 mod trino;
 
-pub use key_scan::read_file_key_rows;
 pub use plan_cache::{PlanCache, PLAN_CACHE_CAP};
 pub use shared_reader::SharedReader;
 pub use trino::{shared_hydrator, TrinoConfig, TrinoHydrator};
 
-// The table IO handle [`read_file_key_rows`] (and [`TablePlan`]) hands around — re-exported so
-// callers (the engine's re-map driver, its tests) needn't depend on the `iceberg` crate.
+// The table IO handle [`TablePlan`] and [`fs_file_io`] hand around — re-exported so callers
+// needn't depend on the `iceberg` crate.
 pub use iceberg::io::FileIO;
 
 /// A **local-filesystem** [`FileIO`] over the same opendal storage factory the S3 path
@@ -56,17 +52,15 @@ pub enum SourceError {
     #[error(transparent)]
     Iceberg(#[from] iceberg::Error),
 
-    /// A targeted parquet point read failed (hydration pass 1 reads parquet directly for
-    /// row-group + row-selection scoping; see [`point_read`]).
+    /// A parquet read failed.
     #[error(transparent)]
     Parquet(#[from] parquet::errors::ParquetError),
 
-    /// A locator referenced a data file absent from the current table plan
-    /// (e.g. compacted away — a stale locator).
+    /// A referenced data file was absent from the current table plan (e.g. compacted away).
     #[error("data file not found in current table plan: {0}")]
     FileNotFound(String),
 
-    /// A locator's row position was out of range for its data file (stale).
+    /// A row position was out of range for its data file.
     #[error("row position {position} out of range in {file}")]
     RowOutOfRange {
         /// The data file path.
@@ -170,25 +164,16 @@ impl IcebergConfig {
     }
 }
 
-/// A record batch tagged with where its rows live in the source, for the locator.
-pub struct LocatedBatch {
-    pub batch: RecordBatch,
-    /// Source data-file path the rows came from.
-    pub data_file: String,
-    /// Row position (within `data_file`) of the first row of `batch`.
-    pub start_row: u64,
-}
-
-/// The result of reading a table snapshot: its Arrow schema and located batches.
+/// The result of reading a table snapshot: its Arrow schema and record batches.
 pub struct ReadResult {
     pub schema: SchemaRef,
-    pub batches: Vec<LocatedBatch>,
+    pub batches: Vec<RecordBatch>,
 }
 
 impl ReadResult {
     /// Total number of rows across all batches.
     pub fn row_count(&self) -> usize {
-        self.batches.iter().map(|b| b.batch.num_rows()).sum()
+        self.batches.iter().map(|b| b.num_rows()).sum()
     }
 }
 
@@ -199,7 +184,7 @@ const STREAM_CHUNK: usize = 50_000;
 /// Reads Apache Iceberg tables via a REST catalog.
 pub struct IcebergReader {
     catalog: RestCatalog,
-    /// Snapshot-pinned plan cache for [hydration](Self::hydrate)'s pass-1 unpredicated
+    /// Snapshot-pinned plan cache for [hydration](Self::hydrate)'s unpredicated
     /// current-snapshot plan: only effective when the reader itself is long-lived — hold it
     /// via [`SharedReader`] rather than connecting per call.
     plans: PlanCache<Arc<Vec<FileScanTask>>>,
@@ -413,125 +398,91 @@ impl IcebergReader {
         Ok(sort_field_names_of(&tbl))
     }
 
-    /// **Hydration with verify-and-fall-back** ([Flow 2], [keeping the locator
-    /// valid]): resolve `(key, locator)` pairs to authoritative rows.
+    /// **Store-less hydration** ([Flow 2]): resolve each request's composite key to its
+    /// authoritative row by a single **pruned key-equality scan** of the current snapshot.
     ///
-    /// For each request the located `(file, position)` is read — a **targeted parquet point
-    /// read** ([`point_read`]) that fetches only the row group(s) holding the requested positions
-    /// instead of streaming the file from row 0 — and **verified**: the
-    /// row's key must match the requested key. If the locator is **stale** (the file was
-    /// rewritten away, the position is out of range, or the row no longer carries that key),
-    /// GrowlerDB **falls back** to a partition-scoped scan of the current snapshot to re-find
-    /// the row by key, and returns a **refreshed** locator for it. So a phantom row is never
-    /// returned (verification), and a lagging locator self-heals (fallback + refresh). Keys
-    /// sharing a file are coalesced; rows come back in input order (genuinely-absent keys
-    /// omitted).
-    ///
-    /// A request may carry **no locator** (`None`) — a *known-stale* key whose locator points
-    /// into a file the index has flagged dead (the live-file bitmap): it skips the doomed pass-1
-    /// point read entirely and goes straight to the fallback (whose
-    /// result refreshes the slot).
+    /// There is no stored `(file, position)` locator — every request re-finds its row by key.
+    /// The scan pushes an equality predicate over each key's partition + identifier fields (plus
+    /// its **sort-key prune hints** — the row's own fast `ts`, etc.) so a sorted/partitioned
+    /// source prunes by manifest min/max to the files that can hold the row. Correctness doesn't
+    /// depend on the predicate: every candidate is re-verified against the exact key, so a
+    /// superset (or an unfiltered read on any predicate/scan error) is always safe. Rows come
+    /// back in input order (genuinely-absent keys omitted).
     ///
     /// [Flow 2]: ../../../okf/system/architecture.md
-    /// [keeping the locator valid]: ../../../okf/system/storage/locators-segments.md
     pub async fn hydrate(
         &self,
         table: &str,
         requests: &[HydrateRequest],
         projection: &Projection,
     ) -> Result<HydrationResult> {
-        // Max bytes the lazy pass-2 fallback reads per hydration call (decoded, row-group-granular). A
-        // well-pruned plan is far under this (a partitioned key → a file or two → full heal); an
-        // *unprunable* key (random, or secondary-sorted so per-file min/max spans the space) is capped
-        // here instead of scanning the whole snapshot per hit (TASK-339, the 30s topk stalls). The
-        // background compaction re-map (`remap.rs`) is the real, complete heal; pass-2 is a bounded
-        // stopgap that serves what it cheaply finds. 256 MiB keeps a worst-case fallback to a couple of
-        // seconds even against few-but-huge (~1 GB) compacted files.
+        // Max bytes the key scan reads per hydration call (decoded, row-group-granular). A
+        // well-pruned plan is far under this (a sort/partition-clustered key → a file or two → every
+        // hit resolved); an *unprunable* key (large, unclustered, unpartitioned, so per-file min/max
+        // spans the space) is capped here instead of scanning the whole snapshot per hit — it serves
+        // what it cheaply finds and omits the rest (graceful, assemble_rows). 256 MiB keeps a
+        // worst-case scan to a couple of seconds even against few-but-huge (~1 GB) compacted files.
         const FALLBACK_MAX_SCAN_BYTES: u64 = 256 * 1024 * 1024;
         if requests.is_empty() {
             return Ok(HydrationResult::default());
         }
-        // One catalog REST call to learn the current snapshot; the pass-1 unpredicated plan is
-        // reused from the snapshot-pinned cache until the snapshot advances. Pass 2 below is
+        // One catalog REST call to learn the current snapshot; the unpredicated plan is reused from
+        // the snapshot-pinned cache until the snapshot advances. The key scan below is
         // per-request-predicated and stays uncached.
-        let (tbl, tasks, plan_cache_hit) = self.load_and_plan(table).await?;
-        let file_io = tbl.file_io().clone();
+        let (tbl, _tasks, plan_cache_hit) = self.load_and_plan(table).await?;
 
-        // Pass 1 — located read + verify (point reads, coalesced by file); a `None` is a stale
-        // entry (missing file/position or key mismatch), deferred to the fallback.
-        let mut resolved = resolve_pass1(&file_io, &tasks, requests).await?;
-        let any_stale = resolved.iter().any(Option::is_none);
-
-        // Pass 2 — fallback: re-resolve stale rows by scanning the current snapshot, pushing an
-        // equality predicate over the stale keys' partition + identifier fields so Iceberg prunes
-        // to the relevant partitions/files. Correctness doesn't depend on the predicate: every
-        // candidate is re-verified against the exact key below, so a superset (or an unfiltered
-        // read on any predicate/scan error) is always safe.
-        let mut refreshed: Vec<(CompositeKey, RowLocator)> = Vec::new();
-        let mut duplicate_pks = 0u64;
-        if any_stale {
-            // Each stale request carries its key plus its **sort-key prune hints** (the row's own
-            // fast `ts`, etc.) — both go into the predicate so a sorted table prunes by manifest
-            // min/max on the sort key, not just the (unprunable) random identifier.
-            let stale: Vec<(&CompositeKey, &[(String, Value)])> = requests
-                .iter()
-                .zip(&resolved)
-                .filter(|(_, r)| r.is_none())
-                .map(|(req, _)| (&req.key, req.prune.as_slice()))
-                .collect();
-            let predicate = key_predicate(tbl.metadata().current_schema(), &stale);
-            let (partition_names, identifier_names) = key_field_names(&requests[0].key);
-            // Only the stale keys are re-resolved and the scan streams with early-exit, so even the
-            // unfiltered (`None` predicate) path is bounded in memory and cost.
-            let wanted: HashSet<Vec<u8>> = stale.iter().map(|(k, _)| k.encode()).collect();
-            let (index, duplicates) = match scan_stale_index(
-                &tbl,
-                predicate.clone(),
-                &wanted,
-                &partition_names,
-                &identifier_names,
-                FALLBACK_MAX_SCAN_BYTES,
-            )
-            .await
-            {
-                Ok(found) => found,
-                // A pruned scan that errored (e.g. an unexpected type binding) must never turn a
-                // present row into a miss — fall back to the unfiltered scan (same file budget).
-                Err(_) if predicate.is_some() => {
-                    scan_stale_index(
-                        &tbl,
-                        None,
-                        &wanted,
-                        &partition_names,
-                        &identifier_names,
-                        FALLBACK_MAX_SCAN_BYTES,
-                    )
-                    .await?
-                }
-                Err(e) => return Err(e),
-            };
-            duplicate_pks = duplicates;
-            for (i, req) in requests.iter().enumerate() {
-                if resolved[i].is_some() {
-                    continue;
-                }
-                if let Some((full, fresh)) = index.get(&req.key.encode()) {
-                    resolved[i] = Some(full.clone());
-                    refreshed.push((req.key.clone(), fresh.clone()));
-                }
+        // Each request carries its key plus its **sort-key prune hints** — both go into the
+        // predicate so a sorted table prunes by manifest min/max on the sort key, not just the
+        // (unprunable) random identifier.
+        let entries: Vec<(&CompositeKey, &[(String, Value)])> = requests
+            .iter()
+            .map(|req| (&req.key, req.prune.as_slice()))
+            .collect();
+        let predicate = key_predicate(tbl.metadata().current_schema(), &entries);
+        let (partition_names, identifier_names) = key_field_names(&requests[0].key);
+        // Only the wanted keys are indexed and the scan streams with early-exit, so even the
+        // unfiltered (`None` predicate) path is bounded in memory and cost.
+        let wanted: HashSet<Vec<u8>> = entries.iter().map(|(k, _)| k.encode()).collect();
+        let (index, duplicate_pks) = match scan_stale_index(
+            &tbl,
+            predicate.clone(),
+            &wanted,
+            &partition_names,
+            &identifier_names,
+            FALLBACK_MAX_SCAN_BYTES,
+        )
+        .await
+        {
+            Ok(found) => found,
+            // A pruned scan that errored (e.g. an unexpected type binding) must never turn a
+            // present row into a miss — fall back to the unfiltered scan (same file budget).
+            Err(_) if predicate.is_some() => {
+                scan_stale_index(
+                    &tbl,
+                    None,
+                    &wanted,
+                    &partition_names,
+                    &identifier_names,
+                    FALLBACK_MAX_SCAN_BYTES,
+                )
+                .await?
             }
-        }
+            Err(e) => return Err(e),
+        };
+        let resolved: Vec<Option<BTreeMap<String, Value>>> = requests
+            .iter()
+            .map(|req| index.get(&req.key.encode()).map(|(full, _)| full.clone()))
+            .collect();
 
         let rows = assemble_rows(requests, resolved, projection);
         Ok(HydrationResult {
             rows,
-            refreshed,
             plan_cache_hit: Some(plan_cache_hit),
             duplicate_pks,
         })
     }
 
-    /// `load_table` + the snapshot-pinned pass-1 plan for its current snapshot (cached per
+    /// `load_table` + the snapshot-pinned plan for its current snapshot (cached per
     /// snapshot, replanned on advance) — shared by [`hydrate`](Self::hydrate) and
     /// [`current_plan`](Self::current_plan). Returns `(table, tasks, cache_hit)`.
     async fn load_and_plan(&self, table: &str) -> Result<(Table, Arc<Vec<FileScanTask>>, bool)> {
@@ -557,11 +508,9 @@ impl IcebergReader {
 
     /// The table's **current-snapshot plan** — snapshot id, file-scan tasks, and the
     /// `FileIO` to read them with — served from the same snapshot-pinned [`PlanCache`]
-    /// hydration uses (one catalog call; manifest reads only on snapshot advance). The
-    /// compaction re-map poller diffs its live data-file set against
-    /// the index's interned files each tick, so the steady-state poll costs one REST
-    /// call and a cache hit. Observing table metadata is read-only — it imposes nothing
-    /// on the source.
+    /// hydration uses (one catalog call; manifest reads only on snapshot advance), so the
+    /// steady-state fetch costs one REST call and a cache hit. Observing table metadata is
+    /// read-only — it imposes nothing on the source.
     pub async fn current_plan(&self, table: &str) -> Result<TablePlan> {
         let (tbl, tasks, cache_hit) = self.load_and_plan(table).await?;
         Ok(TablePlan {
@@ -573,8 +522,7 @@ impl IcebergReader {
     }
 
     /// Read a table's current snapshot and map every row to a [`LocatedDoc`] —
-    /// the composite key + indexed fields (per `index`) plus the row's source
-    /// location (data file + position) for the locator. Full snapshot, append-only.
+    /// the composite key + indexed fields (per `index`). Full snapshot, append-only.
     pub async fn read_documents(
         &self,
         table: &str,
@@ -586,8 +534,8 @@ impl IcebergReader {
 
         let read = self.read_current(table).await?;
         let mut docs = Vec::with_capacity(read.row_count());
-        for lb in &read.batches {
-            batch_to_docs(index, &lb.batch, &lb.data_file, lb.start_row, &mut docs);
+        for batch in &read.batches {
+            batch_to_docs(index, batch, &mut docs);
         }
         Ok(DocumentBatch { docs, snapshot_id })
     }
@@ -693,18 +641,14 @@ impl IcebergReader {
         let mut total = 0usize;
         let mut chunk: Vec<LocatedDoc> = Vec::new();
         for task in tasks {
-            let data_file = task.data_file_path.clone();
             let reader =
                 ArrowReaderBuilder::new(file_io.clone(), iceberg::Runtime::current()).build();
             let task_stream =
                 futures::stream::once(async move { Ok::<FileScanTask, iceberg::Error>(task) })
                     .boxed();
             let mut stream = reader.read(task_stream)?.stream();
-            let mut pos = 0u64;
             while let Some(batch) = stream.try_next().await? {
-                let n = batch.num_rows() as u64;
-                batch_to_docs(index, &batch, &data_file, pos, &mut chunk);
-                pos += n;
+                batch_to_docs(index, &batch, &mut chunk);
                 if chunk.len() >= STREAM_CHUNK {
                     total += chunk.len();
                     sink(std::mem::take(&mut chunk)).map_err(SourceError::Sink)?;
@@ -754,18 +698,14 @@ impl IcebergReader {
             if identity_partition_of(&task).as_deref() != Some(partition) {
                 continue;
             }
-            let data_file = task.data_file_path.clone();
             let reader =
                 ArrowReaderBuilder::new(file_io.clone(), iceberg::Runtime::current()).build();
             let task_stream =
                 futures::stream::once(async move { Ok::<FileScanTask, iceberg::Error>(task) })
                     .boxed();
             let mut stream = reader.read(task_stream)?.stream();
-            let mut pos = 0u64;
             while let Some(batch) = stream.try_next().await? {
-                let n = batch.num_rows() as u64;
-                batch_to_docs(index, &batch, &data_file, pos, &mut chunk);
-                pos += n;
+                batch_to_docs(index, &batch, &mut chunk);
                 if chunk.len() >= STREAM_CHUNK {
                     total += chunk.len();
                     sink(std::mem::take(&mut chunk)).map_err(SourceError::Sink)?;
@@ -791,8 +731,8 @@ impl IcebergReader {
     ) -> Result<DocumentBatch> {
         let (read, snapshot_id, _seq) = self.read_appended_since(table, since_snapshot).await?;
         let mut docs = Vec::with_capacity(read.row_count());
-        for lb in &read.batches {
-            batch_to_docs(index, &lb.batch, &lb.data_file, lb.start_row, &mut docs);
+        for batch in &read.batches {
+            batch_to_docs(index, batch, &mut docs);
         }
         Ok(DocumentBatch { docs, snapshot_id })
     }
@@ -811,8 +751,8 @@ impl IcebergReader {
         let (read, snapshot_id, sequence_number) =
             self.read_appended_since(table, since_snapshot).await?;
         let mut docs = Vec::with_capacity(read.row_count());
-        for lb in &read.batches {
-            batch_to_docs(index, &lb.batch, &lb.data_file, lb.start_row, &mut docs);
+        for batch in &read.batches {
+            batch_to_docs(index, batch, &mut docs);
         }
         Ok(OrderedDocumentBatch {
             docs,
@@ -850,7 +790,7 @@ pub struct TablePlan {
     pub snapshot_id: i64,
     /// The snapshot's file-scan tasks (one per data file), from the snapshot-pinned cache.
     pub tasks: Arc<Vec<FileScanTask>>,
-    /// The table's IO stack — reads the plan's data files (e.g. the re-map's key scan).
+    /// The table's IO stack — reads the plan's data files (the pruned hydration key scan).
     pub file_io: iceberg::io::FileIO,
     /// Whether the plan came from the snapshot-pinned cache (no manifest reads).
     pub cache_hit: bool,
@@ -877,49 +817,32 @@ pub struct OrderedDocumentBatch {
     pub sequence_number: Option<i64>,
 }
 
-/// Read each `FileScanTask` into [`LocatedBatch`]es, skipping any whose data file is
-/// in `exclude` (the append fast-path's already-seen files). Each output batch is
-/// attributed to one data file + a row position within it (plan-then-read, so files
-/// aren't merged and the locator stays exact).
+/// Read each `FileScanTask` into record batches, skipping any whose data file is in
+/// `exclude` (the append fast-path's already-seen files).
 async fn read_tasks(
     file_io: iceberg::io::FileIO,
     tasks: Vec<FileScanTask>,
     exclude: &HashSet<String>,
-) -> Result<Vec<LocatedBatch>> {
+) -> Result<Vec<RecordBatch>> {
     let mut batches = Vec::new();
     for task in tasks {
         if exclude.contains(&task.data_file_path) {
             continue;
         }
-        let data_file = task.data_file_path.clone();
         let reader = ArrowReaderBuilder::new(file_io.clone(), iceberg::Runtime::current()).build();
         let task_stream =
             futures::stream::once(async move { Ok::<FileScanTask, iceberg::Error>(task) }).boxed();
         let mut stream = reader.read(task_stream)?.stream();
-
-        let mut pos = 0u64;
         while let Some(batch) = stream.try_next().await? {
-            let n = batch.num_rows() as u64;
-            batches.push(LocatedBatch {
-                batch,
-                data_file: data_file.clone(),
-                start_row: pos,
-            });
-            pos += n;
+            batches.push(batch);
         }
     }
     Ok(batches)
 }
 
-/// Map each row of `batch` to a [`LocatedDoc`] per the resolved `index`, appending
-/// to `out`. `start_row` is the batch's absolute row offset within `data_file`.
-fn batch_to_docs(
-    index: &ResolvedIndex,
-    batch: &RecordBatch,
-    data_file: &str,
-    start_row: u64,
-    out: &mut Vec<LocatedDoc>,
-) {
+/// Map each row of `batch` to a [`LocatedDoc`] per the resolved `index`, appending to `out`.
+/// Hydration re-finds rows by key, so nothing but the document is carried (store-less).
+fn batch_to_docs(index: &ResolvedIndex, batch: &RecordBatch, out: &mut Vec<LocatedDoc>) {
     let extract = |names: &[String], row: usize| -> Vec<(String, Value)> {
         names
             .iter()
@@ -940,22 +863,16 @@ fn batch_to_docs(
         }
         out.push(LocatedDoc {
             doc: Document::new(key, fields),
-            iceberg_file: data_file.to_string(),
-            row_position: start_row + row as u64,
         });
     }
 }
 
-/// The outcome of [hydration](IcebergReader::hydrate): the resolved rows plus any
-/// **refreshed** locator entries (stale entries that fell back and re-found their
-/// row) for the caller to write back into the index store.
+/// The outcome of [hydration](IcebergReader::hydrate): the resolved rows in request order.
 #[derive(Debug, Clone, Default)]
 pub struct HydrationResult {
     /// The hydrated rows, in request order (genuinely-absent keys omitted).
     pub rows: Vec<HydratedRow>,
-    /// `(key, fresh locator)` for entries whose `(file, position)` had moved.
-    pub refreshed: Vec<(CompositeKey, RowLocator)>,
-    /// Whether pass 1's plan came from the snapshot-pinned [`PlanCache`] (`Some(true)`),
+    /// Whether the plan came from the snapshot-pinned [`PlanCache`] (`Some(true)`),
     /// was freshly planned (`Some(false)`), or no planning happened at all (`None` — an
     /// empty request). Feeds the `growlerdb_plan_cache_{hits,misses}_total` counters.
     pub plan_cache_hit: Option<bool>,
@@ -965,95 +882,6 @@ pub struct HydrationResult {
     /// wins (see [`index_batch`]) — but a duplicate means the source table holds more
     /// than one row for a "unique" key. Feeds `growlerdb_duplicate_pks_total`.
     pub duplicate_pks: u64,
-}
-
-/// Pass 1 of [hydration](IcebergReader::hydrate): resolve each request's `(file, position)` and
-/// **verify** the row's key, returning per-request `Some(full row)` or `None` (stale — the caller
-/// falls back). Requests are coalesced by file; within a file one parquet footer read serves all
-/// requested positions via a **targeted point read** ([`point_read`]) — the row group(s) holding
-/// the positions plus a `RowSelection` to the exact rows, instead of streaming the file from row
-/// 0. A file absent from `tasks` (rewritten away) yields `None` for all its positions, and a
-/// request with **no locator** (known-stale via the live-file bitmap) is `None` without any read
-/// at all.
-async fn resolve_pass1(
-    file_io: &iceberg::io::FileIO,
-    tasks: &[FileScanTask],
-    requests: &[HydrateRequest],
-) -> Result<Vec<Option<BTreeMap<String, Value>>>> {
-    let mut by_file: BTreeMap<String, Vec<u64>> = BTreeMap::new();
-    for req in requests {
-        let Some(loc) = &req.locator else {
-            continue; // known stale — straight to the pass-2 fallback
-        };
-        by_file
-            .entry(loc.iceberg_file.clone())
-            .or_default()
-            .push(loc.row_position);
-    }
-    // Index the plan by data-file path once (O(files)) so the per-file lookup below is O(1); a
-    // linear `find` per requested file would be O(files × requested-files), dominating planning at
-    // the small-file counts an appended table accumulates.
-    let by_path: HashMap<&str, &FileScanTask> = tasks
-        .iter()
-        .map(|t| (t.data_file_path.as_str(), t))
-        .collect();
-    let mut located: HashMap<(String, u64), BTreeMap<String, Value>> = HashMap::new();
-    for (file, positions) in &by_file {
-        let Some(task) = by_path.get(file.as_str()).map(|t| (*t).clone()) else {
-            continue; // file rewritten away → all its positions fall back
-        };
-        // For a delete-free file the ingest-recorded position equals the physical row position, so
-        // the direct parquet point read is exact. A file carrying delete files/DVs must go through
-        // the iceberg reader (which applies them): its stream positions are delete-shifted to match
-        // ingest, and a physical read could return a since-deleted row whose key still verifies.
-        // Either way, a row that fails the key verify goes stale → pass 2.
-        let rows = if task.deletes.is_empty() {
-            point_read::read_file_rows(file_io, file, positions).await?
-        } else {
-            stream_file_rows(file_io.clone(), task, positions).await?
-        };
-        for (pos, full) in rows {
-            located.insert((file.clone(), pos), full);
-        }
-    }
-    // Verify: the located row must carry the requested key, else the entry is stale — a phantom
-    // row from a moved `(file, position)` is never returned.
-    Ok(requests
-        .iter()
-        .map(|req| {
-            let loc = req.locator.as_ref()?;
-            located
-                .get(&(loc.iceberg_file.clone(), loc.row_position))
-                .filter(|full| row_matches_key(full, &req.key))
-                .cloned()
-        })
-        .collect())
-}
-
-/// The streaming pass-1 read, kept for **delete-bearing files** (see [`resolve_pass1`]): the
-/// iceberg Arrow reader applies the file's delete files while streaming from row 0, stopping past
-/// `max(positions)` rather than reading the whole file. Returns `position → full row`;
-/// out-of-range positions are simply absent.
-async fn stream_file_rows(
-    file_io: iceberg::io::FileIO,
-    task: FileScanTask,
-    positions: &[u64],
-) -> Result<BTreeMap<u64, BTreeMap<String, Value>>> {
-    let reader = ArrowReaderBuilder::new(file_io, iceberg::Runtime::current()).build();
-    let task_stream =
-        futures::stream::once(async move { Ok::<FileScanTask, iceberg::Error>(task) }).boxed();
-    let mut stream = reader.read(task_stream)?.stream();
-    let max_pos = positions.iter().copied().max().unwrap_or(0);
-    let mut batches = Vec::new();
-    let mut rows_seen = 0u64;
-    while let Some(batch) = stream.try_next().await? {
-        rows_seen += batch.num_rows() as u64;
-        batches.push(batch);
-        if rows_seen > max_pos {
-            break; // every requested position for this file is now covered
-        }
-    }
-    Ok(extract_full_rows(&batches, positions))
 }
 
 /// Final assembly of [hydration](IcebergReader::hydrate): the resolved rows back in **request
@@ -1073,26 +901,6 @@ fn assemble_rows(
             })
         })
         .collect()
-}
-
-/// Extract the **full** rows (all columns) at the requested `positions` (absolute
-/// row offsets across a single file's `batches`). Out-of-range positions are
-/// simply omitted (a stale-locator signal, not an error).
-fn extract_full_rows(
-    batches: &[RecordBatch],
-    positions: &[u64],
-) -> BTreeMap<u64, BTreeMap<String, Value>> {
-    let want: BTreeSet<u64> = positions.iter().copied().collect();
-    let mut result: BTreeMap<u64, BTreeMap<String, Value>> = BTreeMap::new();
-    let mut offset = 0u64;
-    for batch in batches {
-        let n = batch.num_rows() as u64;
-        for &p in want.range(offset..offset + n) {
-            result.insert(p, full_row(batch, (p - offset) as usize));
-        }
-        offset += n;
-    }
-    result
 }
 
 /// Extract every column of `batch` at `row` as a field map (scalar subset).
@@ -1119,26 +927,24 @@ fn project_row(full: &BTreeMap<String, Value>, projection: &Projection) -> BTree
     }
 }
 
-/// Whether `full` carries the values of every field in `key` — the verification
-/// that prevents returning a phantom row from a stale `(file, position)`.
-fn row_matches_key(full: &BTreeMap<String, Value>, key: &CompositeKey) -> bool {
-    key.partition
-        .iter()
-        .chain(key.identifier.iter())
-        .all(|(name, value)| full.get(name) == Some(value))
-}
-
 /// The partition + identifier field names of a composite key.
 fn key_field_names(key: &CompositeKey) -> (Vec<String>, Vec<String>) {
     let names = |fields: &[(String, Value)]| fields.iter().map(|(n, _)| n.clone()).collect();
     (names(&key.partition), names(&key.identifier))
 }
 
+/// A scanned row's source coordinates — `(data file, row position)`. Used purely as the
+/// deterministic duplicate-PK tiebreak key (the highest one wins); no locator is stored.
+struct ScanLoc {
+    file: String,
+    position: u64,
+}
+
 /// Stream the current snapshot (optionally pruned by `predicate`, reusing the already-loaded
-/// [`Table`]) and index **only** the `wanted` stale keys → `(full row, fresh locator)`, stopping
-/// once all are found — the hydration-fallback read. Batches are processed one at a time and the
-/// result map is capped at the stale set, so even an unfiltered scan (`predicate` = `None`, from a
-/// DATE key / type mismatch) is bounded.
+/// [`Table`]) and index **only** the `wanted` keys → `full row`, stopping once all are found —
+/// the store-less hydration read. Batches are processed one at a time and the result map is
+/// capped at the wanted set, so even an unfiltered scan (`predicate` = `None`, from a DATE key /
+/// type mismatch) is bounded.
 ///
 /// Also returns the number of **duplicate PKs** seen (see [`index_batch`]). The early exit bounds
 /// detection too: a duplicate in a not-yet-scanned file goes unreported — detection is honest
@@ -1150,7 +956,7 @@ async fn scan_stale_index(
     partition_names: &[String],
     identifier_names: &[String],
     max_scan_bytes: u64,
-) -> Result<(HashMap<Vec<u8>, (BTreeMap<String, Value>, RowLocator)>, u64)> {
+) -> Result<(HashMap<Vec<u8>, (BTreeMap<String, Value>, ScanLoc)>, u64)> {
     let mut builder = tbl.scan().select_all();
     if let Some(p) = predicate {
         builder = builder.with_filter(p);
@@ -1164,9 +970,9 @@ async fn scan_stale_index(
     // plan — this scan would otherwise read the *whole current snapshot* on every hydration call
     // (O(snapshot)/hit → 30s stalls post-compaction, TASK-339). A file *count* budget is useless when
     // files are few-but-huge (a handful of ~1 GB parquet = the whole table), so bound the bytes
-    // *read*, checked at row-group granularity. A well-pruned plan is far under budget and heals
-    // fully; an unpruned one returns what it cheaply found and leaves the rest to the background
-    // compaction re-map. Unresolved rows are omitted, not errored (assemble_rows) — graceful.
+    // *read*, checked at row-group granularity. A well-pruned plan is far under budget and resolves
+    // every key; an unpruned one returns what it cheaply found and omits the rest. Unresolved rows
+    // are omitted, not errored (assemble_rows) — graceful.
     let mut bytes_scanned = 0u64;
     'files: for task in tasks.into_iter() {
         if bytes_scanned >= max_scan_bytes {
@@ -1195,7 +1001,7 @@ async fn scan_stale_index(
                 break 'files; // every stale key located → stop scanning
             }
             if bytes_scanned >= max_scan_bytes {
-                break 'files; // budget exhausted mid-file → serve what we found, re-map heals the rest
+                break 'files; // budget exhausted mid-file → serve what we found, omit the rest
             }
         }
     }
@@ -1356,9 +1162,9 @@ fn value_to_datum(schema: &IcebergSchema, name: &str, value: &Value) -> Option<D
     }
 }
 
-/// Index the rows of one `batch` whose composite key is in `wanted` → `enc(key) → (full row, fresh
-/// locator)`, for the verify-and-fall-back re-find. Filtering to `wanted` (the stale keys) bounds
-/// the fallback's memory. `start_row` is the batch's absolute offset within `data_file`.
+/// Index the rows of one `batch` whose composite key is in `wanted` → `enc(key) → (full row,
+/// [`ScanLoc`])`, for the store-less re-find. Filtering to `wanted` bounds the scan's memory.
+/// `start_row` is the batch's absolute offset within `data_file`.
 ///
 /// **Duplicate-PK detection**: a second distinct source row for an already-matched key means the
 /// table holds >1 row for a "unique" key. Each extra row counts toward the returned total (→
@@ -1366,7 +1172,7 @@ fn value_to_datum(schema: &IcebergSchema, name: &str, value: &Value) -> Option<D
 /// winner is deterministic — per key, the highest `(file, position)` scanned, not scan-order
 /// last-wins — but bounded to what the scan read (the caller's early exit stops at all-matched).
 fn index_batch(
-    index: &mut HashMap<Vec<u8>, (BTreeMap<String, Value>, RowLocator)>,
+    index: &mut HashMap<Vec<u8>, (BTreeMap<String, Value>, ScanLoc)>,
     batch: &RecordBatch,
     data_file: &str,
     start_row: u64,
@@ -1390,15 +1196,15 @@ fn index_batch(
         let key = CompositeKey::new(partition, field(identifier_names, row));
         let enc = key.encode();
         if !wanted.contains(&enc) {
-            continue; // only re-resolve the stale keys, not every row in the snapshot
+            continue; // only re-resolve the wanted keys, not every row in the snapshot
         }
-        let locator = RowLocator {
-            iceberg_file: data_file.to_string(),
-            row_position: start_row + row as u64,
+        let loc = ScanLoc {
+            file: data_file.to_string(),
+            position: start_row + row as u64,
         };
         match index.entry(enc) {
             std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert((full_row(batch, row), locator));
+                slot.insert((full_row(batch, row), loc));
             }
             std::collections::hash_map::Entry::Occupied(mut slot) => {
                 // A second distinct row for this key — a genuine duplicate PK (one
@@ -1406,16 +1212,12 @@ fn index_batch(
                 // winner: highest (file, position).
                 duplicates += 1;
                 let held = &slot.get().1;
-                let keep_new = (locator.iceberg_file.as_str(), locator.row_position)
-                    > (held.iceberg_file.as_str(), held.row_position);
-                let (winner, loser) = if keep_new {
-                    (&locator, held)
-                } else {
-                    (held, &locator)
-                };
+                let keep_new =
+                    (loc.file.as_str(), loc.position) > (held.file.as_str(), held.position);
+                let (winner, loser) = if keep_new { (&loc, held) } else { (held, &loc) };
                 warn_duplicate_pk(&key, winner, loser);
                 if keep_new {
-                    slot.insert((full_row(batch, row), locator));
+                    slot.insert((full_row(batch, row), loc));
                 }
             }
         }
@@ -1431,7 +1233,7 @@ const DUP_WARN_INTERVAL_SECS: u64 = 10;
 /// the key scan found a **duplicate primary key**: `key` matched more than one distinct
 /// source row. Names the key and both rows, and states the deterministic winner rule.
 /// Returns whether a line was actually emitted (for tests).
-fn warn_duplicate_pk(key: &CompositeKey, winner: &RowLocator, loser: &RowLocator) -> bool {
+fn warn_duplicate_pk(key: &CompositeKey, winner: &ScanLoc, loser: &ScanLoc) -> bool {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     /// Epoch seconds of the last emitted warning (0 = never).
@@ -1464,10 +1266,10 @@ fn warn_duplicate_pk(key: &CompositeKey, winner: &RowLocator, loser: &RowLocator
          this warning is rate-limited.",
         describe(&key.partition),
         describe(&key.identifier),
-        winner.iceberg_file,
-        winner.row_position,
-        loser.iceberg_file,
-        loser.row_position,
+        winner.file,
+        winner.position,
+        loser.file,
+        loser.position,
     );
     true
 }
@@ -1586,66 +1388,33 @@ fn arrow_type_to_source(dt: &DataType) -> SourceType {
 }
 
 #[cfg(test)]
-pub(crate) mod test_util {
-    //! Shared parquet fixture for the point-read tests: a real multi-row-group `docs` file on
-    //! local disk, read back through the same opendal `FileIO` stack production uses (`fs` scheme).
-    use std::sync::Arc;
-
-    use arrow_array::{Int64Array, RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
-    use iceberg::io::FileIO;
-    use parquet::arrow::ArrowWriter;
-    use parquet::file::properties::WriterProperties;
-
-    /// Write `rows` docs rows (`id = base + i` Int64, `body = body_for(id)` Utf8) to `path` with
-    /// row groups of `group_size` rows, returning the file's length in bytes.
-    pub(crate) fn write_docs_parquet(path: &str, base: i64, rows: usize, group_size: usize) -> u64 {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("body", DataType::Utf8, true),
-        ]));
-        let ids: Vec<i64> = (0..rows as i64).map(|i| base + i).collect();
-        let bodies: Vec<String> = ids.iter().map(|id| body_for(*id)).collect();
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(ids)),
-                Arc::new(StringArray::from(bodies)),
-            ],
-        )
-        .unwrap();
-        let props = WriterProperties::builder()
-            .set_max_row_group_row_count(Some(group_size))
-            .build();
-        let file = std::fs::File::create(path).unwrap();
-        let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-        std::fs::metadata(path).unwrap().len()
-    }
-
-    /// The deterministic body of row `id` — a mixed-in hash keeps the payload from compressing
-    /// away, so byte-count assertions stay meaningful.
-    pub(crate) fn body_for(id: i64) -> String {
-        format!(
-            "body-{id}-{:016x}",
-            (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        )
-    }
-
-    /// A local-filesystem `FileIO` (the crate-level [`fs_file_io`](crate::fs_file_io)).
-    pub(crate) fn fs_file_io() -> FileIO {
-        crate::fs_file_io()
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use arrow_schema::Field;
     use std::sync::Arc;
 
     use iceberg::spec::{NestedField, PartitionSpec, Struct, Type};
+
+    /// A minimal delete-free [`FileScanTask`] for `path`; only `data_file_path` + `deletes` are
+    /// meaningful to the tests, the rest is inert.
+    fn docs_task(path: &str) -> FileScanTask {
+        FileScanTask {
+            file_size_in_bytes: 0,
+            start: 0,
+            length: 0,
+            record_count: None,
+            data_file_path: path.to_string(),
+            data_file_format: iceberg::spec::DataFileFormat::Parquet,
+            schema: Arc::new(ice_schema()),
+            project_field_ids: vec![],
+            predicate: None,
+            deletes: vec![],
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
+        }
+    }
 
     /// An identity `PartitionSpec` on `site` over [`ice_schema`] (count-gate tests).
     fn site_spec() -> PartitionSpec {
@@ -1978,23 +1747,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_full_rows_reads_positions_across_batches() {
-        let batches = docs_batches();
-        let rows = extract_full_rows(&batches, &[0, 2]);
-        assert_eq!(rows[&0]["id"], Value::Int(10));
-        assert_eq!(rows[&0]["body"], Value::Str("alpha".into()));
-        assert_eq!(rows[&2]["body"], Value::Str("charlie".into()));
-    }
-
-    #[test]
-    fn extract_full_rows_omits_out_of_range() {
-        let batches = docs_batches(); // 3 rows total (0..=2)
-        let rows = extract_full_rows(&batches, &[1, 3]);
-        assert!(rows.contains_key(&1));
-        assert!(!rows.contains_key(&3), "out-of-range omitted, not an error");
-    }
-
-    #[test]
     fn project_row_narrows_columns() {
         let full = full_row(&docs_batches()[0], 1);
         let narrowed = project_row(&full, &Projection::Columns(vec!["body".into()]));
@@ -2003,178 +1755,9 @@ mod tests {
     }
 
     #[test]
-    fn row_matches_key_verifies_identity() {
-        let full = full_row(&docs_batches()[0], 0); // id=10
-        assert!(row_matches_key(&full, &key_id(10)), "matching key verifies");
-        assert!(
-            !row_matches_key(&full, &key_id(99)),
-            "a different key at this position is a phantom — rejected"
-        );
-    }
-
-    /// A minimal delete-free [`FileScanTask`] for `path` — pass 1 only reads its
-    /// `data_file_path` + `deletes` on the point-read path; the rest is inert.
-    fn docs_task(path: &str) -> FileScanTask {
-        FileScanTask {
-            file_size_in_bytes: 0,
-            start: 0,
-            length: 0,
-            record_count: None,
-            data_file_path: path.to_string(),
-            data_file_format: iceberg::spec::DataFileFormat::Parquet,
-            schema: Arc::new(ice_schema()),
-            project_field_ids: vec![],
-            predicate: None,
-            deletes: vec![],
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: false,
-        }
-    }
-
-    fn locator(file: &str, pos: u64) -> RowLocator {
-        RowLocator {
-            iceberg_file: file.to_string(),
-            row_position: pos,
-        }
-    }
-
-    /// Hydration pass 1 over **real parquet files**: a batch mixing two files
-    /// resolves via targeted point reads and comes back in **input order**; a wrong-key position
-    /// (phantom), an out-of-range position, and a rewritten-away file all verify-fail to `None`
-    /// (→ the pass-2 fallback, unchanged) and are **omitted** from the assembled rows.
-    #[tokio::test]
-    async fn pass1_resolves_mixed_files_in_input_order_and_marks_stale() {
-        use crate::test_util::{body_for, fs_file_io, write_docs_parquet};
-
-        let dir = tempfile::tempdir().unwrap();
-        let f0 = dir.path().join("f0.parquet").to_str().unwrap().to_string();
-        let f1 = dir.path().join("f1.parquet").to_str().unwrap().to_string();
-        write_docs_parquet(&f0, 0, 300, 50); // ids 0..300, 6 row groups
-        write_docs_parquet(&f1, 1000, 300, 50); // ids 1000..1300
-
-        let key = |id: i64| CompositeKey::new(vec![], vec![("id".into(), Value::Int(id))]);
-        let req = HydrateRequest::new;
-        let requests = vec![
-            req(key(1005), Some(locator(&f1, 5))),   // resolves (file 1)
-            req(key(7), Some(locator(&f0, 7))),      // resolves (file 0) — interleaved input order
-            req(key(999), Some(locator(&f0, 8))),    // wrong key at position 8 (id=8) → stale
-            req(key(1299), Some(locator(&f1, 299))), // last row of file 1 → resolves
-            req(key(42), Some(locator(&f0, 9_999))), // past EOF → stale
-            req(key(1), Some(locator("gone.parquet", 1))), // file rewritten away → stale
-            req(key(2), None), // known stale (dead-file bitmap) → no read at all
-        ];
-        let tasks = vec![docs_task(&f0), docs_task(&f1)];
-
-        let resolved = resolve_pass1(&fs_file_io(), &tasks, &requests)
-            .await
-            .expect("pass 1");
-        assert_eq!(
-            resolved.iter().map(Option::is_some).collect::<Vec<_>>(),
-            vec![true, true, false, true, false, false, false],
-            "verify: matches resolve; phantoms/OOR/missing-file/known-stale go stale"
-        );
-
-        let rows = assemble_rows(&requests, resolved, &Projection::All);
-        let ids: Vec<&Value> = rows.iter().map(|r| &r.fields["id"]).collect();
-        assert_eq!(
-            ids,
-            vec![&Value::Int(1005), &Value::Int(7), &Value::Int(1299)],
-            "rows come back in input order, absent keys omitted"
-        );
-        assert_eq!(rows[1].key, key(7), "row carries its request key");
-        assert_eq!(
-            rows[0].fields["body"],
-            Value::Str(body_for(1005)),
-            "full-row equality with the source row"
-        );
-    }
-
-    /// The hydration hot path composed with the snapshot-pinned [`PlanCache`] over **real
-    /// parquet files**: two hydrates at the same snapshot run exactly one
-    /// planning pass; an appended file (snapshot advance) forces a fresh plan whose rows
-    /// then resolve correctly — the cached stale plan alone could not see them.
-    #[tokio::test]
-    async fn plan_cache_reuses_at_same_snapshot_and_replans_on_advance() {
-        use crate::test_util::{fs_file_io, write_docs_parquet};
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let dir = tempfile::tempdir().unwrap();
-        let f0 = dir.path().join("f0.parquet").to_str().unwrap().to_string();
-        let f1 = dir.path().join("f1.parquet").to_str().unwrap().to_string();
-        write_docs_parquet(&f0, 0, 100, 50); // ids 0..100 — present at snapshot 1
-        write_docs_parquet(&f1, 1000, 100, 50); // ids 1000..1100 — appended at snapshot 2
-
-        // The table's plan per snapshot, exactly as `hydrate` would learn it from
-        // `load_table` + `plan_files`: snapshot 1 sees f0; snapshot 2 sees f0 + f1.
-        let plan_at = |snapshot: i64| match snapshot {
-            1 => vec![docs_task(&f0)],
-            _ => vec![docs_task(&f0), docs_task(&f1)],
-        };
-        let cache: PlanCache<Arc<Vec<FileScanTask>>> = PlanCache::new(PLAN_CACHE_CAP);
-        let plans_run = AtomicUsize::new(0);
-
-        // One "hydrate" = hydrate()'s pass 1 with the cached-or-planned task set.
-        let hydrate_at = |snapshot: i64, requests: Vec<HydrateRequest>| {
-            let (cache, plans_run) = (&cache, &plans_run);
-            async move {
-                let (tasks, hit) = cache
-                    .get_or_plan("g.docs", snapshot, || async {
-                        plans_run.fetch_add(1, Ordering::SeqCst);
-                        Ok::<_, SourceError>(Arc::new(plan_at(snapshot)))
-                    })
-                    .await
-                    .unwrap();
-                let resolved = resolve_pass1(&fs_file_io(), &tasks, &requests)
-                    .await
-                    .unwrap();
-                (assemble_rows(&requests, resolved, &Projection::All), hit)
-            }
-        };
-
-        // Two hydrates at snapshot 1 → correct rows, one planning pass (the second is a hit).
-        let (rows, hit) = hydrate_at(
-            1,
-            vec![HydrateRequest::new(key_id(7), Some(locator(&f0, 7)))],
-        )
-        .await;
-        assert_eq!(rows[0].fields["id"], Value::Int(7));
-        assert!(!hit);
-        let (rows, hit) = hydrate_at(
-            1,
-            vec![HydrateRequest::new(key_id(42), Some(locator(&f0, 42)))],
-        )
-        .await;
-        assert_eq!(rows[0].fields["id"], Value::Int(42));
-        assert!(hit, "same snapshot → cached plan reused");
-        assert_eq!(plans_run.load(Ordering::SeqCst), 1, "manifests read once");
-
-        // Snapshot advances (f1 appended) → replan → the appended row hydrates correctly,
-        // and rows from the old plan's file still do.
-        let (rows, hit) = hydrate_at(
-            2,
-            vec![
-                HydrateRequest::new(key_id(1005), Some(locator(&f1, 5))),
-                HydrateRequest::new(key_id(7), Some(locator(&f0, 7))),
-            ],
-        )
-        .await;
-        assert!(!hit, "snapshot advance → fresh plan");
-        assert_eq!(plans_run.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            rows.len(),
-            2,
-            "appended file visible only via the fresh plan"
-        );
-        assert_eq!(rows[0].fields["id"], Value::Int(1005));
-        assert_eq!(rows[1].fields["id"], Value::Int(7));
-    }
-
-    #[test]
     fn index_batch_indexes_only_wanted_keys_for_fallback() {
-        // A stale locator (wrong file/position) is re-found by key from a scan — and only the wanted
-        // (stale) keys are indexed, so an unfiltered fallback scan doesn't materialize every row.
+        // A key is re-found from a scan — and only the wanted keys are indexed, so an unfiltered
+        // scan doesn't materialize every row.
         let batch = docs_batches()[0].clone(); // ids 10, 11 in data/x at rows 0, 1
         let wanted: HashSet<Vec<u8>> = [key_id(11).encode()].into_iter().collect();
         let mut index = HashMap::new();
@@ -2196,10 +1779,10 @@ mod tests {
             !index.contains_key(&key_id(10).encode()),
             "unwanted key skipped"
         );
-        let (full, locator) = index.get(&key_id(11).encode()).expect("found by key");
+        let (full, loc) = index.get(&key_id(11).encode()).expect("found by key");
         assert_eq!(full["body"], Value::Str("bravo".into()));
-        assert_eq!(locator.iceberg_file, "data/x.parquet");
-        assert_eq!(locator.row_position, 1);
+        assert_eq!(loc.file, "data/x.parquet");
+        assert_eq!(loc.position, 1);
     }
 
     #[test]
@@ -2244,10 +1827,7 @@ mod tests {
         );
         let (full, loc) = &index[&key_id(11).encode()];
         assert_eq!(full["body"], Value::Str("second-11".into()));
-        assert_eq!(
-            (loc.iceberg_file.as_str(), loc.row_position),
-            ("data/x.parquet", 2)
-        );
+        assert_eq!((loc.file.as_str(), loc.position), ("data/x.parquet", 2));
 
         // A later file that sorts HIGHER wins even at a lower row position...
         let batch_y = RecordBatch::try_new(
@@ -2270,10 +1850,7 @@ mod tests {
         assert_eq!(dups, 1);
         let (full, loc) = &index[&key_id(11).encode()];
         assert_eq!(full["body"], Value::Str("third-11".into()));
-        assert_eq!(
-            (loc.iceberg_file.as_str(), loc.row_position),
-            ("data/y.parquet", 0)
-        );
+        assert_eq!((loc.file.as_str(), loc.position), ("data/y.parquet", 0));
 
         // ... and a lower-sorting file NEVER displaces it (deterministic, not scan-order).
         let batch_w = RecordBatch::try_new(
@@ -2300,7 +1877,7 @@ mod tests {
             Value::Str("third-11".into()),
             "winner unchanged"
         );
-        assert_eq!(loc.iceberg_file, "data/y.parquet");
+        assert_eq!(loc.file, "data/y.parquet");
 
         // Warning path: the detections above went through `warn_duplicate_pk`, which
         // consumed the process-wide rate-limit window — a direct call inside the same
@@ -2309,8 +1886,14 @@ mod tests {
         assert!(
             !warn_duplicate_pk(
                 &key_id(11),
-                &locator("data/y.parquet", 0),
-                &locator("data/w.parquet", 5),
+                &ScanLoc {
+                    file: "data/y.parquet".into(),
+                    position: 0
+                },
+                &ScanLoc {
+                    file: "data/w.parquet".into(),
+                    position: 5
+                },
             ),
             "rate limit engaged: the scan's own warning consumed the window"
         );
@@ -2352,16 +1935,16 @@ mod tests {
             &["ts".to_string()],
         );
         assert_eq!(index.len(), 1, "only the wanted temporal key is indexed");
-        let (full, locator) = index
+        let (full, loc) = index
             .get(&key(micros[1]).encode())
             .expect("found by ts key");
         assert_eq!(full["body"], Value::Str("bravo".into()));
         assert_eq!(full["ts"], Value::Ts(micros[1]));
-        assert_eq!(locator.row_position, 1);
+        assert_eq!(loc.position, 1);
     }
 
     #[test]
-    fn batch_to_docs_builds_keyed_located_documents() {
+    fn batch_to_docs_builds_keyed_documents() {
         use growlerdb_core::{IndexDefinition, SourceField, SourceSchema, SourceType};
 
         // Index: identifier `id` (KEYWORD), fields id + body.
@@ -2382,16 +1965,13 @@ mod tests {
 
         let batches = docs_batches(); // id (Int64) 10,11 | 12 ; body strings
         let mut docs = Vec::new();
-        batch_to_docs(&index, &batches[0], "data/f0.parquet", 0, &mut docs);
-        batch_to_docs(&index, &batches[1], "data/f0.parquet", 2, &mut docs);
+        batch_to_docs(&index, &batches[0], &mut docs);
+        batch_to_docs(&index, &batches[1], &mut docs);
 
         assert_eq!(docs.len(), 3);
-        // Key carries the identifier; locator carries file + absolute position.
+        // Key carries the identifier.
         assert_eq!(docs[0].doc.key.get("id"), Some(&Value::Int(10)));
-        assert_eq!(docs[0].row_position, 0);
         assert_eq!(docs[2].doc.key.get("id"), Some(&Value::Int(12)));
-        assert_eq!(docs[2].row_position, 2);
-        assert_eq!(docs[2].iceberg_file, "data/f0.parquet");
         // Fields include the mapped columns.
         assert_eq!(docs[1].doc.fields["body"], Value::Str("bravo".into()));
     }
@@ -2499,7 +2079,7 @@ mod tests {
         .unwrap();
 
         let mut out = Vec::new();
-        batch_to_docs(&idx, &batch, "data/f.parquet", 0, &mut out);
+        batch_to_docs(&idx, &batch, &mut out);
         assert_eq!(out.len(), 2);
 
         // Row 0: the nested leaves resolve to their dotted paths, and the top-level
@@ -2558,9 +2138,10 @@ mod tests {
             .expect("connect");
         let res = reader.read_current("growlerdb.docs").await.expect("read");
         assert!(res.row_count() >= 1, "expected seeded rows");
-        for b in &res.batches {
-            assert!(!b.data_file.is_empty(), "every batch carries a source file");
-        }
+        assert!(
+            !res.batches.is_empty(),
+            "seeded rows come back as record batches"
+        );
     }
 
     /// Regression (no stack): read a **real Spark merge-on-read** table off local disk via
@@ -2605,7 +2186,7 @@ mod tests {
         let batches = read_tasks(tbl.file_io().clone(), tasks, &HashSet::new())
             .await
             .expect("read");
-        let rows: usize = batches.iter().map(|b| b.batch.num_rows()).sum();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(
             rows, 9,
             "MoR history delete must be honored (9 live rows, not 10 or 0)"
@@ -2619,7 +2200,7 @@ mod tests {
     /// (`request_id`) is written to span the whole hex space in every file, so a request_id-only
     /// predicate can never prune.
     ///
-    /// Proves the mechanism: the pass-2 fallback's [`key_predicate`], once the row's own `ts`
+    /// Proves the mechanism: the hydration scan's [`key_predicate`], once the row's own `ts`
     /// sort-key value is AND-ed on as a prune hint, makes `plan_files` prune to the **one** file that
     /// can hold the row (vs the full 6-file scan on the key alone). Also proves the *dependency* on a
     /// declared sort order: [`sort_field_names_of`] reads `default_sort_order()` — the sorted table
@@ -2873,6 +2454,191 @@ mod tests {
         assert_eq!(
             spread_scan, 6,
             "a topk batch whose keys span the whole timeline can't prune — the OR matches every file (the live 30s full-scan)"
+        );
+    }
+
+    /// The decisive measurement the file-count sibling tests never took: does iceberg-rust prune at
+    /// the **row-group** level *within* one data file? This settles whether store-less `PREDICATE`
+    /// hydration can serve a **scattered** top-k (the real `topk_hydrated`: `sort response_time desc`
+    /// → 20 hits with `ts` spread across the whole timeline) in sub-second.
+    ///
+    /// The sibling REST test showed a scattered batch can't prune at the FILE level (`spread_scan`
+    /// = every file). But the compacted files are few-but-huge (many row groups each). This loads a
+    /// single 40-row-group file — `ts` strictly increasing (tight, disjoint per-row-group min/max),
+    /// `request_id` md5-uniform (spans the whole space in EVERY row group, so it prunes neither file
+    /// nor row group; iceberg-rust 0.10.1 has no bloom support) — and measures the bytes iceberg
+    /// actually fetches (`ScanMetrics::bytes_read`) for the real hydration read (mirrors
+    /// [`scan_stale_index`]) in three modes:
+    ///   * no filter          → whole file (the baseline);
+    ///   * request_id-only    → the CONTROL: an unselective key can't skip any row group → ~whole
+    ///                          file (this is also why the parquet request_id bloom is dead weight);
+    ///   * request_id AND ts  → the scattered batch's 5 keys, each with its `ts` prune hint.
+    ///
+    /// If the ts+key read fetches ~5/40 of the file → row-group pruning carries the scattered batch
+    /// → PREDICATE is sub-second with NO stored locators, NO remap, NO staleness. That is the whole
+    /// question behind dropping the fragile `(file,position)` locator.
+    ///
+    /// Generate first (any pyiceberg + pyarrow venv):
+    ///   `GDB_RG_WAREHOUSE=/tmp/rgwh python3 tests/fixtures/gen_rowgroup_prune.py`
+    /// Then: `cargo test -p growlerdb-source -- --ignored rowgroup_prune --nocapture`
+    #[tokio::test]
+    #[ignore = "requires the pyiceberg row-group fixture at /tmp/rgwh (see gen_rowgroup_prune.py)"]
+    async fn rowgroup_prune_reads_only_the_matching_row_groups() {
+        use growlerdb_core::{CompositeKey, Value};
+        use iceberg::io::FileIOBuilder;
+        use iceberg::table::StaticTable;
+        use iceberg_storage_opendal::OpenDalStorageFactory;
+
+        // The 5 scattered targets the fixture prints (md5("req-<i>"), ts = i), one per row group
+        // ~9 apart across the 40-group file.
+        const TARGETS: [(&str, i64); 5] = [
+            ("697999c93cb1611f2bbd5b10610416f0", 2_500),
+            ("d2b947b49b2beba62b6f5f861a6fae54", 11_500),
+            ("d691c64dd2248551c44ec631b0c9b078", 20_500),
+            ("bb9a07ef8619e182e3e74fac490f7d59", 29_500),
+            ("e6e9a115791ff9c51ddc55af0acd5a4a", 38_500),
+        ];
+
+        let wh = std::env::var("GDB_RG_WAREHOUSE").unwrap_or_else(|_| "/tmp/rgwh".into());
+        let dir = format!("{wh}/ns/rowgroups/metadata");
+        let mut metas: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("read fixture dir {dir}: {e} — run gen_rowgroup_prune.py"))
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .collect();
+        metas.sort(); // version-prefixed → last is current
+        let meta = metas
+            .last()
+            .expect("a metadata json")
+            .to_string_lossy()
+            .into_owned();
+        let file_io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::Fs)).build();
+        let ident = TableIdent::from_strs(["ns", "rowgroups"]).unwrap();
+        let tbl = StaticTable::from_metadata_file(&meta, ident, file_io)
+            .await
+            .expect("static table")
+            .into_table();
+
+        // The declared sort order surfaces `ts` as a hint field (the production dependency).
+        assert_eq!(
+            sort_field_names_of(&tbl),
+            vec!["ts".to_string(), "request_id".to_string()],
+            "declared WRITE ORDERED BY (ts, request_id) must surface as hint fields"
+        );
+
+        // Run the REAL hydration read (mirrors `scan_stale_index`: plan_files with the filter, then the
+        // iceberg ArrowReader per task) and return (matched request_ids, bytes fetched from storage).
+        async fn scan_read(tbl: &Table, predicate: Option<Predicate>) -> (Vec<String>, u64) {
+            let mut b = tbl.scan().select_all();
+            if let Some(p) = predicate {
+                b = b.with_filter(p);
+            }
+            let tasks: Vec<FileScanTask> = b
+                .build()
+                .unwrap()
+                .plan_files()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let file_io = tbl.file_io().clone();
+            let mut rids = Vec::new();
+            let mut bytes = 0u64;
+            for task in tasks {
+                let reader =
+                    ArrowReaderBuilder::new(file_io.clone(), iceberg::Runtime::current()).build();
+                let task_stream =
+                    futures::stream::once(async move { Ok::<FileScanTask, iceberg::Error>(task) })
+                        .boxed();
+                let scan = reader.read(task_stream).unwrap();
+                let metrics = scan.metrics().clone(); // shares the Arc byte counter
+                let mut stream = scan.stream();
+                while let Some(batch) = stream.try_next().await.unwrap() {
+                    for r in 0..batch.num_rows() {
+                        if let Some(Value::Str(rid)) = full_row(&batch, r).get("request_id") {
+                            rids.push(rid.clone());
+                        }
+                    }
+                }
+                bytes += metrics.bytes_read();
+            }
+            (rids, bytes)
+        }
+
+        let key = |rid: &str| {
+            CompositeKey::new(vec![], vec![("request_id".into(), Value::Str(rid.into()))])
+        };
+        let keys: Vec<CompositeKey> = TARGETS.iter().map(|(rid, _)| key(rid)).collect();
+        let ts_hints: Vec<Vec<(String, Value)>> = TARGETS
+            .iter()
+            .map(|(_, ts)| vec![("ts".to_string(), Value::Int(*ts))])
+            .collect();
+        let schema = tbl.metadata().current_schema();
+        let no_hint: &[(String, Value)] = &[];
+        let key_only: Vec<(&CompositeKey, &[(String, Value)])> =
+            keys.iter().map(|k| (k, no_hint)).collect();
+        let key_and_ts: Vec<(&CompositeKey, &[(String, Value)])> = keys
+            .iter()
+            .zip(&ts_hints)
+            .map(|(k, h)| (k, h.as_slice()))
+            .collect();
+
+        let (full_rows, full_bytes) = scan_read(&tbl, None).await;
+        let (ctrl_rids, ctrl_bytes) = scan_read(&tbl, key_predicate(schema, &key_only)).await;
+        let (hit_rids, hit_bytes) = scan_read(&tbl, key_predicate(schema, &key_and_ts)).await;
+
+        eprintln!(
+            "row-group prune bytes_read: full={full_bytes} request_id_only={ctrl_bytes} \
+             request_id+ts={hit_bytes} (full rows={})",
+            full_rows.len()
+        );
+
+        // Both filtered reads return exactly the 5 scattered targets (the RowFilter is applied) —
+        // so pruning is a pure speed-up, never a correctness change.
+        let want: std::collections::BTreeSet<String> =
+            TARGETS.iter().map(|(rid, _)| rid.to_string()).collect();
+        assert_eq!(
+            ctrl_rids
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            want,
+            "request_id-only still returns the 5 targets (correctness)"
+        );
+        assert_eq!(
+            hit_rids.iter().cloned().collect::<std::collections::BTreeSet<_>>(),
+            want,
+            "request_id+ts returns exactly the 5 targets — the ts prune term never drops a real hit"
+        );
+
+        // CONTROL: `request_id` alone cannot skip a row group (its per-group min/max spans the whole
+        // space, and iceberg-rust 0.10.1 uses no parquet bloom filter), so it reads every row group's
+        // key column — but parquet's RowFilter still late-materializes, reading the fat `payload` only
+        // for the 5 matched rows, so `request_id`-only lands well below the unfiltered full read. The
+        // exact "touches all 40 row groups" control is asserted by the sibling
+        // `tests/rowgroup_bytes.rs` (which logs per-row-group reads); here we only need it as the
+        // no-ts baseline the `ts` hint must beat.
+        assert!(
+            ctrl_bytes < full_bytes,
+            "request_id-only ({ctrl_bytes}) reads less than the unfiltered full scan ({full_bytes}) \
+             via RowFilter late-materialization"
+        );
+
+        // THE PROOF: AND-ing each hit's `ts` prunes to the 5 of 40 row groups the scattered keys fall
+        // in — even though the batch spans the whole timeline (file-level pruning was useless here).
+        // The residual is the ~5 row groups' data plus a fixed ~512 KiB footer/page-index prefetch,
+        // so the ratio is generous on this small file and shrinks toward ~5/40 at production 8 MiB
+        // row groups. The sibling `rowgroup_bytes.rs` proves the exact 5-group touch.
+        assert!(
+            (hit_bytes as f64) < 0.35 * full_bytes as f64,
+            "scattered ts+key must read only the matching row groups ({hit_bytes} vs full \
+             {full_bytes}) — the row-group pruning that makes PREDICATE hydration sub-second"
+        );
+        assert!(
+            (hit_bytes as f64) < 0.6 * ctrl_bytes as f64,
+            "the ts hint is what prunes: ts+key ({hit_bytes}) must be well below request_id-only \
+             ({ctrl_bytes})"
         );
     }
 }

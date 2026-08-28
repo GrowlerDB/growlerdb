@@ -64,8 +64,6 @@ fn seed(root: &std::path::Path) {
         f.insert("rank".to_string(), Value::Int(rank));
         LocatedDoc {
             doc: Document::new(key, f),
-            iceberg_file: "data/f0.parquet".into(),
-            row_position: 0,
         }
     };
     IndexWriter::write(

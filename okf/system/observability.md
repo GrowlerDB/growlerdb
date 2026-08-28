@@ -33,8 +33,7 @@ hybrid arms reuse deliberately record nothing, so a hybrid query counts once. `k
 
 For **where the time went**, two per-index layer histograms: `growlerdb_query_retrieval_duration_seconds{index}`
 (the search / KNN fan-out + fusion, excl. hydration) and `growlerdb_hydration_duration_seconds{index}`
-(the Iceberg row fetch); `growlerdb_hydration_*{index}` + `growlerdb_stale_locators_total{index}` are
-labelled node-side with the served index. This makes the console's **Search** tab per-index under the
+(the Iceberg row fetch); `growlerdb_hydration_*{index}` are labelled node-side with the served index. This makes the console's **Search** tab per-index under the
 scope selector, with a retrieval-vs-hydrate breakdown beneath the full-latency hero. The label sets keep
 cardinality bounded (index × 3 kinds × 2 hydrated × buckets). The **cold-cache** hit rate is the
 deliberate exception: its `growlerdb_cold_cache_{hits,misses}_total{tier="cold"}` counters come from a
@@ -82,8 +81,8 @@ console's Runtime "API" panels (request rate, 5xx/4xx rate, p95 latency) and the
 **Index size attribution:** `growlerdb_index_bytes{index}` is a shard's
 full on-disk footprint, and `growlerdb_index_bytes_component{index,component}` splits it by structure
 — `term` / `postings` / `positions` / `fieldnorms` (together the inverted index), `fast`
-(fast-field cache), `store` (doc store), `locator` (hydration lookup: `location.arr` + `aux.redb`),
-`other` (metadata/deletes). The components **sum to the total exactly**, so the index:source ratio
+(fast-field cache), `store` (doc store), `other` (metadata/deletes + the slim `aux.redb`). The
+components **sum to the total exactly**, so the index:source ratio
 is attributable to the structure that drives it and storage changes are verifiable against the
 exact file kind they target.
 `growlerdb_index_deleted_docs{index}` is the **delete debt** a size sample must be read

@@ -270,7 +270,6 @@ mod tests {
             shard_count: 1,
             tenant_field: None,
             windowing: None,
-            location_strategy: Default::default(),
         }
     }
 

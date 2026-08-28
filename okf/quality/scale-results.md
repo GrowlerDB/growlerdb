@@ -83,8 +83,8 @@ Trino pre-compaction are flagged — their speedups flatter GrowlerDB.
 - **idx:src compressed** — index bytes ÷ compressed source (config-dependent; context only).
 - **Converged** — `index_docs == source_records` and the distinct-id convergence check passes.
 - **Query latency** — `harness.py query` weighted mix, p50/p99 ms, end-to-end (incl. client RTT).
-- **hydration p95 (internal)** — server-side `growlerdb_hydration_duration_seconds` p95 (the O(rows)
-  hydration ceiling, [TASK-339]).
+- **hydration p95 (internal)** — server-side `growlerdb_hydration_duration_seconds` p95 (the
+  store-less stats-pruned key scan; degrades on an unclustered/unpartitioned source that can't prune).
 - **Trino speedup** — `compare_trino.py` p50(Trino) ÷ p50(GDB) for equivalent predicates; must be
   post-compaction + bloom + day-pruned to be fair ([TASK-343]).
 - **Single-node index ceiling** — max sustained `growlerdb_ingested_docs_total` rate for one connector

@@ -52,8 +52,6 @@ fn shard(root: &std::path::Path) -> Arc<Shard> {
         &CommitBatch::from_upserts(
             vec![LocatedDoc {
                 doc: Document::new(key, f),
-                iceberg_file: "f".into(),
-                row_position: 0,
             }],
             SourceCheckpoint::iceberg(1),
             "b1",

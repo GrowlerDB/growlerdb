@@ -45,7 +45,7 @@ Each maps to metrics/graphs (dashboard: `deploy/k8s/observability/grafana.yaml`)
    by `bench/scale/convergence_check.py`, plus a sample of real ids each resolving to exactly one doc
    that hydrates. The k8s drain gate `deploy/k8s/streaming/convergence-gate.sh` is the count-only,
    compaction-racing sibling.
-4. **Index:source size ratio,** stacked into **inverted-index / locator / fast-cache** (the size-attribution
+4. **Index:source size ratio,** stacked into **inverted-index / doc-store / fast-cache** (the size-attribution
    breakdown). Reported against the **uncompressed raw-corpus size** (the OSB/ES-benchmark convention)
    — *not* against `growlerdb_source_bytes`, which is Iceberg `total-files-size` = **compressed**
    parquet and so shifts under storage config (parquet↔orc, zstd↔snappy) even though the logical data
@@ -132,11 +132,11 @@ accumulates thousands of tiny files (Run 7: **2769 files at 1 GB**) and hydratio
 tax — compacting to ~128 MB files cut a top-20 hydrated `_search` **~2×** (30s→16s). Two open caveats
 the runs must watch (do **not** assume they hold): the maintenance CronJob is currently hardcoded to
 the non-windowed `growlerdb.http_logs` table, so a **windowed** run gets no compaction unless you run
-one targeting `…_windowed` ([[TASK-340]]); and the post-compaction locator heal does **not** yet
-demonstrably persist — Run 7 saw `growlerdb_stale_locators_total` **rise ~1 per hydrated hit** with
-topk latency flat across passes (re-refresh on every read), and the `growlerdb_locator_remap_*`
-metrics an earlier draft cited are **absent in 0.5.0** ([[TASK-339]]). So a run asserts hydration p99
-across compactions as a *measurement to report*, not an invariant known to hold.
+one targeting `…_windowed` ([[TASK-340]]). There is **no post-compaction heal to watch**: store-less
+hydration ([D54](/system/decisions/d54-store-less-hydration.md)) keeps no stored location, so a
+compaction only shifts which row groups a hit's stored sort-key value prunes to — the next lookup
+prunes to them for free. So a run asserts hydration p99 across compactions as a *measurement to
+report* (does pruning hold as files are rewritten?), not a heal to observe converging.
 
 ## Operational prerequisites (learned bringing it up live)
 
@@ -284,8 +284,7 @@ screenshot ritual racing teardown.
   **throughput** into Iceberg (`deriv(growlerdb_source_records)`) and GrowlerDB
   (`rate(growlerdb_ingested_docs_total)`); the **write-path trio** (`growlerdb_write_duration_seconds`,
   `growlerdb_write_queue_depth`, connector retries) that localizes an ingest ceiling; **source→index
-  lag** (`growlerdb_ingest_lag_ms`); **index bytes** (`growlerdb_index_bytes`); the locator-heal
-  signals (`growlerdb_stale_locators_total` ≈ flat, `growlerdb_locator_remapped_rows_total`); and the
+  lag** (`growlerdb_ingest_lag_ms`); **index bytes** (`growlerdb_index_bytes`); and the
   **cold-tier cache** hit-ratio. Dumped as JSON (diff-able, re-plottable) rather than one-off images.
 - **Logs** — the connector / hot node / gateway streams from **Loki** (`LOKI_URL`), to correlate a
   latency spike with the log line.

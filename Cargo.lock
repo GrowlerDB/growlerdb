@@ -2201,6 +2201,7 @@ version = "0.0.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "async-trait",
  "bytes",
  "futures",
  "growlerdb-core",
@@ -2215,6 +2216,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "typetag",
 ]
 
 [[package]]

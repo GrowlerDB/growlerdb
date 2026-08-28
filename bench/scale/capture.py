@@ -47,7 +47,7 @@ LEDGER_HEADER = (
 
 # Metric series dumped over the run window (name -> PromQL). Mirrors the scale-test-plan capture list:
 # doc growth, query/hydration latency, ingest/index throughput, the write-path trio, lag, index bytes,
-# the locator-heal signals, cold-tier cache, and node CPU. Missing metrics just dump empty — the
+# cold-tier cache, and node CPU. Missing metrics just dump empty — the
 # capture is best-effort and never fails on one absent series.
 RANGE_METRICS = {
     "source_records": "max(growlerdb_source_records)",
@@ -62,8 +62,6 @@ RANGE_METRICS = {
     "write_queue_depth": "max(growlerdb_write_queue_depth)",
     "ingest_lag_ms": "max(growlerdb_ingest_lag_ms)",
     "index_bytes": "sum(growlerdb_index_bytes)",
-    "stale_locators": "max(growlerdb_stale_locators_total)",
-    "locator_remapped_rows": "max(growlerdb_locator_remapped_rows_total)",
     "cold_cache_hit_ratio": "sum(rate(growlerdb_cold_cache_hits_total[5m]))/clamp_min(sum(rate(growlerdb_cold_cache_lookups_total[5m])),1)",
     "node_cpu_cores": 'sum(rate(node_cpu_seconds_total{mode!="idle"}[2m]))',
     # Ingest-bottleneck attribution (per-component). Cluster-summed series above can't localize a

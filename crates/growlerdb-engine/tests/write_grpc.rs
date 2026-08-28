@@ -34,21 +34,19 @@ fn docs_index() -> ResolvedIndex {
 }
 
 fn batch() -> CommitBatch {
-    let doc = |id: &str, body: &str, row: u64| {
+    let doc = |id: &str, body: &str| {
         let key = CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]);
         let mut fields = BTreeMap::new();
         fields.insert("id".to_string(), Value::from(id));
         fields.insert("body".to_string(), Value::from(body));
         LocatedDoc {
             doc: Document::new(key, fields),
-            iceberg_file: "data/f0.parquet".into(),
-            row_position: row,
         }
     };
     CommitBatch::from_upserts(
         vec![
-            doc("doc-1", "hello over the wire", 0),
-            doc("doc-2", "grpc write path", 1),
+            doc("doc-1", "hello over the wire"),
+            doc("doc-2", "grpc write path"),
         ],
         SourceCheckpoint::iceberg(7),
         "b1",

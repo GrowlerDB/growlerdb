@@ -21,7 +21,6 @@ pub mod node;
 pub mod opensearch;
 pub mod pool_routing;
 pub mod rbac;
-pub mod remap;
 pub mod rest;
 pub mod search_service;
 pub mod service_auth;
@@ -47,14 +46,13 @@ pub use engine::{DriftReport, Engine, IndexOutcome, SearchOutcome, SyncOutcome};
 pub use error::EngineError;
 pub use fence::{ReindexFence, ReindexGuard};
 pub use gateway::{Gateway, GatewayLimits, IndexRoute, RouteResolver, WindowRouting};
-pub use hydrate::{apply_live_file_bitmap, get_by_key, resolve_locators};
+pub use hydrate::get_by_key;
 pub use license::{License, LicenseError, FREE_NODE_LIMIT};
 pub use lookup_service::LookupService;
 pub use mcp_http::mcp_router;
 pub use node::{FailoverNode, LocalNode, Node, RemoteNode};
 pub use opensearch::opensearch_router;
 pub use rbac::{scope_for_method, RbacPolicy, Scope};
-pub use remap::{remap_shard, remap_tick, RemapOutcome, RemapState};
 pub use search_service::{heavy_reads_cap, IndexHeavyShare, SearchService};
 /// Serialize every test that mutates a process-global env var (`GROWLERDB_*_API_KEY`, ...).
 /// `set_var`/`remove_var` are process-wide, so env-touching tests across modules must share ONE

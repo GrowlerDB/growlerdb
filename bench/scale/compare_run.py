@@ -62,7 +62,6 @@ INDEX = os.environ.get("INDEX", "http_logs")
 TABLE = os.environ.get("TABLE", "http_logs")  # Trino table under iceberg.growlerdb
 ID_COL = os.environ.get("ID_COL", "request_id")  # http_logs PK (key-only; OpenSearch _id)
 PROM_URL = os.environ.get("PROM_URL", "http://localhost:9090")  # capture-only (read-only metrics pull)
-REMAP_INTERVAL_S = int(os.environ.get("REMAP_INTERVAL_S", "45"))  # node --remap-interval-secs (helm)
 
 RESULT_BEGIN, RESULT_END = "<<<RESULT_JSON", "RESULT_JSON>>>"
 DRY = False
@@ -262,65 +261,16 @@ def compact_source(scale, deadline):
         wait_job(job, timeout_s=deadline + 300)
 
 
-def prom_instant(query):
-    """One Prometheus instant query → the first series' scalar value, or None (no data / unreachable)."""
-    import urllib.parse
-    import urllib.request
-    try:
-        url = f"{PROM_URL}/api/v1/query?" + urllib.parse.urlencode({"query": query})
-        with urllib.request.urlopen(url, timeout=15) as r:
-            res = json.load(r).get("data", {}).get("result", [])
-        return float(res[0]["value"][1]) if res else None
-    except Exception:
-        return None
-
-
-def wait_remap_settled(scale, poll_s=20, stable_polls=3):
-    """Gate the query matrix on the background locator re-map SETTLING after compaction.
-
-    `rewrite_data_files` rewrites every data file, so all row locators go stale at once; the node
-    re-map poller (--remap-interval-secs) re-points them so hydration stays on point-reads instead of
-    the bounded per-hit fallback scan. Measuring mid-heal would report a transient, not steady state
-    (guardrail: never measure an unsettled system). Wait until `locator_remapped_rows_total` plateaus,
-    after at least ~2 re-map ticks so a slow first pass isn't mistaken for "done". Best-effort — if
-    Prometheus/the metric is unavailable it returns after the grace window (Fix A's bounded fallback
-    still keeps queries from melting down)."""
-    if DRY:
-        return
-    metric = "sum(growlerdb_locator_remapped_rows_total)"
-    deadline = time.time() + SCALE_TIMEOUTS[scale]["compact"]
-    grace_until = time.time() + 2 * REMAP_INTERVAL_S  # ensure the post-compaction rewrite is observed
-    last, stable, seen = None, 0, False
-    while time.time() < deadline:
-        val = prom_instant(metric)
-        if val is not None:
-            seen = True
-            if val == last:
-                stable += 1
-                if stable >= stable_polls and time.time() >= grace_until:
-                    log(f"remap-settle: locator remap plateaued ({val:.0f} rows re-mapped) — querying healed index")
-                    return
-            else:
-                stable = 0
-            last = val
-        # Past the grace window with no re-map activity at all → nothing was rewritten to heal.
-        if time.time() >= grace_until and not seen:
-            log("remap-settle: no locator-remap activity after compaction — nothing to heal, proceeding")
-            return
-        time.sleep(poll_s)
-    log("remap-settle: no plateau before timeout — proceeding (bounded hydration fallback guards latency)")
-
-
 def phase_growlerdb(scale):
-    log("PHASE growlerdb — compact, settle re-map, warmup, query matrix, freshness, capture")
+    log("PHASE growlerdb — compact, warmup, query matrix, freshness, capture")
     t = SCALE_TIMEOUTS[scale]
     # Convergence already ran + passed in phase_gdb_coldsync (the ingest axis). Here: compact the
-    # source for a fair Trino baseline, then let the locator re-map heal + WARM the index before measuring.
+    # source (declares WRITE ORDERED BY ts → ts-clustered files) for a fair Trino baseline AND so the
+    # store-less PREDICATE hydration scan prunes by ts row-group stats, then WARM the index before
+    # measuring. Hydration is store-less (no per-row locators), so there is nothing to heal or settle.
     compact_source(scale, t["compact"])
-    # Let the compaction's locator re-map settle so hydration is measured healed, not mid-heal (TASK-339).
-    wait_remap_settled(scale)
-    # Warmup (best-effort): a short query pass so any residual locator-heal happens OFF the clock.
-    # Results discarded (no result_path).
+    # Warmup (best-effort): a short query pass so plan-cache / object-store warmup happens OFF the
+    # clock. Results discarded (no result_path).
     run_driver_job(
         "warmup-gdb",
         "python compare_query.py run http_logs --engines growlerdb --qps 50 --duration 30 --out /tmp/out.json",

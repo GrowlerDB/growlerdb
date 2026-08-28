@@ -150,7 +150,7 @@ mod tests {
             &vec![("berlin".to_string(), 2), ("bern".to_string(), 1)]
         );
         // No prefix longer than the term's length.
-        assert!(table.get(b"bostons".as_slice()).is_none());
+        assert!(!table.contains_key(b"bostons".as_slice()));
     }
 
     #[test]

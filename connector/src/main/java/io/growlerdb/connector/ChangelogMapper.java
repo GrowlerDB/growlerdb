@@ -21,11 +21,11 @@ import java.util.Set;
  * Iceberg</a>):
  *
  * <ul>
- *   <li>{@code INSERT} / {@code UPDATE_AFTER} → upsert (key + fields + locator);
+ *   <li>{@code INSERT} / {@code UPDATE_AFTER} → upsert (key + fields);
  *   <li>{@code DELETE} / {@code UPDATE_BEFORE} → delete by key;
  *   <li>rows from a {@code replace}/compaction snapshot → <b>skipped</b> (a layout
- *       change, not content) — locators self-heal via verify-and-fall-back,
- *       so they must not be read as a flood of delete+insert.
+ *       change, not content) — the index content is unchanged, so they must not be
+ *       read as a flood of delete+insert.
  * </ul>
  *
  * Rows are processed in commit order by {@code _change_ordinal} with <b>last-write-wins per key</b>,
@@ -121,12 +121,7 @@ public final class ChangelogMapper {
     // Extracted variant leaves (D47/D48): shape values already merged into row.columns above (they
     // ride the typed fields); the untyped flatten leaves ride the document's variant columns.
     doc.addAllVariants(row.variants);
-    LocatedDoc located =
-        LocatedDoc.newBuilder()
-            .setDoc(doc)
-            .setIcebergFile(row.icebergFile)
-            .setRowPosition(row.rowPosition)
-            .build();
+    LocatedDoc located = LocatedDoc.newBuilder().setDoc(doc).build();
     return DocOp.newBuilder().setUpsert(located).build();
   }
 

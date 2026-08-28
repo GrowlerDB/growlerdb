@@ -25,9 +25,9 @@ The [control plane](/system/runtime/components/control-plane.md) assigns **R hol
 **Replica data path — cold-tier read-through (not standing segment-shipped copies).** A replica or a
 re-placed owner obtains its data by **reading the unit's sealed segments and cold windows read-through
 from shared object storage**, warming to local NVMe lazily — it never rebuilds from source and never
-needs a primary-to-replica copy stream. This leans on the [cold tier](/product/functional/cold-tiering.md)
-+ the layered locator ([D30](/system/decisions/d30-layered-locator.md)): sealed segments live in the
-backup/object store and a parked cold window offloads ~97% of index bytes there, so a unit's data is
+needs a primary-to-replica copy stream. This leans on the [cold tier](/product/functional/cold-tiering.md):
+sealed segments live in the backup/object store and a parked cold window offloads ~97% of index bytes
+there, so a unit's data is
 durable **independent of any node** and any holder can serve it. Chosen over standing segment-shipped
 replicas (the [D14](/system/decisions/d14-replica-sync.md) single-shard mechanism generalized): that
 gives faster hot reads but costs R× hot storage and a copy fabric, and the read-through path already

@@ -1,7 +1,7 @@
 # Periodic Iceberg table maintenance for growlerdb.http_logs. The streaming generator commits a
 # tiny append every few seconds, so the source table accumulates thousands of small data files +
-# manifests — which slows *hydration* (search reads the authoritative rows from Iceberg via the
-# index's row locators; lots of tiny files + fat metadata = slow planning/opens). This CronJob runs
+# manifests — which slows *hydration* (search re-finds the authoritative rows in Iceberg by a pruned
+# key scan; lots of tiny files + fat metadata = slow planning/opens). This CronJob runs
 # the standard Iceberg maintenance procedures via spark-sql against the Polaris catalog:
 #   - rewrite_data_files : compact small files into ~128MB files (the hydration win). SORTED by
 #       (ts, request_id) so rows cluster in the parquet row groups by time then key — a point lookup
@@ -20,7 +20,8 @@
 #       connector's near-head commit latency, so it never deletes a file a live append is mid-commit.
 #
 # Safe w.r.t. the index: a rewrite is a *replace* (non-append) snapshot, which the connector skips,
-# and GrowlerDB self-heals stale row locators on hydration (engine/hydrate.rs: refresh_locators).
+# and hydration is store-less — it re-finds rows by a pruned key scan, so nothing needs healing; the
+# sorted layout compaction writes is exactly what lets that scan skip row groups.
 # Safe w.r.t. the connector's exactly-once resume: it stays near head, and expire keeps recent
 # snapshots (RETAIN_LAST + EXPIRE_OLDER_THAN_HOURS), so its checkpoint snapshot is never expired.
 #

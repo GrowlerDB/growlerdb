@@ -56,7 +56,6 @@ spec:
                 --rest-addr 0.0.0.0:{{ .Values.node.restPort }} \
                 --metrics-addr 0.0.0.0:{{ .Values.node.metricsPort }} \
                 --compact-interval-secs {{ .Values.node.compactIntervalSecs }} \
-                --remap-interval-secs {{ .Values.node.remapIntervalSecs }} \
                 --register {{ include "growlerdb.controlplane.endpoint" . }} \
                 --advertise-addr "http://${POD_NAME}.{{ include "growlerdb.node.fullname" . }}-headless.${POD_NAMESPACE}.svc.cluster.local:{{ .Values.node.grpcPort }}"
               {{- else }}
@@ -84,7 +83,6 @@ spec:
                 --rest-addr 0.0.0.0:{{ .Values.node.restPort }} \
                 --metrics-addr 0.0.0.0:{{ .Values.node.metricsPort }} \
                 --compact-interval-secs {{ .Values.node.compactIntervalSecs }} \
-                --remap-interval-secs {{ .Values.node.remapIntervalSecs }} \
                 --register {{ include "growlerdb.controlplane.endpoint" . }} \
                 --advertise-addr "http://${POD_NAME}.{{ include "growlerdb.node.fullname" . }}-headless.${POD_NAMESPACE}.svc.cluster.local:{{ .Values.node.grpcPort }}"
               {{- end }}

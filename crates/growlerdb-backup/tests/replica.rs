@@ -37,8 +37,6 @@ fn doc(id: &str, body: &str) -> LocatedDoc {
     f.insert("body".to_string(), Value::from(body));
     LocatedDoc {
         doc: Document::new(key, f),
-        iceberg_file: "f".into(),
-        row_position: 0,
     }
 }
 
@@ -173,7 +171,7 @@ async fn refresh_and_reopen_reopens_only_on_change() {
     assert_eq!(scored(&shard, "body:alpha"), scored(&primary, "body:alpha"));
 
     // Second cycle, now serving snapshot 1, primary unchanged → no re-open (cheap steady-state poll),
-    // even though the mutable meta/locator files always re-download.
+    // even though the mutable meta file always re-downloads.
     let (none, _) = refresh_and_reopen(
         &store,
         prefix,

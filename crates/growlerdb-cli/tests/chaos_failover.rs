@@ -80,8 +80,6 @@ async fn park_window(store_dir: &std::path::Path, window: i64, id: &str) {
         &CommitBatch::from_upserts(
             vec![LocatedDoc {
                 doc: Document::new(key, f),
-                iceberg_file: "f".into(),
-                row_position: 0,
             }],
             SourceCheckpoint::iceberg(1),
             "b1",
@@ -713,8 +711,6 @@ async fn a_write_to_a_replica_held_window_is_fenced_and_the_parked_data_survives
         let b: growlerdb_proto::v1::DocBatch = CommitBatch::from_upserts(
             vec![LocatedDoc {
                 doc: Document::new(key, f),
-                iceberg_file: "f".into(),
-                row_position: 0,
             }],
             SourceCheckpoint::iceberg(9),
             "intrude-1",
@@ -831,8 +827,6 @@ async fn seed_ordinal(store_dir: &std::path::Path, ordinal: u32, id: &str) {
         &CommitBatch::from_upserts(
             vec![LocatedDoc {
                 doc: Document::new(key, f),
-                iceberg_file: "f".into(),
-                row_position: 0,
             }],
             SourceCheckpoint::iceberg(1),
             "b1",

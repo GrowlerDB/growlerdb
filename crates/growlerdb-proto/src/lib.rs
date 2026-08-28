@@ -245,8 +245,6 @@ impl From<growlerdb_core::LocatedDoc> for v1::LocatedDoc {
     fn from(d: growlerdb_core::LocatedDoc) -> Self {
         v1::LocatedDoc {
             doc: Some(d.doc.into()),
-            iceberg_file: d.iceberg_file,
-            row_position: d.row_position,
         }
     }
 }
@@ -256,8 +254,6 @@ impl TryFrom<v1::LocatedDoc> for growlerdb_core::LocatedDoc {
     fn try_from(d: v1::LocatedDoc) -> Result<Self, MissingField> {
         Ok(growlerdb_core::LocatedDoc {
             doc: d.doc.ok_or(MissingField("LocatedDoc.doc"))?.try_into()?,
-            iceberg_file: d.iceberg_file,
-            row_position: d.row_position,
         })
     }
 }

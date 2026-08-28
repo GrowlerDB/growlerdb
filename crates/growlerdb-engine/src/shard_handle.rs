@@ -111,8 +111,6 @@ mod tests {
                 f.insert("body".to_string(), Value::from("doc"));
                 LocatedDoc {
                     doc: Document::new(key, f),
-                    iceberg_file: "f".into(),
-                    row_position: 0,
                 }
             })
             .collect();

@@ -41,8 +41,6 @@ fn doc(id: &str, body: &str) -> LocatedDoc {
     f.insert("body".to_string(), Value::from(body));
     LocatedDoc {
         doc: Document::new(key, f),
-        iceberg_file: "f".into(),
-        row_position: 0,
     }
 }
 
@@ -92,13 +90,11 @@ async fn backup_then_restore_round_trips_data_and_checkpoint() {
     .unwrap();
 
     assert_eq!(manifest.snapshot, 1);
-    // Format 1 is the layered format — the backup ships the dense location array
-    // alongside the segments + aux store.
+    // The backup ships the Tantivy segments + the aux store.
     assert_eq!(manifest.format, MANIFEST_FORMAT);
-    assert_eq!(manifest.format, 1, "format 1 is the layered format");
+    assert_eq!(manifest.format, 1);
     assert_eq!(manifest.checkpoint, Some(SourceCheckpoint::iceberg(7)));
     assert!(manifest.files.iter().any(|f| f.path == "aux.redb"));
-    assert!(manifest.files.iter().any(|f| f.path == "location.arr"));
     assert!(manifest.files.iter().any(|f| f.path == "index/meta.json"));
     assert!(manifest.files.iter().any(|f| f.path.starts_with("index/")));
     // The definition is carried in the manifest (not as a shard file).
@@ -115,13 +111,6 @@ async fn backup_then_restore_round_trips_data_and_checkpoint() {
         restored_manifest.format, 1,
         "format 1 restores materialized"
     );
-    // The location array is restored byte-identical.
-    assert_eq!(
-        std::fs::read(dest.join("location.arr")).unwrap(),
-        std::fs::read(src_store.shard_path(&id).join("location.arr")).unwrap(),
-        "location.arr round-trips byte-identical"
-    );
-
     let restored = dest_store.open_shard(&id, &idx).unwrap();
     let hits_after = restored
         .search_all(&Query::parse("body:alpha").unwrap(), 10)
@@ -133,11 +122,6 @@ async fn backup_then_restore_round_trips_data_and_checkpoint() {
         Some(SourceCheckpoint::iceberg(7)),
         "restored checkpoint lets ingestion resume the tail exactly-once"
     );
-    // …and hydrates through the layered path: key → `_locid` → restored array → intern.
-    let key = CompositeKey::new(vec![], vec![("id".into(), Value::from("doc-2"))]);
-    let loc = restored.locate(&key).unwrap().expect("layered locate");
-    assert_eq!(loc.iceberg_file, "f");
-    assert_eq!(loc.row_position, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -256,13 +240,9 @@ async fn cold_park_evicts_bulk_keeps_aux_and_serves_read_through() {
     .await
     .unwrap();
 
-    // Bulk evicted; aux + location array + marker kept; marker carries prefix, zone-map, snapshot.
+    // Bulk evicted; aux + marker kept; marker carries prefix, zone-map, snapshot.
     assert!(!window_dir.join("index").exists(), "tantivy bulk evicted");
     assert!(window_dir.join("aux.redb").exists(), "aux kept local");
-    assert!(
-        window_dir.join("location.arr").exists(),
-        "D30: the location array ships with the parked window and stays LOCAL (never read-through)"
-    );
     assert!(window_dir.join("cold.json").exists(), "marker written");
     assert_eq!(marker.object_prefix, "cold/docs/w1700000000000/data/index");
     assert_eq!((marker.event_min, marker.event_max), (Some(10), Some(99)));
@@ -307,13 +287,9 @@ async fn cold_park_evicts_bulk_keeps_aux_and_serves_read_through() {
             .any(|f| f.path.starts_with("index/")),
         "index/* entries dropped from the bundled manifest"
     );
-    // Only `index/*` files were bundled/deleted — the aux + location-array entries (and
-    // their data objects, part of the restorable backup) survive the bundling rewrite.
+    // Only `index/*` files were bundled/deleted — the aux entry (and its data object,
+    // part of the restorable backup) survives the bundling rewrite.
     assert!(bundled_manifest.files.iter().any(|f| f.path == "aux.redb"));
-    assert!(bundled_manifest
-        .files
-        .iter()
-        .any(|f| f.path == "location.arr"));
     let dest = tempfile::tempdir().unwrap();
     assert!(
         matches!(
@@ -334,7 +310,7 @@ async fn cold_park_evicts_bulk_keeps_aux_and_serves_read_through() {
     let hotcache_key = marker.hotcache_key.clone();
     let bundle_key = marker.bundle_key.clone();
     let bundle_manifest_key = marker.bundle_manifest_key.clone();
-    let (hits, cold_loc) = tokio::task::spawn_blocking(move || {
+    let hits = tokio::task::spawn_blocking(move || {
         let bundle = bundle_key.as_deref().zip(bundle_manifest_key.as_deref());
         let cold = local
             .open_cold_shard(
@@ -348,15 +324,9 @@ async fn cold_park_evicts_bulk_keeps_aux_and_serves_read_through() {
                 None, // the hot shard was consumed by cold_park → open aux.redb fresh
             )
             .unwrap();
-        let hits = cold
-            .search_all(&Query::parse("body:alpha").unwrap(), 10)
+        cold.search_all(&Query::parse("body:alpha").unwrap(), 10)
             .unwrap()
-            .len();
-        // The layered locate works on the parked window — the key term resolves
-        // through the read-through segments, the slot from the LOCAL array.
-        let key = CompositeKey::new(vec![], vec![("id".into(), Value::from("doc-1"))]);
-        let loc = cold.locate(&key).unwrap();
-        (hits, loc)
+            .len()
     })
     .await
     .unwrap();
@@ -364,9 +334,6 @@ async fn cold_park_evicts_bulk_keeps_aux_and_serves_read_through() {
         hits, 2,
         "cold-parked window still searchable via the hotcache"
     );
-    let cold_loc = cold_loc.expect("cold layered locate");
-    assert_eq!(cold_loc.iceberg_file, "f");
-    assert_eq!(cold_loc.row_position, 0);
 
     // PRE-WARM — a hot-again window is promoted back to a local hot shard.
     // (Re-open the store handle + index; the search block above moved its clones.)
@@ -407,10 +374,10 @@ async fn cold_park_evicts_bulk_keeps_aux_and_serves_read_through() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn open_cold_replica_serves_a_parked_window_from_a_bare_node() {
     // D53 replica read-through: a replica on ANOTHER node has no local copy of the window. It opens
-    // the parked window by fetching the aux.redb + location.arr sidecars from shared object storage
-    // (the keys the park recorded), then reads the index through the object store — no rebuild from
-    // source, no primary→replica copy stream. This is what makes a re-placed/replica holder answer
-    // in seconds instead of rebuilding.
+    // the parked window by fetching the aux.redb sidecar from shared object storage (the key the
+    // park recorded), then reads the index through the object store — no rebuild from source, no
+    // primary→replica copy stream. This is what makes a re-placed/replica holder answer in seconds
+    // instead of rebuilding.
     let idx = docs_index();
     let w: i64 = 1_700_000_000_000;
     let id = ShardId::window("docs", w);
@@ -446,14 +413,10 @@ async fn open_cold_replica_serves_a_parked_window_from_a_bare_node() {
     )
     .await
     .unwrap();
-    // The park recorded the sidecar keys a replica fetches.
+    // The park recorded the sidecar key a replica fetches.
     assert_eq!(
         marker.aux_key.as_deref(),
         Some("cold/docs/w1700000000000/data/aux.redb")
-    );
-    assert_eq!(
-        marker.location_key.as_deref(),
-        Some("cold/docs/w1700000000000/data/location.arr")
     );
 
     // --- Replica node: a DIFFERENT store root with NO local window data. ---
@@ -466,19 +429,10 @@ async fn open_cold_replica_serves_a_parked_window_from_a_bare_node() {
         let cold = replica
             .open_cold_replica(&idx2, &scratch, store2, &marker2, cache)
             .unwrap();
-        // Read-through search works with no local index data...
-        let hits = cold
-            .search_all(&Query::parse("body:alpha").unwrap(), 10)
+        // Read-through search works with no local index data.
+        cold.search_all(&Query::parse("body:alpha").unwrap(), 10)
             .unwrap()
-            .len();
-        // ...and the layered locator resolves a key: postings read-through, the slot from the
-        // fetched location array.
-        let key = CompositeKey::new(vec![], vec![("id".into(), Value::from("doc-1"))]);
-        assert!(
-            cold.locate(&key).unwrap().is_some(),
-            "the replica locates a key via the fetched location array"
-        );
-        hits
+            .len()
     })
     .await
     .unwrap();
@@ -932,8 +886,4 @@ async fn cold_park_in_place_backs_up_without_evicting_and_leaves_shard_usable() 
         "bulk evicted after swap"
     );
     assert!(window_dir.join("aux.redb").exists(), "aux kept local");
-    assert!(
-        window_dir.join("location.arr").exists(),
-        "the location array stays local across an in-place park"
-    );
 }
