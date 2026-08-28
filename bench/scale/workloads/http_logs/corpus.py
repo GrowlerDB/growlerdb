@@ -35,10 +35,17 @@ except ImportError:
 # only row-group skip — without it every `request_id=`/`status=`/`trace_id=` predicate full-scans.
 # `trace_id` (the searchable X-Request-ID) carries a bloom so the point-lookup pair measures
 # GrowlerDB's indexed lookup against Iceberg at its best (bloom-skipped scan), not a full scan.
+# Parquet row-group size is the UNIT OF I/O for a hydration point read: fetching one row reads its
+# whole row group. Iceberg's default (128 MB) means a 20-row top-k pulls ~20×128 MB from object
+# storage and saturates a single MinIO (→ 30s). An 8 MB row group makes a point read ~8 MB, so a
+# scattered top-k is ~20×8 MB ≈ 160 MB — cheap. Applies to BOTH ingest and Spark compaction (the
+# rewrite honors the table's write properties). Keep files ~128 MB (≈16 row groups each).
 WRITE_PROPERTIES = {
     "write.parquet.bloom-filter-enabled.column.request_id": "true",
     "write.parquet.bloom-filter-enabled.column.trace_id": "true",
     "write.parquet.bloom-filter-enabled.column.status": "true",
+    "write.parquet.row-group-size-bytes": "8388608",  # 8 MiB — small point-read unit (see above)
+    "write.target-file-size-bytes": "134217728",  # 128 MiB data files
 }
 
 BATCH = int(os.environ.get("BENCH_BATCH", "50000"))
