@@ -17,10 +17,10 @@ pub mod window;
 
 pub use api::{
     cmp_sort_value, sort_has_score, validate_aggs, Agg, AggRange, CollapsedHit, CommitBatch, DocOp,
-    Highlight, HighlightFragment, HighlightSegment, Hit, HydratedRow, IndexReader, IndexWriter,
-    LocatedDoc, Projection, RowLocator, SearchAfter, SearchParams, ShardHits, Snapshot, Sort,
-    SortOrder, SortValue, DEFAULT_HIGHLIGHT_FRAGMENT_SIZE, DEFAULT_HIGHLIGHT_MAX_FRAGMENTS,
-    SCORE_SORT_KEY,
+    Highlight, HighlightFragment, HighlightSegment, Hit, HydrateRequest, HydratedRow, IndexReader,
+    IndexWriter, LocatedDoc, Projection, RowLocator, SearchAfter, SearchParams, ShardHits,
+    Snapshot, Sort, SortOrder, SortValue, DEFAULT_HIGHLIGHT_FRAGMENT_SIZE,
+    DEFAULT_HIGHLIGHT_MAX_FRAGMENTS, SCORE_SORT_KEY,
 };
 pub use doc::{
     CompositeKey, DocBatch, Document, KeyDecodeError, SourceCheckpoint, Value, VariantLeaves,

@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 
 use growlerdb_core::{
-    CompositeKey, FieldType, HydratedRow, Projection, ResolvedIndex, RowLocator, Source,
+    CompositeKey, FieldType, HydrateRequest, HydratedRow, Projection, ResolvedIndex, Source,
     SourceField, SourceSchema, SourceType, Value,
 };
 use serde::Deserialize;
@@ -102,14 +102,16 @@ impl TrinoHydrator {
     pub async fn hydrate(
         &self,
         index: &ResolvedIndex,
-        requests: &[(CompositeKey, Option<RowLocator>)],
+        requests: &[HydrateRequest],
         projection: &Projection,
     ) -> Result<HydrationResult> {
         if requests.is_empty() {
             return Ok(HydrationResult::default());
         }
         let table = iceberg_table(index)?;
-        let keys: Vec<&CompositeKey> = requests.iter().map(|(k, _)| k).collect();
+        // The Trino lane re-finds by key predicate — the sort-key prune hints (an Iceberg
+        // manifest-pruning aid) don't apply here, so requests carry them but this path ignores them.
+        let keys: Vec<&CompositeKey> = requests.iter().map(|req| &req.key).collect();
         let cols = SelectColumns::for_index(index);
         let sql = point_query_sql(&self.cfg.catalog, table, &cols, &keys);
         let result = self.run_query(table, &sql).await?;
@@ -359,7 +361,7 @@ fn trino_type_to_source(ty: &str) -> SourceType {
 /// variant column's JSON value is carried as a `Value::Str` of its compact JSON text.
 fn assemble_rows(
     result: &QueryResult,
-    requests: &[(CompositeKey, Option<RowLocator>)],
+    requests: &[HydrateRequest],
     index: &ResolvedIndex,
     cols: &SelectColumns,
     projection: &Projection,
@@ -406,10 +408,10 @@ fn assemble_rows(
 
     Ok(requests
         .iter()
-        .filter_map(|(key, _)| {
-            let full = by_key.get(&key.encode())?;
+        .filter_map(|req| {
+            let full = by_key.get(&req.key.encode())?;
             Some(HydratedRow {
-                key: key.clone(),
+                key: req.key.clone(),
                 fields: project(full, projection),
             })
         })
@@ -651,9 +653,9 @@ mapping:
         };
         // Requested order is evt-1, evt-2, evt-missing → rows come back in that order, absent omitted.
         let requests = vec![
-            (key("evt-1"), None),
-            (key("evt-2"), None),
-            (key("evt-missing"), None),
+            HydrateRequest::new(key("evt-1"), None),
+            HydrateRequest::new(key("evt-2"), None),
+            HydrateRequest::new(key("evt-missing"), None),
         ];
         let rows = assemble_rows(&result, &requests, &idx, &cols, &Projection::All).unwrap();
         assert_eq!(rows.len(), 2, "the missing key is omitted");
@@ -686,7 +688,7 @@ mapping:
                 serde_json::json!({ "number": 1 }),
             ]],
         };
-        let requests = vec![(key("evt-1"), None)];
+        let requests = vec![HydrateRequest::new(key("evt-1"), None)];
         let rows = assemble_rows(
             &result,
             &requests,
@@ -706,7 +708,10 @@ mapping:
     async fn trino_hydrates_the_live_events_table() {
         let hydrator = TrinoHydrator::new(TrinoConfig::local()).expect("hydrator");
         let idx = events_index();
-        let requests = vec![(key("evt-1"), None), (key("evt-3"), None)];
+        let requests = vec![
+            HydrateRequest::new(key("evt-1"), None),
+            HydrateRequest::new(key("evt-3"), None),
+        ];
         let result = hydrator
             .hydrate(&idx, &requests, &Projection::All)
             .await

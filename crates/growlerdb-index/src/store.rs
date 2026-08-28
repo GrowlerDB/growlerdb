@@ -2455,6 +2455,21 @@ impl Shard {
             .collect()
     }
 
+    /// Read each key's live-doc **fast values** for `fields` — the sort-key **prune hints** the
+    /// hydration fallback AND-s onto its pass-2 key predicate so a sorted source table prunes files
+    /// by manifest min/max (the heal for an otherwise-unprunable random key). Reuses the identity
+    /// layer's key→doc resolution; a key with no live doc, or a non-fast field, contributes nothing
+    /// (never an error). Returns a vec aligned 1:1 with `keys`. See [`SegmentReader::fast_values`].
+    pub fn prune_values(
+        &self,
+        keys: &[CompositeKey],
+        fields: &[String],
+    ) -> Result<Vec<Vec<(String, growlerdb_core::Value)>>> {
+        self.core
+            .fast_values(keys, fields)
+            .map_err(StoreError::Segment)
+    }
+
     /// The field names a query can sort by — numeric/date/keyword fields declared `fast`. The
     /// console lists exactly these so it never offers a non-sortable field (see
     /// `IndexSchema::sort_fields`).
@@ -3385,6 +3400,39 @@ mod sort_tests {
         hits.iter()
             .map(|h| h.key.get("id").unwrap().to_index_string())
             .collect()
+    }
+
+    #[test]
+    fn prune_values_reads_each_key_live_fast_value_typed_and_aligned() {
+        // The sort-key prune-hint read: resolve each key's live doc and read its `rank` fast field,
+        // typed to the field's LONG mapping. A key with no live doc contributes an empty row; a
+        // non-fast/unknown field is skipped — never an error (the predicate is a pure prune).
+        let tmp = tempfile::tempdir().unwrap();
+        let shard = ranked_shard(tmp.path());
+        let k = |id: &str| CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]);
+        let out = shard
+            .prune_values(
+                &[k("a"), k("absent"), k("c")],
+                &["rank".to_string(), "id".to_string()],
+            )
+            .unwrap();
+        assert_eq!(out.len(), 3, "aligned 1:1 with keys");
+        assert_eq!(
+            out[0],
+            vec![("rank".to_string(), Value::Int(30))],
+            "a → rank 30"
+        );
+        assert!(out[1].is_empty(), "no live doc → no hint, not an error");
+        assert_eq!(
+            out[2],
+            vec![("rank".to_string(), Value::Int(20))],
+            "c → rank 20"
+        );
+        // `id` is a KEYWORD identifier but not declared `fast` here, so it yields no hint (skipped).
+        assert!(
+            out[0].iter().all(|(n, _)| n != "id"),
+            "non-fast field contributes nothing"
+        );
     }
 
     // --- chunked commit -------------------------------------------------------------

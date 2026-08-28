@@ -152,6 +152,35 @@ pub struct RowLocator {
     pub row_position: u64,
 }
 
+/// One hydration request: a key to re-fetch, its (optional) source [`RowLocator`], and the
+/// **sort-key prune hints** — the row's own fast-field values (e.g. `ts = <that row's ts>`)
+/// AND-ed onto the pass-2 key predicate so Iceberg prunes files by manifest min/max on a
+/// **sorted** source table. The hints are a pure speed-up: every candidate is still re-verified
+/// against the exact key, so an empty `prune` (or one that can't be typed) only widens the scan,
+/// never drops a row. In-memory only — never persisted or sent on the wire.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HydrateRequest {
+    /// The composite key to hydrate.
+    pub key: CompositeKey,
+    /// The stored source locator, or `None` (known-stale / a locator-less PREDICATE index) — then
+    /// the request goes straight to the pruned pass-2 key scan.
+    pub locator: Option<RowLocator>,
+    /// Sort-key prune hints: `(column, that row's value)` for identity sort columns the shard also
+    /// stores fast. Empty ⇒ a key-only predicate (the prior behavior).
+    pub prune: Vec<(String, Value)>,
+}
+
+impl HydrateRequest {
+    /// A request with no prune hints (they're attached later, once the shard's fast values are read).
+    pub fn new(key: CompositeKey, locator: Option<RowLocator>) -> Self {
+        Self {
+            key,
+            locator,
+            prune: Vec::new(),
+        }
+    }
+}
+
 /// One search hit: the document's **coordinates** (composite key) and BM25 score.
 /// Never carries sensitive/big-text fields.
 #[derive(Debug, Clone, PartialEq)]

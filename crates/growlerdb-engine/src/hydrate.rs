@@ -5,8 +5,11 @@
 //!
 //! [Flow 2]: ../../../okf/system/architecture.md
 
+use std::collections::HashSet;
+
 use growlerdb_core::{
-    CompositeKey, HydratedRow, IndexReader, LocationStrategy, Projection, RowLocator,
+    CompositeKey, HydrateRequest, HydratedRow, IndexReader, LocationStrategy, Projection,
+    RowLocator,
 };
 use growlerdb_index::Shard;
 use growlerdb_source::IcebergReader;
@@ -43,7 +46,7 @@ pub fn resolve_locators(
 pub fn resolve_requests(
     shard: &Shard,
     keys: &[CompositeKey],
-) -> Result<Vec<(CompositeKey, Option<RowLocator>)>, EngineError> {
+) -> Result<Vec<HydrateRequest>, EngineError> {
     match shard.location_strategy() {
         LocationStrategy::Coordinates => Ok(apply_live_file_bitmap(
             shard,
@@ -52,11 +55,59 @@ pub fn resolve_requests(
         LocationStrategy::Predicate => keys
             .iter()
             .map(|key| match shard.contains_key(key) {
-                Ok(true) => Ok((key.clone(), None)),
+                Ok(true) => Ok(HydrateRequest::new(key.clone(), None)),
                 Ok(false) => Err(EngineError::MissingLocator(describe(key))),
                 Err(e) => Err(EngineError::Store(e)),
             })
             .collect(),
+    }
+}
+
+/// Attach **sort-key prune hints** to `requests` (in place) — the values the source's pass-2 key
+/// predicate AND-s on so a **sorted** source table prunes files by manifest min/max on the sort key
+/// (the heal for an unpartitioned, hash-routed random identifier whose per-file min/max spans the
+/// whole space, TASK-339). The hint fields are the table's identity sort columns the shard also
+/// stores fast (excluding the key's own fields, already in the predicate); their values are the
+/// row's own fast-field values, aligned 1:1 with `keys`.
+///
+/// **Best-effort**: any failure (a catalog metadata read, a shard fast-field read) just leaves the
+/// hints empty — the predicate is a pure prune, correctness rests on the exact key re-verify. Costs
+/// one metadata load plus a fast-field read per key; skipped entirely on an unsorted table.
+pub(crate) async fn attach_prune_hints(
+    requests: &mut [HydrateRequest],
+    shard: &Shard,
+    source: &IcebergReader,
+    table: &str,
+    keys: &[CompositeKey],
+) {
+    let Some(first) = keys.first() else {
+        return;
+    };
+    let Ok(sort_names) = source.sort_field_names(table).await else {
+        return;
+    };
+    if sort_names.is_empty() {
+        return;
+    }
+    let fast: HashSet<String> = shard.sort_fields().into_iter().collect();
+    let key_fields: HashSet<&str> = first
+        .partition
+        .iter()
+        .chain(first.identifier.iter())
+        .map(|(n, _)| n.as_str())
+        .collect();
+    let hint_fields: Vec<String> = sort_names
+        .into_iter()
+        .filter(|n| fast.contains(n) && !key_fields.contains(n.as_str()))
+        .collect();
+    if hint_fields.is_empty() {
+        return;
+    }
+    let Ok(values) = shard.prune_values(keys, &hint_fields) else {
+        return;
+    };
+    for (req, v) in requests.iter_mut().zip(values) {
+        req.prune = v;
     }
 }
 
@@ -67,12 +118,12 @@ pub fn resolve_requests(
 pub fn apply_live_file_bitmap(
     shard: &Shard,
     located: Vec<(CompositeKey, RowLocator)>,
-) -> Vec<(CompositeKey, Option<RowLocator>)> {
+) -> Vec<HydrateRequest> {
     located
         .into_iter()
         .map(|(key, locator)| {
             let live = !shard.file_is_dead(&locator.iceberg_file);
-            (key, live.then_some(locator))
+            HydrateRequest::new(key, live.then_some(locator))
         })
         .collect()
 }
@@ -97,8 +148,9 @@ pub async fn get_by_key(
     keys: &[CompositeKey],
     projection: &Projection,
 ) -> Result<Vec<HydratedRow>, EngineError> {
-    let located = resolve_requests(shard, keys)?;
+    let mut located = resolve_requests(shard, keys)?;
     if index.has_variant_field() {
+        // Trino re-finds by key predicate — no manifest pruning, so no sort-key hints needed.
         let result = growlerdb_source::shared_hydrator()
             .hydrate(index, &located, projection)
             .await?;
@@ -106,6 +158,7 @@ pub async fn get_by_key(
         // Trino lane re-finds by key predicate — no per-row locator to refresh.
         return Ok(result.rows);
     }
+    attach_prune_hints(&mut located, shard, source, table, keys).await;
     let result = source.hydrate(table, &located, projection).await?;
     growlerdb_telemetry::sli::duplicate_pks(result.duplicate_pks);
     if shard.location_strategy() == LocationStrategy::Coordinates {
@@ -197,17 +250,17 @@ mod tests {
         let located = resolve_locators(&shard, &[key(1)]).unwrap();
         assert!(
             apply_live_file_bitmap(&shard, located.clone())[0]
-                .1
+                .locator
                 .is_some(),
             "live file → locator passes through to pass 1"
         );
         shard.mark_files_dead(&["data/f0.parquet".into()]).unwrap();
         let stripped = apply_live_file_bitmap(&shard, located);
         assert!(
-            stripped[0].1.is_none(),
+            stripped[0].locator.is_none(),
             "dead file → known stale, straight to the fallback"
         );
-        assert_eq!(stripped[0].0, key(1), "the key still hydrates via pass 2");
+        assert_eq!(stripped[0].key, key(1), "the key still hydrates via pass 2");
     }
 
     #[test]
@@ -268,9 +321,9 @@ mod tests {
         );
         let requests = resolve_requests(&shard, &[key(1)]).unwrap();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].0, key(1));
+        assert_eq!(requests[0].key, key(1));
         assert!(
-            requests[0].1.is_none(),
+            requests[0].locator.is_none(),
             "predicate request carries no locator → straight to the pruned scan"
         );
     }
@@ -291,13 +344,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let shard = committed_shard(tmp.path());
         let requests = resolve_requests(&shard, &[key(1)]).unwrap();
-        let loc = requests[0].1.as_ref().expect("locator resolved");
+        let loc = requests[0].locator.as_ref().expect("locator resolved");
         assert_eq!(loc.iceberg_file, "data/f0.parquet");
         assert_eq!(loc.row_position, 7);
 
         // ... and the bitmap still strips dead files to `None` (known stale).
         shard.mark_files_dead(&["data/f0.parquet".into()]).unwrap();
         let requests = resolve_requests(&shard, &[key(1)]).unwrap();
-        assert!(requests[0].1.is_none(), "dead file → pass-2 fallback");
+        assert!(requests[0].locator.is_none(), "dead file → pass-2 fallback");
     }
 }

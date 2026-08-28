@@ -14,8 +14,8 @@ use arrow_array::{
 use arrow_schema::{DataType, Fields, Schema, SchemaRef, TimeUnit};
 use futures::{StreamExt, TryStreamExt};
 use growlerdb_core::{
-    CompositeKey, Document, HydratedRow, LocatedDoc, Projection, ResolvedIndex, RowLocator,
-    SourceField, SourceSchema, SourceType, Value,
+    CompositeKey, Document, HydrateRequest, HydratedRow, LocatedDoc, Projection, ResolvedIndex,
+    RowLocator, SourceField, SourceSchema, SourceType, Value,
 };
 use iceberg::arrow::{schema_to_arrow_schema, ArrowReaderBuilder};
 use iceberg::expr::{Predicate, Reference};
@@ -203,6 +203,10 @@ pub struct IcebergReader {
     /// current-snapshot plan: only effective when the reader itself is long-lived — hold it
     /// via [`SharedReader`] rather than connecting per call.
     plans: PlanCache<Arc<Vec<FileScanTask>>>,
+    /// Per-table cache of [`sort_field_names`](Self::sort_field_names). The sort order is a stable
+    /// table property (changes only on DDL), so caching it keeps the per-hydration prune-hint lookup
+    /// from adding a catalog `load_table` round-trip to every hydrated query.
+    sort_fields: std::sync::Mutex<HashMap<String, Arc<Vec<String>>>>,
 }
 
 impl IcebergReader {
@@ -220,6 +224,7 @@ impl IcebergReader {
         Ok(Self {
             catalog,
             plans: PlanCache::new(PLAN_CACHE_CAP),
+            sort_fields: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -396,6 +401,32 @@ impl IcebergReader {
         ))
     }
 
+    /// The source table's **sort-order column names** usable for equality pruning — each
+    /// `default_sort_order` field with an **Identity** transform, resolved to its schema column
+    /// name. A sorted table's compaction lays rows out by these columns, so a hydration fallback can
+    /// AND the row's own sort-key values onto its key predicate and let Iceberg prune files by
+    /// manifest min/max — the heal for an unpartitioned, hash-routed random key. Non-identity
+    /// transforms (`day`/`bucket`/…) don't preserve equality, so they're excluded (a hint on one
+    /// could exclude the matching row). Empty for an unsorted table. One catalog metadata load.
+    pub async fn sort_field_names(&self, table: &str) -> Result<Vec<String>> {
+        if let Some(cached) = self
+            .sort_fields
+            .lock()
+            .expect("sort_fields cache not poisoned")
+            .get(table)
+        {
+            return Ok((**cached).clone());
+        }
+        let ident = TableIdent::from_strs(table.split('.'))?;
+        let tbl = self.catalog.load_table(&ident).await?;
+        let names = Arc::new(sort_field_names_of(&tbl));
+        self.sort_fields
+            .lock()
+            .expect("sort_fields cache not poisoned")
+            .insert(table.to_string(), names.clone());
+        Ok((*names).clone())
+    }
+
     /// **Hydration with verify-and-fall-back** ([Flow 2], [keeping the locator
     /// valid]): resolve `(key, locator)` pairs to authoritative rows.
     ///
@@ -420,14 +451,17 @@ impl IcebergReader {
     pub async fn hydrate(
         &self,
         table: &str,
-        requests: &[(CompositeKey, Option<RowLocator>)],
+        requests: &[HydrateRequest],
         projection: &Projection,
     ) -> Result<HydrationResult> {
-        // Max data files the lazy pass-2 fallback reads per hydration call. A well-pruned plan is far
-        // under this (a partitioned key → a handful of files → full heal); an *unprunable* random key
-        // is capped here instead of scanning the whole snapshot per hit (TASK-339). The background
-        // compaction re-map (`remap.rs`) is the real, complete heal; pass-2 is a bounded stopgap.
-        const FALLBACK_MAX_SCAN_FILES: usize = 32;
+        // Max bytes the lazy pass-2 fallback reads per hydration call (decoded, row-group-granular). A
+        // well-pruned plan is far under this (a partitioned key → a file or two → full heal); an
+        // *unprunable* key (random, or secondary-sorted so per-file min/max spans the space) is capped
+        // here instead of scanning the whole snapshot per hit (TASK-339, the 30s topk stalls). The
+        // background compaction re-map (`remap.rs`) is the real, complete heal; pass-2 is a bounded
+        // stopgap that serves what it cheaply finds. 256 MiB keeps a worst-case fallback to a couple of
+        // seconds even against few-but-huge (~1 GB) compacted files.
+        const FALLBACK_MAX_SCAN_BYTES: u64 = 256 * 1024 * 1024;
         if requests.is_empty() {
             return Ok(HydrationResult::default());
         }
@@ -450,24 +484,27 @@ impl IcebergReader {
         let mut refreshed: Vec<(CompositeKey, RowLocator)> = Vec::new();
         let mut duplicate_pks = 0u64;
         if any_stale {
-            let stale_keys: Vec<&CompositeKey> = requests
+            // Each stale request carries its key plus its **sort-key prune hints** (the row's own
+            // fast `ts`, etc.) — both go into the predicate so a sorted table prunes by manifest
+            // min/max on the sort key, not just the (unprunable) random identifier.
+            let stale: Vec<(&CompositeKey, &[(String, Value)])> = requests
                 .iter()
                 .zip(&resolved)
                 .filter(|(_, r)| r.is_none())
-                .map(|((k, _), _)| k)
+                .map(|(req, _)| (&req.key, req.prune.as_slice()))
                 .collect();
-            let predicate = key_predicate(tbl.metadata().current_schema(), &stale_keys);
-            let (partition_names, identifier_names) = key_field_names(&requests[0].0);
+            let predicate = key_predicate(tbl.metadata().current_schema(), &stale);
+            let (partition_names, identifier_names) = key_field_names(&requests[0].key);
             // Only the stale keys are re-resolved and the scan streams with early-exit, so even the
             // unfiltered (`None` predicate) path is bounded in memory and cost.
-            let wanted: HashSet<Vec<u8>> = stale_keys.iter().map(|k| k.encode()).collect();
+            let wanted: HashSet<Vec<u8>> = stale.iter().map(|(k, _)| k.encode()).collect();
             let (index, duplicates) = match scan_stale_index(
                 &tbl,
                 predicate.clone(),
                 &wanted,
                 &partition_names,
                 &identifier_names,
-                FALLBACK_MAX_SCAN_FILES,
+                FALLBACK_MAX_SCAN_BYTES,
             )
             .await
             {
@@ -481,20 +518,20 @@ impl IcebergReader {
                         &wanted,
                         &partition_names,
                         &identifier_names,
-                        FALLBACK_MAX_SCAN_FILES,
+                        FALLBACK_MAX_SCAN_BYTES,
                     )
                     .await?
                 }
                 Err(e) => return Err(e),
             };
             duplicate_pks = duplicates;
-            for (i, (key, _)) in requests.iter().enumerate() {
+            for (i, req) in requests.iter().enumerate() {
                 if resolved[i].is_some() {
                     continue;
                 }
-                if let Some((full, fresh)) = index.get(&key.encode()) {
+                if let Some((full, fresh)) = index.get(&req.key.encode()) {
                     resolved[i] = Some(full.clone());
-                    refreshed.push((key.clone(), fresh.clone()));
+                    refreshed.push((req.key.clone(), fresh.clone()));
                 }
             }
         }
@@ -955,11 +992,11 @@ pub struct HydrationResult {
 async fn resolve_pass1(
     file_io: &iceberg::io::FileIO,
     tasks: &[FileScanTask],
-    requests: &[(CompositeKey, Option<RowLocator>)],
+    requests: &[HydrateRequest],
 ) -> Result<Vec<Option<BTreeMap<String, Value>>>> {
     let mut by_file: BTreeMap<String, Vec<u64>> = BTreeMap::new();
-    for (_key, loc) in requests {
-        let Some(loc) = loc else {
+    for req in requests {
+        let Some(loc) = &req.locator else {
             continue; // known stale — straight to the pass-2 fallback
         };
         by_file
@@ -997,11 +1034,11 @@ async fn resolve_pass1(
     // row from a moved `(file, position)` is never returned.
     Ok(requests
         .iter()
-        .map(|(key, loc)| {
-            let loc = loc.as_ref()?;
+        .map(|req| {
+            let loc = req.locator.as_ref()?;
             located
                 .get(&(loc.iceberg_file.clone(), loc.row_position))
-                .filter(|full| row_matches_key(full, key))
+                .filter(|full| row_matches_key(full, &req.key))
                 .cloned()
         })
         .collect())
@@ -1036,16 +1073,16 @@ async fn stream_file_rows(
 /// Final assembly of [hydration](IcebergReader::hydrate): the resolved rows back in **request
 /// order**, genuinely-absent keys omitted, each row narrowed to `projection`.
 fn assemble_rows(
-    requests: &[(CompositeKey, Option<RowLocator>)],
+    requests: &[HydrateRequest],
     resolved: Vec<Option<BTreeMap<String, Value>>>,
     projection: &Projection,
 ) -> Vec<HydratedRow> {
     requests
         .iter()
         .zip(resolved)
-        .filter_map(|((key, _), full)| {
+        .filter_map(|(req, full)| {
             full.map(|full| HydratedRow {
-                key: key.clone(),
+                key: req.key.clone(),
                 fields: project_row(&full, projection),
             })
         })
@@ -1126,7 +1163,7 @@ async fn scan_stale_index(
     wanted: &HashSet<Vec<u8>>,
     partition_names: &[String],
     identifier_names: &[String],
-    max_scan_files: usize,
+    max_scan_bytes: u64,
 ) -> Result<(HashMap<Vec<u8>, (BTreeMap<String, Value>, RowLocator)>, u64)> {
     let mut builder = tbl.scan().select_all();
     if let Some(p) = predicate {
@@ -1136,14 +1173,17 @@ async fn scan_stale_index(
     let file_io = tbl.file_io().clone();
     let mut index = HashMap::new();
     let mut duplicates = 0u64;
-    'files: for (files_scanned, task) in tasks.into_iter().enumerate() {
-        // Budget guard: when the predicate can't prune (a random high-cardinality identifier key,
-        // or a `None`/unfiltered plan), this scan would otherwise read the *whole current snapshot*
-        // on every hydration call (O(snapshot)/hit → 30s stalls post-compaction, TASK-339). Cap the
-        // files read: a well-pruned plan is under budget and heals fully; an unpruned one returns
-        // what it cheaply found and leaves the rest to the background compaction re-map. Unresolved
-        // rows are omitted, not errored (assemble_rows), so this degrades gracefully.
-        if files_scanned >= max_scan_files {
+    // Byte budget (not a file count): when the predicate can't prune — a random high-cardinality
+    // identifier, a secondary-sorted key whose per-file min/max spans the whole space, or a `None`
+    // plan — this scan would otherwise read the *whole current snapshot* on every hydration call
+    // (O(snapshot)/hit → 30s stalls post-compaction, TASK-339). A file *count* budget is useless when
+    // files are few-but-huge (a handful of ~1 GB parquet = the whole table), so bound the bytes
+    // *read*, checked at row-group granularity. A well-pruned plan is far under budget and heals
+    // fully; an unpruned one returns what it cheaply found and leaves the rest to the background
+    // compaction re-map. Unresolved rows are omitted, not errored (assemble_rows) — graceful.
+    let mut bytes_scanned = 0u64;
+    'files: for task in tasks.into_iter() {
+        if bytes_scanned >= max_scan_bytes {
             break 'files;
         }
         let data_file = task.data_file_path.clone();
@@ -1153,6 +1193,7 @@ async fn scan_stale_index(
         let mut stream = reader.read(task_stream)?.stream();
         let mut start_row = 0u64;
         while let Some(batch) = stream.try_next().await? {
+            bytes_scanned += batch.get_array_memory_size() as u64;
             let n = batch.num_rows() as u64;
             duplicates += index_batch(
                 &mut index,
@@ -1167,36 +1208,68 @@ async fn scan_stale_index(
             if index.len() == wanted.len() {
                 break 'files; // every stale key located → stop scanning
             }
+            if bytes_scanned >= max_scan_bytes {
+                break 'files; // budget exhausted mid-file → serve what we found, re-map heals the rest
+            }
         }
     }
     Ok((index, duplicates))
 }
 
-/// Build an `OR`-of-`AND` equality predicate over the partition + identifier fields of `keys`, so a
-/// hydration fallback prunes the Iceberg scan to the partitions/files that can hold them.
+/// Build an `OR`-of-`AND` equality predicate over each entry's key fields **plus its sort-key prune
+/// hints**, so a hydration fallback prunes the Iceberg scan to the files that can hold the row. The
+/// hint is the row's *own* sort-key value (e.g. `ts = <that row's ts>`); on a **sorted** source
+/// table it lets Iceberg prune by manifest min/max on the sort key — the heal for an unpartitioned,
+/// hash-routed random identifier whose per-file min/max spans the whole space.
 ///
-/// Datums are typed to match the source schema; any field whose type can't be mapped safely (a
+/// Datums are typed to match the source schema. A **key** field that can't map safely (a
 /// value/column-type mismatch, or a timestamp that can't be an exact DATE) makes the whole
-/// predicate `None` so the caller reads unfiltered. This must never *exclude* a matching row — the
-/// fallback re-verifies each candidate against the exact key — so `None` (read everything) is the
-/// safe default, and pruning is a pure speed-up. Returns `None` for an empty key set.
-fn key_predicate(schema: &IcebergSchema, keys: &[&CompositeKey]) -> Option<Predicate> {
-    let mut per_key = Vec::with_capacity(keys.len());
-    for key in keys {
+/// predicate `None` so the caller reads unfiltered. A **hint** field that can't map is simply
+/// *skipped* (the row's key still constrains it). Neither can *exclude* a matching row — the
+/// fallback re-verifies each candidate against the exact key — so pruning is a pure speed-up, and
+/// `None` (read everything) is the safe default. Returns `None` for an empty entry set.
+fn key_predicate(
+    schema: &IcebergSchema,
+    entries: &[(&CompositeKey, &[(String, Value)])],
+) -> Option<Predicate> {
+    let mut per_key = Vec::with_capacity(entries.len());
+    for (key, hints) in entries {
         let mut conj: Option<Predicate> = None;
-        for (name, value) in key.partition.iter().chain(key.identifier.iter()) {
-            let datum = value_to_datum(schema, name, value)?;
-            let eq = Reference::new(name.clone()).equal_to(datum);
-            conj = Some(match conj {
+        let push = |conj: &mut Option<Predicate>, name: &str, datum: Datum| {
+            let eq = Reference::new(name.to_string()).equal_to(datum);
+            *conj = Some(match conj.take() {
                 Some(c) => c.and(eq),
                 None => eq,
             });
+        };
+        for (name, value) in key.partition.iter().chain(key.identifier.iter()) {
+            let datum = value_to_datum(schema, name, value)?;
+            push(&mut conj, name, datum);
+        }
+        // Hints only narrow: an unmappable hint is skipped, never widening incorrectly.
+        for (name, value) in hints.iter() {
+            if let Some(datum) = value_to_datum(schema, name, value) {
+                push(&mut conj, name, datum);
+            }
         }
         per_key.push(conj?); // identifier is always non-empty, so conj is Some
     }
     let mut it = per_key.into_iter();
     let first = it.next()?;
     Some(it.fold(first, |acc, p| acc.or(p)))
+}
+
+/// The identity sort-order columns of `tbl` — see [`IcebergReader::sort_field_names`]. Free helper
+/// so a caller already holding the [`Table`] needn't re-load it.
+fn sort_field_names_of(tbl: &Table) -> Vec<String> {
+    let meta = tbl.metadata();
+    let schema = meta.current_schema();
+    meta.default_sort_order()
+        .fields
+        .iter()
+        .filter(|sf| sf.transform == Transform::Identity)
+        .filter_map(|sf| schema.field_by_id(sf.source_id).map(|f| f.name.clone()))
+        .collect()
 }
 
 /// Microseconds per UTC day — the Date32 (days-since-epoch) ↔ canonical-micros scale factor.
@@ -1655,6 +1728,11 @@ mod tests {
         CompositeKey::new(own(partition), own(identifier))
     }
 
+    /// `key_predicate` entries with no prune hints — the key-only predicate (the prior behavior).
+    fn no_hint<'a>(keys: &[&'a CompositeKey]) -> Vec<(&'a CompositeKey, &'a [(String, Value)])> {
+        keys.iter().map(|k| (*k, &[][..])).collect()
+    }
+
     #[test]
     fn key_predicate_prunes_by_partition_and_identifier() {
         let schema = ice_schema();
@@ -1662,7 +1740,7 @@ mod tests {
             vec![("site", Value::Str("plant-1".into()))],
             vec![("id", Value::Str("doc-10".into()))],
         );
-        let p = key_predicate(&schema, &[&k]).expect("predicate");
+        let p = key_predicate(&schema, &no_hint(&[&k])).expect("predicate");
         let s = p.to_string();
         assert!(
             s.contains("site") && s.contains("plant-1"),
@@ -1679,7 +1757,7 @@ mod tests {
         let schema = ice_schema();
         let a = ckey(vec![], vec![("id", Value::Str("a".into()))]);
         let b = ckey(vec![], vec![("id", Value::Str("b".into()))]);
-        let p = key_predicate(&schema, &[&a, &b]).expect("predicate");
+        let p = key_predicate(&schema, &no_hint(&[&a, &b])).expect("predicate");
         let s = p.to_string();
         assert!(
             s.contains("\"a\"") && s.contains("\"b\""),
@@ -1693,15 +1771,56 @@ mod tests {
         // `id` is a String column but the key value is an Int — can't safely prune, so no predicate
         // (the caller reads unfiltered; the exact in-memory match still guarantees correctness).
         let k = ckey(vec![], vec![("id", Value::Int(5))]);
-        assert!(key_predicate(&schema, &[&k]).is_none());
+        assert!(key_predicate(&schema, &no_hint(&[&k])).is_none());
         // An unknown/absent column likewise yields None.
         let missing = ckey(vec![], vec![("nope", Value::Str("x".into()))]);
-        assert!(key_predicate(&schema, &[&missing]).is_none());
+        assert!(key_predicate(&schema, &no_hint(&[&missing])).is_none());
     }
 
     #[test]
     fn key_predicate_is_none_for_no_keys() {
         assert!(key_predicate(&ice_schema(), &[]).is_none());
+    }
+
+    #[test]
+    fn key_predicate_ands_a_sort_key_hint_onto_the_key() {
+        // The sort-key prune hint (`n = 42`, the row's own value) is AND-ed onto the key's own
+        // `id` equality — on a sorted table this prunes files by manifest min/max on `n`, which the
+        // random `id` alone can't. Correctness rests on the exact key re-verify, so the extra
+        // equality on the row's true value is always safe.
+        let schema = ice_schema();
+        let k = ckey(vec![], vec![("id", Value::Str("doc-10".into()))]);
+        let hints = [("n".to_string(), Value::Int(42))];
+        let p = key_predicate(&schema, &[(&k, &hints)]).expect("predicate");
+        let s = p.to_string();
+        assert!(
+            s.contains("id") && s.contains("doc-10"),
+            "key term present: {s}"
+        );
+        assert!(
+            s.contains('n') && s.contains("42"),
+            "sort-key hint AND-ed in: {s}"
+        );
+    }
+
+    #[test]
+    fn key_predicate_absent_hint_degrades_to_the_key_only_predicate() {
+        // No hint (or an unmappable one) leaves exactly the prior key-only predicate — a hint never
+        // widens or narrows incorrectly. An `n = <string>` hint can't type against the Long column,
+        // so it's skipped, and the result matches the no-hint predicate verbatim.
+        let schema = ice_schema();
+        let k = ckey(vec![], vec![("id", Value::Str("doc-10".into()))]);
+        let key_only = key_predicate(&schema, &no_hint(&[&k]))
+            .expect("predicate")
+            .to_string();
+        let bad = [("n".to_string(), Value::Str("not-a-long".into()))];
+        let with_bad_hint = key_predicate(&schema, &[(&k, &bad)])
+            .expect("predicate")
+            .to_string();
+        assert_eq!(
+            with_bad_hint, key_only,
+            "unmappable hint skipped → key-only"
+        );
     }
 
     /// A temporal source schema `day:Date (partition), ts:Timestamp, tstz:Timestamptz, id:String`
@@ -1762,7 +1881,7 @@ mod tests {
             vec![("day", Value::Ts(20_625 * MICROS_PER_DAY))],
             vec![("ts", Value::Ts(1_782_000_123_456_789))],
         );
-        let p = key_predicate(&schema, &[&k]).expect("temporal predicate");
+        let p = key_predicate(&schema, &no_hint(&[&k])).expect("temporal predicate");
         let s = p.to_string();
         assert!(s.contains("day"), "date key pruned: {s}");
         assert!(s.contains("ts"), "timestamp key pruned: {s}");
@@ -1782,7 +1901,7 @@ mod tests {
             vec![("day", Value::Ts(not_midnight))],
             vec![("id", Value::Str("x".into()))],
         );
-        assert!(key_predicate(&schema, &[&k]).is_none());
+        assert!(key_predicate(&schema, &no_hint(&[&k])).is_none());
     }
 
     #[test]
@@ -1935,14 +2054,15 @@ mod tests {
         write_docs_parquet(&f1, 1000, 300, 50); // ids 1000..1300
 
         let key = |id: i64| CompositeKey::new(vec![], vec![("id".into(), Value::Int(id))]);
+        let req = HydrateRequest::new;
         let requests = vec![
-            (key(1005), Some(locator(&f1, 5))),         // resolves (file 1)
-            (key(7), Some(locator(&f0, 7))), // resolves (file 0) — interleaved input order
-            (key(999), Some(locator(&f0, 8))), // wrong key at position 8 (id=8) → stale
-            (key(1299), Some(locator(&f1, 299))), // last row of file 1 → resolves
-            (key(42), Some(locator(&f0, 9_999))), // past EOF → stale
-            (key(1), Some(locator("gone.parquet", 1))), // file rewritten away → stale
-            (key(2), None),                  // known stale (dead-file bitmap) → no read at all
+            req(key(1005), Some(locator(&f1, 5))),   // resolves (file 1)
+            req(key(7), Some(locator(&f0, 7))),      // resolves (file 0) — interleaved input order
+            req(key(999), Some(locator(&f0, 8))),    // wrong key at position 8 (id=8) → stale
+            req(key(1299), Some(locator(&f1, 299))), // last row of file 1 → resolves
+            req(key(42), Some(locator(&f0, 9_999))), // past EOF → stale
+            req(key(1), Some(locator("gone.parquet", 1))), // file rewritten away → stale
+            req(key(2), None), // known stale (dead-file bitmap) → no read at all
         ];
         let tasks = vec![docs_task(&f0), docs_task(&f1)];
 
@@ -1995,7 +2115,7 @@ mod tests {
         let plans_run = AtomicUsize::new(0);
 
         // One "hydrate" = hydrate()'s pass 1 with the cached-or-planned task set.
-        let hydrate_at = |snapshot: i64, requests: Vec<(CompositeKey, Option<RowLocator>)>| {
+        let hydrate_at = |snapshot: i64, requests: Vec<HydrateRequest>| {
             let (cache, plans_run) = (&cache, &plans_run);
             async move {
                 let (tasks, hit) = cache
@@ -2013,10 +2133,18 @@ mod tests {
         };
 
         // Two hydrates at snapshot 1 → correct rows, one planning pass (the second is a hit).
-        let (rows, hit) = hydrate_at(1, vec![(key_id(7), Some(locator(&f0, 7)))]).await;
+        let (rows, hit) = hydrate_at(
+            1,
+            vec![HydrateRequest::new(key_id(7), Some(locator(&f0, 7)))],
+        )
+        .await;
         assert_eq!(rows[0].fields["id"], Value::Int(7));
         assert!(!hit);
-        let (rows, hit) = hydrate_at(1, vec![(key_id(42), Some(locator(&f0, 42)))]).await;
+        let (rows, hit) = hydrate_at(
+            1,
+            vec![HydrateRequest::new(key_id(42), Some(locator(&f0, 42)))],
+        )
+        .await;
         assert_eq!(rows[0].fields["id"], Value::Int(42));
         assert!(hit, "same snapshot → cached plan reused");
         assert_eq!(plans_run.load(Ordering::SeqCst), 1, "manifests read once");
@@ -2026,8 +2154,8 @@ mod tests {
         let (rows, hit) = hydrate_at(
             2,
             vec![
-                (key_id(1005), Some(locator(&f1, 5))),
-                (key_id(7), Some(locator(&f0, 7))),
+                HydrateRequest::new(key_id(1005), Some(locator(&f1, 5))),
+                HydrateRequest::new(key_id(7), Some(locator(&f0, 7))),
             ],
         )
         .await;

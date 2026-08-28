@@ -153,7 +153,7 @@ impl Lookup for LookupService {
         // locate + live-file bitmap; `PREDICATE` a locator-less key-presence check.
         let predicate_index =
             shard.location_strategy() == growlerdb_core::LocationStrategy::Predicate;
-        let located = hydrate::resolve_requests(&shard, &keys).map_err(engine_status)?;
+        let mut located = hydrate::resolve_requests(&shard, &keys).map_err(engine_status)?;
         growlerdb_telemetry::sli::locate_keys(located.len() as u64);
 
         // Variant fork (D48/D49): a variant-table index hydrates through the interim Trino lane
@@ -170,6 +170,10 @@ impl Lookup for LookupService {
                 Ok(reader) => reader,
                 Err(e) => return Err(engine_status(EngineError::Source(e))),
             };
+            // Sort-key prune hints (best-effort) so pass 2 prunes by the sorted table's manifest
+            // min/max, not a whole-snapshot scan on the unprunable random key.
+            hydrate::attach_prune_hints(&mut located, &shard, reader.as_ref(), &self.table, &keys)
+                .await;
             match reader.hydrate(&self.table, &located, &projection).await {
                 Ok(result) => result,
                 Err(e) => {

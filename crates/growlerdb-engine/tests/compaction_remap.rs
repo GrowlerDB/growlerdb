@@ -142,9 +142,10 @@ async fn hydrate(shard: &Shard, keys: &[CompositeKey], files: &[String]) -> Hydr
     let mut found = 0usize;
     let mut pass1_reads = 0usize;
     let mut refreshed: Vec<(CompositeKey, RowLocator)> = Vec::new();
-    for (k, locator) in located {
+    for req in located {
+        let k = req.key;
         // Pass 1: a locator that survived the bitmap is read and key-verified.
-        let verified = locator.as_ref().is_some_and(|loc| {
+        let verified = req.locator.as_ref().is_some_and(|loc| {
             let Some(rows) = rows_of.get(&loc.iceberg_file) else {
                 return false; // file rewritten away — the read never happens
             };
@@ -314,7 +315,7 @@ async fn compaction_under_hydration_with_remap_and_bitmap_only() {
     // resolution strips them all — zero doomed pass-1 reads are even attempted.
     let located = apply_live_file_bitmap(&shard, resolve_locators(&shard, &keys).unwrap());
     assert!(
-        located.iter().all(|(_, loc)| loc.is_none()),
+        located.iter().all(|req| req.locator.is_none()),
         "dead-file locators go straight to the fallback"
     );
 

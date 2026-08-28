@@ -891,6 +891,73 @@ impl SegmentReader {
         Ok(None)
     }
 
+    /// The [`DocAddress`](tantivy::DocAddress) of the live doc carrying `key_enc`, or `None` when no
+    /// live doc has the key — the same identity-layer resolution [`live_loc_id`](Self::live_loc_id)
+    /// does, but exposing the address so a caller reads arbitrary **fast fields** (the sort-key prune
+    /// hints), not just `_locid`. The address is only valid for `searcher` (segment ords align).
+    fn live_doc_address(
+        &self,
+        searcher: &tantivy::Searcher,
+        key_enc: &[u8],
+    ) -> Result<Option<tantivy::DocAddress>> {
+        let schema = self.index.schema();
+        let Ok(key_enc_field) = schema.get_field(KEY_ENC_FIELD) else {
+            return Ok(None);
+        };
+        let term = Term::from_field_bytes(key_enc_field, key_enc);
+        for (seg_ord, segment) in searcher.segment_readers().iter().enumerate() {
+            let inverted = segment.inverted_index(key_enc_field)?;
+            let Some(mut postings) = inverted
+                .read_postings(&term, IndexRecordOption::Basic)
+                .map_err(|e| IndexError::Tantivy(e.into()))?
+            else {
+                continue;
+            };
+            let alive = segment.alive_bitset();
+            let mut doc = postings.doc();
+            while doc != TERMINATED {
+                if alive.is_none_or(|b| b.is_alive(doc)) {
+                    return Ok(Some(tantivy::DocAddress::new(seg_ord as u32, doc)));
+                }
+                doc = postings.advance();
+            }
+        }
+        Ok(None)
+    }
+
+    /// Read each key's live-doc **fast values** for `fields` — the sort-key **prune hints** hydration
+    /// AND-s onto the pass-2 predicate so a sorted source table prunes by manifest min/max. For each
+    /// key: resolve its live doc ([`live_doc_address`](Self::live_doc_address)) then read each field's
+    /// fast value, typed to the field's mapping. A key with no live doc, or a field that isn't
+    /// fast/sortable, simply contributes nothing (never an error — the predicate is a pure prune).
+    /// Returns a vec aligned 1:1 with `keys`.
+    pub fn fast_values(
+        &self,
+        keys: &[CompositeKey],
+        fields: &[String],
+    ) -> Result<Vec<Vec<(String, GValue)>>> {
+        let searcher = self.reader.searcher();
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            let mut row = Vec::new();
+            if let Some(address) = self.live_doc_address(&searcher, &key.encode())? {
+                for field in fields {
+                    let Ok((_, ftype)) = self.resolve_typed_field(field) else {
+                        continue; // unknown field — no hint
+                    };
+                    let Ok(sv) = self.fast_value(&searcher, address, field) else {
+                        continue; // not a fast/sortable field — no hint
+                    };
+                    if let Some(v) = sort_value_to_value(&ftype, &sv) {
+                        row.push((field.clone(), v));
+                    }
+                }
+            }
+            out.push(row);
+        }
+        Ok(out)
+    }
+
     /// Whether any **live** doc carries `enc(key)` — a postings probe filtered by each segment's
     /// alive bitset. Unlike a raw term lookup this never counts a deleted-but-unmerged doc (under
     /// `NoMergePolicy` term dictionaries retain superseded/deleted keys until compaction).
@@ -2481,6 +2548,20 @@ fn bounded_levenshtein(a: &[char], b: &[char], max: u8) -> Option<u8> {
         std::mem::swap(&mut prev, &mut cur);
     }
     (prev[m] <= max).then_some(prev[m] as u8)
+}
+
+/// Map a fast-field [`SortValue`] to a core [`GValue`] typed to the field's mapping — the sort-key
+/// prune hint's value (LONG→[`Int`](GValue::Int), DOUBLE→[`Float`](GValue::Float), DATE→canonical
+/// micros [`Ts`](GValue::Ts), KEYWORD→[`Str`](GValue::Str)). [`Missing`](SortValue::Missing) or a
+/// type mismatch yields `None`, contributing no hint.
+fn sort_value_to_value(ftype: &TvFieldType, sv: &SortValue) -> Option<GValue> {
+    match (ftype, sv) {
+        (TvFieldType::I64(_), SortValue::Num(x)) => Some(GValue::Int(*x as i64)),
+        (TvFieldType::F64(_), SortValue::Num(x)) => Some(GValue::Float(*x)),
+        (TvFieldType::Date(_), SortValue::Num(x)) => Some(GValue::Ts(*x as i64)),
+        (TvFieldType::Str(_), SortValue::Str(s)) => Some(GValue::Str(s.clone())),
+        _ => None,
+    }
 }
 
 /// Build a keyset [`Term`] for a sort field from a cursor [`SortValue`], or `None` for
