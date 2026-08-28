@@ -203,10 +203,6 @@ pub struct IcebergReader {
     /// current-snapshot plan: only effective when the reader itself is long-lived — hold it
     /// via [`SharedReader`] rather than connecting per call.
     plans: PlanCache<Arc<Vec<FileScanTask>>>,
-    /// Per-table cache of [`sort_field_names`](Self::sort_field_names). The sort order is a stable
-    /// table property (changes only on DDL), so caching it keeps the per-hydration prune-hint lookup
-    /// from adding a catalog `load_table` round-trip to every hydrated query.
-    sort_fields: std::sync::Mutex<HashMap<String, Arc<Vec<String>>>>,
 }
 
 impl IcebergReader {
@@ -224,7 +220,6 @@ impl IcebergReader {
         Ok(Self {
             catalog,
             plans: PlanCache::new(PLAN_CACHE_CAP),
-            sort_fields: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -409,22 +404,13 @@ impl IcebergReader {
     /// transforms (`day`/`bucket`/…) don't preserve equality, so they're excluded (a hint on one
     /// could exclude the matching row). Empty for an unsorted table. One catalog metadata load.
     pub async fn sort_field_names(&self, table: &str) -> Result<Vec<String>> {
-        if let Some(cached) = self
-            .sort_fields
-            .lock()
-            .expect("sort_fields cache not poisoned")
-            .get(table)
-        {
-            return Ok((**cached).clone());
-        }
+        // Read fresh each call — NOT cached: the sort order is declared by compaction (WRITE ORDERED
+        // BY) *after* a table is first hydrated (the cold-sync convergence sample), so a cache would
+        // pin the pre-compaction empty order and never prune. The extra `load_table` lands only on the
+        // hydrated path (already an Iceberg round-trip), so its cost is in the noise.
         let ident = TableIdent::from_strs(table.split('.'))?;
         let tbl = self.catalog.load_table(&ident).await?;
-        let names = Arc::new(sort_field_names_of(&tbl));
-        self.sort_fields
-            .lock()
-            .expect("sort_fields cache not poisoned")
-            .insert(table.to_string(), names.clone());
-        Ok((*names).clone())
+        Ok(sort_field_names_of(&tbl))
     }
 
     /// **Hydration with verify-and-fall-back** ([Flow 2], [keeping the locator

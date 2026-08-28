@@ -97,6 +97,11 @@ spec:
                     --conf spark.hadoop.fs.s3a.path.style.access=true \
                     --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \
                     -e "
+                      -- Declare the table's sort order so it lands in the metadata (default-sort-order),
+                      -- not just the rewritten files: hydration reads default_sort_order to prune the
+                      -- fallback key scan by the sort key (ts). rewrite_data_files' sort_order option
+                      -- alone sorts the files but leaves the metadata unsorted, so the pruner sees none.
+                      ALTER TABLE stream.growlerdb.http_logs WRITE ORDERED BY ts ASC NULLS LAST, request_id ASC NULLS LAST;
                       CALL stream.system.rewrite_data_files(table => 'growlerdb.http_logs', strategy => 'sort', sort_order => 'ts ASC NULLS LAST, request_id ASC NULLS LAST', options => map('min-input-files','2','target-file-size-bytes','134217728','partial-progress.enabled','true','partial-progress.max-commits','10'));
                       CALL stream.system.rewrite_manifests('growlerdb.http_logs');
                       CALL stream.system.expire_snapshots(table => 'growlerdb.http_logs', older_than => TIMESTAMP '${EXPIRE_TS}', retain_last => ${RETAIN_LAST});
