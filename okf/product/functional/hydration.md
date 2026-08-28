@@ -38,7 +38,11 @@ How the lookup reaches the source row is a per-index choice
 - **`COORDINATES`** (default) — the index keeps each row's `(file, position)`
   ([locators](/system/storage/locators-segments.md)), so hydration is a targeted parquet point
   read. Works well on **any** table; costs ~13–15 B/row of index and background healing when the
-  source compacts. Choose it unless you know better.
+  source compacts. A compaction (`rewrite_data_files`) stales every locator at once; a background
+  re-map **streams the rewritten files** and re-points slots incrementally (bounded memory,
+  progressive, resumable), while the per-hit stale fallback is **file-budgeted** so an unprunable key
+  never turns one lookup into a whole-snapshot scan (it serves what it cheaply finds and the re-map
+  heals the rest). Choose it unless you know better.
 - **`PREDICATE`** — the index keeps **no location data**; hydration re-finds the row by a
   key-equality scan pruned by partition values + column stats (temporal keys included). Zero
   location bytes and nothing to heal — but **only worth it when the key correlates with the table

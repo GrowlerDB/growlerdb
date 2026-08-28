@@ -18,7 +18,9 @@ Define an index over an Iceberg table and build it. The definition chooses:
   columnar path serves; a *term* filter like `archived:true` needs `indexed: true`, since
   the columnar path answers ranges/sorts but has no postings to match a term) / TEXT-only **`record`**
   + **`fieldnorms`** (posting detail and
-  BM25 norms; see [data model](/system/storage/data-model.md)) flags; optionally a
+  BM25 norms; see [data model](/system/storage/data-model.md)) / **`suggest`** (build a per-segment
+  prefix-completion sidecar for low-latency typeahead — see
+  [suggest](/product/functional/search/suggest.md)) flags; optionally a
   declared **timestamp** field and [windowing](/product/functional/windowing-time.md). Iceberg v3
   **variant** columns have their own `type: VARIANT` mapping surface
   ([variant fields](/product/functional/index-management/variant.md)) — untyped `flatten` and/or
