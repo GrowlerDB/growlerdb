@@ -174,6 +174,34 @@ class ConnectorJobPlanTest {
     assertTrue(maxChunk[0] <= 10, "no chunk exceeded the cap: " + maxChunk[0]);
   }
 
+  // --- backfill windowing ------------------------------------------
+
+  @Test
+  void streamBackfillCommitsCutsAtTheRowCapNotSnapshotBoundaries() {
+    // 5 rows, all the same (current) snapshot, cap 2 → three chunks (2, 2, 1). Unlike the changelog
+    // path this cuts purely on the row count, since a from-empty backfill is all upserts, one snapshot.
+    List<List<ChangelogRow>> chunks = new ArrayList<>();
+    ConnectorJob.streamBackfillCommits(rows(99, 5).iterator(), 2, chunks::add);
+    assertEquals(3, chunks.size());
+    assertEquals(2, chunks.get(0).size());
+    assertEquals(2, chunks.get(1).size());
+    assertEquals(1, chunks.get(2).size());
+  }
+
+  @Test
+  void streamBackfillCommitsAlwaysEmitsAtLeastOneChunkToAdvanceAnEmptyOwnedSubset() {
+    // An owned subset with no rows must still commit once so the worker's shard advances to current.
+    List<List<ChangelogRow>> chunks = new ArrayList<>();
+    ConnectorJob.streamBackfillCommits(List.<ChangelogRow>of().iterator(), 2, chunks::add);
+    assertEquals(1, chunks.size());
+    assertTrue(chunks.get(0).isEmpty());
+
+    // An exact multiple of the cap emits no trailing empty chunk (the last full chunk already advanced).
+    List<List<ChangelogRow>> exact = new ArrayList<>();
+    ConnectorJob.streamBackfillCommits(rows(99, 4).iterator(), 2, exact::add);
+    assertEquals(2, exact.size());
+  }
+
   // --- bounded metadata walk ----------------------------------
 
   /** A `.snapshots` metadata row: (snapshot_id, parent_id, operation, added-records string). */

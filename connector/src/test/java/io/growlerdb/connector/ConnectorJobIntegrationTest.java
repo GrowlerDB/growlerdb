@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.growlerdb.proto.v1.DocBatch;
 import io.growlerdb.proto.v1.DocOp;
+import io.growlerdb.proto.v1.LocatedDoc;
 import io.growlerdb.proto.v1.WriteGrpc;
 import io.growlerdb.proto.v1.WriteRequest;
 import io.growlerdb.proto.v1.WriteResponse;
@@ -70,12 +71,10 @@ class ConnectorJobIntegrationTest {
   }
 
   @Test
-  void readsChangelogAndCommitsOverGrpc() throws Exception {
+  void backfillEmitsRealLocatorsThenIncrementalUsesPlaceholder() throws Exception {
     spark.sql("DROP TABLE IF EXISTS demo.ns.docs");
     spark.sql("CREATE TABLE demo.ns.docs (id STRING, body STRING) USING iceberg");
     spark.sql("INSERT INTO demo.ns.docs VALUES ('doc-1','hello'), ('doc-2','world')");
-    spark.sql("UPDATE demo.ns.docs SET body = 'updated' WHERE id = 'doc-1'");
-    spark.sql("DELETE FROM demo.ns.docs WHERE id = 'doc-2'");
 
     RecordingWrite node = new RecordingWrite();
     Server server = ServerBuilder.forPort(0).addService(node).build().start();
@@ -88,28 +87,51 @@ class ConnectorJobIntegrationTest {
               List.of("id"));
 
       try (WriteClient client = new WriteClient("127.0.0.1", server.getPort())) {
-        // From the start (null checkpoint) → the whole history collapses to the
-        // net effect: doc-1 present (updated), doc-2 gone.
-        ConnectorJob.Result r = job.runOnce(spark, null, client);
-        assertTrue(r.wrote, "a batch should be committed");
-        assertEquals(1L, r.committedSnapshot, "first commit → index snapshot 1");
-        assertEquals(r.checkpointSnapshotId, job.currentSnapshotId(spark));
+        // From-empty (null checkpoint) → BACKFILL: a plain scan of the current snapshot, every row an
+        // upsert carrying its REAL (file, position) so hydration can pass-1 point-read.
+        ConnectorJob.Result backfill = job.runOnce(spark, null, client);
+        assertTrue(backfill.wrote, "a backfill batch should be committed");
+        assertEquals(backfill.checkpointSnapshotId, job.currentSnapshotId(spark));
+
+        assertEquals(1, node.received.size(), "backfill sent one bounded sub-batch");
+        DocBatch backfillBatch = node.received.get(0);
+        // A bootstrap sub-batch: no `from` (covers from empty), checkpoint = current.
+        assertFalse(backfillBatch.hasFromCheckpoint(), "backfill sub-batch is a bootstrap (no `from`)");
+        Map<String, DocOp> backfilled = byIdentifier(backfillBatch);
+        for (String id : List.of("doc-1", "doc-2")) {
+          DocOp op = backfilled.get(id);
+          assertTrue(op.hasUpsert(), id + " → upsert");
+          LocatedDoc located = op.getUpsert();
+          assertFalse(
+              located.getIcebergFile().isEmpty(), id + " carries a REAL data-file path, not \"\"");
+          assertTrue(located.getRowPosition() >= 0, id + " carries a real row position");
+        }
+
+        // Now an UPDATE + DELETE, then resume INCREMENTALLY (a non-null checkpoint) → the changelog
+        // path, which emits the placeholder locator (hydration heals it lazily).
+        spark.sql("UPDATE demo.ns.docs SET body = 'updated' WHERE id = 'doc-1'");
+        spark.sql("DELETE FROM demo.ns.docs WHERE id = 'doc-2'");
+        ConnectorJob.Result incr = job.runOnce(spark, backfill.checkpointSnapshotId, client);
+        assertTrue(incr.wrote, "the update/delete window commits");
+
+        assertEquals(2, node.received.size(), "incremental sent a second batch");
+        Map<String, DocOp> changed = byIdentifier(node.received.get(1));
+
+        DocOp doc1 = changed.get("doc-1");
+        assertTrue(doc1.hasUpsert(), "doc-1 → upsert (UPDATE_AFTER)");
+        assertEquals("updated", doc1.getUpsert().getDoc().getFieldsMap().get("body").getStr());
+        assertTrue(
+            doc1.getUpsert().getIcebergFile().isEmpty(),
+            "incremental changelog upsert keeps the placeholder locator");
+
+        DocOp doc2 = changed.get("doc-2");
+        assertTrue(doc2.hasDelete(), "doc-2 → delete");
 
         // Idempotent resume: re-running from the same checkpoint is a no-op.
-        ConnectorJob.Result again = job.runOnce(spark, r.checkpointSnapshotId, client);
-        assertFalse(again.wrote, "already caught up → no RPC");
+        assertFalse(
+            job.runOnce(spark, incr.checkpointSnapshotId, client).wrote,
+            "already caught up → no RPC");
       }
-
-      assertEquals(1, node.received.size(), "exactly one batch sent");
-      DocBatch batch = node.received.get(0);
-      Map<String, DocOp> byKey = byIdentifier(batch);
-
-      DocOp doc1 = byKey.get("doc-1");
-      assertTrue(doc1.hasUpsert(), "doc-1 → upsert");
-      assertEquals("updated", doc1.getUpsert().getDoc().getFieldsMap().get("body").getStr());
-
-      DocOp doc2 = byKey.get("doc-2");
-      assertTrue(doc2.hasDelete(), "doc-2 → delete");
     } finally {
       server.shutdownNow();
     }

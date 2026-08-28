@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.stream.Collectors;
+import org.apache.spark.sql.Column;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
@@ -19,7 +20,9 @@ import org.apache.spark.sql.functions;
  *
  * <p>The changelog scan abstracts away data-file layout, so it does not carry the
  * source {@code (file, position)}; {@link #toRows} emits a <b>placeholder
- * locator</b> and hydration fills it lazily via verify-and-fall-back.
+ * locator</b> and hydration fills it lazily via verify-and-fall-back. The
+ * <b>backfill</b> path ({@link #backfillScan} — a from-empty index) instead does a plain scan that
+ * projects {@code _file}/{@code _pos}, so its rows carry the REAL locator for a pass-1 point read.
  */
 public final class ChangelogReader {
 
@@ -138,9 +141,94 @@ public final class ChangelogReader {
    *  is walked into flatten leaves (carried on the {@link ChangelogRow}) plus discriminator-selected
    *  shape values (merged into {@code columns}, riding the typed fields). {@code null} = no variant. */
   static ChangelogRow toRow(Row row, List<String> columns, VariantExtractor variant) {
-    ChangeType type = ChangeType.fromIceberg(row.getAs("_change_type"));
-    long ordinal = ((Number) row.getAs("_change_ordinal")).longValue();
-    long snapshot = ((Number) row.getAs("_commit_snapshot_id")).longValue();
+    // Changelog rows carry no source layout, so the locator is a placeholder (hydration heals it).
+    return buildRow(
+        row,
+        columns,
+        variant,
+        ChangeType.fromIceberg(row.getAs("_change_type")),
+        ((Number) row.getAs("_change_ordinal")).longValue(),
+        ((Number) row.getAs("_commit_snapshot_id")).longValue(),
+        "",
+        0L);
+  }
+
+  /** Iceberg's hidden metadata columns for a plain scan: data-file path and row ordinal in it. */
+  static final String FILE_COL = "_file";
+
+  static final String POS_COL = "_pos";
+
+  /**
+   * Build the <b>backfill</b> DataFrame: a plain scan of {@code table}'s current snapshot projecting
+   * the indexed {@code columns} plus the {@code _file}/{@code _pos} metadata columns, so each row
+   * carries its REAL Iceberg locator {@code (file, position)} — unlike the changelog scan, which drops
+   * layout. A from-empty backfill of a settled table needs no CDC delta: the current snapshot IS "all
+   * changes since empty". {@code variantColumn} is rendered as JSON text (as in {@link #changelog}).
+   */
+  public static Dataset<Row> backfillScan(
+      SparkSession spark, String catalog, String table, List<String> columns, String variantColumn) {
+    List<Column> projection = new ArrayList<>();
+    for (String c : columns) {
+      projection.add(functions.col(c));
+    }
+    projection.add(functions.col(FILE_COL));
+    projection.add(functions.col(POS_COL));
+    Dataset<Row> df =
+        spark.table(catalog + "." + table).select(projection.toArray(new Column[0]));
+    if (variantColumn != null) {
+      df = df.withColumn(variantColumn, functions.to_json(functions.col(variantColumn)));
+    }
+    return df;
+  }
+
+  /**
+   * Stream a {@link #backfillScan} as {@link ChangelogRow}s: every row is an INSERT (append-only
+   * backfill) stamped with {@code snapshot} (the current snapshot the scan reflects) and its real
+   * {@code (_file, _pos)} locator. {@code changeOrdinal} is a per-scan running counter — its only use
+   * is intra-batch last-write-wins, and a from-empty backfill has one op per key. Pulls one partition
+   * at a time ({@link Dataset#toLocalIterator}) so driver memory stays O(chunk).
+   */
+  public static Iterator<ChangelogRow> backfillRowIterator(
+      Dataset<Row> scan, List<String> columns, long snapshot, VariantExtractor variant) {
+    Iterator<Row> rows = scan.toLocalIterator();
+    return new Iterator<>() {
+      private long ordinal = 0;
+
+      @Override
+      public boolean hasNext() {
+        return rows.hasNext();
+      }
+
+      @Override
+      public ChangelogRow next() {
+        Row row = rows.next();
+        Object file = row.getAs(FILE_COL);
+        Object pos = row.getAs(POS_COL);
+        return buildRow(
+            row,
+            columns,
+            variant,
+            ChangeType.INSERT,
+            ordinal++,
+            snapshot,
+            file == null ? "" : file.toString(),
+            pos == null ? 0L : ((Number) pos).longValue());
+      }
+    };
+  }
+
+  /** Shared row builder: project {@code columns} as wire {@link Value}s and (optionally) extract the
+   *  variant column, then assemble a {@link ChangelogRow} with the given change type/ordinal/snapshot
+   *  and locator. The changelog and backfill paths differ only in those header/locator fields. */
+  private static ChangelogRow buildRow(
+      Row row,
+      List<String> columns,
+      VariantExtractor variant,
+      ChangeType type,
+      long ordinal,
+      long snapshot,
+      String icebergFile,
+      long rowPosition) {
     String variantColumn = variant == null ? null : variant.spec().column;
     var cols = new java.util.HashMap<String, Value>();
     for (String column : columns) {
@@ -172,7 +260,7 @@ public final class ChangelogReader {
       cols.putAll(extracted.shapedFields);
       variants = java.util.List.of(extracted.variantColumn);
     }
-    return new ChangelogRow(type, ordinal, snapshot, cols, "", 0, variants);
+    return new ChangelogRow(type, ordinal, snapshot, cols, icebergFile, rowPosition, variants);
   }
 
   /** Resolve a row's discriminator value: a path inside the variant (qualified with the column)
