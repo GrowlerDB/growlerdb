@@ -46,6 +46,11 @@ STAGE="${STAGE:-all}"
 # streaming connector performs the entire, measured cold backfill — symmetric with Data Prepper CDC and
 # keeping ingest on the metric-emitting connector write path. Default off (nodes boot-build as before).
 DEFINE_ONLY="${DEFINE_ONLY:-false}"
+# CONNECTOR_SET: on the non-windowed (sharded) topology, deploy the parallel connector SET — W=SHARDS
+# independent worker pipelines, each owning a disjoint shard group — so cold-sync ingest uses idle node
+# headroom instead of one pipeline. Set false to fall back to the single connector. The set's
+# owned-shard model is for the sharded topology only; a WINDOWED run always uses the single connector.
+CONNECTOR_SET="${CONNECTOR_SET:-true}"
 IMAGE_TAG="${IMAGE_TAG:-dev}"
 GH_USER="${GH_USER:-}"
 GHCR_PAT="${GHCR_PAT:-}"
@@ -83,7 +88,8 @@ if ! $PY -c 'import yaml' >/dev/null 2>&1; then
 fi
 RENDER_DIR="$(mktemp -d)"
 $PY "$REPO_ROOT/bench/scale/harness.py" render "$WORKLOAD" \
-  --shards "$SHARDS" --namespace "$NAMESPACE" --generators "$GENERATORS" --out "$RENDER_DIR"
+  --shards "$SHARDS" --namespace "$NAMESPACE" --generators "$GENERATORS" \
+  --connector-workers "$SHARDS" --out "$RENDER_DIR"
 # TABLE / INDEX / INDEX_DEF for the gates + helm flags below.
 # shellcheck source=/dev/null
 source "$RENDER_DIR/workload.env"
@@ -189,8 +195,15 @@ kubectl -n "$NAMESPACE" exec statefulset/gdb-growlerdb-node -- growlerdb --versi
 # shards register, so deploy the connector after (its --nodes must equal the now-confirmed ready
 # shard count).
 deploy_connector() {
-  say "5/7 streaming connector — fields from the workload's index.yaml, --nodes sized to $SHARDS shards"
-  kubectl apply -f "$RENDER_DIR/connector.yaml"
+  # Parallel SET (W=SHARDS pipelines) on the sharded topology; single connector for windowed, or when
+  # CONNECTOR_SET=false. NEVER apply both — two writers on a shard fail fast at the node (CHECKPOINT_GAP).
+  if [ "$CONNECTOR_SET" = true ] && [ "$WINDOWED" != true ]; then
+    say "5/7 streaming connector SET — $SHARDS parallel workers (one per shard group), --nodes sized to $SHARDS shards"
+    kubectl apply -f "$RENDER_DIR/connector-set.yaml"
+  else
+    say "5/7 streaming connector (single pipeline) — fields from the workload's index.yaml, --nodes sized to $SHARDS shards"
+    kubectl apply -f "$RENDER_DIR/connector.yaml"
+  fi
 }
 [ "$WINDOWED" = true ] && deploy_connector
 kubectl -n "$NAMESPACE" rollout status deploy/gdb-growlerdb-gateway --timeout=300s
