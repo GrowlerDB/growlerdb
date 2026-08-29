@@ -1,7 +1,5 @@
-//! The Node **Lookup** gRPC service — the PK-lookup / hydration path: check each key's
-//! presence against the index, then re-find the authoritative rows from Iceberg by a pruned
-//! key scan. Pairs with [`SearchService`] (which returns coordinates) to complete a
-//! search → row round-trip.
+//! The Node **Lookup** gRPC service — the PK-lookup / hydration path: check key presence, then
+//! re-find authoritative rows from Iceberg by a pruned key scan. Pairs with [`SearchService`].
 //!
 //! [`SearchService`]: crate::SearchService
 
@@ -483,9 +481,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn predicate_index_unknown_key_is_not_found_before_connecting_to_iceberg() {
-        // The NotFound-before-catalog contract holds under PREDICATE too: presence is a
-        // local key-term presence probe, so a missing key never
-        // costs an Iceberg connect — and never triggers a broad scan.
+        // The NotFound-before-catalog contract holds under PREDICATE too: presence is a local
+        // key-term probe, so a missing key never costs an Iceberg connect nor triggers a broad scan.
         let tmp = tempfile::tempdir().unwrap();
         let svc = predicate_service(tmp.path());
         let err = svc

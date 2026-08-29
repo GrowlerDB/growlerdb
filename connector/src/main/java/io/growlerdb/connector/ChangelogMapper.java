@@ -24,8 +24,7 @@ import java.util.Set;
  *   <li>{@code INSERT} / {@code UPDATE_AFTER} → upsert (key + fields);
  *   <li>{@code DELETE} / {@code UPDATE_BEFORE} → delete by key;
  *   <li>rows from a {@code replace}/compaction snapshot → <b>skipped</b> (a layout
- *       change, not content) — the index content is unchanged, so they must not be
- *       read as a flood of delete+insert.
+ *       change, not content), so they must not read as a flood of delete+insert.
  * </ul>
  *
  * Rows are processed in commit order by {@code _change_ordinal} with <b>last-write-wins per key</b>,

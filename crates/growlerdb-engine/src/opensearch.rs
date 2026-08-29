@@ -501,9 +501,8 @@ struct OsSearchBody {
     source: Option<JsonValue>,
 }
 
-/// Whether a search should hydrate `_source` from Iceberg. Real OpenSearch returns the document body
-/// unless the client suppresses it with `_source: false` or asks for a count only (`size: 0`); a field
-/// list, `_source: true`, an includes/excludes object, or an absent `_source` all still want the body.
+/// Whether a search should hydrate `_source` from Iceberg. Suppressed only by `_source: false` or a
+/// count-only `size: 0`; a field list, `true`, an includes/excludes object, or absent all hydrate.
 fn wants_hydration(source: &Option<JsonValue>, size: Option<u32>) -> bool {
     !matches!(source, Some(JsonValue::Bool(false))) && size != Some(0)
 }
@@ -556,9 +555,8 @@ async fn run_search(
     // Present ⇒ the response carries a per-hit `highlight` object of matched fragments.
     let highlight = body.highlight.as_ref().map(translate_highlight);
 
-    // Hydrate (read rows from Iceberg to fill `_source`) only when the client actually wants
-    // documents — matching real OpenSearch, which fetches `_source` unless suppressed. A count-only
-    // (`size: 0`) or `_source: false` query skips the per-hit Iceberg round-trip entirely.
+    // Hydrate `_source` from Iceberg only when the client wants documents (matching real OpenSearch).
+    // A count-only (`size: 0`) or `_source: false` query skips the per-hit Iceberg round-trip.
     let hydrate = wants_hydration(&body.source, body.size);
 
     let req = grpc_request(
@@ -581,11 +579,8 @@ async fn run_search(
             // Scope to the path's `{index}`; empty for `/_search` (the served index).
             index: index.clone(),
             highlight,
-            // `_source` comes from the engine's inline hydration: rows attach to their hits by
-            // coordinates at the Gateway. A hit whose row doesn't resolve (failed shard /
-            // tenant-filtered / missing) carries `hydrate_error` and gets an empty `_source` —
-            // hydration failure is non-fatal. Gated on `hydrate` so count/`_source:false` queries
-            // don't pay the Iceberg fetch (see above).
+            // `_source` comes from the engine's inline hydration; a hit whose row doesn't resolve
+            // carries `hydrate_error` with an empty `_source` (non-fatal). Gated on `hydrate`.
             hydrate,
             hydrate_columns: Vec::new(),
         },

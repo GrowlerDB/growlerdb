@@ -821,10 +821,8 @@ impl SegmentReader {
         self.reader.searcher().num_docs()
     }
 
-    /// The [`DocAddress`](tantivy::DocAddress) of the live doc carrying `key_enc`, or `None` when no
-    /// live doc has the key — a key-term probe per segment resolving the identity layer, exposing the
-    /// address so a caller reads arbitrary **fast fields** (the sort-key prune hints). The address is
-    /// only valid for `searcher` (segment ords align).
+    /// The [`DocAddress`](tantivy::DocAddress) of the live doc carrying `key_enc`, or `None` — a
+    /// key-term probe per segment, exposing the address so a caller reads its **fast fields** (the prune hints). Valid only for `searcher` (segment ords align).
     fn live_doc_address(
         &self,
         searcher: &tantivy::Searcher,
@@ -856,11 +854,7 @@ impl SegmentReader {
     }
 
     /// Read each key's live-doc **fast values** for `fields` — the sort-key **prune hints** hydration
-    /// AND-s onto the pass-2 predicate so a sorted source table prunes by manifest min/max. For each
-    /// key: resolve its live doc ([`live_doc_address`](Self::live_doc_address)) then read each field's
-    /// fast value, typed to the field's mapping. A key with no live doc, or a field that isn't
-    /// fast/sortable, simply contributes nothing (never an error — the predicate is a pure prune).
-    /// Returns a vec aligned 1:1 with `keys`.
+    /// AND-s onto its predicate. A key with no live doc, or a non-fast field, contributes nothing (never an error — a pure prune); returns a vec aligned 1:1 with `keys`.
     pub fn fast_values(
         &self,
         keys: &[CompositeKey],
@@ -1098,11 +1092,8 @@ impl SegmentReader {
         Ok(vectors)
     }
 
-    /// Build the **per-segment completion sidecar(s)** for every `suggest` field in `schema`, writing
-    /// `<segment-uuid>.cmp` beside each Tantivy segment in `dir`. Idempotent (an existing sidecar is
-    /// skipped), so it can run after every commit; rebuilt for a new (merged) segment id on
-    /// compaction, mirroring [`build_ann_sidecars`](Self::build_ann_sidecars). Frequencies are the
-    /// dictionary's `doc_freq` (not liveness-filtered) — the accepted suggester contract.
+    /// Build the **per-segment completion sidecar(s)** for every `suggest` field, writing `<uuid>.cmp`
+    /// beside each segment in `dir`. Idempotent (rebuilt per merged segment id on compaction); frequencies are the dictionary's `doc_freq`, the accepted suggester contract.
     pub fn build_completion_sidecars(&self, schema: &IndexSchema, dir: &Path) -> Result<()> {
         if schema.suggest_fields.is_empty() {
             return Ok(());
@@ -1136,13 +1127,8 @@ impl SegmentReader {
         Ok(())
     }
 
-    /// **Prefix autocomplete from the completion sidecar**: the top-`limit` terms of `field` under
-    /// `prefix` by descending doc frequency (ties by term ascending) — read from each segment's
-    /// precomputed `<uuid>.cmp` instead of scanning the term dictionary. Returns `None` (fall back to
-    /// the live seek) when the sidecar can't answer: no local index dir, an empty/over-`P` prefix, or
-    /// **any** live segment missing its sidecar or a table for `field` (partial coverage would drop
-    /// terms and mis-rank). Same summed-across-segments frequency contract as [`prefix_terms`](
-    /// Self::prefix_terms), so a flagged field returns identical results to the live path.
+    /// **Prefix autocomplete from the completion sidecar**: `field`'s top-`limit` terms under `prefix`
+    /// (freq desc, term asc) read from each segment's `<uuid>.cmp`. `None` (→ live seek) when the sidecar can't answer: no local dir, empty/over-`P` prefix, or any live segment lacking coverage (would drop terms/mis-rank).
     pub fn suggest_prefix_sidecar(
         &self,
         field: &str,
@@ -2480,10 +2466,8 @@ fn bounded_levenshtein(a: &[char], b: &[char], max: u8) -> Option<u8> {
     (prev[m] <= max).then_some(prev[m] as u8)
 }
 
-/// Map a fast-field [`SortValue`] to a core [`GValue`] typed to the field's mapping — the sort-key
-/// prune hint's value (LONG→[`Int`](GValue::Int), DOUBLE→[`Float`](GValue::Float), DATE→canonical
-/// micros [`Ts`](GValue::Ts), KEYWORD→[`Str`](GValue::Str)). [`Missing`](SortValue::Missing) or a
-/// type mismatch yields `None`, contributing no hint.
+/// Map a fast-field [`SortValue`] to a core [`GValue`] typed to the field's mapping (the prune hint's
+/// value: LONG→Int, DOUBLE→Float, DATE→canonical-micros Ts, KEYWORD→Str). Missing / type mismatch ⇒ `None` (no hint).
 fn sort_value_to_value(ftype: &TvFieldType, sv: &SortValue) -> Option<GValue> {
     match (ftype, sv) {
         (TvFieldType::I64(_), SortValue::Num(x)) => Some(GValue::Int(*x as i64)),

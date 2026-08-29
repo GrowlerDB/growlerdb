@@ -1,9 +1,5 @@
-"""Create the prune-repro tables THROUGH the live Polaris REST catalog (not SqlCatalog/StaticTable).
-
-Same shape as tests/fixtures/gen_prune_fixture.py but via RestCatalog + MinIO S3, so the Rust
-IcebergReader::connect path (RestCatalog::load_table) is exercised exactly as live. Two tables:
-  growlerdb.sorted   — declared sort order [ts identity, request_id identity]
-  growlerdb.unsorted — same data + per-file ts clustering, NO declared sort order
+"""Create the prune-repro tables THROUGH the live Polaris REST catalog (RestCatalog + MinIO S3) so the
+Rust IcebergReader::connect path runs as live — same shape as gen_prune_fixture.py (sorted vs unsorted).
 """
 import os
 import pyarrow as pa

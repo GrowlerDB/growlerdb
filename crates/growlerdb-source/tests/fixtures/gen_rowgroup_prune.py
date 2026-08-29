@@ -1,34 +1,10 @@
 #!/usr/bin/env python3
-"""Generate a LOCAL Iceberg fixture that isolates **row-group-level** hydration pruning.
-
-The sibling `gen_prune_fixture.py` proves *file*-level pruning (6 ts-disjoint files → 1). It does
-NOT answer the question the PREDICATE hydration strategy hinges on: within a SINGLE large data file
-of many row groups, does iceberg-rust skip the row groups a `ts` predicate can't match — so a
-scattered top-k batch (20 hits with `ts` spread across the whole timeline, the real
-`topk_hydrated` shape) reads ~one row group per hit instead of the whole file?
-
-This fixture is ONE table, ONE data file, MANY ts-sorted row groups:
-  - `ts` is strictly increasing across the file → each row group owns a tight, disjoint ts range
-    (per-row-group parquet min/max on ts is selective).
-  - `request_id` is a multiplicative hash of the row index → within any contiguous row group it
-    spans ~the whole hex space, so a `request_id` predicate can prune NEITHER file NOR row group
-    (iceberg-rust 0.10.1 has no bloom-filter support; only column min/max stats prune). This is the
-    control: request_id-only reads the whole file.
-  - a fat `payload` column makes each row group real bytes, so the Rust test's `bytes_read`
-    (iceberg `ScanMetrics`) assertion is meaningful.
-
-Declared sort order [ts, request_id] identity — what Spark `WRITE ORDERED BY ts, request_id`
-records — so `sort_field_names` surfaces `ts` as a hint field, mirroring production.
-
-The data file is written with pyarrow directly (exact `row_group_size` in ROWS) then registered
-with `add_files`, so the row-group layout is controlled precisely rather than left to the writer's
-byte heuristic.
+"""LOCAL Iceberg fixture isolating **row-group-level** hydration pruning: ONE data file of many ts-sorted
+row groups — proves iceberg-rust skips the row groups a `ts` predicate can't match (request_id is the control).
 
 Run (any pyiceberg + pyarrow venv):
   GDB_RG_WAREHOUSE=/tmp/rgwh python3 gen_rowgroup_prune.py
 Then: cargo test -p growlerdb-source -- --ignored rowgroup_prune
-
-It prints the row-group count and the scattered target rows (rid/ts) the Rust test asserts on.
 """
 import hashlib
 import json
@@ -69,9 +45,8 @@ ARROW = pa.schema([
 
 
 def rid(i):
-    # md5 -> 128-bit uniform; uncorrelated with ts/row order, so within any row group the
-    # request_id values span ~the whole hex space (per-group min/max is unselective — the real
-    # hash-routed key, and the control that request_id alone cannot prune file OR row group).
+    # md5 -> 128-bit uniform, uncorrelated with ts/row order, so per-group min/max is unselective —
+    # the control that request_id alone (hash-routed key) prunes neither file nor row group.
     return hashlib.md5(f"req-{i}".encode()).hexdigest()
 
 

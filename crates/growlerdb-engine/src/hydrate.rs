@@ -1,8 +1,7 @@
 //! Hydration orchestration — the **PK lookup** path ([Flow 2]).
 //!
-//! Store-less: the index keeps no location data. Each key is checked for presence, then the source
-//! re-finds its authoritative row by a key-equality scan pruned to the matching Iceberg row groups
-//! by the row's own stored sort-key value ([`attach_prune_hints`]).
+//! Store-less: the index keeps no location data — each key is checked for presence, then the source
+//! re-finds its row by a key-equality scan pruned by the row's sort-key value ([`attach_prune_hints`]).
 //!
 //! [Flow 2]: ../../../okf/system/architecture.md
 
@@ -15,8 +14,7 @@ use growlerdb_source::IcebergReader;
 use crate::EngineError;
 
 /// Resolve `keys` into hydration requests. Presence is checked against the index (a live key term),
-/// so an unindexed key is a clean `KeyNotFound` (→ `NotFound`) before any Iceberg connect; a
-/// present key goes out to the source's pruned key-scan (prune hints attached later).
+/// so an unindexed key is a clean `KeyNotFound` (→ `NotFound`) before any Iceberg connect.
 pub fn resolve_requests(
     shard: &Shard,
     keys: &[CompositeKey],
@@ -30,16 +28,8 @@ pub fn resolve_requests(
         .collect()
 }
 
-/// Attach **sort-key prune hints** to `requests` (in place) — the values the source's pass-2 key
-/// predicate AND-s on so a **sorted** source table prunes files by manifest min/max on the sort key
-/// (the heal for an unpartitioned, hash-routed random identifier whose per-file min/max spans the
-/// whole space, TASK-339). The hint fields are the table's identity sort columns the shard also
-/// stores fast (excluding the key's own fields, already in the predicate); their values are the
-/// row's own fast-field values, aligned 1:1 with `keys`.
-///
-/// **Best-effort**: any failure (a catalog metadata read, a shard fast-field read) just leaves the
-/// hints empty — the predicate is a pure prune, correctness rests on the exact key re-verify. Costs
-/// one metadata load plus a fast-field read per key; skipped entirely on an unsorted table.
+/// Attach **sort-key prune hints** in place so a sorted source prunes files by manifest min/max on
+/// the sort key (heal for a hash-routed random id, TASK-339). Best-effort: failure leaves them empty.
 pub(crate) async fn attach_prune_hints(
     requests: &mut [HydrateRequest],
     shard: &Shard,
@@ -78,16 +68,11 @@ pub(crate) async fn attach_prune_hints(
     }
 }
 
-/// Hydrate `keys` to authoritative rows: presence-checked request resolution
-/// ([`resolve_requests`]) + a partition/row-group-scoped Iceberg key scan of the projected
-/// columns, pruned by the rows' own sort-key values ([`attach_prune_hints`]). Rows come back in
-/// `keys` order. Store-less — there is nothing to write back.
+/// Hydrate `keys` to authoritative rows: presence-checked resolution ([`resolve_requests`]) + a
+/// row-group-pruned Iceberg key scan ([`attach_prune_hints`]) in `keys` order (store-less, nothing
+/// to write back). Variant-table indexes route via the interim Trino lane ([D48]/[D49]).
 ///
-/// **Variant fork** ([D48](../../../okf/system/decisions/d48-variant-delivery.md)/[D49]): a
-/// variant-table index routes hydration through the interim Trino lane — released iceberg-rust
-/// can't scan a v3 variant table. The Trino lane re-finds rows by key predicate, returning the
-/// variant column(s) as JSON.
-///
+/// [D48]: ../../../okf/system/decisions/d48-variant-delivery.md
 /// [D49]: ../../../okf/system/decisions/d49-variant-iceberg-rust-routing.md
 pub async fn get_by_key(
     shard: &Shard,

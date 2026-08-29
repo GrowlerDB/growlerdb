@@ -54,9 +54,8 @@ pub enum BackupError {
 
 type Result<T> = std::result::Result<T, BackupError>;
 
-/// The manifest **format version** this binary writes and consumes. Format **1** is the
-/// current shard format (the file list carries the Tantivy segments beside `aux.redb`). A future
-/// incompatible layout bumps this; [`read_manifest`] refuses newer formats rather than mis-restore.
+/// The manifest **format version** this binary writes and consumes. Format **1** is the current shard
+/// format; [`read_manifest`] refuses newer formats rather than mis-restore.
 pub const MANIFEST_FORMAT: u32 = 1;
 
 /// Manifests written without a `format` field deserialize as format 1.

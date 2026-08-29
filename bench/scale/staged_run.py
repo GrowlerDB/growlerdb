@@ -108,9 +108,8 @@ def snapshot():
         "node_cpu_cores": prom("sum(rate(node_cpu_seconds_total{mode!=\"idle\"}[2m]))"),
         # index:source vs COMPRESSED parquet — kept for continuity, but config-dependent (see below).
         "index_source_ratio": prom("sum(growlerdb_index_bytes) / max(growlerdb_source_bytes)"),
-        # Per-component index bytes: term/postings/positions/fieldnorms (the inverted index), fast,
-        # store, other — sums to index_bytes, so a ratio change is attributable to the
-        # structure that moved (positions dropped, key terms shrunk, ...).
+        # Per-component index bytes (inverted index / fast / store / other) sum to index_bytes, so a
+        # ratio change is attributable to the structure that moved (positions dropped, terms shrunk).
         "index_bytes_component": prom_by("sum by (component) (growlerdb_index_bytes_component)", "component"),
         # Measurement context: a size sample between merges carries superseded docs (NoMergePolicy —
         # purged only at compaction), so record the delete debt + segment count alongside; a milestone

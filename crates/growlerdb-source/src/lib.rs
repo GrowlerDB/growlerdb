@@ -381,33 +381,18 @@ impl IcebergReader {
         ))
     }
 
-    /// The source table's **sort-order column names** usable for equality pruning — each
-    /// `default_sort_order` field with an **Identity** transform, resolved to its schema column
-    /// name. A sorted table's compaction lays rows out by these columns, so a hydration fallback can
-    /// AND the row's own sort-key values onto its key predicate and let Iceberg prune files by
-    /// manifest min/max — the heal for an unpartitioned, hash-routed random key. Non-identity
-    /// transforms (`day`/`bucket`/…) don't preserve equality, so they're excluded (a hint on one
-    /// could exclude the matching row). Empty for an unsorted table. One catalog metadata load.
+    /// The source table's **identity sort-order column names** usable for equality pruning — the
+    /// hint fields a hydration fallback ANDs onto its key predicate. Non-identity transforms excluded (could exclude the matching row); empty for an unsorted table. One catalog metadata load.
     pub async fn sort_field_names(&self, table: &str) -> Result<Vec<String>> {
-        // Read fresh each call — NOT cached: the sort order is declared by compaction (WRITE ORDERED
-        // BY) *after* a table is first hydrated (the cold-sync convergence sample), so a cache would
-        // pin the pre-compaction empty order and never prune. The extra `load_table` lands only on the
-        // hydrated path (already an Iceberg round-trip), so its cost is in the noise.
+        // Read fresh each call — NOT cached: compaction declares the sort order (WRITE ORDERED BY)
+        // *after* first hydration, so a cache would pin the pre-compaction empty order and never prune.
         let ident = TableIdent::from_strs(table.split('.'))?;
         let tbl = self.catalog.load_table(&ident).await?;
         Ok(sort_field_names_of(&tbl))
     }
 
-    /// **Store-less hydration** ([Flow 2]): resolve each request's composite key to its
-    /// authoritative row by a single **pruned key-equality scan** of the current snapshot.
-    ///
-    /// There is no stored `(file, position)` locator — every request re-finds its row by key.
-    /// The scan pushes an equality predicate over each key's partition + identifier fields (plus
-    /// its **sort-key prune hints** — the row's own fast `ts`, etc.) so a sorted/partitioned
-    /// source prunes by manifest min/max to the files that can hold the row. Correctness doesn't
-    /// depend on the predicate: every candidate is re-verified against the exact key, so a
-    /// superset (or an unfiltered read on any predicate/scan error) is always safe. Rows come
-    /// back in input order (genuinely-absent keys omitted).
+    /// **Store-less hydration** ([Flow 2]): resolve each request's composite key by a single **pruned
+    /// key-equality scan** of the current snapshot (no stored locator). Pruning (key fields + sort-key hints) is a pure speed-up — every candidate is re-verified against the exact key; rows come back in input order (absent keys omitted).
     ///
     /// [Flow 2]: ../../../okf/system/architecture.md
     pub async fn hydrate(
@@ -416,24 +401,18 @@ impl IcebergReader {
         requests: &[HydrateRequest],
         projection: &Projection,
     ) -> Result<HydrationResult> {
-        // Max bytes the key scan reads per hydration call (decoded, row-group-granular). A
-        // well-pruned plan is far under this (a sort/partition-clustered key → a file or two → every
-        // hit resolved); an *unprunable* key (large, unclustered, unpartitioned, so per-file min/max
-        // spans the space) is capped here instead of scanning the whole snapshot per hit — it serves
-        // what it cheaply finds and omits the rest (graceful, assemble_rows). 256 MiB keeps a
-        // worst-case scan to a couple of seconds even against few-but-huge (~1 GB) compacted files.
+        // Max bytes the key scan reads per hydration call (row-group-granular). A well-pruned plan is
+        // far under it; an unprunable key is capped here rather than scanning the whole snapshot per hit (serves what it finds, omits the rest). 256 MiB ⇒ ~a couple seconds worst-case on ~1 GB files.
         const FALLBACK_MAX_SCAN_BYTES: u64 = 256 * 1024 * 1024;
         if requests.is_empty() {
             return Ok(HydrationResult::default());
         }
-        // One catalog REST call to learn the current snapshot; the unpredicated plan is reused from
-        // the snapshot-pinned cache until the snapshot advances. The key scan below is
-        // per-request-predicated and stays uncached.
+        // One catalog REST call to learn the current snapshot; the unpredicated plan is reused from the
+        // snapshot-pinned cache until it advances. The key scan below is per-request-predicated, uncached.
         let (tbl, _tasks, plan_cache_hit) = self.load_and_plan(table).await?;
 
-        // Each request carries its key plus its **sort-key prune hints** — both go into the
-        // predicate so a sorted table prunes by manifest min/max on the sort key, not just the
-        // (unprunable) random identifier.
+        // Each request's key plus its **sort-key prune hints** both go into the predicate, so a sorted
+        // table prunes by manifest min/max on the sort key, not just the (unprunable) random identifier.
         let entries: Vec<(&CompositeKey, &[(String, Value)])> = requests
             .iter()
             .map(|req| (&req.key, req.prune.as_slice()))
@@ -506,11 +485,8 @@ impl IcebergReader {
         Ok((tbl, tasks, cache_hit))
     }
 
-    /// The table's **current-snapshot plan** — snapshot id, file-scan tasks, and the
-    /// `FileIO` to read them with — served from the same snapshot-pinned [`PlanCache`]
-    /// hydration uses (one catalog call; manifest reads only on snapshot advance), so the
-    /// steady-state fetch costs one REST call and a cache hit. Observing table metadata is
-    /// read-only — it imposes nothing on the source.
+    /// The table's **current-snapshot plan** — snapshot id, file-scan tasks, and the `FileIO` — from
+    /// the same snapshot-pinned [`PlanCache`] hydration uses (steady state: one REST call + a cache hit; manifest reads only on snapshot advance). Read-only on the source.
     pub async fn current_plan(&self, table: &str) -> Result<TablePlan> {
         let (tbl, tasks, cache_hit) = self.load_and_plan(table).await?;
         Ok(TablePlan {
@@ -940,11 +916,8 @@ struct ScanLoc {
     position: u64,
 }
 
-/// Stream the current snapshot (optionally pruned by `predicate`, reusing the already-loaded
-/// [`Table`]) and index **only** the `wanted` keys → `full row`, stopping once all are found —
-/// the store-less hydration read. Batches are processed one at a time and the result map is
-/// capped at the wanted set, so even an unfiltered scan (`predicate` = `None`, from a DATE key /
-/// type mismatch) is bounded.
+/// Stream the current snapshot (optionally `predicate`-pruned, reusing the loaded [`Table`]) and
+/// index **only** the `wanted` keys → `full row`, stopping once all are found — the store-less read. The result map is capped at the wanted set, so even an unfiltered (`None`) scan is bounded.
 ///
 /// Also returns the number of **duplicate PKs** seen (see [`index_batch`]). The early exit bounds
 /// detection too: a duplicate in a not-yet-scanned file goes unreported — detection is honest
@@ -965,14 +938,8 @@ async fn scan_stale_index(
     let file_io = tbl.file_io().clone();
     let mut index = HashMap::new();
     let mut duplicates = 0u64;
-    // Byte budget (not a file count): when the predicate can't prune — a random high-cardinality
-    // identifier, a secondary-sorted key whose per-file min/max spans the whole space, or a `None`
-    // plan — this scan would otherwise read the *whole current snapshot* on every hydration call
-    // (O(snapshot)/hit → 30s stalls post-compaction, TASK-339). A file *count* budget is useless when
-    // files are few-but-huge (a handful of ~1 GB parquet = the whole table), so bound the bytes
-    // *read*, checked at row-group granularity. A well-pruned plan is far under budget and resolves
-    // every key; an unpruned one returns what it cheaply found and omits the rest. Unresolved rows
-    // are omitted, not errored (assemble_rows) — graceful.
+    // Byte budget (not a file count): an unprunable predicate would otherwise read the whole snapshot
+    // per hydration call (→ 30s stalls post-compaction, TASK-339). Bytes *read* (row-group-granular), since few-but-huge files make a count budget useless; over budget, serve what was found and omit the rest.
     let mut bytes_scanned = 0u64;
     'files: for task in tasks.into_iter() {
         if bytes_scanned >= max_scan_bytes {
@@ -1009,17 +976,7 @@ async fn scan_stale_index(
 }
 
 /// Build an `OR`-of-`AND` equality predicate over each entry's key fields **plus its sort-key prune
-/// hints**, so a hydration fallback prunes the Iceberg scan to the files that can hold the row. The
-/// hint is the row's *own* sort-key value (e.g. `ts = <that row's ts>`); on a **sorted** source
-/// table it lets Iceberg prune by manifest min/max on the sort key — the heal for an unpartitioned,
-/// hash-routed random identifier whose per-file min/max spans the whole space.
-///
-/// Datums are typed to match the source schema. A **key** field that can't map safely (a
-/// value/column-type mismatch, or a timestamp that can't be an exact DATE) makes the whole
-/// predicate `None` so the caller reads unfiltered. A **hint** field that can't map is simply
-/// *skipped* (the row's key still constrains it). Neither can *exclude* a matching row — the
-/// fallback re-verifies each candidate against the exact key — so pruning is a pure speed-up, and
-/// `None` (read everything) is the safe default. Returns `None` for an empty entry set.
+/// hints** (the row's own sort value, e.g. `ts=…`) so a sorted source prunes by manifest min/max. Pure speed-up (each candidate is key-verified): an un-typeable key field ⇒ `None`/unfiltered, an un-typeable hint is skipped; `None` for empty entries.
 fn key_predicate(
     schema: &IcebergSchema,
     entries: &[(&CompositeKey, &[(String, Value)])],
@@ -1034,11 +991,8 @@ fn key_predicate(
                 None => eq,
             });
         };
-        // Every term only NARROWS a pure prune — each candidate row is re-verified against the exact
-        // composite key downstream — so an un-typeable term (key field OR hint) is SKIPPED, never
-        // fatal. Bailing to `None` on an un-typeable KEY field (the old `?`) discarded the whole
-        // predicate incl. the sort-key hint, so a table whose random key doesn't cleanly map to an
-        // Iceberg datum lost all pruning — the `ts` hint must survive that.
+        // Every term only NARROWS a pure prune (candidates are key-verified downstream), so an
+        // un-typeable term — key field OR hint — is SKIPPED, never fatal: an un-typeable key must not discard the whole predicate, or the `ts` hint's pruning is lost.
         for (name, value) in key
             .partition
             .iter()
@@ -1163,8 +1117,7 @@ fn value_to_datum(schema: &IcebergSchema, name: &str, value: &Value) -> Option<D
 }
 
 /// Index the rows of one `batch` whose composite key is in `wanted` → `enc(key) → (full row,
-/// [`ScanLoc`])`, for the store-less re-find. Filtering to `wanted` bounds the scan's memory.
-/// `start_row` is the batch's absolute offset within `data_file`.
+/// [`ScanLoc`])`, for the store-less re-find. `start_row` is the batch's absolute offset in `data_file`.
 ///
 /// **Duplicate-PK detection**: a second distinct source row for an already-matched key means the
 /// table holds >1 row for a "unique" key. Each extra row counts toward the returned total (→
@@ -1548,10 +1501,8 @@ mod tests {
 
     #[test]
     fn key_predicate_ands_a_sort_key_hint_onto_the_key() {
-        // The sort-key prune hint (`n = 42`, the row's own value) is AND-ed onto the key's own
-        // `id` equality — on a sorted table this prunes files by manifest min/max on `n`, which the
-        // random `id` alone can't. Correctness rests on the exact key re-verify, so the extra
-        // equality on the row's true value is always safe.
+        // The sort-key prune hint (`n = 42`, the row's own value) is AND-ed onto the key's `id`
+        // equality — pruning by manifest min/max on `n`, which the random `id` alone can't. Safe: the exact key re-verify carries correctness.
         let schema = ice_schema();
         let k = ckey(vec![], vec![("id", Value::Str("doc-10".into()))]);
         let hints = [("n".to_string(), Value::Int(42))];
@@ -1569,9 +1520,8 @@ mod tests {
 
     #[test]
     fn key_predicate_absent_hint_degrades_to_the_key_only_predicate() {
-        // No hint (or an unmappable one) leaves exactly the prior key-only predicate — a hint never
-        // widens or narrows incorrectly. An `n = <string>` hint can't type against the Long column,
-        // so it's skipped, and the result matches the no-hint predicate verbatim.
+        // An unmappable hint (`n = <string>` against the Long column) is skipped, leaving exactly the
+        // prior key-only predicate — a hint never widens or narrows incorrectly.
         let schema = ice_schema();
         let k = ckey(vec![], vec![("id", Value::Str("doc-10".into()))]);
         let key_only = key_predicate(&schema, &no_hint(&[&k]))
@@ -1653,10 +1603,8 @@ mod tests {
 
     #[test]
     fn key_predicate_skips_an_intraday_date_field_but_keeps_the_rest() {
-        // A DATE column can only be pruned by an exact UTC-midnight value; anything else could build
-        // a predicate that *excludes* the row, so that term is SKIPPED (value_to_datum → None). But
-        // skipping one term must not discard the whole predicate — the other key fields still prune
-        // (a pure superset filter, re-verified by the exact key), so `id="x"` survives.
+        // An intraday DATE value could build a predicate that *excludes* the row, so that term is
+        // SKIPPED (value_to_datum → None) without discarding the rest — the other key fields still prune, so `id="x"` survives.
         let schema = temporal_ice_schema();
         let not_midnight = 20_625 * MICROS_PER_DAY + 1;
         assert_eq!(
@@ -2193,23 +2141,8 @@ mod tests {
         );
     }
 
-    /// Reproduction (no cloud): the **sort-key hydration prune**, end to end. A local Iceberg table
-    /// with a declared sort order `[ts, request_id]` (identity — what Spark `WRITE ORDERED BY ts,
-    /// request_id` records) and 6 ts-disjoint data files, each a tight `ts` manifest min/max — the
-    /// post-compaction, ts-clustered layout the bench measured via Trino readable_metrics. The key
-    /// (`request_id`) is written to span the whole hex space in every file, so a request_id-only
-    /// predicate can never prune.
-    ///
-    /// Proves the mechanism: the hydration scan's [`key_predicate`], once the row's own `ts`
-    /// sort-key value is AND-ed on as a prune hint, makes `plan_files` prune to the **one** file that
-    /// can hold the row (vs the full 6-file scan on the key alone). Also proves the *dependency* on a
-    /// declared sort order: [`sort_field_names_of`] reads `default_sort_order()` — the sorted table
-    /// yields the `ts` hint field, its unsorted twin (same data, same clustering, no sort order)
-    /// yields none → no hint → full scan, which is the live symptom's cause.
-    ///
-    /// Generate the fixture first (any pyiceberg + pyarrow venv):
-    ///   `NS_WAREHOUSE=/tmp/prunewh python3 tests/fixtures/gen_prune_fixture.py`
-    /// Then: `cargo test -p growlerdb-source -- --ignored sort_key_hint_prunes_hydration_scan`
+    /// Reproduction (no cloud) of the **sort-key hydration prune**: over a local sorted table (6
+    /// ts-disjoint files, random request_id), AND-ing the row's own `ts` hint onto [`key_predicate`] prunes `plan_files` 6→1; the unsorted twin yields no `ts` hint → full scan (the live symptom).
     #[tokio::test]
     #[ignore = "requires the pyiceberg prune fixture at /tmp/prunewh (see gen_prune_fixture.py)"]
     async fn sort_key_hint_prunes_hydration_scan() {
@@ -2303,29 +2236,8 @@ mod tests {
         );
     }
 
-    /// Reproduction (no cloud) of the **live** sort-key prune path — over a real **REST catalog**
-    /// (Polaris), the one difference from [`sort_key_hint_prunes_hydration_scan`] (which loads via
-    /// `StaticTable` off a metadata file). Settles the two candidate live root causes:
-    ///
-    /// - **(A) RestCatalog gap** — does `iceberg-rust`'s `RestCatalog::load_table` surface
-    ///   `default_sort_order()` (identity `ts`/`request_id`) the same as `StaticTable`? If Polaris /
-    ///   the REST response didn't round-trip the sort order, [`sort_field_names`] returns `[]` live →
-    ///   no hint → full scan. Asserted directly below.
-    /// - **(B) Key typing** — for the real `request_id` (a string identifier) key, does
-    ///   [`key_predicate`] emit a predicate that still carries the `ts` term? Asserted via the
-    ///   predicate's rendered form.
-    ///
-    /// Then the end-to-end proof: `plan_files` over the REST-loaded [`Table`] prunes 6 → 1 once the
-    /// `ts` hint is AND-ed on (vs 6 on the key alone).
-    ///
-    /// Stand the fixture up first (Polaris + MinIO, no cloud):
-    ///   `docker compose -p prunerepro up -d minio createbuckets polaris-db polaris-bootstrap polaris`
-    ///   `POLARIS=http://localhost:8181 bash deploy/compose/setup-polaris.sh`  (creates the `growlerdb` catalog)
-    ///   then create `growlerdb.{sorted,unsorted}` THROUGH the REST catalog with a declared
-    ///   `sort_order=[ts, request_id]` (see the investigation's `gen_rest_prune.py`).
-    /// Run it in-network (the catalog vends the `minio:9000` endpoint):
-    ///   `GROWLERDB_CATALOG_URI=http://polaris:8181/api/catalog cargo test -p growlerdb-source \
-    ///      -- --ignored rest_catalog_sort_key_hint_prunes_hydration_scan`
+    /// The **live** [`sort_key_hint_prunes_hydration_scan`] over a real **REST catalog** (Polaris),
+    /// settling the two live root causes: (A) `RestCatalog::load_table` surfaces `default_sort_order()` like `StaticTable`; (B) the string `request_id` key still types with the `ts` term. Then `plan_files` prunes 6→1 (see `gen_rest_prune.py`).
     #[tokio::test]
     #[ignore = "requires a local Polaris+MinIO REST catalog with growlerdb.{sorted,unsorted} (see gen_rest_prune.py)"]
     async fn rest_catalog_sort_key_hint_prunes_hydration_scan() {
@@ -2404,12 +2316,8 @@ mod tests {
             "over REST too, AND-ing the row's ts sort-key value prunes to the one file that holds it"
         );
 
-        // The live differentiator: a topk hydrates a *batch* of keys at once → ONE OR-of-AND
-        // predicate. The ts hint only prunes when the batch's keys cluster in a narrow ts window.
-        // A clustered batch (both keys in file 3's ts range) still prunes to 1; a batch whose keys
-        // are spread across the whole timeline (one distinct key per file, each ts in a different
-        // file's range) matches EVERY file — the OR spans the space, so nothing prunes and the scan
-        // reads all 6 files. That is the live full-scan: a broad topk, not a narrow/recency one.
+        // The live differentiator: a topk's batch is ONE OR-of-AND, so the `ts` hint prunes only when
+        // its keys cluster in a narrow ts window (→ 1 file); a batch spread across the timeline matches EVERY file — the live 30s full-scan is a broad topk, not a recency one.
         let clustered_keys = [
             (
                 CompositeKey::new(
@@ -2457,30 +2365,8 @@ mod tests {
         );
     }
 
-    /// The decisive measurement the file-count sibling tests never took: does iceberg-rust prune at
-    /// the **row-group** level *within* one data file? This settles whether store-less `PREDICATE`
-    /// hydration can serve a **scattered** top-k (the real `topk_hydrated`: `sort response_time desc`
-    /// → 20 hits with `ts` spread across the whole timeline) in sub-second.
-    ///
-    /// The sibling REST test showed a scattered batch can't prune at the FILE level (`spread_scan`
-    /// = every file). But the compacted files are few-but-huge (many row groups each). This loads a
-    /// single 40-row-group file — `ts` strictly increasing (tight, disjoint per-row-group min/max),
-    /// `request_id` md5-uniform (spans the whole space in EVERY row group, so it prunes neither file
-    /// nor row group; iceberg-rust 0.10.1 has no bloom support) — and measures the bytes iceberg
-    /// actually fetches (`ScanMetrics::bytes_read`) for the real hydration read (mirrors
-    /// [`scan_stale_index`]) in three modes:
-    ///   * no filter          → whole file (the baseline);
-    ///   * request_id-only    → the CONTROL: an unselective key can't skip any row group → ~whole
-    ///                          file (this is also why the parquet request_id bloom is dead weight);
-    ///   * request_id AND ts  → the scattered batch's 5 keys, each with its `ts` prune hint.
-    ///
-    /// If the ts+key read fetches ~5/40 of the file → row-group pruning carries the scattered batch
-    /// → PREDICATE is sub-second with NO stored locators, NO remap, NO staleness. That is the whole
-    /// question behind dropping the fragile `(file,position)` locator.
-    ///
-    /// Generate first (any pyiceberg + pyarrow venv):
-    ///   `GDB_RG_WAREHOUSE=/tmp/rgwh python3 tests/fixtures/gen_rowgroup_prune.py`
-    /// Then: `cargo test -p growlerdb-source -- --ignored rowgroup_prune --nocapture`
+    /// Does iceberg-rust prune at the **row-group** level within one file? Over a single 40-row-group
+    /// file (increasing `ts`, md5-uniform `request_id`), measures `bytes_read` for a scattered 5-key top-k: `ts`+key reads ~5/40 while request_id-only reads ~all — so store-less `PREDICATE` hydration is sub-second with no locators (see `gen_rowgroup_prune.py`).
     #[tokio::test]
     #[ignore = "requires the pyiceberg row-group fixture at /tmp/rgwh (see gen_rowgroup_prune.py)"]
     async fn rowgroup_prune_reads_only_the_matching_row_groups() {
@@ -2612,13 +2498,8 @@ mod tests {
             "request_id+ts returns exactly the 5 targets — the ts prune term never drops a real hit"
         );
 
-        // CONTROL: `request_id` alone cannot skip a row group (its per-group min/max spans the whole
-        // space, and iceberg-rust 0.10.1 uses no parquet bloom filter), so it reads every row group's
-        // key column — but parquet's RowFilter still late-materializes, reading the fat `payload` only
-        // for the 5 matched rows, so `request_id`-only lands well below the unfiltered full read. The
-        // exact "touches all 40 row groups" control is asserted by the sibling
-        // `tests/rowgroup_bytes.rs` (which logs per-row-group reads); here we only need it as the
-        // no-ts baseline the `ts` hint must beat.
+        // CONTROL: `request_id` alone reads every row group's key column (unselective, no bloom) but
+        // RowFilter late-materializes the fat `payload` only for the 5 matches, so it lands below the unfiltered read — the no-ts baseline the `ts` hint must beat (`rowgroup_bytes.rs` asserts the exact 40-group touch).
         assert!(
             ctrl_bytes < full_bytes,
             "request_id-only ({ctrl_bytes}) reads less than the unfiltered full scan ({full_bytes}) \
@@ -2626,10 +2507,7 @@ mod tests {
         );
 
         // THE PROOF: AND-ing each hit's `ts` prunes to the 5 of 40 row groups the scattered keys fall
-        // in — even though the batch spans the whole timeline (file-level pruning was useless here).
-        // The residual is the ~5 row groups' data plus a fixed ~512 KiB footer/page-index prefetch,
-        // so the ratio is generous on this small file and shrinks toward ~5/40 at production 8 MiB
-        // row groups. The sibling `rowgroup_bytes.rs` proves the exact 5-group touch.
+        // in, though the batch spans the timeline (file-level pruning was useless). Ratio is generous here (+~512 KiB fixed footer prefetch), tightening toward ~5/40 at production 8 MiB row groups.
         assert!(
             (hit_bytes as f64) < 0.35 * full_bytes as f64,
             "scattered ts+key must read only the matching row groups ({hit_bytes} vs full \

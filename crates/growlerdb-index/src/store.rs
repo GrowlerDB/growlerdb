@@ -1,7 +1,5 @@
-//! `LocalIndexStore` — one Tantivy index per shard plus a small redb aux store, with an
-//! incremental, crash-safe commit. Crash safety: the Tantivy commit lands before the redb
-//! checkpoint txn; a crash re-applies the batch on resume, idempotent on the key
-//! (delete-then-add). Commits are idempotent on `batch_id`.
+//! `LocalIndexStore` — one Tantivy index per shard plus a small redb aux store, with an incremental,
+//! crash-safe commit: Tantivy commits before the redb checkpoint txn, so a crash replays the batch on resume, idempotent on the key (delete-then-add) and on `batch_id`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -408,13 +406,8 @@ impl LocalIndexStore {
         })
     }
 
-    /// Open a **parked window as a cross-node replica** (D53): unlike [`open_cold_shard`], which
-    /// reads the window's `aux.redb` from a **local** `aux_dir` (the primary keeps it beside the
-    /// marker), a replica on another node has no local copy — so this fetches the sidecar from
-    /// object storage (the [`aux_key`](ColdMarker::aux_key) `backup()` uploaded) into `scratch_dir`,
-    /// then opens the window read-through exactly like a cold open. The window is immutable, so the
-    /// fetched snapshot is consistent and never re-synced. Errors if the marker predates replica
-    /// support (no sidecar key — re-park to enable it).
+    /// Open a **parked window as a cross-node replica** (D53): a replica has no local `aux_dir`, so it
+    /// fetches the `aux.redb` sidecar ([`aux_key`](ColdMarker::aux_key)) into `scratch_dir` and opens read-through like a cold open. Errors if the marker predates replica support (no sidecar key).
     pub fn open_cold_replica(
         &self,
         index: &ResolvedIndex,
@@ -1531,15 +1524,8 @@ impl Shard {
         })
     }
 
-    /// **Commit** staged work: apply native-delete upserts/deletes to the single Tantivy
-    /// index and commit it (durable first), reload the live reader, then in one redb txn
-    /// advance the checkpoint/snapshot and record the batch ids. A crash between the two
-    /// commits re-applies the batch on resume — idempotent on the key (delete-then-add),
-    /// so exactly-once holds.
-    ///
-    /// Hydration is store-less (PREDICATE): the commit stores no source-location data —
-    /// only the Tantivy doc + key/checkpoint/batch bookkeeping — so this is the plain
-    /// two-phase Tantivy-then-redb ordering.
+    /// **Commit** staged work to the single Tantivy index (durable first), reload the reader, then in
+    /// one redb txn advance checkpoint/snapshot + batch ids. Store-less (no source-location data), so a crash replays the batch idempotently (delete-then-add) — plain two-phase Tantivy-then-redb.
     pub fn commit_staged(&self, staged: &[StagedRef]) -> Result<Snapshot> {
         let mut writer = self
             .writer
@@ -1611,9 +1597,7 @@ impl Shard {
                 .record(secs);
         };
         // Bound each Tantivy commit to `chunk` docs (`0` = one commit). The redb checkpoint still
-        // advances exactly once at the end, so the crash invariant holds: intermediate commits
-        // leave the index ahead of the un-advanced checkpoint, and a crash before the redb txn
-        // replays the whole batch idempotently.
+        // advances once at the end, so a crash before it replays the whole batch idempotently.
         let chunk = self.commit_chunk;
         macro_rules! flush_chunk {
             () => {{
@@ -1654,9 +1638,8 @@ impl Shard {
         // writer (last upsert on a chunk boundary) is a harmless no-op fsync.
         flush_chunk!();
 
-        // Build the per-segment ANN + completion sidecars over the just-committed segments.
-        // Idempotent + skipped when the index has no such field; run after the final flush so the
-        // reloaded searcher sees every new segment.
+        // Build the per-segment ANN + completion sidecars over the just-committed segments (idempotent,
+        // skipped when the index has no such field). After the final flush so the reloaded searcher sees every new segment.
         self.build_ann_sidecars()?;
         self.build_completion_sidecars()?;
 
@@ -1988,9 +1971,8 @@ impl Shard {
                 .map_err(|e| StoreError::Segment(e.into()))?;
             drop(writer); // release the lock so ingest can commit before the next bounded pass
             self.core.reload().map_err(StoreError::Segment)?;
-            // A merge produced a new segment id → build its ANN + completion sidecars. The
-            // merged-away segments' orphaned sidecars may linger (harmless — `sealed_segments` lists
-            // only current segments, so backup never carries an orphan).
+            // A merge produced a new segment id → build its ANN + completion sidecars. Merged-away
+            // orphans may linger (harmless — `sealed_segments` lists only current segments).
             self.build_ann_sidecars()?;
             self.build_completion_sidecars()?;
         }
@@ -2023,9 +2005,8 @@ impl Shard {
         self.schema.vector_spec(field)
     }
 
-    /// Whether this shard's index maps an Iceberg v3 **variant** column (D47) — the stats
-    /// pollers use this to skip a variant table, whose metadata released
-    /// iceberg-rust can't parse (D49).
+    /// Whether this shard's index maps an Iceberg v3 **variant** column (D47) — the stats pollers use
+    /// this to skip a variant table, whose metadata released iceberg-rust can't parse (D49).
     pub fn has_variant_fields(&self) -> bool {
         self.schema.has_variant_fields()
     }
@@ -2040,11 +2021,8 @@ impl Shard {
             .collect()
     }
 
-    /// Read each key's live-doc **fast values** for `fields` — the sort-key **prune hints** the
-    /// hydration fallback AND-s onto its pass-2 key predicate so a sorted source table prunes files
-    /// by manifest min/max (the heal for an otherwise-unprunable random key). Reuses the identity
-    /// layer's key→doc resolution; a key with no live doc, or a non-fast field, contributes nothing
-    /// (never an error). Returns a vec aligned 1:1 with `keys`. See [`SegmentReader::fast_values`].
+    /// Read each key's live-doc **fast values** for `fields` — the sort-key **prune hints** hydration
+    /// AND-s onto its predicate to prune a sorted source by manifest min/max. Aligned 1:1 with `keys`; see [`SegmentReader::fast_values`].
     pub fn prune_values(
         &self,
         keys: &[CompositeKey],
@@ -2093,19 +2071,14 @@ impl Shard {
         &self.index_dir
     }
 
-    /// The shard's full on-disk index footprint in bytes — every component of
-    /// [`index_size_breakdown`](Self::index_size_breakdown) summed, i.e. the Tantivy files **plus**
-    /// the sibling `aux.redb`. Used by the serving loop to emit `growlerdb_index_bytes`; computed
-    /// from the breakdown so the total gauge and the per-component gauge always reconcile.
+    /// The shard's full on-disk index footprint in bytes — [`index_size_breakdown`](Self::index_size_breakdown)
+    /// summed (Tantivy files plus the sibling `aux.redb`), so the `growlerdb_index_bytes` total and per-component gauges reconcile.
     pub fn index_size_bytes(&self) -> u64 {
         self.index_size_breakdown().total()
     }
 
-    /// On-disk index size broken into components, so the
-    /// index:source ratio can be attributed to the structure that drives it — term dictionaries vs
-    /// postings vs positions vs fieldnorms vs the **fast-field cache** vs the **doc store** —
-    /// rather than a lump total. Tantivy files are classified by extension; the sibling `aux.redb`
-    /// counts under `other`. Best-effort — unreadable entries count as 0.
+    /// On-disk index size broken into components (term/postings/positions/fieldnorms/fast/store) so the
+    /// index:source ratio is attributable, not a lump. Tantivy files by extension; the sibling `aux.redb` counts under `other`. Best-effort — unreadable entries count as 0.
     pub fn index_size_breakdown(&self) -> IndexSizeBreakdown {
         let mut b = IndexSizeBreakdown::default();
         if let Ok(entries) = std::fs::read_dir(&self.index_dir) {
@@ -2167,9 +2140,8 @@ impl Shard {
             .map_err(StoreError::Segment)
     }
 
-    /// Build the per-segment completion sidecars (`<uuid>.cmp`) for the `suggest` fields. Idempotent
-    /// and a no-op when no field opts in. Must run with the live reader reloaded onto the target
-    /// commit, so it sees every new segment — same discipline as [`build_ann_sidecars`](Self::build_ann_sidecars).
+    /// Build the per-segment completion sidecars (`<uuid>.cmp`) for the `suggest` fields (idempotent,
+    /// no-op when none opt in). Must run with the reader reloaded onto the target commit — same discipline as [`build_ann_sidecars`](Self::build_ann_sidecars).
     fn build_completion_sidecars(&self) -> Result<()> {
         if !self.schema.has_suggest_fields() {
             return Ok(());
@@ -2192,9 +2164,8 @@ impl Shard {
                     .into_iter()
                     .filter(|f| self.index_dir.join(f).exists())
                     .collect();
-                // The `.ann`/`.cmp` sidecars aren't listed by `list_files` but belong to this
-                // segment — register them so backup/restore carries them (content-stable, dedupes
-                // like the rest).
+                // The `.ann`/`.cmp` sidecars aren't listed by `list_files` but belong to this segment
+                // — register them so backup/restore carries them (content-stable, dedupes like the rest).
                 for suffix in ["ann", "cmp"] {
                     let side = PathBuf::from(format!("{}.{suffix}", meta.id().uuid_string()));
                     if self.index_dir.join(&side).exists() {
@@ -2598,9 +2569,8 @@ impl Shard {
         prefix: &str,
         limit: usize,
     ) -> Result<Vec<(String, u64)>> {
-        // Completion fast path: for a `suggest`-flagged field with a short prefix, answer from the
-        // precomputed per-segment top-K table (no term-dict scan). `None` = the sidecar can't answer
-        // (cold, over-`P`/empty prefix, or partial coverage) → the live seek below, unchanged.
+        // Completion fast path: for a `suggest` field with a short prefix, answer from the precomputed
+        // per-segment top-K table. `None` (cold, over-`P`/empty prefix, partial coverage) → the live seek below.
         if self.schema.is_suggest_field(field) {
             if let Some(ranked) = self.core.suggest_prefix_sidecar(field, prefix, limit)? {
                 return Ok(ranked);
@@ -2901,9 +2871,8 @@ mod sort_tests {
 
     #[test]
     fn prune_values_reads_each_key_live_fast_value_typed_and_aligned() {
-        // The sort-key prune-hint read: resolve each key's live doc and read its `rank` fast field,
-        // typed to the field's LONG mapping. A key with no live doc contributes an empty row; a
-        // non-fast/unknown field is skipped — never an error (the predicate is a pure prune).
+        // The sort-key prune-hint read: resolve each key's live doc and read its `rank` fast field
+        // typed LONG. No live doc → empty row; a non-fast/unknown field is skipped — never an error.
         let tmp = tempfile::tempdir().unwrap();
         let shard = ranked_shard(tmp.path());
         let k = |id: &str| CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]);

@@ -1,20 +1,5 @@
-//! Definitive row-group-touch measurement for store-less (`PREDICATE`) hydration.
-//!
-//! The lib.rs `rowgroup_prune` unit test shows the byte *ratio* iceberg fetches for a scattered
-//! top-k. This test answers the sharper question — **exactly which row groups does iceberg read?**
-//! — by wrapping the iceberg `FileIO` in a logging `Storage` that records every byte range the
-//! parquet reader fetches, then bucketing those ranges into the file's row groups.
-//!
-//! It settles whether iceberg-rust 0.10.1 skips the non-matching row groups of a single large file
-//! for a SCATTERED OR-of-AND predicate (`(rid=R1 AND ts=T1) OR … OR (rid=R5 AND ts=T5)`, five keys
-//! whose `ts` land in five widely-separated row groups — the real `topk_hydrated` shape). If it
-//! touches ~5 of the 40 row groups → row-group pruning carries the scattered batch → `PREDICATE`
-//! hydration needs no stored `(file,position)` locators. The control (`request_id` alone, no `ts`)
-//! touches every row group — iceberg has no bloom-filter support, so an unselective key can't skip.
-//!
-//! Generate the fixture first (any pyiceberg + pyarrow venv):
-//!   `GDB_RG_WAREHOUSE=/tmp/rgwh python3 tests/fixtures/gen_rowgroup_prune.py`
-//! Then: `cargo test -p growlerdb-source --test rowgroup_bytes -- --ignored --nocapture`
+//! Definitive row-group-touch measurement for store-less (`PREDICATE`) hydration: a logging `FileIO`
+//! records exactly which row groups iceberg reads for a scattered OR-of-AND top-k. `ts`+key prunes to ~5 of 40; `request_id` alone touches all 40 (iceberg 0.10.1 has no bloom). Needs the `gen_rowgroup_prune.py` fixture.
 
 use std::collections::BTreeSet;
 use std::ops::Range;
@@ -152,11 +137,8 @@ fn row_group_spans(data_path: &str) -> Vec<Range<u64>> {
         .collect()
 }
 
-/// Which row groups the logged data-file **data-page** reads overlap. Excludes the parquet
-/// footer/page-index prefetch — a single large read of the file tail that reaches EOF (past the
-/// last row group's data into the footer); it overlaps the tail groups' byte spans without
-/// decoding their data, so counting it would mask the real pruning. Data-page reads always end at
-/// or before the last row group's data end.
+/// Which row groups the logged data-file **data-page** reads overlap. Excludes the footer/page-index
+/// prefetch (a tail read past the last row group's data), which would otherwise mask the real pruning.
 fn touched_row_groups(data_file_suffix: &str, spans: &[Range<u64>]) -> BTreeSet<usize> {
     let data_end = spans.last().map(|s| s.end).unwrap_or(0);
     let log = read_log().lock().unwrap();
@@ -302,10 +284,8 @@ async fn scattered_topk_touches_only_matching_row_groups() {
         ctrl_groups.len(),
     );
 
-    // THE PROOF: a scattered 5-key OR-of-AND reads the DATA of EXACTLY the 5 row groups its `ts`
-    // hints fall in — of 40. Row-group pruning fully carries the scattered top-k the file-level
-    // plan can't prune. (The extra ~512 KB in `hit_bytes` is the fixed footer/page-index prefetch,
-    // independent of key count — negligible against production 8 MiB row groups.)
+    // THE PROOF: a scattered 5-key OR-of-AND reads the DATA of EXACTLY its 5 matching row groups, of
+    // 40 — row-group pruning fully carries the top-k the file-level plan can't. (~512 KB fixed footer prefetch aside.)
     let want_groups: BTreeSet<usize> = TARGETS
         .iter()
         .map(|(_, ts)| (*ts as usize) / 1_000) // ts == row index; 1000 rows/group
@@ -316,9 +296,8 @@ async fn scattered_topk_touches_only_matching_row_groups() {
         "scattered ts+key must read exactly the 5 matching row groups' data, of {}",
         spans.len()
     );
-    // CONTROL: `request_id` alone touches EVERY row group — an unselective key prunes nothing, and
-    // iceberg-rust 0.10.1 has no parquet bloom-filter support (so the corpus request_id bloom is
-    // dead weight for this reader; only column min/max — i.e. the `ts` sort key — prunes).
+    // CONTROL: `request_id` alone touches EVERY row group — unselective, and iceberg-rust 0.10.1 has
+    // no parquet bloom support, so only column min/max (the `ts` sort key) prunes.
     assert_eq!(
         ctrl_groups.len(),
         spans.len(),

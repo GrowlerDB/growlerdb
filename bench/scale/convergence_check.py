@@ -1,25 +1,6 @@
 #!/usr/bin/env python3
-"""Source->index convergence check: assert an engine matches the Iceberg source.
-
-At steady state (after ingest drains) the engine's live doc count must equal the source's DISTINCT-id
-count. Two engines, one target:
-
-  * ``--engine growlerdb`` (default) — index live-doc count == source DISTINCT id, plus a
-    sample-integrity check: a page of real hits each hydrates from Iceberg (the key->row invariant).
-  * ``--engine opensearch`` — OpenSearch ``_count`` == source DISTINCT id. OpenSearch dedups by
-    ``_id`` (= request_id, set by Data Prepper ``identifier_columns``), so the count IS the distinct
-    target and there is no separate hydrate step to sample.
-
-Why DISTINCT, not raw rows: both engines collapse duplicate PKs last-write-wins, so raw source rows
-exceed doc count whenever the source has duplicate ids (e.g. an OOM-restarted generator re-emitting
-its id sequence). Comparing to the raw ``total-records`` metric is therefore *dup-fooled*; the
-authoritative target is ``COUNT(DISTINCT request_id)`` over the same Iceberg table.
-
-Source count path (in priority order): ``TRINO_URL`` (the Trino REST API, reachable in-cluster — this
-is what lets the check run inside a driver Job with no kubectl); else ``kubectl exec deploy/trino``
-(a kubectl-capable host); else ``TRINO=0`` falls back to the raw ``growlerdb_source_records`` metric
-(clearly flagged dup-UNSAFE). Exits non-zero on failure so it gates the run's phases.
-"""
+"""Source->index convergence gate (--engine growlerdb|opensearch): an engine's live doc count must
+equal COUNT(DISTINCT request_id) over the Iceberg source (dup-safe). See comparison-plan.md."""
 import argparse
 import json
 import os
@@ -61,11 +42,8 @@ def prom(expr):
 # --- source DISTINCT-id count -------------------------------------------------------------------
 
 def _trino_http_scalar(sql):
-    """Run one SQL statement through the Trino REST API and return its single scalar cell.
-
-    POST /v1/statement returns a chain of pages linked by nextUri; follow them, collecting `data`
-    rows, until the chain ends (or errors). In-cluster this needs no kubectl — the whole point, so
-    a driver Job can compute the distinct count itself."""
+    """One SQL statement via the Trino REST API, returning its single scalar cell. POST /v1/statement
+    returns pages linked by nextUri; follow them until the chain ends. In-cluster: no kubectl needed."""
     req = urllib.request.Request(
         f"{TRINO_URL}/v1/statement", data=sql.encode(),
         headers={"X-Trino-User": "bench", "X-Trino-Catalog": "iceberg", "X-Trino-Schema": "growlerdb"})
@@ -124,9 +102,8 @@ def opensearch_count():
 
 
 def growlerdb_sample(n):
-    """Take a page of real hits and hydrate each coordinate — the key->row invariant. Keyed on
-    coordinates, not an id term query: request_id is key-only (not searchable), so `id:"..."` can't
-    sample. Net loss is caught by count convergence; this checks that live hits still hydrate."""
+    """Hydrate each coordinate of a page of real hits — the key->row invariant. Keyed on coordinates,
+    not an id term query (request_id is key-only); net loss is already caught by count convergence."""
     hits = growlerdb_search("*", limit=n).get("hits", [])
     coords = [h["coordinates"] for h in hits if "coordinates" in h]
     checked, mismatch = 0, 0

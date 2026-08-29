@@ -64,11 +64,8 @@ RANGE_METRICS = {
     "index_bytes": "sum(growlerdb_index_bytes)",
     "cold_cache_hit_ratio": "sum(rate(growlerdb_cold_cache_hits_total[5m]))/clamp_min(sum(rate(growlerdb_cold_cache_lookups_total[5m])),1)",
     "node_cpu_cores": 'sum(rate(node_cpu_seconds_total{mode!="idle"}[2m]))',
-    # Ingest-bottleneck attribution (per-component). Cluster-summed series above can't localize a
-    # ceiling; these split it by shard-pod and pull the (already-scraped) connector metrics so a run
-    # can say WHAT limits ingest — connector vs node commit-path vs commit cadence vs shard-skew vs IO.
-    # Query split: retrieval (index only) vs hydration (Iceberg read) — the _search-adapter forces
-    # hydration on every query, so these two histograms separate engine-core cost from object-store cost.
+    # Ingest-bottleneck attribution (per shard-pod + connector) to localize the ingest ceiling, plus
+    # the query retrieval-vs-hydration split — engine-core cost vs object-store (Iceberg) cost.
     "query_retrieval_p95": "histogram_quantile(0.95,sum(rate(growlerdb_query_retrieval_duration_seconds_bucket[2m]))by(le))",
     "index_rate_dps_by_pod": "sum by (pod)(rate(growlerdb_ingested_docs_total[2m]))",
     "commit_rate_by_pod": "sum by (pod)(rate(growlerdb_write_duration_seconds_count[2m]))",
@@ -94,16 +91,14 @@ LOG_STREAMS = {
     "gateway": '{app="growlerdb-gateway"}',
 }
 
-# Avg uncompressed corpus row = the ONLY valid index:source denominator (never the compressed parquet
-# intermediary). Measured by corpus_stats.py `raw_row_bytes` (compact NDJSON, corpus_export.py format).
-# See synthetic-corpus.md. Override per run with --raw-row-bytes if the schema/generator changes.
+# Avg uncompressed corpus row — the ONLY valid index:source denominator (never compressed parquet).
+# corpus_stats.py `raw_row_bytes`; see synthetic-corpus.md. Override with --raw-row-bytes per schema.
 RAW_ROW_BYTES = 540.0
 
 
 def index_source_ratio_raw(index_bytes, rows, raw_row_bytes=RAW_ROW_BYTES):
     """index:source on the RAW uncompressed basis: index_bytes / (rows * raw_row_bytes). Returns
-    (ratio, raw_source_bytes), or (None, None) if inputs are missing/zero. A ratio < 1 means the
-    index is smaller than the original corpus."""
+    (ratio, raw_source_bytes), or (None, None) on missing/zero inputs; ratio < 1 = index < corpus."""
     if not index_bytes or not rows or not raw_row_bytes:
         return None, None
     raw_source_bytes = rows * raw_row_bytes

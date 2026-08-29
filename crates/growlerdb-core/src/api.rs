@@ -134,11 +134,8 @@ impl CommitBatch {
     }
 }
 
-/// One hydration request: a key to re-fetch plus its **sort-key prune hints** — the row's own
-/// fast-field values (e.g. `ts = <that row's ts>`) AND-ed onto the key predicate so Iceberg prunes
-/// to the row groups that can hold the row on a **sort-clustered** source table. The hints are a
-/// pure speed-up: every candidate is still re-verified against the exact key, so an empty `prune`
-/// (or one that can't be typed) only widens the scan, never drops a row. In-memory only.
+/// One hydration request: a key to re-fetch plus its **sort-key prune hints** — the row's own fast
+/// values AND-ed onto the key predicate to prune the scan. Pure speed-up (every candidate is key-verified); in-memory only.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HydrateRequest {
     /// The composite key to hydrate.

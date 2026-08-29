@@ -991,9 +991,8 @@ pub struct FieldMapping {
     /// hit, so a page renders without hydration. Default false.
     #[serde(default)]
     pub cached: bool,
-    /// **Suggest** field — build a per-segment prefix-completion sidecar so `/v1/suggest`
-    /// answers from a precomputed top-K-by-frequency table instead of a live term-dict scan.
-    /// Only KEYWORD/TEXT fields are eligible; ignored (no sidecar) on other types. Default false.
+    /// **Suggest** field — build a per-segment prefix-completion sidecar so `/v1/suggest` answers
+    /// from a precomputed top-K table. KEYWORD/TEXT only (ignored, no sidecar, otherwise). Default false.
     #[serde(default)]
     pub suggest: bool,
     /// **Sensitive** field (eventually catalog/Polaris-marked) — hard-blocked

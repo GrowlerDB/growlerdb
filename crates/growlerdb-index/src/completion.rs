@@ -1,8 +1,5 @@
 //! Per-segment **prefix-completion sidecar** — a precomputed top-K-by-doc-frequency table for the
-//! `suggest`-flagged fields, so `/v1/suggest` answers a short prefix from a lookup instead of a live
-//! term-dictionary scan + hashmap + sort per request. Mirrors the [`SegmentAnn`](crate::vector)
-//! sidecar's lifecycle: one `<segment-uuid>.cmp` file per segment, content-stable per segment id,
-//! written after commit and rebuilt when segments compact.
+//! `suggest` fields, so `/v1/suggest` answers a short prefix from a `<segment-uuid>.cmp` lookup instead of a live term-dict scan. Lifecycle mirrors [`SegmentAnn`](crate::vector): written after commit, rebuilt on compaction.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -79,9 +76,8 @@ impl SegmentCompletion {
     }
 }
 
-/// Accumulates a single field's [`FieldCompletion`] from a term stream. Each term feeds all of its
-/// byte-prefixes up to [`COMPLETION_PREFIX_DEPTH`]; each prefix keeps only its top-[`COMPLETION_TOP_K`]
-/// by the suggest contract. Byte-prefixes (not char) match the FST's byte-sorted `starts_with`.
+/// Accumulates a single field's [`FieldCompletion`] from a term stream: each term feeds its
+/// byte-prefixes up to [`COMPLETION_PREFIX_DEPTH`], each keeping only its top-[`COMPLETION_TOP_K`]. Byte-prefixes (not char) match the FST's byte-sorted `starts_with`.
 #[derive(Default)]
 pub struct CompletionBuilder {
     prefixes: HashMap<Vec<u8>, Vec<(String, u64)>>,

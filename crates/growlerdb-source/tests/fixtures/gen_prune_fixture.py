@@ -1,18 +1,7 @@
 #!/usr/bin/env python3
-"""Generate a LOCAL Iceberg fixture that reproduces the hydration sort-key prune path.
-
-Two tables in a local FS warehouse (no cloud):
-  ns.sorted    — declared sort order [ts identity, request_id identity] (what Spark
-                 `WRITE ORDERED BY ts, request_id` records: sort-orders + default-sort-order-id)
-  ns.unsorted  — same data + same per-file ts clustering, NO declared sort order
-
-Both hold the SAME rows written in N ts-disjoint appends (one data file each), so per-file
-manifest ts min/max is a tight, non-overlapping range — exactly the post-compaction layout the
-bench measured via Trino readable_metrics. `request_id` (the key) is written to span the whole
-hex space in every file, so a request_id-only predicate cannot prune; only the ts hint can.
-
-The Rust test (growlerdb-source, ignored) loads each table via StaticTable and asserts the
-file-count delta. Env NS_WAREHOUSE picks the output dir (default /tmp/prunewh).
+"""LOCAL Iceberg fixture for the hydration sort-key prune path: ns.sorted ([ts, request_id] identity sort
+order) vs ns.unsorted over the same N ts-disjoint files; only the ts hint prunes (request_id spans the
+hex space in every file). The Rust test asserts the file-count delta. Env NS_WAREHOUSE (default /tmp/prunewh).
 """
 import os
 import shutil

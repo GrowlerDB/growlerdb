@@ -1,26 +1,8 @@
 #!/usr/bin/env python3
-"""Neutral, open-loop, multi-engine query driver for the GrowlerDB-vs-OpenSearch comparison.
-
-Fires the SAME query set (`queries.comparison.json`) at each engine through an identical HTTP path so
-neither side gets a home-field harness. Complements `harness.py query` (GrowlerDB-only, closed-loop)
-and `compare_trino.py` (the Iceberg-scan baseline — Trino predicates aren't `_search`-shaped, so it
-stays there).
-
-Two things it does that the fairness charter requires (see bench/scale/comparison-plan.md):
-
-  * Open-loop arrival rate. Requests are issued at a fixed schedule regardless of when responses come
-    back, so a slow server shows up as queue wait in the latency — the closed-loop `harness.py query`
-    hides that (coordinated omission). We report BOTH `latency` (scheduled->response, the honest tail)
-    and `service_time` (send->response).
-  * Per-query-type reporting + a QPS saturation sweep (QPS vs p50/p99, to find the knee).
-
-Engines share the OpenSearch `_search` body for lexical queries. The two documented asymmetries are
-handled explicitly: `retrieval` runs in the value-fetch modes each engine actually uses, and
-`autocomplete` hits GrowlerDB's native /v1/suggest vs OpenSearch's completion suggester.
-
-Endpoints (env): GROWLERDB_OS_URL (default http://localhost:8081), OPENSEARCH_URL
-(default http://localhost:9200), GROWLERDB_TOKEN (optional bearer for the gateway).
-"""
+"""Neutral open-loop multi-engine query driver: fires the SAME query set (queries.comparison.json) at
+each engine over an identical HTTP path (open-loop, so a slow server shows as latency, not hidden by
+coordinated omission). Two disclosed asymmetries (retrieval, autocomplete) are routed explicitly in
+request_for. See bench/scale/comparison-plan.md."""
 
 import argparse
 import concurrent.futures
@@ -38,10 +20,8 @@ from harness import Workload, _percentiles  # reuse workload loading + percentil
 GROWLERDB_OS_URL = os.environ.get("GROWLERDB_OS_URL", "http://localhost:8081")
 OPENSEARCH_URL = os.environ.get("OPENSEARCH_URL", "http://localhost:9200")
 GROWLERDB_TOKEN = os.environ.get("GROWLERDB_TOKEN", "")
-# Per-request ceiling: a query slower than this counts as a timeout error, not an open-ended wait. A
-# pathologically slow engine (e.g. hydration over an uncompacted table, ~30s/query) must yield
-# high-latency/timeout numbers, never hang the sweep by draining an unbounded backlog of in-flight
-# requests — the first live shakedown lost the whole GrowlerDB phase to exactly that hang.
+# Per-request ceiling: a slower query counts as a timeout error, not an open-ended wait — a
+# pathologically slow engine must yield high-latency numbers, never hang the sweep on a backlog.
 REQUEST_TIMEOUT_S = float(os.environ.get("REQUEST_TIMEOUT_S", "30"))
 
 # Lexical kinds share the OpenSearch _search body verbatim across engines.
@@ -57,9 +37,8 @@ def _engines(names):
 
 
 def request_for(engine, cfg, index, q):
-    """(url, body) for this engine+query, or None to skip (query n/a for the engine).
-
-    The single source of the two disclosed asymmetries — keep them here, not scattered."""
+    """(url, body) for this engine+query — the single source of the two disclosed asymmetries
+    (retrieval, autocomplete); keep them here, not scattered."""
     kind = q.get("kind", "count")
     if kind in LEXICAL_KINDS:
         return f"{cfg['base']}/{index}/_search", q["body"]
@@ -96,9 +75,8 @@ def _post_json(url, body, token):
 
 
 def _resolve_value(cfg, index, field):
-    """Fetch a live value for `field` via the shared _search path — a real value must exist (seeds vary
-    per pod, so it can't be hardcoded). Uses the same neutral endpoint as the benchmark itself. Returns
-    None if it can't be read; the caller then skips that query for this engine (never fails the run)."""
+    """Fetch a live value for `field` via the shared _search path (seeds vary per pod, so it can't be
+    hardcoded). Returns None if unreadable; the caller then skips that query for this engine."""
     body = {"size": 1, "_source": [field], "query": {"match_all": {}}}
     try:
         payload = _post_json(f"{cfg['base']}/{index}/_search", body, cfg["token"])
@@ -116,10 +94,8 @@ def _resolve_value(cfg, index, field):
 
 
 def _resolve_queries(engine, cfg, index, queries):
-    """Per-engine copy of the query set with any `resolve` placeholder filled from a live value. A query
-    with `"resolve": {"field": F}` has its `term.F` value replaced by a real F fetched from the engine
-    (e.g. the point-lookup on trace_id). Because the run is sequential (one engine per phase), each
-    engine resolves its own valid id — a point-lookup's latency doesn't depend on which existing id."""
+    """Per-engine copy of the query set with any `resolve` placeholder (`term.F`) filled from a live
+    value fetched off the engine (e.g. point-lookup on trace_id); the run is sequential, so each resolves its own."""
     out = []
     for q in queries:
         r = q.get("resolve")
@@ -169,10 +145,8 @@ def run_open_loop(engine, cfg, index, plan, target_qps, duration, max_workers):
         futures.append(ex.submit(one, q, next_t))
         next_t += interval
 
-    # Bounded drain: after the arrival window, wait at most one request-timeout for in-flight requests
-    # to resolve, then stop. Requests still queued behind a slow engine are cancelled and counted as
-    # dropped rather than drained — this caps a level at duration + REQUEST_TIMEOUT_S instead of the
-    # hours a full backlog of slow queries would take.
+    # Bounded drain: after the arrival window wait at most one request-timeout for in-flight requests,
+    # then cancel the rest as dropped — caps a level at duration + REQUEST_TIMEOUT_S, not a full backlog.
     pending = set(futures)
     dropped = 0
     try:

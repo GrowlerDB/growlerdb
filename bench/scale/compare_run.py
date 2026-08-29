@@ -1,23 +1,8 @@
 #!/usr/bin/env python3
-"""Orchestrate the GrowlerDB-vs-OpenSearch comparison run end to end.
-
-Sequential-on-full-cluster (fairness charter): generate the corpus once into the shared Iceberg table,
-benchmark GrowlerDB on the whole cluster, tear it down, then benchmark OpenSearch (Data Prepper CDC)
-on the same table. Each phase drives already-validated tools; this script only sequences them, waits
-on the right conditions, and captures artifacts.
-
-Load generation runs IN-CLUSTER as Jobs, never over `kubectl port-forward` — the shake-out proved a
-port-forwarded driver reports garbage (500ms/25s, timeouts) because the localhost tunnel, not the
-engine, is the bottleneck. Each driver phase renders `deploy/k8s/comparison/driver-job.template.yaml`,
-applies it, waits for completion, and reads the machine-readable result back from the pod's stdout
-(a marker-delimited JSON). The one non-load exception is the final `capture` step (a read-only
-Prometheus scrape of already-recorded time series), which stays host-side.
-
-Assumes the cluster is provisioned (deploy/iac `terraform apply`) and the GrowlerDB stack is up
-(deploy/k8s/scale-up.sh, which also starts the generator, deps, observability, and Trino). Run
-`--plan` first to print the ordered steps + commands without touching anything; `--self-check` renders
-the driver Job offline and validates it.
-"""
+"""Orchestrate the GrowlerDB-vs-OpenSearch comparison run: sequential-on-full-cluster (fairness charter)
+— generate the corpus once, benchmark GrowlerDB, tear down, benchmark OpenSearch on the same table.
+Load drivers run IN-CLUSTER as Jobs (port-forwarded drivers report garbage); `--plan`/`--self-check`
+run nothing. Assumes the cluster is up (scale-up.sh). See bench/scale/comparison-plan.md."""
 
 import argparse
 import json
@@ -37,16 +22,11 @@ MAINTENANCE_CRONJOB = "growlerdb-iceberg-maintenance"  # name in maintenance.yam
 ROW_BYTES = 400  # ~uncompressed bytes/row (see synthetic-corpus.md) — target_rows = target_gb*1e9/ROW_BYTES
 SCALES = {"smoke": 1, "shakedown": 10, "full": 50}  # GB; smoke = fast full-flow validation
 
-# Phase timeouts (seconds) scale with data volume — shakedown values are tight, full-run values allow
-# for the ~50 GB reality. The load matters most for two slow steps: the Data Prepper CDC *initial load*
-# (conv_os_wait — the run's single slowest phase, hours at 50 GB, not minutes) and the Spark compaction
-# rewrite (compact — the CronJob's own 1800s cap is fine hourly but too tight for a 50 GB rewrite, so
-# compact_source raises the one-shot Job's deadline to this). conv_*_wait is the in-Job
-# convergence_check --wait-timeout; the Job itself gets +CONV_MARGIN for clone/pip/count/final-poll.
+# Phase timeouts (s) scale with data volume; the slow steps at 50 GB are the CDC initial load (hours)
+# and Spark compaction. conv_*_wait is the in-Job convergence --wait-timeout; the Job gets +CONV_MARGIN.
 CONV_MARGIN = 900
-# conv_gdb_wait now covers a from-COLD connector backfill of the settled table (phase_gdb_coldsync),
-# not just a tail catch-up — sized like conv_os_wait (both are full initial syncs at the connector's
-# ~20k docs/s ceiling: 50 GB ≈ 125M rows ≈ ~1.7h, so 3h at full leaves margin).
+# conv_gdb_wait covers a from-COLD connector backfill of the settled table (phase_gdb_coldsync), sized
+# like conv_os_wait — both are full initial syncs at the connector's ~20k docs/s ceiling (~1.7h at 50 GB).
 SCALE_TIMEOUTS = {
     "smoke":     {"conv_gdb_wait": 600,   "conv_os_wait": 900,   "compact": 900,  "query_job": 1200, "fresh_job": 900},
     "shakedown": {"conv_gdb_wait": 2400,  "conv_os_wait": 3000,  "compact": 1800, "query_job": 3600, "fresh_job": 1800},
@@ -140,11 +120,8 @@ def _extract_result(logs, local_out):
 
 def run_driver_job(name, core_cmd, pip="pyyaml", result_path=None, local_out=None,
                    timeout_s=3600, check=True):
-    """Render + apply an in-cluster driver Job, wait for it, and collect results from its logs.
-
-    `core_cmd` is the single-line bench/scale command (already includes `--out {result_path}` when it
-    writes a report). When result_path/local_out are given, the pod cats that file between markers so
-    the orchestrator can persist it host-side (capture.py folds these). Returns True on Job success."""
+    """Render + apply an in-cluster driver Job, wait for it, collect results from its logs. When
+    result_path/local_out are given the pod cats that file between markers for host-side persistence."""
     if result_path:
         driver_cmd = (f"{core_cmd} ; rc=$? ; echo '{RESULT_BEGIN}' ; "
                       f"cat {result_path} 2>/dev/null ; echo '{RESULT_END}' ; exit $rc")
@@ -190,11 +167,8 @@ def trino_count(sql):
 
 
 def wait_source_rows(target_rows, timeout_s=6 * 3600):
-    """Block until the Iceberg source has >= target_rows, then scale the generator to 0.
-
-    Counts rows straight from the source table via Trino (`kubectl exec`, no port-forward). Raw
-    COUNT(*) — the generator is the only writer and this only gates corpus SIZE, so duplicate ids from
-    a restart don't matter here (convergence_check uses DISTINCT for the correctness gate)."""
+    """Block until the Iceberg source has >= target_rows (raw COUNT(*) via Trino), then scale the
+    generator to 0. Dups don't matter here — this only gates corpus SIZE (convergence uses DISTINCT)."""
     if DRY:
         print(f"  # poll `SELECT COUNT(*) FROM {TABLE}` (kubectl exec trino) until >= {target_rows:,}, "
               f"then scale the generator to 0")
@@ -220,18 +194,13 @@ def phase_generate(target_rows):
 # --- GrowlerDB cold-sync (ingest axis) ----------------------------------------------------------
 
 def phase_gdb_coldsync(scale):
-    """Deploy the GrowlerDB serving stack AGAINST the settled table and measure the cold full sync —
-    the symmetric ingest counterpart to phase_transition+conv-os for OpenSearch. Precondition: only the
-    `deps` stage is up (deps + generator + observability); GrowlerDB nodes/connector are NOT yet
-    deployed, so generation ran with nothing ingesting it. Here nodes come up EMPTY (DEFINE_ONLY) and
-    the streaming connector performs the entire backfill on the metric-emitting write path."""
+    """Deploy the GrowlerDB serving stack against the settled table and measure the cold full sync (the
+    ingest counterpart to OpenSearch's CDC load). Nodes come up EMPTY (DEFINE_ONLY); the connector backfills."""
     log("PHASE gdb_coldsync — bring up GrowlerDB on the settled table, measure the cold full sync")
     t = SCALE_TIMEOUTS[scale]
     sh(f"STAGE=serving DEFINE_ONLY=true NAMESPACE={NS} {REPO}/deploy/k8s/scale-up.sh")
-    # Time to convergence (index docs == source DISTINCT id) IS the ingest headline: docs/s =
-    # source_count / elapsed. capture(started_epoch=start) scopes the metrics window to exactly the
-    # backfill so index_rate_dps + the per-shard/connector attribution series (capture.py) localize the
-    # ~20k docs/s ceiling. Querying mid-load would be unfair, so this gate blocks the query phase.
+    # Time to convergence (index docs == source DISTINCT id) IS the ingest headline (docs/s =
+    # source_count / elapsed); started_epoch scopes the metrics window to the backfill. Gates the query phase.
     start = time.time()
     run_driver_job("conv-gdb",
                    f"ID_COL={ID_COL} TABLE={TABLE} INDEX={INDEX} python convergence_check.py "
@@ -245,11 +214,8 @@ def phase_gdb_coldsync(scale):
 # --- GrowlerDB query phase ----------------------------------------------------------------------
 
 def compact_source(scale, deadline):
-    """Compact the non-windowed source so the Trino/Iceberg baseline reads a fair layout (not thousands
-    of tiny streaming files). scale-up.sh doesn't deploy the maintenance CronJob (it's in the streaming
-    bundle, not observability), so apply it here, trigger a one-shot Job from it, raise that Job's
-    deadline to the scale budget (the CronJob's jobTemplate caps at 1800s — fine hourly, too tight for a
-    50 GB rewrite), then wait."""
+    """Compact the source so the Trino/Iceberg baseline reads a fair layout (not thousands of tiny
+    streaming files): apply the maintenance CronJob, trigger a one-shot Job, raise its deadline, wait."""
     log(f"compact — deploy the maintenance CronJob + trigger a one-shot compaction (deadline {deadline}s)")
     job = f"compact-{scale}"
     kubectl(["apply", "-f", str(MAINTENANCE_YAML)], check=False)
@@ -264,10 +230,8 @@ def compact_source(scale, deadline):
 def phase_growlerdb(scale):
     log("PHASE growlerdb — compact, warmup, query matrix, freshness, capture")
     t = SCALE_TIMEOUTS[scale]
-    # Convergence already ran + passed in phase_gdb_coldsync (the ingest axis). Here: compact the
-    # source (declares WRITE ORDERED BY ts → ts-clustered files) for a fair Trino baseline AND so the
-    # store-less PREDICATE hydration scan prunes by ts row-group stats, then WARM the index before
-    # measuring. Hydration is store-less (no per-row locators), so there is nothing to heal or settle.
+    # Convergence already passed in phase_gdb_coldsync. Here: compact (ts-clustered files) for a fair
+    # Trino baseline AND so the store-less PREDICATE hydration prunes by ts stats, then warm the index.
     compact_source(scale, t["compact"])
     # Warmup (best-effort): a short query pass so plan-cache / object-store warmup happens OFF the
     # clock. Results discarded (no result_path).
@@ -280,9 +244,8 @@ def phase_growlerdb(scale):
         "python compare_query.py run http_logs --engines growlerdb "
         "--qps 200 --duration 120 --sweep 50,100,200,400,800 --sweep-duration 30 --out /tmp/out.json",
         result_path="/tmp/out.json", local_out=f"{HERE}/gdb-query.json", timeout_s=t["query_job"])
-    # Trino/Iceberg-scan baseline (fairness axis 1): GrowlerDB search+hydrate vs Iceberg table scan
-    # over the SAME table, post-compaction. Best-effort (check=False) — an informative baseline, not a
-    # gate. Predicates target the non-windowed http_logs schema (status/user_id/path; no day pruning).
+    # Trino/Iceberg-scan baseline (fairness axis 1): search+hydrate vs table scan over the same
+    # post-compaction table. Best-effort (check=False) — an informative baseline, not a gate.
     run_driver_job(
         "trino-gdb",
         f"OUT=/tmp/out.json INDEX={INDEX} TRINO_TABLE={TABLE} python compare_trino.py",
@@ -306,10 +269,8 @@ def phase_transition():
 def phase_opensearch(scale):
     log("PHASE opensearch — wait for CDC initial load convergence, query matrix, freshness, capture")
     t = SCALE_TIMEOUTS[scale]
-    # convergence gate: OpenSearch _count == source DISTINCT id (Data Prepper CDC initial load complete).
-    # The initial load of the whole table is the run's slowest step (hours at 50 GB) — conv_os_wait is
-    # sized for it so a slow-but-healthy CDC load doesn't false-fail the gate. Querying mid-load is unfair.
-    # Timed + captured like phase_gdb_coldsync so the two ingest axes are measured identically.
+    # Convergence gate: OpenSearch _count == source DISTINCT id (CDC initial load complete). That load
+    # is the run's slowest step (hours at 50 GB); timed + captured like phase_gdb_coldsync for symmetry.
     start = time.time()
     run_driver_job("conv-os",
                    f"ID_COL={ID_COL} TABLE={TABLE} INDEX={INDEX} python convergence_check.py "
@@ -334,14 +295,8 @@ def phase_opensearch(scale):
 # --- capture (host-side; read-only Prometheus pull) ---------------------------------------------
 
 def capture(scale, phase_name, query_json="", freshness_json="", params=None, started_epoch=None):
-    """Fold a phase's result JSONs + a Prometheus metrics window into a run dir + ledger row.
-
-    Runs host-side (the run dir must be local for the bucket push). PROM_URL must be reachable — a
-    read-only scrape of already-recorded time series, NOT a load path, so a port-forward is fine here
-    (unlike the drivers). Set PROM_URL, or port-forward `svc/prometheus 9090:9090` before this.
-    query/freshness JSONs are optional (an ingest-only phase like the cold sync has neither);
-    `started_epoch` scopes the metrics window to exactly the phase (e.g. the cold-sync backfill), and
-    `params` records headline scalars (e.g. cold_sync_secs) into the audit + ledger."""
+    """Fold a phase's result JSONs + a Prometheus metrics window into a run dir + ledger row. Host-side
+    (read-only PROM_URL scrape, port-forward OK); `started_epoch` scopes the window, `params` records scalars."""
     a = [f"--purpose 'comparison {scale} — {phase_name} phase'"]
     if query_json:
         a.append(f"--comparison {query_json}")

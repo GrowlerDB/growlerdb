@@ -373,11 +373,8 @@ async fn cold_park_evicts_bulk_keeps_aux_and_serves_read_through() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn open_cold_replica_serves_a_parked_window_from_a_bare_node() {
-    // D53 replica read-through: a replica on ANOTHER node has no local copy of the window. It opens
-    // the parked window by fetching the aux.redb sidecar from shared object storage (the key the
-    // park recorded), then reads the index through the object store — no rebuild from source, no
-    // primary→replica copy stream. This is what makes a re-placed/replica holder answer in seconds
-    // instead of rebuilding.
+    // D53 replica read-through: a replica on ANOTHER node fetches the parked window's aux.redb sidecar
+    // from shared object storage and reads the index through the object store — no rebuild, no primary→replica copy stream, so it answers in seconds.
     let idx = docs_index();
     let w: i64 = 1_700_000_000_000;
     let id = ShardId::window("docs", w);

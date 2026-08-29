@@ -1,20 +1,7 @@
 #!/usr/bin/env python3
-"""End-to-end ingest-freshness harness for the GrowlerDB-vs-OpenSearch comparison.
-
-Freshness = wall-clock from a source Iceberg commit until a query returns that row, measured on ONE
-clock for every engine (fairness charter, bench/scale/comparison-plan.md). This is the honest metric:
-GrowlerDB's lag is its streaming-connector commit path; OpenSearch's stacks Iceberg snapshot cadence
-+ Data Prepper `polling_interval` + the index `refresh_interval`. We do NOT compare OpenSearch's
-internal refresh against GrowlerDB's end-to-end — both are timed the same way here.
-
-Method: append a sentinel row (unique `user_id`) to the shared Iceberg table via the workload's own
-corpus write path, note the commit instant, then poll every engine CONCURRENTLY (so a slow engine
-doesn't delay when we start watching another) until a `term` query on that user_id returns it.
-Repeat for a distribution. request_id is key-only (not searchable), so we key on user_id.
-
-Endpoints (env): GROWLERDB_OS_URL, OPENSEARCH_URL, GROWLERDB_TOKEN. Catalog/S3 come from the same
-POLARIS_*/AWS_* vars the corpus loaders use (see workloads/http_logs/corpus.py).
-"""
+"""End-to-end ingest-freshness harness: wall-clock from a source Iceberg commit until a query returns
+that row, on ONE clock for every engine (fairness charter). Appends a sentinel row (unique user_id;
+request_id is key-only), then polls each engine concurrently until it appears. See comparison-plan.md."""
 
 import argparse
 import json
@@ -71,9 +58,8 @@ def _poll_until_visible(name, cfg, index, token, commit_t, timeout, interval, ou
 
 
 def _write_sentinel(mod, table, model, rng, token):
-    """Append a single sentinel row (user_id=token) through the corpus write path. Returns the
-    commit instant (perf_counter after tbl.append returns = the Iceberg snapshot is committed).
-    `model`/`rng` are built once in cmd_run (the corpus row recipe: mod._rows(n, model, rng))."""
+    """Append a single sentinel row (user_id=token) through the corpus write path, returning the commit
+    instant (perf_counter after tbl.append = the snapshot is committed). ts is stamped NOW for the lag basis."""
     import pyarrow as pa
 
     schema = mod._schema()
@@ -142,11 +128,8 @@ def cmd_run(args):
 
 
 def cmd_selfcheck(args):
-    """No network/Iceberg: validate poll-query construction, lag math, and the corpus write path.
-
-    The corpus-row assertions exercise exactly what _write_sentinel builds (mod._build_model + _rows +
-    the sentinel override), so a corpus refactor that renames those helpers fails here offline instead
-    of only at runtime in-cluster."""
+    """No network/Iceberg: validate poll-query construction, lag math, and the corpus write path. The
+    corpus-row assertions mirror _write_sentinel, so a helper rename fails here offline, not in-cluster."""
     import random
 
     wl = Workload(args.workload)

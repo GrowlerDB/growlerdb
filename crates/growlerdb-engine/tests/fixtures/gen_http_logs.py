@@ -1,6 +1,5 @@
-"""Create growlerdb.http_logs through the live Polaris REST catalog (MinIO S3), with
-SEVERAL data files (multiple appends) and a `request_id` string identifier key, partition
-empty — the http_logs key shape. Mirrors connector #4's backfill source table.
+"""Create growlerdb.http_logs via the live Polaris REST catalog (MinIO S3): several data files, a
+`request_id` string identifier key, empty partition — connector #4's backfill source-table shape.
 
 Usage:
   gen_http_logs.py            # drop+create, N appends

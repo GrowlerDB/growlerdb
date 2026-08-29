@@ -1,24 +1,6 @@
-"""Realistic synthetic HTTP access-log corpus for the scale/comparison benchmark.
-
-One module, two entry points: `load()` bulk-writes to Iceberg (local smoke / `harness.py load`),
-and `stream()` is the in-cluster generator the k8s generator Deployment mounts and runs — so the row
-recipe lives in exactly one place, and parallel generator pods (distinct `BENCH_SEED` per pod) shard
-the corpus to reach the target size.
-
-The distributions are deliberately skewed to match real web traffic — uniform-random data would give
-flat term dictionaries, no IP-CIDR selectivity, and no partition-pruning signal, none of which reflect
-a real search workload. The full model + rationale + parameters are documented in
-`bench/scale/synthetic-corpus.md`; keep the two in sync. In brief:
-
-  - Zipf popularity for URL paths, client IPs, and user activity (heavy hitters + long tail).
-  - Status/method/size conditioned on path kind (static vs api vs page); ~87% 200 overall.
-  - Lognormal response sizes + latencies; 5xx run slower; 304s carry size 0.
-  - Diurnal (hour-of-day) + weekly (weekday vs weekend) timestamp density over `SPAN_DAYS`.
-
-Everything is seeded (`BENCH_SEED`) → byte-reproducible. Env: POLARIS_URI, POLARIS_CATALOG,
-POLARIS_CREDENTIAL, AWS_ENDPOINT_URL_S3, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY; BENCH_ROWS (rows at
-fraction=1.0), BENCH_BATCH (write batch), BENCH_SEED (RNG seed), SPAN_DAYS (timeline span).
-"""
+"""Realistic synthetic HTTP access-log corpus (scale/comparison bench): `load()` bulk-writes to Iceberg,
+`stream()` is the in-cluster k8s generator; seeded → byte-reproducible. Full model, parameters, and env
+vars are in bench/scale/synthetic-corpus.md."""
 
 import os
 import random
@@ -30,16 +12,8 @@ try:  # generator telemetry (uncompressed-corpus bytes) — provided by the seed
 except ImportError:
     _genmetrics = None
 
-# Parquet bloom filters so a GrowlerDB-vs-Iceberg comparison is FAIR (TASK-343): this table is
-# UNPARTITIONED (hash-routed by request_id), so a bloom filter on the equality columns is Iceberg's
-# only row-group skip — without it every `request_id=`/`status=`/`trace_id=` predicate full-scans.
-# `trace_id` (the searchable X-Request-ID) carries a bloom so the point-lookup pair measures
-# GrowlerDB's indexed lookup against Iceberg at its best (bloom-skipped scan), not a full scan.
-# Parquet row-group size is the UNIT OF I/O for a hydration point read: fetching one row reads its
-# whole row group. Iceberg's default (128 MB) means a 20-row top-k pulls ~20×128 MB from object
-# storage and saturates a single MinIO (→ 30s). An 8 MB row group makes a point read ~8 MB, so a
-# scattered top-k is ~20×8 MB ≈ 160 MB — cheap. Applies to BOTH ingest and Spark compaction (the
-# rewrite honors the table's write properties). Keep files ~128 MB (≈16 row groups each).
+# FAIR GrowlerDB-vs-Iceberg comparison (TASK-343): UNPARTITIONED table → blooms (request_id/trace_id/status) are Iceberg's only row-group skip.
+# 8 MB row groups keep a hydration point-read cheap (~8 MB vs the 128 MB default that saturates MinIO). See synthetic-corpus.md.
 WRITE_PROPERTIES = {
     "write.parquet.bloom-filter-enabled.column.request_id": "true",
     "write.parquet.bloom-filter-enabled.column.trace_id": "true",
@@ -290,14 +264,8 @@ def load(table="growlerdb.http_logs", fraction=1.0):
 
 
 def stream(table="growlerdb.http_logs", batch=10, sleep_s=5):
-    """Append `batch` rows every `sleep_s` forever — the in-cluster streaming generator (the k8s
-    generator Deployment mounts this module and calls it). Creates the table if absent (never drops)
-    and prints `created <table>` once, the readiness gate scale-up.sh waits on.
-
-    Restart-safe: the row stream is seeded with per-process entropy, so a container restart appends
-    FRESH rows rather than replaying the same seeded `request_id` sequence (which duplicated ~8% of
-    keys on the first live 3-generator run and broke count convergence). The model vocabulary stays
-    seeded by BENCH_SEED so each pod keeps a stable, disjoint term dictionary across restarts."""
+    """Append `batch` rows every `sleep_s` forever — the in-cluster generator; creates the table if absent and prints `created <table>` once (scale-up.sh readiness gate).
+    Restart-safe: the row stream mixes per-process entropy so a restart appends FRESH rows, not a replayed request_id sequence (which broke count convergence); vocabulary stays BENCH_SEED-seeded."""
     import pyarrow as pa
     from pyiceberg.schema import Schema
     from pyiceberg.types import LongType, NestedField, StringType
@@ -327,15 +295,8 @@ def stream(table="growlerdb.http_logs", batch=10, sleep_s=5):
 
 
 def _append_retry(catalog, table, schema, make_cols, attempts=12):
-    """Append one batch with optimistic-commit retry, returning the committed columns. Parallel
-    generator pods (GENERATORS>1) all commit to the one Iceberg branch, so pyiceberg raises
-    CommitFailedException when another pod committed first — expected contention, not an error. Reload
-    the latest snapshot each attempt and back off with jitter so colliding pods desynchronize.
-
-    Each attempt appends a FRESH batch (`make_cols()` → new random request_ids): Iceberg's append is
-    NOT idempotent under retry, so re-committing the same batch after a false-negative commit error
-    duplicates rows (~1% dup keys observed at scale). A failed attempt's data files are orphaned, not
-    committed, and reclaimed by the maintenance job's remove_orphan_files — never double-counted."""
+    """Append one batch with optimistic-commit retry: parallel pods share one Iceberg branch, so CommitFailedException is expected contention (reload snapshot, back off with jitter, retry).
+    Each attempt makes a FRESH batch — Iceberg append is NOT idempotent, so re-committing after a false-negative commit error would duplicate rows; orphaned data files are reclaimed by remove_orphan_files."""
     import pyarrow as pa
     from pyiceberg.exceptions import CommitFailedException
 

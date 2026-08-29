@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
-"""GrowlerDB vs Iceberg-alone (Trino) query comparison — the scan baseline (fairness charter axis 1).
-
-Runs equivalent predicates as GrowlerDB search(+hydrate) and as Trino SQL over the SAME Iceberg table,
-times both, and reports side-by-side latency — where the index wins (selective predicates) vs where a
-scan is comparable. Honest framing: search + PK-hydrate vs table-scan, not a general OLAP benchmark.
-
-Endpoints: GrowlerDB via GATEWAY_URL (its native /v1/search + /v1/keys:get). Trino via TRINO_URL (the
-Trino REST API — this is what lets the comparison run inside a driver Job with no kubectl), else
-`kubectl exec deploy/trino` on a kubectl-capable host.
-"""
+"""GrowlerDB search(+hydrate) vs Iceberg-scan (Trino) over the SAME table — the scan baseline
+(fairness charter axis 1; see comparison-plan.md). Endpoints: GrowlerDB via GATEWAY_URL; Trino via
+TRINO_URL (REST, in-cluster) else `kubectl exec deploy/trino`."""
 import json
 import os
 import subprocess
@@ -23,13 +16,9 @@ INDEX = os.environ.get("INDEX", "http_logs")
 TABLE = os.environ.get("TRINO_TABLE", INDEX)  # Iceberg table under iceberg.growlerdb
 ITERS = int(os.environ.get("ITERS", "5"))
 
-# FAIRNESS (TASK-343): run this AFTER a compaction pass — on the uncompacted streaming layout (thousands
-# of tiny files) Trino pays a pathological planning/open cost unrelated to the engine (compare_run's
-# GrowlerDB phase compacts first). http_logs is UNPARTITIONED (hash-routed by request_id) with parquet
-# bloom filters on request_id + status (corpus WRITE_PROPERTIES), so equality on those *can* skip row
-# groups; everything else is a full scan — the honest worst case for a scan. The unique-key bloom
-# (request_id) is Iceberg's best skip but can't be paired: request_id is KEY-ONLY in GrowlerDB (not a
-# searchable term), so there is no GrowlerDB point-lookup-by-id query to put opposite it (disclosed).
+# FAIRNESS (TASK-343): run AFTER compaction (compare_run compacts first) — the uncompacted layout
+# makes Trino pay a planning cost unrelated to the engine. http_logs is UNPARTITIONED with parquet
+# blooms on request_id/trace_id/status, so equality on those can skip row groups; else full scan.
 
 # (label, GrowlerDB native query, Trino SQL) — equivalent predicates over iceberg.growlerdb.<TABLE>.
 # main() prepends a point-lookup on a LIVE-resolved trace_id (a real value, since seeds vary per pod).

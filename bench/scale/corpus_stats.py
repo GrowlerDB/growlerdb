@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-"""Distribution-validation report for the synthetic http_logs corpus.
-
-Generates a sample from the workload's own `corpus.py` recipe and reports the distribution shape, so
-the realism claims in `bench/scale/synthetic-corpus.md` can be checked (and regressions caught). Runs
-offline — no cluster, no Iceberg. Usage: `python corpus_stats.py [--rows N] [--seed S] [--json out]`.
+"""Distribution-validation report for the synthetic http_logs corpus — samples the workload's corpus.py
+recipe offline to check the realism claims in bench/scale/synthetic-corpus.md.
+Usage: python corpus_stats.py [--rows N] [--seed S] [--json out].
 """
 
 import argparse
@@ -52,9 +50,8 @@ def main():
         if first_row is None:
             first_row = {k: cols[k][0] for k in cols}
         for i in range(b):
-            # Match corpus_export.py byte-for-byte (compact separators + trailing newline) so
-            # `raw_row_bytes` is the true uncompressed corpus row size, the ONLY valid "source" basis
-            # for index:source ratios — never the compressed parquet intermediary. See synthetic-corpus.md.
+            # Match corpus_export.py byte-for-byte (compact separators + newline) so `raw_row_bytes` is
+            # the true uncompressed row size — the ONLY valid index:source basis, never the parquet size.
             raw_bytes += len(json.dumps({k: cols[k][i] for k in cols}, separators=(",", ":")).encode()) + 1
             st = cols["status"][i]; p = cols["path"][i]; sz = cols["response_size"][i]; rt = cols["response_time_ms"][i]
             status_c[st] += 1; method_c[cols["method"][i]] += 1; path_c[p] += 1

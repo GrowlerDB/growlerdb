@@ -548,9 +548,8 @@ impl Engine {
         })
     }
 
-    /// Search `index`, returning ranked coordinates + scores. When `hydrate` is
-    /// set, also fetch the authoritative rows (projected by `projection`) from
-    /// Iceberg by key.
+    /// Search `index`, returning ranked coordinates + scores. When `hydrate` is set, also fetch the
+    /// authoritative rows (projected by `projection`) from Iceberg by key.
     pub async fn search(
         &self,
         index: &str,

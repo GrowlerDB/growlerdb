@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
-"""Export the synthetic http_logs corpus as gzipped NDJSON shards — the portable "raw logs" artifact
-archived to object storage alongside the Iceberg tables.
-
-Reuses the workload's `corpus.py` recipe, so the NDJSON is the same corpus the Iceberg load/stream
-produces. One shard per seed (matching the k8s parallel-generator sharding: each generator pod owns a
-distinct BENCH_SEED / disjoint data). Deterministic: same seeds -> byte-identical shards.
+"""Export the synthetic http_logs corpus as gzipped NDJSON shards (portable "raw logs" artifact) via the
+workload's own corpus.py recipe — one shard per seed, deterministic. See bench/scale/synthetic-corpus.md.
 
 Usage: python corpus_export.py --rows-per-shard N --seeds 42,43,44 --out-dir ./ndjson [--span-days 7]
 """
