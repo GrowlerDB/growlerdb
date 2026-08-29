@@ -26,7 +26,7 @@ A summary of GrowlerDB's security design:
 - **AuthZ.** Control-plane RBAC at the Engine (role → operation scopes). **Data-plane authorization
   is delegated to the lakehouse**: `_source` is hydrated from Iceberg via PK lookup, governed by
   the catalog (Polaris) at the **table** level (via a deployment service credential, not per-caller).
-  Full per-caller, row-level Polaris policy enforcement is post-GA — see [GA criteria](docs/ga-criteria.md).
+  Full per-caller, row-level Polaris policy enforcement is not implemented.
 - **Tenant isolation.** When an index sets `tenant_field`, every read has a mandatory, non-scoring
   `tenant_field = <verified claim>` filter ANDed in; no query structure (`OR`, nested bool) can
   widen past it, and a missing claim is denied. The same scope is enforced across search, hydration
