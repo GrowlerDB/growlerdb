@@ -32,3 +32,6 @@ bytes = "1"
 tempfile.workspace = true
 async-trait = "0.1"
 typetag = "0.2"
+# `time` (dev-only) lets the latency-injecting FileIO in the hydration-concurrency probe `sleep` per
+# read, so `buffered` file reads actually overlap in wall-clock.
+tokio = { version = "1", features = ["time"] }

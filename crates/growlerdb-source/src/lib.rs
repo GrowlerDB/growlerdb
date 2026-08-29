@@ -401,64 +401,42 @@ impl IcebergReader {
         requests: &[HydrateRequest],
         projection: &Projection,
     ) -> Result<HydrationResult> {
-        // Max bytes the key scan reads per hydration call (row-group-granular). A well-pruned plan is
-        // far under it; an unprunable key is capped here rather than scanning the whole snapshot per hit (serves what it finds, omits the rest). 256 MiB ⇒ ~a couple seconds worst-case on ~1 GB files.
-        const FALLBACK_MAX_SCAN_BYTES: u64 = 256 * 1024 * 1024;
         if requests.is_empty() {
             return Ok(HydrationResult::default());
         }
         // One catalog REST call to learn the current snapshot; the unpredicated plan is reused from the
         // snapshot-pinned cache until it advances. The key scan below is per-request-predicated, uncached.
         let (tbl, _tasks, plan_cache_hit) = self.load_and_plan(table).await?;
+        scan_and_assemble(&tbl, plan_cache_hit, requests, projection).await
+    }
 
-        // Each request's key plus its **sort-key prune hints** both go into the predicate, so a sorted
-        // table prunes by manifest min/max on the sort key, not just the (unprunable) random identifier.
-        let entries: Vec<(&CompositeKey, &[(String, Value)])> = requests
-            .iter()
-            .map(|req| (&req.key, req.prune.as_slice()))
-            .collect();
-        let predicate = key_predicate(tbl.metadata().current_schema(), &entries);
-        let (partition_names, identifier_names) = key_field_names(&requests[0].key);
-        // Only the wanted keys are indexed and the scan streams with early-exit, so even the
-        // unfiltered (`None` predicate) path is bounded in memory and cost.
-        let wanted: HashSet<Vec<u8>> = entries.iter().map(|(k, _)| k.encode()).collect();
-        let (index, duplicate_pks) = match scan_stale_index(
-            &tbl,
-            predicate.clone(),
-            &wanted,
-            &partition_names,
-            &identifier_names,
-            FALLBACK_MAX_SCAN_BYTES,
-        )
-        .await
-        {
-            Ok(found) => found,
-            // A pruned scan that errored (e.g. an unexpected type binding) must never turn a
-            // present row into a miss — fall back to the unfiltered scan (same file budget).
-            Err(_) if predicate.is_some() => {
-                scan_stale_index(
-                    &tbl,
-                    None,
-                    &wanted,
-                    &partition_names,
-                    &identifier_names,
-                    FALLBACK_MAX_SCAN_BYTES,
-                )
-                .await?
+    /// As [`hydrate`](Self::hydrate), but resolves each request's **sort-key prune hints from the same
+    /// table load** the scan uses — `make_hints` maps the table's identity sort-field names to per-request
+    /// prune values (the shard-side lookup). Folds away the separate `sort_field_names` catalog
+    /// round-trip a caller would otherwise pay before `hydrate` (one `load_table` per hydration, not two).
+    pub async fn hydrate_pruned<F>(
+        &self,
+        table: &str,
+        requests: &mut [HydrateRequest],
+        projection: &Projection,
+        make_hints: F,
+    ) -> Result<HydrationResult>
+    where
+        F: FnOnce(&[String]) -> Vec<Vec<(String, Value)>>,
+    {
+        if requests.is_empty() {
+            return Ok(HydrationResult::default());
+        }
+        let (tbl, _tasks, plan_cache_hit) = self.load_and_plan(table).await?;
+        // Sort-order names come free off the already-loaded table (was a second `load_table` in the
+        // caller's `sort_field_names`). Empty order ⇒ no hints, and the scan reads unpruned as before.
+        let sort_names = sort_field_names_of(&tbl);
+        if !sort_names.is_empty() {
+            for (req, v) in requests.iter_mut().zip(make_hints(&sort_names)) {
+                req.prune = v;
             }
-            Err(e) => return Err(e),
-        };
-        let resolved: Vec<Option<BTreeMap<String, Value>>> = requests
-            .iter()
-            .map(|req| index.get(&req.key.encode()).map(|(full, _)| full.clone()))
-            .collect();
-
-        let rows = assemble_rows(requests, resolved, projection);
-        Ok(HydrationResult {
-            rows,
-            plan_cache_hit: Some(plan_cache_hit),
-            duplicate_pks,
-        })
+        }
+        scan_and_assemble(&tbl, plan_cache_hit, requests, projection).await
     }
 
     /// `load_table` + the snapshot-pinned plan for its current snapshot (cached per
@@ -793,25 +771,59 @@ pub struct OrderedDocumentBatch {
     pub sequence_number: Option<i64>,
 }
 
-/// Read each `FileScanTask` into record batches, skipping any whose data file is in
-/// `exclude` (the append fast-path's already-seen files).
+/// Iceberg-read concurrency knobs, env-tunable so an operator matches them to the object store's
+/// concurrent-GET headroom (a single MinIO pod wants a low value; cloud S3/GCS a high one). Read once.
+mod read_conc {
+    use std::sync::LazyLock;
+
+    fn env_usize(key: &str, default: usize) -> usize {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(default)
+    }
+
+    /// Files read concurrently by a **plain full scan** ([`super::read_tasks`]) via iceberg's
+    /// `concurrency_limit_data_files`. `GROWLERDB_SCAN_FILE_CONCURRENCY`, default 8.
+    pub static SCAN_FILE: LazyLock<usize> =
+        LazyLock::new(|| env_usize("GROWLERDB_SCAN_FILE_CONCURRENCY", 8));
+
+    /// Files read concurrently per **hydration key scan** (across-file overlap in the node-layer
+    /// hydration). `GROWLERDB_HYDRATE_FILE_CONCURRENCY`, default 8.
+    pub static HYDRATE_FILE: LazyLock<usize> =
+        LazyLock::new(|| env_usize("GROWLERDB_HYDRATE_FILE_CONCURRENCY", 8));
+
+    /// Concurrent byte-range (column-chunk) fetches **within a single file** read.
+    /// `GROWLERDB_ICEBERG_RANGE_FETCH_CONCURRENCY`, default 4.
+    pub static RANGE_FETCH: LazyLock<usize> =
+        LazyLock::new(|| env_usize("GROWLERDB_ICEBERG_RANGE_FETCH_CONCURRENCY", 4));
+}
+
+/// Read all `FileScanTask`s into record batches, skipping any whose data file is in `exclude` (the
+/// append fast-path's already-seen files). All kept tasks go to **one** `ArrowReader` so iceberg reads
+/// [`read_conc::SCAN_FILE`] files at once (feeding one task per reader would defeat that limit).
 async fn read_tasks(
     file_io: iceberg::io::FileIO,
     tasks: Vec<FileScanTask>,
     exclude: &HashSet<String>,
 ) -> Result<Vec<RecordBatch>> {
+    let kept: Vec<FileScanTask> = tasks
+        .into_iter()
+        .filter(|t| !exclude.contains(&t.data_file_path))
+        .collect();
+    if kept.is_empty() {
+        return Ok(Vec::new());
+    }
+    let reader = ArrowReaderBuilder::new(file_io, iceberg::Runtime::current())
+        .with_data_file_concurrency_limit(*read_conc::SCAN_FILE)
+        .with_range_fetch_concurrency(*read_conc::RANGE_FETCH)
+        .build();
+    let task_stream = futures::stream::iter(kept.into_iter().map(Ok::<_, iceberg::Error>)).boxed();
+    let mut stream = reader.read(task_stream)?.stream();
     let mut batches = Vec::new();
-    for task in tasks {
-        if exclude.contains(&task.data_file_path) {
-            continue;
-        }
-        let reader = ArrowReaderBuilder::new(file_io.clone(), iceberg::Runtime::current()).build();
-        let task_stream =
-            futures::stream::once(async move { Ok::<FileScanTask, iceberg::Error>(task) }).boxed();
-        let mut stream = reader.read(task_stream)?.stream();
-        while let Some(batch) = stream.try_next().await? {
-            batches.push(batch);
-        }
+    while let Some(batch) = stream.try_next().await? {
+        batches.push(batch);
     }
     Ok(batches)
 }
@@ -916,6 +928,67 @@ struct ScanLoc {
     position: u64,
 }
 
+/// The predicate-build → pruned key scan → row-assembly tail shared by [`IcebergReader::hydrate`] and
+/// [`IcebergReader::hydrate_pruned`], over an already-loaded `tbl` (so neither reloads it).
+async fn scan_and_assemble(
+    tbl: &Table,
+    plan_cache_hit: bool,
+    requests: &[HydrateRequest],
+    projection: &Projection,
+) -> Result<HydrationResult> {
+    // Max bytes the key scan reads per hydration call (row-group-granular). A well-pruned plan is
+    // far under it; an unprunable key is capped here rather than scanning the whole snapshot per hit (serves what it finds, omits the rest). 256 MiB ⇒ ~a couple seconds worst-case on ~1 GB files.
+    const FALLBACK_MAX_SCAN_BYTES: u64 = 256 * 1024 * 1024;
+    // Each request's key plus its **sort-key prune hints** both go into the predicate, so a sorted
+    // table prunes by manifest min/max on the sort key, not just the (unprunable) random identifier.
+    let entries: Vec<(&CompositeKey, &[(String, Value)])> = requests
+        .iter()
+        .map(|req| (&req.key, req.prune.as_slice()))
+        .collect();
+    let predicate = key_predicate(tbl.metadata().current_schema(), &entries);
+    let (partition_names, identifier_names) = key_field_names(&requests[0].key);
+    // Only the wanted keys are indexed and the scan streams with early-exit, so even the
+    // unfiltered (`None` predicate) path is bounded in memory and cost.
+    let wanted: HashSet<Vec<u8>> = entries.iter().map(|(k, _)| k.encode()).collect();
+    let (index, duplicate_pks) = match scan_stale_index(
+        tbl,
+        predicate.clone(),
+        &wanted,
+        &partition_names,
+        &identifier_names,
+        FALLBACK_MAX_SCAN_BYTES,
+    )
+    .await
+    {
+        Ok(found) => found,
+        // A pruned scan that errored (e.g. an unexpected type binding) must never turn a
+        // present row into a miss — fall back to the unfiltered scan (same file budget).
+        Err(_) if predicate.is_some() => {
+            scan_stale_index(
+                tbl,
+                None,
+                &wanted,
+                &partition_names,
+                &identifier_names,
+                FALLBACK_MAX_SCAN_BYTES,
+            )
+            .await?
+        }
+        Err(e) => return Err(e),
+    };
+    let resolved: Vec<Option<BTreeMap<String, Value>>> = requests
+        .iter()
+        .map(|req| index.get(&req.key.encode()).map(|(full, _)| full.clone()))
+        .collect();
+
+    let rows = assemble_rows(requests, resolved, projection);
+    Ok(HydrationResult {
+        rows,
+        plan_cache_hit: Some(plan_cache_hit),
+        duplicate_pks,
+    })
+}
+
 /// Stream the current snapshot (optionally `predicate`-pruned, reusing the loaded [`Table`]) and
 /// index **only** the `wanted` keys → `full row`, stopping once all are found — the store-less read. The result map is capped at the wanted set, so even an unfiltered (`None`) scan is bounded.
 ///
@@ -930,6 +1003,32 @@ async fn scan_stale_index(
     identifier_names: &[String],
     max_scan_bytes: u64,
 ) -> Result<(HashMap<Vec<u8>, (BTreeMap<String, Value>, ScanLoc)>, u64)> {
+    scan_stale_index_conc(
+        tbl,
+        predicate,
+        wanted,
+        partition_names,
+        identifier_names,
+        max_scan_bytes,
+        *read_conc::HYDRATE_FILE,
+    )
+    .await
+}
+
+/// [`scan_stale_index`] with the file-read fan-out exposed. Files are read `concurrency`-at-a-time and
+/// their per-file found maps merged (same deterministic highest-`(file, position)` duplicate winner as
+/// the serial path). Early-exit and the byte budget are honored between completed files, so up to
+/// `concurrency - 1` extra files may be in flight when the budget/all-found stop fires — a bounded
+/// over-read that trades a little work for overlapped I/O.
+async fn scan_stale_index_conc(
+    tbl: &Table,
+    predicate: Option<Predicate>,
+    wanted: &HashSet<Vec<u8>>,
+    partition_names: &[String],
+    identifier_names: &[String],
+    max_scan_bytes: u64,
+    concurrency: usize,
+) -> Result<(HashMap<Vec<u8>, (BTreeMap<String, Value>, ScanLoc)>, u64)> {
     let mut builder = tbl.scan().select_all();
     if let Some(p) = predicate {
         builder = builder.with_filter(p);
@@ -941,38 +1040,101 @@ async fn scan_stale_index(
     // Byte budget (not a file count): an unprunable predicate would otherwise read the whole snapshot
     // per hydration call (→ 30s stalls post-compaction, TASK-339). Bytes *read* (row-group-granular), since few-but-huge files make a count budget useless; over budget, serve what was found and omit the rest.
     let mut bytes_scanned = 0u64;
-    'files: for task in tasks.into_iter() {
-        if bytes_scanned >= max_scan_bytes {
-            break 'files;
+    let mut reads =
+        futures::stream::iter(
+            tasks.into_iter().map(|task| {
+                let file_io = file_io.clone();
+                async move {
+                    read_one_file(&file_io, task, wanted, partition_names, identifier_names).await
+                }
+            }),
+        )
+        .buffered(concurrency.max(1));
+    while let Some(res) = reads.next().await {
+        let (local, local_dups, bytes) = res?;
+        bytes_scanned += bytes;
+        // Within-file duplicates are counted by `index_batch`; a wanted key found in two files is a
+        // cross-file duplicate, counted at the merge — total matches the serial scan's dup count.
+        duplicates += local_dups + merge_found(&mut index, local);
+        if index.len() == wanted.len() {
+            break; // every stale key located → stop draining the remaining reads
         }
-        let data_file = task.data_file_path.clone();
-        let reader = ArrowReaderBuilder::new(file_io.clone(), iceberg::Runtime::current()).build();
-        let task_stream =
-            futures::stream::once(async move { Ok::<FileScanTask, iceberg::Error>(task) }).boxed();
-        let mut stream = reader.read(task_stream)?.stream();
-        let mut start_row = 0u64;
-        while let Some(batch) = stream.try_next().await? {
-            bytes_scanned += batch.get_array_memory_size() as u64;
-            let n = batch.num_rows() as u64;
-            duplicates += index_batch(
-                &mut index,
-                &batch,
-                &data_file,
-                start_row,
-                wanted,
-                partition_names,
-                identifier_names,
-            );
-            start_row += n;
-            if index.len() == wanted.len() {
-                break 'files; // every stale key located → stop scanning
-            }
-            if bytes_scanned >= max_scan_bytes {
-                break 'files; // budget exhausted mid-file → serve what we found, omit the rest
-            }
+        if bytes_scanned >= max_scan_bytes {
+            break; // budget exhausted → serve what we found, omit the rest
         }
     }
     Ok((index, duplicates))
+}
+
+/// Read one data file's matching row groups, indexing only the `wanted` keys → `(full row, ScanLoc)`.
+/// Returns the per-file found map, its within-file duplicate count, and bytes touched.
+async fn read_one_file(
+    file_io: &iceberg::io::FileIO,
+    task: FileScanTask,
+    wanted: &HashSet<Vec<u8>>,
+    partition_names: &[String],
+    identifier_names: &[String],
+) -> Result<(
+    HashMap<Vec<u8>, (BTreeMap<String, Value>, ScanLoc)>,
+    u64,
+    u64,
+)> {
+    let data_file = task.data_file_path.clone();
+    // Within-file overlap: fetch this file's column-chunk byte ranges concurrently (the across-file
+    // overlap is the caller's `buffered`). Provenance is preserved — one task per reader.
+    let reader = ArrowReaderBuilder::new(file_io.clone(), iceberg::Runtime::current())
+        .with_range_fetch_concurrency(*read_conc::RANGE_FETCH)
+        .build();
+    let task_stream =
+        futures::stream::once(async move { Ok::<FileScanTask, iceberg::Error>(task) }).boxed();
+    let mut stream = reader.read(task_stream)?.stream();
+    let mut index = HashMap::new();
+    let mut duplicates = 0u64;
+    let mut bytes = 0u64;
+    let mut start_row = 0u64;
+    while let Some(batch) = stream.try_next().await? {
+        bytes += batch.get_array_memory_size() as u64;
+        let n = batch.num_rows() as u64;
+        duplicates += index_batch(
+            &mut index,
+            &batch,
+            &data_file,
+            start_row,
+            wanted,
+            partition_names,
+            identifier_names,
+        );
+        start_row += n;
+        if index.len() == wanted.len() {
+            break; // this file already yielded every wanted key
+        }
+    }
+    Ok((index, duplicates, bytes))
+}
+
+/// Merge one file's found map into the running `dst`, keeping the deterministic highest-`(file,
+/// position)` winner per key (matching [`index_batch`]). Returns the number of **cross-file duplicate**
+/// keys (a wanted key present in both maps).
+fn merge_found(
+    dst: &mut HashMap<Vec<u8>, (BTreeMap<String, Value>, ScanLoc)>,
+    src: HashMap<Vec<u8>, (BTreeMap<String, Value>, ScanLoc)>,
+) -> u64 {
+    let mut cross = 0u64;
+    for (k, (row, loc)) in src {
+        match dst.entry(k) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert((row, loc));
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                cross += 1;
+                let held = &slot.get().1;
+                if (loc.file.as_str(), loc.position) > (held.file.as_str(), held.position) {
+                    slot.insert((row, loc));
+                }
+            }
+        }
+    }
+    cross
 }
 
 /// Build an `OR`-of-`AND` equality predicate over each entry's key fields **plus its sort-key prune
@@ -1347,6 +1509,92 @@ mod tests {
     use std::sync::Arc;
 
     use iceberg::spec::{NestedField, PartitionSpec, Struct, Type};
+
+    /// Per-read latency the [`LatencyFs`] injects, emulating one single-MinIO object-store round-trip
+    /// so the concurrent-vs-serial file-read wall-clock delta is measurable on local disk.
+    const READ_LATENCY: std::time::Duration = std::time::Duration::from_millis(15);
+
+    /// A `FileIO` that wraps local-fs storage and sleeps [`READ_LATENCY`] on every range read — used by
+    /// [`parallel_file_reads_beat_serial_hydration`] to stand in for object-store round-trip cost.
+    #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+    struct LatencyFs;
+
+    #[async_trait::async_trait]
+    #[typetag::serde]
+    impl iceberg::io::Storage for LatencyFs {
+        async fn exists(&self, path: &str) -> iceberg::Result<bool> {
+            iceberg::io::LocalFsStorage::new().exists(path).await
+        }
+        async fn metadata(&self, path: &str) -> iceberg::Result<iceberg::io::FileMetadata> {
+            iceberg::io::LocalFsStorage::new().metadata(path).await
+        }
+        async fn read(&self, path: &str) -> iceberg::Result<bytes::Bytes> {
+            tokio::time::sleep(READ_LATENCY).await;
+            iceberg::io::LocalFsStorage::new().read(path).await
+        }
+        async fn reader(&self, path: &str) -> iceberg::Result<Box<dyn iceberg::io::FileRead>> {
+            let inner = iceberg::io::LocalFsStorage::new().reader(path).await?;
+            Ok(Box::new(LatencyRead { inner }))
+        }
+        async fn write(&self, path: &str, bs: bytes::Bytes) -> iceberg::Result<()> {
+            iceberg::io::LocalFsStorage::new().write(path, bs).await
+        }
+        async fn writer(&self, path: &str) -> iceberg::Result<Box<dyn iceberg::io::FileWrite>> {
+            iceberg::io::LocalFsStorage::new().writer(path).await
+        }
+        async fn delete(&self, path: &str) -> iceberg::Result<()> {
+            iceberg::io::LocalFsStorage::new().delete(path).await
+        }
+        async fn delete_prefix(&self, path: &str) -> iceberg::Result<()> {
+            iceberg::io::LocalFsStorage::new().delete_prefix(path).await
+        }
+        async fn delete_stream(
+            &self,
+            paths: futures::stream::BoxStream<'static, String>,
+        ) -> iceberg::Result<()> {
+            iceberg::io::LocalFsStorage::new()
+                .delete_stream(paths)
+                .await
+        }
+        fn new_input(&self, path: &str) -> iceberg::Result<iceberg::io::InputFile> {
+            Ok(iceberg::io::InputFile::new(
+                Arc::new(LatencyFs),
+                path.to_string(),
+            ))
+        }
+        fn new_output(&self, path: &str) -> iceberg::Result<iceberg::io::OutputFile> {
+            iceberg::io::LocalFsStorage::new().new_output(path)
+        }
+    }
+
+    struct LatencyRead {
+        inner: Box<dyn iceberg::io::FileRead>,
+    }
+
+    #[async_trait::async_trait]
+    impl iceberg::io::FileRead for LatencyRead {
+        async fn read(&self, range: std::ops::Range<u64>) -> iceberg::Result<bytes::Bytes> {
+            tokio::time::sleep(READ_LATENCY).await;
+            self.inner.read(range).await
+        }
+    }
+
+    #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+    struct LatencyFsFactory;
+
+    #[typetag::serde]
+    impl iceberg::io::StorageFactory for LatencyFsFactory {
+        fn build(
+            &self,
+            _config: &iceberg::io::StorageConfig,
+        ) -> iceberg::Result<Arc<dyn iceberg::io::Storage>> {
+            Ok(Arc::new(LatencyFs))
+        }
+    }
+
+    fn latency_file_io() -> FileIO {
+        iceberg::io::FileIOBuilder::new(Arc::new(LatencyFsFactory)).build()
+    }
 
     /// A minimal delete-free [`FileScanTask`] for `path`; only `data_file_path` + `deletes` are
     /// meaningful to the tests, the rest is inert.
@@ -2234,6 +2482,194 @@ mod tests {
             hint_scan, 1,
             "AND-ing the row's ts sort-key value prunes to the single file that can hold it"
         );
+    }
+
+    /// **Hydration file-read concurrency probe** (the Option-2 prototype): over a many-file sorted
+    /// fixture where a scattered top-k selects one row group per file, the serial read
+    /// (`scan_stale_index_conc(.., 1)`) pays every file's object-store round-trip in series; the
+    /// concurrent read (`.., 8`) overlaps them. A latency-injecting `FileIO` sleeps per read so the
+    /// wall-clock delta is measurable on local disk. Both must return the identical rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires the multi-file fixture (see gen_multifile_prune.py; GDB_MF_WAREHOUSE=/tmp/mfwh)"]
+    async fn parallel_file_reads_beat_serial_hydration() {
+        use growlerdb_core::{CompositeKey, Value};
+
+        let wh = std::env::var("GDB_MF_WAREHOUSE").unwrap_or_else(|_| "/tmp/mfwh".into());
+        let summary: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("{wh}/summary.json")).unwrap())
+                .unwrap();
+        let targets = summary["targets"].as_array().unwrap();
+        let n_files = summary["n_files"].as_u64().unwrap() as usize;
+
+        // Load the table with a per-read-latency FileIO (emulating single-MinIO round-trips).
+        let dir = format!("{wh}/ns/multifile/metadata");
+        let mut metas: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("read fixture dir {dir}: {e} — run gen_multifile_prune.py"))
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .collect();
+        metas.sort();
+        let meta = metas
+            .last()
+            .expect("a metadata json")
+            .to_string_lossy()
+            .into_owned();
+        let tbl = iceberg::table::StaticTable::from_metadata_file(
+            &meta,
+            TableIdent::from_strs(["ns", "multifile"]).unwrap(),
+            latency_file_io(),
+        )
+        .await
+        .expect("static table")
+        .into_table();
+
+        // The scattered top-k: one (request_id AND ts) disjunct per file → plan selects every file.
+        let entries: Vec<(CompositeKey, Vec<(String, Value)>)> = targets
+            .iter()
+            .map(|t| {
+                let key = CompositeKey::new(
+                    vec![],
+                    vec![(
+                        "request_id".into(),
+                        Value::Str(t["request_id"].as_str().unwrap().into()),
+                    )],
+                );
+                let hint = vec![("ts".into(), Value::Int(t["ts"].as_i64().unwrap()))];
+                (key, hint)
+            })
+            .collect();
+        let entry_refs: Vec<(&CompositeKey, &[(String, Value)])> =
+            entries.iter().map(|(k, h)| (k, h.as_slice())).collect();
+        let predicate = key_predicate(tbl.metadata().current_schema(), &entry_refs);
+        let wanted: std::collections::HashSet<Vec<u8>> =
+            entries.iter().map(|(k, _)| k.encode()).collect();
+        let files = plan_len(&tbl, predicate.clone()).await;
+        assert_eq!(
+            files, n_files,
+            "scattered top-k must select all {n_files} files"
+        );
+
+        // request_id is the identifier (not a partition) — the field split scan_stale_index expects.
+        // Three strategies, identical fixture: (1) serial per-file loop = the original production read;
+        // (2) growlerdb `buffered(8)` per-file (provenance-preserving); (3) native iceberg
+        // `concurrency_limit_data_files=8` (one reader, all tasks).
+        let (serial_n, serial_t) = run_scan(&tbl, predicate.clone(), &wanted, 1).await;
+        let (buf_n, buf_t) = run_scan(&tbl, predicate.clone(), &wanted, 8).await;
+        let (nat_n, nat_t) = run_scan_native(&tbl, predicate.clone(), &wanted, 8).await;
+
+        eprintln!(
+            "hydration file-read probe: {n_files} files, {} keys\n  \
+             serial(conc=1)          {serial_t:?}  found {serial_n}\n  \
+             buffered(8) growlerdb   {buf_t:?}  found {buf_n}  ({:.2}× vs serial)\n  \
+             native(8) iceberg CLDF  {nat_t:?}  found {nat_n}  ({:.2}× vs serial)",
+            wanted.len(),
+            serial_t.as_secs_f64() / buf_t.as_secs_f64(),
+            serial_t.as_secs_f64() / nat_t.as_secs_f64(),
+        );
+        assert_eq!(serial_n, n_files, "serial finds every scattered key");
+        assert_eq!(buf_n, n_files, "buffered finds the identical set");
+        assert_eq!(
+            nat_n, n_files,
+            "native concurrent read finds the identical set"
+        );
+        assert!(
+            serial_t.as_secs_f64() > 1.5 * buf_t.as_secs_f64(),
+            "buffered concurrent reads must materially beat serial (serial {serial_t:?} vs {buf_t:?})"
+        );
+        assert!(
+            serial_t.as_secs_f64() > 1.5 * nat_t.as_secs_f64(),
+            "native concurrent reads must materially beat serial (serial {serial_t:?} vs {nat_t:?})"
+        );
+    }
+
+    /// Plan-file count for a predicate (test helper).
+    async fn plan_len(tbl: &Table, predicate: Option<Predicate>) -> usize {
+        let mut b = tbl.scan().select_all();
+        if let Some(p) = predicate {
+            b = b.with_filter(p);
+        }
+        b.build()
+            .unwrap()
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .len()
+    }
+
+    /// Time one `scan_stale_index_conc` at the given file concurrency; returns (rows found, elapsed).
+    async fn run_scan(
+        tbl: &Table,
+        predicate: Option<Predicate>,
+        wanted: &std::collections::HashSet<Vec<u8>>,
+        conc: usize,
+    ) -> (usize, std::time::Duration) {
+        let t = std::time::Instant::now();
+        let (idx, _dups) = scan_stale_index_conc(
+            tbl,
+            predicate,
+            wanted,
+            &[],
+            &["request_id".to_string()],
+            u64::MAX,
+            conc,
+        )
+        .await
+        .unwrap();
+        (idx.len(), t.elapsed())
+    }
+
+    /// Time the **native** iceberg read: feed ALL the plan's tasks to a single `ArrowReader` with
+    /// `with_data_file_concurrency_limit(conc)` — iceberg's own `try_buffer_unordered` reads `conc` files
+    /// at once. Contrast with [`run_scan`], which reads one task per reader (defeating that limit) and
+    /// re-adds concurrency in growlerdb. Returns (wanted keys found, elapsed). The merged stream carries
+    /// no per-batch file provenance, so this path can't supply `scan_stale_index`'s `(file, position)`
+    /// duplicate-PK tiebreak — the reason the hydration scan keeps the per-file form.
+    async fn run_scan_native(
+        tbl: &Table,
+        predicate: Option<Predicate>,
+        wanted: &std::collections::HashSet<Vec<u8>>,
+        conc: usize,
+    ) -> (usize, std::time::Duration) {
+        let mut builder = tbl.scan().select_all();
+        if let Some(p) = predicate {
+            builder = builder.with_filter(p);
+        }
+        let tasks: Vec<FileScanTask> = builder
+            .build()
+            .unwrap()
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let reader = ArrowReaderBuilder::new(tbl.file_io().clone(), iceberg::Runtime::current())
+            .with_data_file_concurrency_limit(conc.max(1))
+            .build();
+        let task_stream =
+            futures::stream::iter(tasks.into_iter().map(Ok::<_, iceberg::Error>)).boxed();
+        let t = std::time::Instant::now();
+        let mut index = HashMap::new();
+        let mut start = 0u64;
+        let mut stream = reader.read(task_stream).unwrap().stream();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            let n = batch.num_rows() as u64;
+            // "merged" file placeholder: provenance is lost in the concurrent merge (see doc above).
+            index_batch(
+                &mut index,
+                &batch,
+                "merged",
+                start,
+                wanted,
+                &[],
+                &["request_id".to_string()],
+            );
+            start += n;
+        }
+        (index.len(), t.elapsed())
     }
 
     /// The **live** [`sort_key_hint_prunes_hydration_scan`] over a real **REST catalog** (Polaris),

@@ -166,10 +166,14 @@ impl Lookup for LookupService {
                 Err(e) => return Err(engine_status(EngineError::Source(e))),
             };
             // Sort-key prune hints (best-effort) so pass 2 prunes by the sorted table's manifest
-            // min/max, not a whole-snapshot scan on the unprunable random key.
-            hydrate::attach_prune_hints(&mut located, &shard, reader.as_ref(), &self.table, &keys)
+            // min/max, not a whole-snapshot scan on the unprunable random key — resolved from the same
+            // table load the scan uses (one catalog round-trip, not two).
+            let hydrated = reader
+                .hydrate_pruned(&self.table, &mut located, &projection, |sort_names| {
+                    hydrate::prune_hint_values(&shard, sort_names, &keys)
+                })
                 .await;
-            match reader.hydrate(&self.table, &located, &projection).await {
+            match hydrated {
                 Ok(result) => result,
                 Err(e) => {
                     self.reader.invalidate().await;

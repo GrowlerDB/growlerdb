@@ -1,7 +1,7 @@
 //! Hydration orchestration — the **PK lookup** path ([Flow 2]).
 //!
 //! Store-less: the index keeps no location data — each key is checked for presence, then the source
-//! re-finds its row by a key-equality scan pruned by the row's sort-key value ([`attach_prune_hints`]).
+//! re-finds its row by a key-equality scan pruned by the row's sort-key value ([`prune_hint_values`]).
 //!
 //! [Flow 2]: ../../../okf/system/architecture.md
 
@@ -28,24 +28,20 @@ pub fn resolve_requests(
         .collect()
 }
 
-/// Attach **sort-key prune hints** in place so a sorted source prunes files by manifest min/max on
-/// the sort key (heal for a hash-routed random id, TASK-339). Best-effort: failure leaves them empty.
-pub(crate) async fn attach_prune_hints(
-    requests: &mut [HydrateRequest],
+/// Per-request **sort-key prune values** for `keys`, given the table's identity sort-field `sort_names`:
+/// the row's own value on each field that is both a shard fast field and a non-key sort column, so a
+/// sorted source prunes files by manifest min/max on the sort key (heal for a hash-routed random id,
+/// TASK-339). Empty when there's nothing to prune on. **No catalog call** — `sort_names` comes from the
+/// table [`IcebergReader::hydrate_pruned`] already loaded, folding away the old separate `sort_field_names`
+/// round-trip.
+pub(crate) fn prune_hint_values(
     shard: &Shard,
-    source: &IcebergReader,
-    table: &str,
+    sort_names: &[String],
     keys: &[CompositeKey],
-) {
+) -> Vec<Vec<(String, growlerdb_core::Value)>> {
     let Some(first) = keys.first() else {
-        return;
+        return Vec::new();
     };
-    let Ok(sort_names) = source.sort_field_names(table).await else {
-        return;
-    };
-    if sort_names.is_empty() {
-        return;
-    }
     let fast: HashSet<String> = shard.sort_fields().into_iter().collect();
     let key_fields: HashSet<&str> = first
         .partition
@@ -54,22 +50,21 @@ pub(crate) async fn attach_prune_hints(
         .map(|(n, _)| n.as_str())
         .collect();
     let hint_fields: Vec<String> = sort_names
-        .into_iter()
-        .filter(|n| fast.contains(n) && !key_fields.contains(n.as_str()))
+        .iter()
+        .filter(|n| {
+            let s = n.as_str();
+            fast.contains(s) && !key_fields.contains(s)
+        })
+        .cloned()
         .collect();
     if hint_fields.is_empty() {
-        return;
+        return Vec::new();
     }
-    let Ok(values) = shard.prune_values(keys, &hint_fields) else {
-        return;
-    };
-    for (req, v) in requests.iter_mut().zip(values) {
-        req.prune = v;
-    }
+    shard.prune_values(keys, &hint_fields).unwrap_or_default()
 }
 
 /// Hydrate `keys` to authoritative rows: presence-checked resolution ([`resolve_requests`]) + a
-/// row-group-pruned Iceberg key scan ([`attach_prune_hints`]) in `keys` order (store-less, nothing
+/// row-group-pruned Iceberg key scan ([`prune_hint_values`]) in `keys` order (store-less, nothing
 /// to write back). Variant-table indexes route via the interim Trino lane ([D48]/[D49]).
 ///
 /// [D48]: ../../../okf/system/decisions/d48-variant-delivery.md
@@ -91,8 +86,11 @@ pub async fn get_by_key(
         growlerdb_telemetry::sli::duplicate_pks(result.duplicate_pks);
         return Ok(result.rows);
     }
-    attach_prune_hints(&mut located, shard, source, table, keys).await;
-    let result = source.hydrate(table, &located, projection).await?;
+    let result = source
+        .hydrate_pruned(table, &mut located, projection, |sort_names| {
+            prune_hint_values(shard, sort_names, keys)
+        })
+        .await?;
     growlerdb_telemetry::sli::duplicate_pks(result.duplicate_pks);
     Ok(result.rows)
 }
