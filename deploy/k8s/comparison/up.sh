@@ -9,7 +9,9 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 
 echo "==> applying OpenSearch + Data Prepper manifests to namespace ${NS}"
 kubectl -n "$NS" apply -f "$HERE/opensearch.yaml"
-kubectl -n "$NS" apply -f "$HERE/data-prepper.yaml"
+# Data Prepper reads the Iceberg source via S3 — render it against the active object-store target
+# (deploy/k8s/render-s3.sh → s3-target.env) so it matches every other component's endpoint/creds.
+"$HERE/../render-s3.sh" "$HERE/data-prepper.yaml" | kubectl -n "$NS" apply -f -
 
 echo "==> waiting for OpenSearch statefulset to be ready"
 kubectl -n "$NS" rollout status statefulset/opensearch --timeout=600s

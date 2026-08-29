@@ -46,10 +46,10 @@ spec:
         - name: polaris
           image: apache/polaris:1.5.0
           env:
-            - { name: AWS_REGION, value: us-east-1 }
+            - { name: AWS_REGION, value: "${S3_REGION}" }
             - { name: AWS_ACCESS_KEY_ID, valueFrom: { secretKeyRef: { name: minio-creds, key: rootUser } } }
             - { name: AWS_SECRET_ACCESS_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: rootPassword } } }
-            - { name: AWS_ENDPOINT_URL_S3, value: "http://minio:9000" }
+            - { name: AWS_ENDPOINT_URL_S3, value: "${S3_ENDPOINT}" }
             - { name: POLARIS_PERSISTENCE_TYPE, value: relational-jdbc }
             - { name: QUARKUS_DATASOURCE_DB_KIND, value: postgresql }
             - { name: QUARKUS_DATASOURCE_USERNAME, valueFrom: { secretKeyRef: { name: polaris-db-creds, key: user } } }

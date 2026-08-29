@@ -169,11 +169,22 @@ documented in the published report.
   cores** (matches the requested quota exactly). $0.5216/hr/node ≈ **$75/day** cluster.
 - Probe (2026-08-24): 1× ccx43 provisioned + destroyed cleanly, no quota error → dedicated quota is
   ≥16 cores. The full 96-core headroom is confirmed at `terraform apply` (fails fast, no real spend).
-- Index data (GrowlerDB Tantivy segments, OpenSearch shards) on **local NVMe**; MinIO/Iceberg on a
-  cheap Hetzner volume. Est. footprint at ~50 GB raw: Iceberg parquet ~10–25 GB, GrowlerDB index
+- Index data (GrowlerDB Tantivy segments, OpenSearch shards) on **local NVMe**; the Iceberg object
+  store is **switchable** (`deploy/k8s/s3-target.env`, `S3_PROFILE`): default `minio` (a single
+  in-cluster MinIO pod — fine for correctness, but its single-pod GET throughput caps hydration under
+  load, distorting the topk-under-load number), or `hetzner` — the **same nbg1 Hetzner Object Storage
+  bucket** used for run artifacts, under an `iceberg/` path prefix. **nbg1 == the cluster region**, so
+  hydration GETs stay in-region (no cross-region latency/egress). Use `hetzner` for the representative
+  hydration-under-load numbers; a real cloud store's horizontal GET throughput is what production sees.
+  Est. footprint at ~50 GB raw: Iceberg parquet ~10–25 GB, GrowlerDB index
   ~18–24 GB, **OpenSearch index (with `_source`) ~50–75 GB**, staging/backups ~25 GB — fits the
   ~2,160 GB total local NVMe with headroom. The searchable near-unique `trace_id` adds a large keyword
   term dictionary to **both** indexes (≈ one entry/row) — a disclosed cost, reported alongside latency.
+- **Object-store profile mechanics.** One source of truth (`s3-target.env`) drives every S3 client
+  (Polaris catalog, engine helm values, Spark connector/maintenance, generator, Data Prepper, Trino)
+  via `deploy/k8s/render-s3.sh` at each apply site; `minio` renders byte-for-byte as before. Hetzner
+  credentials are read at deploy time from `~/.ssh/hetzner-gdb-storage` (the artifacts creds file),
+  never committed. Run: `S3_PROFILE=hetzner scale-up.sh …` then `S3_PROFILE=hetzner compare_run.py …`.
 
 ## Phases
 

@@ -20,6 +20,7 @@ REPO = HERE.parents[1]
 DRIVER_TEMPLATE = REPO / "deploy" / "k8s" / "comparison" / "driver-job.template.yaml"
 MAINTENANCE_YAML = REPO / "deploy" / "k8s" / "streaming" / "maintenance.yaml"
 MAINTENANCE_CRONJOB = "growlerdb-iceberg-maintenance"  # name in maintenance.yaml (NOT growlerdb-maintenance)
+RENDER_S3 = REPO / "deploy" / "k8s" / "render-s3.sh"  # S3-target renderer (s3-target.env: minio|hetzner)
 
 ROW_BYTES = 400  # ~uncompressed bytes/row (see synthetic-corpus.md) — target_rows = target_gb*1e9/ROW_BYTES
 SCALES = {"smoke": 1, "shakedown": 10, "full": 50}  # GB; smoke = fast full-flow validation
@@ -72,6 +73,13 @@ def kubectl(args, input_text=None, check=True, capture=False):
     r = subprocess.run(cmd, input=input_text, text=True, check=check,
                        capture_output=capture)
     return (r.stdout or "") if capture else ""
+
+
+def render_s3(path):
+    """Render an S3-templated manifest against the active object-store target (deploy/k8s/render-s3.sh
+    → s3-target.env; resolves S3_PROFILE=minio|hetzner). Returns the substituted YAML text."""
+    return subprocess.run([str(RENDER_S3), str(path)], text=True, check=True,
+                          capture_output=True).stdout
 
 
 # --- in-cluster driver Jobs ---------------------------------------------------------------------
@@ -224,7 +232,10 @@ def compact_source(scale, deadline):
     streaming files): apply the maintenance CronJob, trigger a one-shot Job, raise its deadline, wait."""
     log(f"compact — deploy the maintenance CronJob + trigger a one-shot compaction (deadline {deadline}s)")
     job = f"compact-{scale}"
-    kubectl(["apply", "-f", str(MAINTENANCE_YAML)], check=False)
+    # Render the maintenance Spark job against the active object-store target (S3_PROFILE) before apply,
+    # so compaction reads/writes the same store (MinIO default | Hetzner) as every other component.
+    maint = render_s3(MAINTENANCE_YAML)
+    kubectl(["apply", "-f", "-"], input_text=maint, check=False)
     kubectl(["delete", "job", job, "--ignore-not-found"], check=False)
     kubectl(["create", "job", f"--from=cronjob/{MAINTENANCE_CRONJOB}", job], check=False)
     kubectl(["patch", "job", job, "--type", "merge",

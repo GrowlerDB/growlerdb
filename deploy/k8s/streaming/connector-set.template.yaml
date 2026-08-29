@@ -54,9 +54,9 @@ spec:
           image: ghcr.io/growlerdb/growlerdb-connector:dev
           imagePullPolicy: Always   # :dev is mutable — re-pull on every roll so rebuilds land
           env:
-            - { name: AWS_ACCESS_KEY_ID, value: minioadmin }
-            - { name: AWS_SECRET_ACCESS_KEY, value: minioadmin }
-            - { name: AWS_REGION, value: us-east-1 }
+            - { name: AWS_ACCESS_KEY_ID, value: ${S3_ACCESS_KEY} }
+            - { name: AWS_SECRET_ACCESS_KEY, value: ${S3_SECRET_KEY} }
+            - { name: AWS_REGION, value: ${S3_REGION} }
             # Graceful in-place recovery from a shard-node crash. The stream commits tiny batches,
             # so a tight write deadline lets a wedged write fail + retry fast; channel keepalive
             # (WriteClient) detects the dead connection and re-resolves DNS to the restarted pod's
@@ -107,9 +107,9 @@ spec:
             - --conf
             - spark.sql.catalog.stream.io-impl=org.apache.iceberg.aws.s3.S3FileIO
             - --conf
-            - spark.sql.catalog.stream.s3.endpoint=http://minio:9000
+            - spark.sql.catalog.stream.s3.endpoint=${S3_ENDPOINT}
             - --conf
-            - spark.sql.catalog.stream.s3.path-style-access=true
+            - spark.sql.catalog.stream.s3.path-style-access=${S3_PATH_STYLE}
             - --class
             - io.growlerdb.connector.ConnectorApp
             - /opt/growlerdb/connector.jar

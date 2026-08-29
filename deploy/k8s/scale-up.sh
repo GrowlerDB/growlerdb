@@ -72,9 +72,18 @@ fi
 
 say() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 
+# Object-store target: default = in-cluster MinIO (unchanged); S3_PROFILE=hetzner backs Iceberg on the
+# remote Hetzner OS bucket (same nbg1 region as the cluster, under a path prefix). Sourcing resolves the
+# profile and EXPORTS S3_* so the harness render, the deps/observability render, and helm read one target.
+# shellcheck source=deploy/k8s/s3-target.env
+. "$HERE/s3-target.env"
+say "object store: profile=$S3_PROFILE endpoint=$S3_ENDPOINT base=$S3_WAREHOUSE_BASE (deploy-minio=$S3_DEPLOY_MINIO)"
+
 deploy_observability() {
   say "observability bundle (Prometheus / Grafana / node-exporter / kube-state / Trino / Loki+Promtail)"
-  kubectl apply -f "$HERE/observability/"
+  # Render each manifest against the S3 target (Trino carries S3 config; the rest pass through untouched).
+  for f in "$HERE"/observability/*.yaml; do "$HERE/render-s3.sh" "$f"; echo '---'; done \
+    | kubectl apply -f -
 }
 
 say "0/7 render the '$WORKLOAD' workload → generator/connector manifests + index def"
@@ -111,11 +120,27 @@ kubectl -n "$NAMESPACE" create secret docker-registry ghcr-pull \
   --docker-server=ghcr.io --docker-username="$GH_USER" --docker-password="$GHCR_PAT" \
   --dry-run=client -o yaml | kubectl apply -f -
 
+# Object-store creds as the shared `minio-creds` Secret (both profiles) — every S3 client (Polaris,
+# Spark connector/maintenance, Data Prepper) reads rootUser/rootPassword from it. Populated from the
+# active profile so the Hetzner keys never live in a committed manifest.
+kubectl -n "$NAMESPACE" create secret generic minio-creds \
+  --from-literal=rootUser="$S3_ACCESS_KEY" --from-literal=rootPassword="$S3_SECRET_KEY" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
 # --- deps + generator: run for `deps`/`all`, skip for `serving` (the source table already exists). ---
 if [ "$STAGE" != serving ]; then
-say "2/7 deps (MinIO / Polaris / Postgres) — the Iceberg catalog + object store"
-kubectl apply -k "$HERE/deps"   # kustomization pins namespace: growlerdb
-kubectl -n "$NAMESPACE" rollout status deploy/minio --timeout=180s
+say "2/7 deps (object store: $S3_PROFILE / Polaris / Postgres) — the Iceberg catalog + object store"
+# S3-templated deps rendered against the active target (the kustomization was namespace-only, replaced by
+# `-n`). Postgres (incl. polaris-db creds) is not S3-templated → applied verbatim. MinIO only for its profile.
+kubectl apply -n "$NAMESPACE" -f "$HERE/deps/postgres.yaml"
+if [ "$S3_DEPLOY_MINIO" = true ]; then
+  "$HERE/render-s3.sh" "$HERE/deps/minio.yaml" | kubectl apply -n "$NAMESPACE" -f -
+fi
+"$HERE/render-s3.sh" "$HERE/deps/polaris.yaml"       | kubectl apply -n "$NAMESPACE" -f -
+"$HERE/render-s3.sh" "$HERE/deps/catalog-setup.yaml" | kubectl apply -n "$NAMESPACE" -f -
+if [ "$S3_DEPLOY_MINIO" = true ]; then
+  kubectl -n "$NAMESPACE" rollout status deploy/minio --timeout=180s
+fi
 kubectl -n "$NAMESPACE" rollout status deploy/polaris --timeout=180s
 kubectl -n "$NAMESPACE" wait --for=condition=complete job/polaris-catalog-setup --timeout=240s
 
@@ -174,6 +199,8 @@ helm upgrade --install gdb "$HELM_CHART" -f "$HELM_CHART/values-scale.yaml" -n "
   --set image.tag="$IMAGE_TAG" --set index.shards="$SHARDS" \
   --set index.windowed="$WINDOWED" --set index.defineOnly="$DEFINE_ONLY" \
   --set index.name="$INDEX" --set index.sourceTable="$TABLE" \
+  --set iceberg.s3Endpoint="$S3_ENDPOINT" --set iceberg.s3Region="$S3_REGION" \
+  --set-string credentials.s3AccessKey="$S3_ACCESS_KEY" --set-string credentials.s3SecretKey="$S3_SECRET_KEY" \
   ${COLD_ARGS[@]+"${COLD_ARGS[@]}"} ${LICENSE_ARGS[@]+"${LICENSE_ARGS[@]}"} \
   --set-file index.definition="$INDEX_DEF"
 echo "waiting for $SHARDS node $([ "$WINDOWED" = true ] && echo pods || echo shards) to become Ready ..."

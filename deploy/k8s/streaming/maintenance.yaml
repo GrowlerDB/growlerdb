@@ -58,9 +58,9 @@ spec:
               image: apache/spark:4.0.0   # stock Spark 4.0 — matches iceberg-spark-runtime-4.0 (see header)
               imagePullPolicy: IfNotPresent
               env:
-                - { name: AWS_ACCESS_KEY_ID, value: minioadmin }
-                - { name: AWS_SECRET_ACCESS_KEY, value: minioadmin }
-                - { name: AWS_REGION, value: us-east-1 }
+                - { name: AWS_ACCESS_KEY_ID, value: "${S3_ACCESS_KEY}" }
+                - { name: AWS_SECRET_ACCESS_KEY, value: "${S3_SECRET_KEY}" }
+                - { name: AWS_REGION, value: "${S3_REGION}" }
                 # Retention knobs — keep the connector's recent resume point safe. expire keeps the
                 # most-recent RETAIN_LAST snapshots and anything newer than EXPIRE_OLDER_THAN_HOURS.
                 - { name: EXPIRE_OLDER_THAN_HOURS, value: "1" }
@@ -87,16 +87,16 @@ spec:
                     --conf spark.sql.catalog.stream.credential=root:s3cr3t \
                     --conf spark.sql.catalog.stream.scope=PRINCIPAL_ROLE:ALL \
                     --conf spark.sql.catalog.stream.io-impl=org.apache.iceberg.aws.s3.S3FileIO \
-                    --conf spark.sql.catalog.stream.s3.endpoint=http://minio:9000 \
-                    --conf spark.sql.catalog.stream.s3.path-style-access=true \
+                    --conf spark.sql.catalog.stream.s3.endpoint=${S3_ENDPOINT} \
+                    --conf spark.sql.catalog.stream.s3.path-style-access=${S3_PATH_STYLE} \
                     --conf spark.sql.catalog.stream.rest-metrics-reporting-enabled=false \
                     --conf spark.hadoop.fs.s3.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
                     --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
-                    --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000 \
-                    --conf spark.hadoop.fs.s3a.access.key=minioadmin \
-                    --conf spark.hadoop.fs.s3a.secret.key=minioadmin \
-                    --conf spark.hadoop.fs.s3a.path.style.access=true \
-                    --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \
+                    --conf spark.hadoop.fs.s3a.endpoint=${S3_ENDPOINT} \
+                    --conf spark.hadoop.fs.s3a.access.key=${S3_ACCESS_KEY} \
+                    --conf spark.hadoop.fs.s3a.secret.key=${S3_SECRET_KEY} \
+                    --conf spark.hadoop.fs.s3a.path.style.access=${S3_PATH_STYLE} \
+                    --conf spark.hadoop.fs.s3a.connection.ssl.enabled=${S3_SSL} \
                     -e "
                       -- Declare the table's sort order so it lands in the metadata (default-sort-order),
                       -- not just the rewritten files: hydration reads default_sort_order to prune the
