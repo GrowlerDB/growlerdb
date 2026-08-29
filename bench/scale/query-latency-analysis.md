@@ -273,6 +273,43 @@ tested (48 wanted reads bounded to 32, all keys still found); **its p99 impact n
 measure.** Remaining: tune the knobs on a real store (a sweep — needs a run), the 10 s engine hydration
 ceiling, and isolate topk in the driver (a dedicated pool) so index-only throughput isn't starved.
 
+### Follow-up round — local (no cluster spend): the 10 s "ceiling" resolved, driver isolated, table reuse
+
+Three changes landed locally (gate-green; the two measurement changes are prerequisites for the knob
+sweep to be readable), before the next cluster session:
+
+- **The 10 s engine hydration ceiling is a metrics artifact, not a deadline (resolved by code-read).**
+  There is no 10 s timeout in the hydration path: `hydrate.rs` has none, `source/lib.rs` bounds the key
+  scan by a 256 MiB **byte budget** (not time), and the only real deadlines are the node channel
+  `REQUEST_TIMEOUT = 30 s` and `per_attempt = REQUEST_TIMEOUT / candidates` (30 s single-primary, 15 s
+  with one replica) — matching the observed 30 s client timeouts and the 30 s gateway scatter deadline.
+  The flat p95/p99 = 10000 ms was **Prometheus right-censoring**: the shared `_duration_seconds` bucket
+  set (`telemetry/lib.rs`) topped out at a largest finite boundary of **10.0 s**, so any request slower
+  than 10 s fell in `+Inf` and `histogram_quantile` reported the last finite boundary (10.0). It masked
+  how bad the under-load tail is (the real engine-internal p95/p99 is between 10 s and the 30 s timeout);
+  it did **not** cut real requests. **Fix:** extended the buckets to `15, 20, 30 s` so the tail is
+  observable — a prerequisite for reading the knob sweep from the engine histogram (a p99 moving 28 s→15 s
+  was invisible before, both pinned at 10000 ms). Driver `service_ms` already saw the real tail; the
+  decomposition (retrieval vs hydration) did not.
+- **Driver: topk isolated + a symmetric low-concurrency pass (re-measurement plan steps 1–2).**
+  `compare_query.py` now runs a **pass matrix**: each query **group** — `index` (index-only + autocomplete,
+  no hydration), `topk` (the two hydrated retrievals), `mixed` (all, the realistic-throughput number) —
+  runs as its **own** open-loop pass with its **own** executor, so topk can no longer starve the shared
+  64-worker pool and inflate index-only's reported throughput (§Contamination). `--low-qps` adds an
+  at-rest pass per group, so **at-rest and under-load are captured in the same run for both engines**.
+  `compare_run.py` drives `--groups index,topk,mixed --low-qps 10` for both GrowlerDB and OpenSearch.
+  Validated locally against a mock engine (a 300 ms topk sleep leaves the isolated `index` pass at p99
+  ~10 ms while the `mixed` pass shows the ~300 ms contamination — the artifact, reproduced and removed).
+- **Table reuse (`--reuse-table`) for cheap GDB-only iteration.** The persisted Hetzner corpus survives
+  teardown (`S3_PROFILE=hetzner`, left compacted). `--reuse-table` registers the latest persisted
+  `metadata.json` into the fresh Polaris (skips the ~20 min generation and, since it is already compacted,
+  the compaction), turning `--phase all` into `register → gdb_coldsync → growlerdb → finalize` (GDB-only —
+  OpenSearch's Data Prepper can't ingest the compacted layout). Latest-metadata discovery + the register
+  path verified against the live bucket (read-only) and offline.
+
+The knob sweep and the in-flight cap's p99 impact (below, and the two open items above) still need the
+next cluster session; the engine-internal numbers it produces are now readable past 10 s.
+
 ## Where hydration parallelism can live (coordinator ↔ nodes)
 
 The reads do **not** happen on the coordinator. Tracing the top-k path:

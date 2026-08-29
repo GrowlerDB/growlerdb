@@ -27,6 +27,23 @@ REQUEST_TIMEOUT_S = float(os.environ.get("REQUEST_TIMEOUT_S", "30"))
 # Lexical kinds share the OpenSearch _search body verbatim across engines.
 LEXICAL_KINDS = {"count", "term", "range", "match", "phrase", "boolean", "ip_cidr", "retrieval"}
 
+# Query groups for pass isolation. `retrieval` (topk, size>0) hydrates from the object store and can
+# take seconds under load; run in its OWN pool/pass so it can't starve the index-only types sharing a
+# single executor queue (the shared-pool contamination — see comparison-plan §Contamination). `mixed`
+# keeps every type in one pool: the realistic-throughput number, read as throughput not per-type latency.
+GROUPS = ("index", "topk", "mixed")
+
+
+def _group_of(q):
+    """`topk` = hydrated retrieval (the object-store path); everything else is index-only (`index`)."""
+    return "topk" if q.get("kind") == "retrieval" else "index"
+
+
+def _plan_for_group(queries, group):
+    """Weighted plan for one group: `mixed` = all, else only that group's queries (empty if none)."""
+    picked = queries if group == "mixed" else [q for q in queries if _group_of(q) == group]
+    return _weighted_plan(picked)
+
 
 def _engines(names):
     reg = {
@@ -195,6 +212,32 @@ def run_sweep(engine, cfg, index, plan, rates, duration, max_workers):
     return rounds
 
 
+def _run_passes(name, cfg, index, queries, args):
+    """The pass matrix for one engine: each requested group (its own executor → no cross-group pool
+    contamination), at low concurrency (`--low-qps`, if set) and under load (`--qps` + `--sweep`). At-rest
+    and under-load are thus captured in the same run, symmetric for both engines."""
+    groups = [g.strip() for g in args.groups.split(",") if g.strip()]
+    rates = [int(x) for x in args.sweep.split(",")] if args.sweep else []
+    passes = []
+    for group in groups:
+        plan = _plan_for_group(queries, group)
+        if not plan:
+            print(f"  ! {name}: group '{group}' has no queries — skipping", file=sys.stderr)
+            continue
+        if args.low_qps > 0:  # at-rest pass: low arrival rate, no sweep
+            print(f"  {name} [{group}] low-conc @ {args.low_qps} qps ...", file=sys.stderr)
+            p = run_open_loop(name, cfg, index, plan, args.low_qps, args.low_duration, args.max_workers)
+            p.update(group=group, load="low")
+            passes.append(p)
+        print(f"  {name} [{group}] under-load @ {args.qps} qps ...", file=sys.stderr)
+        p = run_open_loop(name, cfg, index, plan, args.qps, args.duration, args.max_workers)
+        p.update(group=group, load="high")
+        if rates:
+            p["sweep"] = run_sweep(name, cfg, index, plan, rates, args.sweep_duration, args.max_workers)
+        passes.append(p)
+    return passes
+
+
 def cmd_run(args):
     wl = Workload(args.workload)
     # This driver runs the COMPARISON query set, not the default queries.json.
@@ -203,16 +246,17 @@ def cmd_run(args):
     engines = _engines(args.engines.split(","))
     index = wl.index_name
 
-    report = {"workload": wl.name, "index": index, "max_workers": args.max_workers, "engines": {}}
+    report = {
+        "workload": wl.name, "index": index,
+        "config": {"max_workers": args.max_workers, "groups": args.groups,
+                   "low_qps": args.low_qps, "high_qps": args.qps, "sweep": args.sweep},
+        "engines": {},
+    }
     for name, cfg in engines.items():
         print(f"== {name} ({cfg['base']}) ==", file=sys.stderr)
         # Fill any `resolve` placeholder (e.g. point_lookup_trace_id) from a live value on this engine.
-        plan = _weighted_plan(_resolve_queries(name, cfg, index, queries))
-        entry = run_open_loop(name, cfg, index, plan, args.qps, args.duration, args.max_workers)
-        if args.sweep:
-            rates = [int(x) for x in args.sweep.split(",")]
-            entry["sweep"] = run_sweep(name, cfg, index, plan, rates, args.sweep_duration, args.max_workers)
-        report["engines"][name] = entry
+        resolved = _resolve_queries(name, cfg, index, queries)
+        report["engines"][name] = {"passes": _run_passes(name, cfg, index, resolved, args)}
 
     Path(args.out).write_text(json.dumps(report, indent=2))
     _print(report)
@@ -221,18 +265,20 @@ def cmd_run(args):
 
 def _print(r):
     for name, e in r["engines"].items():
-        print(f"\n== {name} @ {e['achieved_qps']}/{e['target_qps']} qps "
-              f"(overall p50 {e['overall_latency_ms']['p50']:.1f} / p99 {e['overall_latency_ms']['p99']:.1f} ms) ==")
-        print(f"{'query':24}{'kind':12}{'n':>6}{'err':>5}{'lat_p50':>9}{'lat_p99':>9}{'svc_p50':>9}{'svc_p99':>9}")
-        for qn, s in e["per_query"].items():
-            print(f"{qn:24}{(s['kind'] or ''):12}{s['count']:>6}{s['errors']:>5}"
-                  f"{s['latency_ms']['p50']:>9.1f}{s['latency_ms']['p99']:>9.1f}"
-                  f"{s['service_ms']['p50']:>9.1f}{s['service_ms']['p99']:>9.1f}")
-        if "sweep" in e:
-            print("  sweep (target->achieved qps : p50/p99 ms):")
-            for row in e["sweep"]:
-                print(f"    {row['target_qps']:>6} -> {row['achieved_qps']:>7} : "
-                      f"{row['p50']:.1f}/{row['p99']:.1f}")
+        for p in e["passes"]:
+            print(f"\n== {name} [{p['group']}/{p['load']}] @ {p['achieved_qps']}/{p['target_qps']} qps "
+                  f"(overall p50 {p['overall_latency_ms']['p50']:.1f} / p99 {p['overall_latency_ms']['p99']:.1f} ms; "
+                  f"dropped {p['dropped']}) ==")
+            print(f"{'query':24}{'kind':12}{'n':>6}{'err':>5}{'lat_p50':>9}{'lat_p99':>9}{'svc_p50':>9}{'svc_p99':>9}")
+            for qn, s in p["per_query"].items():
+                print(f"{qn:24}{(s['kind'] or ''):12}{s['count']:>6}{s['errors']:>5}"
+                      f"{s['latency_ms']['p50']:>9.1f}{s['latency_ms']['p99']:>9.1f}"
+                      f"{s['service_ms']['p50']:>9.1f}{s['service_ms']['p99']:>9.1f}")
+            if "sweep" in p:
+                print("  sweep (target->achieved qps : p50/p99 ms):")
+                for row in p["sweep"]:
+                    print(f"    {row['target_qps']:>6} -> {row['achieved_qps']:>7} : "
+                          f"{row['p50']:.1f}/{row['p99']:.1f}")
 
 
 def cmd_selfcheck(args):
@@ -274,6 +320,18 @@ def cmd_selfcheck(args):
                   f"({', '.join(q['name'] for q in resolvers)}); drop-on-unreachable works")
     kinds = sorted({q.get("kind") for q in queries})
     print(f"kinds covered: {kinds}")
+    # Group partitioning: topk = exactly the retrieval queries, index = the rest, mixed = all, and
+    # index+topk exactly repartition mixed (no query lost or double-counted).
+    idx, topk, mixed = (_plan_for_group(queries, g) for g in ("index", "topk", "mixed"))
+    if any(_group_of(q) != "topk" for q in topk):
+        fails.append("topk group must contain only retrieval queries")
+    if any(_group_of(q) != "index" for q in idx):
+        fails.append("index group must exclude retrieval queries")
+    if len(idx) + len(topk) != len(mixed):
+        fails.append(f"index+topk ({len(idx)}+{len(topk)}) must repartition mixed ({len(mixed)})")
+    if not topk:
+        fails.append("topk group is empty — no retrieval query to isolate")
+    print(f"groups OK: index={len(idx)} topk={len(topk)} mixed={len(mixed)} weighted entries")
     if fails:
         print("FAIL:")
         for f in fails:
@@ -288,8 +346,16 @@ def main():
     p = sub.add_parser("run", help="run the comparison query set against each engine")
     p.add_argument("workload")
     p.add_argument("--engines", default="growlerdb,opensearch")
-    p.add_argument("--qps", type=int, default=100, help="open-loop target arrival rate")
+    p.add_argument("--qps", type=int, default=100, help="open-loop target arrival rate (under-load pass)")
     p.add_argument("--duration", type=int, default=60)
+    p.add_argument("--groups", default="mixed",
+                   help="comma list of query groups to run as isolated passes (own pool each): "
+                        f"{', '.join(GROUPS)}. `index`+`topk` separates the hydrated top-k so it can't "
+                        "starve index-only; `mixed` is the realistic-throughput pass.")
+    p.add_argument("--low-qps", type=int, default=0, dest="low_qps",
+                   help="if >0, also run each group at this low arrival rate (at-rest pass), e.g. 10")
+    p.add_argument("--low-duration", type=int, default=30, dest="low_duration",
+                   help="duration of the low-concurrency at-rest pass")
     p.add_argument("--max-workers", type=int, default=64, dest="max_workers",
                    help="client concurrency ceiling; 512 bursts overwhelm an unguarded server (500/429)")
     p.add_argument("--sweep", default="", help="comma QPS list for a saturation sweep, e.g. 50,100,200,400,800")

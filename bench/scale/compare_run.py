@@ -43,11 +43,14 @@ GIT_REF = os.environ.get("GIT_REF", "feat/os-comparison-bench")  # branch the dr
 DRIVER_IMAGE = os.environ.get("DRIVER_IMAGE", "python:3.12-slim")
 INDEX = os.environ.get("INDEX", "http_logs")
 TABLE = os.environ.get("TABLE", "http_logs")  # Trino table under iceberg.growlerdb
+ICEBERG_NS = os.environ.get("ICEBERG_NS", "growlerdb")  # Iceberg namespace holding TABLE (== warehouse subdir)
+ICEBERG_TABLE = f"{ICEBERG_NS}.{TABLE}"  # pyiceberg identifier for register (namespace.table)
 ID_COL = os.environ.get("ID_COL", "request_id")  # http_logs PK (key-only; OpenSearch _id)
 PROM_URL = os.environ.get("PROM_URL", "http://localhost:9090")  # capture-only (read-only metrics pull)
 
 RESULT_BEGIN, RESULT_END = "<<<RESULT_JSON", "RESULT_JSON>>>"
 DRY = False
+REUSE = False  # --reuse-table: register the persisted compacted table instead of regenerating
 
 
 def log(msg):
@@ -213,6 +216,41 @@ def phase_generate(target_rows):
     wait_source_rows(target_rows)
 
 
+# --- table reuse (skip generation) --------------------------------------------------------------
+# The persisted Iceberg data survives cluster teardown (S3_PROFILE=hetzner, leave-the-data). A GDB-only
+# rerun registers it into the fresh empty Polaris instead of regenerating — skips the ~20-min generation
+# and, since it is left compacted, the compaction too. See the leave-hetzner-iceberg-data note.
+
+def _discover_latest_metadata():
+    """The newest `NNNNN-*.metadata.json` for TABLE in the active warehouse (host-side S3 list, where the
+    creds + aws CLI live). Zero-padded %05d prefix → a lexical sort picks the latest. Prints the full
+    s3:// location on its last line."""
+    # Source s3-target.env (minio|hetzner), bridge its S3_* creds to the AWS_* the CLI reads, list the
+    # table's metadata dir, take the highest-versioned file, and echo the full location.
+    script = (
+        f'set -e; . "{RENDER_S3.parent}/s3-target.env" >/dev/null 2>&1; '
+        'export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" AWS_REGION="${S3_REGION:-nbg1}"; '
+        f'dir="$S3_WAREHOUSE_BASE/{ICEBERG_NS}/{TABLE}/metadata/"; '
+        'latest=$(aws --endpoint-url "$S3_ENDPOINT" s3 ls "$dir" | awk "/metadata.json/{print \\$4}" | sort | tail -1); '
+        '[ -n "$latest" ] && printf "%s%s" "$dir" "$latest"')
+    out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=os.environ, check=True).stdout.strip()
+    if not out:
+        raise SystemExit(f"reuse-table: no *.metadata.json found for {TABLE} in the active warehouse")
+    return out
+
+
+def phase_register(scale):
+    """Skip generation: register the persisted (compacted) table into the fresh Polaris. GDB cold-sync then
+    builds its local index from it (the index is on ephemeral NVMe, so it is still rebuilt each cluster)."""
+    log("PHASE register — attach the persisted Iceberg table (reuse, skip generation)")
+    loc = os.environ.get("REUSE_METADATA_LOCATION") or _discover_latest_metadata()
+    log(f"registering {ICEBERG_TABLE} from {loc}")
+    run_driver_job(
+        "register-table",
+        f"REUSE_METADATA_LOCATION={loc} python workloads/http_logs/corpus.py register --table {ICEBERG_TABLE}",
+        pip="pyiceberg pyarrow", timeout_s=600)
+
+
 # --- GrowlerDB cold-sync (ingest axis) ----------------------------------------------------------
 
 def phase_gdb_coldsync(scale):
@@ -261,16 +299,22 @@ def phase_growlerdb(scale):
     t = SCALE_TIMEOUTS[scale]
     # Convergence already passed in phase_gdb_coldsync. Here: compact (ts-clustered files) for a fair
     # Trino baseline AND so the store-less PREDICATE hydration prunes by ts stats, then warm the index.
-    compact_source(scale, t["compact"])
+    if REUSE:
+        log("reuse-table: skipping compaction (the persisted table is already compacted/ts-sorted)")
+    else:
+        compact_source(scale, t["compact"])
     # Warmup (best-effort): a short query pass so plan-cache / object-store warmup happens OFF the
     # clock. Results discarded (no result_path).
     run_driver_job(
         "warmup-gdb",
         "python compare_query.py run http_logs --engines growlerdb --qps 50 --duration 30 --out /tmp/out.json",
         timeout_s=t["fresh_job"], check=False)
+    # Isolated passes (own pool each) + a low-conc at-rest pass: topk can't starve index-only (the
+    # shared-pool contamination), and at-rest + under-load are both captured symmetrically. See §Contamination.
     run_driver_job(
         "query-gdb",
         "python compare_query.py run http_logs --engines growlerdb "
+        "--groups index,topk,mixed --low-qps 10 --low-duration 30 "
         "--qps 200 --duration 120 --sweep 50,100,200,400,800 --sweep-duration 30 --out /tmp/out.json",
         result_path="/tmp/out.json", local_out=f"{HERE}/gdb-query.json", timeout_s=t["query_job"])
     # Trino/Iceberg-scan baseline (fairness axis 1): search+hydrate vs table scan over the same
@@ -317,9 +361,11 @@ def phase_opensearch(scale):
     OS queries its own Lucene index, independent of the Iceberg file layout."""
     log("PHASE opensearch — query matrix, freshness, capture")
     t = SCALE_TIMEOUTS[scale]
+    # Same isolated + low-conc matrix as GrowlerDB so every published number is same-conditions symmetric.
     run_driver_job(
         "query-os",
         "python compare_query.py run http_logs --engines opensearch "
+        "--groups index,topk,mixed --low-qps 10 --low-duration 30 "
         "--qps 200 --duration 120 --sweep 50,100,200,400,800 --sweep-duration 30 --out /tmp/out.json",
         result_path="/tmp/out.json", local_out=f"{HERE}/os-query.json", timeout_s=t["query_job"])
     run_driver_job(
@@ -362,8 +408,14 @@ def phase_finalize():
 # cold-sync (both engines ingest the same small-file layout = fair T1) → compact + GrowlerDB query (its
 # ts-pruned hydration needs the sort-clustered compaction) → finalize. phase_gdb_coldsync scales
 # OpenSearch down first; phase_growlerdb owns the single compaction.
-PHASES = {"generate": phase_generate, "os_coldsync": phase_os_coldsync, "opensearch": phase_opensearch,
+PHASES = {"generate": phase_generate, "register": phase_register,
+          "os_coldsync": phase_os_coldsync, "opensearch": phase_opensearch,
           "gdb_coldsync": phase_gdb_coldsync, "growlerdb": phase_growlerdb, "finalize": phase_finalize}
+
+# `--phase all` order. Default = the full symmetric head-to-head; `--reuse-table` = a GDB-only iteration
+# on the persisted compacted table (OS's Data Prepper can't ingest compacted files — leave-the-data note).
+DEFAULT_ORDER = ["generate", "os_coldsync", "opensearch", "gdb_coldsync", "growlerdb", "finalize"]
+REUSE_ORDER = ["register", "gdb_coldsync", "growlerdb", "finalize"]
 
 
 # --- offline self-check -------------------------------------------------------------------------
@@ -403,10 +455,13 @@ def self_check():
 
 
 def main():
-    global DRY
+    global DRY, REUSE
     ap = argparse.ArgumentParser(description="Orchestrate the GrowlerDB-vs-OpenSearch comparison run")
     ap.add_argument("--scale", choices=SCALES, default="shakedown")
     ap.add_argument("--phase", choices=["all", *PHASES], default="all", help="run one phase (resume)")
+    ap.add_argument("--reuse-table", action="store_true", dest="reuse_table",
+                    help="register the persisted compacted table instead of regenerating (GDB-only iteration; "
+                         "--phase all becomes register→gdb_coldsync→growlerdb→finalize, and compaction is skipped)")
     ap.add_argument("--plan", action="store_true", help="print the ordered steps/commands, run nothing")
     ap.add_argument("--self-check", action="store_true", help="render + validate the driver Job offline, exit")
     args = ap.parse_args()
@@ -414,11 +469,12 @@ def main():
         self_check()
         return
     DRY = args.plan
+    REUSE = args.reuse_table
     target_rows = int(SCALES[args.scale] * 1e9 / ROW_BYTES)
 
     log(f"scale={args.scale} (~{SCALES[args.scale]} GB, ~{target_rows:,} rows), phase={args.phase}, "
-        f"plan={args.plan}, ns={NS}, git_ref={GIT_REF}")
-    order = list(PHASES) if args.phase == "all" else [args.phase]
+        f"plan={args.plan}, reuse_table={REUSE}, ns={NS}, git_ref={GIT_REF}")
+    order = (REUSE_ORDER if REUSE else DEFAULT_ORDER) if args.phase == "all" else [args.phase]
     for name in order:
         fn = PHASES[name]
         # generate takes the row target, finalize takes nothing, every other phase takes the scale.

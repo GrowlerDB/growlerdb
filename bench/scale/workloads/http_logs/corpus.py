@@ -310,3 +310,75 @@ def _append_retry(catalog, table, schema, make_cols, attempts=12):
             if i == attempts - 1:
                 raise
             time.sleep(min(2.0, 0.1 * (2**i)) * (0.5 + random.random()))
+
+
+# --- table reuse (skip generation) --------------------------------------------------------------
+# The Iceberg data files survive cluster teardown (S3_PROFILE=hetzner, leave-the-data); only the
+# Polaris catalog is ephemeral. `register()` re-attaches a persisted table into a fresh empty catalog
+# so a GDB-only rerun skips the ~20-min generation (and, since the persisted table is left compacted,
+# the compaction too). See bench/scale/comparison-plan.md and the leave-hetzner-iceberg-data note.
+
+def _pick_latest_metadata(names):
+    """The highest-versioned `NNNNN-<uuid>.metadata.json` (Iceberg writes a monotonic %05d prefix).
+    Pure so it is unit-testable offline; takes paths/basenames, returns the winner path or None."""
+    best = None
+    for name in names:
+        base = name.rstrip("/").rsplit("/", 1)[-1]
+        if not base.endswith(".metadata.json"):
+            continue
+        head = base.split("-", 1)[0]
+        if not head.isdigit():
+            continue
+        key = int(head)
+        if best is None or key > best[0]:
+            best = (key, name)
+    return best[1] if best else None
+
+
+def _latest_metadata_location(table):
+    """Discover the newest metadata.json in the warehouse for `table` (S3 list). Used when
+    REUSE_METADATA_LOCATION is not supplied explicitly."""
+    import pyarrow.fs as pafs
+
+    base = os.environ.get("S3_WAREHOUSE_BASE", "s3://growlerdb-warehouse/growlerdb").rstrip("/")
+    ns, name = table.split(".")
+    path = f"{base}/{ns}/{name}/metadata".split("://", 1)[1]  # S3FileSystem takes bucket/key, no scheme
+    fs = pafs.S3FileSystem(
+        access_key=os.environ.get("AWS_ACCESS_KEY_ID"),
+        secret_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+        endpoint_override=os.environ.get("AWS_ENDPOINT_URL_S3"),
+        region=os.environ.get("S3_REGION") or os.environ.get("AWS_REGION"),
+    )
+    entries = fs.get_file_info(pafs.FileSelector(path, allow_not_found=True))
+    latest = _pick_latest_metadata([e.path for e in entries])
+    if latest is None:
+        raise RuntimeError(f"no *.metadata.json under s3://{path}")
+    return "s3://" + latest
+
+
+def register(table="growlerdb.http_logs", metadata_location=None):
+    """Register an existing persisted table into a fresh catalog. Idempotent (a re-register is a
+    no-op if the table already resolves). `metadata_location` falls back to REUSE_METADATA_LOCATION
+    then to S3 auto-discovery."""
+    catalog = _catalog()
+    catalog.create_namespace_if_not_exists(table.split(".")[0])
+    if _table_exists(catalog, table):
+        print(f"exists {table} (already registered)", flush=True)
+        return "exists"
+    loc = metadata_location or os.environ.get("REUSE_METADATA_LOCATION") or _latest_metadata_location(table)
+    catalog.register_table(tuple(table.split(".")), loc)
+    print(f"registered {table} -> {loc}", flush=True)
+    return loc
+
+
+if __name__ == "__main__":
+    import argparse
+
+    ap = argparse.ArgumentParser(description="http_logs corpus ops")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("register", help="register a persisted table into a fresh catalog (reuse)")
+    r.add_argument("--table", default="growlerdb.http_logs")
+    r.add_argument("--metadata-location", default=None)
+    a = ap.parse_args()
+    if a.cmd == "register":
+        register(a.table, a.metadata_location)
