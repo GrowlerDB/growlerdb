@@ -57,6 +57,32 @@ Trino pre-compaction are flagged — their speedups flatter GrowlerDB.
 | Run 7 | ~(not stepped) | PASS — auto-park/read-through/auto-revive (in-cluster MinIO) | ~$1–2 |
 | Run 8 | ~8,900 docs/s | not exercised (9 windows / 6 nodes < park threshold; PASS in Run 7) | ~$2 |
 
+## D54 store-less hydration — live validation (non-windowed comparison shakedown)
+
+The [store-less pruned key scan](/system/decisions/d54-store-less-hydration.md) replaced the stored
+locator + compaction re-map. Validated live on a 10 GB non-windowed `http_logs` shakedown (6× ccx43
+nbg1, image `dev-868f826`, 25.85 M rows, convergence exact). **Headline: `topk_hydrated` (size-20,
+`sort response_time_ms desc` → 20 hits with `ts` scattered across the 7-day span) is sub-second
+post-compaction — it was a 30 s timeout under the old locator path.** Shakedown-scale (directional,
+not a publishable milestone); the full 100 GB head-to-head is the publishable run.
+
+| Metric | Value | Basis |
+|---|---|---|
+| topk_hydrated, low concurrency | service p50 **864** / p95 924 / p99 **964** ms, 0 err | in-cluster driver, 10 qps, fresh compacted |
+| hydration duration (engine-internal) | p50 431 / p95 924 / p99 **985** ms | `growlerdb_hydration_duration_seconds`, 2 m post-compaction window |
+| topk_hydrated, high concurrency | ~12 s; overall collapses to ~40 qps | qps 200 + sweep→800 mixed — object-store-throughput-bound (single MinIO; the _source-vs-hydrate tradeoff) |
+| index-only + autocomplete under load | 5–75 ms, 0 err | same high-concurrency mix (unaffected by the topk saturation) |
+| freshness at rest | p50 2.06 / p99 2.56 s, 0 timeouts | streaming-commit visibility |
+| primary index bytes | **3.90 GB** (term 1.86 / store 0.61 / postings 0.60 / positions 0.26 / fieldnorms 0.23 / fast 0.16) | 25.85 M docs, no `_source`; ≈0.28× raw NDJSON, ~310 MB below the pre-D54 index (deleted location array) |
+| prune hint | fires — `sorted_by=[ts ASC, request_id ASC]` in table metadata (Spark `WRITE ORDERED BY` at compaction) | the prime prior failure mode (empty sort order → no hint → full scan), resolved |
+
+The prune is the whole mechanism: on a `ts`-sort-clustered table iceberg-rust prunes a scattered top-k
+to ~one row group per hit by `ts` min/max stats (no bloom support), so hydration reads ~K row groups —
+the point-read volume, without any stored locator or re-map. On a large **unclustered/unpartitioned**
+source the scan has no stats to prune on and degrades to a byte-budget-bounded broad scan (stated at
+create). OpenSearch did not converge this run (a Data-Prepper-vs-compacted-table CDC artifact, not a
+GrowlerDB result), so same-run head-to-head query numbers are pending the full run.
+
 ## Comparability
 
 - **Run 7's "1 GB" is on the OLD compressed basis** (`growlerdb_source_bytes` = compressed parquet) —
