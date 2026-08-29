@@ -7,6 +7,18 @@
 # NOTE: K8s rejects dotted env var names (C_IDENTIFIER rule), so the Quarkus config props the compose
 # stack sets as `polaris.persistence.type` / `quarkus.datasource.*` are given here in their
 # UPPERCASE_UNDERSCORE env form (Quarkus maps them identically). Validate on first apply.
+# Polaris feature config. SKIP_CREDENTIAL_SUBSCOPING_INDIRECTION returns the catalog's base S3
+# credentials directly instead of vending STS-subscoped ones. Required for object stores WITHOUT an AWS
+# STS AssumeRole endpoint (Hetzner Object Storage → the vend 404s "Failed to get subscoped credentials");
+# MinIO fakes STS so it worked without this, and returning base creds is fine there too.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: polaris-config
+data:
+  application.properties: |
+    polaris.features."SKIP_CREDENTIAL_SUBSCOPING_INDIRECTION"=true
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -25,6 +37,8 @@ spec:
           image: busybox:1.36
           command: ["/bin/sh", "-c", "until nc -z polaris-db 5432; do echo waiting for polaris-db; sleep 2; done"]
         - name: bootstrap
+          # `:latest` bootstraps the persistent DB; a restart then prints "already bootstrapped; skipping",
+          # which the idempotency grep below tolerates. (Pinning to 1.5.0 can't re-open a :latest-written schema.)
           image: apache/polaris-admin-tool:latest
           env:
             - { name: POLARIS_PERSISTENCE_TYPE, value: relational-jdbc }
@@ -39,8 +53,10 @@ spec:
             - |
               out=$(java -jar /deployments/polaris-admin-tool.jar bootstrap -r POLARIS -c POLARIS,root,s3cr3t 2>&1)
               echo "$out"
-              echo "$out" | grep -q "already been bootstrapped" && { echo "realm already bootstrapped - ok"; exit 0; }
-              echo "$out" | grep -q "Bootstrap completed successfully" && exit 0
+              # Idempotent across admin-tool versions: tolerate both fresh ("Bootstrap completed
+              # successfully") and already-done ("already bootstrapped; skipping" / "Bootstrap completed
+              # (N realm(s) already bootstrapped)") wording, so a restart on the persistent DB is a no-op.
+              echo "$out" | grep -qiE "already (been )?bootstrapped|Bootstrap completed" && exit 0
               exit 1
       containers:
         - name: polaris
@@ -58,12 +74,18 @@ spec:
           ports:
             - { name: rest, containerPort: 8181 }
             - { name: mgmt, containerPort: 8182 }
+          # Quarkus fast-jar runs `java -jar -cp . …` from /deployments, so it reads config/application.properties there.
+          volumeMounts:
+            - { name: polaris-config, mountPath: /deployments/config, readOnly: true }
           readinessProbe:
             # Polaris serves a Quarkus health endpoint on the management port (8182).
             httpGet: { path: /q/health/ready, port: mgmt }
             initialDelaySeconds: 15
             periodSeconds: 5
             failureThreshold: 30
+      volumes:
+        - name: polaris-config
+          configMap: { name: polaris-config }
 ---
 apiVersion: v1
 kind: Service
