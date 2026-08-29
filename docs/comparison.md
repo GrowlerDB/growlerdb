@@ -44,6 +44,15 @@ aggregation, scripting, and ingest-pipeline surface. GrowlerDB's [OpenSearch `_s
 documented read-path subset and returns `501` on anything unsupported, so you never get a silent wrong
 answer.
 
+**Ingesting from Iceberg.** Both engines can index an Iceberg table, but by different paths. GrowlerDB's
+ingestion *is* a streaming **changelog connector** purpose-built for Iceberg: it follows the table's
+commit stream to keep the derived index in sync, with no second write path to operate. OpenSearch has no
+native Iceberg ingest — you either **dual-write** via `_bulk` (a separate pipeline to build and keep from
+drifting) or bridge the table through **Data Prepper's Iceberg CDC source, which is experimental and
+copy-on-write-only** and polls snapshots on an interval. So for data that already lives in Iceberg,
+GrowlerDB stays in sync natively where OpenSearch needs an extra, less-mature moving part. (A
+quantitative ingest + freshness head-to-head is a planned follow-up.)
+
 ## vs. Trino / Spark full-text on Iceberg
 
 You can already run `LIKE`/`regexp` or a full-text UDF over an Iceberg table with Trino or Spark. The
