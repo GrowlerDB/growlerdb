@@ -798,6 +798,15 @@ mod read_conc {
     /// `GROWLERDB_ICEBERG_RANGE_FETCH_CONCURRENCY`, default 4.
     pub static RANGE_FETCH: LazyLock<usize> =
         LazyLock::new(|| env_usize("GROWLERDB_ICEBERG_RANGE_FETCH_CONCURRENCY", 4));
+
+    /// **Node-wide** cap on concurrent object-store file reads across ALL in-flight hydrations. Bounds
+    /// the aggregate GET load so a burst of top-k requests can't flood the store — the under-load tail:
+    /// each `buffered(HYDRATE_FILE)` call still fans out, but the total in flight node-wide is capped, so
+    /// requests queue for a slot and complete in bounded time instead of all thrashing the object store.
+    /// `GROWLERDB_HYDRATE_MAX_INFLIGHT_READS`, default 32 (keep >= HYDRATE_FILE so a lone request isn't throttled).
+    pub static INFLIGHT_READS: LazyLock<tokio::sync::Semaphore> = LazyLock::new(|| {
+        tokio::sync::Semaphore::new(env_usize("GROWLERDB_HYDRATE_MAX_INFLIGHT_READS", 32))
+    });
 }
 
 /// Read all `FileScanTask`s into record batches, skipping any whose data file is in `exclude` (the
@@ -1079,6 +1088,12 @@ async fn read_one_file(
     u64,
     u64,
 )> {
+    // Node-wide concurrent-read admission: bounds aggregate object-store GETs so a top-k burst can't
+    // flood the store (held for this file's read; never closed, so acquire cannot error).
+    let _permit = read_conc::INFLIGHT_READS
+        .acquire()
+        .await
+        .expect("hydrate read semaphore is never closed");
     let data_file = task.data_file_path.clone();
     // Within-file overlap: fetch this file's column-chunk byte ranges concurrently (the across-file
     // overlap is the caller's `buffered`). Provenance is preserved — one task per reader.
@@ -1534,6 +1549,9 @@ mod tests {
         }
         async fn reader(&self, path: &str) -> iceberg::Result<Box<dyn iceberg::io::FileRead>> {
             let inner = iceberg::io::LocalFsStorage::new().reader(path).await?;
+            // One reader per file — track concurrent open files to observe the in-flight-read cap.
+            let n = FILE_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            FILE_MAX.fetch_max(n, std::sync::atomic::Ordering::SeqCst);
             Ok(Box::new(LatencyRead { inner }))
         }
         async fn write(&self, path: &str, bs: bytes::Bytes) -> iceberg::Result<()> {
@@ -1567,8 +1585,18 @@ mod tests {
         }
     }
 
+    /// Concurrent open files (readers) and the max seen — asserts the in-flight-read cap engages.
+    static FILE_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static FILE_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
     struct LatencyRead {
         inner: Box<dyn iceberg::io::FileRead>,
+    }
+
+    impl Drop for LatencyRead {
+        fn drop(&mut self) {
+            FILE_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     #[async_trait::async_trait]
@@ -2670,6 +2698,88 @@ mod tests {
             start += n;
         }
         (index.len(), t.elapsed())
+    }
+
+    /// **In-flight read cap** ([`read_conc::INFLIGHT_READS`]): several hydrations run at once, each fanning
+    /// out `buffered(8)` file reads, so the total wanted concurrency (6×8=48) exceeds the node-wide cap.
+    /// The tracking `FileIO` records the max concurrent open files — it must stay ≤ the cap (bounding the
+    /// object-store GET flood that caused the under-load tail), while every scan still finds all its keys.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires the multi-file fixture (gen_multifile_prune.py; GDB_MF_WAREHOUSE=/tmp/mfwh)"]
+    async fn inflight_read_cap_bounds_concurrent_files() {
+        use growlerdb_core::{CompositeKey, Value};
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let wh = std::env::var("GDB_MF_WAREHOUSE").unwrap_or_else(|_| "/tmp/mfwh".into());
+        let summary: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("{wh}/summary.json")).unwrap())
+                .unwrap();
+        let targets = summary["targets"].as_array().unwrap();
+        let n_files = summary["n_files"].as_u64().unwrap() as usize;
+        let dir = format!("{wh}/ns/multifile/metadata");
+        let mut metas: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("read fixture dir {dir}: {e} — run gen_multifile_prune.py"))
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .collect();
+        metas.sort();
+        let meta = metas.last().unwrap().to_string_lossy().into_owned();
+        let tbl = iceberg::table::StaticTable::from_metadata_file(
+            &meta,
+            TableIdent::from_strs(["ns", "multifile"]).unwrap(),
+            latency_file_io(),
+        )
+        .await
+        .unwrap()
+        .into_table();
+
+        let entries: Vec<(CompositeKey, Vec<(String, Value)>)> = targets
+            .iter()
+            .map(|t| {
+                (
+                    CompositeKey::new(
+                        vec![],
+                        vec![(
+                            "request_id".into(),
+                            Value::Str(t["request_id"].as_str().unwrap().into()),
+                        )],
+                    ),
+                    vec![("ts".into(), Value::Int(t["ts"].as_i64().unwrap()))],
+                )
+            })
+            .collect();
+        let entry_refs: Vec<(&CompositeKey, &[(String, Value)])> =
+            entries.iter().map(|(k, h)| (k, h.as_slice())).collect();
+        let predicate = key_predicate(tbl.metadata().current_schema(), &entry_refs);
+        let wanted: std::collections::HashSet<Vec<u8>> =
+            entries.iter().map(|(k, _)| k.encode()).collect();
+
+        FILE_INFLIGHT.store(0, SeqCst);
+        FILE_MAX.store(0, SeqCst);
+        let cap = read_conc::INFLIGHT_READS.available_permits(); // total permits = the node-wide cap
+        let idn = vec!["request_id".to_string()];
+        let runs = (0..6).map(|_| {
+            scan_stale_index_conc(&tbl, predicate.clone(), &wanted, &[], &idn, u64::MAX, 8)
+        });
+        let results = futures::future::join_all(runs).await;
+        let max = FILE_MAX.load(SeqCst);
+
+        eprintln!("in-flight read cap: default {cap}, observed max concurrent files {max} (6 scans × 8 wanted = 48)");
+        for r in &results {
+            assert_eq!(
+                r.as_ref().unwrap().0.len(),
+                n_files,
+                "every scan finds all its keys even under the cap"
+            );
+        }
+        assert!(
+            max <= cap,
+            "concurrent file reads ({max}) must not exceed the node-wide cap ({cap})"
+        );
+        assert!(
+            max > 8,
+            "the cap should aggregate concurrency across scans (beyond one scan's 8), got {max}"
+        );
     }
 
     /// The **live** [`sort_key_hint_prunes_hydration_scan`] over a real **REST catalog** (Polaris),
