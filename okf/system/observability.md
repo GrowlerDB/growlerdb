@@ -35,7 +35,9 @@ For **where the time went**, two per-index layer histograms: `growlerdb_query_re
 (the search / KNN fan-out + fusion, excl. hydration) and `growlerdb_hydration_duration_seconds{index}`
 (the Iceberg row fetch); `growlerdb_hydration_*{index}` are labelled node-side with the served index. This makes the console's **Search** tab per-index under the
 scope selector, with a retrieval-vs-hydrate breakdown beneath the full-latency hero. The label sets keep
-cardinality bounded (index × 3 kinds × 2 hydrated × buckets). The **cold-cache** hit rate is the
+cardinality bounded (index × 3 kinds × 2 hydrated × buckets). All `_duration_seconds` histograms share one
+explicit bucket set whose top runs to **30 s** — the node/gateway request timeout — so a slow object-store
+hydration tail reports its real p95/p99 instead of right-censoring at the largest finite bucket. The **cold-cache** hit rate is the
 deliberate exception: its `growlerdb_cold_cache_{hits,misses}_total{tier="cold"}` counters come from a
 process-wide range LRU with no index in scope, so that SLI stays cluster-wide.
 

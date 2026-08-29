@@ -41,9 +41,12 @@ pub fn init(service: &str) {
     // as a summary (`{quantile}`, no `_bucket`), so `histogram_quantile` returns nothing. With buckets
     // it exports a true cumulative histogram, aggregatable across replicas. All latency metrics end in
     // `_duration_seconds`, so one suffix rule covers query / hydration / http-request.
+    // The top runs to 30 s (the node/gateway request timeout, source/lib.rs): without buckets past 10 s,
+    // any p95/p99 above it right-censors to exactly 10 s — masking the under-load hydration tail.
     if PROMETHEUS.get().is_none() {
         const LATENCY_BUCKETS: &[f64] = &[
             0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            15.0, 20.0, 30.0,
         ];
         let builder = PrometheusBuilder::new()
             .set_buckets_for_metric(Matcher::Suffix("_duration_seconds".into()), LATENCY_BUCKETS)
