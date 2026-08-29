@@ -91,7 +91,7 @@ Maintenance commands operate on a local index:
 | `growlerdb sync <index>` | Append fast-path: index files added since the last checkpoint. |
 | `growlerdb reconcile <index>` | Compare against Iceberg's current snapshot; fix drift. |
 | `growlerdb rebuild <index>` | Hard reset: drop and rebuild from Iceberg (the backstop). |
-| `growlerdb backup <index>` | Back up the shard (segments + locator/checkpoint + definition) to object storage. |
+| `growlerdb backup <index>` | Back up the shard (segments + checkpoint + definition) to object storage. |
 | `growlerdb restore <index>` | Restore the shard from a backup, or rebuild from Iceberg if none exists. |
 | `growlerdb refresh-replica <index>` | Pull the latest sealed segments from the primary's backup (incremental) for a read replica. |
 

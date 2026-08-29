@@ -13,8 +13,8 @@ nav_order: 9
 > **Directional, not the formal suite.** These numbers come from a ballpark assessment on a small
 > dev VM (4 GiB / 2 vCPU, lima), not the pre-1.0 at-scale benchmark. Absolute latencies are
 > small-scale and cache-warm, so the ratios and the findings are the signal, not the milliseconds.
-> The formal staged suite (real hardware, tens of millions of rows, QPS/p95/p99, cold-tier
-> read-through, hydration throughput) is tracked on the [roadmap](roadmap). Reproduce everything here
+> This is a directional read, not the formal staged suite (real hardware, tens of millions of rows,
+> QPS/p95/p99, cold-tier read-through, hydration throughput). Reproduce everything here
 > from [`bench/`](https://github.com/GrowlerDB/growlerdb/tree/main/bench) in the repo.
 
 ## What was measured
@@ -63,9 +63,9 @@ GrowlerDB has three return modes. Median ms for the top-20 documents:
    index adds almost nothing over coordinates (~1.5–6.5 ms) and is faster than ES `_source` (7–10
    ms), embedded versus networked. For the common case (you read a reading summary), GrowlerDB is fast.
 2. **Hydration from Iceberg = 80–190 ms.** Fetching the *authoritative governed row* is the real cost
-   of the coordinate → hydrate model (~15–50× the cached path). But it is locator-targeted: it
-   reads only the K matching rows via the PK locator, so it is still ~2× faster than Trino's scan
-   (150–260 ms), and unlike ES `_source` it is the live lakehouse row, not a search-time copy.
+   of the coordinate → hydrate model (~15–50× the cached path). But it is targeted: a key-equality scan
+   pruned by the sort-key column stats reads only the matching row groups, so it is still ~2× faster than
+   Trino's scan (150–260 ms), and unlike ES `_source` it is the live lakehouse row, not a search-time copy.
 
 **Takeaway:** GrowlerDB wins decisively for *filter + display* (cached fields). For *authoritative,
 full-fidelity retrieval* it pays an Iceberg round-trip that Elasticsearch avoids, so cache the display
@@ -77,7 +77,8 @@ fields you serve hot, and reserve hydration for governed/audit reads.
   whole-table read would OOM-kill above ~500k rows; the connector streams bounded chunks.
 - **Index footprint (1M, Tantivy):** `telemetry` (no cached) **93 MB** · `telemetry_cached` **176 MB**
   · Elasticsearch **155 MB**. GrowlerDB's *plain* index is more compact than ES (no `_source`); with
-  all display fields cached it is comparable. (The `aux.redb` PK → Iceberg locator is extra, on top.)
+  all display fields cached it is comparable. (Hydration is store-less — the index carries keys, not row
+  positions, so there is no per-row locator structure on top.)
 
 ## Honest limitations
 
@@ -86,7 +87,6 @@ fields you serve hot, and reserve hydration for governed/audit reads.
   fields close it for the display case.
 - The cold-tier read path already serves cold data without a full restore, but its at-scale
   read-through latency is part of the formal suite, not measured here.
-- These are single-node, cache-warm, small-VM numbers. The formal suite (real hardware, tens of
+- These are single-node, cache-warm, small-VM numbers, not the formal suite (real hardware, tens of
   millions of events, concurrency/QPS, p95/p99, cold vs warm cache, hydration throughput at K, an
-  apples-to-apples ES/OpenSearch-at-scale and Spark/Trino full-text baseline) is the pre-1.0
-  deliverable on the [roadmap](roadmap).
+  apples-to-apples ES/OpenSearch-at-scale and Spark/Trino full-text baseline).

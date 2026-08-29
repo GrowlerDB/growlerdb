@@ -6,6 +6,71 @@ All notable changes to GrowlerDB are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-29
+
+The **store-less hydration** release. Fetching full documents for a top-K result no longer depends on
+stored row locators: a search returns keys, and the engine re-finds each row by a key-equality scan
+against Iceberg **pruned to the matching row groups by the row's own `ts` sort-key value**. This deletes
+the fragile stored-locator + compaction re-map machinery that turned post-compaction `topk_hydrated` into
+a 30 s timeout, and makes hydrated top-K **sub-second at rest** on a compacted, sort-clustered table. The
+release also adds env-tunable hydration read concurrency, an opt-in autocomplete completion sidecar, and
+the first at-scale GrowlerDB-vs-OpenSearch benchmark suite.
+
+**Upgrading:** the **on-disk index format changed** — stored row locators (`_locid`, the location array,
+the redb locator tables) are gone. An index is a *derived* store, so the migration is a **reindex/rebuild
+from the Iceberg source** (always available; see [RELEASING.md](RELEASING.md)); no source data is
+affected. Hydration now needs the source table's **default sort order declared** (compaction's `WRITE
+ORDERED BY (ts, …)` sets it) for the `ts` row-group prune to fire. The `growlerdb_locator_*` /
+`stale_locators` metrics and the `--remap-interval-secs` node flag / `remapIntervalSecs` Helm value are
+**removed**. Search, indexing, ingestion, and the query APIs are otherwise unchanged.
+
+### Added
+
+- **Tunable hydration read concurrency.** `GROWLERDB_HYDRATE_FILE_CONCURRENCY` (default 8, across-file),
+  `GROWLERDB_ICEBERG_RANGE_FETCH_CONCURRENCY` (4, within-file column-chunk fetches), and a node-wide
+  in-flight cap `GROWLERDB_HYDRATE_MAX_INFLIGHT_READS` (32) let an operator match hydration concurrency to
+  the object store's concurrent-GET headroom.
+- **Opt-in autocomplete completion sidecar.** A `suggest: true` field flag builds a per-segment
+  prefix→top-K-by-frequency sidecar for lower-latency whole-value typeahead, rebuilt on commit and
+  compaction, with transparent fallback to the live term-dictionary seek.
+- **At-scale comparison benchmark suite** (`bench/scale`) — GrowlerDB vs OpenSearch + Data Prepper with a
+  Trino/Iceberg baseline: a neutral open-loop driver (per-query-group pass isolation + concurrency sweep),
+  a sentinel-row freshness harness, a synthetic `http_logs` corpus, and a documented fairness charter. This
+  is the scale-test infrastructure behind the hydration work.
+
+### Changed
+
+- **Store-less hydration ([D54](okf/system/decisions/d54-store-less-hydration.md), supersedes D13/D30).**
+  Hydration re-finds rows by a `ts`-pruned key-equality scan against Iceberg instead of a stored
+  `(file, position)` locator, so there is nothing to invalidate when `rewrite_data_files` moves every row.
+  Post-compaction `topk_hydrated` goes from a 30 s timeout to sub-second at rest.
+- **Concurrent per-shard hydration reads.** The per-shard key scan reads its matching files concurrently
+  (`buffered`) and folds two catalog `load_table` round-trips into one, cutting per-request latency on a
+  scattered top-K.
+- **Latency histograms report the full tail.** All `growlerdb_*_duration_seconds` buckets extend to 30 s
+  (the request timeout); a slow object-store hydration tail now reports its real p95/p99 instead of
+  right-censoring flat at 10 s.
+- **Faster cold-sync ingest.** The streaming connector can run as a parallel worker **set** (one pipeline
+  per shard) so a from-empty backfill uses idle node headroom instead of a single Spark pipeline.
+- **Compose stack** activates the full profile set and pulls the pre-built connector image, so `just stack`
+  needs no host Maven/JDK.
+
+### Removed
+
+- The **stored-locator apparatus**, superseded by store-less hydration: `LocationStrategy` from the index
+  definition, `RowLocator` / `_locid` / the dense location array / the redb locator tables, the compaction
+  re-map loop (`--remap-interval-secs`, `remapIntervalSecs`), and the `growlerdb_locator_*` /
+  `stale_locators` metrics and their dashboards/alerts.
+
+### Security
+
+- **h2 → 0.4.17**, resolving [RUSTSEC-2026-0258](https://rustsec.org/advisories/RUSTSEC-2026-0258).
+
+### Fixed
+
+- The demo stack ships non-breached `demo` / `admin` credentials, so the browser no longer raises its
+  "change your password" prompt.
+
 ## [0.9.0] - 2026-08-05
 
 The **reindex** release. Rebuilding an index from its Iceberg source is now a first-class, coordinated
@@ -622,7 +687,8 @@ The initial public (Beta) surface.
   into the image, chart `appVersion`, binaries, and CLI `--version` while the tree stays `0.0.0`;
   the image gets an immutable `X.Y.Z` plus moving `X.Y`/`X`/`latest`. See [RELEASING.md](RELEASING.md).
 
-[Unreleased]: https://github.com/GrowlerDB/growlerdb/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/GrowlerDB/growlerdb/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.6.0...v0.7.0
