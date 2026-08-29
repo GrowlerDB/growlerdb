@@ -307,8 +307,89 @@ sweep to be readable), before the next cluster session:
   OpenSearch's Data Prepper can't ingest the compacted layout). Latest-metadata discovery + the register
   path verified against the live bucket (read-only) and offline.
 
-The knob sweep and the in-flight cap's p99 impact (below, and the two open items above) still need the
-next cluster session; the engine-internal numbers it produces are now readable past 10 s.
+### Measured at scale — cluster run (2026-08-29, reused corpus, image dev-3a2f977)
+
+GDB-only run on the persisted, compacted **25,425,380-row** `http_logs` table (registered via
+`--reuse-table` — no regeneration; sort order `[ts, request_id]` declared so the ts prune hint fires),
+6× ccx43 nbg1, `S3_PROFILE=hetzner`, image `dev-3a2f977` (histogram buckets to 30 s + in-flight cap
+default 32). Index boot-built (not connector-backfilled), so the autocomplete completion sidecar was
+**not** built — `autocomplete_user_id` runs the live term-dict fallback (178 ms p50, disclosed below),
+not the ~15 ms sidecar path. OpenSearch was **not** run this round (GDB-only reuse); no head-to-head row.
+Each config is its own isolated open-loop pass (`compare_query.py` groups). `service_ms` throughout.
+
+**Task (d), confirmed live.** With the extended buckets the engine `growlerdb_hydration_duration_seconds`
+now reports the tail instead of pinning at 10000 ms. Per config, under the isolated topk pass
+(200 qps offered), engine-internal hydration p50 / p95 / p99 (ms):
+
+| config (FILE,RANGE,INFLIGHT) | hyd p50 | hyd p95 | hyd p99 |
+|---|---|---|---|
+| 8,4,100000 (no-cap) | 5063.9 | 12202.7 | 14937.6 |
+| 8,4,16 | 2157.9 | 9600.3 | 13453.2 |
+| 8,4,32 (default) | — | — | — ¹ |
+| 8,4,64 | 1661.8 | 9979.9 | 14465.9 |
+| 4,2,32 | 2169.1 | 11675.3 | 14807.3 |
+| 16,4,32 | 919.1 | 12284.0 | 14882.8 |
+| 8,8,32 | 981.4 | 9926.5 | 14247.2 |
+
+¹ the default-config engine histogram was scraped over a window spanning the low+high passes (p50 925.6
+/ p95 10713.6 / p99 14764.1); every p95/p99 above sits between 9.6 s and 14.9 s — the real tail, formerly
+censored flat at 10000 ms.
+
+**Task (a) — in-flight cap sweep. `topk_hydrated` under load (isolated topk pass, 200 qps offered):**
+
+| INFLIGHT | th p50 | th p99 | err | qps | tr p50 | tr p99 |
+|---|---|---|---|---|---|---|
+| 100000 (no-cap) | 835.6 | 13635.9 | 0 | 30 | 28.0 | 173.2 |
+| 16 | 1834.5 | 13785.8 | 0 | 31 | 26.6 | 181.0 |
+| 32 (default) | 971.7 | 13847.9 | 0 | 30 | 14.9 | 68.1 |
+| 64 | 815.0 | 13700.4 | 0 | 30 | 28.2 | 148.5 |
+
+**The cap does not move the p99 tail** — every value lands at 13.6–13.9 s, 0 err, ~30 qps. It changes
+only p50, and **too-tight (16) nearly doubles it** (1834 vs 815–972 ms); 32 / 64 / no-cap are within
+~150 ms of each other. The under-load errors of the prior run (8× 30 s client timeouts) are **not** the
+cap's doing — they were the shared-pool coordinated omission (a slow topk holding 64 workers), removed by
+the driver isolation. **The cap is not the tail lever on a real object store.**
+
+**Task (b) — read-concurrency knob sweep. `topk_hydrated` under load (isolated topk pass, 200 qps offered):**
+
+| FILE | RANGE | INFLIGHT | th p50 | th p99 | err | qps |
+|---|---|---|---|---|---|---|
+| 8 | 4 | 32 (default) | 971.7 | 13847.9 | 0 | 30 |
+| 4 | 2 | 32 | 910.1 | 13852.8 | 0 | 30 |
+| 16 | 4 | 32 | 837.6 | 13884.0 | 0 | 29 |
+| 8 | 8 | 32 | 1043.9 | 13515.3 | 0 | 30 |
+
+Same story: **p99 is invariant (13.5–13.9 s) across every FILE×RANGE×INFLIGHT setting**; p50 jitters within
+~200 ms (16,4 and 64 marginally lowest, 8,8 marginally highest — more within-file range concurrency does
+not help). There is **no per-request-latency-vs-tail balance to strike** on this store: the tail is the
+Hetzner-OS concurrent-GET ceiling (~30 topk qps), which no read-concurrency knob moves. Default (8,4,32)
+is near-optimal; the only actionable finding is *do not lower the cap to 16*.
+
+**At rest (10 qps low-conc pass) — knob-independent.** `topk_hydrated` p50 / p99 (ms), all seven configs:
+310–320 / 376–485; `topk_recent` 14–29 / 22–35; 0 err throughout. Sub-second at rest regardless of knobs
+(the cap/concurrency never engages at 10 qps). Index-only at 10 qps: 5–80 ms p50 except autocomplete 202 ms.
+
+**The realistic mixed workload does not collapse (200 qps offered, one shared pool, weighted plan):**
+
+| group | achieved qps | dropped | topk_hydrated p50/p99 | index-only p50 range | err |
+|---|---|---|---|---|---|
+| mixed | 189 | 0 | 314.0 / 6342.4 ms | 2.7–70.6 ms | 0 |
+
+At its realistic 5/32 weight topk runs at ~30 qps (its store ceiling, not over-driven), so it doesn't
+saturate the pool: the mix serves **189 qps with 0 drops**, index-only 2.7–70 ms, topk_hydrated 314 ms
+p50 / 6.3 s p99. **Caveat on comparability:** this is not directly comparable to the prior run's
+"52 qps / 19,171 dropped / topk 19.5 s" — that number was the shared-pool mix swept to 800 qps on the
+old driver; the driver methodology changed (task c) precisely so the measurement is clean. The isolated
+topk pass above (200 qps on topk alone = 6.6× its ceiling) is what surfaces the pure store-bound tail;
+the mixed pass is the realistic load.
+
+**Net for the four mechanisms.** At rest, sub-second hydration holds (315 ms p50 / ~400 ms p99). Under
+load the residual is exactly the *fundamental floor* named in the TL;DR (§4): `(row-groups/hit) ×
+(object-store round-trip)`, throughput-capped by the store — on Hetzner OS ~30 topk qps with a ~13.7 s
+tail under 6.6× overdrive, ~6.3 s p99 at the realistic ~30 qps. Neither the in-flight cap nor the
+read-concurrency knobs move that tail; the driver isolation makes it *measurable* (0 timeouts, clean
+per-type numbers) but does not lower it. The scale-out levers that would (Level 2/3 below, a distributed
+store's aggregate GET bandwidth) remain the real path past this floor.
 
 ## Where hydration parallelism can live (coordinator ↔ nodes)
 
