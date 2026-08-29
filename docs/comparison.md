@@ -61,7 +61,7 @@ On the [directional benchmark](performance) (a small dev VM, not a formal at-sca
 ~50–170× faster than a Trino scan on filtered search, and the gap widens with data size because the
 index lookup stays flat while the scan grows. Both read the same Iceberg table. GrowlerDB doesn't replace your query engine; it adds the
 search access path the query engine lacks. (For authoritative full-row retrieval, GrowlerDB's
-locator-targeted hydration is still ~2× faster than a Trino `SELECT *`, because it reads only the
+hydration is still ~2× faster than a Trino `SELECT *`, because a sort-key-pruned key scan reads only the
 matching rows rather than scanning.)
 
 ## When GrowlerDB is a good fit

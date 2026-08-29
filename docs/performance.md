@@ -63,9 +63,9 @@ GrowlerDB has three return modes. Median ms for the top-20 documents:
    index adds almost nothing over coordinates (~1.5–6.5 ms) and is faster than ES `_source` (7–10
    ms), embedded versus networked. For the common case (you read a reading summary), GrowlerDB is fast.
 2. **Hydration from Iceberg = 80–190 ms.** Fetching the *authoritative governed row* is the real cost
-   of the coordinate → hydrate model (~15–50× the cached path). But it is locator-targeted: it
-   reads only the K matching rows via the PK locator, so it is still ~2× faster than Trino's scan
-   (150–260 ms), and unlike ES `_source` it is the live lakehouse row, not a search-time copy.
+   of the coordinate → hydrate model (~15–50× the cached path). But it is targeted: a key-equality scan
+   pruned by the sort-key column stats reads only the matching row groups, so it is still ~2× faster than
+   Trino's scan (150–260 ms), and unlike ES `_source` it is the live lakehouse row, not a search-time copy.
 
 **Takeaway:** GrowlerDB wins decisively for *filter + display* (cached fields). For *authoritative,
 full-fidelity retrieval* it pays an Iceberg round-trip that Elasticsearch avoids, so cache the display
@@ -77,7 +77,8 @@ fields you serve hot, and reserve hydration for governed/audit reads.
   whole-table read would OOM-kill above ~500k rows; the connector streams bounded chunks.
 - **Index footprint (1M, Tantivy):** `telemetry` (no cached) **93 MB** · `telemetry_cached` **176 MB**
   · Elasticsearch **155 MB**. GrowlerDB's *plain* index is more compact than ES (no `_source`); with
-  all display fields cached it is comparable. (The `aux.redb` PK → Iceberg locator is extra, on top.)
+  all display fields cached it is comparable. (Hydration is store-less — the index carries keys, not row
+  positions, so there is no per-row locator structure on top.)
 
 ## Honest limitations
 
