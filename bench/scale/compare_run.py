@@ -306,7 +306,9 @@ def capture(scale, phase_name, query_json="", freshness_json="", params=None, st
         a.append(f"--started-epoch {started_epoch:.0f}")
     for k, v in (params or {}).items():
         a.append(f"--param {k}={v}")
-    sh(f"python {HERE}/capture.py " + " ".join(a), {"PROM_URL": PROM_URL}, check=False)
+    # sys.executable, not "python": host `/bin/sh` often has only python3 on PATH (macOS), so a bare
+    # `python` silently no-ops capture. Driver-Job core_cmds keep `python` (python:3.12-slim has it).
+    sh(f"{sys.executable} {HERE}/capture.py " + " ".join(a), {"PROM_URL": PROM_URL}, check=False)
 
 
 def phase_finalize():
