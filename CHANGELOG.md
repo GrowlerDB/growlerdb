@@ -36,7 +36,7 @@ ORDERED BY (ts, …)` sets it) for the `ts` row-group prune to fire. The `growle
 - **At-scale comparison benchmark suite** (`bench/scale`) — GrowlerDB vs OpenSearch + Data Prepper with a
   Trino/Iceberg baseline: a neutral open-loop driver (per-query-group pass isolation + concurrency sweep),
   a sentinel-row freshness harness, a synthetic `http_logs` corpus, and a documented fairness charter. This
-  is the scale-test infrastructure behind the hydration work; the published head-to-head is a follow-up.
+  is the scale-test infrastructure behind the hydration work.
 
 ### Changed
 

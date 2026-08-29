@@ -13,8 +13,8 @@ nav_order: 9
 > **Directional, not the formal suite.** These numbers come from a ballpark assessment on a small
 > dev VM (4 GiB / 2 vCPU, lima), not the pre-1.0 at-scale benchmark. Absolute latencies are
 > small-scale and cache-warm, so the ratios and the findings are the signal, not the milliseconds.
-> The formal staged suite (real hardware, tens of millions of rows, QPS/p95/p99, cold-tier
-> read-through, hydration throughput) is tracked on the [roadmap](roadmap). Reproduce everything here
+> This is a directional read, not the formal staged suite (real hardware, tens of millions of rows,
+> QPS/p95/p99, cold-tier read-through, hydration throughput). Reproduce everything here
 > from [`bench/`](https://github.com/GrowlerDB/growlerdb/tree/main/bench) in the repo.
 
 ## What was measured
@@ -87,7 +87,6 @@ fields you serve hot, and reserve hydration for governed/audit reads.
   fields close it for the display case.
 - The cold-tier read path already serves cold data without a full restore, but its at-scale
   read-through latency is part of the formal suite, not measured here.
-- These are single-node, cache-warm, small-VM numbers. The formal suite (real hardware, tens of
+- These are single-node, cache-warm, small-VM numbers, not the formal suite (real hardware, tens of
   millions of events, concurrency/QPS, p95/p99, cold vs warm cache, hydration throughput at K, an
-  apples-to-apples ES/OpenSearch-at-scale and Spark/Trino full-text baseline) is the pre-1.0
-  deliverable on the [roadmap](roadmap).
+  apples-to-apples ES/OpenSearch-at-scale and Spark/Trino full-text baseline).
