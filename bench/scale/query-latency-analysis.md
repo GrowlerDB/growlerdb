@@ -242,9 +242,36 @@ env-tunable knobs so an operator matches concurrency to the object store's GET h
 MinIO pod onto the same nbg1 Hetzner Object Storage bucket (`S3_PROFILE=hetzner`), so the under-load
 hydration number can be taken against a real, in-region store instead of the single-pod artifact.
 
-**Not yet measured at scale.** The at-rest and under-load impact on a real store needs the symmetric run
-below, run with `S3_PROFILE=hetzner` — the local numbers prove the *mechanism and its shape*, not the
-cluster magnitude.
+## Measured at scale — Hetzner run (2026-08-29, 10 GB, 6× ccx43 nbg1, image dev-a9177ee)
+
+First full run on a real, in-region object store (Hetzner OS, `S3_PROFILE=hetzner`). Every Hetzner
+client path validated (generator write, Data Prepper read, Spark connector read, engine hydrate;
+convergence EXACT both engines, `sample_integrity: PASS`).
+
+**topk_hydrated, at rest (10 qps, mixed, 0 err) — the objective (`<1 s`) is met:**
+
+| | old single-MinIO 10 qps | **Hetzner 10 qps (this run)** |
+|---|---|---|
+| topk_hydrated p50 / p99 | 1153 ms | **437 / 525 ms** (2.6×) |
+| topk_recent p50 / p99 | 431 ms | **239 / 295 ms** |
+
+Index-only at rest unchanged/robust (point_lookup 4.8, term 21, bool_must 75 ms, 0 err). So Hetzner +
+concurrent reads put per-request hydration **well under the 1 s target**.
+
+**Under load (200 qps mixed + 50→800 sweep) — still tail-bound:** topk_hydrated **6.6 s p50** (was 19.5 s
+on single-MinIO, ~3×) but **p99 ≈30 s with 8 client timeouts**; achieved 52 qps (was 31). The errors are
+**all 30 s client timeouts, zero Hetzner-side 5xx/throttle** — Hetzner is healthy. The tail is a
+**concurrency pile-up**: engine-internal hydration is p50 5.2 s / p95+ ≥10 s under load (vs ~0.4 s at
+rest) because ~30 topk req/s × `buffered(8)` each = hundreds of concurrent GETs flood the store and the
+nodes. Index-only retrieval stayed clean (internal p50 16 ms). Freshness on Hetzner: p50 2.55 s, 0
+timeouts (the driver-S3 fix).
+
+**Tail fix shipped (this round):** a node-wide cap on concurrent object-store reads across ALL in-flight
+hydrations — `read_conc::INFLIGHT_READS`, `GROWLERDB_HYDRATE_MAX_INFLIGHT_READS` (default 32) — so a
+top-k burst can't flood the store; requests queue for a slot and complete in bounded time. Correctness
+tested (48 wanted reads bounded to 32, all keys still found); **its p99 impact needs the next run to
+measure.** Remaining: tune the knobs on a real store (a sweep — needs a run), the 10 s engine hydration
+ceiling, and isolate topk in the driver (a dedicated pool) so index-only throughput isn't starved.
 
 ## Where hydration parallelism can live (coordinator ↔ nodes)
 
