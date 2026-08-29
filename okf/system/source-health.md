@@ -15,7 +15,7 @@ walk the current snapshot's data files. So a source table that accumulates **sma
 at the real cause.
 
 GrowlerDB is **never** responsible for maintaining the source table — compaction, `expire_snapshots`,
-and orphan cleanup are the user's job, outside GrowlerDB ([D30](/system/decisions/d30-layered-locator.md)).
+and orphan cleanup are the user's job, outside GrowlerDB ([D54](/system/decisions/d54-store-less-hydration.md)).
 Its job is **observability**: emit gauges that let an operator *diagnose* that the source wants
 maintenance. It never runs that maintenance itself. This closes
 [scale ceiling #2](/quality/known-limitations/scale-ceilings.md): the deliverable is

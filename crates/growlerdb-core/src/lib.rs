@@ -17,8 +17,8 @@ pub mod window;
 
 pub use api::{
     cmp_sort_value, sort_has_score, validate_aggs, Agg, AggRange, CollapsedHit, CommitBatch, DocOp,
-    Highlight, HighlightFragment, HighlightSegment, Hit, HydratedRow, IndexReader, IndexWriter,
-    LocatedDoc, Projection, RowLocator, SearchAfter, SearchParams, ShardHits, Snapshot, Sort,
+    Highlight, HighlightFragment, HighlightSegment, Hit, HydrateRequest, HydratedRow, IndexReader,
+    IndexWriter, LocatedDoc, Projection, SearchAfter, SearchParams, ShardHits, Snapshot, Sort,
     SortOrder, SortValue, DEFAULT_HIGHLIGHT_FRAGMENT_SIZE, DEFAULT_HIGHLIGHT_MAX_FRAGMENTS,
     SCORE_SORT_KEY,
 };
@@ -30,9 +30,9 @@ pub use embed::{
 };
 pub use index_def::{
     validate_index_name, AlterPlan, DefError, EmbedProvider, EqualityDeleteHandling, FieldMapping,
-    FieldType, FlattenConfig, IcebergSource, IndexDefinition, KeySpec, LocationStrategy, Mapping,
-    ResolvedField, ResolvedIndex, ResolvedKey, ResolvedShape, ResolvedVariant, ScanMode, Selection,
-    Source, SourceField, SourceSchema, SourceType, TextRecord, VariantMappingOpts, VariantShape,
+    FieldType, FlattenConfig, IcebergSource, IndexDefinition, KeySpec, Mapping, ResolvedField,
+    ResolvedIndex, ResolvedKey, ResolvedShape, ResolvedVariant, ScanMode, Selection, Source,
+    SourceField, SourceSchema, SourceType, TextRecord, VariantMappingOpts, VariantShape,
     VectorMappingOpts, VectorMetric, VectorSpec, DEFAULT_EMBED_DIMS, DEFAULT_EMBED_MODEL,
     MAX_CACHED_FIELD_BYTES,
 };

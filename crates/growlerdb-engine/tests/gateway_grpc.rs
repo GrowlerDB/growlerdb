@@ -55,8 +55,6 @@ fn shard(root: &std::path::Path) -> Arc<Shard> {
         f.insert("rank".to_string(), Value::Int(rank));
         LocatedDoc {
             doc: Document::new(key, f),
-            iceberg_file: "f".into(),
-            row_position: 0,
         }
     };
     IndexWriter::write(

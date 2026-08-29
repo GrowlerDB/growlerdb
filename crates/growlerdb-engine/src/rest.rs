@@ -2745,8 +2745,6 @@ mod tests {
             f.insert("rank".to_string(), Value::Int(rank));
             LocatedDoc {
                 doc: Document::new(key, f),
-                iceberg_file: "f".into(),
-                row_position: 0,
             }
         };
         IndexWriter::write(
@@ -2841,8 +2839,6 @@ mod tests {
             f.insert("body".to_string(), Value::from(body));
             LocatedDoc {
                 doc: Document::new(key, f),
-                iceberg_file: "f".into(),
-                row_position: 0,
             }
         };
         let mut docs = vec![

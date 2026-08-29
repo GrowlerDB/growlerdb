@@ -3160,8 +3160,6 @@ mod tests {
                 f.insert("cat".to_string(), Value::from(*cat));
                 LocatedDoc {
                     doc: Document::new(key, f),
-                    iceberg_file: "f".into(),
-                    row_position: 0,
                 }
             })
             .collect();
@@ -3217,8 +3215,6 @@ mod tests {
                 f.insert("id".to_string(), Value::from(id.as_str()));
                 LocatedDoc {
                     doc: Document::new(key, f),
-                    iceberg_file: "f".into(),
-                    row_position: 0,
                 }
             })
             .collect();

@@ -57,8 +57,6 @@ fn build_windowed_index(data_dir: &std::path::Path, index: &str, only: &str) {
         &CommitBatch::from_upserts(
             vec![LocatedDoc {
                 doc: Document::new(key, fields),
-                iceberg_file: "f0".into(),
-                row_position: 0,
             }],
             SourceCheckpoint::iceberg(1),
             "b1",

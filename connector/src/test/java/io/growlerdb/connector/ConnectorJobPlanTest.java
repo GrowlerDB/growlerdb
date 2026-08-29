@@ -25,7 +25,7 @@ class ConnectorJobPlanTest {
 
   /** A changelog row in {@code snapshot} (only the snapshot id matters to windowing). */
   private static ChangelogRow row(long snapshot) {
-    return new ChangelogRow(ChangeType.INSERT, snapshot, snapshot, Map.of(), "f", 0);
+    return new ChangelogRow(ChangeType.INSERT, snapshot, snapshot, Map.of());
   }
 
   private static List<ChangelogRow> rows(long snapshot, int n) {
@@ -154,7 +154,7 @@ class ConnectorJobPlanTest {
           @Override
           public ChangelogRow next() {
             long s = ++i;
-            return new ChangelogRow(ChangeType.INSERT, s, s, Map.of(), "f", 0);
+            return new ChangelogRow(ChangeType.INSERT, s, s, Map.of());
           }
         };
 

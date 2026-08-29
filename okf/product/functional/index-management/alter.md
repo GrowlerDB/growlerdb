@@ -16,7 +16,7 @@ change. A multi-shard index is applied by the [control plane](/system/runtime/co
   flip, and a **`max_bytes`** redeclaration. Nothing stored or indexed differs.
 - **Reindex-requiring** — everything else needs a rebuild: **adding or removing** a mapped field, any
   field **type/analyzer/`record`/`fieldnorms`/`fast`/`indexed`/`cached`/vector/variant** change, and
-  **key/`source`/`shard_count`/`location_strategy`** changes. A segment's Tantivy schema is fixed at
+  **key/`source`/`shard_count`** changes. A segment's Tantivy schema is fixed at
   build time, so these can't be applied to existing segments. (Adding new keys *within* a VARIANT field
   is not a definition change — those flatten in place, no reindex.)
 

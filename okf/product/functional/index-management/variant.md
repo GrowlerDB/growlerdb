@@ -96,7 +96,7 @@ tables routes through **Trino in the interim** (released iceberg-rust cannot yet
 variant schema — see [D49](/system/decisions/d49-variant-iceberg-rust-routing.md) for the full
 per-call-site routing), and the **native Rust path takes over** — batch build and in-point-read
 variant decode — once iceberg-rust ships variant support, leaving Trino as the permanent slow lane
-for delete-bearing files and the stale-locator fallback.
+for delete-bearing files and the unprunable-scan fallback.
 
 Phasing: **first** flatten end-to-end (connector ingest + Trino-backed hydration); **then**
 shapes — discriminator, typed fields and flags, shredding-aware reads; **then** the native-path

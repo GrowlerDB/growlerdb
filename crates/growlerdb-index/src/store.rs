@@ -1,7 +1,5 @@
-//! `LocalIndexStore` — one Tantivy index per shard plus a small redb aux store, with an
-//! incremental, crash-safe commit. Crash safety (D30 layered locator): `location.arr` is fsynced
-//! first, then the Tantivy commit, then the redb checkpoint txn; a crash re-applies the batch on
-//! resume, idempotent on the key (delete-then-add). Commits are idempotent on `batch_id`.
+//! `LocalIndexStore` — one Tantivy index per shard plus a small redb aux store, with an incremental,
+//! crash-safe commit: Tantivy commits before the redb checkpoint txn, so a crash replays the batch on resume, idempotent on the key (delete-then-add) and on `batch_id`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -11,13 +9,12 @@ use std::time::{Duration, Instant};
 
 use growlerdb_core::{
     cmp_sort_value, durable, sort_has_score, Agg, CollapsedHit, CommitBatch, CompositeKey, DocOp,
-    Document, Highlight, Hit, IndexReader, IndexWriter, Query, ResolvedIndex, RowLocator,
-    SearchAfter, SearchParams, ShardHits, Snapshot, Sort, SortOrder, SortValue, SourceCheckpoint,
-    Value,
+    Document, Highlight, Hit, IndexReader, IndexWriter, Query, ResolvedIndex, SearchAfter,
+    SearchParams, ShardHits, Snapshot, Sort, SortOrder, SortValue, SourceCheckpoint, Value,
 };
 use redb::{
     Database, MultimapTableDefinition, ReadTransaction, ReadableDatabase, ReadableMultimapTable,
-    ReadableTable, TableDefinition,
+    TableDefinition,
 };
 use serde::{Deserialize, Serialize};
 use tantivy::aggregation::agg_req::Aggregations;
@@ -25,7 +22,6 @@ use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResult
 use tantivy::merge_policy::NoMergePolicy;
 use tantivy::Term;
 
-use crate::location::{LocationStore, LOCATION_FILE};
 use crate::object_directory::ObjectDirectory;
 use crate::range_cache::RangeCache;
 use crate::segment::{
@@ -37,8 +33,8 @@ use crate::segment::{
 /// Engine API put `sort_values` on every wire hit for cross-shard merge.
 type ValuedPage = (Vec<(Hit, Vec<SortValue>)>, Option<SearchAfter>);
 
-// `aux.redb` holds META + BATCH_KEYS (+ its BATCH_CKPT prune index) + FILES. Locators live in
-// the layered store (D30); the live-key set is enumerated from the index with per-term liveness.
+// `aux.redb` holds META + BATCH_KEYS (+ its BATCH_CKPT prune index). The live-key set is
+// enumerated from the index with per-term liveness.
 /// Small store metadata: `checkpoint` (JSON), `snapshot` (u64 LE).
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// `batch_id` → commit snapshot; idempotent-retry guard (the presence of the key, not the
@@ -57,17 +53,6 @@ const BATCH_KEYS: TableDefinition<&str, u64> = TableDefinition::new("batch_keys"
 /// once at open (safe: the window-covering guard makes these records an optimization, not
 /// correctness). A checkpoint with no sequence number gets no entry and is never pruned.
 const BATCH_CKPT: MultimapTableDefinition<i64, &str> = MultimapTableDefinition::new("batch_ckpt");
-/// **Interned data-file table** (D30 location layer): dense `file_id: u32` → Iceberg data-file
-/// path; the shard keeps an in-memory bidirectional map, loaded from here at open. New interns
-/// commit in the post-Tantivy redb txn — a crash before it only orphans array slots (benign; the
-/// batch replay re-interns and re-patches).
-const FILES: TableDefinition<u32, &str> = TableDefinition::new("files");
-/// **Dead-file bitmap** (D30 `coordinates` strategy): interned `file_id`s whose data file an
-/// Iceberg rewrite removed from the live table. A parallel key-set table keeps the [`FILES`] rows
-/// immutable and marking cheap. Dead flags are **permanent tombstones** — interns are dense and
-/// append-only, so an id is never reused and a flag never has to be cleared. Hydration consults it
-/// to skip doomed point reads; the background re-map patches only slots still pointing at a dead file.
-const DEAD_FILES: TableDefinition<u32, ()> = TableDefinition::new("dead_files");
 
 const META_CHECKPOINT: &str = "checkpoint";
 const META_SNAPSHOT: &str = "snapshot";
@@ -136,10 +121,6 @@ pub struct ColdMarker {
     /// A parked window is immutable, so the snapshot is frozen. `None` if parked before replica support.
     #[serde(default)]
     pub aux_key: Option<String>,
-    /// Object key of the parked window's `location.arr` (the [D30](/system/decisions/d30-layered-locator.md)
-    /// locator array), the sidecar counterpart to [`aux_key`](Self::aux_key) for a replica open.
-    #[serde(default)]
-    pub location_key: Option<String>,
 }
 
 /// Cap on concurrently-open point-in-time handles per shard. Each held
@@ -324,8 +305,7 @@ impl LocalIndexStore {
 
     /// Create (or open) a shard for `index`, deriving its schema. Opens the shard's
     /// single Tantivy index (creating it if absent; Tantivy recovers any uncommitted
-    /// writer state on open), its redb aux store, and its dense location array
-    /// (`location.arr`, the D30 location layer).
+    /// writer state on open) and its redb aux store.
     pub fn create_shard(&self, id: &ShardId, index: &ResolvedIndex) -> Result<Shard> {
         self.build_shard(self.root.join(id.rel_path()), index)
     }
@@ -350,7 +330,7 @@ impl LocalIndexStore {
 
     /// Open a **cold** window shard **read-through**: its Tantivy index is served from
     /// object storage under `prefix` in `op` (via [`ObjectDirectory`] + the shared range `cache`),
-    /// while its `aux.redb` (locator + event-time zone-map) stays **local** under `aux_dir` — kept
+    /// while its `aux.redb` (checkpoints + event-time zone-map) stays **local** under `aux_dir` — kept
     /// in the cold footprint when the index bulk was parked. The shard is **read-only** (no writer);
     /// the gateway routes only searches to it, and every search method works unchanged over the
     /// read-through reader. Must be called from within a tokio runtime, since `ObjectDirectory`
@@ -409,9 +389,6 @@ impl LocalIndexStore {
             Some(db) => db,
             None => Arc::new(Database::open(aux_dir.join("aux.redb"))?),
         };
-        // A cold shard's `location.arr` stays local beside aux.redb (D30: tiny, never parked).
-        let location = LocationStore::open(&aux_dir.join(LOCATION_FILE))?;
-        let files = Mutex::new(FileIntern::load(&db)?);
         Ok(Shard {
             index: tantivy,
             // No local Tantivy dir; the search path never reads `index_dir` (only backup/replica
@@ -420,8 +397,6 @@ impl LocalIndexStore {
             core,
             schema,
             db,
-            location,
-            files,
             writer: None,
             pits: Mutex::new(HashMap::new()),
             next_pit: AtomicU64::new(1),
@@ -431,14 +406,8 @@ impl LocalIndexStore {
         })
     }
 
-    /// Open a **parked window as a cross-node replica** (D53): unlike [`open_cold_shard`], which
-    /// reads the window's `aux.redb` + `location.arr` from a **local** `aux_dir` (the primary keeps
-    /// them beside the marker), a replica on another node has no local copy — so this fetches both
-    /// sidecars from object storage (the [`aux_key`](ColdMarker::aux_key) /
-    /// [`location_key`](ColdMarker::location_key) `backup()` uploaded) into `scratch_dir`, then opens
-    /// the window read-through exactly like a cold open. The window is immutable, so the fetched
-    /// snapshot is consistent and never re-synced. Errors if the marker predates replica support
-    /// (no sidecar keys — re-park to enable it).
+    /// Open a **parked window as a cross-node replica** (D53): a replica has no local `aux_dir`, so it
+    /// fetches the `aux.redb` sidecar ([`aux_key`](ColdMarker::aux_key)) into `scratch_dir` and opens read-through like a cold open. Errors if the marker predates replica support (no sidecar key).
     pub fn open_cold_replica(
         &self,
         index: &ResolvedIndex,
@@ -447,26 +416,24 @@ impl LocalIndexStore {
         marker: &ColdMarker,
         cache: RangeCache,
     ) -> Result<Shard> {
-        let (aux_key, location_key) = match (&marker.aux_key, &marker.location_key) {
-            (Some(a), Some(l)) => (a, l),
-            _ => return Err(StoreError::Cold(
-                "parked window has no replica sidecar keys (aux_key/location_key) — re-park it \
+        let aux_key = match &marker.aux_key {
+            Some(a) => a,
+            None => {
+                return Err(StoreError::Cold(
+                    "parked window has no replica sidecar key (aux_key) — re-park it \
                      to enable cross-node replica read-through"
-                    .into(),
-            )),
+                        .into(),
+                ))
+            }
         };
         std::fs::create_dir_all(scratch_dir)?;
-        // Blocking operator for the two one-shot sidecar downloads (this open path is synchronous).
+        // Blocking operator for the one-shot sidecar download (this open path is synchronous).
         let bop = opendal::blocking::Operator::new(op.clone())
             .map_err(|e| StoreError::Cold(e.to_string()))?;
         let aux = bop
             .read(aux_key)
             .map_err(|e| StoreError::Cold(e.to_string()))?;
         std::fs::write(scratch_dir.join("aux.redb"), aux.to_vec())?;
-        let location = bop
-            .read(location_key)
-            .map_err(|e| StoreError::Cold(e.to_string()))?;
-        std::fs::write(scratch_dir.join(LOCATION_FILE), location.to_vec())?;
         let bundle = marker
             .bundle_key
             .as_deref()
@@ -720,9 +687,6 @@ impl LocalIndexStore {
                 db
             }
         };
-        // The dense location array sits beside aux.redb.
-        let location = LocationStore::open(&dir.join(LOCATION_FILE))?;
-        let files = Mutex::new(FileIntern::load(&db)?);
         let writer: tantivy::IndexWriter = tantivy
             .writer(WRITER_HEAP_BYTES)
             .map_err(|e| StoreError::Segment(e.into()))?;
@@ -733,8 +697,6 @@ impl LocalIndexStore {
             core,
             schema,
             db,
-            location,
-            files,
             writer: Some(Mutex::new(writer)),
             pits: Mutex::new(HashMap::new()),
             next_pit: AtomicU64::new(1),
@@ -807,8 +769,7 @@ impl LocalIndexStore {
         }
 
         // Build + populate the replacement, then drop it so its files are flushed and
-        // closed. The rebuild re-adds every doc from the source through the normal
-        // commit path, so each one gets its `_locid` fast field and `location.arr` slot.
+        // closed. The rebuild re-adds every doc from the source through the normal commit path.
         {
             let staged = self.build_shard(staging.clone(), index)?;
             populate(&staged)?;
@@ -955,63 +916,6 @@ impl LocalIndexStore {
 /// promote on recovery. Any non-empty payload works; the *presence* is the signal.
 const REINDEX_COMMIT_MARKER: &[u8] = b"reindex-committed\n";
 
-/// The in-memory **bidirectional file-intern map** over the redb [`FILES`] table (D30
-/// location layer): path→id to intern at commit, id→path to resolve a location entry.
-/// Ids are allocated **densely** (`next = len`), so a reopened map continues exactly
-/// where the persisted table stopped.
-#[derive(Default)]
-struct FileIntern {
-    path_to_id: HashMap<String, u32>,
-    id_to_path: HashMap<u32, String>,
-    /// Interned ids flagged **dead** (the file was rewritten away by an Iceberg
-    /// `replace`) — the in-memory view of the [`DEAD_FILES`] table.
-    dead: HashSet<u32>,
-}
-
-impl FileIntern {
-    /// Load the persisted table (empty when the shard has never interned a file),
-    /// plus the [`DEAD_FILES`] bitmap.
-    fn load(db: &Database) -> Result<Self> {
-        let txn = db.begin_read()?;
-        let mut intern = Self::default();
-        match txn.open_table(FILES) {
-            Ok(table) => {
-                for entry in table.iter()? {
-                    let (id, path) = entry?;
-                    let (id, path) = (id.value(), path.value().to_string());
-                    intern.path_to_id.insert(path.clone(), id);
-                    intern.id_to_path.insert(id, path);
-                }
-            }
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(intern),
-            Err(e) => return Err(e.into()),
-        }
-        match txn.open_table(DEAD_FILES) {
-            Ok(table) => {
-                for entry in table.iter()? {
-                    let (id, _) = entry?;
-                    intern.dead.insert(id.value());
-                }
-            }
-            Err(redb::TableError::TableDoesNotExist(_)) => {}
-            Err(e) => return Err(e.into()),
-        }
-        Ok(intern)
-    }
-
-    /// The id for `path`, interning it densely if new. Returns `(id, newly_interned)`;
-    /// the caller persists new interns in the post-Tantivy redb txn.
-    fn intern(&mut self, path: &str) -> (u32, bool) {
-        if let Some(&id) = self.path_to_id.get(path) {
-            return (id, false);
-        }
-        let id = self.path_to_id.len() as u32;
-        self.path_to_id.insert(path.to_string(), id);
-        self.id_to_path.insert(id, path.to_string());
-        (id, true)
-    }
-}
-
 /// Total size in bytes of the files under `dir` (recursive); 0 if absent/unreadable. Best-effort
 /// disk-usage for the per-shard size signal.
 fn dir_size_bytes(dir: &Path) -> u64 {
@@ -1046,11 +950,9 @@ pub struct IndexSizeBreakdown {
     pub fast: u64,
     /// Stored-document data.
     pub store: u64,
-    /// Segment/index metadata, deletes, and anything else under `index_dir`.
+    /// Segment/index metadata, deletes, and anything else under `index_dir`, plus the sibling
+    /// `aux.redb` (checkpoint / batch idempotency / zone-map).
     pub other: u64,
-    /// The hydration lookup structures: the dense `location.arr` (D30) plus the slim
-    /// redb `aux.redb` (checkpoint / batch idempotency / file interns / zone-map).
-    pub locator: u64,
 }
 
 impl IndexSizeBreakdown {
@@ -1060,25 +962,11 @@ impl IndexSizeBreakdown {
     }
 
     /// Every component summed — the shard's full on-disk index footprint (Tantivy files
-    /// **plus** the locator layers). This is what `growlerdb_index_bytes` reports, so the
+    /// **plus** the sibling `aux.redb`). This is what `growlerdb_index_bytes` reports, so the
     /// total gauge and `sum(growlerdb_index_bytes_component)` reconcile exactly.
     pub fn total(&self) -> u64 {
-        self.inverted() + self.fast + self.store + self.other + self.locator
+        self.inverted() + self.fast + self.store + self.other
     }
-}
-
-/// The outcome of one [`Shard::remap_locations`] pass: how many
-/// slots were re-pointed at the rewritten rows' new locations, and why the rest were
-/// (safely) skipped.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RemapStats {
-    /// Slots patched: keys whose slot still pointed at a dead file.
-    pub remapped: u64,
-    /// Keys with no live doc — deleted since the rewrite, or not yet ingested.
-    pub skipped_no_live_doc: u64,
-    /// Keys whose slot already points at a live file — ingest or a lazy hydration
-    /// refresh re-pointed it first, so the re-mapped row would be stale.
-    pub skipped_already_live: u64,
 }
 
 /// `{dir}` → a sibling path `{dir}.{suffix}` (e.g. `…/docs/0` → `…/docs/0.reindex`).
@@ -1363,7 +1251,7 @@ pub struct BackupSnapshot {
 }
 
 /// A single shard's store: its **one** Tantivy index (+ a live reader), the derived
-/// schema, the dense location array, and a small redb aux store (checkpoint / batch
+/// schema and a small redb aux store (checkpoint / batch
 /// ids / file interns).
 pub struct Shard {
     index: tantivy::Index,
@@ -1373,17 +1261,12 @@ pub struct Shard {
     /// The live reader (auto-reloads on commit); all non-PIT reads go through it.
     core: SegmentReader,
     schema: IndexSchema,
-    /// The redb aux store (locator + interned files + checkpoints). Behind an `Arc` because redb
+    /// The redb aux store (checkpoints + batch idempotency + zone-map). Behind an `Arc` because redb
     /// permits only **one** open handle per file per process, yet an in-process hot↔cold tier swap
     /// (park / pre-warm) has both the retiring and the arriving shard live at once — they **share**
     /// this one handle across the swap (`aux.redb` stays local and unchanged through it) rather than
     /// racing a second `Database::open`.
     db: Arc<Database>,
-    /// The dense **location array** (`location.arr`, the D30 location layer). Writes
-    /// happen under the writer lock (the commit path); reads are lock-free.
-    location: LocationStore,
-    /// In-memory bidirectional map over the [`FILES`] intern table, loaded at open.
-    files: Mutex<FileIntern>,
     /// The **single, long-lived** Tantivy writer, behind a `Mutex` (Tantivy allows one
     /// writer; the lock also serializes commits). Created with [`NoMergePolicy`] once at
     /// open so segments accumulate per commit and only [`compact`](Shard::compact) merges
@@ -1393,7 +1276,7 @@ pub struct Shard {
     writer: Option<Mutex<tantivy::IndexWriter>>,
     /// Open **point-in-time** handles: each holds a pinned Tantivy
     /// [`SegmentReader`] snapshot (its segment ref-counting keeps the files alive
-    /// through compaction) + a redb read txn (as-of-`S` locator/snapshot). Bounded by
+    /// through compaction) + a redb read txn (as-of-`S` snapshot). Bounded by
     /// [TTL expiry](Shard::expire_pits) + [`MAX_OPEN_PITS`].
     pits: Mutex<HashMap<u64, PitEntry>>,
     /// Monotonic source of opaque PIT ids.
@@ -1401,14 +1284,14 @@ pub struct Shard {
     /// Max docs per Tantivy commit inside [`commit_staged`](Shard::commit_staged). Set from
     /// [`commit_chunk_docs`] (env) at open; tests set it directly. `0` ⇒ commit the whole batch at once.
     commit_chunk: usize,
-    /// Test-only recorder of the commit's durability ordering (array fsync → Tantivy
-    /// commit → redb txn) so the D30 crash contract is asserted, not just documented.
+    /// Test-only recorder of the commit's durability ordering (Tantivy commit → redb txn)
+    /// so the crash contract is asserted, not just documented.
     #[cfg(test)]
     commit_trace: Mutex<Vec<&'static str>>,
 }
 
 /// A live point-in-time handle: the pinned Tantivy snapshot (shared so concurrent PIT
-/// reads don't serialize) + the redb view (as-of-`S` locator/snapshot), and the
+/// reads don't serialize) + the redb view (as-of-`S` snapshot), and the
 /// last-used time for [idle TTL expiry](Shard::expire_pits).
 struct PitEntry {
     core: Arc<SegmentReader>,
@@ -1449,7 +1332,7 @@ impl ReadView {
 }
 
 /// Staged-but-uncommitted work from [`stage`](Shard::stage_batch): the effective
-/// per-key upserts (document + locator) and deleted keys that
+/// per-key upserts (document) and deleted keys that
 /// [`commit`](Shard::commit_staged) applies to the Tantivy index. `already_applied`
 /// marks a batch whose `batch_id` was already committed (an idempotent no-op).
 pub struct StagedRef {
@@ -1458,8 +1341,8 @@ pub struct StagedRef {
     /// `None` = a bootstrap batch (from the start of the changelog).
     from_checkpoint: Option<SourceCheckpoint>,
     batch_id: String,
-    /// `(enc(key), document, locator)` for each upserted doc.
-    upserts: Vec<(Vec<u8>, Document, RowLocator)>,
+    /// `(enc(key), document)` for each upserted doc.
+    upserts: Vec<(Vec<u8>, Document)>,
     /// `enc(key)` of deleted docs.
     deletes: Vec<Vec<u8>>,
     already_applied: bool,
@@ -1496,7 +1379,7 @@ enum Continuity {
 impl Shard {
     /// Whether this shard is a **read-only cold read-through** shard (served from object storage
     /// via [`open_cold_shard`](LocalIndexStore::open_cold_shard), no local writer). A hot shard
-    /// has a writer; a cold one does not. Background writers (auto-compaction, locator re-map)
+    /// has a writer; a cold one does not. Background writers (auto-compaction)
     /// key off this to stand down the moment a window is parked underneath a live handle.
     pub fn is_read_only(&self) -> bool {
         self.writer.is_none()
@@ -1568,7 +1451,7 @@ impl Shard {
     }
 
     /// **Stage** a batch: reduce its ops to last-write-wins per key and collect the
-    /// effective upserts (document + locator) and deleted keys. No Tantivy write yet —
+    /// effective upserts (documents) and deleted keys. No Tantivy write yet —
     /// [`commit`](Self::commit_staged) applies it. An already-applied batch (by
     /// `batch_id`) stages as a no-op.
     ///
@@ -1616,7 +1499,7 @@ impl Shard {
             effective.insert(enc, op.clone());
         }
 
-        let mut upserts: Vec<(Vec<u8>, Document, RowLocator)> = Vec::new();
+        let mut upserts: Vec<(Vec<u8>, Document)> = Vec::new();
         let mut deletes: Vec<Vec<u8>> = Vec::new();
         // A stage-time NoOp (window ends at/behind this shard) stages no content: the
         // checkpoint only advances, so commit's authoritative re-decision can't flip a
@@ -1624,13 +1507,7 @@ impl Shard {
         if !already_applied && !stage_noop {
             for (enc, op) in effective {
                 match op {
-                    DocOp::Upsert(d) => {
-                        let locator = RowLocator {
-                            iceberg_file: d.iceberg_file.clone(),
-                            row_position: d.row_position,
-                        };
-                        upserts.push((enc, d.doc.clone(), locator));
-                    }
+                    DocOp::Upsert(d) => upserts.push((enc, d.doc.clone())),
                     DocOp::Delete(_) => deletes.push(enc),
                 }
             }
@@ -1647,28 +1524,8 @@ impl Shard {
         })
     }
 
-    /// **Commit** staged work: apply native-delete upserts/deletes to the single Tantivy
-    /// index and commit it (durable first), reload the live reader, then in one redb txn
-    /// advance the checkpoint/snapshot, record the batch ids, and persist new file
-    /// interns. A crash between the two commits re-applies the batch on resume —
-    /// idempotent on the key (delete-then-add), so exactly-once holds.
-    ///
-    /// The D30 layered locator adds a step *before* the Tantivy commit:
-    /// each upsert resolves a **locator ID** — reusing (and patching in place) the id
-    /// of the key's live doc when one exists, else appending a fresh `location.arr`
-    /// slot — attaches it to the doc as the `_locid` fast field, and the array is
-    /// **fsynced before** `writer.commit()`. Ordering matters: a crash after the fsync
-    /// but before the Tantivy commit leaves only unreachable orphan slots, never a
-    /// committed doc pointing at unwritten location bytes. A patched slot whose
-    /// Tantivy commit is then lost is also benign: the old doc's id now resolves to the
-    /// *newer source row of the same key* — verification passes and the replay
-    /// re-applies the batch. **Deletes never touch the array** — a deleted doc's slot
-    /// just becomes unreachable (12 B leaked until store compaction).
-    ///
-    /// A **`PREDICATE`** index (D30 location strategies) stores **no
-    /// location data at all**: no file interns, no `location.arr` appends, and the
-    /// `_locid` fast field — kept in the schema for uniformity — is never populated.
-    /// The commit collapses to the plain two-phase Tantivy-then-redb ordering.
+    /// **Commit** staged work to the single Tantivy index (durable first), reload the reader, then in
+    /// one redb txn advance checkpoint/snapshot + batch ids. Store-less (no source-location data), so a crash replays the batch idempotently (delete-then-add) — plain two-phase Tantivy-then-redb.
     pub fn commit_staged(&self, staged: &[StagedRef]) -> Result<Snapshot> {
         let mut writer = self
             .writer
@@ -1731,40 +1588,19 @@ impl Shard {
             return Ok(Snapshot(snapshot));
         }
 
-        // 1) Apply to Tantivy — writing each upsert's location slot as we go — then
-        //    fsync the array and commit Tantivy (the durable point).
+        // 1) Apply to Tantivy, then commit it (the durable point).
         let key_enc = self.schema.key_enc_field();
-        // A PREDICATE index keeps no location layer: skip interns, slots, `_locid`.
-        let store_locations =
-            self.schema.location_strategy() == growlerdb_core::LocationStrategy::Coordinates;
-        // Newly interned file ids, persisted in the post-Tantivy redb txn below.
-        let mut new_files: Vec<(u32, String)> = Vec::new();
-        // Ids assigned earlier in THIS commit, per key — the pre-batch searcher can't
-        // see uncommitted docs, so a key upserted twice across staged batches must
-        // reuse its in-commit id (patch), not append a second slot.
-        let mut seen: HashMap<&[u8], u64> = HashMap::new();
-        // Per-phase write latency (apply / location_sync / tantivy_commit / redb) so a high
+        // Per-phase write latency (apply / tantivy_commit / redb) so a high
         // `growlerdb_write_duration_seconds` is attributable to a phase.
         let phase_secs = |name: &'static str, secs: f64| {
             metrics::histogram!("growlerdb_write_phase_duration_seconds", "phase" => name)
                 .record(secs);
         };
-        // Bound each Tantivy commit to `chunk` docs (`0` = one commit). Each flush runs the D30
-        // durability order (array synced → writer committed → searcher reloaded), but the redb
-        // checkpoint still advances exactly once at the end — so the crash invariant holds:
-        // intermediate commits leave the index ahead of the un-advanced checkpoint, and a crash
-        // before the redb txn replays the whole batch idempotently. The `seen`/`new_files`/intern
-        // state carries across chunks, so a cross-chunk re-upsert of a key still reuses one slot.
+        // Bound each Tantivy commit to `chunk` docs (`0` = one commit). The redb checkpoint still
+        // advances once at the end, so a crash before it replays the whole batch idempotently.
         let chunk = self.commit_chunk;
-        // A chunk flush: durable-order commit (D30: sync the array first when `store_locations`).
         macro_rules! flush_chunk {
             () => {{
-                if store_locations {
-                    let t = std::time::Instant::now();
-                    self.location.sync()?;
-                    self.trace("location_sync");
-                    phase_secs("location_sync", t.elapsed().as_secs_f64());
-                }
                 let t = std::time::Instant::now();
                 writer.commit().map_err(|e| StoreError::Segment(e.into()))?;
                 self.trace("tantivy_commit");
@@ -1779,37 +1615,11 @@ impl Shard {
             for enc in &s.deletes {
                 writer.delete_term(Term::from_field_bytes(key_enc, enc));
             }
-            for (enc, doc, locator) in &s.upserts {
+            for (enc, doc) in &s.upserts {
                 // delete-then-add: the new doc out-opstamps the delete and survives,
                 // while the prior committed version is removed.
                 writer.delete_term(Term::from_field_bytes(key_enc, enc));
-                let mut td = self.schema.to_tantivy(doc);
-                if store_locations {
-                    let (file_id, newly_interned) = self
-                        .files
-                        .lock()
-                        .expect("file intern not poisoned")
-                        .intern(&locator.iceberg_file);
-                    if newly_interned {
-                        new_files.push((file_id, locator.iceberg_file.clone()));
-                    }
-                    // Reuse the key's live locator id and patch its slot in place (keeping the array
-                    // O(live keys)); append only for a genuinely new key. An insert after a delete of
-                    // the same key finds no live doc and appends a NEW id — the old slot stays orphaned.
-                    let reused = match seen.get(enc.as_slice()) {
-                        Some(&id) => Some(id),
-                        None => self.core.live_loc_id(enc).map_err(StoreError::Segment)?,
-                    };
-                    let id = match reused {
-                        Some(id) => {
-                            self.location.patch(id, file_id, locator.row_position)?;
-                            id
-                        }
-                        None => self.location.append(&[(file_id, locator.row_position)])?,
-                    };
-                    seen.insert(enc.as_slice(), id);
-                    td.add_u64(self.schema.loc_id_field(), id);
-                }
+                let td = self.schema.to_tantivy(doc);
                 writer
                     .add_document(td)
                     .map_err(|e| StoreError::Segment(e.into()))?;
@@ -1828,24 +1638,16 @@ impl Shard {
         // writer (last upsert on a chunk boundary) is a harmless no-op fsync.
         flush_chunk!();
 
-        // Build the per-segment ANN sidecars over the just-committed vectors. Idempotent + skipped
-        // for a non-vector index; runs after the final flush so the reloaded searcher sees every new
-        // segment.
+        // Build the per-segment ANN + completion sidecars over the just-committed segments (idempotent,
+        // skipped when the index has no such field). After the final flush so the reloaded searcher sees every new segment.
         self.build_ann_sidecars()?;
+        self.build_completion_sidecars()?;
 
-        // 2) redb: checkpoint + snapshot + batch ids + new file-table interns.
+        // 2) redb: checkpoint + snapshot + batch ids.
         let t_redb = std::time::Instant::now();
         let snapshot = self.current_snapshot()? + 1;
         let txn = self.db.begin_write()?;
         {
-            if !new_files.is_empty() {
-                // A crash before this commit re-interns the same ids deterministically on replay
-                // (dense allocation from the persisted table's length).
-                let mut files = txn.open_table(FILES)?;
-                for (id, path) in &new_files {
-                    files.insert(id, path.as_str())?;
-                }
-            }
             let mut meta = txn.open_table(META)?;
             // The furthest APPLIED end — `apply` may trail an empty (advance-only) batch
             // behind the last content batch; the checkpoint reflects it.
@@ -1935,218 +1737,6 @@ impl Shard {
             batches.remove(id.as_str())?;
         }
         Ok(())
-    }
-
-    /// Refresh locator entries whose source `(file, position)` moved (Iceberg rewrote the data
-    /// file) — the write-back from hydration's verify-and-fall-back. Only updates keys still present.
-    ///
-    /// Patches the key's `location.arr` slot in place. Ordering keeps the crash invariant that a
-    /// **reachable** slot never references un-durable state: new file interns commit in a redb txn
-    /// *first*, then the slots are patched and the array fsynced (a crash between just leaves the old
-    /// location, which hydration verify-falls-back and refreshes again). Serialized against commits
-    /// by the writer lock.
-    pub fn refresh_locators(&self, entries: &[(CompositeKey, RowLocator)]) -> Result<()> {
-        // A PREDICATE index has no location layer to refresh — the pruned key scan *is* its read
-        // path, so a re-found row is not a "stale locator".
-        if self.schema.location_strategy() == growlerdb_core::LocationStrategy::Predicate {
-            return Ok(());
-        }
-        if entries.is_empty() {
-            return Ok(());
-        }
-        let _guard = self
-            .writer
-            .as_ref()
-            .map(|w| w.lock().expect("writer not poisoned"));
-        // Resolve each key's live loc_id up front (identity + reference layers) and
-        // intern its refreshed file; only keys with a live doc patch.
-        let mut patches: Vec<(u64, u32, u64)> = Vec::new();
-        let mut new_files: Vec<(u32, String)> = Vec::new();
-        for (key, entry) in entries {
-            let Some(loc_id) = self
-                .core
-                .live_loc_id(&key.encode())
-                .map_err(StoreError::Segment)?
-            else {
-                continue; // key deleted since it was hydrated — skip
-            };
-            let (file_id, newly_interned) = self
-                .files
-                .lock()
-                .expect("file intern not poisoned")
-                .intern(&entry.iceberg_file);
-            if newly_interned {
-                new_files.push((file_id, entry.iceberg_file.clone()));
-            }
-            patches.push((loc_id, file_id, entry.row_position));
-        }
-        if !new_files.is_empty() {
-            let txn = self.db.begin_write()?;
-            {
-                let mut files = txn.open_table(FILES)?;
-                for (id, path) in &new_files {
-                    files.insert(id, path.as_str())?;
-                }
-            }
-            txn.commit()?;
-        }
-        if !patches.is_empty() {
-            for (loc_id, file_id, row_position) in patches {
-                self.location.patch(loc_id, file_id, row_position)?;
-            }
-            self.location.sync()?;
-        }
-        Ok(())
-    }
-
-    /// Mark interned data files **dead**: the files were removed
-    /// from the live table by an Iceberg rewrite, so every location slot still pointing
-    /// at them is stale. Persists to the [`DEAD_FILES`] table **before** updating the
-    /// in-memory set, so a flag ever observed by a reader is already durable (a crash
-    /// can lose an unpersisted marking, never resurrect one — and losing one only means
-    /// the next re-map poll re-marks it). Paths that were never interned are ignored
-    /// (no slot can reference them); already-dead paths are idempotent no-ops. Returns
-    /// how many files were newly marked.
-    pub fn mark_files_dead(&self, paths: &[String]) -> Result<u64> {
-        let newly: Vec<u32> = {
-            let files = self.files.lock().expect("file intern not poisoned");
-            paths
-                .iter()
-                .filter_map(|p| files.path_to_id.get(p).copied())
-                .filter(|id| !files.dead.contains(id))
-                .collect()
-        };
-        if newly.is_empty() {
-            return Ok(0);
-        }
-        let txn = self.db.begin_write()?;
-        {
-            let mut dead = txn.open_table(DEAD_FILES)?;
-            for id in &newly {
-                dead.insert(id, ())?;
-            }
-        }
-        txn.commit()?;
-        let mut files = self.files.lock().expect("file intern not poisoned");
-        let count = newly.len() as u64;
-        files.dead.extend(newly);
-        Ok(count)
-    }
-
-    /// Whether `path` is an interned data file flagged **dead** (rewritten away) — the
-    /// live-file bitmap the hydration path consults at locator resolution: a locator
-    /// pointing into a dead file skips the doomed parquet point read and goes straight
-    /// to the pass-2 fallback. A never-interned path is not dead.
-    pub fn file_is_dead(&self, path: &str) -> bool {
-        let files = self.files.lock().expect("file intern not poisoned");
-        files
-            .path_to_id
-            .get(path)
-            .is_some_and(|id| files.dead.contains(id))
-    }
-
-    /// Number of interned files currently flagged dead (the
-    /// `growlerdb_locator_dead_files` gauge).
-    pub fn dead_file_count(&self) -> u64 {
-        self.files
-            .lock()
-            .expect("file intern not poisoned")
-            .dead
-            .len() as u64
-    }
-
-    /// The interned data-file paths **not** flagged dead — the shard's view of which
-    /// source files its slots may still point at. The re-map poller diffs this against
-    /// the table's current plan: an interned live file absent from the plan means a
-    /// rewrite happened.
-    pub fn interned_live_files(&self) -> Vec<String> {
-        let files = self.files.lock().expect("file intern not poisoned");
-        files
-            .path_to_id
-            .iter()
-            .filter(|(_, id)| !files.dead.contains(id))
-            .map(|(path, _)| path.clone())
-            .collect()
-    }
-
-    /// **Compaction re-map** (D30 `coordinates` strategy): bulk-patch location slots after an
-    /// Iceberg rewrite, from the rewritten rows' `(key, new location)` pairs. Callers mark the
-    /// disappeared files dead ([`mark_files_dead`](Self::mark_files_dead)) **first** — the dead flag
-    /// is this method's patch guard.
-    ///
-    /// Per entry: resolve the key's live `_locid` (skip if no live doc), then patch its slot **only
-    /// if it still points at a dead file**. That guard makes every interleaving safe: ingest or a
-    /// lazy refresh that already re-pointed the slot at a live file is *newer* than the re-mapped
-    /// row, so the re-map only heals dead pointers and loses to anything fresher.
-    ///
-    /// Entries are **sorted by encoded key** before lookup (term-dictionary locality), processed in
-    /// bounded chunks (the writer lock released between chunks so a large re-map never blocks ingest
-    /// for its full duration). Each chunk mirrors [`refresh_locators`](Self::refresh_locators)'
-    /// durability order: interns commit first, then slots are patched and the array fsynced.
-    pub fn remap_locations(&self, entries: &[(CompositeKey, RowLocator)]) -> Result<RemapStats> {
-        /// Slots patched per writer-lock acquisition — small enough that ingest commits
-        /// interleave, large enough to amortize the fsync.
-        const REMAP_CHUNK: usize = 8_192;
-
-        let mut stats = RemapStats::default();
-        let mut sorted: Vec<(Vec<u8>, &RowLocator)> = entries
-            .iter()
-            .map(|(key, loc)| (key.encode(), loc))
-            .collect();
-        sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-
-        for chunk in sorted.chunks(REMAP_CHUNK) {
-            let _guard = self
-                .writer
-                .as_ref()
-                .map(|w| w.lock().expect("writer not poisoned"));
-            let mut patches: Vec<(u64, u32, u64)> = Vec::new();
-            let mut new_files: Vec<(u32, String)> = Vec::new();
-            for (enc, locator) in chunk {
-                let Some(loc_id) = self.core.live_loc_id(enc).map_err(StoreError::Segment)? else {
-                    stats.skipped_no_live_doc += 1;
-                    continue; // key deleted, or not yet ingested
-                };
-                let points_at_dead = match self.location.get(loc_id)? {
-                    Some((file_id, _)) => {
-                        let files = self.files.lock().expect("file intern not poisoned");
-                        files.dead.contains(&file_id)
-                    }
-                    None => false,
-                };
-                if !points_at_dead {
-                    stats.skipped_already_live += 1;
-                    continue; // ingest/refresh got there first — its state is newer
-                }
-                let (file_id, newly_interned) = self
-                    .files
-                    .lock()
-                    .expect("file intern not poisoned")
-                    .intern(&locator.iceberg_file);
-                if newly_interned {
-                    new_files.push((file_id, locator.iceberg_file.clone()));
-                }
-                patches.push((loc_id, file_id, locator.row_position));
-            }
-            if !new_files.is_empty() {
-                let txn = self.db.begin_write()?;
-                {
-                    let mut files = txn.open_table(FILES)?;
-                    for (id, path) in &new_files {
-                        files.insert(id, path.as_str())?;
-                    }
-                }
-                txn.commit()?;
-            }
-            if !patches.is_empty() {
-                stats.remapped += patches.len() as u64;
-                for (loc_id, file_id, row_position) in patches {
-                    self.location.patch(loc_id, file_id, row_position)?;
-                }
-                self.location.sync()?;
-            }
-        }
-        Ok(stats)
     }
 
     /// **Partition-scoped reconciliation** — the equality-delete fallback
@@ -2328,19 +1918,6 @@ impl Shard {
         self.page_in(&core, query, k, sort, offset, after)
     }
 
-    /// Resolve a key to its source-row locator **as of a PIT** (hydration against the
-    /// frozen snapshot). Errors if the handle is unknown/expired.
-    ///
-    /// The key is resolved against the PIT's pinned Tantivy snapshot (so
-    /// presence/absence is as-of-`S`) but the `location.arr` slot is read *current* —
-    /// a slot patched since the PIT opened resolves to the **newer source row of the
-    /// same key**, which is the D30 locator semantic everywhere (locators are
-    /// best-effort coordinates; hydration verifies by key and falls back).
-    pub fn locate_pit(&self, pit: u64, key: &CompositeKey) -> Result<Option<RowLocator>> {
-        let (core, _view) = self.pit(pit)?;
-        self.locate_in(&core, key)
-    }
-
     /// The number of Tantivy **segments** in the index (compaction pressure / stats).
     pub fn segment_count(&self) -> Result<u64> {
         Ok(self
@@ -2394,10 +1971,10 @@ impl Shard {
                 .map_err(|e| StoreError::Segment(e.into()))?;
             drop(writer); // release the lock so ingest can commit before the next bounded pass
             self.core.reload().map_err(StoreError::Segment)?;
-            // A merge produced a new segment id → build its ANN sidecar. The merged-away segments'
-            // orphaned `.ann` sidecars may linger (harmless — `sealed_segments` lists only current
-            // segments, so backup never carries an orphan).
+            // A merge produced a new segment id → build its ANN + completion sidecars. Merged-away
+            // orphans may linger (harmless — `sealed_segments` lists only current segments).
             self.build_ann_sidecars()?;
+            self.build_completion_sidecars()?;
         }
         Ok(())
     }
@@ -2428,17 +2005,8 @@ impl Shard {
         self.schema.vector_spec(field)
     }
 
-    /// The index's **location strategy** (D30): `COORDINATES` (per-row
-    /// location data in the layered locator) or `PREDICATE` (store-less — hydration
-    /// re-finds rows by a pruned key scan). The engine's hydration path branches on
-    /// this, and the re-map loop is never spawned for a `PREDICATE` index.
-    pub fn location_strategy(&self) -> growlerdb_core::LocationStrategy {
-        self.schema.location_strategy()
-    }
-
-    /// Whether this shard's index maps an Iceberg v3 **variant** column (D47) — the compaction
-    /// re-map / stats pollers use this to skip a variant table, whose metadata released
-    /// iceberg-rust can't parse (D49).
+    /// Whether this shard's index maps an Iceberg v3 **variant** column (D47) — the stats pollers use
+    /// this to skip a variant table, whose metadata released iceberg-rust can't parse (D49).
     pub fn has_variant_fields(&self) -> bool {
         self.schema.has_variant_fields()
     }
@@ -2451,6 +2019,18 @@ impl Shard {
             .into_iter()
             .map(str::to_string)
             .collect()
+    }
+
+    /// Read each key's live-doc **fast values** for `fields` — the sort-key **prune hints** hydration
+    /// AND-s onto its predicate to prune a sorted source by manifest min/max. Aligned 1:1 with `keys`; see [`SegmentReader::fast_values`].
+    pub fn prune_values(
+        &self,
+        keys: &[CompositeKey],
+        fields: &[String],
+    ) -> Result<Vec<Vec<(String, growlerdb_core::Value)>>> {
+        self.core
+            .fast_values(keys, fields)
+            .map_err(StoreError::Segment)
     }
 
     /// The field names a query can sort by — numeric/date/keyword fields declared `fast`. The
@@ -2491,21 +2071,14 @@ impl Shard {
         &self.index_dir
     }
 
-    /// The shard's full on-disk index footprint in bytes — every component of
-    /// [`index_size_breakdown`](Self::index_size_breakdown) summed, i.e. the Tantivy files **plus**
-    /// the locator layers (`location.arr` + `aux.redb`). Used by the serving loop to emit
-    /// `growlerdb_index_bytes`; computed from the breakdown so the total gauge and the per-component
-    /// gauge always reconcile.
+    /// The shard's full on-disk index footprint in bytes — [`index_size_breakdown`](Self::index_size_breakdown)
+    /// summed (Tantivy files plus the sibling `aux.redb`), so the `growlerdb_index_bytes` total and per-component gauges reconcile.
     pub fn index_size_bytes(&self) -> u64 {
         self.index_size_breakdown().total()
     }
 
-    /// On-disk index size broken into components, so the
-    /// index:source ratio can be attributed to the structure that drives it — term dictionaries vs
-    /// postings vs positions vs fieldnorms vs the **fast-field cache** vs the **doc store** vs the
-    /// **hydration locator** — rather than a lump total. Tantivy files are classified by extension;
-    /// the locator is the sibling `aux.redb` + `location.arr`. Best-effort — unreadable entries
-    /// count as 0.
+    /// On-disk index size broken into components (term/postings/positions/fieldnorms/fast/store) so the
+    /// index:source ratio is attributable, not a lump. Tantivy files by extension; the sibling `aux.redb` counts under `other`. Best-effort — unreadable entries count as 0.
     pub fn index_size_breakdown(&self) -> IndexSizeBreakdown {
         let mut b = IndexSizeBreakdown::default();
         if let Ok(entries) = std::fs::read_dir(&self.index_dir) {
@@ -2527,13 +2100,10 @@ impl Shard {
                 }
             }
         }
-        // The locator files (aux.redb + location.arr, D30) sit beside `index_dir`.
+        // The sibling `aux.redb` sits beside `index_dir`.
         if let Some(parent) = self.index_dir.parent() {
             if let Ok(meta) = std::fs::metadata(parent.join("aux.redb")) {
-                b.locator = meta.len();
-            }
-            if let Ok(meta) = std::fs::metadata(parent.join(LOCATION_FILE)) {
-                b.locator += meta.len();
+                b.other += meta.len();
             }
         }
         b
@@ -2570,6 +2140,17 @@ impl Shard {
             .map_err(StoreError::Segment)
     }
 
+    /// Build the per-segment completion sidecars (`<uuid>.cmp`) for the `suggest` fields (idempotent,
+    /// no-op when none opt in). Must run with the reader reloaded onto the target commit — same discipline as [`build_ann_sidecars`](Self::build_ann_sidecars).
+    fn build_completion_sidecars(&self) -> Result<()> {
+        if !self.schema.has_suggest_fields() {
+            return Ok(());
+        }
+        self.core
+            .build_completion_sidecars(&self.schema, &self.index_dir)
+            .map_err(StoreError::Segment)
+    }
+
     pub fn sealed_segments(&self) -> Result<Vec<SealedSegment>> {
         let segments = self.index.searchable_segments().map_err(IndexError::from)?;
         Ok(segments
@@ -2583,11 +2164,13 @@ impl Shard {
                     .into_iter()
                     .filter(|f| self.index_dir.join(f).exists())
                     .collect();
-                // The `.ann` sidecar isn't listed by `list_files` but belongs to this segment —
-                // register it so backup/restore carries it (content-stable, dedupes like the rest).
-                let ann = PathBuf::from(format!("{}.ann", meta.id().uuid_string()));
-                if self.index_dir.join(&ann).exists() {
-                    files.push(ann);
+                // The `.ann`/`.cmp` sidecars aren't listed by `list_files` but belong to this segment
+                // — register them so backup/restore carries them (content-stable, dedupes like the rest).
+                for suffix in ["ann", "cmp"] {
+                    let side = PathBuf::from(format!("{}.{suffix}", meta.id().uuid_string()));
+                    if self.index_dir.join(&side).exists() {
+                        files.push(side);
+                    }
                 }
                 files.sort();
                 SealedSegment {
@@ -2652,10 +2235,6 @@ impl Shard {
         let shard_dir = self.index_dir.parent().unwrap_or(&self.index_dir);
         std::fs::copy(shard_dir.join("aux.redb"), staging.join("aux.redb"))?;
         files.push(PathBuf::from("aux.redb"));
-        // The dense location array travels with the backup (D30). Mutable (slots patched in place),
-        // so a byte copy, never a hard link — a later patch must not reach into the staging copy.
-        std::fs::copy(shard_dir.join(LOCATION_FILE), staging.join(LOCATION_FILE))?;
-        files.push(PathBuf::from(LOCATION_FILE));
         Ok(BackupSnapshot {
             snapshot,
             checkpoint,
@@ -2990,6 +2569,13 @@ impl Shard {
         prefix: &str,
         limit: usize,
     ) -> Result<Vec<(String, u64)>> {
+        // Completion fast path: for a `suggest` field with a short prefix, answer from the precomputed
+        // per-segment top-K table. `None` (cold, over-`P`/empty prefix, partial coverage) → the live seek below.
+        if self.schema.is_suggest_field(field) {
+            if let Some(ranked) = self.core.suggest_prefix_sidecar(field, prefix, limit)? {
+                return Ok(ranked);
+            }
+        }
         // Bounded multiple of the page so a broad prefix can't walk the whole vocabulary, while
         // leaving room to rank. `prefix_terms` already sums across segments.
         let scan_cap = limit.saturating_mul(64).max(1024);
@@ -3085,42 +2671,6 @@ impl Shard {
         Ok(batches.get(batch_id)?.map(|v| v.value()))
     }
 
-    /// Resolve a key to its source-row locator (the hydration bridge), if present —
-    /// through the D30 layers: key term → live doc → `_locid` fast field →
-    /// `location.arr` slot → the interned file path.
-    pub fn locate(&self, key: &CompositeKey) -> Result<Option<RowLocator>> {
-        self.locate_in(&self.core, key)
-    }
-
-    /// The layered locate against a specific reader (`core` = the live reader, or a
-    /// PIT's pinned snapshot): the identity layer (key term → live doc), then the
-    /// reference layer (`_locid`) and the location layer (`location.arr` + file
-    /// interns) into the [`RowLocator`] the hydration path consumes.
-    ///
-    /// A live doc whose fast-field value is missing, whose slot is past the array's
-    /// end, or whose `file_id` is not in the intern map resolves as **locator missing**
-    /// (same as an absent key). Each of those states should be unreachable through the
-    /// commit ordering (array fsync → Tantivy commit → intern txn plus the batch
-    /// replay), so we degrade to the caller's missing-locator handling, never panic.
-    fn locate_in(&self, core: &SegmentReader, key: &CompositeKey) -> Result<Option<RowLocator>> {
-        let Some(loc_id) = core
-            .live_loc_id(&key.encode())
-            .map_err(StoreError::Segment)?
-        else {
-            return Ok(None);
-        };
-        let Some((file_id, row_position)) = self.location.get(loc_id)? else {
-            return Ok(None); // slot past EOF: unreachable via the commit ordering
-        };
-        let Some(iceberg_file) = self.file_path(file_id) else {
-            return Ok(None); // unknown intern: unreachable via the commit ordering
-        };
-        Ok(Some(RowLocator {
-            iceberg_file,
-            row_position,
-        }))
-    }
-
     /// The source checkpoint the shard currently reflects, if any.
     pub fn current_checkpoint(&self) -> Result<Option<SourceCheckpoint>> {
         self.meta_bytes(META_CHECKPOINT)?
@@ -3185,43 +2735,6 @@ impl Shard {
         }
         txn.commit()?;
         Ok(())
-    }
-
-    /// The **locator ID** of the live doc carrying `key` (its `_locid` fast field), or
-    /// `None` when the key has no live doc. The building block of the layered read
-    /// path ([`locate`](Self::locate)) and of the commit path's reuse lookup.
-    pub fn loc_id_for_key(&self, key: &CompositeKey) -> Result<Option<u64>> {
-        self.core
-            .live_loc_id(&key.encode())
-            .map_err(StoreError::Segment)
-    }
-
-    /// The shard's dense location array (D30 location layer). Read-only outside the
-    /// store — writes go through `commit_staged` /
-    /// [`refresh_locators`](Self::refresh_locators), both under the writer lock.
-    pub fn location_store(&self) -> &LocationStore {
-        &self.location
-    }
-
-    /// Resolve an interned `file_id` back to its Iceberg data-file path (D30 location
-    /// layer), from the in-memory map loaded off the `files` table.
-    pub fn file_path(&self, file_id: u32) -> Option<String> {
-        self.files
-            .lock()
-            .expect("file intern not poisoned")
-            .id_to_path
-            .get(&file_id)
-            .cloned()
-    }
-
-    /// The interned `file_id` for an Iceberg data-file path, if it has been interned.
-    pub fn file_id(&self, path: &str) -> Option<u32> {
-        self.files
-            .lock()
-            .expect("file intern not poisoned")
-            .path_to_id
-            .get(path)
-            .copied()
     }
 
     /// Record a commit-ordering event (test builds only) — see `commit_trace`.
@@ -3292,10 +2805,6 @@ impl IndexReader for Shard {
         Ok(ShardHits { hits, total })
     }
 
-    fn get_by_key(&self, keys: &[CompositeKey]) -> Result<Vec<Option<RowLocator>>> {
-        keys.iter().map(|k| self.locate(k)).collect()
-    }
-
     fn snapshot(&self) -> Snapshot {
         // Infallible per Design 02; an unreadable aux store reads as snapshot 0.
         Snapshot(self.current_snapshot().unwrap_or(0))
@@ -3334,8 +2843,6 @@ mod sort_tests {
             f.insert("rank".to_string(), Value::Int(rank));
             LocatedDoc {
                 doc: Document::new(key, f),
-                iceberg_file: "f".into(),
-                row_position: 0,
             }
         };
         // Two commits → two generations, so the merge sort spans segments.
@@ -3362,6 +2869,38 @@ mod sort_tests {
             .collect()
     }
 
+    #[test]
+    fn prune_values_reads_each_key_live_fast_value_typed_and_aligned() {
+        // The sort-key prune-hint read: resolve each key's live doc and read its `rank` fast field
+        // typed LONG. No live doc → empty row; a non-fast/unknown field is skipped — never an error.
+        let tmp = tempfile::tempdir().unwrap();
+        let shard = ranked_shard(tmp.path());
+        let k = |id: &str| CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]);
+        let out = shard
+            .prune_values(
+                &[k("a"), k("absent"), k("c")],
+                &["rank".to_string(), "id".to_string()],
+            )
+            .unwrap();
+        assert_eq!(out.len(), 3, "aligned 1:1 with keys");
+        assert_eq!(
+            out[0],
+            vec![("rank".to_string(), Value::Int(30))],
+            "a → rank 30"
+        );
+        assert!(out[1].is_empty(), "no live doc → no hint, not an error");
+        assert_eq!(
+            out[2],
+            vec![("rank".to_string(), Value::Int(20))],
+            "c → rank 20"
+        );
+        // `id` is a KEYWORD identifier but not declared `fast` here, so it yields no hint (skipped).
+        assert!(
+            out[0].iter().all(|(n, _)| n != "id"),
+            "non-fast field contributes nothing"
+        );
+    }
+
     // --- chunked commit -------------------------------------------------------------
     fn chunk_shard(tmp: &std::path::Path, chunk: usize) -> Shard {
         let src = SourceSchema::new(
@@ -3384,15 +2923,13 @@ mod sort_tests {
         shard
     }
 
-    fn ck_doc(id: i64, row: u64) -> LocatedDoc {
+    fn ck_doc(id: i64) -> LocatedDoc {
         let key = CompositeKey::new(vec![], vec![("id".into(), Value::Int(id))]);
         let mut f = BTreeMap::new();
         f.insert("id".to_string(), Value::Int(id));
         f.insert("body".to_string(), Value::from("shared token"));
         LocatedDoc {
             doc: Document::new(key, f),
-            iceberg_file: format!("data/f{}.parquet", id % 3),
-            row_position: row,
         }
     }
 
@@ -3405,7 +2942,7 @@ mod sort_tests {
         let tmp_w = tempfile::tempdir().unwrap();
         let whole = chunk_shard(tmp_w.path(), 0);
 
-        let docs: Vec<LocatedDoc> = (0..50).map(|i| ck_doc(i, i as u64)).collect();
+        let docs: Vec<LocatedDoc> = (0..50).map(ck_doc).collect();
         for s in [&chunked, &whole] {
             IndexWriter::write(
                 s,
@@ -3433,7 +2970,7 @@ mod sort_tests {
         // ⇒ Apply) must not duplicate — delete-then-add by key across chunks is idempotent.
         let tmp = tempfile::tempdir().unwrap();
         let shard = chunk_shard(tmp.path(), 7);
-        let docs: Vec<LocatedDoc> = (0..50).map(|i| ck_doc(i, i as u64)).collect();
+        let docs: Vec<LocatedDoc> = (0..50).map(ck_doc).collect();
         IndexWriter::write(
             &shard,
             &CommitBatch::from_upserts(docs.clone(), SourceCheckpoint::iceberg(100), "b1"),
@@ -3462,8 +2999,8 @@ mod sort_tests {
         // second upsert (in a later chunk) must reuse/replace the first — one live doc, not two.
         let tmp = tempfile::tempdir().unwrap();
         let shard = chunk_shard(tmp.path(), 3);
-        let mut docs: Vec<LocatedDoc> = (0..10).map(|i| ck_doc(i, i as u64)).collect();
-        docs.push(ck_doc(0, 999)); // key 0 again, at a new row — lands in a later chunk
+        let mut docs: Vec<LocatedDoc> = (0..10).map(ck_doc).collect();
+        docs.push(ck_doc(0)); // key 0 again, at a new row — lands in a later chunk
         IndexWriter::write(
             &shard,
             &CommitBatch::from_upserts(docs, SourceCheckpoint::iceberg(100), "b1"),
@@ -3547,8 +3084,6 @@ mod sort_tests {
             f.insert("rank".to_string(), Value::Int(rank));
             LocatedDoc {
                 doc: Document::new(key, f),
-                iceberg_file: "f".into(),
-                row_position: 0,
             }
         };
         IndexWriter::write(
@@ -3683,8 +3218,6 @@ mod sort_tests {
             f.insert("body".to_string(), Value::from(body));
             LocatedDoc {
                 doc: Document::new(key, f),
-                iceberg_file: "f".into(),
-                row_position: 0,
             }
         };
         IndexWriter::write(
@@ -3783,8 +3316,6 @@ mod sort_tests {
             f.insert("rank".to_string(), Value::Int(rank));
             LocatedDoc {
                 doc: Document::new(key, f),
-                iceberg_file: "f".into(),
-                row_position: 0,
             }
         };
         IndexWriter::write(
@@ -3899,8 +3430,6 @@ mod sort_tests {
             f.insert("rank".to_string(), Value::Int(rank));
             LocatedDoc {
                 doc: Document::new(key, f),
-                iceberg_file: "f".into(),
-                row_position: 0,
             }
         };
         IndexWriter::write(
@@ -3999,8 +3528,6 @@ mod sort_tests {
             f.insert("name".to_string(), Value::from(name));
             LocatedDoc {
                 doc: Document::new(key, f),
-                iceberg_file: "f".into(),
-                row_position: 0,
             }
         };
         IndexWriter::write(
@@ -4105,8 +3632,6 @@ mod pit_tests {
         f.insert("rank".to_string(), Value::Int(rank));
         let doc = LocatedDoc {
             doc: Document::new(key, f),
-            iceberg_file: "f".into(),
-            row_position: 0,
         };
         IndexWriter::write(
             shard,
@@ -4265,8 +3790,6 @@ mod pit_tests {
             f.insert("rank".to_string(), Value::Int(rank));
             let doc = LocatedDoc {
                 doc: Document::new(key, f),
-                iceberg_file: "f".into(),
-                row_position: 0,
             };
             IndexWriter::write(
                 &shard,
@@ -4369,8 +3892,6 @@ mod highlight_tests {
             f.insert("body".to_string(), Value::from(body));
             LocatedDoc {
                 doc: Document::new(key, f),
-                iceberg_file: "f".into(),
-                row_position: 0,
             }
         };
         IndexWriter::write(
@@ -4482,8 +4003,6 @@ mod agg_tests {
             f.insert("amount".to_string(), Value::Int(amt));
             LocatedDoc {
                 doc: Document::new(key, f),
-                iceberg_file: "f".into(),
-                row_position: 0,
             }
         };
         // gen 1: A(red, 10), B(blue, 20).
@@ -4577,8 +4096,6 @@ mod agg_tests {
                 f.insert("ts".to_string(), Value::Int(*ts));
                 LocatedDoc {
                     doc: Document::new(key, f),
-                    iceberg_file: "f".into(),
-                    row_position: 0,
                 }
             })
             .collect();
@@ -4956,8 +4473,6 @@ mod suggest_tests {
         f.insert("body".to_string(), Value::from(body));
         let doc = LocatedDoc {
             doc: Document::new(key, f),
-            iceberg_file: "f".into(),
-            row_position: 0,
         };
         IndexWriter::write(
             shard,
@@ -4997,6 +4512,116 @@ mod suggest_tests {
         // A no-match prefix is empty; a non-string field errors.
         assert!(shard.suggest_prefix("city", "zzz", 10).unwrap().is_empty());
         assert!(shard.suggest_prefix("id", "x", 10).is_ok()); // id is KEYWORD → fine
+    }
+
+    /// A shard whose `city` field opts into the completion sidecar.
+    fn suggest_shard(tmp: &Path) -> Shard {
+        let src = SourceSchema::new(
+            vec![
+                SourceField::new("id", SourceType::String),
+                SourceField::new("city", SourceType::String),
+            ],
+            vec![],
+            vec!["id".into()],
+        );
+        let idx = IndexDefinition::from_yaml(
+            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD }, { path: city, type: KEYWORD, suggest: true } ] }\n",
+        )
+        .unwrap()
+        .resolve(&src)
+        .unwrap();
+        LocalIndexStore::open(tmp)
+            .unwrap()
+            .create_shard(&ShardId::single("docs"), &idx)
+            .unwrap()
+    }
+
+    fn put_city(shard: &Shard, id: &str, city: &str, snap: i64, batch: &str) {
+        let key = CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]);
+        let mut f = BTreeMap::new();
+        f.insert("id".to_string(), Value::from(id));
+        f.insert("city".to_string(), Value::from(city));
+        let doc = LocatedDoc {
+            doc: Document::new(key, f),
+        };
+        IndexWriter::write(
+            shard,
+            &CommitBatch::from_upserts(vec![doc], SourceCheckpoint::iceberg(snap), batch),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn suggest_sidecar_built_and_answers_top_k_by_frequency() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard = suggest_shard(tmp.path());
+        put_city(&shard, "1", "berlin", 1, "b1");
+        put_city(&shard, "2", "berlin", 1, "b2");
+        put_city(&shard, "3", "bern", 1, "b3");
+        put_city(&shard, "4", "boston", 1, "b4");
+
+        // A `.cmp` sidecar exists (the fast path has data to read).
+        let has_cmp = std::fs::read_dir(shard.index_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.path().extension().is_some_and(|x| x == "cmp"));
+        assert!(has_cmp, "completion sidecar was not written");
+
+        // Same frequency-ranked contract as the live path: berlin(2) before bern(1).
+        assert_eq!(
+            shard.suggest_prefix("city", "ber", 10).unwrap(),
+            vec![("berlin".to_string(), 2), ("bern".to_string(), 1)]
+        );
+        // limit truncates the merged top-K: berlin(2) outranks bern(1)/boston(1).
+        assert_eq!(
+            shard.suggest_prefix("city", "b", 1).unwrap(),
+            vec![("berlin".to_string(), 2)]
+        );
+    }
+
+    #[test]
+    fn suggest_sidecar_merges_across_segments_for_global_top_k() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard = suggest_shard(tmp.path());
+        // Each put is a separate generation → a separate segment (NoMergePolicy). "berlin" lands in
+        // three segments (freq 1 each) and must sum to 3 across their per-segment sidecars.
+        put_city(&shard, "1", "berlin", 1, "b1");
+        put_city(&shard, "2", "berlin", 2, "b2");
+        put_city(&shard, "3", "bern", 3, "b3");
+        put_city(&shard, "4", "berlin", 4, "b4");
+
+        assert_eq!(
+            shard.suggest_prefix("city", "ber", 10).unwrap(),
+            vec![("berlin".to_string(), 3), ("bern".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn suggest_falls_back_for_long_prefix_and_unflagged_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard = suggest_shard(tmp.path());
+        // Two cities sharing a >P-byte prefix; a prefix longer than P isn't in the table → live seek.
+        put_city(&shard, "1", "abcdefghij_one", 1, "b1");
+        put_city(&shard, "2", "abcdefghij_two", 1, "b2");
+        put_city(&shard, "3", "abcdefghij_two", 1, "b3");
+        // 10-byte prefix (> P=8) — served correctly by the fallback live path.
+        assert_eq!(
+            shard.suggest_prefix("city", "abcdefghij", 10).unwrap(),
+            vec![
+                ("abcdefghij_two".to_string(), 2),
+                ("abcdefghij_one".to_string(), 1),
+            ]
+        );
+        // A short prefix (≤ P) is served by the sidecar, same answer.
+        assert_eq!(
+            shard.suggest_prefix("city", "abc", 10).unwrap(),
+            vec![
+                ("abcdefghij_two".to_string(), 2),
+                ("abcdefghij_one".to_string(), 1),
+            ]
+        );
+        // The unflagged `id` field has no sidecar → live path (never errors).
+        assert!(shard.suggest_prefix("id", "1", 10).is_ok());
     }
 
     #[test]
@@ -5061,23 +4686,21 @@ mapping:
         .unwrap()
     }
 
-    fn located(id: i64, body: &str, file: &str, row: u64) -> LocatedDoc {
+    fn located(id: i64, body: &str) -> LocatedDoc {
         let key = CompositeKey::new(vec![], vec![("id".into(), id.into())]);
         let mut fields = BTreeMap::new();
         fields.insert("id".to_string(), id.into());
         fields.insert("body".to_string(), body.into());
         LocatedDoc {
             doc: Document::new(key, fields),
-            iceberg_file: file.to_string(),
-            row_position: row,
         }
     }
 
     fn batch() -> CommitBatch {
         CommitBatch::from_upserts(
             vec![
-                located(1, "the quick brown fox", "data/f0.parquet", 0),
-                located(2, "a lazy brown dog", "data/f0.parquet", 1),
+                located(1, "the quick brown fox"),
+                located(2, "a lazy brown dog"),
             ],
             SourceCheckpoint::iceberg(100),
             "b1",
@@ -5171,8 +4794,6 @@ mapping:
         fields.insert("title".to_string(), "greeting".into());
         let doc = LocatedDoc {
             doc: Document::new(key(1), fields),
-            iceberg_file: "data/f0.parquet".into(),
-            row_position: 0,
         };
         IndexWriter::write(
             &shard_b,
@@ -5215,7 +4836,7 @@ mapping:
         let shard = open_committed(tmp.path());
         assert_eq!(search(&shard, "body:brown"), vec![1, 2]);
 
-        // Delete id 1 → logically removed from search; locator + key_to_doc gone.
+        // Delete id 1 → logically removed from search.
         IndexWriter::write(
             &shard,
             &CommitBatch::new(
@@ -5231,7 +4852,6 @@ mapping:
             vec![2],
             "deleted doc excluded"
         );
-        assert!(shard.locate(&key(1)).unwrap().is_none(), "locator dropped");
         assert!(
             !shard.contains_key(&key(1)).unwrap(),
             "key no longer indexed"
@@ -5252,7 +4872,7 @@ mapping:
         let ordered = |cp: i64| SourceCheckpoint::iceberg_ordered(cp, cp);
         let commit = |id: i64, cp: i64, from: Option<i64>, safe: Option<i64>| {
             let batch = CommitBatch::from_upserts(
-                vec![located(id, "brown", "data/f.parquet", id as u64)],
+                vec![located(id, "brown")],
                 ordered(cp),
                 format!("b{cp}"),
             )
@@ -5295,12 +4915,8 @@ mapping:
         // A retained batch still dedups on replay (no CheckpointGap, no double-apply): re-sending
         // b300 is a benign no-op that leaves the shard where it is.
         let before = shard.current_snapshot().unwrap();
-        let replay = CommitBatch::from_upserts(
-            vec![located(3, "brown", "data/f.parquet", 3)],
-            ordered(300),
-            "b300",
-        )
-        .with_from_checkpoint(Some(ordered(200)));
+        let replay = CommitBatch::from_upserts(vec![located(3, "brown")], ordered(300), "b300")
+            .with_from_checkpoint(Some(ordered(200)));
         IndexWriter::write(&shard, &replay).unwrap();
         assert_eq!(
             shard.current_snapshot().unwrap(),
@@ -5383,12 +4999,8 @@ mapping:
         // stream restarted, and the head moved to H2=222/seq3 before the re-send.
         IndexWriter::write(
             &shard,
-            &CommitBatch::from_upserts(
-                vec![located(1, "brown", "data/f.parquet", 1)],
-                ord(111, 2),
-                "t1",
-            )
-            .with_from_checkpoint(Some(ord(100, 1))),
+            &CommitBatch::from_upserts(vec![located(1, "brown")], ord(111, 2), "t1")
+                .with_from_checkpoint(Some(ord(100, 1))),
         )
         .unwrap();
 
@@ -5398,8 +5010,8 @@ mapping:
             &shard,
             &CommitBatch::from_upserts(
                 vec![
-                    located(1, "brown", "data/f.parquet", 1), // overlap: re-apply, idempotent
-                    located(2, "quick", "data/f.parquet", 2), // the rows past the old head
+                    located(1, "brown"), // overlap: re-apply, idempotent
+                    located(2, "quick"), // the rows past the old head
                 ],
                 ord(222, 3),
                 "t2",
@@ -5415,12 +5027,8 @@ mapping:
         let before = shard.current_snapshot().unwrap();
         IndexWriter::write(
             &shard,
-            &CommitBatch::from_upserts(
-                vec![located(1, "brown", "data/f.parquet", 1)],
-                ord(111, 2),
-                "t3-stale",
-            )
-            .with_from_checkpoint(Some(ord(100, 1))),
+            &CommitBatch::from_upserts(vec![located(1, "brown")], ord(111, 2), "t3-stale")
+                .with_from_checkpoint(Some(ord(100, 1))),
         )
         .unwrap();
         assert_eq!(
@@ -5458,11 +5066,7 @@ mapping:
         for s in &shards {
             IndexWriter::write(
                 s,
-                &CommitBatch::from_upserts(
-                    vec![located(0, "seed", "data/f.parquet", 0)],
-                    ord(100, 1),
-                    "t0",
-                ),
+                &CommitBatch::from_upserts(vec![located(0, "seed")], ord(100, 1), "t0"),
             )
             .unwrap();
         }
@@ -5470,12 +5074,8 @@ mapping:
         // Trigger 1 (R=100 → H1=111/seq2): only shard 0's write lands; shards 1 & 2 miss theirs.
         IndexWriter::write(
             &shards[0],
-            &CommitBatch::from_upserts(
-                vec![located(1, "brown", "data/f.parquet", 1)],
-                ord(111, 2),
-                "t1",
-            )
-            .with_from_checkpoint(Some(ord(100, 1))),
+            &CommitBatch::from_upserts(vec![located(1, "brown")], ord(111, 2), "t1")
+                .with_from_checkpoint(Some(ord(100, 1))),
         )
         .unwrap();
         assert_eq!(shards[0].current_checkpoint().unwrap(), Some(ord(111, 2)));
@@ -5487,12 +5087,8 @@ mapping:
 
         // Trigger 2 (H1=111 → H2=222/seq3), `from = H1` stamped on every sub-batch.
         let t2_batch = || {
-            CommitBatch::from_upserts(
-                vec![located(2, "quick", "data/f.parquet", 2)],
-                ord(222, 3),
-                "t2",
-            )
-            .with_from_checkpoint(Some(ord(111, 2)))
+            CommitBatch::from_upserts(vec![located(2, "quick")], ord(222, 3), "t2")
+                .with_from_checkpoint(Some(ord(111, 2)))
         };
 
         // Shard 0 is at H1 → the window covers it → applies.
@@ -5528,33 +5124,21 @@ mapping:
             let shard = open_empty(tmp.path());
             IndexWriter::write(
                 &shard,
-                &CommitBatch::from_upserts(
-                    vec![located(1, "brown", "data/f.parquet", 1)],
-                    ord(10, 1),
-                    "base",
-                ),
+                &CommitBatch::from_upserts(vec![located(1, "brown")], ord(10, 1), "base"),
             )
             .unwrap();
             // Both writers stage against current = seq1 (the lock-free advisory check passes
             // for both), then commit in the "wrong" order.
             let short = shard
                 .stage_batch(
-                    &CommitBatch::from_upserts(
-                        vec![located(2, "quick", "data/f.parquet", 2)],
-                        ord(20, 2),
-                        "w-short",
-                    )
-                    .with_from_checkpoint(Some(ord(10, 1))),
+                    &CommitBatch::from_upserts(vec![located(2, "quick")], ord(20, 2), "w-short")
+                        .with_from_checkpoint(Some(ord(10, 1))),
                 )
                 .unwrap();
             let long = shard
                 .stage_batch(
-                    &CommitBatch::from_upserts(
-                        vec![located(3, "lazy", "data/f.parquet", 3)],
-                        ord(30, 3),
-                        "w-long",
-                    )
-                    .with_from_checkpoint(Some(ord(10, 1))),
+                    &CommitBatch::from_upserts(vec![located(3, "lazy")], ord(30, 3), "w-long")
+                        .with_from_checkpoint(Some(ord(10, 1))),
                 )
                 .unwrap();
             shard.commit_staged(&[long]).unwrap();
@@ -5575,31 +5159,19 @@ mapping:
             let plain = SourceCheckpoint::iceberg;
             IndexWriter::write(
                 &shard,
-                &CommitBatch::from_upserts(
-                    vec![located(1, "brown", "data/f.parquet", 1)],
-                    plain(10),
-                    "base",
-                ),
+                &CommitBatch::from_upserts(vec![located(1, "brown")], plain(10), "base"),
             )
             .unwrap();
             let short = shard
                 .stage_batch(
-                    &CommitBatch::from_upserts(
-                        vec![located(2, "quick", "data/f.parquet", 2)],
-                        plain(20),
-                        "w-short",
-                    )
-                    .with_from_checkpoint(Some(plain(10))),
+                    &CommitBatch::from_upserts(vec![located(2, "quick")], plain(20), "w-short")
+                        .with_from_checkpoint(Some(plain(10))),
                 )
                 .unwrap();
             let long = shard
                 .stage_batch(
-                    &CommitBatch::from_upserts(
-                        vec![located(3, "lazy", "data/f.parquet", 3)],
-                        plain(30),
-                        "w-long",
-                    )
-                    .with_from_checkpoint(Some(plain(10))),
+                    &CommitBatch::from_upserts(vec![located(3, "lazy")], plain(30), "w-long")
+                        .with_from_checkpoint(Some(plain(10))),
                 )
                 .unwrap();
             shard.commit_staged(&[long]).unwrap();
@@ -5624,21 +5196,13 @@ mapping:
         // Lineage A → B → C with ids deliberately numerically backwards: 900, 50, 30.
         IndexWriter::write(
             &shard,
-            &CommitBatch::from_upserts(
-                vec![located(1, "brown", "data/f.parquet", 1)],
-                ord(900, 1),
-                "bA",
-            ),
+            &CommitBatch::from_upserts(vec![located(1, "brown")], ord(900, 1), "bA"),
         )
         .unwrap();
         IndexWriter::write(
             &shard,
-            &CommitBatch::from_upserts(
-                vec![located(2, "quick", "data/f.parquet", 2)],
-                ord(50, 2),
-                "bB",
-            )
-            .with_from_checkpoint(Some(ord(900, 1))),
+            &CommitBatch::from_upserts(vec![located(2, "quick")], ord(50, 2), "bB")
+                .with_from_checkpoint(Some(ord(900, 1))),
         )
         .unwrap();
         // bC ends at id 30 — numerically BELOW its own floor's id 50: the old `..= id` range
@@ -5646,13 +5210,9 @@ mapping:
         // bA (seq 1) and bB (seq 2, at the floor) are pruned.
         IndexWriter::write(
             &shard,
-            &CommitBatch::from_upserts(
-                vec![located(3, "lazy", "data/f.parquet", 3)],
-                ord(30, 3),
-                "bC",
-            )
-            .with_from_checkpoint(Some(ord(50, 2)))
-            .with_safe_checkpoint(Some(ord(50, 2))),
+            &CommitBatch::from_upserts(vec![located(3, "lazy")], ord(30, 3), "bC")
+                .with_from_checkpoint(Some(ord(50, 2)))
+                .with_safe_checkpoint(Some(ord(50, 2))),
         )
         .unwrap();
         assert!(shard.batch_snapshot("bA").unwrap().is_none(), "bA pruned");
@@ -5697,7 +5257,7 @@ mapping:
         IndexWriter::write(
             &shard,
             &CommitBatch::from_upserts(
-                vec![located(1, "brown", "data/f.parquet", 0)],
+                vec![located(1, "brown")],
                 SourceCheckpoint::iceberg_ordered(100, 100),
                 "b100",
             ),
@@ -5732,7 +5292,7 @@ mapping:
         IndexWriter::write(
             &shard,
             &CommitBatch::from_upserts(
-                vec![located(7, "old release notes", "data/a.parquet", 0)],
+                vec![located(7, "old release notes")],
                 SourceCheckpoint::iceberg(1),
                 "b1",
             ),
@@ -5744,7 +5304,7 @@ mapping:
         IndexWriter::write(
             &shard,
             &CommitBatch::from_upserts(
-                vec![located(7, "new shiny notes", "data/b.parquet", 0)],
+                vec![located(7, "new shiny notes")],
                 SourceCheckpoint::iceberg(2),
                 "b2",
             ),
@@ -5761,11 +5321,6 @@ mapping:
         );
         // Exactly one live hit for id 7 across a term in both versions ("notes").
         assert_eq!(search(&shard, "body:notes"), vec![7]);
-        // Locator points at the latest row.
-        assert_eq!(
-            shard.locate(&key(7)).unwrap().unwrap().iceberg_file,
-            "data/b.parquet"
-        );
     }
 
     #[test]
@@ -5786,7 +5341,7 @@ mapping:
         IndexWriter::write(
             &shard,
             &CommitBatch::from_upserts(
-                vec![located(1, "brown again", "data/c.parquet", 0)],
+                vec![located(1, "brown again")],
                 SourceCheckpoint::iceberg(3),
                 "u1",
             ),
@@ -5812,7 +5367,7 @@ mapping:
             &shard,
             &CommitBatch::new(
                 vec![
-                    DocOp::Upsert(located(5, "brown transient", "data/a.parquet", 0)),
+                    DocOp::Upsert(located(5, "brown transient")),
                     DocOp::Delete(key(5)),
                 ],
                 SourceCheckpoint::iceberg(1),
@@ -5849,50 +5404,6 @@ mapping:
         let scoped =
             IndexReader::search(&shard, &SearchParams::parse("body:fox", 10).unwrap()).unwrap();
         assert_eq!(scoped.total, 1);
-
-        // get_by_key resolves locator entries; one result per key, None if absent.
-        let present = CompositeKey::new(vec![], vec![("id".into(), 1i64.into())]);
-        let absent = CompositeKey::new(vec![], vec![("id".into(), 999i64.into())]);
-        let locs = IndexReader::get_by_key(&shard, &[present, absent]).unwrap();
-        assert_eq!(locs.len(), 2);
-        assert_eq!(locs[0].as_ref().unwrap().row_position, 0);
-        assert!(locs[1].is_none());
-    }
-
-    // ---- D30 layered locator store layers ------------------------------
-
-    #[test]
-    fn ingest_carries_loc_ids_and_fills_the_array() {
-        let tmp = tempfile::tempdir().unwrap();
-        let shard = open_empty(tmp.path());
-        IndexWriter::write(&shard, &batch()).unwrap(); // ids 1,2 — both in data/f0.parquet
-
-        // Each live doc carries a loc_id fast field; ids are dense from 0.
-        let a = shard.loc_id_for_key(&key(1)).unwrap().expect("loc_id");
-        let b = shard.loc_id_for_key(&key(2)).unwrap().expect("loc_id");
-        let mut ids = [a, b];
-        ids.sort_unstable();
-        assert_eq!(ids, [0, 1]);
-
-        // The array holds a matching entry per doc; one interned file for both docs.
-        let loc = shard.location_store();
-        assert_eq!(loc.len(), 2);
-        let fid = shard.file_id("data/f0.parquet").expect("interned once");
-        assert_eq!(shard.file_path(fid).as_deref(), Some("data/f0.parquet"));
-        // id 1's row_position is 0, id 2's is 1 (see `batch()`).
-        assert_eq!(loc.get(a).unwrap(), Some((fid, 0)));
-        assert_eq!(loc.get(b).unwrap(), Some((fid, 1)));
-
-        // `location.arr` counts into the breakdown's locator component.
-        let arr = tmp.path().join("docs/0").join(LOCATION_FILE);
-        assert!(arr.exists());
-        let aux = std::fs::metadata(tmp.path().join("docs/0/aux.redb"))
-            .unwrap()
-            .len();
-        assert_eq!(
-            shard.index_size_breakdown().locator,
-            aux + std::fs::metadata(&arr).unwrap().len()
-        );
     }
 
     #[test]
@@ -5926,7 +5437,7 @@ mapping:
                 "quick quick slow steady wins the long race every time",
             ];
             let docs: Vec<LocatedDoc> = (0..300)
-                .map(|i| located(i, bodies[i as usize % 3], "data/f0.parquet", i as u64))
+                .map(|i| located(i, bodies[i as usize % 3]))
                 .collect();
             IndexWriter::write(
                 &shard,
@@ -5986,8 +5497,7 @@ mapping:
     #[test]
     fn stored_key_round_trips_through_a_real_shard() {
         // Hit identity is the stored `enc(key)` bytes decoded back — assert the full
-        // write→search→decode loop over realistic hex-string keys (the scale-run shape),
-        // and that hydration's get_by_key resolves the same rows.
+        // write→search→decode loop over realistic hex-string keys (the scale-run shape).
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalIndexStore::open(tmp.path()).unwrap();
         let shard = store
@@ -6002,8 +5512,6 @@ mapping:
                 fields.insert("body".to_string(), "the quick brown fox".into());
                 LocatedDoc {
                     doc: Document::new(key, fields),
-                    iceberg_file: "data/f0.parquet".to_string(),
-                    row_position: i,
                 }
             })
             .collect();
@@ -6025,10 +5533,6 @@ mapping:
         let mut want: Vec<String> = (0..500).map(hex).collect();
         want.sort_unstable();
         assert_eq!(got, want, "every stored key decodes back exactly");
-
-        let key1 = CompositeKey::new(vec![], vec![("id".into(), hex(1).into())]);
-        let loc = IndexReader::get_by_key(&shard, &[key1]).unwrap();
-        assert_eq!(loc[0].as_ref().map(|l| l.row_position), Some(1));
     }
 
     #[test]
@@ -6037,8 +5541,8 @@ mapping:
         let shard = open_committed(tmp.path());
 
         // Every Tantivy structure a committed TEXT+KEYWORD segment writes is attributed: term
-        // dicts, postings, positions (body is analyzed TEXT), fieldnorms, fast (`_locid` is
-        // always FAST), the doc store (`_key` is STORED), metadata, and the locator layers.
+        // dicts, postings, positions (body is analyzed TEXT), fieldnorms, fast fields, the doc
+        // store (`_key` is STORED), and metadata (plus the sibling `aux.redb`, counted in `other`).
         let b = shard.index_size_breakdown();
         assert!(b.term > 0, "term dict: {b:?}");
         assert!(b.postings > 0, "postings: {b:?}");
@@ -6046,8 +5550,7 @@ mapping:
         assert!(b.fieldnorms > 0, "fieldnorms: {b:?}");
         assert!(b.fast > 0, "fast fields: {b:?}");
         assert!(b.store > 0, "doc store: {b:?}");
-        assert!(b.other > 0, "metadata: {b:?}");
-        assert!(b.locator > 0, "locator: {b:?}");
+        assert!(b.other > 0, "metadata + aux.redb: {b:?}");
         assert_eq!(
             b.inverted(),
             b.term + b.postings + b.positions + b.fieldnorms
@@ -6060,625 +5563,16 @@ mapping:
     }
 
     #[test]
-    fn update_reuses_the_loc_id_and_patches_the_slot() {
-        let tmp = tempfile::tempdir().unwrap();
-        let shard = open_empty(tmp.path());
-        IndexWriter::write(&shard, &batch()).unwrap();
-        let id = shard.loc_id_for_key(&key(1)).unwrap().unwrap();
-        let len_before = shard.location_store().len();
-
-        // Upsert the same key from a rewritten file → same loc_id, slot patched.
-        IndexWriter::write(
-            &shard,
-            &CommitBatch::from_upserts(
-                vec![located(1, "the quick brown fox", "data/f9.parquet", 42)],
-                SourceCheckpoint::iceberg(101),
-                "b2",
-            ),
-        )
-        .unwrap();
-        assert_eq!(
-            shard.loc_id_for_key(&key(1)).unwrap(),
-            Some(id),
-            "update reuses the live doc's loc_id"
-        );
-        let loc = shard.location_store();
-        assert_eq!(loc.len(), len_before, "patched in place, nothing appended");
-        let fid = shard.file_id("data/f9.parquet").expect("new file interned");
-        assert_eq!(loc.get(id).unwrap(), Some((fid, 42)));
-    }
-
-    #[test]
-    fn same_key_twice_in_one_commit_reuses_the_in_commit_id() {
-        // The pre-batch searcher can't see uncommitted docs, so a key upserted by two
-        // staged batches in ONE commit must reuse the id assigned in-commit (patch),
-        // not append a second slot.
-        let tmp = tempfile::tempdir().unwrap();
-        let shard = open_empty(tmp.path());
-        let s1 = shard
-            .stage_batch(&CommitBatch::from_upserts(
-                vec![located(9, "first brown", "data/a.parquet", 1)],
-                SourceCheckpoint::iceberg(1),
-                "b1",
-            ))
-            .unwrap();
-        let s2 = shard
-            .stage_batch(&CommitBatch::from_upserts(
-                vec![located(9, "second brown", "data/b.parquet", 2)],
-                SourceCheckpoint::iceberg(2),
-                "b2",
-            ))
-            .unwrap();
-        shard.commit_staged(&[s1, s2]).unwrap();
-        let loc = shard.location_store();
-        assert_eq!(loc.len(), 1, "one slot for one key");
-        let id = shard.loc_id_for_key(&key(9)).unwrap().unwrap();
-        let fid = shard.file_id("data/b.parquet").unwrap();
-        assert_eq!(loc.get(id).unwrap(), Some((fid, 2)), "last write wins");
-    }
-
-    #[test]
-    fn delete_leaves_the_array_untouched() {
-        let tmp = tempfile::tempdir().unwrap();
-        let shard = open_empty(tmp.path());
-        IndexWriter::write(&shard, &batch()).unwrap();
-        let len_before = shard.location_store().len();
-        IndexWriter::write(
-            &shard,
-            &CommitBatch::new(
-                vec![DocOp::Delete(key(1))],
-                SourceCheckpoint::iceberg(101),
-                "del",
-            ),
-        )
-        .unwrap();
-        assert_eq!(search(&shard, "body:brown"), vec![2], "doc gone");
-        assert!(shard.loc_id_for_key(&key(1)).unwrap().is_none());
-        assert_eq!(
-            shard.location_store().len(),
-            len_before,
-            "the slot just becomes unreachable — deletes never touch the array"
-        );
-    }
-
-    #[test]
-    fn insert_after_delete_appends_a_new_id() {
-        let tmp = tempfile::tempdir().unwrap();
-        let shard = open_empty(tmp.path());
-        IndexWriter::write(&shard, &batch()).unwrap();
-        let old_id = shard.loc_id_for_key(&key(1)).unwrap().unwrap();
-        IndexWriter::write(
-            &shard,
-            &CommitBatch::new(
-                vec![DocOp::Delete(key(1))],
-                SourceCheckpoint::iceberg(101),
-                "del",
-            ),
-        )
-        .unwrap();
-        let len_after_delete = shard.location_store().len();
-        IndexWriter::write(
-            &shard,
-            &CommitBatch::from_upserts(
-                vec![located(1, "brown again", "data/c.parquet", 7)],
-                SourceCheckpoint::iceberg(102),
-                "re-ins",
-            ),
-        )
-        .unwrap();
-        let new_id = shard.loc_id_for_key(&key(1)).unwrap().unwrap();
-        assert_ne!(
-            new_id, old_id,
-            "no live doc to reuse → a NEW id is appended"
-        );
-        assert_eq!(new_id, len_after_delete, "appended at the tail");
-        assert_eq!(
-            shard.location_store().len(),
-            len_after_delete + 1,
-            "the old slot stays orphaned (12 B leak until store compaction)"
-        );
-    }
-
-    #[test]
-    fn commit_fsyncs_the_array_before_the_tantivy_commit() {
-        // The D30 crash-ordering seam: location.arr must be durable BEFORE any doc
-        // referencing its slots can commit, and the redb txn stays last.
+    fn commit_is_durable_tantivy_then_redb() {
+        // Store-less ingest collapses to the two-phase ordering: the Tantivy commit is
+        // the durable point, then the redb checkpoint txn lands last.
         let tmp = tempfile::tempdir().unwrap();
         let shard = open_empty(tmp.path());
         IndexWriter::write(&shard, &batch()).unwrap();
         assert_eq!(
             shard.take_commit_trace(),
-            vec!["location_sync", "tantivy_commit", "redb_commit"]
+            vec!["tantivy_commit", "redb_commit"]
         );
-    }
-
-    // ---- PREDICATE location strategy (D30) --------------------------------
-
-    /// The `index()` fixture with `location_strategy: PREDICATE` — store-less hydration.
-    fn predicate_index() -> ResolvedIndex {
-        let src = SourceSchema::new(
-            vec![
-                SourceField::new("id", SourceType::String),
-                SourceField::new("body", SourceType::String),
-            ],
-            vec![],
-            vec!["id".into()],
-        );
-        IndexDefinition::from_yaml(
-            r#"
-name: docs
-source: { iceberg: { catalog: growlerdb, table: growlerdb.docs } }
-location_strategy: PREDICATE
-mapping:
-  selection: EXPLICIT
-  fields:
-    - { path: id, type: KEYWORD }
-    - { path: body, type: TEXT }
-"#,
-        )
-        .unwrap()
-        .resolve(&src)
-        .unwrap()
-    }
-
-    #[test]
-    fn predicate_shard_stores_no_location_data_across_ingest_update_delete() {
-        // A PREDICATE shard's write path keeps NO location layer: the `location.arr`
-        // never grows, `_locid` is never populated, no file is interned — while the
-        // identity layer (key terms), search, and delete/update semantics are intact.
-        let tmp = tempfile::tempdir().unwrap();
-        let store = LocalIndexStore::open(tmp.path()).unwrap();
-        let shard = store
-            .create_shard(&ShardId::single("docs"), &predicate_index())
-            .unwrap();
-        assert_eq!(
-            shard.location_strategy(),
-            growlerdb_core::LocationStrategy::Predicate
-        );
-
-        // Ingest (ids 1, 2).
-        IndexWriter::write(&shard, &batch()).unwrap();
-        assert_eq!(
-            shard.take_commit_trace(),
-            vec!["tantivy_commit", "redb_commit"],
-            "no array fsync — the commit collapses to the two-phase ordering"
-        );
-        assert_eq!(shard.location_store().len(), 0, "no array growth");
-        assert_eq!(
-            shard.loc_id_for_key(&key(1)).unwrap(),
-            None,
-            "`_locid` never populated (the schema field exists, unvalued)"
-        );
-        assert!(
-            shard.locate(&key(1)).unwrap().is_none(),
-            "nothing to locate"
-        );
-        assert_eq!(shard.file_id("data/f0.parquet"), None, "no file interned");
-        assert!(
-            shard.contains_key(&key(1)).unwrap(),
-            "identity layer intact"
-        );
-        assert_eq!(search(&shard, "body:brown"), vec![1, 2], "search unchanged");
-        assert_eq!(shard.key_count(&[]).unwrap(), 2, "live-key set unchanged");
-
-        // Update (upsert id 1 from a new file) + delete (id 2) behave; still no bytes.
-        IndexWriter::write(
-            &shard,
-            &CommitBatch::new(
-                vec![
-                    DocOp::Upsert(located(1, "a shiny red fox", "data/f1.parquet", 9)),
-                    DocOp::Delete(key(2)),
-                ],
-                SourceCheckpoint::iceberg(101),
-                "b2",
-            ),
-        )
-        .unwrap();
-        assert_eq!(search(&shard, "body:shiny"), vec![1], "upsert supersedes");
-        assert_eq!(search(&shard, "body:brown"), Vec::<i64>::new());
-        assert!(!shard.contains_key(&key(2)).unwrap(), "delete lands");
-        assert_eq!(shard.location_store().len(), 0, "still no array growth");
-        assert_eq!(shard.file_id("data/f1.parquet"), None, "still no interns");
-
-        // The on-disk array file exists (created at open, uniform layout) but is
-        // empty — a backup of this shard carries a 0-byte `location.arr`.
-        let arr = tmp.path().join("docs").join("0").join(LOCATION_FILE);
-        assert_eq!(std::fs::metadata(&arr).unwrap().len(), 0);
-
-        // refresh_locators is an explicit no-op (a pruned-scan re-find is the read
-        // path, not a stale-locator refresh) — nothing is appended or interned.
-        shard
-            .refresh_locators(&[(
-                key(1),
-                RowLocator {
-                    iceberg_file: "data/f2.parquet".into(),
-                    row_position: 3,
-                },
-            )])
-            .unwrap();
-        assert_eq!(shard.location_store().len(), 0);
-        assert_eq!(shard.file_id("data/f2.parquet"), None);
-    }
-
-    #[test]
-    fn reopen_reloads_interns_and_continues_ids() {
-        let tmp = tempfile::tempdir().unwrap();
-        {
-            let shard = open_empty(tmp.path());
-            IndexWriter::write(&shard, &batch()).unwrap(); // loc_ids 0,1; file f0 → 0
-        }
-        // A reopen reloads the intern map + array position.
-        let store = LocalIndexStore::open(tmp.path()).unwrap();
-        let shard = store
-            .open_shard(&ShardId::single("docs"), &index())
-            .unwrap();
-        assert_eq!(
-            shard.file_id("data/f0.parquet"),
-            Some(0),
-            "interns reloaded"
-        );
-        assert_eq!(shard.location_store().len(), 2);
-        // Which of ids {0,1} key 2 got is batch-internal (HashMap order); what must
-        // hold is that its id resolves to its entry (file 0, row 1).
-        let id2 = shard.loc_id_for_key(&key(2)).unwrap().expect("live loc_id");
-        assert_eq!(shard.location_store().get(id2).unwrap(), Some((0, 1)));
-
-        IndexWriter::write(
-            &shard,
-            &CommitBatch::from_upserts(
-                vec![located(3, "a brown bear", "data/f1.parquet", 0)],
-                SourceCheckpoint::iceberg(200),
-                "b2",
-            ),
-        )
-        .unwrap();
-        assert_eq!(
-            shard.loc_id_for_key(&key(3)).unwrap(),
-            Some(2),
-            "ids continue after reopen"
-        );
-        assert_eq!(shard.file_id("data/f1.parquet"), Some(1), "dense next id");
-        let loc = shard.location_store();
-        assert_eq!(loc.get(2).unwrap(), Some((1, 0)));
-    }
-
-    // ---- D30 layered read path -------------------------------------------
-
-    #[test]
-    fn layered_locate_end_to_end_ingest_update_delete() {
-        // The full layered read path:
-        // key term → live doc → `_locid` → `location.arr` slot → interned file path.
-        let tmp = tempfile::tempdir().unwrap();
-        let shard = open_empty(tmp.path());
-        IndexWriter::write(&shard, &batch()).unwrap(); // ids 1,2 in data/f0.parquet
-
-        // Ingest → locate resolves through the layers (file via intern, pos via slot).
-        let loc = shard.locate(&key(1)).unwrap().expect("located");
-        assert_eq!(loc.iceberg_file, "data/f0.parquet");
-        assert_eq!(loc.row_position, 0);
-        // …and get_by_key (the trait seam the engine hydrates through) agrees.
-        let both = IndexReader::get_by_key(&shard, &[key(1), key(2), key(9)]).unwrap();
-        assert_eq!(both[0].as_ref().unwrap().row_position, 0);
-        assert_eq!(both[1].as_ref().unwrap().row_position, 1);
-        assert!(both[2].is_none(), "unknown key locates as None");
-
-        // Update the key from a rewritten file → locate reflects the patched slot.
-        IndexWriter::write(
-            &shard,
-            &CommitBatch::from_upserts(
-                vec![located(1, "the quick brown fox", "data/f7.parquet", 33)],
-                SourceCheckpoint::iceberg(101),
-                "b2",
-            ),
-        )
-        .unwrap();
-        let loc = shard
-            .locate(&key(1))
-            .unwrap()
-            .expect("located after update");
-        assert_eq!(loc.iceberg_file, "data/f7.parquet");
-        assert_eq!(loc.row_position, 33);
-
-        // Delete → locate None (the slot merely becomes unreachable).
-        IndexWriter::write(
-            &shard,
-            &CommitBatch::new(
-                vec![DocOp::Delete(key(1))],
-                SourceCheckpoint::iceberg(102),
-                "del",
-            ),
-        )
-        .unwrap();
-        assert!(shard.locate(&key(1)).unwrap().is_none());
-        assert!(shard.locate(&key(2)).unwrap().is_some(), "other key intact");
-    }
-
-    #[test]
-    fn layered_locate_resolves_a_partitioned_key() {
-        // A partitioned key resolves through the same layers — partition scoping
-        // travels in the key encoding, not in the locator.
-        let tmp = tempfile::tempdir().unwrap();
-        let store = LocalIndexStore::open(tmp.path()).unwrap();
-        let shard = store
-            .create_shard(&ShardId::single("docs"), &partitioned_index())
-            .unwrap();
-        IndexWriter::write(
-            &shard,
-            &CommitBatch::from_upserts(
-                vec![plocated("us", 1, "alpha")],
-                SourceCheckpoint::iceberg(1),
-                "b1",
-            ),
-        )
-        .unwrap();
-        let loc = shard.locate(&pkey("us", 1)).unwrap().expect("located");
-        assert_eq!(loc.iceberg_file, "data/f0.parquet");
-        assert_eq!(loc.row_position, 1);
-        assert!(
-            shard.locate(&pkey("eu", 1)).unwrap().is_none(),
-            "same identifier in another partition is a different key"
-        );
-    }
-
-    #[test]
-    fn layered_locate_treats_a_past_eof_slot_as_missing_never_panics() {
-        // A live doc whose slot lies past the array's end should be impossible (the
-        // commit ordering forbids it) — but if it ever happens, it must read as
-        // locator-missing, exactly like an absent key. Simulate by truncating the
-        // array out from under a committed shard and reopening.
-        let tmp = tempfile::tempdir().unwrap();
-        {
-            let shard = open_empty(tmp.path());
-            IndexWriter::write(&shard, &batch()).unwrap();
-        }
-        let arr = tmp.path().join("docs/0").join(LOCATION_FILE);
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&arr)
-            .unwrap()
-            .set_len(0)
-            .unwrap();
-        let store = LocalIndexStore::open(tmp.path()).unwrap();
-        let shard = store
-            .open_shard(&ShardId::single("docs"), &index())
-            .unwrap();
-        assert!(
-            shard.loc_id_for_key(&key(1)).unwrap().is_some(),
-            "the doc is still live"
-        );
-        assert!(
-            shard.locate(&key(1)).unwrap().is_none(),
-            "past-EOF slot degrades to locator-missing"
-        );
-    }
-
-    #[test]
-    fn refresh_locators_patches_the_slot_durably() {
-        let tmp = tempfile::tempdir().unwrap();
-        {
-            let shard = open_empty(tmp.path());
-            IndexWriter::write(&shard, &batch()).unwrap();
-            let id = shard.loc_id_for_key(&key(1)).unwrap().unwrap();
-
-            // Refresh key 1 to a rewritten file; key 9 has no live doc → skipped.
-            shard
-                .refresh_locators(&[
-                    (
-                        key(1),
-                        RowLocator {
-                            iceberg_file: "data/rewritten.parquet".into(),
-                            row_position: 55,
-                        },
-                    ),
-                    (
-                        key(9),
-                        RowLocator {
-                            iceberg_file: "data/ghost.parquet".into(),
-                            row_position: 1,
-                        },
-                    ),
-                ])
-                .unwrap();
-
-            // The slot was patched in place (same loc_id, no append)…
-            assert_eq!(shard.loc_id_for_key(&key(1)).unwrap(), Some(id));
-            let fid = shard.file_id("data/rewritten.parquet").expect("interned");
-            assert_eq!(shard.location_store().get(id).unwrap(), Some((fid, 55)));
-            assert_eq!(
-                shard.locate(&key(1)).unwrap().unwrap().iceberg_file,
-                "data/rewritten.parquet"
-            );
-            // …and the ghost key changed nothing.
-            assert!(shard.file_id("data/ghost.parquet").is_none());
-        }
-        // The new intern + patch are durable across a reopen.
-        let store = LocalIndexStore::open(tmp.path()).unwrap();
-        let shard = store
-            .open_shard(&ShardId::single("docs"), &index())
-            .unwrap();
-        assert_eq!(
-            shard.locate(&key(1)).unwrap().unwrap().iceberg_file,
-            "data/rewritten.parquet"
-        );
-    }
-
-    // ---- D30 live-file bitmap + compaction re-map ---------------
-
-    #[test]
-    fn dead_file_flags_persist_across_reopen_and_ignore_unknown_paths() {
-        let tmp = tempfile::tempdir().unwrap();
-        {
-            let shard = open_committed(tmp.path()); // ids 1,2 in data/f0.parquet
-            assert!(!shard.file_is_dead("data/f0.parquet"));
-            assert_eq!(shard.dead_file_count(), 0);
-            assert_eq!(shard.interned_live_files(), vec!["data/f0.parquet"]);
-
-            // Marking: the interned file flips dead; a never-interned path is ignored
-            // (no slot can reference it); re-marking is an idempotent no-op.
-            let marked = shard
-                .mark_files_dead(&["data/f0.parquet".into(), "data/never-seen.parquet".into()])
-                .unwrap();
-            assert_eq!(marked, 1);
-            assert!(shard.file_is_dead("data/f0.parquet"));
-            assert!(!shard.file_is_dead("data/never-seen.parquet"));
-            assert_eq!(shard.dead_file_count(), 1);
-            assert!(shard.interned_live_files().is_empty());
-            assert_eq!(
-                shard.mark_files_dead(&["data/f0.parquet".into()]).unwrap(),
-                0,
-                "already dead → no-op"
-            );
-        }
-        // The flag is a durable tombstone: it survives a reopen.
-        let store = LocalIndexStore::open(tmp.path()).unwrap();
-        let shard = store
-            .open_shard(&ShardId::single("docs"), &index())
-            .unwrap();
-        assert!(shard.file_is_dead("data/f0.parquet"));
-        assert_eq!(shard.dead_file_count(), 1);
-    }
-
-    #[test]
-    fn remap_patches_only_slots_still_pointing_at_dead_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        let shard = open_committed(tmp.path()); // ids 1,2 in data/f0.parquet @ rows 0,1
-        let loc = |file: &str, pos: u64| RowLocator {
-            iceberg_file: file.into(),
-            row_position: pos,
-        };
-
-        // Ingest re-points key 2 at a live append file BEFORE the re-map runs — the
-        // interleaving the patch guard exists for.
-        IndexWriter::write(
-            &shard,
-            &CommitBatch::from_upserts(
-                vec![located(2, "a lazy brown dog", "data/append.parquet", 7)],
-                SourceCheckpoint::iceberg(101),
-                "b2",
-            ),
-        )
-        .unwrap();
-
-        // Compaction rewrote f0 into compacted.parquet; the re-map is fed every
-        // rewritten row (keys 1, 2) plus a key with no live doc (9).
-        shard.mark_files_dead(&["data/f0.parquet".into()]).unwrap();
-        let stats = shard
-            .remap_locations(&[
-                (key(1), loc("data/compacted.parquet", 4)),
-                (key(2), loc("data/compacted.parquet", 5)),
-                (key(9), loc("data/compacted.parquet", 6)),
-            ])
-            .unwrap();
-        assert_eq!(
-            stats,
-            RemapStats {
-                remapped: 1,             // key 1: slot pointed at the dead f0 → healed
-                skipped_no_live_doc: 1,  // key 9: never ingested
-                skipped_already_live: 1, // key 2: ingest's newer location wins
-            }
-        );
-        assert_eq!(
-            shard.locate(&key(1)).unwrap().unwrap(),
-            loc("data/compacted.parquet", 4)
-        );
-        assert_eq!(
-            shard.locate(&key(2)).unwrap().unwrap(),
-            loc("data/append.parquet", 7),
-            "the re-map never clobbers a slot ingest already re-pointed"
-        );
-
-        // Re-running the same re-map is a no-op: every slot now points at live files.
-        let again = shard
-            .remap_locations(&[
-                (key(1), loc("data/compacted.parquet", 4)),
-                (key(2), loc("data/compacted.parquet", 5)),
-            ])
-            .unwrap();
-        assert_eq!(again.remapped, 0);
-        assert_eq!(again.skipped_already_live, 2);
-    }
-
-    #[test]
-    fn remap_patch_is_durable_and_the_dead_source_file_stays_tombstoned() {
-        let tmp = tempfile::tempdir().unwrap();
-        {
-            let shard = open_committed(tmp.path());
-            shard.mark_files_dead(&["data/f0.parquet".into()]).unwrap();
-            let stats = shard
-                .remap_locations(&[
-                    (
-                        key(1),
-                        RowLocator {
-                            iceberg_file: "data/compacted.parquet".into(),
-                            row_position: 10,
-                        },
-                    ),
-                    (
-                        key(2),
-                        RowLocator {
-                            iceberg_file: "data/compacted.parquet".into(),
-                            row_position: 11,
-                        },
-                    ),
-                ])
-                .unwrap();
-            assert_eq!(stats.remapped, 2);
-        }
-        let store = LocalIndexStore::open(tmp.path()).unwrap();
-        let shard = store
-            .open_shard(&ShardId::single("docs"), &index())
-            .unwrap();
-        // The patched slots + the new intern survived the reopen…
-        assert_eq!(
-            shard.locate(&key(1)).unwrap().unwrap().iceberg_file,
-            "data/compacted.parquet"
-        );
-        assert_eq!(shard.locate(&key(2)).unwrap().unwrap().row_position, 11);
-        // …and the fully re-pointed source file stays dead (permanent tombstone —
-        // no slot references it anymore, so the flag never needs clearing).
-        assert!(shard.file_is_dead("data/f0.parquet"));
-        assert!(!shard.file_is_dead("data/compacted.parquet"));
-    }
-
-    #[test]
-    fn layered_locate_pit_pins_presence_and_reads_the_current_slot() {
-        let tmp = tempfile::tempdir().unwrap();
-        let shard = open_empty(tmp.path());
-        IndexWriter::write(&shard, &batch()).unwrap();
-        let pit = shard.open_pit().unwrap();
-
-        // An update after the PIT patches the (reused) slot: the PIT still *finds*
-        // the key as-of-S, and its locator points at the newer row of the same key —
-        // the documented D30 semantic (locators are verified coordinates).
-        IndexWriter::write(
-            &shard,
-            &CommitBatch::from_upserts(
-                vec![located(1, "the quick brown fox", "data/f7.parquet", 33)],
-                SourceCheckpoint::iceberg(101),
-                "b2",
-            ),
-        )
-        .unwrap();
-        let loc = shard.locate_pit(pit.id, &key(1)).unwrap().expect("as-of-S");
-        assert_eq!(loc.iceberg_file, "data/f7.parquet");
-
-        // A delete after the PIT: the pinned snapshot still resolves the key; the
-        // live path doesn't.
-        IndexWriter::write(
-            &shard,
-            &CommitBatch::new(
-                vec![DocOp::Delete(key(2))],
-                SourceCheckpoint::iceberg(102),
-                "del",
-            ),
-        )
-        .unwrap();
-        assert!(shard.locate(&key(2)).unwrap().is_none(), "live: deleted");
-        assert!(
-            shard.locate_pit(pit.id, &key(2)).unwrap().is_some(),
-            "PIT: still present as-of-S"
-        );
-        shard.close_pit(pit.id);
     }
 
     #[test]
@@ -6705,7 +5599,7 @@ mapping:
     }
 
     #[test]
-    fn commit_appends_a_generation_with_locator_and_checkpoint() {
+    fn commit_appends_a_generation_and_advances_the_checkpoint() {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalIndexStore::open(tmp.path()).unwrap();
         let shard = store
@@ -6720,20 +5614,16 @@ mapping:
         let q = Query::parse("body:brown").unwrap();
         assert_eq!(shard.search_all(&q, 10).unwrap().len(), 2);
 
-        // Checkpoint advanced; the layered locate resolves a key to its source row.
+        // Checkpoint advanced to the committed batch's source checkpoint.
         assert_eq!(
             shard.current_checkpoint().unwrap(),
             Some(SourceCheckpoint::iceberg(100))
         );
-        let key = CompositeKey::new(vec![], vec![("id".into(), 2i64.into())]);
-        let loc = shard.locate(&key).unwrap().expect("locator entry");
-        assert_eq!(loc.iceberg_file, "data/f0.parquet");
-        assert_eq!(loc.row_position, 1);
     }
 
     #[test]
     fn second_commit_appends_a_segment_searchable_alongside_the_first() {
-        // Two distinct commits accumulate; both are searchable and the locator merges.
+        // Two distinct commits accumulate; both are searchable.
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalIndexStore::open(tmp.path()).unwrap();
         let shard = store
@@ -6744,7 +5634,7 @@ mapping:
         let snap2 = IndexWriter::write(
             &shard,
             &CommitBatch::from_upserts(
-                vec![located(3, "a brown bear", "data/f1.parquet", 0)],
+                vec![located(3, "a brown bear")],
                 SourceCheckpoint::iceberg(200),
                 "b2",
             ),
@@ -6758,18 +5648,6 @@ mapping:
             .search_all(&Query::parse("body:brown").unwrap(), 10)
             .unwrap();
         assert_eq!(ids(&hits), vec![1, 2, 3]);
-
-        // The locator carries entries from both commits.
-        let k3 = CompositeKey::new(vec![], vec![("id".into(), 3i64.into())]);
-        assert_eq!(
-            shard.locate(&k3).unwrap().unwrap().iceberg_file,
-            "data/f1.parquet"
-        );
-        let k1 = CompositeKey::new(vec![], vec![("id".into(), 1i64.into())]);
-        assert!(
-            shard.locate(&k1).unwrap().is_some(),
-            "first commit survives"
-        );
     }
 
     #[test]
@@ -6832,8 +5710,6 @@ mapping:
         fields.insert("body".to_string(), body.into());
         LocatedDoc {
             doc: Document::new(pkey(region, id), fields),
-            iceberg_file: "data/f0.parquet".into(),
-            row_position: id as u64,
         }
     }
 
@@ -6871,10 +5747,6 @@ mapping:
         assert!(
             !shard.contains_key(&pkey("us", 2)).unwrap(),
             "stale key dropped"
-        );
-        assert!(
-            shard.locate(&pkey("us", 2)).unwrap().is_none(),
-            "locator dropped"
         );
         assert!(
             shard.contains_key(&pkey("eu", 3)).unwrap(),
@@ -6940,8 +5812,8 @@ mapping:
         assert!(!shard.contains_key(&key(2)).unwrap());
     }
 
-    // ---- live-key enumeration under delete debt (D30: the keyed locator table is
-    // gone; the live-key set comes from the term dictionary + per-term liveness).
+    // ---- live-key enumeration under delete debt: the live-key set comes from the
+    // term dictionary + per-term liveness.
     // The store runs NoMergePolicy, so a deleted/superseded doc's key term stays in
     // the dictionary until compaction — raw enumeration would over-report.
 
@@ -7088,8 +5960,6 @@ mod compact_tests {
         f.insert("body".to_string(), Value::from(body));
         let doc = LocatedDoc {
             doc: Document::new(key, f),
-            iceberg_file: "f".into(),
-            row_position: 0,
         };
         IndexWriter::write(
             shard,
@@ -7374,8 +6244,6 @@ mod reindex_tests {
                 f.insert("body".to_string(), Value::from("doc"));
                 LocatedDoc {
                     doc: Document::new(key, f),
-                    iceberg_file: "f".into(),
-                    row_position: 0,
                 }
             })
             .collect();
@@ -7416,36 +6284,6 @@ mod reindex_tests {
         assert!(canonical.exists());
         assert!(!sibling(&canonical, "reindex").exists());
         assert!(!sibling(&canonical, "old").exists());
-    }
-
-    #[test]
-    fn reindex_rebuilds_the_location_layer() {
-        // A reindex re-adds every doc from the source through the normal commit path,
-        // so the staging shard gets a freshly populated `_locid` fast field + location
-        // array, and the promoted shard serves the layered read path.
-        let tmp = tempfile::tempdir().unwrap();
-        let store = LocalIndexStore::open(tmp.path()).unwrap();
-        let id = ShardId::single("docs");
-        let resolved = resolved();
-
-        let shard = store.create_shard(&id, &resolved).unwrap();
-        write(&shard, &["a", "b"], 1);
-        drop(shard);
-
-        let promoted = store
-            .reindex(&id, &resolved, |s| {
-                write(s, &["a", "b"], 2);
-                Ok(())
-            })
-            .unwrap();
-        let key = CompositeKey::new(vec![], vec![("id".into(), Value::from("a"))]);
-        assert!(
-            promoted.loc_id_for_key(&key).unwrap().is_some(),
-            "rebuilt docs carry the fast field"
-        );
-        assert_eq!(promoted.location_store().len(), 2);
-        let loc = promoted.locate(&key).unwrap().expect("layered locate");
-        assert_eq!(loc.iceberg_file, "f");
     }
 
     #[test]
@@ -7706,8 +6544,6 @@ mod window_store_tests {
                 CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]),
                 f,
             ),
-            iceberg_file: "f".into(),
-            row_position: 0,
         })
     }
 
@@ -8048,8 +6884,6 @@ mod ann_tests {
         f.insert("body_vec".to_string(), Value::Vector(v));
         let doc = LocatedDoc {
             doc: Document::new(key, f),
-            iceberg_file: "f".into(),
-            row_position: 0,
         };
         IndexWriter::write(
             shard,
@@ -8198,8 +7032,6 @@ mod ann_tests {
         f.insert("body_vec".to_string(), Value::Vector(v));
         let doc = LocatedDoc {
             doc: Document::new(key, f),
-            iceberg_file: "f".into(),
-            row_position: 0,
         };
         IndexWriter::write(
             shard,

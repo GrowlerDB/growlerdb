@@ -91,8 +91,6 @@ fn two_tenant_node(root: &std::path::Path) -> (Arc<dyn Node>, Arc<ApiKeyStore>, 
         f.insert("tenant".to_string(), Value::from(tenant));
         LocatedDoc {
             doc: Document::new(key, f),
-            iceberg_file: "f".into(),
-            row_position: 0,
         }
     };
     IndexWriter::write(
@@ -262,8 +260,6 @@ fn two_tenant_search_service(root: &std::path::Path) -> SearchService {
         f.insert("tenant".to_string(), Value::from(tenant));
         LocatedDoc {
             doc: Document::new(key, f),
-            iceberg_file: "f".into(),
-            row_position: 0,
         }
     };
     IndexWriter::write(

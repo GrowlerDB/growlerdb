@@ -1,7 +1,5 @@
-//! The Node **Lookup** gRPC service — the PK-lookup / hydration path: resolve each
-//! coordinate through the shard [locator](growlerdb_core::RowLocator) and read the
-//! authoritative rows from Iceberg. Pairs with [`SearchService`] (which returns
-//! coordinates) to complete a search → row round-trip.
+//! The Node **Lookup** gRPC service — the PK-lookup / hydration path: check key presence, then
+//! re-find authoritative rows from Iceberg by a pruned key scan. Pairs with [`SearchService`].
 //!
 //! [`SearchService`]: crate::SearchService
 
@@ -149,11 +147,8 @@ impl Lookup for LookupService {
         };
 
         // Resolve first (a quick, Iceberg-free local read) so a missing key is a clear `NotFound`
-        // *before* we connect to the catalog. Strategy-aware: `COORDINATES` uses the layered
-        // locate + live-file bitmap; `PREDICATE` a locator-less key-presence check.
-        let predicate_index =
-            shard.location_strategy() == growlerdb_core::LocationStrategy::Predicate;
-        let located = hydrate::resolve_requests(&shard, &keys).map_err(engine_status)?;
+        // *before* we connect to the catalog — a store-less key-presence check against the index.
+        let mut located = hydrate::resolve_requests(&shard, &keys).map_err(engine_status)?;
         growlerdb_telemetry::sli::locate_keys(located.len() as u64);
 
         // Variant fork (D48/D49): a variant-table index hydrates through the interim Trino lane
@@ -170,7 +165,15 @@ impl Lookup for LookupService {
                 Ok(reader) => reader,
                 Err(e) => return Err(engine_status(EngineError::Source(e))),
             };
-            match reader.hydrate(&self.table, &located, &projection).await {
+            // Sort-key prune hints (best-effort) so pass 2 prunes by the sorted table's manifest
+            // min/max, not a whole-snapshot scan on the unprunable random key — resolved from the same
+            // table load the scan uses (one catalog round-trip, not two).
+            let hydrated = reader
+                .hydrate_pruned(&self.table, &mut located, &projection, |sort_names| {
+                    hydrate::prune_hint_values(&shard, sort_names, &keys)
+                })
+                .await;
+            match hydrated {
                 Ok(result) => result,
                 Err(e) => {
                     self.reader.invalidate().await;
@@ -182,30 +185,21 @@ impl Lookup for LookupService {
             growlerdb_telemetry::sli::plan_cache(hit);
         }
         // `requested - found` is the hydration-miss signal: a stale index (e.g. a recreated
-        // source) returns hits whose keys no longer exist in the table. On a `PREDICATE` index the
-        // pruned key scan is the *primary* read path, not a refresh, so its re-found rows never
-        // count as stale (`growlerdb_stale_locators_total` stays 0) and there's no layer to write back.
-        let refreshed = stale_locators_for_metrics(predicate_index, result.refreshed.len());
+        // source) returns hits whose keys no longer exist in the table, so they fail to re-find.
         let requested = keys.len() as u64;
         let found = result.rows.len() as u64;
         // The key scan saw >1 distinct source row for a key.
         growlerdb_telemetry::sli::duplicate_pks(result.duplicate_pks);
-        if !predicate_index {
-            shard
-                .refresh_locators(&result.refreshed)
-                .map_err(|e| engine_status(EngineError::Store(e)))?;
-        }
 
         let mut rows = result.rows;
         if let (Some(field), Some(claim)) = (&tenant_field, &tenant) {
             enforce_tenant_post_hydration(&mut rows, field, claim, added_tenant_col);
         }
 
-        // Hydration SLI: latency + stale-locator count + requested-vs-found (index↔source drift).
+        // Hydration SLI: latency + requested-vs-found (index↔source drift).
         growlerdb_telemetry::sli::hydration(
             &self.resolved.name,
             started.elapsed().as_secs_f64(),
-            refreshed,
             requested,
             found,
         );
@@ -234,17 +228,6 @@ fn enforce_tenant_post_hydration(
     }
 }
 
-/// The stale-locator count for the hydration SLI. On a `PREDICATE` index re-found rows came
-/// through the pruned key scan (the primary read path, not a refresh), so none count. On
-/// `COORDINATES` a re-found row means a locator had genuinely gone stale, so each one counts.
-fn stale_locators_for_metrics(predicate_index: bool, refound_rows: usize) -> u64 {
-    if predicate_index {
-        0
-    } else {
-        refound_rows as u64
-    }
-}
-
 /// A hydrated row → its wire form.
 fn to_wire_row(row: HydratedRow) -> WireRow {
     WireRow {
@@ -260,11 +243,11 @@ fn to_wire_row(row: HydratedRow) -> WireRow {
     }
 }
 
-/// Map an engine error to a gRPC status: a key with no locator is a client-facing
+/// Map an engine error to a gRPC status: a key not found in the index is a client-facing
 /// `NotFound`; everything else is `Internal`.
 fn engine_status(e: EngineError) -> Status {
     match e {
-        EngineError::MissingLocator(_) => {
+        EngineError::KeyNotFound(_) => {
             to_status(Code::NotFound, WireError::new("NOT_FOUND", e.to_string()))
         }
         other => to_status(
@@ -303,7 +286,7 @@ mod tests {
             .unwrap()
             .create_shard(&ShardId::single("docs"), &idx)
             .unwrap();
-        // Index one doc so the index exists (its locator resolves; "missing" won't).
+        // Index one doc so the index exists (its key is present; "missing" won't be).
         let key = CompositeKey::new(vec![], vec![("id".into(), Value::from("present"))]);
         let mut f = BTreeMap::new();
         f.insert("id".to_string(), Value::from("present"));
@@ -312,8 +295,6 @@ mod tests {
             &CommitBatch::from_upserts(
                 vec![LocatedDoc {
                     doc: Document::new(key, f),
-                    iceberg_file: "data/f0.parquet".into(),
-                    row_position: 0,
                 }],
                 SourceCheckpoint::iceberg(1),
                 "b1",
@@ -361,7 +342,7 @@ mod tests {
     async fn unknown_key_is_not_found_before_connecting_to_iceberg() {
         let tmp = tempfile::tempdir().unwrap();
         let svc = service(tmp.path(), default_auth());
-        // "missing" was never indexed → no locator → NotFound, resolved without ever
+        // "missing" was never indexed → key not present → NotFound, resolved without ever
         // reaching the (absent) Iceberg catalog.
         let err = svc
             .get_by_key(Request::new(GetByKeyRequest {
@@ -449,8 +430,6 @@ mod tests {
             &CommitBatch::from_upserts(
                 vec![LocatedDoc {
                     doc: Document::new(key, f),
-                    iceberg_file: "data/f0.parquet".into(),
-                    row_position: 0,
                 }],
                 SourceCheckpoint::iceberg(1),
                 "b1",
@@ -473,7 +452,7 @@ mod tests {
             vec!["id".into()],
         );
         let idx = IndexDefinition::from_yaml(
-            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nlocation_strategy: PREDICATE\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD } ] }\n",
+            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: id, type: KEYWORD } ] }\n",
         )
         .unwrap()
         .resolve(&src)
@@ -490,8 +469,6 @@ mod tests {
             &CommitBatch::from_upserts(
                 vec![LocatedDoc {
                     doc: Document::new(key, f),
-                    iceberg_file: "data/f0.parquet".into(),
-                    row_position: 0,
                 }],
                 SourceCheckpoint::iceberg(1),
                 "b1",
@@ -508,9 +485,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn predicate_index_unknown_key_is_not_found_before_connecting_to_iceberg() {
-        // The NotFound-before-catalog contract holds under PREDICATE too: presence is a
-        // local key-term probe (there is no locator to resolve), so a missing key never
-        // costs an Iceberg connect — and never triggers a broad scan.
+        // The NotFound-before-catalog contract holds under PREDICATE too: presence is a local
+        // key-term probe, so a missing key never costs an Iceberg connect nor triggers a broad scan.
         let tmp = tempfile::tempdir().unwrap();
         let svc = predicate_service(tmp.path());
         let err = svc
@@ -526,23 +502,12 @@ mod tests {
         assert_eq!(err.code(), Code::NotFound);
     }
 
-    #[test]
-    fn predicate_hydration_never_counts_stale_locators() {
-        // A `PREDICATE` hydration re-finds every key through the pruned scan — that's
-        // its primary path, not a refresh, so `growlerdb_stale_locators_total` must not
-        // move. Under `COORDINATES` the same re-found rows are genuinely stale locators.
-        assert_eq!(stale_locators_for_metrics(true, 5), 0);
-        assert_eq!(stale_locators_for_metrics(true, 0), 0);
-        assert_eq!(stale_locators_for_metrics(false, 5), 5);
-        assert_eq!(stale_locators_for_metrics(false, 0), 0);
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn tenant_scoped_hydration_requires_a_claim_before_any_iceberg_connect() {
         let tmp = tempfile::tempdir().unwrap();
         let svc = tenant_service(tmp.path());
         // No `x-growlerdb-tenant` metadata → fail closed with PermissionDenied, *before*
-        // resolving locators or reaching the (absent) catalog.
+        // checking key presence or reaching the (absent) catalog.
         let err = svc
             .get_by_key(Request::new(GetByKeyRequest {
                 shard: 0,

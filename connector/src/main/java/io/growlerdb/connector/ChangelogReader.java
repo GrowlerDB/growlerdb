@@ -17,9 +17,8 @@ import org.apache.spark.sql.functions;
  * {@code _commit_snapshot_id} plus the table columns. The row→{@code DocOp}
  * mapping is {@link ChangelogMapper}.
  *
- * <p>The changelog scan abstracts away data-file layout, so it does not carry the
- * source {@code (file, position)}; {@link #toRows} emits a <b>placeholder
- * locator</b> and hydration fills it lazily via verify-and-fall-back.
+ * <p>Ingest carries only the document — hydration re-finds the source row by key at
+ * read time (store-less), so no source {@code (file, position)} is read or sent.
  */
 public final class ChangelogReader {
 
@@ -85,7 +84,7 @@ public final class ChangelogReader {
    * Stream the changelog DataFrame as {@link ChangelogRow}s, pulling <b>one partition at a time</b>
    * to the driver ({@link Dataset#toLocalIterator}) so driver memory stays O(chunk) — a large
    * post-outage backlog does not OOM the driver. Ordered by {@code _change_ordinal}, so iterating
-   * partitions in index order preserves changelog order. Locator is a placeholder (see class docs).
+   * partitions in index order preserves changelog order.
    */
   public static Iterator<ChangelogRow> rowIterator(Dataset<Row> changelog, List<String> columns) {
     return rowIterator(changelog, columns, null);
@@ -124,7 +123,7 @@ public final class ChangelogReader {
   }
 
   /** Map one changelog {@link Row} to a {@link ChangelogRow}, projecting {@code columns} as wire
-   *  {@link Value}s. Placeholder locator (hydration fills it lazily). */
+   *  {@link Value}s. */
   static ChangelogRow toRow(Row row, List<String> columns) {
     return toRow(row, columns, null);
   }
@@ -172,7 +171,7 @@ public final class ChangelogReader {
       cols.putAll(extracted.shapedFields);
       variants = java.util.List.of(extracted.variantColumn);
     }
-    return new ChangelogRow(type, ordinal, snapshot, cols, "", 0, variants);
+    return new ChangelogRow(type, ordinal, snapshot, cols, variants);
   }
 
   /** Resolve a row's discriminator value: a path inside the variant (qualified with the column)

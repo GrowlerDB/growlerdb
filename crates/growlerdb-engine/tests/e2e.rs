@@ -8,9 +8,9 @@ use std::collections::BTreeMap;
 
 use growlerdb_core::{
     CommitBatch, CompositeKey, DocOp, Document, IndexWriter, LocatedDoc, Projection, ResolvedIndex,
-    RowLocator, ShardRouter, SourceCheckpoint, Value,
+    ShardRouter, SourceCheckpoint, Value,
 };
-use growlerdb_engine::{get_by_key, Engine, SearchOutcome};
+use growlerdb_engine::{Engine, SearchOutcome};
 use growlerdb_index::{LocalIndexStore, ShardId};
 use growlerdb_source::{IcebergConfig, IcebergReader};
 
@@ -245,8 +245,6 @@ async fn update_and_delete_round_trip_reflected_in_search() {
         updated_fields.insert("body".to_string(), Value::from("supernovae cosmology"));
         let updated = LocatedDoc {
             doc: Document::new(doc_key("doc-3"), updated_fields),
-            iceberg_file: "data/mutation.parquet".into(),
-            row_position: 0,
         };
 
         IndexWriter::write(
@@ -296,76 +294,6 @@ async fn update_and_delete_round_trip_reflected_in_search() {
     );
 }
 
-/// A stale locator (as if Iceberg rewrote the data file) must **verify and fall
-/// back** — re-find the row by key, return the correct content (never a phantom),
-/// and **refresh** the locator so it self-heals.
-#[tokio::test]
-#[ignore = "requires the local dev stack (just up) + `127.0.0.1 minio` in /etc/hosts"]
-async fn stale_locator_self_heals_via_verify_and_fall_back() {
-    let tmp = tempfile::tempdir().unwrap();
-    let engine = Engine::open(tmp.path(), IcebergConfig::local()).unwrap();
-    engine
-        .index("growlerdb.docs", None, None)
-        .await
-        .expect("index");
-
-    // Reopen the shard directly to corrupt a locator entry, simulating a rewrite
-    // that moved the row to a file/position the locator no longer points at.
-    let resolved: ResolvedIndex =
-        serde_json::from_slice(&std::fs::read(tmp.path().join("docs/index.json")).unwrap())
-            .unwrap();
-    let store = LocalIndexStore::open(tmp.path()).unwrap();
-    let shard = store
-        .open_shard(&ShardId::single("docs"), &resolved)
-        .unwrap();
-
-    let key = CompositeKey::new(vec![], vec![("id".into(), Value::from("doc-2"))]);
-    let bogus = "data/rewritten-away.parquet";
-    shard
-        .refresh_locators(&[(
-            key.clone(),
-            RowLocator {
-                iceberg_file: bogus.into(),
-                row_position: 999,
-            },
-        )])
-        .unwrap();
-
-    // Hydrate through the engine path → fallback re-finds doc-2 by key.
-    let reader = IcebergReader::connect(&IcebergConfig::local())
-        .await
-        .unwrap();
-    let rows = get_by_key(
-        &shard,
-        &reader,
-        &resolved,
-        "growlerdb.docs",
-        std::slice::from_ref(&key),
-        &Projection::All,
-    )
-    .await
-    .expect("hydrate with fallback");
-    assert_eq!(rows.len(), 1, "row re-found despite the stale locator");
-    assert_eq!(id_of(&rows[0].key), "doc-2");
-    assert_eq!(rows[0].fields["title"].to_index_string(), "iceberg search");
-
-    // The locator self-healed — it no longer points at the bogus file, and a
-    // second hydrate (now via the fast located path) still returns the row.
-    let healed = shard.locate(&key).unwrap().expect("locator");
-    assert_ne!(healed.iceberg_file, bogus, "locator refreshed");
-    let again = get_by_key(
-        &shard,
-        &reader,
-        &resolved,
-        "growlerdb.docs",
-        &[key],
-        &Projection::All,
-    )
-    .await
-    .unwrap();
-    assert_eq!(again[0].fields["title"].to_index_string(), "iceberg search");
-}
-
 /// **Reconcile backstop** — the detect-and-repair promise, end-to-end against the real seeded
 /// table. Injects drift in **both** directions and asserts a single [`Engine::reconcile`] cycle
 /// repairs it all, idempotently.
@@ -403,8 +331,6 @@ async fn reconcile_backstop_detects_and_repairs_drift_both_ways() {
         phantom_fields.insert("id".to_string(), Value::from("doc-99"));
         let phantom = LocatedDoc {
             doc: Document::new(doc_key("doc-99"), phantom_fields),
-            iceberg_file: "data/never-in-source.parquet".into(),
-            row_position: 0,
         };
 
         IndexWriter::write(

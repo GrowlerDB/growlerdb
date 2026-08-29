@@ -37,11 +37,10 @@ message VariantLeaf {
   Value value = 2;   // scalar leaf value, canonical form
 }
 
-// A document paired with where its row lives in the source (for the locator).
+// One document to ingest. Store-less hydration re-finds the source row by key at read time,
+// so the write path carries only the document — no source (file, position).
 message LocatedDoc {
   Document doc = 1;
-  string iceberg_file = 2;
-  uint64 row_position = 3;
 }
 
 // A single change, keyed by the composite key (a changelog reduces to these).

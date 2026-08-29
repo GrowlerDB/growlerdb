@@ -27,7 +27,7 @@ delivered in this order:
    expected in the next release). Batch/backfill decodes variant natively, and hydration pass-1
    decodes the variant column inside the existing direct parquet point read (the Arrow/parquet
    line we already pin carries the decode machinery). Trino is then demoted to the **permanent
-   slow lane**: delete-bearing files and the pass-2 stale-locator fallback.
+   slow lane**: delete-bearing files and the pass-2 unprunable-scan fallback.
 
 **Status.** Steps 1–2 **implemented + live-verified**; step 3 pending the next iceberg-rust release.
 The connector extracts the variant column (step 1: `VariantExtractor` + `--variant-spec`; bootstrap +
