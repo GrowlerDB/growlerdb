@@ -84,13 +84,25 @@ def render_s3(path):
 
 # --- in-cluster driver Jobs ---------------------------------------------------------------------
 
+def _s3_subs():
+    """Resolve the active object-store target (deploy/k8s/s3-target.env: minio|hetzner) → the S3_* values
+    a driver Job needs to write Iceberg sentinels (freshness). Same source render-s3.sh uses, so drivers
+    match every other component's endpoint/creds instead of the hardcoded MinIO default."""
+    script = (f'. "{RENDER_S3.parent}/s3-target.env" >/dev/null 2>&1; '
+              'printf "%s\\t%s\\t%s" "$S3_ENDPOINT" "$S3_ACCESS_KEY" "$S3_SECRET_KEY"')
+    out = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                         env=os.environ, check=True).stdout
+    ep, ak, sk = out.split("\t")
+    return {"S3_ENDPOINT": ep, "S3_ACCESS_KEY": ak, "S3_SECRET_KEY": sk}
+
+
 def render_driver_job(name, driver_cmd, pip):
     """Substitute the driver-Job template. `driver_cmd` MUST be a single line (block-scalar safety)."""
     if "\n" in driver_cmd:
         raise SystemExit(f"driver_cmd for job '{name}' must be single-line, got:\n{driver_cmd}")
     text = string.Template(DRIVER_TEMPLATE.read_text()).safe_substitute(
         JOB_NAME=name, NAMESPACE=NS, GIT_REF=GIT_REF, IMAGE=DRIVER_IMAGE, PIP=pip,
-        DRIVER_CMD=driver_cmd)
+        DRIVER_CMD=driver_cmd, **_s3_subs())
     if "${" in text:
         raise SystemExit(f"driver-job.template.yaml: unresolved placeholder rendering '{name}'")
     return text

@@ -53,7 +53,7 @@ spec:
             - { name: POLARIS_URI, value: "http://polaris:8181/api/catalog" }
             - { name: POLARIS_CATALOG, value: "growlerdb" }
             - { name: POLARIS_CREDENTIAL, value: "root:s3cr3t" }
-            - { name: AWS_ENDPOINT_URL_S3, value: "http://minio:9000" }
-            - { name: AWS_ACCESS_KEY_ID, value: "minioadmin" }
-            - { name: AWS_SECRET_ACCESS_KEY, value: "minioadmin" }
+            - { name: AWS_ENDPOINT_URL_S3, value: "${S3_ENDPOINT}" }
+            - { name: AWS_ACCESS_KEY_ID, value: "${S3_ACCESS_KEY}" }
+            - { name: AWS_SECRET_ACCESS_KEY, value: "${S3_SECRET_KEY}" }
           volumeMounts: [{ name: work, mountPath: /work }]
