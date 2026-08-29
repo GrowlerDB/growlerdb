@@ -604,8 +604,10 @@ fn vec_f32_to_le_bytes(v: &[f32]) -> Vec<u8> {
 /// Decode raw little-endian `f32` bytes back into a vector — inverse of [`vec_f32_to_le_bytes`]. A
 /// trailing partial element (length not a multiple of 4) is dropped.
 fn le_bytes_to_vec_f32(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 

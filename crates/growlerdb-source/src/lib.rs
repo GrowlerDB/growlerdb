@@ -1500,7 +1500,7 @@ mod tests {
     }
 
     #[test]
-    fn key_predicate_ands_a_sort_key_hint_onto_the_key() {
+    fn key_predicate_conjoins_a_sort_key_hint_onto_the_key() {
         // The sort-key prune hint (`n = 42`, the row's own value) is AND-ed onto the key's `id`
         // equality — pruning by manifest min/max on `n`, which the random `id` alone can't. Safe: the exact key re-verify carries correctness.
         let schema = ice_schema();
