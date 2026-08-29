@@ -102,16 +102,25 @@ table**:
 
 1. **Generate → finish → settle.** Fill the Iceberg table to the target size, stop the generator,
    and let the table settle (final snapshot committed, no in-flight writes). The corpus must be
-   **dup-free** (see Risks) so both engines can converge exactly. Optionally run maintenance
-   (compaction) once here so both engines read the identical, compacted layout.
-2. **Cold full-sync to GrowlerDB — measured.** Bring GrowlerDB up against the settled table from
-   empty and measure **wall-clock to converged** (doc_count == `COUNT(*)`), **sustained docs/s**
+   **dup-free** (see Risks) so both engines can converge exactly. **Do NOT compact yet** — both cold
+   syncs ingest the *uncompacted* small-file layout (see the compaction-ordering note below).
+2. **Cold full-sync to OpenSearch — measured (runs first).** Bring OpenSearch + Data Prepper up
+   against the settled table from empty → `_count` converged; throughput, Data Prepper fleet resource
+   use. OpenSearch goes first because Data Prepper's Iceberg CDC reads a whole compacted ~128 MB file
+   as one initial-load partition whose bulk-write times out (poison-pill), so it must precede compaction.
+3. **Cold full-sync to GrowlerDB — measured.** Same *uncompacted* table (fair T1: identical layout),
+   from empty: **wall-clock to converged** (doc_count == `COUNT(*)`), **sustained docs/s**
    (`growlerdb_ingested_docs_total` rate, sampled *during* the sync — not after), peak `ingest_lag_ms`,
-   and node/connector resource use. Convergence gate as today.
-3. **Cold full-sync to OpenSearch — measured.** Same table, same measurements: Data Prepper CDC from
-   empty → `_count` converged; throughput, Data Prepper fleet resource use.
-4. **Then queries** (per engine, on the fully-synced index): the query matrix, QPS sweep, and
-   freshness, exactly as before.
+   node/connector resource use. Convergence gate as today.
+4. **Compact once, then queries.** After both engines have ingested, run maintenance (compaction) once
+   — GrowlerDB's `ts`-pruned hydration needs the sort-clustered layout; OpenSearch queries its own
+   Lucene index (layout-independent). Then the query matrix, QPS sweep, and freshness, per engine.
+
+**Compaction ordering (why OpenSearch is first).** The Iceberg file layout only matters to GrowlerDB's
+hydration (needs the `ts`-sorted compaction) and to Data Prepper's *ingest* (chokes on large files);
+once rows are indexed each engine queries its own store. So both ingest the uncompacted table, then a
+single compaction lands before the GrowlerDB query phase. `compare_run` scales OpenSearch down before
+the GrowlerDB cold sync and owns exactly one compaction in the GrowlerDB phase.
 
 The load-bearing change vs the earlier harness: **neither engine's ingest overlaps generation.**
 Previously GrowlerDB's streaming connector was deployed by `scale-up` and ingested *concurrently with
@@ -181,8 +190,9 @@ documented in the published report.
   keeps the `http_logs` shape everything was built against, now 18 fields with the searchable
   `trace_id`).
 - **Phase 2 — Run A @ ~50 GB `http_logs`:** orchestrated by `compare_run.py`, sequential per the
-  **Ingest methodology**: **generate once → settle (dup-free) → GrowlerDB cold full-sync (MEASURED) →
-  query matrix → transition → OpenSearch cold full-sync (MEASURED) → query matrix → finalize.** The
+  **Ingest methodology**: **generate once → settle (dup-free) → OpenSearch cold full-sync + query
+  (MEASURED, uncompacted table) → GrowlerDB cold full-sync (MEASURED, same uncompacted layout) →
+  compact once → GrowlerDB query matrix → finalize.** The
   cold-sync of each engine from the *settled* table is its own timed, throughput-measured phase — not
   a side effect of generation. Load/convergence/freshness drivers run as **in-cluster Jobs** (rendered
   from `deploy/k8s/comparison/driver-job.template.yaml`), never over `kubectl port-forward` — the

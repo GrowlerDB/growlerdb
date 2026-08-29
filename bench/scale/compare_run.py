@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Orchestrate the GrowlerDB-vs-OpenSearch comparison run: sequential-on-full-cluster (fairness charter)
-— generate the corpus once, benchmark GrowlerDB, tear down, benchmark OpenSearch on the same table.
+— generate the corpus once, benchmark OpenSearch, then GrowlerDB, on the same table. OpenSearch ingests
+FIRST, on the uncompacted table (Data Prepper's Iceberg CDC times out bulk-writing a whole compacted file);
+GrowlerDB then cold-syncs the same uncompacted layout (fair T1) and compacts for its ts-pruned hydration.
 Load drivers run IN-CLUSTER as Jobs (port-forwarded drivers report garbage); `--plan`/`--self-check`
 run nothing. Assumes the cluster is up (scale-up.sh). See bench/scale/comparison-plan.md."""
 
@@ -194,10 +196,14 @@ def phase_generate(target_rows):
 # --- GrowlerDB cold-sync (ingest axis) ----------------------------------------------------------
 
 def phase_gdb_coldsync(scale):
-    """Deploy the GrowlerDB serving stack against the settled table and measure the cold full sync (the
-    ingest counterpart to OpenSearch's CDC load). Nodes come up EMPTY (DEFINE_ONLY); the connector backfills."""
-    log("PHASE gdb_coldsync — bring up GrowlerDB on the settled table, measure the cold full sync")
+    """Scale OpenSearch down, deploy the GrowlerDB serving stack against the still-UNCOMPACTED table, and
+    measure the cold full sync. Fair T1: both engines ingest the same small-file layout; compaction (which
+    GrowlerDB's ts-pruned hydration needs) runs later in phase_growlerdb, once both have ingested. Nodes
+    come up EMPTY (DEFINE_ONLY); the connector backfills."""
+    log("PHASE gdb_coldsync — scale OpenSearch down, bring up GrowlerDB on the uncompacted table, measure the cold full sync")
     t = SCALE_TIMEOUTS[scale]
+    sh(f"kubectl -n {NS} scale statefulset opensearch --replicas=0", check=False)
+    sh(f"kubectl -n {NS} scale deploy data-prepper --replicas=0", check=False)
     sh(f"STAGE=serving DEFINE_ONLY=true NAMESPACE={NS} {REPO}/deploy/k8s/scale-up.sh")
     # Time to convergence (index docs == source DISTINCT id) IS the ingest headline (docs/s =
     # source_count / elapsed); started_epoch scopes the metrics window to the backfill. Gates the query phase.
@@ -258,17 +264,19 @@ def phase_growlerdb(scale):
     capture(scale, "GrowlerDB", f"{HERE}/gdb-query.json", f"{HERE}/gdb-freshness.json")
 
 
-# --- transition + OpenSearch phase --------------------------------------------------------------
+# --- OpenSearch cold-sync + query phase ---------------------------------------------------------
+# OpenSearch runs FIRST, on the UNCOMPACTED table: Data Prepper's Iceberg CDC source reads a whole
+# compacted ~128 MB file as one giant initial-load partition whose bulk-write to OS times out (poison-
+# pill retry, OS idle), so compaction MUST follow the CDC load. GrowlerDB — which needs the sort-
+# clustered compaction for its ts-pruned hydration — ingests next and compacts in phase_growlerdb.
 
-def phase_transition():
-    log("PHASE transition — scale GrowlerDB serving down, bring up OpenSearch + Data Prepper")
-    sh(f"kubectl -n {NS} scale statefulset gdb-growlerdb-node --replicas=0", check=False)
-    sh(f"NAMESPACE={NS} {REPO}/deploy/k8s/comparison/up.sh")
-
-
-def phase_opensearch(scale):
-    log("PHASE opensearch — wait for CDC initial load convergence, query matrix, freshness, capture")
+def phase_os_coldsync(scale):
+    """Bring up OpenSearch + Data Prepper on the UNCOMPACTED table and measure the CDC cold sync (the ingest
+    counterpart to GrowlerDB's connector backfill). Runs before any compaction — Data Prepper's Iceberg CDC
+    chokes on compacted large files (see the section note)."""
+    log("PHASE os_coldsync — bring up OpenSearch + Data Prepper on the uncompacted table, measure the CDC cold sync")
     t = SCALE_TIMEOUTS[scale]
+    sh(f"NAMESPACE={NS} {REPO}/deploy/k8s/comparison/up.sh")
     # Convergence gate: OpenSearch _count == source DISTINCT id (CDC initial load complete). That load
     # is the run's slowest step (hours at 50 GB); timed + captured like phase_gdb_coldsync for symmetry.
     start = time.time()
@@ -279,6 +287,13 @@ def phase_opensearch(scale):
     elapsed = time.time() - start
     log(f"OpenSearch CDC cold-sync converged in {elapsed:.0f}s")
     capture(scale, "OpenSearch cold-sync", params={"cold_sync_secs": f"{elapsed:.0f}"}, started_epoch=start)
+
+
+def phase_opensearch(scale):
+    """OpenSearch query matrix + freshness (already converged in phase_os_coldsync). No compaction needed —
+    OS queries its own Lucene index, independent of the Iceberg file layout."""
+    log("PHASE opensearch — query matrix, freshness, capture")
+    t = SCALE_TIMEOUTS[scale]
     run_driver_job(
         "query-os",
         "python compare_query.py run http_logs --engines opensearch "
@@ -319,10 +334,13 @@ def phase_finalize():
         log("HETZNER_S3_* not set — skipping artifact push (create the bucket + set creds to enable)")
 
 
-# Order matters (run-all iterates insertion order): generate the settled corpus → measure GrowlerDB's
-# cold sync → GrowlerDB query matrix → transition → measure OpenSearch's cold sync + query → finalize.
-PHASES = {"generate": phase_generate, "gdb_coldsync": phase_gdb_coldsync, "growlerdb": phase_growlerdb,
-          "transition": phase_transition, "opensearch": phase_opensearch, "finalize": phase_finalize}
+# Order matters (run-all iterates insertion order): generate the settled corpus → OpenSearch cold-sync +
+# query on the UNCOMPACTED table (Data Prepper's Iceberg CDC chokes on compacted large files) → GrowlerDB
+# cold-sync (both engines ingest the same small-file layout = fair T1) → compact + GrowlerDB query (its
+# ts-pruned hydration needs the sort-clustered compaction) → finalize. phase_gdb_coldsync scales
+# OpenSearch down first; phase_growlerdb owns the single compaction.
+PHASES = {"generate": phase_generate, "os_coldsync": phase_os_coldsync, "opensearch": phase_opensearch,
+          "gdb_coldsync": phase_gdb_coldsync, "growlerdb": phase_growlerdb, "finalize": phase_finalize}
 
 
 # --- offline self-check -------------------------------------------------------------------------
@@ -380,8 +398,8 @@ def main():
     order = list(PHASES) if args.phase == "all" else [args.phase]
     for name in order:
         fn = PHASES[name]
-        fn(target_rows) if name == "generate" else (
-            fn(args.scale) if name in ("gdb_coldsync", "growlerdb", "opensearch") else fn())
+        # generate takes the row target, finalize takes nothing, every other phase takes the scale.
+        fn(target_rows) if name == "generate" else (fn() if name == "finalize" else fn(args.scale))
     log("done" if not DRY else "plan complete (nothing executed)")
 
 
