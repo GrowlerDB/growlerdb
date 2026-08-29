@@ -46,6 +46,9 @@ STAGE="${STAGE:-all}"
 # streaming connector performs the entire, measured cold backfill — symmetric with Data Prepper CDC and
 # keeping ingest on the metric-emitting connector write path. Default off (nodes boot-build as before).
 DEFINE_ONLY="${DEFINE_ONLY:-false}"
+# SKIP_GENERATOR: STAGE=deps brings up Polaris + observability but NOT the generator — for a --reuse-table
+# run, where the persisted table is registered (not regenerated), so the generator must not create/pollute it.
+SKIP_GENERATOR="${SKIP_GENERATOR:-false}"
 # CONNECTOR_SET: on the non-windowed (sharded) topology, deploy the parallel connector SET — W=SHARDS
 # independent worker pipelines, each owning a disjoint shard group — so cold-sync ingest uses idle node
 # headroom instead of one pipeline. Set false to fall back to the single connector. The set's
@@ -144,6 +147,9 @@ fi
 kubectl -n "$NAMESPACE" rollout status deploy/polaris --timeout=180s
 kubectl -n "$NAMESPACE" wait --for=condition=complete job/polaris-catalog-setup --timeout=240s
 
+if [ "$SKIP_GENERATOR" = true ]; then
+  say "3/7 generator — SKIPPED (SKIP_GENERATOR=true; --reuse-table registers the persisted $TABLE)"
+else
 say "3/7 generator — creates $TABLE and starts feeding it"
 kubectl apply -f "$RENDER_DIR/generator.yaml"
 echo "waiting for the $TABLE table to be created ..."
@@ -165,6 +171,7 @@ if ! kubectl -n "$NAMESPACE" get configmap growlerdb-workload-corpus \
   exit 1
 fi
 echo "  generator corpus.py carries the idempotent append-retry (make_cols) ✓"
+fi  # end SKIP_GENERATOR
 fi  # end deps+generator (skipped for STAGE=serving)
 
 # STAGE=deps stops here: bring up observability (so Prometheus scrapes generation + the later cold
