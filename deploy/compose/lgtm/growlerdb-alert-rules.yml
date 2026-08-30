@@ -23,15 +23,6 @@ groups:
           summary: 'p99 query latency {{ $value | printf "%.2f" }}s exceeds 1s'
           description: 'GrowlerDB p99 query latency is above target.'
 
-      - alert: StaleLocatorChurn
-        expr: sum(rate(growlerdb_stale_locators_total[5m])) > 1
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: 'Stale-locator churn {{ $value | printf "%.2f" }}/s exceeds 1/s'
-          description: 'Hydration is discarding stale locators faster than expected.'
-
       # Index↔source drift early-warning: GetByKey returning far fewer rows than keys
       # requested means search hits whose keys no longer exist in the source — a stale index, e.g.
       # after a recreated source table. Sustained high miss fraction → reindex. The denominator is

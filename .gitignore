@@ -30,3 +30,4 @@ deploy/compose/demo-data/local/*
 !deploy/compose/demo-data/local/.gitkeep
 # local docs preview only — GitHub Pages' native build pins its own gem set
 docs/Gemfile.lock
+/bench/scale/ndjson/

@@ -1,0 +1,102 @@
+# Data Prepper: Iceberg CDC source -> OpenSearch sink. Reads the SAME growlerdb.http_logs Iceberg
+# table (Polaris REST + MinIO) as GrowlerDB/Trino and streams row-level changes into OpenSearch.
+# This fleet's resources count AGAINST OpenSearch's budget (fairness charter).
+# VERIFIED end-to-end against Data Prepper 2.15.1 in a local smoke (Polaris + MinIO + OpenSearch on
+# the compose network): CDC initial-load converged exactly (500 source rows -> 500 OpenSearch docs,
+# _id = request_id). What the smoke settled:
+#   - The iceberg source is EXPERIMENTAL — must be enabled in data-prepper-config.yaml (below).
+#   - catalog is PER-TABLE, not top-level (top-level source.iceberg only accepts
+#     polling_interval/acknowledgments/tables); polling_interval IS source-level.
+#   - Explicit s3.* keys authenticate against MinIO (Polaris did not force credential vending here).
+# Benign warnings seen (safe to ignore): Iceberg OAuth2 "missing oauth2-server-uri, defaulting to
+# {uri}/v1/oauth/tokens" (correct for Polaris), and Polaris REPORT_READ_METRICS "Forbidden"
+# (scan-metrics reporting only; no effect on data flow).
+# Still true at real scale: the iceberg source is CoW-ONLY — the http_logs table must be CoW.
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: data-prepper-pipeline, namespace: growlerdb }
+data:
+  pipelines.yaml: |
+    version: "2"
+    iceberg-cdc-pipeline:
+      source:
+        iceberg:
+          # catalog is PER-TABLE (verified vs 2.15.1: top-level source.iceberg accepts only
+          # [polling_interval, acknowledgments, tables]). The catalog map is passed verbatim to
+          # Iceberg CatalogUtil.loadCatalog(), so these are standard Iceberg catalog/S3FileIO props.
+          tables:
+            - table_name: "growlerdb.http_logs"
+              identifier_columns: ["request_id"]
+              disable_export: false   # false = initial full load THEN CDC; true = CDC-only
+              catalog:
+                type: "rest"
+                uri: "http://polaris:8181/api/catalog"
+                warehouse: "growlerdb"
+                credential: "root:s3cr3t"
+                scope: "PRINCIPAL_ROLE:ALL"
+                io-impl: "org.apache.iceberg.aws.s3.S3FileIO"
+                client.region: "${S3_REGION}"
+                s3.endpoint: "${S3_ENDPOINT}"
+                s3.access-key-id: "${S3_ACCESS_KEY}"
+                s3.secret-access-key: "${S3_SECRET_KEY}"
+                s3.path-style-access: "${S3_PATH_STYLE}"
+          polling_interval: "PT30S"
+          acknowledgments: true
+      sink:
+        - opensearch:
+            hosts: ["http://opensearch:9200"]   # security plugin disabled on the OS side
+            index: "http_logs"
+            action: '${getMetadata("bulk_action")}'      # index | delete, set by the source
+            document_id: '${getMetadata("document_id")}' # request_id value
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: data-prepper-config, namespace: growlerdb }
+data:
+  data-prepper-config.yaml: |
+    ssl: false
+    metricRegistries:
+      - Prometheus
+    # The Iceberg source is an EXPERIMENTAL plugin — without this it fails at startup with
+    # "Unable to create experimental plugin iceberg" (verified against 2.15.1).
+    experimental:
+      enable_all: true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: data-prepper, namespace: growlerdb, labels: { app: data-prepper } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: data-prepper } }
+  template:
+    metadata: { labels: { app: data-prepper } }
+    spec:
+      # Don't ingest until the parity index template exists, or Data Prepper's sink auto-creates
+      # http_logs with a dynamic mapping (wrong types + no completion field) before the setup Job wins.
+      initContainers:
+        - name: wait-template
+          image: curlimages/curl:8.11.1
+          command: ["sh", "-c", "until curl -sf -o /dev/null http://opensearch:9200/_index_template/http_logs; do echo 'waiting for http_logs index template'; sleep 3; done"]
+      containers:
+        - name: data-prepper
+          image: opensearchproject/data-prepper:2.15.1
+          env:
+            - { name: JAVA_OPTS, value: "-Xms6g -Xmx6g" }
+          ports:
+            - { name: api, containerPort: 4900 } # core API + Prometheus metrics (/metrics/sys, /metrics/prometheus)
+          resources:
+            requests: { cpu: "4", memory: 8Gi }
+            limits: { cpu: "8", memory: 16Gi }
+          volumeMounts:
+            - { name: pipeline, mountPath: /usr/share/data-prepper/pipelines/pipelines.yaml, subPath: pipelines.yaml }
+            - { name: config, mountPath: /usr/share/data-prepper/config/data-prepper-config.yaml, subPath: data-prepper-config.yaml }
+      volumes:
+        - { name: pipeline, configMap: { name: data-prepper-pipeline } }
+        - { name: config, configMap: { name: data-prepper-config } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: data-prepper, namespace: growlerdb, labels: { app: data-prepper } }
+spec:
+  selector: { app: data-prepper }
+  ports: [{ name: api, port: 4900, targetPort: 4900 }]

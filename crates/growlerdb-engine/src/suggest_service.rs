@@ -181,8 +181,6 @@ mod tests {
                 key.clone(),
                 LocatedDoc {
                     doc: Document::new(key, f),
-                    iceberg_file: "f".into(),
-                    row_position: 0,
                 },
             )
         };

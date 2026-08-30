@@ -1044,8 +1044,6 @@ mod tests {
             f.insert("rank".to_string(), Value::Int(rank));
             LocatedDoc {
                 doc: Document::new(key, f),
-                iceberg_file: "f".into(),
-                row_position: 0,
             }
         };
         IndexWriter::write(
@@ -1239,8 +1237,6 @@ mod tests {
             f.insert("rank".to_string(), Value::Int(rank));
             LocatedDoc {
                 doc: Document::new(key, f),
-                iceberg_file: "f".into(),
-                row_position: 0,
             }
         };
         IndexWriter::write(
@@ -1395,8 +1391,6 @@ mod tests {
         f.insert("rank".to_string(), Value::Int(rank));
         let doc = LocatedDoc {
             doc: Document::new(key, f),
-            iceberg_file: "f".into(),
-            row_position: 0,
         };
         IndexWriter::write(
             shard,
@@ -1952,8 +1946,6 @@ mod tests {
             f.insert("tenant".to_string(), Value::from(tenant));
             LocatedDoc {
                 doc: Document::new(key, f),
-                iceberg_file: "f".into(),
-                row_position: 0,
             }
         };
         IndexWriter::write(
@@ -2046,8 +2038,6 @@ mod tests {
             f.insert("body".to_string(), Value::from(body));
             LocatedDoc {
                 doc: Document::new(key, f),
-                iceberg_file: "f".into(),
-                row_position: 0,
             }
         };
         IndexWriter::write(
@@ -2146,8 +2136,6 @@ mod tests {
             f.insert("body".to_string(), Value::from(body));
             LocatedDoc {
                 doc: Document::new(key, f),
-                iceberg_file: "f".into(),
-                row_position: 0,
             }
         };
         let mut docs = vec![
@@ -2220,8 +2208,6 @@ mod tests {
         );
         let mut docs = vec![LocatedDoc {
             doc: Document::new(key, f),
-            iceberg_file: "f".into(),
-            row_position: 0,
         }];
         growlerdb_embed::embed_located_docs(&idx, &mut docs);
         IndexWriter::write(
@@ -2281,8 +2267,6 @@ mod tests {
             f.insert("body".to_string(), Value::from(body));
             LocatedDoc {
                 doc: Document::new(key, f),
-                iceberg_file: "f".into(),
-                row_position: 0,
             }
         };
         let mut docs = vec![
@@ -2419,8 +2403,6 @@ mod tests {
             f.insert("body".to_string(), Value::from(body));
             LocatedDoc {
                 doc: Document::new(key, f),
-                iceberg_file: "f".into(),
-                row_position: 0,
             }
         };
         let mut docs = vec![

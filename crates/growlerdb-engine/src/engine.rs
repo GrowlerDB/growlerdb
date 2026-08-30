@@ -548,9 +548,8 @@ impl Engine {
         })
     }
 
-    /// Search `index`, returning ranked coordinates + scores. When `hydrate` is
-    /// set, also fetch the authoritative rows (projected by `projection`) from
-    /// Iceberg via the locator.
+    /// Search `index`, returning ranked coordinates + scores. When `hydrate` is set, also fetch the
+    /// authoritative rows (projected by `projection`) from Iceberg by key.
     pub async fn search(
         &self,
         index: &str,
@@ -795,8 +794,6 @@ impl Engine {
             shard_count: 1,     // the embedded engine builds a single shard
             tenant_field: None, // auto-mapped indexes aren't tenant-scoped (set it explicitly)
             windowing: None,    // auto-mapped indexes aren't time-windowed (set it explicitly)
-            // The universal default; PREDICATE is an explicit choice.
-            location_strategy: growlerdb_core::LocationStrategy::default(),
         })
     }
 
@@ -1028,23 +1025,21 @@ mod tests {
         )
         .unwrap();
 
-        let doc = |id: &str, body: &str, pos: u64| {
+        let doc = |id: &str, body: &str| {
             let key = CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]);
             let mut fields = BTreeMap::new();
             fields.insert("id".to_string(), Value::from(id));
             fields.insert("body".to_string(), Value::from(body));
             LocatedDoc {
                 doc: Document::new(key, fields),
-                iceberg_file: "data/f0.parquet".into(),
-                row_position: pos,
             }
         };
         IndexWriter::write(
             &shard,
             &CommitBatch::from_upserts(
                 vec![
-                    doc("doc-1", "hello world welcome", 0),
-                    doc("doc-2", "full text search over iceberg", 1),
+                    doc("doc-1", "hello world welcome"),
+                    doc("doc-2", "full text search over iceberg"),
                 ],
                 SourceCheckpoint::iceberg(1),
                 "b1",
@@ -1084,9 +1079,9 @@ mod tests {
         .unwrap();
 
         let mut docs = vec![
-            doc("doc-1", "apache iceberg lakehouse tables", 0),
-            doc("doc-2", "full text search relevance ranking", 1),
-            doc("doc-3", "vector embeddings semantic retrieval", 2),
+            doc("doc-1", "apache iceberg lakehouse tables"),
+            doc("doc-2", "full text search relevance ranking"),
+            doc("doc-3", "vector embeddings semantic retrieval"),
         ];
         // Embed each doc's `body` into `body_vec`, exactly as the ingest transform does.
         embed_located_docs(&resolved, &mut docs);
@@ -1225,7 +1220,7 @@ mod tests {
         )
         .unwrap();
 
-        let tdoc = |id: &str, tenant: &str, body: &str, pos: u64| {
+        let tdoc = |id: &str, tenant: &str, body: &str| {
             let key = CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]);
             let mut fields = BTreeMap::new();
             fields.insert("id".to_string(), Value::from(id));
@@ -1233,16 +1228,14 @@ mod tests {
             fields.insert("body".to_string(), Value::from(body));
             LocatedDoc {
                 doc: Document::new(key, fields),
-                iceberg_file: "f".into(),
-                row_position: pos,
             }
         };
         let mut docs = vec![
-            tdoc("t1-a", "t1", "vector embeddings semantic retrieval", 0),
-            tdoc("t1-b", "t1", "apache iceberg lakehouse tables", 1),
+            tdoc("t1-a", "t1", "vector embeddings semantic retrieval"),
+            tdoc("t1-b", "t1", "apache iceberg lakehouse tables"),
             // Same body as t1-a but a DIFFERENT tenant — the nearest neighbor to a matching query,
             // so it would surface first without the tenant filter.
-            tdoc("t2-a", "t2", "vector embeddings semantic retrieval", 2),
+            tdoc("t2-a", "t2", "vector embeddings semantic retrieval"),
         ];
         embed_located_docs(&resolved, &mut docs);
         IndexWriter::write(
@@ -1322,8 +1315,8 @@ mod tests {
         )
         .unwrap();
         let mut docs = vec![
-            doc("both", "apple banana cherry", 0),
-            doc("other", "xylophone yak zebra", 1),
+            doc("both", "apple banana cherry"),
+            doc("other", "xylophone yak zebra"),
         ];
         embed_located_docs(&resolved, &mut docs);
         IndexWriter::write(
@@ -1509,8 +1502,6 @@ mod tests {
             &CommitBatch::from_upserts(
                 vec![LocatedDoc {
                     doc: Document::new(key, fields),
-                    iceberg_file: "data/f0.parquet".into(),
-                    row_position: 0,
                 }],
                 SourceCheckpoint::iceberg(1),
                 "b1",
@@ -1520,15 +1511,13 @@ mod tests {
         assert_eq!(shard.num_docs().unwrap(), 1);
     }
 
-    fn doc(id: &str, body: &str, pos: u64) -> LocatedDoc {
+    fn doc(id: &str, body: &str) -> LocatedDoc {
         let key = CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]);
         let mut fields = BTreeMap::new();
         fields.insert("id".to_string(), Value::from(id));
         fields.insert("body".to_string(), Value::from(body));
         LocatedDoc {
             doc: Document::new(key, fields),
-            iceberg_file: "data/f0.parquet".into(),
-            row_position: pos,
         }
     }
 
@@ -1558,8 +1547,6 @@ mod tests {
         fields.insert("event".to_string(), Value::Int(event));
         LocatedDoc {
             doc: Document::new(key, fields),
-            iceberg_file: "f".into(),
-            row_position: 0,
         }
     }
 
@@ -1599,7 +1586,7 @@ mod tests {
             .write_build(
                 &resolved(),
                 CommitBatch::from_upserts(
-                    vec![doc("d1", "hello", 0)],
+                    vec![doc("d1", "hello")],
                     SourceCheckpoint::iceberg(1),
                     "b2",
                 ),
@@ -1628,7 +1615,7 @@ mod tests {
         let docs: Vec<LocatedDoc> = (0..30)
             .map(|i| {
                 let body = if i % 3 == 0 { "alpha beta" } else { "beta" };
-                doc(&format!("d{i}"), body, i)
+                doc(&format!("d{i}"), body)
             })
             .collect();
         let count = |shard: &Shard, q: &str| {
@@ -1690,7 +1677,7 @@ mod tests {
         IndexWriter::write(
             &shard,
             &CommitBatch::from_upserts(
-                vec![doc("doc-1", "a", 0), doc("doc-2", "b", 1)],
+                vec![doc("doc-1", "a"), doc("doc-2", "b")],
                 SourceCheckpoint::iceberg(1),
                 "seed",
             ),
@@ -1698,7 +1685,7 @@ mod tests {
         .unwrap();
 
         // Source now has doc-1 (unchanged) + doc-3 (new); doc-2 is gone.
-        let source = vec![doc("doc-1", "a", 0), doc("doc-3", "c", 2)];
+        let source = vec![doc("doc-1", "a"), doc("doc-3", "c")];
         let report = apply_drift(&shard, &[], source.clone(), None).unwrap();
         assert_eq!(
             report,
@@ -1749,7 +1736,7 @@ mod tests {
         IndexWriter::write(
             &shard0,
             &CommitBatch::from_upserts(
-                vec![doc(stay, "a", 0), doc(stale, "b", 1)],
+                vec![doc(stay, "a"), doc(stale, "b")],
                 SourceCheckpoint::iceberg(1),
                 "seed",
             ),
@@ -1758,9 +1745,9 @@ mod tests {
 
         // The FULL source (every shard's keys): `stay` + a new owned `missing` + ALL foreign keys;
         // `stale` is gone. This is what a whole-table read would hand a single node.
-        let mut full_source = vec![doc(stay, "a", 0), doc(missing, "c", 2)];
-        for (i, f) in foreign.iter().enumerate() {
-            full_source.push(doc(f, "x", 100 + i as u64));
+        let mut full_source = vec![doc(stay, "a"), doc(missing, "c")];
+        for f in foreign.iter() {
+            full_source.push(doc(f, "x"));
         }
 
         // Shard-scope: keep only the docs THIS shard owns before reconciling (what the RPC does).
@@ -1865,11 +1852,7 @@ mod tests {
             ("mountain", "hikers ascended the steep granite ridge"),
             ("ocean", "divers explored a vivid coral reef"),
         ];
-        let mut docs: Vec<LocatedDoc> = corpus
-            .iter()
-            .enumerate()
-            .map(|(i, (id, body))| doc(id, body, i as u64))
-            .collect();
+        let mut docs: Vec<LocatedDoc> = corpus.iter().map(|(id, body)| doc(id, body)).collect();
         embed_located_docs(&resolved, &mut docs);
         // Seed in a scope so the store/shard (holding the redb) drops before `Engine::open` reopens
         // the same root — otherwise redb refuses the second open (`DatabaseAlreadyOpen`).

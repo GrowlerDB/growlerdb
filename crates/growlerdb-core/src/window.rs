@@ -384,8 +384,6 @@ mod tests {
                 CompositeKey::new(vec![], vec![("id".into(), Value::from(id))]),
                 f,
             ),
-            iceberg_file: "f".into(),
-            row_position: 0,
         })
     }
 

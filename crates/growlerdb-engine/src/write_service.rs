@@ -303,8 +303,6 @@ mod tests {
         fields.insert("id".to_string(), Value::from("doc-1"));
         let doc = LocatedDoc {
             doc: Document::new(key, fields),
-            iceberg_file: "data/f0.parquet".into(),
-            row_position: 0,
         };
         let batch = CommitBatch::from_upserts(vec![doc], SourceCheckpoint::iceberg(42), "b1");
         svc.write(Request::new(WriteRequest {
@@ -342,8 +340,6 @@ mod tests {
             fields.insert("id".to_string(), Value::from("doc-1"));
             let doc = LocatedDoc {
                 doc: Document::new(key, fields),
-                iceberg_file: "f".into(),
-                row_position: 0,
             };
             WriteRequest {
                 batch: Some(
@@ -383,8 +379,6 @@ mod tests {
             fields.insert("id".to_string(), Value::from("doc-1"));
             let doc = LocatedDoc {
                 doc: Document::new(key, fields),
-                iceberg_file: "f".into(),
-                row_position: 0,
             };
             WriteRequest {
                 batch: Some(
@@ -417,8 +411,6 @@ mod tests {
             fields.insert("id".to_string(), Value::from("doc-1"));
             let doc = LocatedDoc {
                 doc: Document::new(key, fields),
-                iceberg_file: "f".into(),
-                row_position: 0,
             };
             WriteRequest {
                 batch: Some(
@@ -479,8 +471,6 @@ mod tests {
         fields.insert("id".to_string(), Value::from("doc-1"));
         let doc = LocatedDoc {
             doc: Document::new(key, fields),
-            iceberg_file: "f".into(),
-            row_position: 0,
         };
         svc.write(Request::new(WriteRequest {
             batch: Some(

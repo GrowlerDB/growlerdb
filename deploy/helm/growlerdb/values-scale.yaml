@@ -44,9 +44,11 @@ node:
   persistence:
     storageClass: local-path # k3s rancher local-path provisioner
     size: 50Gi
+  # Sized for large dedicated-vCPU nodes (e.g. ccx43 = 16 vCPU / 64 GiB): headroom so query + compaction
+  # don't saturate the node (4 CPU was too low → readiness flaps → scatter-gather 500s under load).
   resources:
-    requests: { cpu: "1", memory: 2Gi }
-    limits: { cpu: "4", memory: 8Gi }
+    requests: { cpu: "4", memory: 16Gi }
+    limits: { cpu: "12", memory: 48Gi }
   podDisruptionBudget:
     enabled: true
     minAvailable: 5 # of 6 shard pods

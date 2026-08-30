@@ -13,7 +13,7 @@ timestamp: 2026-07-16T00:00:00
 [cold read-through](/product/functional/cold-tiering.md). This is the hot→cold counterpart of the
 already-existing access-driven **pre-warm** loop (cold→hot), and it reuses the same machinery: back the
 window up through the live serving handle (no second writer), atomically swap the handle to a
-read-through shard, then evict the local Tantivy bulk (keeping the tiny locator + `aux.redb` local).
+read-through shard, then evict the local Tantivy bulk (keeping the tiny `aux.redb` local).
 A parked window immediately gets a pre-warm watcher, so a re-heated window promotes itself back to hot
 — the pair is a self-managing hot/cold set.
 
@@ -31,8 +31,8 @@ the intact hot shard back on a mismatch rather than evicting a write that exists
 Only one node owns the current (actively written) window and it is that node's most-recent window, so a
 per-node "keep the most recent N hot" policy never parks a window still being written. The backup +
 durable marker land **before** any local eviction, so a crash mid-park always leaves a fully-serving
-hot shard, never a markerless empty window. The two background writers (auto-compaction, locator
-re-map) stand down the moment a window becomes read-only (no writer), so an in-place swap is race-free.
+hot shard, never a markerless empty window. The background auto-compaction writer stands down the
+moment a window becomes read-only (no writer), so an in-place swap is race-free.
 
 **Writes that still reach a parked window.** Two ingest paths can target a parked window, and both
 are handled without panicking the write path (a write into a cold shard is a clean

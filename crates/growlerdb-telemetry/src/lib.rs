@@ -41,9 +41,12 @@ pub fn init(service: &str) {
     // as a summary (`{quantile}`, no `_bucket`), so `histogram_quantile` returns nothing. With buckets
     // it exports a true cumulative histogram, aggregatable across replicas. All latency metrics end in
     // `_duration_seconds`, so one suffix rule covers query / hydration / http-request.
+    // The top runs to 30 s (the node/gateway request timeout, source/lib.rs): without buckets past 10 s,
+    // any p95/p99 above it right-censors to exactly 10 s — masking the under-load hydration tail.
     if PROMETHEUS.get().is_none() {
         const LATENCY_BUCKETS: &[f64] = &[
             0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            15.0, 20.0, 30.0,
         ];
         let builder = PrometheusBuilder::new()
             .set_buckets_for_metric(Matcher::Suffix("_duration_seconds".into()), LATENCY_BUCKETS)
@@ -207,8 +210,8 @@ pub mod sli {
         gauge!("growlerdb_segments_live", "index" => label.to_string()).set(segments as f64);
     }
 
-    /// A shard's full on-disk index footprint in bytes — Tantivy files **plus** the
-    /// locator layers, i.e. exactly the sum of `growlerdb_index_bytes_component`.
+    /// A shard's full on-disk index footprint in bytes — the Tantivy files plus the slim redb aux
+    /// store, i.e. exactly the sum of `growlerdb_index_bytes_component`.
     /// Emitted on the compaction loop's tick alongside `segments_live` — so the index-size panel
     /// tracks growth (and the drop after a merge), not just the segment count.
     pub fn index_bytes(label: &str, bytes: u64) {
@@ -226,7 +229,7 @@ pub mod sli {
     /// Per-component index size in bytes: `component` is
     /// `term` (term dictionaries), `postings`, `positions` (phrase support), `fieldnorms` (BM25
     /// lengths) — together the classic inverted index — plus `fast` (fast-field cache), `store`
-    /// (doc store), `locator` (hydration lookup), and `other` (metadata/deletes). Lets the
+    /// (doc store), and `other` (metadata/deletes). Lets the
     /// index:source ratio be attributed to its drivers (a stacked panel) rather than a lump total,
     /// and lets storage work (dropping positions, fast-only numerics, compact key terms) be
     /// verified against the exact structure it targets. The components sum to
@@ -388,23 +391,16 @@ pub mod sli {
         .increment(missing);
     }
 
-    /// Record a key-hydration (PK lookup): its `duration_secs`, how many locators Iceberg had
-    /// rewritten (the **stale-locator / verify-fallback** signal), and how many of the `requested`
-    /// keys were authoritatively `found` in the source.
+    /// Record a key-hydration (PK lookup): its `duration_secs` and how many of the `requested`
+    /// keys were authoritatively `found` in the source (the store-less key scan re-finds each row).
     ///
     /// A rising **miss rate** (`requested - found`) is the cheap early-warning for index↔source
     /// **drift**: a stale index — e.g. after a recreated source — still returns search
     /// hits whose keys no longer exist in the table, so they fail to hydrate. It flags trouble even
     /// before the lineage guard engages on a restart.
-    /// Labelled by `index` (the served index) so hydrate rate/latency, the Iceberg-match ratio
-    /// (found/requested), and the stale-locator rate are all chart-able per index.
-    pub fn hydration(
-        index: &str,
-        duration_secs: f64,
-        refreshed_locators: u64,
-        requested: u64,
-        found: u64,
-    ) {
+    /// Labelled by `index` (the served index) so hydrate rate/latency and the Iceberg-match ratio
+    /// (found/requested) are chart-able per index.
+    pub fn hydration(index: &str, duration_secs: f64, requested: u64, found: u64) {
         counter!("growlerdb_hydration_total", "index" => index.to_string()).increment(1);
         histogram!("growlerdb_hydration_duration_seconds", "index" => index.to_string())
             .record(duration_secs);
@@ -412,37 +408,12 @@ pub mod sli {
             .increment(requested);
         counter!("growlerdb_hydration_keys_found_total", "index" => index.to_string())
             .increment(found);
-        if refreshed_locators > 0 {
-            counter!("growlerdb_stale_locators_total", "index" => index.to_string())
-                .increment(refreshed_locators);
-        }
     }
 
-    /// Record the keys resolved by a hydration's locate (the layered
-    /// path: key term → `_locid` fast field → `location.arr`). Counts **keys**, not
-    /// requests, so locator traffic is directly rate-able.
+    /// Record the keys resolved by a hydration (each key re-found in the source by the store-less
+    /// key scan). Counts **keys**, not requests, so hydration traffic is directly rate-able.
     pub fn locate_keys(keys: u64) {
         counter!("growlerdb_locate_keys_total").increment(keys);
-    }
-
-    /// Record a completed **compaction re-map** event: an Iceberg
-    /// rewrite removed interned data files from the live table, and the background re-map
-    /// re-pointed the affected location slots at the rewritten rows' new files. Counts events
-    /// and rows re-mapped, labelled by `index` — a rising `growlerdb_stale_locators_total`
-    /// *despite* re-map events firing means the re-map isn't keeping up (or is skipping files,
-    /// e.g. delete-bearing ones).
-    pub fn locator_remap(index: &str, rows_remapped: u64) {
-        counter!("growlerdb_locator_remap_events_total", "index" => index.to_string()).increment(1);
-        counter!("growlerdb_locator_remapped_rows_total", "index" => index.to_string())
-            .increment(rows_remapped);
-    }
-
-    /// Record the current **dead-file count**: interned data files flagged
-    /// dead (rewritten away — permanent tombstones). A gauge labelled by `index`; it grows with
-    /// each compaction the source table undergoes, and hydration skips point reads into these
-    /// files, so the gauge doubles as a "compactions the index has absorbed" signal.
-    pub fn locator_dead_files(index: &str, count: u64) {
-        gauge!("growlerdb_locator_dead_files", "index" => index.to_string()).set(count as f64);
     }
 
     /// Record **source-health** gauges for an index's source table, sampled from Iceberg
@@ -496,7 +467,7 @@ pub mod sli {
         }
     }
 
-    /// Record a hydration **plan-cache** outcome: whether pass 1's
+    /// Record a hydration **plan-cache** outcome: whether the key scan's
     /// current-snapshot plan was reused from the snapshot-pinned cache (`hit`) or freshly
     /// planned — catalog + manifest reads (`miss`). The miss rate makes planning cost
     /// observable for the scale tests: a miss per batch means the cache isn't earning
@@ -551,7 +522,7 @@ mod tests {
         sli::query("docs", "semantic", true, 0.034, true);
         sli::query_retrieval("docs", 0.005);
         sli::ingested_docs("docs", 5);
-        sli::hydration("docs", 0.002, 0, 10, 7); // 10 keys requested, 7 found → 3 hydration misses
+        sli::hydration("docs", 0.002, 10, 7); // 10 keys requested, 7 found → 3 hydration misses
         sli::ingest_lag_ms("docs", 45_000);
         sli::shard_availability("docs", 2, 3);
         sli::compaction("docs", 5, 1); // 4 segments reclaimed

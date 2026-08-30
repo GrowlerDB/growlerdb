@@ -97,9 +97,9 @@ registry until something calls `CreateIndex`).
 - **Observability is pre-wired** (`lgtm/`, mounted into the otel-lgtm container): the bundled
   OTel Collector scrapes each service's `/metrics` into Prometheus, and Grafana auto-loads the
   **GrowlerDB SLIs** dashboard (`http://localhost:3000` → Dashboards) — query RED (rate/errors/
-  latency), ingestion throughput, and hydration latency + stale-locator rate. Traces land in
-  Tempo (search by service `growlerdb`). The error/ingestion/stale panels populate under the
-  matching traffic (failed queries / connector writes / locator refreshes).
+  latency), ingestion throughput, and hydration latency. Traces land in
+  Tempo (search by service `growlerdb`). The error/ingestion panels populate under the
+  matching traffic (failed queries / connector writes).
 - Health/readiness (`/healthz`, `/readyz`) and Prometheus `/metrics` are on each service's
   `--metrics-addr` port; Docker healthchecks gate `depends_on` (the gateway waits for a ready node).
 - Smoke test once up: `curl localhost:9103/readyz` (gateway ready). REST queries need a **login

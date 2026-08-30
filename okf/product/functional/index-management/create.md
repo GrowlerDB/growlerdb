@@ -1,7 +1,7 @@
 ---
 type: Feature
 title: Create index
-description: Define and build an index over an Iceberg table — fields, key, cached/fast flags, windowing, location strategy.
+description: Define and build an index over an Iceberg table — fields, key, cached/fast flags, windowing, sharding.
 tags: [feature, index, create]
 timestamp: 2026-07-04T14:22:00
 ---
@@ -18,26 +18,23 @@ Define an index over an Iceberg table and build it. The definition chooses:
   columnar path serves; a *term* filter like `archived:true` needs `indexed: true`, since
   the columnar path answers ranges/sorts but has no postings to match a term) / TEXT-only **`record`**
   + **`fieldnorms`** (posting detail and
-  BM25 norms; see [data model](/system/storage/data-model.md)) flags; optionally a
+  BM25 norms; see [data model](/system/storage/data-model.md)) / **`suggest`** (build a per-segment
+  prefix-completion sidecar for low-latency typeahead — see
+  [suggest](/product/functional/search/suggest.md)) flags; optionally a
   declared **timestamp** field and [windowing](/product/functional/windowing-time.md). Iceberg v3
   **variant** columns have their own `type: VARIANT` mapping surface
   ([variant fields](/product/functional/index-management/variant.md)) — untyped `flatten` and/or
   discriminator-selected typed `shapes` — because their paths are per-row rather than in the source
   schema; `resolve()` accepts a variant column without resolving its (non-existent) leaf schema.
 - **Sharding** — shard count + routing.
-- **Location strategy** (`location_strategy`, [D30](/system/decisions/d30-layered-locator.md)) —
-  how [hydration](/product/functional/hydration.md) locates a key's source row: `COORDINATES`
-  (default; per-row location data, fast point reads on any table) or `PREDICATE` (store-less;
-  re-find by a pruned key scan — effective only on key-correlated layouts, and create returns a
-  warning saying so). Changing it later is reindex-only; auto-detection is deferred until the
-  `row_id` strategy exists.
 
 ## Behavior
 
 Create validates the definition against the source schema, registers the index in the
 [control plane](/system/runtime/components/control-plane.md), and a [node](/system/runtime/components/node.md)
-builds it. Non-fatal resolution **warnings** (e.g. the `PREDICATE` honest-scope note, or an
-equality-delete column outside the key) come back in the create response and are logged. The
+builds it. Non-fatal resolution **warnings** (e.g. the [hydration](/product/functional/hydration.md)
+honest-scope note when the source is unclustered/unpartitioned, or an equality-delete column outside
+the key) come back in the create response and are logged. The
 console offers create-from-introspection (describe the source, pick fields).
 
 ## Notes

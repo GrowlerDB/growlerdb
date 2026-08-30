@@ -1,0 +1,312 @@
+# GrowlerDB vs OpenSearch — at-scale comparison benchmark plan
+
+Operational plan and fairness charter for the pre-1.0 head-to-head benchmark. Companion to
+[`okf/quality/scale-test-plan.md`](../../okf/quality/scale-test-plan.md) (the GrowlerDB-only scale
+suite) and the [`RUNLOG.md`](RUNLOG.md) ledger. Results publish to a new `docs/benchmarks.md` page.
+
+## Objective
+
+Credible, published data on three axes:
+
+1. **Ingest (full initial sync)** — first-class, measured symmetrically: each engine performs a **cold
+   full sync of the identical, settled Iceberg table** and we measure **wall-clock time, sustained
+   throughput (docs/s), and resource use**. GrowlerDB's streaming changelog connector vs the
+   **OpenSearch Data Prepper Iceberg CDC** path. Ingest is as important as query. See the **Ingest
+   methodology** section — the load-bearing rule is that generation FINISHES and SETTLES first, then
+   each engine syncs the *same static table* (never overlap generation with either engine's ingest,
+   which is what an earlier harness did — GrowlerDB streamed during generation while only OpenSearch got
+   a clean cold load, so the two were not comparable).
+2. **Query latency by query type** — GrowlerDB vs OpenSearch vs the Trino/Iceberg scan baseline.
+3. **Query-throughput scaling** — concurrency/QPS sweeps to saturation.
+4. **End-to-end freshness** — sentinel-row lag, reported **both under sustained ingest load and at rest**
+   (they differ a lot: GrowlerDB's at-rest lag is seconds, but under an ingest burst above the
+   connector's throughput ceiling it accumulates — see the ingest-ceiling note in Risks).
+
+Landing these closes the GA "formal at-scale benchmark suite" item and replaces the current
+`docs/performance.md` directional numbers where measured ones now exist.
+
+Scope this round is **lexical + autocomplete only**. Vector/kNN and hybrid/RRF are explicitly
+deferred to a later round (they need embeddings at scale and a kNN harness on both engines).
+
+## Systems under test (versions pinned in the report)
+
+| System | Role | Ingest path | Notes |
+|---|---|---|---|
+| GrowlerDB | subject | streaming changelog connector | non-windowed `http_logs` for parity |
+| OpenSearch + Data Prepper 2.15 | primary comparison | Iceberg CDC source (snapshot-poll, **CoW-only**, experimental) | `_bulk` fallback if CDC underperforms, **labeled as such** |
+| Trino 483 | Iceberg-scan baseline | reads the same table | already wired in `compare_trino.py`; re-baseline from 470 |
+
+Elasticsearch and Quickwit were considered and **cut this round** on cost/scope.
+
+## Dataset
+
+- **Corpus:** a **generated `http_logs`** corpus at **~50 GB uncompressed** (~120–140M rows). No
+  permissively-licensed real dataset fit all of log-shaped + commercial-use + 30–100 GB, so the corpus
+  is synthetic — but modeled on real web traffic (Zipf path/IP/user popularity, ~87% 200, lognormal
+  sizes/latency, diurnal/weekly timestamps, path-conditioned status/method/size). The generation
+  methodology + a distribution-validation report are documented and open in
+  [`synthetic-corpus.md`](synthetic-corpus.md); the generator is `workloads/http_logs/corpus.py`.
+  Seeded → reproducible; parallel generator pods (distinct `BENCH_SEED`) shard to 50 GB.
+- **Table:** **Copy-on-Write** Iceberg (mandatory — OpenSearch Data Prepper CDC rejects
+  Merge-on-Read at startup), **non-windowed**, hash-routed by `request_id` (the generated primary key).
+- **Why non-windowed for the head-to-head:** apples-to-apples (a single evolving logs index is what
+  OpenSearch would run; no GrowlerDB-only windowing/cold-tier that OpenSearch can't match);
+  conservative for GrowlerDB (no partition-pruning tailwind); and the maintenance CronJob is
+  hardcoded to `growlerdb.http_logs` (TASK-340), so a non-windowed run gets **correct compaction**
+  while a windowed one currently gets none.
+- **GrowlerDB-only windowed addendum:** a separate, clearly-labeled feature demo of windowed
+  sub-linear top-K + cold-tier park/revive, where there is no OpenSearch equivalent to compare
+  against. Not a head-to-head row.
+
+## Query types (this round)
+
+`match_all`, `term`, **exact-id point lookup** (`trace_id`, the searchable X-Request-ID — the
+request-correlation lookup real log search leans on; measured both as a per-type GrowlerDB-vs-OpenSearch
+row in the open-loop driver, its value resolved live per engine since seeds vary per pod, and as a pair
+against Iceberg's `trace_id` bloom in `compare_trino.py`), `phrase` (match_phrase), `boolean` (bool
+must/should/filter), `range`,
+**prefix/autocomplete**, and top-K returning documents in three modes: coordinates-only, cached
+fields, and full retrieval (GrowlerDB hydrate-from-Iceberg vs OpenSearch `_source`).
+
+**Autocomplete parity (resolved):** whole-value prefix typeahead on `user_id`, each system on its
+intended path — GrowlerDB's native `POST /v1/suggest` (a bounded live term-dictionary scan; the
+OpenSearch compat adapter has no suggest route) vs an OpenSearch dedicated `completion` FST field.
+This is a real architectural asymmetry (GrowlerDB reuses the index; OpenSearch builds an extra
+structure), disclosed and reported with the completion field's added storage — like `_source`
+-vs-hydrate. The harness hits two different endpoints per system, also disclosed. See
+`deploy/k8s/comparison/README.md` and the `autocomplete_user_id` query.
+
+## Metrics
+
+- Per-type latency **p50/p95/p99**, both client-timed and engine-internal (subtract the client→DC
+  RTT floor as prior runs did).
+- **QPS-vs-latency saturation curves** (open-loop arrival rate; see fairness charter).
+- **Ingest — cold full-sync time + sustained throughput (docs/s)** per engine, measured on the same
+  settled table (see **Ingest methodology**). Report backfill (this cold sync) and steady-state
+  **separately**. GrowlerDB's connector and OpenSearch's Data Prepper are measured the same way.
+- **End-to-end freshness** — sentinel-row lag distribution (p50/p99), one clock (below); reported
+  **under sustained ingest AND at rest** (they differ materially — see Risks).
+- **Storage footprint** + index:source ratio (raw basis) per system.
+- **Resource use** under load and ingest, on **all** components incl. the Data Prepper fleet and the
+  GrowlerDB connector/nodes during their cold sync.
+- **Convergence** — index live-doc count == source `COUNT(DISTINCT request_id)` == source `COUNT(*)`,
+  which holds **only if the corpus is dup-free** (see the dup-request_id note in Risks). GrowlerDB
+  indexes one doc per source row (doc_count tracks `COUNT(*)`); OpenSearch dedups by `_id`=request_id
+  (tracks `COUNT(DISTINCT)`). If the corpus has duplicate request_ids the two engines index different
+  counts and convergence can't close — so a dup-free corpus is a prerequisite, not a nice-to-have.
+
+## Ingest methodology (cold full-sync, symmetric)
+
+Ingest is a first-class result, measured identically for both engines against the **same static
+table**:
+
+1. **Generate → finish → settle.** Fill the Iceberg table to the target size, stop the generator,
+   and let the table settle (final snapshot committed, no in-flight writes). The corpus must be
+   **dup-free** (see Risks) so both engines can converge exactly. **Do NOT compact yet** — both cold
+   syncs ingest the *uncompacted* small-file layout (see the compaction-ordering note below).
+2. **Cold full-sync to OpenSearch — measured (runs first).** Bring OpenSearch + Data Prepper up
+   against the settled table from empty → `_count` converged; throughput, Data Prepper fleet resource
+   use. OpenSearch goes first because Data Prepper's Iceberg CDC reads a whole compacted ~128 MB file
+   as one initial-load partition whose bulk-write times out (poison-pill), so it must precede compaction.
+3. **Cold full-sync to GrowlerDB — measured.** Same *uncompacted* table (fair T1: identical layout),
+   from empty: **wall-clock to converged** (doc_count == `COUNT(*)`), **sustained docs/s**
+   (`growlerdb_ingested_docs_total` rate, sampled *during* the sync — not after), peak `ingest_lag_ms`,
+   node/connector resource use. Convergence gate as today.
+4. **Compact once, then queries.** After both engines have ingested, run maintenance (compaction) once
+   — GrowlerDB's `ts`-pruned hydration needs the sort-clustered layout; OpenSearch queries its own
+   Lucene index (layout-independent). Then the query matrix, QPS sweep, and freshness, per engine.
+
+**Compaction ordering (why OpenSearch is first).** The Iceberg file layout only matters to GrowlerDB's
+hydration (needs the `ts`-sorted compaction) and to Data Prepper's *ingest* (chokes on large files);
+once rows are indexed each engine queries its own store. So both ingest the uncompacted table, then a
+single compaction lands before the GrowlerDB query phase. `compare_run` scales OpenSearch down before
+the GrowlerDB cold sync and owns exactly one compaction in the GrowlerDB phase.
+
+The load-bearing change vs the earlier harness: **neither engine's ingest overlaps generation.**
+Previously GrowlerDB's streaming connector was deployed by `scale-up` and ingested *concurrently with
+generation*, so its "convergence time" measured only the tail catch-up, while OpenSearch (brought up
+after generation) got a clean cold load — the two ingest numbers were not comparable. Now both start
+from the same settled table. Orchestration change: `compare_run` must hold the GrowlerDB connector/node
+build until generation settles, then time the cold sync as its own measured phase (mirroring the
+OpenSearch phase), before the query matrix.
+
+## Fairness charter
+
+The load-bearing rules that make the numbers defensible. Every place parity is impossible gets
+documented in the published report.
+
+1. **Same source.** Identical CoW Iceberg table, catalog, snapshot history, and commit cadence for
+   all systems.
+2. **Equal total budget, run sequentially.** Each system is benchmarked on the **identical full
+   cluster**, one at a time (bring up → ingest → query + QPS matrix → capture → tear down → next),
+   not concurrently on shared nodes (which lets one starve the other). This is the cleanest reading of
+   "equal budget" at the cost of ingesting 100 GB twice. Data Prepper capacity counts **against**
+   OpenSearch's budget, not free on the side. See `deploy/k8s/comparison/README.md`.
+3. **Config parity.** Same analyzers/tokenizers per field, same shard/replica counts, matching field
+   types. `refresh_interval` is **fixed and disclosed** (raising it lifts bulk throughput but worsens
+   freshness — a disclosed trade, not a per-run tuning knob).
+4. **Freshness on one clock.** End-to-end lag = wall-clock from source Iceberg commit until a query
+   returns that row, measured identically by sentinel rows. OpenSearch's lag legitimately stacks
+   snapshot cadence + `polling_interval` + `refresh_interval`; GrowlerDB's is its streaming commit
+   path. Never compare OpenSearch internal-refresh-only against GrowlerDB end-to-end.
+5. **`_source` vs hydrate is a first-class result, not hidden.** OpenSearch stores a full `_source`
+   copy (more storage, no Iceberg round-trip on fetch); GrowlerDB stores keys + index and hydrates.
+   Measure **both** index-only (IDs/scores) and full-document top-K, and report **storage footprint**
+   alongside latency. Do not silently disable `_source` for "parity"; if disabled, disclose it as a
+   changed operating mode.
+6. **Open-loop load.** Drive QPS at a fixed arrival rate (k6/vegeta) to avoid coordinated omission.
+   If OpenSearch Benchmark is used for OS-native metrics, set a **non-zero `target-throughput`** and
+   read `latency` (its `target-throughput: 0` mode hides tail latency); report both `latency` and
+   `service_time`.
+7. **Warmup + cache handling** identical across systems; enough iterations for stable p99; pin JVM
+   heap/GC for the OpenSearch/Trino side.
+8. **Pinned, disclosed versions.** OpenSearch + Data Prepper (experimental status noted), Trino 483,
+   GrowlerDB image SHA.
+
+## Hardware & sizing
+
+- **6× ccx43** (16 dedicated vCPU / 64 GB / 360 GB local NVMe each) in **nbg1** = **96 dedicated
+  cores** (matches the requested quota exactly). $0.5216/hr/node ≈ **$75/day** cluster.
+- Probe (2026-08-24): 1× ccx43 provisioned + destroyed cleanly, no quota error → dedicated quota is
+  ≥16 cores. The full 96-core headroom is confirmed at `terraform apply` (fails fast, no real spend).
+- Index data (GrowlerDB Tantivy segments, OpenSearch shards) on **local NVMe**; the Iceberg object
+  store is **switchable** (`deploy/k8s/s3-target.env`, `S3_PROFILE`): default `minio` (a single
+  in-cluster MinIO pod — fine for correctness, but its single-pod GET throughput caps hydration under
+  load, distorting the topk-under-load number), or `hetzner` — the **same nbg1 Hetzner Object Storage
+  bucket** used for run artifacts, under an `iceberg/` path prefix. **nbg1 == the cluster region**, so
+  hydration GETs stay in-region (no cross-region latency/egress). Use `hetzner` for the representative
+  hydration-under-load numbers; a real cloud store's horizontal GET throughput is what production sees.
+  Est. footprint at ~50 GB raw: Iceberg parquet ~10–25 GB, GrowlerDB index
+  ~18–24 GB, **OpenSearch index (with `_source`) ~50–75 GB**, staging/backups ~25 GB — fits the
+  ~2,160 GB total local NVMe with headroom. The searchable near-unique `trace_id` adds a large keyword
+  term dictionary to **both** indexes (≈ one entry/row) — a disclosed cost, reported alongside latency.
+- **Object-store profile mechanics.** One source of truth (`s3-target.env`) drives every S3 client
+  (Polaris catalog, engine helm values, Spark connector/maintenance, generator, Data Prepper, Trino)
+  via `deploy/k8s/render-s3.sh` at each apply site; `minio` renders byte-for-byte as before. Hetzner
+  credentials are read at deploy time from `~/.ssh/hetzner-gdb-storage` (the artifacts creds file),
+  never committed. Run: `S3_PROFILE=hetzner scale-up.sh …` then `S3_PROFILE=hetzner compare_run.py …`.
+
+## Phases
+
+- **Phase 0 — pre-flight:** DONE (quota probe, sizing, cost, dataset/hardware decisions).
+- **Phase 1 — harness build-out (local/CI, lexical only):** DONE (synthetic schema). Neutral
+  open-loop driver (`compare_query.py`), OpenSearch + Data Prepper manifests (`deploy/k8s/comparison/`),
+  sentinel-row freshness harness (`compare_freshness.py`), `queries.comparison.json`, concurrency
+  sweep, `capture.py` fold-in. Both engines' query paths + the Data Prepper CDC pipeline were
+  smoke-verified locally (Polaris + MinIO + OpenSearch, real Iceberg table).
+- **Phase 1.5 — generator realism:** DONE. Enhanced `corpus.py` with realistic distributions (Zipf
+  path/IP/user, ~87% 200, lognormal sizes/latency, diurnal/weekly time, path-conditioned fields),
+  seeded/reproducible; added the methodology doc [`synthetic-corpus.md`](synthetic-corpus.md) and the
+  `corpus_stats.py` validation report. Schema/queries unchanged from Phase 1 (the generated corpus
+  keeps the `http_logs` shape everything was built against, now 18 fields with the searchable
+  `trace_id`).
+- **Phase 2 — Run A @ ~50 GB `http_logs`:** orchestrated by `compare_run.py`, sequential per the
+  **Ingest methodology**: **generate once → settle (dup-free) → OpenSearch cold full-sync + query
+  (MEASURED, uncompacted table) → GrowlerDB cold full-sync (MEASURED, same uncompacted layout) →
+  compact once → GrowlerDB query matrix → finalize.** The
+  cold-sync of each engine from the *settled* table is its own timed, throughput-measured phase — not
+  a side effect of generation. Load/convergence/freshness drivers run as **in-cluster Jobs** (rendered
+  from `deploy/k8s/comparison/driver-job.template.yaml`), never over `kubectl port-forward` — the
+  shake-out proved a port-forwarded driver measures the tunnel, not the engine. **10 GB shakedown
+  first** (`--scale shakedown`), then `--scale full`. Corpus + result artifacts persist to a Hetzner
+  Object Storage bucket. Output: RUNLOG row + `scale-results.md`. See `deploy/k8s/comparison/README.md`.
+  **Harness support for this phase order (IMPLEMENTED 2026-08-27):** (a) `scale-up.sh` gained
+  `STAGE=deps`/`serving` so generation runs with no GrowlerDB ingesting, and a `phase_gdb_coldsync`
+  (mirrors conv-os) deploys the serving stack `STAGE=serving DEFINE_ONLY=true` against the settled
+  table and times the cold sync; (b) `index.defineOnly` helm knob brings non-windowed nodes up empty
+  so the connector does the whole metric-emitting backfill; `capture.py` gained per-shard/connector
+  attribution series + `--started-epoch` scoping so the sync window is sampled live. **Still open:**
+  (c) a **dup-free corpus** — convergence gates on `COUNT(*)==COUNT(DISTINCT)`; the dup mechanism is
+  under active investigation (Risks). The `DEFINE_ONLY` non-windowed serve path is new — the shakedown
+  must confirm a node serves an empty define-only shard and the connector backfills it.
+- **Phase 4 — analysis & docs:** new `docs/benchmarks.md` next to Performance (nav_order ~10, bump
+  the tail); update `comparison.md` (measured replaces directional), `ga-criteria.md`, `roadmap.md`,
+  and OKF `scale-results.md`/`scale-test-plan.md`. Fairness charter summarized on the page. Label
+  measured vs modeled and pin the comparison-system versions.
+
+## Cost & timeline
+
+- At ~50 GB (~120–140M rows), a full run (provision → generate/load → both engines → sweeps →
+  capture → teardown) is ~12–18 h ≈ **~$60–100** at $75/day. Add a cheap 10 GB shakedown + iteration
+  buffer → **program ≈ $100–160 cloud**. First-run friction still applies — budget for a restart or two.
+- Engineering: harness ~4–7 working days, then the run, then docs. **~1–2 weeks to published
+  numbers** — so an imminent HN post should keep the "directional" framing and land these as a
+  follow-up rather than rush.
+
+## Risks & design-arounds
+
+- **OpenSearch Data Prepper Iceberg CDC is experimental and CoW-only.** Fallback: labeled `_bulk`
+  load so the ingest comparison still lands. Pin the exact Data Prepper/OpenSearch versions.
+- **Compaction CronJob (TASK-340)** targets the non-windowed table — a pro here (non-windowed run
+  compacts correctly); the windowed addendum would need a fix first. `scale-up.sh` does not deploy it
+  (it lives in the streaming bundle, not observability), so `compare_run.py`'s GrowlerDB phase applies
+  `maintenance.yaml` and triggers a one-shot compaction Job (`growlerdb-iceberg-maintenance`) before
+  the query matrix, so the fair-Trino source layout is compacted.
+- **Locator-heal across compaction (TASK-339) — hardened.** `rewrite_data_files` moves every row, so
+  all locators go stale at once. Two coupled fixes: (a) the background re-map (`engine/remap.rs`) now
+  **streams the rewritten files one at a time**, patching each file's slots immediately (bounded memory,
+  progressive heal, crash-safe) instead of accumulating the whole table (which OOM'd / never converged
+  at scale); (b) the lazy hydration fallback (`source/lib.rs scan_stale_index`) is **file-budgeted** so
+  an unprunable random-key scan can't be an O(snapshot)/hit stall (the 30s topk timeouts) — it serves
+  what it cheaply finds and leaves the rest to the re-map. `compare_run.py` gates the query matrix on
+  the re-map **settling** (`wait_remap_settled`, `locator_remapped_rows_total` plateau) so hydration is
+  measured healed, not mid-heal. Still report hydration-across-compaction as a measurement.
+- **Trino baseline** moves 470 → 483 this round; re-baseline and note it. `compare_trino.py` was
+  refreshed for the non-windowed `http_logs` schema (status/user_id/path predicates, no `day` pruning —
+  the table is unpartitioned) and runs as a driver Job in the GrowlerDB phase, post-compaction. Its
+  headline pair is a **point lookup on `trace_id`** (the searchable X-Request-ID, bloom-filtered):
+  GrowlerDB's indexed exact-term lookup vs a Trino equality skipped by the `trace_id` bloom — Iceberg
+  at its selective best. (`request_id` stays key-only — identity/`_id`, not a searched term.)
+- **Coordinated omission** — see fairness charter #6.
+- **Duplicate `request_id`s — ROOT-CAUSED by local reproduction; fix (`d7fc862`) already in the repo.**
+  Shakedown #2 had ~1.24% duplicate request_ids (source `COUNT(*)` > `COUNT(DISTINCT)`). A local
+  reproduction against real Polaris 1.6.0 + MinIO, driving the actual `corpus.py`, pinned it: the
+  **pre-`d7fc862` `_append_retry` re-committed the *same* batch on a false-negative commit** (an
+  intermediary/LB resend, or Polaris returning 409 for a commit it actually applied under load). With a
+  fault proxy injecting false-negatives: **pre-fix → 17.7% dup; current `d7fc862` (regenerate a FRESH
+  batch per retry) → 0.000% dup** — a false-negative then adds extra rows with *distinct* ids, so
+  `COUNT(*)==COUNT(DISTINCT)` holds. Ruled OUT by direct test: the generator alone (1/3/6 writers, no
+  fault) never dups (Polaris CAS is correct), pyiceberg 0.11.1 can't double-commit, and compaction
+  doesn't dup. **Timeline confirms:** `d7fc862` was committed 06:15 UTC, shakedown #2 ran 05:00 UTC —
+  #2 ran the buggy code. So **no `GENERATORS=1` and no dedup are needed**; `d7fc862` + `79758d6`
+  (restart-safe entropy, covers the 5xx/timeout→crash→restart path) make `GENERATORS>1` robust.
+  **STILL UNRESOLVED:** shakedown #3 ran WITH `d7fc862` (ConfigMap verified to carry it) yet I read
+  `doc_count` ~400k over distinct — but **mid-catch-up** (connector ~107s behind), and I never measured
+  the *settled* source `COUNT(*)` vs `COUNT(DISTINCT)`. Most likely a mid-flight over-read, not real
+  source dups, but it is not proven either way. **Before `--scale full`:** (1) add a deploy-time gate
+  asserting the running generator's `corpus.py` carries the fresh-per-attempt `make_cols` path (a stale
+  ConfigMap would silently reintroduce the bug); (2) let convergence SETTLE and assert
+  `COUNT(*)==COUNT(DISTINCT request_id)` on the static source before measuring. Do not declare the dup
+  issue closed until a settled run shows equality.
+- **GrowlerDB connector ingest throughput ceiling (measured ~21–24k docs/s, 6 shards/ccx43).** The
+  streaming connector does **not** keep up with a generator burst of ~36k rows/s — it falls behind and
+  accumulates lag (~130–150s / ~1M+ rows observed), then drains after the burst. For the benchmark this
+  is a *result*, not a bug: report GrowlerDB's cold-sync throughput (~21–24k docs/s) vs OpenSearch CDC
+  (~15.7k docs/s at 10 GB) as the ingest headline, and report freshness both under-load and at-rest.
+  Worth a separate look at whether the ceiling is the single Spark connector, the nodes' indexing rate,
+  or commit cadence — a faster connector would be a real GrowlerDB win to pursue. **Root-caused +
+  addressed:** the ceiling is the *single* `local[6]` Spark pipeline (serial read→map→blocking-write, no
+  double-buffering), not the engine/nodes (6% node CPU, no backpressure). The benchmark now deploys the
+  already-built **parallel connector SET** (`connector-set.yaml`, W=shard-count independent worker
+  pipelines, each owning a disjoint shard group) via `CONNECTOR_SET=true` in `scale-up.sh`, so cold-sync
+  ingest uses the idle node headroom — expected ~W× and comfortably past OpenSearch CDC's ~17.5k docs/s.
+- **GrowlerDB query numbers were a MEASUREMENT ARTIFACT, not an engine limit (ROOT-CAUSED; drives a
+  harness fix).** At 10 GB the driver saw GrowlerDB flat at **~15 qps** (50→800 offered), ~15s client
+  p95, `topk_hydrated` all 30s-timeout — while engine-internal retrieval p95 was **~5ms**. Cause: the
+  OpenSearch-compat `_search` adapter **hard-codes `hydrate: true` on every request**
+  (`opensearch.rs:572`), so *every* query type — even `term`/`range`/`autocomplete` that need no
+  document — pays a full **hydrate-from-Iceberg** round-trip (a catalog `load_table` REST call + Parquet
+  point-reads per query per shard; `source/lib.rs:420-519`). That is throughput-bound by the catalog/
+  object store, not CPU → the flat qps. Native `/v1/search` defaults `hydrate=false` (`rest.rs:1922`).
+  The ~5ms metric is `growlerdb_query_retrieval_duration_seconds` (recorded *before* hydration); the
+  hydration cost lives in a **separate** histogram `growlerdb_hydration_duration_seconds` — so the
+  engine "looked fine" while every query hit object storage. Post-Iceberg-compaction **locator-heal**
+  makes it far worse (point-reads → full-snapshot scans; `hydrate.rs:67-78`), explaining the 15s stalls
+  and 30s topk timeouts. **Implication for fairness:** this IS the `_source`-vs-hydrate result (charter
+  #5) — but it must be measured **per query type**, not forced on all. **Harness fix:** drive GrowlerDB
+  index-only query types via **native `/v1/search` with `hydrate=false`** (vs OpenSearch `_search` with
+  `_source` off) and measure **full-document top-K separately** with hydration on (vs OpenSearch
+  `_source`), reporting storage footprint alongside — like the disclosed suggest-endpoint asymmetry.
+  Capture `retrieval` vs `hydration` vs `query{hydrated}` histograms + `stale_locators_total`. Confirm
+  with a one-boolean probe: native `/v1/search` hydrate=false (expect high qps @ ~5ms) vs hydrate=true
+  (expect the collapse).

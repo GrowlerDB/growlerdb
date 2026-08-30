@@ -16,7 +16,7 @@ flattened dotted paths") is superseded by [D47](/system/decisions/d47-variant-ma
 flatten + discriminator-selected shapes), delivered end-to-end via the connector + interim Trino lane
 ([D48](/system/decisions/d48-variant-delivery.md)/[D49](/system/decisions/d49-variant-iceberg-rust-routing.md)),
 with the native Rust read path pending the next iceberg-rust release. **Nanosecond timestamps** remain
-planned. Scope note: this decision covers v3 **types** only; v3 **row-lineage**
-adoption (locators) is tracked under [D30](/system/decisions/d30-layered-locator.md)'s `row_id`
-strategy, gated on ecosystem support (iceberg-rust deletion-vector reads, Spark changelog
-`_row_id`, Iceberg ≥1.10.3).
+planned. Scope note: this decision covers v3 **types** only; v3 **row-lineage** is tracked as a
+possible future hydration optimization over the store-less
+[D54](/system/decisions/d54-store-less-hydration.md) contract, gated on ecosystem support
+(iceberg-rust deletion-vector reads, Spark changelog `_row_id`, Iceberg ≥1.10.3).

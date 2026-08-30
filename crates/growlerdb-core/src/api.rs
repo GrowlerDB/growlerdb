@@ -1,6 +1,6 @@
 //! The minimal in-process **Index API** ([Design 02]): the seam the write (ingest) and
 //! read (engine) paths depend on. The traits and vocabulary types ([`Snapshot`],
-//! [`RowLocator`], [`CommitBatch`], [`Hit`], …) live in `growlerdb-core` so the engine builds
+//! [`HydrateRequest`], [`CommitBatch`], [`Hit`], …) live in `growlerdb-core` so the engine builds
 //! against the seam while `growlerdb-index` provides [`LocalIndexStore`].
 //!
 //! [Design 02]: ../../../okf/system/storage/index-store.md
@@ -17,15 +17,12 @@ use crate::query::Query;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Snapshot(pub u64);
 
-/// A document paired with where its row lives in the source, for the locator.
+/// One document to ingest. Hydration re-finds the source row by key at read time (store-less),
+/// so ingest carries only the document — no source `(file, position)`.
 #[derive(Debug, Clone)]
 pub struct LocatedDoc {
     /// The document to index.
     pub doc: Document,
-    /// Source data-file path the row came from.
-    pub iceberg_file: String,
-    /// Row position within `iceberg_file`.
-    pub row_position: u64,
 }
 
 /// A single change to apply, keyed by the composite document key ([Design 02]).
@@ -35,7 +32,7 @@ pub struct LocatedDoc {
 /// [Design 02]: ../../../okf/system/storage/index-store.md
 #[derive(Debug, Clone)]
 pub enum DocOp {
-    /// Index (or replace) the document; carries its source location for the locator.
+    /// Index (or replace) the document.
     Upsert(LocatedDoc),
     /// Remove the document for this key (logical delete).
     Delete(CompositeKey),
@@ -53,8 +50,7 @@ impl DocOp {
 }
 
 /// A batch to commit: a sequence of [`DocOp`]s + the checkpoint they bring the
-/// index to. The realization of [Design 02]'s `DocBatch` (the per-doc source
-/// location is passed explicitly rather than derived during indexing).
+/// index to. The realization of [Design 02]'s `DocBatch`.
 ///
 /// [Design 02]: ../../../okf/system/storage/index-store.md
 #[derive(Debug, Clone)]
@@ -138,18 +134,25 @@ impl CommitBatch {
     }
 }
 
-/// A row's source coordinates: how to fetch the authoritative row for a key. An
-/// **in-memory** bridge between the index's layered locate and the source's
-/// hydrate — never persisted or sent on the wire. Locators are best-effort: hydration
-/// verifies the row by key and falls back to a scan when the coordinates went stale
-/// (Iceberg rewrote the file). Anything key-derived (partition values, field names)
-/// travels with the [`CompositeKey`] it is paired with, not here.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RowLocator {
-    /// Iceberg data-file path holding the row.
-    pub iceberg_file: String,
-    /// Row position within the data file.
-    pub row_position: u64,
+/// One hydration request: a key to re-fetch plus its **sort-key prune hints** — the row's own fast
+/// values AND-ed onto the key predicate to prune the scan. Pure speed-up (every candidate is key-verified); in-memory only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HydrateRequest {
+    /// The composite key to hydrate.
+    pub key: CompositeKey,
+    /// Sort-key prune hints: `(column, that row's value)` for identity sort columns the shard also
+    /// stores fast. Empty ⇒ a key-only predicate.
+    pub prune: Vec<(String, Value)>,
+}
+
+impl HydrateRequest {
+    /// A request with no prune hints (they're attached later, once the shard's fast values are read).
+    pub fn new(key: CompositeKey) -> Self {
+        Self {
+            key,
+            prune: Vec::new(),
+        }
+    }
 }
 
 /// One search hit: the document's **coordinates** (composite key) and BM25 score.
@@ -232,7 +235,7 @@ impl Highlight {
     }
 }
 
-/// Which columns [hydration](RowLocator) returns from the authoritative row.
+/// Which columns [hydration](HydratedRow) returns from the authoritative row.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Projection {
     /// All columns of the source row.
@@ -252,7 +255,7 @@ impl Projection {
     }
 }
 
-/// An authoritative row fetched from the source by [hydration](RowLocator):
+/// An authoritative row fetched from the source by [hydration](HydrateRequest):
 /// the document's [`CompositeKey`] plus the projected column values.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HydratedRow {
@@ -652,17 +655,14 @@ pub trait IndexWriter {
     }
 }
 
-/// Read path: lexical search + key→row locator resolution. Called by the engine.
+/// Read path: lexical search. Called by the engine. Hydration re-finds source rows by key
+/// predicate at read time (store-less), so there is no key→locator resolution here.
 pub trait IndexReader {
     /// Implementation error type.
     type Error;
 
     /// Lexical search; returns **coordinates + score** at the current snapshot.
     fn search(&self, params: &SearchParams) -> Result<ShardHits, Self::Error>;
-
-    /// Resolve keys to their source-row [locators](RowLocator) (the hydration
-    /// bridge). One result per input key, `None` if absent.
-    fn get_by_key(&self, keys: &[CompositeKey]) -> Result<Vec<Option<RowLocator>>, Self::Error>;
 
     /// The snapshot this reader observes — pins a consistent read view.
     fn snapshot(&self) -> Snapshot;
