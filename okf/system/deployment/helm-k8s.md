@@ -64,9 +64,8 @@ produces the generator (the workload's own `corpus.py` mounted into a generic De
 workloads is configuration, never a manifest edit.
 
 **Maintenance cadences are values-driven:** `node.compactIntervalSecs` (auto-compaction
-tick — also the sampling cadence of the per-shard size/docs/segments/delete-debt gauges)
-and `node.remapIntervalSecs` (D30 locator re-map poll) pass through to `growlerdb serve` instead of
-riding hidden binary defaults; `0` disables either loop.
+tick — also the sampling cadence of the per-shard size/docs/segments/delete-debt gauges) passes
+through to `growlerdb serve` instead of riding hidden binary defaults; `0` disables the loop.
 
 The **connector** deploys outside the chart (`deploy/k8s/streaming/`): either the single-process
 Deployment (rendered from `connector.template.yaml`, `replicas: 1`) or, for ingest scale-out, the

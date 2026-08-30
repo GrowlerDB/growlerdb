@@ -1,4 +1,4 @@
-//! Snapshot-pinned **plan cache** for hydration: the planned pass-1 task set (from the
+//! Snapshot-pinned **plan cache** for hydration: the planned task set (from the
 //! `scan().plan_files()` manifest reads) is cached pinned to the snapshot it was planned at —
 //! same `(table, snapshot)` reuses; a snapshot advance replans and replaces — so per-batch
 //! lookups don't re-read manifests. A small LRU keyed by table ident (cap [`PLAN_CACHE_CAP`]).

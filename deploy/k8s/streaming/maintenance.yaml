@@ -1,7 +1,7 @@
 # Periodic Iceberg table maintenance for growlerdb.http_logs. The streaming generator commits a
 # tiny append every few seconds, so the source table accumulates thousands of small data files +
-# manifests — which slows *hydration* (search reads the authoritative rows from Iceberg via the
-# index's row locators; lots of tiny files + fat metadata = slow planning/opens). This CronJob runs
+# manifests — which slows *hydration* (search re-finds the authoritative rows in Iceberg by a pruned
+# key scan; lots of tiny files + fat metadata = slow planning/opens). This CronJob runs
 # the standard Iceberg maintenance procedures via spark-sql against the Polaris catalog:
 #   - rewrite_data_files : compact small files into ~128MB files (the hydration win). SORTED by
 #       (ts, request_id) so rows cluster in the parquet row groups by time then key — a point lookup
@@ -20,12 +20,17 @@
 #       connector's near-head commit latency, so it never deletes a file a live append is mid-commit.
 #
 # Safe w.r.t. the index: a rewrite is a *replace* (non-append) snapshot, which the connector skips,
-# and GrowlerDB self-heals stale row locators on hydration (engine/hydrate.rs: refresh_locators).
+# and hydration is store-less — it re-finds rows by a pruned key scan, so nothing needs healing; the
+# sorted layout compaction writes is exactly what lets that scan skip row groups.
 # Safe w.r.t. the connector's exactly-once resume: it stays near head, and expire keeps recent
 # snapshots (RETAIN_LAST + EXPIRE_OLDER_THAN_HOURS), so its checkpoint snapshot is never expired.
 #
-# Reuses the connector image (apache/spark:4.0.0 base); the Iceberg runtime is fetched via --packages
-# like the connector. Trigger an immediate run with:
+# Runs on stock apache/spark:4.0.0 (NOT the connector image): this job is pure spark-sql + --packages
+# and never uses the connector jar, and the connector base moved to Spark 4.1.3 — for which Iceberg
+# publishes no spark-runtime (Maven tops out at iceberg-spark-runtime-4.0), so the SQL-extension
+# procedures below fail on 4.1 with `NoSuchMethodError catalyst.trees.Origin.<init>`. Pinning the
+# maintenance job to Spark 4.0.0 keeps rewrite_data_files matched to iceberg-spark-runtime-4.0.
+# Trigger an immediate run with:
 #   kubectl -n growlerdb create job --from=cronjob/growlerdb-iceberg-maintenance maint-now
 apiVersion: batch/v1
 kind: CronJob
@@ -48,15 +53,14 @@ spec:
           labels: { app: growlerdb-maintenance }
         spec:
           restartPolicy: Never
-          imagePullSecrets: [{ name: ghcr-pull }]
           containers:
             - name: maintenance
-              image: ghcr.io/growlerdb/growlerdb-connector:dev
-              imagePullPolicy: Always
+              image: apache/spark:4.0.0   # stock Spark 4.0 — matches iceberg-spark-runtime-4.0 (see header)
+              imagePullPolicy: IfNotPresent
               env:
-                - { name: AWS_ACCESS_KEY_ID, value: minioadmin }
-                - { name: AWS_SECRET_ACCESS_KEY, value: minioadmin }
-                - { name: AWS_REGION, value: us-east-1 }
+                - { name: AWS_ACCESS_KEY_ID, value: "${S3_ACCESS_KEY}" }
+                - { name: AWS_SECRET_ACCESS_KEY, value: "${S3_SECRET_KEY}" }
+                - { name: AWS_REGION, value: "${S3_REGION}" }
                 # Retention knobs — keep the connector's recent resume point safe. expire keeps the
                 # most-recent RETAIN_LAST snapshots and anything newer than EXPIRE_OLDER_THAN_HOURS.
                 - { name: EXPIRE_OLDER_THAN_HOURS, value: "1" }
@@ -83,17 +87,22 @@ spec:
                     --conf spark.sql.catalog.stream.credential=root:s3cr3t \
                     --conf spark.sql.catalog.stream.scope=PRINCIPAL_ROLE:ALL \
                     --conf spark.sql.catalog.stream.io-impl=org.apache.iceberg.aws.s3.S3FileIO \
-                    --conf spark.sql.catalog.stream.s3.endpoint=http://minio:9000 \
-                    --conf spark.sql.catalog.stream.s3.path-style-access=true \
+                    --conf spark.sql.catalog.stream.s3.endpoint=${S3_ENDPOINT} \
+                    --conf spark.sql.catalog.stream.s3.path-style-access=${S3_PATH_STYLE} \
                     --conf spark.sql.catalog.stream.rest-metrics-reporting-enabled=false \
                     --conf spark.hadoop.fs.s3.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
                     --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
-                    --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000 \
-                    --conf spark.hadoop.fs.s3a.access.key=minioadmin \
-                    --conf spark.hadoop.fs.s3a.secret.key=minioadmin \
-                    --conf spark.hadoop.fs.s3a.path.style.access=true \
-                    --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \
+                    --conf spark.hadoop.fs.s3a.endpoint=${S3_ENDPOINT} \
+                    --conf spark.hadoop.fs.s3a.access.key=${S3_ACCESS_KEY} \
+                    --conf spark.hadoop.fs.s3a.secret.key=${S3_SECRET_KEY} \
+                    --conf spark.hadoop.fs.s3a.path.style.access=${S3_PATH_STYLE} \
+                    --conf spark.hadoop.fs.s3a.connection.ssl.enabled=${S3_SSL} \
                     -e "
+                      -- Declare the table's sort order so it lands in the metadata (default-sort-order),
+                      -- not just the rewritten files: hydration reads default_sort_order to prune the
+                      -- fallback key scan by the sort key (ts). rewrite_data_files' sort_order option
+                      -- alone sorts the files but leaves the metadata unsorted, so the pruner sees none.
+                      ALTER TABLE stream.growlerdb.http_logs WRITE ORDERED BY ts ASC NULLS LAST, request_id ASC NULLS LAST;
                       CALL stream.system.rewrite_data_files(table => 'growlerdb.http_logs', strategy => 'sort', sort_order => 'ts ASC NULLS LAST, request_id ASC NULLS LAST', options => map('min-input-files','2','target-file-size-bytes','134217728','partial-progress.enabled','true','partial-progress.max-commits','10'));
                       CALL stream.system.rewrite_manifests('growlerdb.http_logs');
                       CALL stream.system.expire_snapshots(table => 'growlerdb.http_logs', older_than => TIMESTAMP '${EXPIRE_TS}', retain_last => ${RETAIN_LAST});

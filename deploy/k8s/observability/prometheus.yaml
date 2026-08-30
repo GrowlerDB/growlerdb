@@ -110,6 +110,23 @@ data:
             regex: (.+)
             target_label: __address__
             replacement: ${1}:9200
+      # Data Prepper (OpenSearch Iceberg CDC) native Prometheus metrics for the comparison run —
+      # ingest/CDC internals on :4900. Pod CPU/mem for OpenSearch + Data Prepper come via cadvisor
+      # below, so no per-app exporter is needed for resource use. (Confirm the metrics path against
+      # the 2.15 container: /metrics/sys is documented, /metrics/prometheus is by convention.)
+      - job_name: data-prepper
+        metrics_path: /metrics/prometheus
+        kubernetes_sd_configs: [{ role: pod, namespaces: { names: [growlerdb] } }]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            regex: data-prepper
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_ip]
+            regex: (.+)
+            target_label: __address__
+            replacement: ${1}:4900
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
       - job_name: cadvisor
         scheme: https
         tls_config: { insecure_skip_verify: true }

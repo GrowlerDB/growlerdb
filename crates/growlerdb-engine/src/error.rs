@@ -7,9 +7,9 @@ use growlerdb_source::SourceError;
 /// Errors from the engine façade (indexing, search, hydration).
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
-    /// A key had no locator entry — it was never indexed, or the index is behind.
-    #[error("no locator for key: {0}")]
-    MissingLocator(String),
+    /// A key is not present in the index — it was never indexed, or the index is behind.
+    #[error("key not found in index: {0}")]
+    KeyNotFound(String),
     /// Search/hydrate referenced an index that has not been built.
     #[error("index `{0}` does not exist — run `growlerdb index` first")]
     NotIndexed(String),

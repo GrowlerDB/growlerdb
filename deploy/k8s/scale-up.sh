@@ -34,6 +34,26 @@ WORKLOAD="${WORKLOAD:-http_logs}"
 NAMESPACE="${NAMESPACE:-growlerdb}"
 SHARDS="${SHARDS:-6}"
 GENERATORS="${GENERATORS:-1}"   # generator pod replicas — raise to parallelize ingest
+# STAGE splits the bring-up so ingest can be measured as a clean COLD sync (comparison-plan.md):
+#   deps    — deps + generator + observability, but NOT the GrowlerDB serving stack (nodes/connector),
+#             so generation runs with nothing ingesting it. compare_run's generate phase uses this.
+#   serving — the GrowlerDB serving stack ONLY (helm nodes + connector + verify), deployed AFTER the
+#             source table is generated and settled, so the connector cold-backfills a static table
+#             (mirrors bringing OpenSearch+Data Prepper up post-generation). This is the measured sync.
+#   all     — the original single-shot bring-up (unchanged default; GrowlerDB streams during generation).
+STAGE="${STAGE:-all}"
+# DEFINE_ONLY: bring nodes up EMPTY (define the index, skip the boot-build from source) so the
+# streaming connector performs the entire, measured cold backfill — symmetric with Data Prepper CDC and
+# keeping ingest on the metric-emitting connector write path. Default off (nodes boot-build as before).
+DEFINE_ONLY="${DEFINE_ONLY:-false}"
+# SKIP_GENERATOR: STAGE=deps brings up Polaris + observability but NOT the generator — for a --reuse-table
+# run, where the persisted table is registered (not regenerated), so the generator must not create/pollute it.
+SKIP_GENERATOR="${SKIP_GENERATOR:-false}"
+# CONNECTOR_SET: on the non-windowed (sharded) topology, deploy the parallel connector SET — W=SHARDS
+# independent worker pipelines, each owning a disjoint shard group — so cold-sync ingest uses idle node
+# headroom instead of one pipeline. Set false to fall back to the single connector. The set's
+# owned-shard model is for the sharded topology only; a WINDOWED run always uses the single connector.
+CONNECTOR_SET="${CONNECTOR_SET:-true}"
 IMAGE_TAG="${IMAGE_TAG:-dev}"
 GH_USER="${GH_USER:-}"
 GHCR_PAT="${GHCR_PAT:-}"
@@ -55,6 +75,20 @@ fi
 
 say() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 
+# Object-store target: default = in-cluster MinIO (unchanged); S3_PROFILE=hetzner backs Iceberg on the
+# remote Hetzner OS bucket (same nbg1 region as the cluster, under a path prefix). Sourcing resolves the
+# profile and EXPORTS S3_* so the harness render, the deps/observability render, and helm read one target.
+# shellcheck source=deploy/k8s/s3-target.env
+. "$HERE/s3-target.env"
+say "object store: profile=$S3_PROFILE endpoint=$S3_ENDPOINT base=$S3_WAREHOUSE_BASE (deploy-minio=$S3_DEPLOY_MINIO)"
+
+deploy_observability() {
+  say "observability bundle (Prometheus / Grafana / node-exporter / kube-state / Trino / Loki+Promtail)"
+  # Render each manifest against the S3 target (Trino carries S3 config; the rest pass through untouched).
+  for f in "$HERE"/observability/*.yaml; do "$HERE/render-s3.sh" "$f"; echo '---'; done \
+    | kubectl apply -f -
+}
+
 say "0/7 render the '$WORKLOAD' workload → generator/connector manifests + index def"
 # The render needs pyyaml; reuse the smoke venv pattern so the script runs on a bare host.
 PY=python3
@@ -66,7 +100,8 @@ if ! $PY -c 'import yaml' >/dev/null 2>&1; then
 fi
 RENDER_DIR="$(mktemp -d)"
 $PY "$REPO_ROOT/bench/scale/harness.py" render "$WORKLOAD" \
-  --shards "$SHARDS" --namespace "$NAMESPACE" --generators "$GENERATORS" --out "$RENDER_DIR"
+  --shards "$SHARDS" --namespace "$NAMESPACE" --generators "$GENERATORS" \
+  --connector-workers "$SHARDS" --out "$RENDER_DIR"
 # TABLE / INDEX / INDEX_DEF for the gates + helm flags below.
 # shellcheck source=/dev/null
 source "$RENDER_DIR/workload.env"
@@ -88,12 +123,33 @@ kubectl -n "$NAMESPACE" create secret docker-registry ghcr-pull \
   --docker-server=ghcr.io --docker-username="$GH_USER" --docker-password="$GHCR_PAT" \
   --dry-run=client -o yaml | kubectl apply -f -
 
-say "2/7 deps (MinIO / Polaris / Postgres) — the Iceberg catalog + object store"
-kubectl apply -k "$HERE/deps"   # kustomization pins namespace: growlerdb
-kubectl -n "$NAMESPACE" rollout status deploy/minio --timeout=180s
+# Object-store creds as the shared `minio-creds` Secret (both profiles) — every S3 client (Polaris,
+# Spark connector/maintenance, Data Prepper) reads rootUser/rootPassword from it. Populated from the
+# active profile so the Hetzner keys never live in a committed manifest.
+kubectl -n "$NAMESPACE" create secret generic minio-creds \
+  --from-literal=rootUser="$S3_ACCESS_KEY" --from-literal=rootPassword="$S3_SECRET_KEY" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# --- deps + generator: run for `deps`/`all`, skip for `serving` (the source table already exists). ---
+if [ "$STAGE" != serving ]; then
+say "2/7 deps (object store: $S3_PROFILE / Polaris / Postgres) — the Iceberg catalog + object store"
+# S3-templated deps rendered against the active target (the kustomization was namespace-only, replaced by
+# `-n`). Postgres (incl. polaris-db creds) is not S3-templated → applied verbatim. MinIO only for its profile.
+kubectl apply -n "$NAMESPACE" -f "$HERE/deps/postgres.yaml"
+if [ "$S3_DEPLOY_MINIO" = true ]; then
+  "$HERE/render-s3.sh" "$HERE/deps/minio.yaml" | kubectl apply -n "$NAMESPACE" -f -
+fi
+"$HERE/render-s3.sh" "$HERE/deps/polaris.yaml"       | kubectl apply -n "$NAMESPACE" -f -
+"$HERE/render-s3.sh" "$HERE/deps/catalog-setup.yaml" | kubectl apply -n "$NAMESPACE" -f -
+if [ "$S3_DEPLOY_MINIO" = true ]; then
+  kubectl -n "$NAMESPACE" rollout status deploy/minio --timeout=180s
+fi
 kubectl -n "$NAMESPACE" rollout status deploy/polaris --timeout=180s
 kubectl -n "$NAMESPACE" wait --for=condition=complete job/polaris-catalog-setup --timeout=240s
 
+if [ "$SKIP_GENERATOR" = true ]; then
+  say "3/7 generator — SKIPPED (SKIP_GENERATOR=true; --reuse-table registers the persisted $TABLE)"
+else
 say "3/7 generator — creates $TABLE and starts feeding it"
 kubectl apply -f "$RENDER_DIR/generator.yaml"
 echo "waiting for the $TABLE table to be created ..."
@@ -104,6 +160,27 @@ for _ in $(seq 1 40); do
   kubectl -n "$NAMESPACE" logs deploy/growlerdb-generator --tail=-1 2>/dev/null | grep -q "created $TABLE" && { echo "  table created"; break; }
   sleep 6
 done
+# Guardrail: the generator's append-retry MUST regenerate FRESH rows per attempt (`make_cols`). The
+# pre-fix code re-committed the same batch on a false-negative commit → duplicate request_ids (~1.5%,
+# breaks convergence-by-distinct; root-caused by local repro). A stale ConfigMap silently reintroduces
+# it — assert the DEPLOYED code carries the fix before generating a whole corpus against it.
+if ! kubectl -n "$NAMESPACE" get configmap growlerdb-workload-corpus \
+     -o jsonpath='{.data.corpus\.py}' 2>/dev/null | grep -q "make_cols"; then
+  echo "FATAL: deployed generator corpus.py lacks the idempotent append-retry (make_cols) — dup risk." >&2
+  echo "  Re-render + re-apply the workload ConfigMap and rollout-restart the generator, then retry." >&2
+  exit 1
+fi
+echo "  generator corpus.py carries the idempotent append-retry (make_cols) ✓"
+fi  # end SKIP_GENERATOR
+fi  # end deps+generator (skipped for STAGE=serving)
+
+# STAGE=deps stops here: bring up observability (so Prometheus scrapes generation + the later cold
+# sync) and exit WITHOUT the GrowlerDB serving stack, so generation runs with nothing ingesting it.
+if [ "$STAGE" = deps ]; then
+  deploy_observability
+  say "STAGE=deps complete — deps + generator + observability up; GrowlerDB serving stack NOT deployed"
+  exit 0
+fi
 
 say "4/7 GrowlerDB (helm) — $SHARDS $([ "$WINDOWED" = true ] && echo 'windowed nodes' || echo 'shards') serving $INDEX"
 # Cold-tiering (TASK-229): windowed runs exercise automatic park/revive. On by default for a windowed
@@ -127,9 +204,11 @@ if [ -n "${GROWLERDB_LICENSE:-}" ]; then
 fi
 helm upgrade --install gdb "$HELM_CHART" -f "$HELM_CHART/values-scale.yaml" -n "$NAMESPACE" \
   --set image.tag="$IMAGE_TAG" --set index.shards="$SHARDS" \
-  --set index.windowed="$WINDOWED" \
+  --set index.windowed="$WINDOWED" --set index.defineOnly="$DEFINE_ONLY" \
   --set index.name="$INDEX" --set index.sourceTable="$TABLE" \
-  "${COLD_ARGS[@]}" "${LICENSE_ARGS[@]}" \
+  --set iceberg.s3Endpoint="$S3_ENDPOINT" --set iceberg.s3Region="$S3_REGION" \
+  --set-string credentials.s3AccessKey="$S3_ACCESS_KEY" --set-string credentials.s3SecretKey="$S3_SECRET_KEY" \
+  ${COLD_ARGS[@]+"${COLD_ARGS[@]}"} ${LICENSE_ARGS[@]+"${LICENSE_ARGS[@]}"} \
   --set-file index.definition="$INDEX_DEF"
 echo "waiting for $SHARDS node $([ "$WINDOWED" = true ] && echo pods || echo shards) to become Ready ..."
 for _ in $(seq 1 40); do
@@ -150,15 +229,23 @@ kubectl -n "$NAMESPACE" exec statefulset/gdb-growlerdb-node -- growlerdb --versi
 # shards register, so deploy the connector after (its --nodes must equal the now-confirmed ready
 # shard count).
 deploy_connector() {
-  say "5/7 streaming connector — fields from the workload's index.yaml, --nodes sized to $SHARDS shards"
-  kubectl apply -f "$RENDER_DIR/connector.yaml"
+  # Parallel SET (W=SHARDS pipelines) on the sharded topology; single connector for windowed, or when
+  # CONNECTOR_SET=false. NEVER apply both — two writers on a shard fail fast at the node (CHECKPOINT_GAP).
+  if [ "$CONNECTOR_SET" = true ] && [ "$WINDOWED" != true ]; then
+    say "5/7 streaming connector SET — $SHARDS parallel workers (one per shard group), --nodes sized to $SHARDS shards"
+    kubectl apply -f "$RENDER_DIR/connector-set.yaml"
+  else
+    say "5/7 streaming connector (single pipeline) — fields from the workload's index.yaml, --nodes sized to $SHARDS shards"
+    kubectl apply -f "$RENDER_DIR/connector.yaml"
+  fi
 }
 [ "$WINDOWED" = true ] && deploy_connector
 kubectl -n "$NAMESPACE" rollout status deploy/gdb-growlerdb-gateway --timeout=300s
 [ "$WINDOWED" = true ] || deploy_connector
 
-say "6/7 observability bundle (Prometheus / Grafana / node-exporter / kube-state / Trino / Loki+Promtail)"
-kubectl apply -f "$HERE/observability/"
+# For STAGE=all, deploy observability here (original order). For STAGE=serving it is already up from
+# the deps stage, so skip it.
+[ "$STAGE" = all ] && deploy_observability
 
 say "7/7 verify — the gateway serves the $INDEX index"
 kubectl -n "$NAMESPACE" run scaleupcheck --rm -i --restart=Never --image=curlimages/curl -- \

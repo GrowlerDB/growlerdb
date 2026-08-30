@@ -20,10 +20,10 @@ as 1). Every manifest consumer (restore, revive, replica refresh, status) refuse
 **newer** than the binary supports with a clear `UnsupportedFormat` error telling the operator to
 use a matching GrowlerDB version — old binaries fail loudly instead of mis-restoring.
 
-- **Format 1** — the current (and only) format: a
-  [D30 layered-locator](/system/storage/locators-segments.md) shard, whose file list carries the
-  segments, `location.arr`, and `aux.redb`. (GrowlerDB shipped unreleased through the D30 work, so
-  format 1 was reset to mean the layered format — no earlier format exists in the wild.)
+- **Format 1** — the current (and only) format: a [store-less](/system/storage/locators-segments.md)
+  shard, whose file list carries the segments and `aux.redb` (no stored location —
+  [D54](/system/decisions/d54-store-less-hydration.md)). GrowlerDB shipped unreleased, so no earlier
+  format exists in the wild.
 - A future incompatible layout bumps the version; the refuse-newer check is the hygiene that makes
   that bump safe.
 
@@ -42,7 +42,7 @@ use a matching GrowlerDB version — old binaries fail loudly instead of mis-res
   the per-file objects it supersedes, so a crash never leaves a manifest naming deleted objects
   (a `restore` gets the clean `Bundled` refusal, never a mid-download 404).
 - **Replica refresh is torn-proof against concurrent backups.** A refresh pass fetches the
-  mutable objects (`index/meta.json`, `aux.redb`, `location.arr`) live while segment files come
+  mutable objects (`index/meta.json`, `aux.redb`) live while segment files come
   from the manifest's list, so a primary backup landing mid-pass could pair a newer meta with an
   older segment set. After each pass the replica re-reads the manifest and retries (bounded)
   whenever the snapshot advanced during the pass; persistent contention surfaces as a transient

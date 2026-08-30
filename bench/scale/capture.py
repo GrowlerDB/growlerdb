@@ -47,7 +47,7 @@ LEDGER_HEADER = (
 
 # Metric series dumped over the run window (name -> PromQL). Mirrors the scale-test-plan capture list:
 # doc growth, query/hydration latency, ingest/index throughput, the write-path trio, lag, index bytes,
-# the locator-heal signals, cold-tier cache, and node CPU. Missing metrics just dump empty — the
+# cold-tier cache, and node CPU. Missing metrics just dump empty — the
 # capture is best-effort and never fails on one absent series.
 RANGE_METRICS = {
     "source_records": "max(growlerdb_source_records)",
@@ -62,10 +62,26 @@ RANGE_METRICS = {
     "write_queue_depth": "max(growlerdb_write_queue_depth)",
     "ingest_lag_ms": "max(growlerdb_ingest_lag_ms)",
     "index_bytes": "sum(growlerdb_index_bytes)",
-    "stale_locators": "max(growlerdb_stale_locators_total)",
-    "locator_remapped_rows": "max(growlerdb_locator_remapped_rows_total)",
     "cold_cache_hit_ratio": "sum(rate(growlerdb_cold_cache_hits_total[5m]))/clamp_min(sum(rate(growlerdb_cold_cache_lookups_total[5m])),1)",
     "node_cpu_cores": 'sum(rate(node_cpu_seconds_total{mode!="idle"}[2m]))',
+    # Ingest-bottleneck attribution (per shard-pod + connector) to localize the ingest ceiling, plus
+    # the query retrieval-vs-hydration split — engine-core cost vs object-store (Iceberg) cost.
+    "query_retrieval_p95": "histogram_quantile(0.95,sum(rate(growlerdb_query_retrieval_duration_seconds_bucket[2m]))by(le))",
+    "index_rate_dps_by_pod": "sum by (pod)(rate(growlerdb_ingested_docs_total[2m]))",
+    "commit_rate_by_pod": "sum by (pod)(rate(growlerdb_write_duration_seconds_count[2m]))",
+    "write_p95_by_pod": "histogram_quantile(0.95,sum by (le,pod)(rate(growlerdb_write_duration_seconds_bucket[2m])))",
+    "write_queue_depth_by_pod": "max by (pod)(growlerdb_write_queue_depth)",
+    "index_docs_by_pod": "sum by (pod)(growlerdb_index_docs)",
+    "connector_rows_read_dps": "rate(growlerdb_connector_rows_read_total[2m])",
+    "connector_trigger_rate": "rate(growlerdb_connector_triggers_total[2m])",
+    "connector_last_batch": "growlerdb_connector_last_trigger_rows",
+    "connector_shard_acks": "sum by (shard)(rate(growlerdb_connector_shard_acks_total[2m]))",
+    "connector_write_retries": "sum by (code)(rate(growlerdb_connector_write_retries_total[2m]))",
+    "connector_cpu_cores": 'sum(rate(container_cpu_usage_seconds_total{pod=~"growlerdb-connector.*"}[2m]))',
+    "node_cpu_by_pod": 'sum by (pod)(rate(container_cpu_usage_seconds_total{pod=~"gdb-growlerdb-node.*"}[2m]))',
+    "node_fs_write_by_pod": 'sum by (pod)(rate(container_fs_writes_bytes_total{pod=~"gdb-growlerdb-node.*"}[2m]))',
+    "node_disk_io_util": "max by (instance)(rate(node_disk_io_time_seconds_total[2m]))",
+    "minio_net_tx": 'sum(rate(container_network_transmit_bytes_total{pod=~"minio.*"}[2m]))',
 }
 
 # Loki log streams to dump (filename -> LogQL selector).
@@ -74,6 +90,19 @@ LOG_STREAMS = {
     "node": '{app="growlerdb-node"}',
     "gateway": '{app="growlerdb-gateway"}',
 }
+
+# Avg uncompressed corpus row — the ONLY valid index:source denominator (never compressed parquet).
+# corpus_stats.py `raw_row_bytes`; see synthetic-corpus.md. Override with --raw-row-bytes per schema.
+RAW_ROW_BYTES = 540.0
+
+
+def index_source_ratio_raw(index_bytes, rows, raw_row_bytes=RAW_ROW_BYTES):
+    """index:source on the RAW uncompressed basis: index_bytes / (rows * raw_row_bytes). Returns
+    (ratio, raw_source_bytes), or (None, None) on missing/zero inputs; ratio < 1 = index < corpus."""
+    if not index_bytes or not rows or not raw_row_bytes:
+        return None, None
+    raw_source_bytes = rows * raw_row_bytes
+    return index_bytes / raw_source_bytes, raw_source_bytes
 
 
 def iso(ts):
@@ -177,7 +206,7 @@ def last_value(prom_json):
         return None
 
 
-def capture_metrics(prom_url, start, end, step, out_dir):
+def capture_metrics(prom_url, start, end, step, out_dir, raw_row_bytes=RAW_ROW_BYTES):
     """Dump each metric's time-series to metrics/<name>.json. Returns {name: status} and a few
     headline last-values for the ledger summary."""
     mdir = os.path.join(out_dir, "metrics")
@@ -190,12 +219,19 @@ def capture_metrics(prom_url, start, end, step, out_dir):
                 json.dump(data, f)
             n = len(data.get("data", {}).get("result", []))
             status[name] = "ok" if n else "empty"
-            if name in ("index_docs", "query_latency_p95", "cold_cache_hit_ratio"):
+            if name in ("index_docs", "query_latency_p95", "cold_cache_hit_ratio",
+                        "index_bytes", "source_records"):
                 lv = last_value(data)
                 if lv is not None:
                     headline[name] = lv
         except Exception as e:
             status[name] = f"error: {type(e).__name__}"
+    # index:source on the raw uncompressed basis (rows * RAW_ROW_BYTES), never the compressed parquet.
+    rows = headline.get("source_records") or headline.get("index_docs")
+    ratio, raw_src = index_source_ratio_raw(headline.get("index_bytes"), rows, raw_row_bytes)
+    if ratio is not None:
+        headline["index_source_ratio_raw"] = ratio
+        headline["raw_source_bytes"] = raw_src
     return status, headline
 
 
@@ -278,6 +314,8 @@ def ledger_row(audit):
         summary_bits.append(f"p95={hl['query_latency_p95']*1000:.0f}ms")
     if "cold_cache_hit_ratio" in hl:
         summary_bits.append(f"cold_hit={hl['cold_cache_hit_ratio']:.2f}")
+    if "index_source_ratio_raw" in hl:
+        summary_bits.append(f"idx:src(raw)={hl['index_source_ratio_raw']:.2f}x")
     if audit.get("run_cost"):
         summary_bits.append(f"cost={audit['run_cost']}")
     summary = ", ".join(summary_bits) or "—"
@@ -340,7 +378,8 @@ def run(args):
     if args.dry_run:
         captured["mode"] = "dry-run (no metrics/logs/screenshots captured)"
     else:
-        m_status, headline = capture_metrics(args.prom, started, ended, args.step, out_dir)
+        m_status, headline = capture_metrics(args.prom, started, ended, args.step, out_dir,
+                                             args.raw_row_bytes)
         captured["metrics"] = m_status
         if args.loki:
             captured["logs"] = capture_logs(
@@ -348,11 +387,14 @@ def run(args):
             )
         else:
             captured["logs"] = {"skipped": "set LOKI_URL to dump pod logs"}
-        if args.results and os.path.exists(args.results):
-            dest = os.path.join(out_dir, "results.json")
-            with open(args.results) as src, open(dest, "w") as dst:
-                dst.write(src.read())
-            captured["results_json"] = True
+        # Fold in the harness result JSONs (GrowlerDB-only + the comparison + freshness drivers).
+        for arg_val, fname, key in ((args.results, "results.json", "results_json"),
+                                    (args.comparison, "comparison-report.json", "comparison_json"),
+                                    (args.freshness, "freshness-report.json", "freshness_json")):
+            if arg_val and os.path.exists(arg_val):
+                with open(arg_val) as src, open(os.path.join(out_dir, fname), "w") as dst:
+                    dst.write(src.read())
+                captured[key] = True
         if args.screenshots:
             captured["screenshots"] = capture_screenshots(
                 args.grafana, out_dir, args.max_screenshots,
@@ -396,15 +438,21 @@ def selftest():
     check(human_duration(3785) == "1h03m", f"human_duration hour: {human_duration(3785)}")
     check(human_duration(125) == "2m05s", f"human_duration min: {human_duration(125)}")
     check(human_duration(9) == "9s", "human_duration sec")
+    # index:source on the raw basis: GDB 4.21 GB index / (25.98M rows * 540 B) ≈ 0.30x (index < corpus).
+    r, src = index_source_ratio_raw(4.21e9, 25.98e6, 540.0)
+    check(abs(r - 0.300) < 0.01, f"index_source_ratio_raw {r}")
+    check(abs(src - 14.03e9) < 0.1e9, f"raw_source_bytes {src}")
+    check(index_source_ratio_raw(0, 100, 540) == (None, None), "ratio guards zero index")
+    check(index_source_ratio_raw(1e9, 0, 540) == (None, None), "ratio guards zero rows")
 
     with tempfile.TemporaryDirectory() as tmp:
         ledger = os.path.join(tmp, "RUNLOG.md")
         args = argparse.Namespace(
             purpose="cold-tier validation | on-cluster", prom="http://x", loki="", grafana="",
             step="15s", window_min=63, started_epoch=None, param=[("shards", "6"), ("nodes", "6")],
-            results=None, screenshots=False, max_screenshots=12, max_run_mb=200,
+            results=None, comparison=None, freshness=None, screenshots=False, max_screenshots=12, max_run_mb=200,
             log_limit=5000, cost="$4.20", dry_run=True, out_root=os.path.join(tmp, "runs"),
-            ledger=ledger, allow_over_budget=False,
+            ledger=ledger, allow_over_budget=False, raw_row_bytes=RAW_ROW_BYTES,
         )
         rc = run(args)
         check(rc == 0, f"run rc {rc}")
@@ -448,6 +496,10 @@ def main(argv=None):
                     metavar="K=V", help="extra audit parameter (repeatable)")
     ap.add_argument("--results", default=os.environ.get("RESULTS", ""),
                     help="harness results.json to fold into the run dir")
+    ap.add_argument("--comparison", default=os.environ.get("COMPARISON", ""),
+                    help="compare_query.py comparison-report.json to fold into the run dir")
+    ap.add_argument("--freshness", default=os.environ.get("FRESHNESS", ""),
+                    help="compare_freshness.py freshness-report.json to fold into the run dir")
     ap.add_argument("--cost", default=os.environ.get("RUN_COST", ""), help="recorded run cost")
     ap.add_argument("--screenshots", action="store_true",
                     help="also render bounded Grafana dashboard images (opt-in; out of git)")
@@ -457,6 +509,9 @@ def main(argv=None):
                     help="exit 0 even if over --max-run-mb (default exits 2)")
     ap.add_argument("--log-limit", type=int, default=5000, help="max Loki lines per stream")
     ap.add_argument("--step", default="15s", help="Prometheus query_range step")
+    ap.add_argument("--raw-row-bytes", type=float, default=RAW_ROW_BYTES,
+                    help="avg uncompressed corpus row bytes for the index:source(raw) ratio "
+                         "(corpus_stats.py raw_row_bytes; NEVER the compressed parquet size)")
     ap.add_argument("--out-root", default=DEFAULT_RUNS_ROOT)
     ap.add_argument("--ledger", default=LEDGER)
     ap.add_argument("--prom", default=os.environ.get("PROM_URL", "http://localhost:9090"))

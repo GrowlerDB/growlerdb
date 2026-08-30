@@ -28,23 +28,22 @@ How a [query](/product/functional/search/query.md) executes against the index.
   **client error**, which the gateway surfaces verbatim as a 4xx — so the caller learns *why*
   rather than seeing an opaque, retryable 500. If any failure is server-side/transient (or shards
   vanished without a status), the total failure stays a retryable `unavailable`.
-- **Hydration point reads** — resolving a [hydration](/product/functional/hydration.md) locator's
-  `(file, row position)` is a **targeted parquet read**: one footer-metadata read per data file,
-  row-group scoping to the group(s) holding the requested positions, and a row selection to the
-  exact rows — cost is bounded by the touched row groups, not the file size (rather than the file
-  streaming from row 0 up to the requested position). Requests coalesce per file; key verification
-  and the predicate fallback are unchanged; files carrying delete files keep the delete-applying
-  streaming read. Foundation for every
-  [D30](/system/decisions/d30-layered-locator.md) location strategy.
+- **Hydration point reads** — a [hydration](/product/functional/hydration.md) lookup is a
+  **stats-pruned key scan** ([D54](/system/decisions/d54-store-less-hydration.md)): the hit's own
+  stored sort-key value (a `fast` field, e.g. `ts`) AND-ed onto the key predicate lets Iceberg's
+  row-group min/max stats scope the read to the group(s) that can hold the row — one footer-metadata
+  read per candidate data file, then a row selection to the matching key. Cost is bounded by the
+  touched row groups (and a byte budget), not the file size. Requests coalesce per file; every row is
+  key-verified; files carrying delete files keep the delete-applying streaming read.
 - **Hydration planning reuse** — the lookup service holds one **shared, lazily-connected** catalog
   client instead of rebuilding it per RPC (a source failure invalidates it; the next request
   reconnects), and pass 1's unpredicated current-snapshot plan is served from a **snapshot-pinned
   plan cache** (a small per-table LRU): each hydrate makes one catalog call to learn the current
   snapshot id, reuses the cached file-scan plan while it's unchanged, and replans (replacing the
   entry) when it advances — so steady-state lookups skip the per-batch manifest-list/manifest reads
-  that would otherwise dominate p99. The predicate fallback (pass 2) is per-request and uncached.
+  that would otherwise dominate p99. The unpruned fallback scan (pass 2) is per-request and uncached.
   Hit/miss are observable as `growlerdb_plan_cache_hits_total` / `_misses_total`
-  ([D30](/system/decisions/d30-layered-locator.md) foundations).
+  ([D54](/system/decisions/d54-store-less-hydration.md) foundations).
 
 ## Notes
 

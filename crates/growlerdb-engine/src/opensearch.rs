@@ -495,6 +495,16 @@ struct OsSearchBody {
     /// opts into server-side highlighting and the response carries a per-hit `highlight` object.
     #[serde(default)]
     highlight: Option<JsonValue>,
+    /// OpenSearch `_source` filter: `false` ⇒ the client wants no document body, so we skip the
+    /// (Iceberg) hydration round-trip. `true`, a field list, an object, or absent ⇒ hydrate.
+    #[serde(rename = "_source", default)]
+    source: Option<JsonValue>,
+}
+
+/// Whether a search should hydrate `_source` from Iceberg. Suppressed only by `_source: false` or a
+/// count-only `size: 0`; a field list, `true`, an includes/excludes object, or absent all hydrate.
+fn wants_hydration(source: &Option<JsonValue>, size: Option<u32>) -> bool {
+    !matches!(source, Some(JsonValue::Bool(false))) && size != Some(0)
 }
 
 async fn search_all_handler(
@@ -545,6 +555,10 @@ async fn run_search(
     // Present ⇒ the response carries a per-hit `highlight` object of matched fragments.
     let highlight = body.highlight.as_ref().map(translate_highlight);
 
+    // Hydrate `_source` from Iceberg only when the client wants documents (matching real OpenSearch).
+    // A count-only (`size: 0`) or `_source: false` query skips the per-hit Iceberg round-trip.
+    let hydrate = wants_hydration(&body.source, body.size);
+
     let req = grpc_request(
         SearchRequest {
             shard: 0,
@@ -565,11 +579,9 @@ async fn run_search(
             // Scope to the path's `{index}`; empty for `/_search` (the served index).
             index: index.clone(),
             highlight,
-            // `_source` comes from the engine's inline hydration: rows attach to their hits by
-            // coordinates at the Gateway. A hit whose row doesn't resolve (failed shard /
-            // tenant-filtered / missing) carries `hydrate_error` and gets an empty `_source` —
-            // hydration failure is non-fatal.
-            hydrate: true,
+            // `_source` comes from the engine's inline hydration; a hit whose row doesn't resolve
+            // carries `hydrate_error` with an empty `_source` (non-fatal). Gated on `hydrate`.
+            hydrate,
             hydrate_columns: Vec::new(),
         },
         &headers,
@@ -689,6 +701,22 @@ mod tests {
         let s = translate_query(&dsl, formats).expect("should translate");
         Query::parse(&s).unwrap_or_else(|e| panic!("`{s}` should parse to the AST: {e}"));
         s
+    }
+
+    #[test]
+    fn hydration_is_gated_on_source_and_size() {
+        // Default and explicit "want the document" cases hydrate...
+        assert!(wants_hydration(&None, None));
+        assert!(wants_hydration(&Some(json!(true)), Some(10)));
+        assert!(wants_hydration(&Some(json!(["method", "path"])), Some(10))); // field list still hydrates
+        assert!(wants_hydration(
+            &Some(json!({ "includes": ["path"] })),
+            Some(10)
+        ));
+        // ...while count-only and _source:false skip the Iceberg fetch.
+        assert!(!wants_hydration(&Some(json!(false)), Some(10)));
+        assert!(!wants_hydration(&None, Some(0)));
+        assert!(!wants_hydration(&Some(json!(true)), Some(0))); // size:0 wins — no hits to hydrate
     }
 
     #[test]

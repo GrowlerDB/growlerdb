@@ -11,13 +11,15 @@ use std::net::{IpAddr, Ipv6Addr};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
+use crate::completion::{
+    CompletionBuilder, SegmentCompletion, COMPLETION_PREFIX_DEPTH, COMPLETION_SUFFIX,
+};
 use crate::vector::{SegmentAnn, StoredAnnIndex, ANN_SUFFIX};
 
 use growlerdb_core::{
     sort_has_score, CompositeKey, DocBatch, Document, FieldType, Highlight, HighlightFragment,
-    HighlightSegment, Hit, LocationStrategy, MatchOp, Query, ResolvedField, ResolvedIndex,
-    SearchAfter, Sort, SortOrder, SortValue, TextRecord, TimeFormat, Value as GValue,
-    SCORE_SORT_KEY,
+    HighlightSegment, Hit, MatchOp, Query, ResolvedField, ResolvedIndex, SearchAfter, Sort,
+    SortOrder, SortValue, TextRecord, TimeFormat, Value as GValue, SCORE_SORT_KEY,
 };
 use tantivy::aggregation::agg_req::Aggregations;
 use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
@@ -42,12 +44,6 @@ pub const KEY_FIELD: &str = "_key";
 /// Bytes-indexed `enc(CompositeKey)` field — delete-by-key plus the agg liveness keyset
 /// exclusion. Not stored (`_key` carries the same bytes for hits).
 const KEY_ENC_FIELD: &str = "_keyenc";
-/// u64 fast field holding a doc's **locator ID** — the reference layer of the [D30] layered
-/// locator. Indexes the shard's dense location array ([`crate::location`]) → the row's current
-/// `(file_id, row_position)`. Written on every upsert.
-///
-/// [D30]: ../../../okf/system/decisions/d30-layered-locator.md
-pub const LOC_ID_FIELD: &str = "_locid";
 
 /// Writer heap budget.
 pub const WRITER_HEAP_BYTES: usize = 50_000_000;
@@ -117,6 +113,10 @@ pub enum IndexError {
     /// An ANN sidecar could not be parsed (bad frame / postcard decode).
     #[error("ann sidecar: {0}")]
     Vector(#[from] crate::vector::VectorIndexError),
+
+    /// A completion sidecar could not be parsed (bad frame / postcard decode).
+    #[error("completion sidecar: {0}")]
+    Sidecar(String),
 }
 
 /// Convenience result alias for the index crate.
@@ -133,9 +133,6 @@ pub struct IndexSchema {
     key_field: Field,
     /// Bytes-indexed `enc(key)` field for the aggregation liveness exclusion.
     key_enc_field: Field,
-    /// u64 FAST locator-ID field ([`LOC_ID_FIELD`], the D30 reference layer), attached
-    /// to every upsert by the store's commit path.
-    loc_id_field: Field,
     /// (path, tantivy field, type, declared timestamp format) per mapped field, in definition
     /// order. The [`TimeFormat`] is set only for timestamp fields; it tells [`add_typed_value`] to
     /// normalize the source epoch to canonical micros at build.
@@ -148,13 +145,12 @@ pub struct IndexSchema {
     mapped_field_summaries: Vec<MappedFieldSummary>,
     /// The tenant-scoping field, if the index is tenant-scoped.
     tenant_field: Option<String>,
-    /// The index's **location strategy** (D30). Under [`Predicate`](LocationStrategy::Predicate) the
-    /// commit path never populates [`LOC_ID_FIELD`], yet the schema **keeps** the field either way
-    /// (see [`from_resolved`](Self::from_resolved)).
-    location_strategy: LocationStrategy,
     /// The VECTOR fields (ANN-build inputs), in definition order — each with its stored-bytes handle
     /// and [`VectorSpec`](growlerdb_core::VectorSpec). Empty for a non-vector index (ANN skipped).
     vector_fields: Vec<VectorFieldInfo>,
+    /// The `suggest`-flagged KEYWORD/TEXT fields (completion-sidecar inputs) — `(path, handle)` in
+    /// definition order. Empty when no field opts in (the completion sidecar is skipped).
+    suggest_fields: Vec<(String, Field)>,
     /// The VARIANT columns' flatten fields (D47), keyed by column — the reserved
     /// `<column>#terms` / `<column>#text` handles (each present iff that flatten mode is on).
     variant_fields: Vec<VariantFieldInfo>,
@@ -193,6 +189,8 @@ pub struct MappedFieldSummary {
     pub fast: bool,
     pub indexed: bool,
     pub cached: bool,
+    /// Whether the field has a prefix-completion sidecar (`/v1/suggest` fast path).
+    pub suggest: bool,
 }
 
 /// A VECTOR field's describe-facing summary: field path plus the embedding config a console needs
@@ -227,6 +225,7 @@ impl IndexSchema {
         let mut sortable_fields = Vec::new();
         let mut mapped_field_summaries = Vec::with_capacity(idx.fields.len());
         let mut vector_fields = Vec::new();
+        let mut suggest_fields = Vec::new();
         let mut variant_fields = Vec::new();
         for f in &idx.fields {
             // A VARIANT field carries no single typed Tantivy field — only its flatten index
@@ -262,6 +261,7 @@ impl IndexSchema {
                     // "indexed" for a variant = queryable via the flatten index.
                     indexed: terms || text,
                     cached: false,
+                    suggest: false,
                 });
                 continue;
             }
@@ -318,29 +318,31 @@ impl IndexSchema {
                 }
             }
             fields.push((f.path.clone(), handle, f.ty, f.format));
+            // Only KEYWORD/TEXT fields have a term dictionary to complete over; `suggest` on any
+            // other type is ignored (no sidecar), per the graceful-ignore contract.
+            let suggest = f.suggest && matches!(f.ty, FieldType::Keyword | FieldType::Text);
+            if suggest {
+                suggest_fields.push((f.path.clone(), handle));
+            }
             mapped_field_summaries.push(MappedFieldSummary {
                 name: f.path.clone(),
                 ty: format!("{:?}", f.ty).to_uppercase(),
                 fast: f.fast,
                 indexed: f.indexed,
                 cached: f.cached,
+                suggest,
             });
         }
-        // Added after the mapped fields so internal handles never shift a user field's ordinal.
-        // Declared for **every** strategy (a `PREDICATE` index just never populates it) so the
-        // schema shape is identical across strategies — avoiding the field-ordinal hazard.
-        let loc_id_field = builder.add_u64_field(LOC_ID_FIELD, FAST);
         Self {
             schema: builder.build(),
             key_field,
             key_enc_field,
-            loc_id_field,
             fields,
             sortable_fields,
             mapped_field_summaries,
             tenant_field: idx.tenant_field().map(str::to_string),
-            location_strategy: idx.location_strategy,
             vector_fields,
+            suggest_fields,
             variant_fields,
         }
     }
@@ -351,17 +353,23 @@ impl IndexSchema {
         !self.vector_fields.is_empty()
     }
 
+    /// Whether any field opts into a prefix-completion sidecar — i.e. whether the commit/compaction
+    /// paths build a per-segment `<uuid>.cmp`. False → the completion build is skipped entirely.
+    pub fn has_suggest_fields(&self) -> bool {
+        !self.suggest_fields.is_empty()
+    }
+
+    /// Whether `name` is a `suggest`-flagged KEYWORD/TEXT field — the gate the suggest path checks
+    /// before attempting the completion-sidecar fast path.
+    pub fn is_suggest_field(&self, name: &str) -> bool {
+        self.suggest_fields.iter().any(|(p, _)| p == name)
+    }
+
     /// Whether this index maps an Iceberg v3 **variant** column (D47) — the cheap, schema-only
     /// counterpart of [`ResolvedIndex::has_variant_field`](growlerdb_core::ResolvedIndex::has_variant_field)
     /// for the hydration fork on paths that hold only the [`IndexSchema`].
     pub fn has_variant_fields(&self) -> bool {
         !self.variant_fields.is_empty()
-    }
-
-    /// The index's [location strategy](LocationStrategy) (D30) — how the store's commit
-    /// path and the engine's hydration path locate source rows.
-    pub fn location_strategy(&self) -> LocationStrategy {
-        self.location_strategy
     }
 
     /// The tenant-scoping field, if this index is tenant-scoped — the field reads inject
@@ -422,12 +430,6 @@ impl IndexSchema {
     /// exclusion.
     pub fn key_enc_field(&self) -> Field {
         self.key_enc_field
-    }
-
-    /// The u64 FAST **locator-ID** field ([`LOC_ID_FIELD`], D30 reference layer) — the store
-    /// attaches each upsert's location-array id through this handle.
-    pub fn loc_id_field(&self) -> Field {
-        self.loc_id_field
     }
 
     /// Build the [`TantivyDocument`] for `doc`: the stored + indexed `enc(key)` and each mapped
@@ -602,8 +604,10 @@ fn vec_f32_to_le_bytes(v: &[f32]) -> Vec<u8> {
 /// Decode raw little-endian `f32` bytes back into a vector — inverse of [`vec_f32_to_le_bytes`]. A
 /// trailing partial element (length not a multiple of 4) is dropped.
 fn le_bytes_to_vec_f32(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
@@ -611,6 +615,12 @@ fn le_bytes_to_vec_f32(b: &[u8]) -> Vec<f32> {
 /// files in the index directory.
 fn ann_sidecar_name(segment_uuid: &str) -> String {
     format!("{segment_uuid}.{ANN_SUFFIX}")
+}
+
+/// The file name of a segment's completion sidecar: `<segment-uuid>.cmp`, beside the lexical segment
+/// files. One file per segment holds every `suggest` field's prefix table.
+pub fn completion_sidecar_name(segment_uuid: &str) -> String {
+    format!("{segment_uuid}.{COMPLETION_SUFFIX}")
 }
 
 /// Normalize an `IpAddr` to the IPv6 form Tantivy stores (IPv4 → v4-mapped v6).
@@ -704,10 +714,11 @@ impl TantivySegmentCore {
         }
 
         writer.commit()?;
-        // Build the per-segment ANN sidecar(s) over the just-committed vectors.
-        if schema.has_vector_fields() {
+        // Build the per-segment ANN + completion sidecar(s) over the just-committed segment.
+        if schema.has_vector_fields() || schema.has_suggest_fields() {
             let reader = self.open(dir)?;
             reader.build_ann_sidecars(schema, dir)?;
+            reader.build_completion_sidecars(schema, dir)?;
         }
         Ok(batch.docs.len() as u64)
     }
@@ -812,18 +823,19 @@ impl SegmentReader {
         self.reader.searcher().num_docs()
     }
 
-    /// The **locator ID** (`_locid` fast field) of the live doc carrying `enc(key)`, or `None` when
-    /// no live doc has the key. The D30 write path's pre-commit **reuse lookup** — a key-term probe
-    /// per segment + one fast-field read — which keeps the location array O(live keys), not O(all
-    /// versions ever written).
-    pub fn live_loc_id(&self, key_enc: &[u8]) -> Result<Option<u64>> {
+    /// The [`DocAddress`](tantivy::DocAddress) of the live doc carrying `key_enc`, or `None` — a
+    /// key-term probe per segment, exposing the address so a caller reads its **fast fields** (the prune hints). Valid only for `searcher` (segment ords align).
+    fn live_doc_address(
+        &self,
+        searcher: &tantivy::Searcher,
+        key_enc: &[u8],
+    ) -> Result<Option<tantivy::DocAddress>> {
         let schema = self.index.schema();
         let Ok(key_enc_field) = schema.get_field(KEY_ENC_FIELD) else {
             return Ok(None);
         };
         let term = Term::from_field_bytes(key_enc_field, key_enc);
-        let searcher = self.reader.searcher();
-        for segment in searcher.segment_readers() {
+        for (seg_ord, segment) in searcher.segment_readers().iter().enumerate() {
             let inverted = segment.inverted_index(key_enc_field)?;
             let Some(mut postings) = inverted
                 .read_postings(&term, IndexRecordOption::Basic)
@@ -831,23 +843,45 @@ impl SegmentReader {
             else {
                 continue;
             };
-            // Defensive: a segment with no `_locid` column can't contribute an id (should be
-            // unreachable — every upsert writes the field).
-            let Some(col) = segment.fast_fields().column_opt::<u64>(LOC_ID_FIELD)? else {
-                continue;
-            };
             let alive = segment.alive_bitset();
             let mut doc = postings.doc();
             while doc != TERMINATED {
                 if alive.is_none_or(|b| b.is_alive(doc)) {
-                    if let Some(id) = col.first(doc) {
-                        return Ok(Some(id));
-                    }
+                    return Ok(Some(tantivy::DocAddress::new(seg_ord as u32, doc)));
                 }
                 doc = postings.advance();
             }
         }
         Ok(None)
+    }
+
+    /// Read each key's live-doc **fast values** for `fields` — the sort-key **prune hints** hydration
+    /// AND-s onto its predicate. A key with no live doc, or a non-fast field, contributes nothing (never an error — a pure prune); returns a vec aligned 1:1 with `keys`.
+    pub fn fast_values(
+        &self,
+        keys: &[CompositeKey],
+        fields: &[String],
+    ) -> Result<Vec<Vec<(String, GValue)>>> {
+        let searcher = self.reader.searcher();
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            let mut row = Vec::new();
+            if let Some(address) = self.live_doc_address(&searcher, &key.encode())? {
+                for field in fields {
+                    let Ok((_, ftype)) = self.resolve_typed_field(field) else {
+                        continue; // unknown field — no hint
+                    };
+                    let Ok(sv) = self.fast_value(&searcher, address, field) else {
+                        continue; // not a fast/sortable field — no hint
+                    };
+                    if let Some(v) = sort_value_to_value(&ftype, &sv) {
+                        row.push((field.clone(), v));
+                    }
+                }
+            }
+            out.push(row);
+        }
+        Ok(out)
     }
 
     /// Whether any **live** doc carries `enc(key)` — a postings probe filtered by each segment's
@@ -1058,6 +1092,89 @@ impl SegmentReader {
             }
         }
         Ok(vectors)
+    }
+
+    /// Build the **per-segment completion sidecar(s)** for every `suggest` field, writing `<uuid>.cmp`
+    /// beside each segment in `dir`. Idempotent (rebuilt per merged segment id on compaction); frequencies are the dictionary's `doc_freq`, the accepted suggester contract.
+    pub fn build_completion_sidecars(&self, schema: &IndexSchema, dir: &Path) -> Result<()> {
+        if schema.suggest_fields.is_empty() {
+            return Ok(());
+        }
+        let searcher = self.reader.searcher();
+        for seg in searcher.segment_readers() {
+            let path = dir.join(completion_sidecar_name(&seg.segment_id().uuid_string()));
+            if path.exists() {
+                continue; // already built (content-stable per segment id)
+            }
+            let mut sidecar = SegmentCompletion::new();
+            for (name, handle) in &schema.suggest_fields {
+                let inverted = seg.inverted_index(*handle)?;
+                let mut builder = CompletionBuilder::new();
+                let mut stream = inverted
+                    .terms()
+                    .stream()
+                    .map_err(|e| IndexError::Tantivy(e.into()))?;
+                while stream.advance() {
+                    builder.add(stream.key(), stream.value().doc_freq as u64);
+                }
+                let table = builder.finish();
+                if !table.is_empty() {
+                    sidecar.insert(name.clone(), table);
+                }
+            }
+            if !sidecar.is_empty() {
+                std::fs::write(&path, sidecar.to_frame())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// **Prefix autocomplete from the completion sidecar**: `field`'s top-`limit` terms under `prefix`
+    /// (freq desc, term asc) read from each segment's `<uuid>.cmp`. `None` (→ live seek) when the sidecar can't answer: no local dir, empty/over-`P` prefix, or any live segment lacking coverage (would drop terms/mis-rank).
+    pub fn suggest_prefix_sidecar(
+        &self,
+        field: &str,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Option<Vec<(String, u64)>>> {
+        let Some(dir) = self.index_dir.as_ref() else {
+            return Ok(None); // no local sidecar directory (e.g. cold read-through)
+        };
+        let (_, is_text) = self.resolve_field(Some(field))?;
+        let needle = if is_text {
+            prefix.to_lowercase()
+        } else {
+            prefix.to_string()
+        };
+        let needle = needle.as_bytes();
+        // A too-long prefix already selects few terms (cheap live) and isn't in the table; an empty
+        // prefix isn't keyed. Byte length matches the FST's byte-sorted prefix semantics.
+        if needle.is_empty() || needle.len() > COMPLETION_PREFIX_DEPTH {
+            return Ok(None);
+        }
+        let searcher = self.reader.searcher();
+        let mut totals: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        for seg in searcher.segment_readers() {
+            let path = dir.join(completion_sidecar_name(&seg.segment_id().uuid_string()));
+            let Ok(bytes) = std::fs::read(&path) else {
+                return Ok(None); // a live segment lacks its sidecar — fall back for completeness
+            };
+            let sidecar = SegmentCompletion::from_frame(&bytes).map_err(IndexError::Sidecar)?;
+            let Some(table) = sidecar.field(field) else {
+                return Ok(None); // sidecar doesn't cover this field — fall back
+            };
+            // An absent key means this segment holds no terms under the prefix (contributes nothing);
+            // a present key sums into the cross-segment total, matching the live path.
+            if let Some(entries) = table.get(needle) {
+                for (term, freq) in entries {
+                    *totals.entry(term.clone()).or_insert(0) += freq;
+                }
+            }
+        }
+        let mut ranked: Vec<(String, u64)> = totals.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        ranked.truncate(limit);
+        Ok(Some(ranked))
     }
 
     pub fn knn_search(
@@ -2351,6 +2468,18 @@ fn bounded_levenshtein(a: &[char], b: &[char], max: u8) -> Option<u8> {
     (prev[m] <= max).then_some(prev[m] as u8)
 }
 
+/// Map a fast-field [`SortValue`] to a core [`GValue`] typed to the field's mapping (the prune hint's
+/// value: LONG→Int, DOUBLE→Float, DATE→canonical-micros Ts, KEYWORD→Str). Missing / type mismatch ⇒ `None` (no hint).
+fn sort_value_to_value(ftype: &TvFieldType, sv: &SortValue) -> Option<GValue> {
+    match (ftype, sv) {
+        (TvFieldType::I64(_), SortValue::Num(x)) => Some(GValue::Int(*x as i64)),
+        (TvFieldType::F64(_), SortValue::Num(x)) => Some(GValue::Float(*x)),
+        (TvFieldType::Date(_), SortValue::Num(x)) => Some(GValue::Ts(*x as i64)),
+        (TvFieldType::Str(_), SortValue::Str(s)) => Some(GValue::Str(s.clone())),
+        _ => None,
+    }
+}
+
 /// Build a keyset [`Term`] for a sort field from a cursor [`SortValue`], or `None` for
 /// [`Missing`](SortValue::Missing). LONG/DATE round-trip through `i64` (DATE as epoch
 /// micros, matching the `as f64` the cursor stored); KEYWORD uses the raw string term.
@@ -2679,7 +2808,7 @@ mapping:
 
         // No dynamic field growth: the Tantivy schema carries exactly the fixed fields —
         // id, the two flatten fields (payload#terms/#text), the shaped payload.number +
-        // payload.action, plus the internal _key/_keyenc/_locid. Never a per-leaf field.
+        // payload.action, plus the internal _key/_keyenc. Never a per-leaf field.
         let names: Vec<String> = schema
             .tantivy_schema()
             .fields()

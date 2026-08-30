@@ -55,10 +55,8 @@ def main():
     cat.create_namespace_if_not_exists("growlerdb")
     # format-version 2 so the changelog read the connector uses is well-defined.
     table = cat.create_table_if_not_exists(TABLE, schema=SCHEMA, properties={"format-version": "2"})
-    # Partition the lake table by `site` (identity) — demonstrates GrowlerDB's composite key =
-    # partition field(s) + identifier: readings co-locate by site, and a point lookup of `id` within
-    # a `site` prunes the Iceberg scan to that site's files (fast hydration even after compaction
-    # rewrites the locators). Name-based + idempotent: applied once, to new data.
+    # Partition by `site` (identity) — GrowlerDB's composite key = partition field(s) + identifier, so
+    # a point lookup of `id` within a `site` prunes hydration to that site's files. Idempotent.
     if not table.spec().fields:
         with table.update_spec() as update:
             update.add_field("site", IdentityTransform(), "site")

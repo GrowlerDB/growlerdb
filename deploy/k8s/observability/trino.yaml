@@ -15,11 +15,11 @@ data:
     iceberg.rest-catalog.oauth2.scope=PRINCIPAL_ROLE:ALL
     iceberg.rest-catalog.vended-credentials-enabled=false
     fs.native-s3.enabled=true
-    s3.endpoint=http://minio:9000
-    s3.region=us-east-1
-    s3.path-style-access=true
-    s3.aws-access-key=minioadmin
-    s3.aws-secret-key=minioadmin
+    s3.endpoint=${S3_ENDPOINT}
+    s3.region=${S3_REGION}
+    s3.path-style-access=${S3_PATH_STYLE}
+    s3.aws-access-key=${S3_ACCESS_KEY}
+    s3.aws-secret-key=${S3_SECRET_KEY}
 ---
 apiVersion: apps/v1
 kind: Deployment

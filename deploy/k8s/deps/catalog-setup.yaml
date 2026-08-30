@@ -33,7 +33,7 @@ spec:
 
               code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$POLARIS/api/management/v1/catalogs" \
                 -H "Authorization: Bearer $TOK" -H "Content-Type: application/json" \
-                -d '{"catalog":{"name":"growlerdb","type":"INTERNAL","properties":{"default-base-location":"s3://growlerdb-warehouse/growlerdb"},"storageConfigInfo":{"storageType":"S3","allowedLocations":["s3://growlerdb-warehouse/"],"roleArn":"arn:aws:iam::000000000000:role/polaris","endpoint":"http://minio:9000","pathStyleAccess":true}}}')
+                -d '{"catalog":{"name":"growlerdb","type":"INTERNAL","properties":{"default-base-location":"${S3_WAREHOUSE_BASE}"},"storageConfigInfo":{"storageType":"S3","allowedLocations":["${S3_ALLOWED_LOCATION}"],"roleArn":"arn:aws:iam::000000000000:role/polaris","endpoint":"${S3_ENDPOINT}","pathStyleAccess":${S3_PATH_STYLE}}}}')
               echo "create catalog 'growlerdb': http=$code (201=created, 409=exists)"
 
               gcode=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \

@@ -269,12 +269,22 @@ def cmd_render(args):
         "FIELDS": ",".join(fields),
         "NODES": nodes,
         "GENERATORS": args.generators,
+        # Parallel connector set: W worker pipelines (default = shards, one per shard group).
+        "WORKERS": args.connector_workers if args.connector_workers is not None else args.shards,
         # ConfigMap block scalar: the corpus source, indented under `corpus.py: |`.
         "CORPUS_PY": "".join(f"    {line}".rstrip() + "\n" for line in corpus_path.read_text().splitlines()).rstrip("\n"),
+        # S3/object-store target (deploy/k8s/s3-target.env). Defaults reproduce today's in-cluster
+        # MinIO byte-for-byte; scale-up.sh exports these to point Iceberg at a remote store.
+        "S3_ENDPOINT": os.environ.get("S3_ENDPOINT", "http://minio:9000"),
+        "S3_REGION": os.environ.get("S3_REGION", "us-east-1"),
+        "S3_PATH_STYLE": os.environ.get("S3_PATH_STYLE", "true"),
+        "S3_SSL": os.environ.get("S3_SSL", "false"),
+        "S3_ACCESS_KEY": os.environ.get("S3_ACCESS_KEY", "minioadmin"),
+        "S3_SECRET_KEY": os.environ.get("S3_SECRET_KEY", "minioadmin"),
     }
     out_dir = Path(args.out) if args.out else (Path(__file__).parent / ".render" / wl.name)
     out_dir.mkdir(parents=True, exist_ok=True)
-    for template in ("generator", "connector"):
+    for template in ("generator", "connector", "connector-set"):
         text = string.Template((STREAMING_DIR / f"{template}.template.yaml").read_text()).safe_substitute(subs)
         if "${" in text:
             raise SystemExit(f"{template}.template.yaml: unresolved placeholder after render")
@@ -309,6 +319,8 @@ def main():
     p.add_argument("--namespace", default="growlerdb")
     p.add_argument("--generators", type=int, default=1,
                    help="generator pod replicas — parallelize ingest (disjoint ids per pod)")
+    p.add_argument("--connector-workers", type=int, default=None,
+                   help="parallel connector-set worker count (default = --shards, one per shard group)")
     p.add_argument("--out", default=None, help="output dir (default bench/scale/.render/<workload>/)")
     p.set_defaults(fn=cmd_render)
     args = ap.parse_args()

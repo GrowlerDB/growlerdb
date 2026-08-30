@@ -117,11 +117,10 @@ Same primitive, three wins: **multi-index density** (kills node-per-index), **re
 ## The cold tier is what makes failover fast
 
 Standing replicas and re-placement would be worthless if a new holder had to **rebuild from source**
-first. The [cold tier](/product/functional/cold-tiering.md) + the layered locator
-([D30](/system/decisions/d30-layered-locator.md)) make it a metadata operation instead:
+first. The [cold tier](/product/functional/cold-tiering.md) makes it a metadata operation instead:
 
 - **Shared durable substrate.** Sealed segments live in the backup/object store, and a parked cold
-  window offloads **~97% of index bytes to object storage** (D30). A unit's data is durable in the
+  window offloads **~97% of index bytes to object storage**. A unit's data is durable in the
   shared store **independent of any node**, so re-placing a dead owner's cold unit is a **metadata-only
   assignment** — the new holder reads the *same* objects through the range-cache; nothing rebuilds.
 - **Near-instant bootstrap.** A new replica answers immediately by reading cold bytes read-through,

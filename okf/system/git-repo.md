@@ -17,7 +17,7 @@ is the codebase; the project *touchpoint* is [product/interfaces/git-repo](/prod
   definition, durable write.
 - **growlerdb-proto** — Protobuf/gRPC definitions (the JVM/Rust contract).
 - **growlerdb-index** — the [local index store](/system/storage/index-store.md): Tantivy segments,
-  redb locators, cold bundles, hotcache.
+  the redb aux store, cold bundles, hotcache.
 - **growlerdb-source** — the Iceberg source reader (scans + hydration reads).
 - **growlerdb-backup** — backup/restore + replica segment shipping.
 - **growlerdb-controlplane** — the registry (indexes, shards, tokens, roles, activity).

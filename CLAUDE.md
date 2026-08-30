@@ -26,7 +26,10 @@ No commit trailer. Keep PRs small and honestly scoped.
 
 Comments earn their place or they go. Applies to all languages (Rust, Java, Svelte/TS).
 
-- **Concise:** most comments are ≤2 lines — targeted sentences, not paragraphs. Minimize visual clutter.
+- **Two lines MAX — hard cap:** every comment is **≤2 lines**, no exceptions. A comment that wants to be
+  a paragraph is a sign the *context* belongs in the **OKF** (`okf/`), not the code — write it there and,
+  if needed, leave a one-line pointer/decision ref (`D54`, `okf/…`). The code carries the terse *why*; the
+  OKF carries the narrative, rationale, and background.
 - **Why, not what:** the code says *what* it does; a comment explains *why* (a non-obvious rationale,
   invariant, trade-off, safety/correctness reason, or a decision ref like `D53`/`HA-G4`). If a comment
   only restates the code, delete it.

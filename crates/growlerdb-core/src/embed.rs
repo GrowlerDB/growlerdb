@@ -242,6 +242,7 @@ mod tests {
                     record: crate::index_def::TextRecord::Position,
                     fieldnorms: true,
                     cached: false,
+                    suggest: false,
                     sensitive: false,
                     max_bytes: None,
                     vector: None,
@@ -257,6 +258,7 @@ mod tests {
                     record: crate::index_def::TextRecord::Position,
                     fieldnorms: true,
                     cached: false,
+                    suggest: false,
                     sensitive: false,
                     max_bytes: None,
                     vector: Some(spec(8)),
@@ -268,7 +270,6 @@ mod tests {
             shard_count: 1,
             tenant_field: None,
             windowing: None,
-            location_strategy: Default::default(),
         }
     }
 
