@@ -6,6 +6,22 @@ All notable changes to GrowlerDB are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-08-29
+
+A patch release fixing reindex/alter on a **pool-hosted index**.
+
+### Fixed
+
+- **Reindex and alter of a pool-hosted index no longer fail `501 Unimplemented`.** The gateway's
+  single-shard fast-path routed `ReindexIndex`/`AlterIndex` straight to the owning node; for a
+  single-shard index served by a **pool** node (e.g. `catalog` on pool-a/pool-b) that node rejects the
+  op ("not supported on a pool node"), which must be coordinated by the control plane. The gateway now
+  prefers the control plane's coordinated path whenever a control plane is present — for pool-hosted and
+  multi-shard indexes alike — and the pool node routes the coordinated reindex lifecycle
+  (`reindex_index`/`reindex_status`/`cancel_reindex`/`reindex_precheck`) to the owning unit's admin
+  service instead of blanket-rejecting it. The direct single-shard path is now reserved for the
+  control-plane-less embedded `serve`.
+
 ## [0.10.0] - 2026-08-29
 
 The **store-less hydration** release. Fetching full documents for a top-K result no longer depends on
@@ -687,7 +703,8 @@ The initial public (Beta) surface.
   into the image, chart `appVersion`, binaries, and CLI `--version` while the tree stays `0.0.0`;
   the image gets an immutable `X.Y.Z` plus moving `X.Y`/`X`/`latest`. See [RELEASING.md](RELEASING.md).
 
-[Unreleased]: https://github.com/GrowlerDB/growlerdb/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/GrowlerDB/growlerdb/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/GrowlerDB/growlerdb/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.7.0...v0.8.0

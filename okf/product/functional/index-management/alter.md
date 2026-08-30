@@ -9,8 +9,9 @@ timestamp: 2026-07-04T14:22:00
 # Alter index
 
 Evolve an existing index. `POST /v1/index:alter` **dry-runs a plan** or **applies** a definition
-change. A multi-shard index is applied by the [control plane](/system/runtime/components/control-plane.md)
-(the gateway forwards it); a single embedded node applies its own.
+change. Whenever a [control plane](/system/runtime/components/control-plane.md) is present the gateway
+forwards the alter to it — for pool-hosted and multi-shard indexes alike (a pool node can't durably change
+the registry) — and only a control-plane-less embedded node applies its own.
 
 - **In-place** — metadata-only changes apply without a rebuild: an index **rename**, a **`sensitive`**
   flip, and a **`max_bytes`** redeclaration. Nothing stored or indexed differs.
