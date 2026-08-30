@@ -49,3 +49,10 @@ code, kbd, samp, pre, .highlight, tt {
 a:hover {
   color: #94b8dd;
 }
+
+// Above 66.5rem the theme grows the left nav bar to fill the gutter (calc), so it reads as an
+// oversized left column. Cap it at the nav width and left-align the content beside it.
+@media (min-width: 66.5rem) {
+  .side-bar { width: 16.5rem; min-width: 16.5rem; }
+  .side-bar + .main { margin-left: 16.5rem; }
+}
