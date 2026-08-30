@@ -2718,10 +2718,8 @@ async fn open_pool_hash_index(
                         resolved.clone(),
                     ),
                 );
-                // Source access so the node made **primary** for this ordinal can rebuild it from
-                // source on a coordinated reindex/alter (the CP drives reindex on the primary only).
-                // Mirrors the single-node `serve` and windowed hot-window paths; a replica serves via
-                // the read-only replicate path, which stays source-less.
+                // Source access so the primary can rebuild this ordinal on a coordinated reindex/alter
+                // (mirrors `serve` + windowed-hot; a replica serves via the source-less replicate path).
                 admin_o.insert(
                     key,
                     AdminService::new(handle.clone(), &index_s).with_source(
