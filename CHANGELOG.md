@@ -6,6 +6,22 @@ All notable changes to GrowlerDB are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-08-30
+
+A patch release completing the pool-hosted reindex fix from v0.10.1.
+
+### Fixed
+
+- **Reindex/alter of a pool-hosted index that is built on primary assignment.** v0.10.1 gave a pool
+  node's hash-sharded ordinals source access only on the **boot-time open** path
+  (`open_pool_hash_index`). A pool node that starts `--define-only` — the default `just stack` demo
+  (docs/catalog/movies) — has no shard on disk at boot and instead **builds each ordinal on primary
+  assignment** (`open_and_publish_ordinal`), a separate path that still constructed the per-unit admin
+  without source. So a coordinated reindex reached the pool node but failed `500` "started without
+  source access for reindex". That path now wires source access too, so reindex/alter of a pool index
+  rebuilds from source in every pool serving mode. Verified end-to-end on `just stack-dev`
+  (`POST /v1/index:reindex {"index":"catalog"}` → `200`, snapshot advancing per cutover).
+
 ## [0.10.1] - 2026-08-29
 
 A patch release fixing reindex/alter on a **pool-hosted index**.
@@ -706,7 +722,8 @@ The initial public (Beta) surface.
   into the image, chart `appVersion`, binaries, and CLI `--version` while the tree stays `0.0.0`;
   the image gets an immutable `X.Y.Z` plus moving `X.Y`/`X`/`latest`. See [RELEASING.md](RELEASING.md).
 
-[Unreleased]: https://github.com/GrowlerDB/growlerdb/compare/v0.10.1...HEAD
+[Unreleased]: https://github.com/GrowlerDB/growlerdb/compare/v0.10.2...HEAD
+[0.10.2]: https://github.com/GrowlerDB/growlerdb/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/GrowlerDB/growlerdb/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/GrowlerDB/growlerdb/compare/v0.8.0...v0.9.0

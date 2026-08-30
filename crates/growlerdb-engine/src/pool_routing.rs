@@ -301,12 +301,8 @@ impl Lookup for PoolLookupService {
     }
 }
 
-/// The admin (DescribeIndex) counterpart to [`PoolSearchService`]: routes on the index + unit
-/// selectors to the owning window/shard's [`AdminService`]. The **reindex lifecycle**
-/// (`reindex_index` / `reindex_status` / `cancel_reindex` / `reindex_precheck`) routes per-unit so the
-/// control plane's coordinated reindex reaches this node's shard/window. Alter/reconcile/compact/backup
-/// stay `Unimplemented` — cluster-shape ops the CP drives at the registry / not per-unit here (alter is
-/// applied CP-side then rebuilt via `reindex_index`), as on the windowed mux.
+/// The admin counterpart to [`PoolSearchService`]: routes on the index + unit selectors to the owning
+/// unit's [`AdminService`]. The reindex lifecycle routes per-unit; alter/reconcile/compact/backup stay `Unimplemented` (CP-driven, not per-unit).
 pub struct PoolAdminService {
     by_index: SharedAdminIndexes,
     kinds: SharedIndexKinds,
