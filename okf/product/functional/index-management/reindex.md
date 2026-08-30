@@ -11,8 +11,10 @@ timestamp: 2026-07-04T14:22:00
 Rebuild an index from its Iceberg source — after a definition change, a source recreation, or to move
 to a new shard layout. Run it **asynchronously as a job** (`POST /v1/jobs` → a job id, the first-class
 path for a long-running multi-shard rebuild) or **synchronously** (`POST /v1/index:reindex`, served by
-the gateway which forwards a multi-shard index to the control plane, or a single embedded node). Both
-drive the same orchestration.
+the gateway). The gateway forwards to the control plane's coordinated reindex whenever a control plane is
+present — for pool-hosted and multi-shard indexes alike, since a single owning **pool** node rejects a
+direct per-index reindex and must be unit-coordinated — and only reindexes a lone shard in-process on the
+control-plane-less embedded `serve`. Both paths drive the same orchestration.
 
 ## Coordinated multi-shard reindex
 
