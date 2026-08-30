@@ -2718,7 +2718,21 @@ async fn open_pool_hash_index(
                         resolved.clone(),
                     ),
                 );
-                admin_o.insert(key, AdminService::new(handle.clone(), &index_s));
+                // Source access so the node made **primary** for this ordinal can rebuild it from
+                // source on a coordinated reindex/alter (the CP drives reindex on the primary only).
+                // Mirrors the single-node `serve` and windowed hot-window paths; a replica serves via
+                // the read-only replicate path, which stays source-less.
+                admin_o.insert(
+                    key,
+                    AdminService::new(handle.clone(), &index_s).with_source(
+                        resolved.clone(),
+                        store.clone(),
+                        ShardId::shard(&index_s, o),
+                        IcebergConfig::from_env(),
+                        table.clone(),
+                        growlerdb_engine::ReindexFence::new(),
+                    ),
+                );
                 write_o.insert(
                     key,
                     WriteService::new(handle.clone(), index_s.clone(), POOL_HASH_MAX_INFLIGHT)

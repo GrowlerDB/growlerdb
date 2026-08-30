@@ -20,7 +20,10 @@ A patch release fixing reindex/alter on a **pool-hosted index**.
   multi-shard indexes alike — and the pool node routes the coordinated reindex lifecycle
   (`reindex_index`/`reindex_status`/`cancel_reindex`/`reindex_precheck`) to the owning unit's admin
   service instead of blanket-rejecting it. The direct single-shard path is now reserved for the
-  control-plane-less embedded `serve`.
+  control-plane-less embedded `serve`. A pool node's **hash-sharded** ordinals are also now opened with
+  source access (like the single-node `serve` and windowed-hot-window paths), so the node made primary
+  can actually rebuild the shard from source — previously the coordinated reindex reached the pool node
+  but failed `500` with "started without source access for reindex".
 
 ## [0.10.0] - 2026-08-29
 
