@@ -1,14 +1,17 @@
 # GrowlerDB index for the realistic http_logs access-log corpus. The SOURCE is rich (~17 fields —
 # see corpus.py, which both bulk-loads and streams it), representative of a real CDN/app log. The
-# INDEX holds only the SEARCHABLE subset plus a compact per-row hydration locator; the rich
-# source-only columns (host, query, protocol, session_id, tags) live in Iceberg and are hydrated on
-# demand. So the index is a realistic fraction of the source (unlike a thin corpus, where the fixed
-# ~14 B/row locator swamps a tiny row). request_id is a KEY-ONLY field: it identifies + hydrates rows
-# (locator) but is NOT indexed as a searchable term dictionary (a per-row UUID has no search value and
-# would bloat the inverted index). The three `fast: true` LONG fields (ts, response_time_ms,
-# response_size) are columnar-only by default — range/sort/exact run on the fast field, so they
-# contribute no term-dict/postings bytes; compare
-# growlerdb_index_bytes_component{component=~"term|postings"} across runs to see the delta.
+# INDEX holds only the SEARCHABLE subset and stores NO per-row location data. Hydration is store-less:
+# every fetch re-finds its rows by a key-equality scan on `request_id`, pruned to the matching Iceberg
+# row groups by the row's own `ts` sort-key value (the source table is ts-clustered by
+# `WRITE ORDERED BY ts, request_id` at compaction; iceberg-rust prunes by row-group ts min/max). See
+# okf/product/functional/hydration.md. The rich source-only columns (host, query, protocol,
+# session_id, tags) live in Iceberg and are hydrated on demand. request_id is a KEY-ONLY field: it
+# identifies + hydrates rows (the composite key the hydration scan matches on) but is NOT indexed as a
+# searchable term dictionary (a per-row UUID has no search value and would bloat the inverted index).
+# The three `fast: true` LONG fields (ts, response_time_ms, response_size) are columnar-only by
+# default — range/sort/exact run on the fast field, so they contribute no term-dict/postings bytes;
+# compare growlerdb_index_bytes_component{component=~"term|postings"} across runs to see the delta. ts
+# being fast is also what lets hydration attach a per-hit ts prune hint (attach_prune_hints).
 name: http_logs
 source:
   iceberg:
@@ -19,6 +22,10 @@ key:
 mapping:
   selection: EXPLICIT
   fields:
+    # trace_id is the LB/proxy-injected X-Request-ID — a searchable KEYWORD (whole-value exact match)
+    # for request correlation, distinct from the key-only `request_id`. Near-unique, so its term dict is
+    # large (a disclosed cost, mirrored on OpenSearch); it enables the point-lookup-vs-Iceberg-bloom pair.
+    - { path: trace_id, type: KEYWORD }
     - { path: ts, type: LONG, fast: true } # range / sort
     - { path: method, type: KEYWORD }
     - { path: status, type: KEYWORD }
@@ -31,7 +38,11 @@ mapping:
     - { path: user_agent, type: TEXT }
     - { path: referer, type: TEXT, record: FREQ }
     - { path: client_ip, type: IP } # CIDR queries
-    - { path: user_id, type: KEYWORD }
+    # user_id drives the /v1/suggest autocomplete benchmark: `suggest: true` builds a per-segment
+    # prefix-completion sidecar so a short prefix answers from a precomputed top-K table (latency
+    # parity with OpenSearch's completion FST) instead of a live term-dictionary scan over this
+    # high-cardinality field.
+    - { path: user_id, type: KEYWORD, suggest: true }
     - { path: region, type: KEYWORD }
     - { path: response_time_ms, type: LONG, fast: true } # range / sort
     - { path: response_size, type: LONG, fast: true }

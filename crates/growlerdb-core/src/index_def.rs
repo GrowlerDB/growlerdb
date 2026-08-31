@@ -263,45 +263,6 @@ pub struct IndexDefinition {
     /// (epoch ms). `None` = no time-windowing (hash/partition routing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub windowing: Option<crate::window::TimeWindowing>,
-    /// How hydration locates a key's source row ([layered locator]): [`COORDINATES`]
-    /// (the default — per-row location data kept in the index) or [`PREDICATE`]
-    /// (store-less — re-find by a pruned key scan). See [`LocationStrategy`] for the
-    /// trade-off and the predicate strategy's honest scope.
-    ///
-    /// [layered locator]: ../../../okf/system/decisions/d30-layered-locator.md
-    /// [`COORDINATES`]: LocationStrategy::Coordinates
-    /// [`PREDICATE`]: LocationStrategy::Predicate
-    #[serde(default)]
-    pub location_strategy: LocationStrategy,
-}
-
-/// Per-index **location strategy** ([layered locator]): how hydration resolves a
-/// composite key back to its source row. Chosen by the author in the definition
-/// (`location_strategy:`); the default is the universal [`Coordinates`](Self::Coordinates).
-/// Auto-detection from table inspection (format version, sort order, partition spec)
-/// is deferred until the `row_id` strategy exists — today the choice is explicit.
-///
-/// Key **verification** (a fetched row must carry the requested key) and the
-/// predicate **fallback** stay on under every strategy — a strategy changes
-/// performance and index size, never correctness.
-///
-/// [layered locator]: ../../../okf/system/decisions/d30-layered-locator.md
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum LocationStrategy {
-    /// Per-row `(file, position)` kept in the index (the layered locator: `_locid`
-    /// fast field + dense location array, ~13–15 B/row) — fast point reads on any
-    /// table; healed in the background when Iceberg compaction rewrites files.
-    #[default]
-    Coordinates,
-    /// **Store-less**: no per-row location data at all. Every hydration re-finds the
-    /// row by a key-equality scan pruned by partition values + column stats — today's
-    /// verify-and-fall-back pass promoted to the primary path. Zero location bytes and
-    /// nothing to heal on source compaction, but **honest scope**: effective only
-    /// where the key correlates with the table layout (partitioned on key fields, or
-    /// clustered/sorted by the key). On an unclustered high-cardinality key, stats
-    /// can't prune and hydration degrades to broad scans.
-    Predicate,
 }
 
 /// Default [`shard_count`](IndexDefinition::shard_count): a single shard.
@@ -429,22 +390,8 @@ impl IndexDefinition {
                 check_time_field(ef)?;
             }
         }
-        let (equality_deletes, mut warnings) =
+        let (equality_deletes, warnings) =
             classify_equality_deletes(&source.equality_delete_fields, &key, &fields);
-        // Honest-scope guardrail: a PREDICATE index stores no location data, so hydration
-        // latency depends on the source layout. We don't inspect the layout (deferred with
-        // auto-detection) — we warn, so the trade-off is a stated choice.
-        if self.location_strategy == LocationStrategy::Predicate {
-            warnings.push(
-                "location_strategy PREDICATE stores no per-row location data: every hydration \
-                 re-finds the row by a partition/stats-pruned key scan of the source table. \
-                 Latency depends on the source layout — effective when the key correlates with \
-                 it (partitioned on key fields, or clustered/sorted by the key); on an \
-                 unclustered high-cardinality key the scan cannot prune and hydration degrades \
-                 to broad scans. Use the default COORDINATES strategy if unsure."
-                    .to_string(),
-            );
-        }
         Ok(ResolvedIndex {
             name: self.name.clone(),
             source: self.source.clone(),
@@ -455,7 +402,6 @@ impl IndexDefinition {
             shard_count: self.shard_count.max(1),
             tenant_field: self.tenant_field.clone(),
             windowing: self.windowing.clone(),
-            location_strategy: self.location_strategy,
         })
     }
 }
@@ -796,6 +742,7 @@ fn resolve_field(
         record: ovr.and_then(|o| o.record).unwrap_or(TextRecord::Position),
         fieldnorms: ovr.and_then(|o| o.fieldnorms).unwrap_or(true),
         cached: ovr.is_some_and(|o| o.cached),
+        suggest: ovr.is_some_and(|o| o.suggest),
         sensitive: ovr.is_some_and(|o| o.sensitive),
         max_bytes: ovr.and_then(|o| o.max_bytes),
         vector: None,
@@ -827,6 +774,7 @@ fn resolve_vector_field(f: &FieldMapping) -> Result<ResolvedField, DefError> {
     };
     reject(f.fast, "fast")?;
     reject(f.cached, "cached")?;
+    reject(f.suggest, "suggest")?;
     reject(f.sensitive, "sensitive")?;
     reject(f.analyzer.is_some(), "analyzer")?;
     reject(f.record.is_some(), "record")?;
@@ -868,6 +816,7 @@ fn resolve_vector_field(f: &FieldMapping) -> Result<ResolvedField, DefError> {
         record: TextRecord::Position,
         fieldnorms: true,
         cached: false,
+        suggest: false,
         sensitive: false,
         max_bytes: None,
         vector: Some(spec),
@@ -979,6 +928,7 @@ fn resolve_variant_field(f: &FieldMapping) -> Result<Vec<ResolvedField>, DefErro
         record: TextRecord::Position,
         fieldnorms: true,
         cached: false,
+        suggest: false,
         sensitive: false,
         max_bytes: None,
         vector: None,
@@ -1041,6 +991,10 @@ pub struct FieldMapping {
     /// hit, so a page renders without hydration. Default false.
     #[serde(default)]
     pub cached: bool,
+    /// **Suggest** field — build a per-segment prefix-completion sidecar so `/v1/suggest` answers
+    /// from a precomputed top-K table. KEYWORD/TEXT only (ignored, no sidecar, otherwise). Default false.
+    #[serde(default)]
+    pub suggest: bool,
     /// **Sensitive** field (eventually catalog/Polaris-marked) — hard-blocked
     /// from caching; requesting `cached` on it is a resolve error. Default false.
     #[serde(default)]
@@ -1501,9 +1455,6 @@ pub struct ResolvedIndex {
     /// Time-window sharding, validated to a mapped fast DATE/LONG field. `None` = none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub windowing: Option<crate::window::TimeWindowing>,
-    /// The index's [location strategy](LocationStrategy), carried from the definition.
-    #[serde(default)]
-    pub location_strategy: LocationStrategy,
 }
 
 impl ResolvedIndex {
@@ -1609,15 +1560,6 @@ impl ResolvedIndex {
             plan.reindex_reasons.push(format!(
                 "shard_count {} → {} (re-routes every doc; reshard via reindex)",
                 self.shard_count, new.shard_count
-            ));
-        }
-        if self.location_strategy != new.location_strategy {
-            // PREDICATE docs carry no `_locid` value and no location slots; COORDINATES
-            // needs both, and non-cached field values aren't stored in Tantivy, so the
-            // location layers can't be rebuilt in place — either direction is a rebuild.
-            plan.reindex_reasons.push(format!(
-                "location_strategy {:?} → {:?} (location data must be rebuilt)",
-                self.location_strategy, new.location_strategy
             ));
         }
         if self.key.partition_fields != new.key.partition_fields {
@@ -1789,6 +1731,10 @@ pub struct ResolvedField {
     /// Cached display field — value stored in-index and returned with the hit.
     #[serde(default)]
     pub cached: bool,
+    /// Suggest field — a prefix-completion sidecar is built (KEYWORD/TEXT only). See
+    /// [`FieldMapping::suggest`].
+    #[serde(default)]
+    pub suggest: bool,
     /// Sensitive field — never cacheable. See [`FieldMapping::sensitive`].
     #[serde(default)]
     pub sensitive: bool,
@@ -2503,70 +2449,6 @@ mapping:
         .unwrap()
         .resolve(&docs_schema());
         assert!(matches!(not_fast, Err(DefError::WindowFieldNotFast(f)) if f == "count"));
-    }
-
-    #[test]
-    fn location_strategy_defaults_to_coordinates_and_round_trips() {
-        // Omitted → COORDINATES, no honest-scope warning.
-        let default_def = IndexDefinition::from_yaml(
-            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\n",
-        )
-        .unwrap();
-        assert_eq!(default_def.location_strategy, LocationStrategy::Coordinates);
-        let resolved = default_def.resolve(&docs_schema()).unwrap();
-        assert_eq!(resolved.location_strategy, LocationStrategy::Coordinates);
-        assert!(resolved.warnings.is_empty());
-
-        // Explicit PREDICATE parses, resolves through, and **round-trips** the wire
-        // form (the definition travels as YAML over both gRPC `definition_yaml` and
-        // the REST DTO, so serde round-trip *is* the wire round-trip).
-        let yaml = "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nlocation_strategy: PREDICATE\n";
-        let def = IndexDefinition::from_yaml(yaml).unwrap();
-        assert_eq!(def.location_strategy, LocationStrategy::Predicate);
-        let re = serde_norway::to_string(&def).unwrap();
-        let back = IndexDefinition::from_yaml(&re).unwrap();
-        assert_eq!(back, def, "definition round-trips through YAML");
-        assert_eq!(back.location_strategy, LocationStrategy::Predicate);
-    }
-
-    #[test]
-    fn predicate_strategy_resolves_with_an_honest_scope_warning() {
-        let resolved = IndexDefinition::from_yaml(
-            "name: docs\nsource: { iceberg: { catalog: g, table: g.docs } }\nlocation_strategy: PREDICATE\n",
-        )
-        .unwrap()
-        .resolve(&docs_schema())
-        .unwrap();
-        assert_eq!(resolved.location_strategy, LocationStrategy::Predicate);
-        assert!(
-            resolved
-                .warnings
-                .iter()
-                .any(|w| w.contains("PREDICATE") && w.contains("degrades to broad scans")),
-            "the honest-scope warning is emitted at resolve: {:?}",
-            resolved.warnings
-        );
-        // And it JSON round-trips on the resolved form (the registry's stored shape).
-        let json = serde_json::to_string(&resolved).unwrap();
-        let back: ResolvedIndex = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.location_strategy, LocationStrategy::Predicate);
-    }
-
-    #[test]
-    fn changing_location_strategy_requires_reindex() {
-        let base = "name: docs\nsource: { iceberg: { catalog: growlerdb, table: growlerdb.docs } }\nmapping: { selection: EXPLICIT, fields: [ { path: body, type: TEXT } ] }";
-        let coords = resolve_yaml(&format!("{base}\n"));
-        let pred = resolve_yaml(&format!("{base}\nlocation_strategy: PREDICATE\n"));
-        let plan = coords.alter_to(&pred);
-        assert!(plan.requires_reindex());
-        assert!(plan
-            .reindex_reasons
-            .iter()
-            .any(|r| r.contains("location_strategy")));
-        assert!(
-            !pred.alter_to(&pred).requires_reindex(),
-            "same strategy: no-op"
-        );
     }
 
     #[test]

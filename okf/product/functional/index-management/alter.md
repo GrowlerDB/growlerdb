@@ -9,14 +9,15 @@ timestamp: 2026-07-04T14:22:00
 # Alter index
 
 Evolve an existing index. `POST /v1/index:alter` **dry-runs a plan** or **applies** a definition
-change. A multi-shard index is applied by the [control plane](/system/runtime/components/control-plane.md)
-(the gateway forwards it); a single embedded node applies its own.
+change. Whenever a [control plane](/system/runtime/components/control-plane.md) is present the gateway
+forwards the alter to it — for pool-hosted and multi-shard indexes alike (a pool node can't durably change
+the registry) — and only a control-plane-less embedded node applies its own.
 
 - **In-place** — metadata-only changes apply without a rebuild: an index **rename**, a **`sensitive`**
   flip, and a **`max_bytes`** redeclaration. Nothing stored or indexed differs.
 - **Reindex-requiring** — everything else needs a rebuild: **adding or removing** a mapped field, any
   field **type/analyzer/`record`/`fieldnorms`/`fast`/`indexed`/`cached`/vector/variant** change, and
-  **key/`source`/`shard_count`/`location_strategy`** changes. A segment's Tantivy schema is fixed at
+  **key/`source`/`shard_count`** changes. A segment's Tantivy schema is fixed at
   build time, so these can't be applied to existing segments. (Adding new keys *within* a VARIANT field
   is not a definition change — those flatten in place, no reindex.)
 

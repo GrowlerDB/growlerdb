@@ -1,15 +1,8 @@
 # MinIO — S3-compatible object store for the Iceberg warehouse (the GrowlerDB chart's
 # iceberg.s3Endpoint defaults to http://minio:9000). Single replica on a PVC; dev credentials.
 # Port of the compose `minio` + `createbuckets` services. NOT hardened — for lab/test clusters.
-apiVersion: v1
-kind: Secret
-metadata:
-  name: minio-creds
-type: Opaque
-stringData:
-  rootUser: minioadmin
-  rootPassword: minioadmin
----
+# The `minio-creds` Secret is created by scale-up.sh from the S3 profile (deploy/k8s/s3-target.env)
+# so both the minio and hetzner profiles share one credential source; it is intentionally not here.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

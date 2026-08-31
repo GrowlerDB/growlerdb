@@ -2004,11 +2004,8 @@ impl Gateway {
         }))
     }
 
-    /// Reindex an index: rebuild from source and durably swap it live. Unlike the scatter-gather read
-    /// RPCs, reindex is a **write-fenced mutation** that must run on the single Node owning the shard.
-    /// Routed only for a **single-shard** gateway (the embedded `serve` the console fronts); a
-    /// distributed reindex needs per-shard orchestration we don't do yet → honest `Unimplemented`. The
-    /// owning Node still enforces the write-fence and single-flight guard.
+    /// Reindex an index: rebuild from source and durably swap it live (a write-fenced mutation). Routed to
+    /// the control plane's coordinated reindex when a CP is present, else a lone-shard direct reindex on the CP-less `serve`.
     pub async fn reindex_index(
         &self,
         mut req: Request<ReindexIndexRequest>,
@@ -2018,16 +2015,9 @@ impl Gateway {
             .guard_and_resolve("ReindexIndex", &index, &mut req)
             .await?;
         let rs = route.routing();
-        if rs.shards.len() != 1 {
-            // Multi-shard: forward to the control plane's coordinated reindex (build every shard's
-            // next generation, then cut over atomically). Needs a CP-backed resolver; a static
-            // multi-shard gateway (no CP) still can't orchestrate it.
-            let Some(cp) = self.resolver.as_ref().and_then(|r| r.control_plane()) else {
-                return Err(Status::unimplemented(format!(
-                    "reindex over a {}-shard gateway without a control plane is not supported",
-                    rs.shards.len()
-                )));
-            };
+        // Prefer the CP's coordinated reindex when a CP is present — required for a pool-hosted index (a
+        // lone pool node rejects a direct per-index reindex). The shard-direct path below is the CP-less `serve`.
+        if let Some(cp) = self.resolver.as_ref().and_then(|r| r.control_plane()) {
             let token = growlerdb_proto::service_token::service_token_from_env();
             let mut client = growlerdb_proto::service_token::connect(cp, None, token.as_deref())
                 .await
@@ -2045,13 +2035,19 @@ impl Gateway {
                 snapshot: resp.generation,
             }));
         }
+        if rs.shards.len() != 1 {
+            // No control plane and multiple shards: a static gateway can't orchestrate the per-shard
+            // build + atomic cutover.
+            return Err(Status::unimplemented(format!(
+                "reindex over a {}-shard gateway without a control plane is not supported",
+                rs.shards.len()
+            )));
+        }
         rs.shards[0].reindex_index(req).await
     }
 
-    /// Plan (and optionally `apply` in-place) an index-definition change: diff a candidate definition
-    /// vs the served one, reporting reindex-forcing vs in-place changes and, with `apply`, persisting
-    /// the in-place ones live. A write-targeted mutation like reindex, so single-shard only; a
-    /// multi-shard alter needs per-shard orchestration we don't do yet → honest `Unimplemented`.
+    /// Plan (or `apply`) an index-definition change: diff the candidate vs the served definition, reporting
+    /// reindex-forcing vs in-place changes. Routed like [`reindex_index`](Self::reindex_index) — CP-coordinated when present, else the lone-shard `serve`.
     pub async fn alter_index(
         &self,
         mut req: Request<AlterIndexRequest>,
@@ -2061,15 +2057,9 @@ impl Gateway {
             .guard_and_resolve("AlterIndex", &index, &mut req)
             .await?;
         let rs = route.routing();
-        if rs.shards.len() != 1 {
-            // Multi-shard: forward to the control plane's durable alter (update the definition; for a
-            // reindex-requiring change, reindex from it across all shards and cut over atomically).
-            let Some(cp) = self.resolver.as_ref().and_then(|r| r.control_plane()) else {
-                return Err(Status::unimplemented(format!(
-                    "alter over a {}-shard gateway without a control plane is not supported",
-                    rs.shards.len()
-                )));
-            };
+        // Prefer the CP's durable alter when a CP is present — required for a pool-hosted index (a pool
+        // node can't durably change the registry and rejects a direct alter). The path below is the CP-less `serve`.
+        if let Some(cp) = self.resolver.as_ref().and_then(|r| r.control_plane()) {
             let dto = req.into_inner();
             let token = growlerdb_proto::service_token::service_token_from_env();
             let mut client = growlerdb_proto::service_token::connect(cp, None, token.as_deref())
@@ -2096,6 +2086,14 @@ impl Gateway {
                 reindex_triggered: out.reindex_triggered,
                 generation: out.generation,
             }));
+        }
+        if rs.shards.len() != 1 {
+            // No control plane and multiple shards: a static gateway can't orchestrate the per-shard
+            // definition update + atomic cutover.
+            return Err(Status::unimplemented(format!(
+                "alter over a {}-shard gateway without a control plane is not supported",
+                rs.shards.len()
+            )));
         }
         rs.shards[0].alter_index(req).await
     }
@@ -3160,8 +3158,6 @@ mod tests {
                 f.insert("cat".to_string(), Value::from(*cat));
                 LocatedDoc {
                     doc: Document::new(key, f),
-                    iceberg_file: "f".into(),
-                    row_position: 0,
                 }
             })
             .collect();
@@ -3217,8 +3213,6 @@ mod tests {
                 f.insert("id".to_string(), Value::from(id.as_str()));
                 LocatedDoc {
                     doc: Document::new(key, f),
-                    iceberg_file: "f".into(),
-                    row_position: 0,
                 }
             })
             .collect();

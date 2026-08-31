@@ -406,11 +406,7 @@ mod tests {
             CompositeKey::new(vec![], vec![("id".into(), Value::from("doc-1"))]),
             fields,
         );
-        let located = LocatedDoc {
-            doc,
-            iceberg_file: "f".into(),
-            row_position: 0,
-        };
+        let located = LocatedDoc { doc };
         let mut batch =
             CommitBatch::from_upserts(vec![located], SourceCheckpoint::iceberg(1), "b1");
         assert!(!batch.ops.is_empty());

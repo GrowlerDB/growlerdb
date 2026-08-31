@@ -30,11 +30,7 @@ class ProtoStubsTest {
         Document.newBuilder().setKey(key).putFields("body", id).build();
     DocOp upsert =
         DocOp.newBuilder()
-            .setUpsert(
-                LocatedDoc.newBuilder()
-                    .setDoc(doc)
-                    .setIcebergFile("data/f0.parquet")
-                    .setRowPosition(0))
+            .setUpsert(LocatedDoc.newBuilder().setDoc(doc))
             .build();
     DocBatch batch =
         DocBatch.newBuilder()

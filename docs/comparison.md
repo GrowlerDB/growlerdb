@@ -44,6 +44,14 @@ aggregation, scripting, and ingest-pipeline surface. GrowlerDB's [OpenSearch `_s
 documented read-path subset and returns `501` on anything unsupported, so you never get a silent wrong
 answer.
 
+**Ingesting from Iceberg.** Both engines can index an Iceberg table, but by different paths. GrowlerDB's
+ingestion *is* a streaming **changelog connector** purpose-built for Iceberg: it follows the table's
+commit stream to keep the derived index in sync, with no second write path to operate. OpenSearch has no
+native Iceberg ingest — you either **dual-write** via `_bulk` (a separate pipeline to build and keep from
+drifting) or bridge the table through **Data Prepper's Iceberg CDC source, which is experimental and
+copy-on-write-only** and polls snapshots on an interval. So for data that already lives in Iceberg,
+GrowlerDB stays in sync natively where OpenSearch needs an extra, less-mature moving part.
+
 ## vs. Trino / Spark full-text on Iceberg
 
 You can already run `LIKE`/`regexp` or a full-text UDF over an Iceberg table with Trino or Spark. The
@@ -61,7 +69,7 @@ On the [directional benchmark](performance) (a small dev VM, not a formal at-sca
 ~50–170× faster than a Trino scan on filtered search, and the gap widens with data size because the
 index lookup stays flat while the scan grows. Both read the same Iceberg table. GrowlerDB doesn't replace your query engine; it adds the
 search access path the query engine lacks. (For authoritative full-row retrieval, GrowlerDB's
-locator-targeted hydration is still ~2× faster than a Trino `SELECT *`, because it reads only the
+hydration is still ~2× faster than a Trino `SELECT *`, because a sort-key-pruned key scan reads only the
 matching rows rather than scanning.)
 
 ## When GrowlerDB is a good fit
@@ -81,9 +89,8 @@ matching rows rather than scanning.)
   `_source` wins on raw latency there.
 - You need a write/ingest API into the search engine itself. GrowlerDB ingests from the Iceberg
   changelog, not a `_bulk` endpoint.
-- Your data isn't in a supported source. Apache Iceberg is supported today (Delta, CDC/Debezium and
-  Kafka are on the [roadmap](roadmap)); GrowlerDB's whole model is a derived index over an
-  authoritative source.
+- Your data isn't in Apache Iceberg. Iceberg is the supported source; GrowlerDB's whole model is a
+  derived index over an authoritative source.
 
 See [Migrating from Elasticsearch/OpenSearch](migration-from-elasticsearch) for the two integration
 paths (native API or the `_search` adapter) and a cutover checklist.

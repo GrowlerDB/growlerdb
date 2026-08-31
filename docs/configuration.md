@@ -61,6 +61,21 @@ Running the gateway without `--oidc-issuer` or `--builtin-auth` leaves it open (
 That is fine for local use and prints a warning at startup; set `GROWLERDB_REQUIRE_AUTH` to turn the
 warning into a hard startup failure.
 
+### Hydration read concurrency {#hydration-concurrency}
+
+Fetching full documents ([hydration](performance)) re-reads the matching rows from the object store. On
+the **index nodes** you can tune how much of that I/O runs concurrently to match your object store's
+per-request GET headroom. Set each on the node (`serve`) process.
+
+| Env var | Default | Effect |
+|---|---|---|
+| `GROWLERDB_HYDRATE_FILE_CONCURRENCY` | `8` | Data files read in parallel within one hydration key scan (across-file overlap). |
+| `GROWLERDB_ICEBERG_RANGE_FETCH_CONCURRENCY` | `4` | Concurrent byte-range (column-chunk) fetches within a single file read. |
+| `GROWLERDB_HYDRATE_MAX_INFLIGHT_READS` | `32` | Node-wide cap on concurrent object-store file reads across all in-flight hydrations, so a burst of top-K requests can't flood the store; excess reads queue for a slot. Keep it ≥ `GROWLERDB_HYDRATE_FILE_CONCURRENCY`. |
+
+The defaults suit a real cloud object store (S3/GCS); a single-pod store with limited concurrent-GET
+throughput may want lower values so a top-K burst doesn't overwhelm it.
+
 ### Scale limit & licensing {#scale-limit}
 
 The open-source tier runs up to 3 index nodes per deployment at no cost. Beyond that, the control
@@ -111,6 +126,26 @@ mapping:
 | `DATE` | Date or timestamp. Range, date-histogram, time pruning. |
 | `IP` | IP address, for CIDR/range match. Never auto-derived (declare it explicitly; it arrives as a string). |
 | `VECTOR` | Dense embedding for semantic or hybrid search. Never auto-derived: declare it with a `vector:` config, and the embedding is produced from a text `source_field` at ingest (see below). |
+
+### Field options {#field-options}
+
+Beyond `type`, each mapped field takes optional per-field knobs:
+
+| Option | Applies to | Default | Effect |
+|---|---|---|---|
+| `cached` | any | `false` | Store the value in-index and return it with the hit, so a page renders **without hydration**. Cache the display fields you serve hot. |
+| `fast` | scalar | `false` | Columnar **fast** field — sortable, filterable, and aggregatable in-index. |
+| `indexed` | scalar | per type | Whether the field gets an inverted index. TEXT/KEYWORD are always indexed; numeric/date/IP default to `!fast`. Set `indexed: true` with `fast: true` to keep both. |
+| `analyzer` | TEXT | built-in | Analyzer name for a TEXT field. |
+| `record` | TEXT | `POSITION` | How much the inverted index records: `BASIC` (doc ids), `FREQ` (+ term frequencies, full BM25), or `POSITION` (+ positions, phrase queries). Drop to `FREQ` on text never phrase-searched. |
+| `fieldnorms` | TEXT | `true` | Store per-doc field lengths (BM25 length-normalization). `false` drops ~1 byte/doc on pure filter/needle fields. |
+| `suggest` | KEYWORD / TEXT | `false` | Build a per-segment prefix-completion sidecar so [`/v1/suggest`](reference) answers whole-value typeahead from a precomputed top-K table instead of a live term-dictionary scan. Rebuilt on commit and compaction; ignored on other types. |
+
+```yaml
+    - { path: user_id, type: KEYWORD, suggest: true }   # fast prefix autocomplete on user_id
+    - { path: title,   type: TEXT,    cached: true }    # render the hit without hydration
+    - { path: ts,      format: epoch_ms, fast: true }   # sort / range / date-histogram
+```
 
 ### Vector fields (semantic search) {#vector-fields}
 

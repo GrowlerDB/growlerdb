@@ -407,8 +407,6 @@ mod tests {
     fn upsert(k: CompositeKey) -> DocOp {
         DocOp::Upsert(LocatedDoc {
             doc: Document::new(k, BTreeMap::new()),
-            iceberg_file: "f".into(),
-            row_position: 0,
         })
     }
 

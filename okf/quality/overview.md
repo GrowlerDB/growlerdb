@@ -16,9 +16,9 @@ quality exists.
 
 - **Exactly-once ingestion** — no committed-data loss (RPO = 0 for acknowledged writes) and no
   duplicates across restarts ([checkpoints](/product/functional/ingestion/checkpoints-exactly-once.md)).
-- **Crash consistency** — the durable Tantivy commit lands before the redb locator checkpoint, so a
+- **Crash consistency** — the durable Tantivy commit lands before the redb checkpoint, so a
   crash never leaves a half-committed or corrupt index
-  ([locators & segments](/system/storage/locators-segments.md)).
+  ([segments & aux store](/system/storage/locators-segments.md)).
 - **No silent under-count** — a true cross-shard `total`, an honest `partial` flag when a shard is
   down, and dedup on cross-shard merge.
 - **No stale/orphaned reads** — the source-lineage guard serves degraded on a recreated source rather

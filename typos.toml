@@ -31,3 +31,5 @@ Fo = "Fo"
 # scale workload has a `referer` field to match real access logs.
 referer = "referer"
 Referer = "Referer"
+# "caf" — a hex fragment of the git short-SHA image tag `dev-82e3caf` recorded in bench/scale/RUNLOG.md.
+caf = "caf"

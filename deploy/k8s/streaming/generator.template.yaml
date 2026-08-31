@@ -23,9 +23,11 @@ metadata:
   namespace: ${NAMESPACE}
   labels: { app: growlerdb-generator }
 spec:
-  # Parallelize ingest by running N generator pods: each pod's rows carry a unique `run` prefix
-  # (HOSTNAME + a random token, see corpus.py), so replicas produce DISJOINT ids with no collision —
-  # aggregate rows/s scales ~linearly with replicas. Rendered by `harness.py render --generators N`.
+  # Parallelize ingest by running N generator pods. corpus.py is SEEDED (byte-reproducible), so each
+  # pod derives a distinct BENCH_SEED from its HOSTNAME (see the container args) → replicas produce
+  # DISJOINT ids/data with no collision, and aggregate rows/s scales ~linearly. Reproducibility across
+  # a full run is via the archived artifact (bucket), not the seed alone — HOSTNAMEs vary per run.
+  # Rendered by `harness.py render --generators N`.
   replicas: ${GENERATORS}
   strategy: { type: Recreate }
   selector:
@@ -59,6 +61,15 @@ spec:
                   genmetrics.serve(int(os.environ.get("METRICS_PORT", "9109")))
               except Exception as e:  # never let telemetry stop ingest
                   print("genmetrics unavailable:", e, flush=True)
+              # Per-pod seed so parallel replicas produce DISJOINT rows. corpus.py reads BENCH_SEED at
+              # import, so without a distinct seed every replica emits identical ids/data. This is a
+              # Deployment (all pods share this spec) → derive the seed from the pod name (HOSTNAME).
+              # Must be set BEFORE `import corpus`. Set BENCH_SEED explicitly to pin one reproducible pod.
+              import hashlib
+              if not os.environ.get("BENCH_SEED"):
+                  os.environ["BENCH_SEED"] = str(int(
+                      hashlib.sha256(os.environ.get("HOSTNAME", "gen").encode()).hexdigest()[:12], 16))
+              print("BENCH_SEED", os.environ["BENCH_SEED"], "HOSTNAME", os.environ.get("HOSTNAME"), flush=True)
               import corpus
               corpus.stream(table=os.environ["TABLE"],
                             batch=int(os.environ["BATCH"]),
@@ -70,6 +81,6 @@ spec:
             - { name: POLARIS_URI, value: "http://polaris:8181/api/catalog" }
             - { name: POLARIS_CATALOG, value: "growlerdb" }
             - { name: POLARIS_CREDENTIAL, value: "root:s3cr3t" }
-            - { name: AWS_ENDPOINT_URL_S3, value: "http://minio:9000" }
-            - { name: AWS_ACCESS_KEY_ID, value: "minioadmin" }
-            - { name: AWS_SECRET_ACCESS_KEY, value: "minioadmin" }
+            - { name: AWS_ENDPOINT_URL_S3, value: "${S3_ENDPOINT}" }
+            - { name: AWS_ACCESS_KEY_ID, value: "${S3_ACCESS_KEY}" }
+            - { name: AWS_SECRET_ACCESS_KEY, value: "${S3_SECRET_KEY}" }

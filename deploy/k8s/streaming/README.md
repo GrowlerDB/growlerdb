@@ -113,14 +113,15 @@ compaction.
 ## Iceberg table maintenance
 
 The generator commits a tiny append every few seconds, so `growlerdb.docs` accumulates thousands of
-small data files + manifests — which slows **hydration** (search reads the authoritative rows from
-Iceberg via the index's row locators; many tiny files + fat metadata = slow planning/opens). A
+small data files + manifests — which slows **hydration** (search re-finds the authoritative rows in
+Iceberg by a pruned key scan; many tiny files + fat metadata = slow planning/opens). A
 **CronJob** runs the standard Iceberg maintenance via spark-sql against the Polaris catalog:
 `rewrite_data_files` (compaction — the hydration win), `rewrite_manifests`, and `expire_snapshots`.
 
-Safe for the index: a rewrite is a non-append snapshot the connector skips, and GrowlerDB self-heals
-stale row locators on hydration (`engine/hydrate.rs`) — no reindex needed. Retention (env on the
-CronJob) keeps the connector's recent resume snapshot: `EXPIRE_OLDER_THAN_HOURS`, `RETAIN_LAST`.
+Safe for the index: a rewrite is a non-append snapshot the connector skips, and hydration is
+store-less — it re-finds rows by a pruned key scan, so a rewrite needs no reindex. The sort order the
+compaction writes is what lets that scan skip row groups. Retention (env on the CronJob) keeps the
+connector's recent resume snapshot: `EXPIRE_OLDER_THAN_HOURS`, `RETAIN_LAST`.
 
 ```sh
 kubectl -n growlerdb apply -f deploy/k8s/streaming/maintenance.yaml   # hourly CronJob

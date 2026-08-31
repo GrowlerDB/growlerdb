@@ -1,0 +1,140 @@
+# OpenSearch cluster for the GrowlerDB-vs-OpenSearch comparison. Runs in the same `growlerdb`
+# namespace; Data Prepper (data-prepper.yaml) feeds it from the same Iceberg table via CDC. Security
+# plugin is DISABLED for the benchmark (plain HTTP, standard for OSB-style runs) — disclosed in the
+# report. See README.md for parity decisions. Pin the exact image version in the results write-up.
+apiVersion: v1
+kind: Service
+metadata: { name: opensearch-headless, namespace: growlerdb, labels: { app: opensearch } }
+spec:
+  clusterIP: None
+  # Publish not-ready pods so discovery (seed_hosts) can resolve peers BEFORE the cluster forms —
+  # otherwise pods never become Ready (need the cluster) and the cluster never forms (need Ready DNS).
+  publishNotReadyAddresses: true
+  selector: { app: opensearch }
+  ports: [{ name: http, port: 9200 }, { name: transport, port: 9300 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: opensearch, namespace: growlerdb, labels: { app: opensearch } }
+spec:
+  selector: { app: opensearch }
+  ports: [{ name: http, port: 9200, targetPort: 9200 }]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: opensearch-index-mapping, namespace: growlerdb }
+data:
+  # Parity mapping derived from bench/scale/workloads/http_logs/index.yaml. shards=6 matches
+  # GrowlerDB shard_count; replicas=0 matches GrowlerDB's single-primary run so the on-disk storage
+  # comparison is primary-vs-primary (both engines unreplicated — disclosed in the report);
+  # refresh_interval fixed at the 1s default; standard analyzer (no stemming) matches GrowlerDB's
+  # default lexical. request_id is the document _id (Data Prepper identifier_columns), not a mapped
+  # field. user_id_suggest is the dedicated completion FST mirroring GrowlerDB's suggest path.
+  http_logs.json: |
+    {
+      "settings": {
+        "index": {
+          "number_of_shards": 6,
+          "number_of_replicas": 0,
+          "refresh_interval": "1s"
+        }
+      },
+      "mappings": {
+        "properties": {
+          "trace_id":         { "type": "keyword" },
+          "ts":               { "type": "long" },
+          "method":           { "type": "keyword" },
+          "status":           { "type": "keyword" },
+          "path":             { "type": "text", "analyzer": "standard" },
+          "user_agent":       { "type": "text", "analyzer": "standard" },
+          "referer":          { "type": "text", "analyzer": "standard", "index_options": "freqs" },
+          "client_ip":        { "type": "ip" },
+          "user_id":          { "type": "keyword", "copy_to": ["user_id_suggest"] },
+          "region":           { "type": "keyword" },
+          "response_time_ms": { "type": "long" },
+          "response_size":    { "type": "long" },
+          "user_id_suggest":  { "type": "completion", "analyzer": "keyword", "search_analyzer": "keyword" }
+        }
+      }
+    }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: opensearch, namespace: growlerdb, labels: { app: opensearch } }
+spec:
+  serviceName: opensearch-headless
+  replicas: 3 # scale profile; override to 1 for the Compose/small smoke run
+  # Parallel: all masters start together so cluster_manager election completes. With the default
+  # OrderedReady, pod-0 never becomes Ready (needs pods 1/2 to form the cluster) → they never start.
+  podManagementPolicy: Parallel
+  selector: { matchLabels: { app: opensearch } }
+  template:
+    metadata: { labels: { app: opensearch } }
+    spec:
+      # OpenSearch requires an elevated mmap count; set it on the node before the main container.
+      initContainers:
+        - name: sysctl
+          image: busybox:1.36
+          command: ["sh", "-c", "sysctl -w vm.max_map_count=262144"]
+          securityContext: { privileged: true }
+      containers:
+        - name: opensearch
+          image: opensearchproject/opensearch:2.19.1
+          env:
+            - { name: cluster.name, value: gdb-comparison }
+            - { name: node.name, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+            - { name: discovery.seed_hosts, value: opensearch-headless }
+            - { name: cluster.initial_cluster_manager_nodes, value: "opensearch-0,opensearch-1,opensearch-2" }
+            - { name: DISABLE_SECURITY_PLUGIN, value: "true" }
+            # Heap = ~half of the memory limit. Sized for the scale profile; lower for smoke.
+            - { name: OPENSEARCH_JAVA_OPTS, value: "-Xms24g -Xmx24g" }
+          ports: [{ containerPort: 9200 }, { containerPort: 9300 }]
+          resources:
+            requests: { cpu: "12", memory: 48Gi }
+            limits: { cpu: "15", memory: 56Gi }
+          volumeMounts: [{ name: data, mountPath: /usr/share/opensearch/data }]
+          readinessProbe:
+            httpGet: { path: /_cluster/health, port: 9200 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: local-path # k3s default → node-local NVMe
+        resources: { requests: { storage: 200Gi } }
+---
+apiVersion: batch/v1
+kind: Job
+metadata: { name: opensearch-index-setup, namespace: growlerdb }
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: setup
+          image: curlimages/curl:8.11.1
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              until curl -sf "http://opensearch:9200/_cluster/health?wait_for_status=yellow&timeout=5s"; do
+                echo "waiting for opensearch..."; sleep 5
+              done
+              # Create an INDEX TEMPLATE, not the index directly: the parity mapping must apply no
+              # matter who creates `http_logs` first — the setup Job or Data Prepper's sink. Creating
+              # the index directly loses that race (Data Prepper auto-creates it with a DYNAMIC mapping
+              # → status=text not keyword, client_ip=text not ip, no completion field). A template wins
+              # regardless of creator. Idempotent.
+              if curl -sf -o /dev/null "http://opensearch:9200/_index_template/http_logs"; then
+                echo "index template http_logs already exists"; exit 0
+              fi
+              BODY=$(printf '{"index_patterns":["http_logs"],"template":%s}' "$(cat /mapping/http_logs.json)")
+              curl -sf -X PUT "http://opensearch:9200/_index_template/http_logs" \
+                -H 'content-type: application/json' -d "$BODY"
+              echo "created index template http_logs"
+          volumeMounts: [{ name: mapping, mountPath: /mapping }]
+      volumes:
+        - { name: mapping, configMap: { name: opensearch-index-mapping } }

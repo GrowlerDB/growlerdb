@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+"""Neutral open-loop multi-engine query driver: fires the SAME query set (queries.comparison.json) at
+each engine over an identical HTTP path (open-loop, so a slow server shows as latency, not hidden by
+coordinated omission). Two disclosed asymmetries (retrieval, autocomplete) are routed explicitly in
+request_for. See bench/scale/comparison-plan.md."""
+
+import argparse
+import concurrent.futures
+import copy
+import json
+import os
+import sys
+import time
+import urllib.request
+from collections import defaultdict
+from pathlib import Path
+
+from harness import Workload, _percentiles  # reuse workload loading + percentile helper
+
+GROWLERDB_OS_URL = os.environ.get("GROWLERDB_OS_URL", "http://localhost:8081")
+OPENSEARCH_URL = os.environ.get("OPENSEARCH_URL", "http://localhost:9200")
+GROWLERDB_TOKEN = os.environ.get("GROWLERDB_TOKEN", "")
+# Per-request ceiling: a slower query counts as a timeout error, not an open-ended wait — a
+# pathologically slow engine must yield high-latency numbers, never hang the sweep on a backlog.
+REQUEST_TIMEOUT_S = float(os.environ.get("REQUEST_TIMEOUT_S", "30"))
+
+# Lexical kinds share the OpenSearch _search body verbatim across engines.
+LEXICAL_KINDS = {"count", "term", "range", "match", "phrase", "boolean", "ip_cidr", "retrieval"}
+
+# Query groups for pass isolation. `retrieval` (topk, size>0) hydrates from the object store and can
+# take seconds under load; run in its OWN pool/pass so it can't starve the index-only types sharing a
+# single executor queue (the shared-pool contamination — see comparison-plan §Contamination). `mixed`
+# keeps every type in one pool: the realistic-throughput number, read as throughput not per-type latency.
+GROUPS = ("index", "topk", "mixed")
+
+
+def _group_of(q):
+    """`topk` = hydrated retrieval (the object-store path); everything else is index-only (`index`)."""
+    return "topk" if q.get("kind") == "retrieval" else "index"
+
+
+def _plan_for_group(queries, group):
+    """Weighted plan for one group: `mixed` = all, else only that group's queries (empty if none)."""
+    picked = queries if group == "mixed" else [q for q in queries if _group_of(q) == group]
+    return _weighted_plan(picked)
+
+
+def _engines(names):
+    reg = {
+        "growlerdb": {"base": GROWLERDB_OS_URL, "token": GROWLERDB_TOKEN, "suggest": "native"},
+        "opensearch": {"base": OPENSEARCH_URL, "token": "", "suggest": "completion"},
+    }
+    return {n: reg[n] for n in names}
+
+
+def request_for(engine, cfg, index, q):
+    """(url, body) for this engine+query — the single source of the two disclosed asymmetries
+    (retrieval, autocomplete); keep them here, not scattered."""
+    kind = q.get("kind", "count")
+    if kind in LEXICAL_KINDS:
+        return f"{cfg['base']}/{index}/_search", q["body"]
+    if kind == "autocomplete":
+        if cfg["suggest"] == "native":  # GrowlerDB: native term-dict scan, index carried in the body
+            return f"{cfg['base']}/v1/suggest", q["growlerdb_suggest"]
+        return f"{cfg['base']}/{index}/_search", q["opensearch_suggest"]  # OpenSearch completion FST
+    raise SystemExit(f"query '{q.get('name')}': unknown kind '{kind}'")
+
+
+def _post(url, body, token):
+    headers = {"content-type": "application/json"}
+    if token:
+        headers["authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST", headers=headers)
+    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S) as resp:
+        resp.read()  # drain; we time the round-trip, not parse cost
+
+
+def _weighted_plan(queries):
+    plan = []
+    for q in queries:
+        plan.extend([q] * int(q.get("weight", 1)))
+    return plan
+
+
+def _post_json(url, body, token):
+    headers = {"content-type": "application/json"}
+    if token:
+        headers["authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST", headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _resolve_value(cfg, index, field):
+    """Fetch a live value for `field` via the shared _search path (seeds vary per pod, so it can't be
+    hardcoded). Returns None if unreadable; the caller then skips that query for this engine."""
+    body = {"size": 1, "_source": [field], "query": {"match_all": {}}}
+    try:
+        payload = _post_json(f"{cfg['base']}/{index}/_search", body, cfg["token"])
+    except Exception:  # noqa: BLE001
+        return None
+    hits = (payload.get("hits") or {}).get("hits") or []
+    if not hits:
+        return None
+    for container in ("_source", "fields"):  # OpenSearch returns _source; tolerate a fields shape too
+        d = hits[0].get(container) or {}
+        if field in d:
+            v = d[field]
+            return v[0] if isinstance(v, list) else v
+    return None
+
+
+def _resolve_queries(engine, cfg, index, queries):
+    """Per-engine copy of the query set with any `resolve` placeholder (`term.F`) filled from a live
+    value fetched off the engine (e.g. point-lookup on trace_id); the run is sequential, so each resolves its own."""
+    out = []
+    for q in queries:
+        r = q.get("resolve")
+        if not r:
+            out.append(q)
+            continue
+        val = _resolve_value(cfg, index, r["field"])
+        if val is None:
+            print(f"  ! {engine}: could not resolve '{r['field']}' for '{q['name']}' — skipping it",
+                  file=sys.stderr)
+            continue
+        qc = copy.deepcopy(q)
+        qc["body"]["query"]["term"][r["field"]] = val
+        out.append(qc)
+    return out
+
+
+def run_open_loop(engine, cfg, index, plan, target_qps, duration, max_workers):
+    """Issue requests at a fixed `target_qps` schedule (open loop) for `duration` seconds."""
+    stats = defaultdict(lambda: {"latency": [], "service": [], "errors": 0, "kind": None})
+    interval = 1.0 / target_qps
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    futures = []
+
+    def one(q, scheduled):
+        url, body = request_for(engine, cfg, index, q)
+        send = time.perf_counter()
+        try:
+            _post(url, body, cfg["token"])
+            recv = time.perf_counter()
+            return q["name"], q.get("kind"), (recv - scheduled) * 1e3, (recv - send) * 1e3, False
+        except Exception as e:  # noqa: BLE001 — record the failure, keep the schedule going
+            recv = time.perf_counter()
+            print(f"  ! {engine} {q['name']}: {e}", file=sys.stderr)
+            return q["name"], q.get("kind"), (recv - scheduled) * 1e3, (recv - send) * 1e3, True
+
+    start = time.perf_counter()
+    end = start + duration
+    next_t = start
+    i = 0
+    while time.perf_counter() < end:
+        now = time.perf_counter()
+        if next_t > now:
+            time.sleep(next_t - now)
+        q = plan[i % len(plan)]
+        i += 1
+        futures.append(ex.submit(one, q, next_t))
+        next_t += interval
+
+    # Bounded drain: after the arrival window wait at most one request-timeout for in-flight requests,
+    # then cancel the rest as dropped — caps a level at duration + REQUEST_TIMEOUT_S, not a full backlog.
+    pending = set(futures)
+    dropped = 0
+    try:
+        for fut in concurrent.futures.as_completed(futures, timeout=REQUEST_TIMEOUT_S + 5):
+            pending.discard(fut)
+            name, kind, latency, service, err = fut.result()
+            s = stats[name]
+            s["kind"] = kind
+            s["latency"].append(latency)
+            s["service"].append(service)
+            if err:
+                s["errors"] += 1
+    except concurrent.futures.TimeoutError:
+        dropped = len(pending)
+        print(f"  ! {engine} @ {target_qps} qps: {dropped} request(s) unresolved within "
+              f"{REQUEST_TIMEOUT_S + 5:.0f}s — cancelled (engine can't keep up)", file=sys.stderr)
+    ex.shutdown(wait=False, cancel_futures=True)
+    elapsed = time.perf_counter() - start
+
+    per_query = {}
+    for name, s in stats.items():
+        per_query[name] = {
+            "kind": s["kind"], "count": len(s["latency"]), "errors": s["errors"],
+            "latency_ms": _percentiles(s["latency"]),
+            "service_ms": _percentiles(s["service"]),
+        }
+    all_lat = [x for s in stats.values() for x in s["latency"]]
+    return {
+        "engine": engine, "target_qps": target_qps,
+        "achieved_qps": round(len(all_lat) / elapsed, 1) if elapsed else 0.0,
+        "duration_s": round(elapsed, 1),
+        "dropped": dropped,  # scheduled requests cancelled unresolved (engine couldn't keep up)
+        "overall_latency_ms": _percentiles(all_lat),
+        "per_query": per_query,
+    }
+
+
+def run_sweep(engine, cfg, index, plan, rates, duration, max_workers):
+    rounds = []
+    for r in rates:
+        print(f"  sweep {engine} @ {r} qps ...", file=sys.stderr)
+        res = run_open_loop(engine, cfg, index, plan, r, duration, max_workers)
+        o = res["overall_latency_ms"]
+        rounds.append({"target_qps": r, "achieved_qps": res["achieved_qps"],
+                       "p50": o["p50"], "p99": o["p99"]})
+    return rounds
+
+
+def _run_passes(name, cfg, index, queries, args):
+    """The pass matrix for one engine: each requested group (its own executor → no cross-group pool
+    contamination), at low concurrency (`--low-qps`, if set) and under load (`--qps` + `--sweep`). At-rest
+    and under-load are thus captured in the same run, symmetric for both engines."""
+    groups = [g.strip() for g in args.groups.split(",") if g.strip()]
+    rates = [int(x) for x in args.sweep.split(",")] if args.sweep else []
+    passes = []
+    for group in groups:
+        plan = _plan_for_group(queries, group)
+        if not plan:
+            print(f"  ! {name}: group '{group}' has no queries — skipping", file=sys.stderr)
+            continue
+        if args.low_qps > 0:  # at-rest pass: low arrival rate, no sweep
+            print(f"  {name} [{group}] low-conc @ {args.low_qps} qps ...", file=sys.stderr)
+            p = run_open_loop(name, cfg, index, plan, args.low_qps, args.low_duration, args.max_workers)
+            p.update(group=group, load="low")
+            passes.append(p)
+        print(f"  {name} [{group}] under-load @ {args.qps} qps ...", file=sys.stderr)
+        p = run_open_loop(name, cfg, index, plan, args.qps, args.duration, args.max_workers)
+        p.update(group=group, load="high")
+        if rates:
+            p["sweep"] = run_sweep(name, cfg, index, plan, rates, args.sweep_duration, args.max_workers)
+        passes.append(p)
+    return passes
+
+
+def cmd_run(args):
+    wl = Workload(args.workload)
+    # This driver runs the COMPARISON query set, not the default queries.json.
+    qfile = wl.dir / "queries.comparison.json"
+    queries = json.loads(qfile.read_text())
+    engines = _engines(args.engines.split(","))
+    index = wl.index_name
+
+    report = {
+        "workload": wl.name, "index": index,
+        "config": {"max_workers": args.max_workers, "groups": args.groups,
+                   "low_qps": args.low_qps, "high_qps": args.qps, "sweep": args.sweep},
+        "engines": {},
+    }
+    for name, cfg in engines.items():
+        print(f"== {name} ({cfg['base']}) ==", file=sys.stderr)
+        # Fill any `resolve` placeholder (e.g. point_lookup_trace_id) from a live value on this engine.
+        resolved = _resolve_queries(name, cfg, index, queries)
+        report["engines"][name] = {"passes": _run_passes(name, cfg, index, resolved, args)}
+
+    Path(args.out).write_text(json.dumps(report, indent=2))
+    _print(report)
+    print(f"\nwrote {args.out}")
+
+
+def _print(r):
+    for name, e in r["engines"].items():
+        for p in e["passes"]:
+            print(f"\n== {name} [{p['group']}/{p['load']}] @ {p['achieved_qps']}/{p['target_qps']} qps "
+                  f"(overall p50 {p['overall_latency_ms']['p50']:.1f} / p99 {p['overall_latency_ms']['p99']:.1f} ms; "
+                  f"dropped {p['dropped']}) ==")
+            print(f"{'query':24}{'kind':12}{'n':>6}{'err':>5}{'lat_p50':>9}{'lat_p99':>9}{'svc_p50':>9}{'svc_p99':>9}")
+            for qn, s in p["per_query"].items():
+                print(f"{qn:24}{(s['kind'] or ''):12}{s['count']:>6}{s['errors']:>5}"
+                      f"{s['latency_ms']['p50']:>9.1f}{s['latency_ms']['p99']:>9.1f}"
+                      f"{s['service_ms']['p50']:>9.1f}{s['service_ms']['p99']:>9.1f}")
+            if "sweep" in p:
+                print("  sweep (target->achieved qps : p50/p99 ms):")
+                for row in p["sweep"]:
+                    print(f"    {row['target_qps']:>6} -> {row['achieved_qps']:>7} : "
+                          f"{row['p50']:.1f}/{row['p99']:.1f}")
+
+
+def cmd_selfcheck(args):
+    """No network: prove plan-building + per-engine request routing for every kind."""
+    wl = Workload(args.workload)
+    queries = json.loads((wl.dir / "queries.comparison.json").read_text())
+    plan = _weighted_plan(queries)
+    print(f"workload {wl.name}: {len(queries)} queries -> plan of {len(plan)} weighted entries")
+    fails = []
+    for name, cfg in _engines(["growlerdb", "opensearch"]).items():
+        for q in queries:
+            try:
+                url, body = request_for(name, cfg, wl.index_name, q)
+                assert url.startswith("http") and isinstance(body, dict)
+            except Exception as e:  # noqa: BLE001
+                fails.append(f"{name}/{q.get('name')}: {e}")
+        # spot-check the autocomplete asymmetry resolves to different endpoints
+    ac = [q for q in queries if q.get("kind") == "autocomplete"]
+    if ac:
+        g = request_for("growlerdb", _engines(["growlerdb"])["growlerdb"], wl.index_name, ac[0])[0]
+        o = request_for("opensearch", _engines(["opensearch"])["opensearch"], wl.index_name, ac[0])[0]
+        assert g.endswith("/v1/suggest") and o.endswith("/_search"), "autocomplete routing wrong"
+        print(f"autocomplete routing OK: growlerdb={g.rsplit('/',1)[1]} opensearch=_search")
+    # resolve queries: correct placeholder shape + drop-on-unresolvable (no network needed)
+    for q in queries:
+        r = q.get("resolve")
+        if not r:
+            continue
+        field = r["field"]
+        if field not in q.get("body", {}).get("query", {}).get("term", {}):
+            fails.append(f"{q['name']}: resolve field '{field}' is not a term in body")
+    resolvers = [q for q in queries if q.get("resolve")]
+    if resolvers:
+        dropped = _resolve_queries("x", {"base": "http://127.0.0.1:0", "token": ""}, wl.index_name, resolvers)
+        if dropped:
+            fails.append("unresolvable resolve-queries should be dropped, got " + str(len(dropped)))
+        else:
+            print(f"resolve OK: {len(resolvers)} live-resolved queries "
+                  f"({', '.join(q['name'] for q in resolvers)}); drop-on-unreachable works")
+    kinds = sorted({q.get("kind") for q in queries})
+    print(f"kinds covered: {kinds}")
+    # Group partitioning: topk = exactly the retrieval queries, index = the rest, mixed = all, and
+    # index+topk exactly repartition mixed (no query lost or double-counted).
+    idx, topk, mixed = (_plan_for_group(queries, g) for g in ("index", "topk", "mixed"))
+    if any(_group_of(q) != "topk" for q in topk):
+        fails.append("topk group must contain only retrieval queries")
+    if any(_group_of(q) != "index" for q in idx):
+        fails.append("index group must exclude retrieval queries")
+    if len(idx) + len(topk) != len(mixed):
+        fails.append(f"index+topk ({len(idx)}+{len(topk)}) must repartition mixed ({len(mixed)})")
+    if not topk:
+        fails.append("topk group is empty — no retrieval query to isolate")
+    print(f"groups OK: index={len(idx)} topk={len(topk)} mixed={len(mixed)} weighted entries")
+    if fails:
+        print("FAIL:")
+        for f in fails:
+            print("  -", f)
+        sys.exit(1)
+    print("self-check OK")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Neutral open-loop multi-engine query driver")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("run", help="run the comparison query set against each engine")
+    p.add_argument("workload")
+    p.add_argument("--engines", default="growlerdb,opensearch")
+    p.add_argument("--qps", type=int, default=100, help="open-loop target arrival rate (under-load pass)")
+    p.add_argument("--duration", type=int, default=60)
+    p.add_argument("--groups", default="mixed",
+                   help="comma list of query groups to run as isolated passes (own pool each): "
+                        f"{', '.join(GROUPS)}. `index`+`topk` separates the hydrated top-k so it can't "
+                        "starve index-only; `mixed` is the realistic-throughput pass.")
+    p.add_argument("--low-qps", type=int, default=0, dest="low_qps",
+                   help="if >0, also run each group at this low arrival rate (at-rest pass), e.g. 10")
+    p.add_argument("--low-duration", type=int, default=30, dest="low_duration",
+                   help="duration of the low-concurrency at-rest pass")
+    p.add_argument("--max-workers", type=int, default=64, dest="max_workers",
+                   help="client concurrency ceiling; 512 bursts overwhelm an unguarded server (500/429)")
+    p.add_argument("--sweep", default="", help="comma QPS list for a saturation sweep, e.g. 50,100,200,400,800")
+    p.add_argument("--sweep-duration", type=int, default=20, dest="sweep_duration")
+    p.add_argument("--out", default="comparison-report.json")
+    p.set_defaults(fn=cmd_run)
+    p = sub.add_parser("self-check", help="no-network logic check (routing for every kind)")
+    p.add_argument("workload")
+    p.set_defaults(fn=cmd_selfcheck)
+    args = ap.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()

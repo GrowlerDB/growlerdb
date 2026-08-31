@@ -423,14 +423,6 @@ enum Command {
         /// disables. Ignored for `--replica` (a replica must not compact). Default 60.
         #[arg(long, default_value_t = 60)]
         compact_interval_secs: u64,
-        /// Seconds between **compaction re-map** polls: the node watches
-        /// the source table's live data-file set; when Iceberg compaction rewrites files away, it
-        /// marks them dead and re-points the affected locators at the new files in the background
-        /// — so hydration doesn't pay a per-read refresh after every source compaction. `0`
-        /// disables (the lazy verify-and-refresh path still heals). Ignored for `--replica` (it
-        /// pulls the primary's already-healed locators). Default 45.
-        #[arg(long, default_value_t = 45)]
-        remap_interval_secs: u64,
         /// Shared service token closing this Node's **data-plane gRPC**
         /// (Write/Search/Lookup/Suggest/Admin/System) to callers that don't present it. In
         /// distributed mode a Node carries no per-user auth of its own (authn/RBAC/tenant live at
@@ -1130,7 +1122,6 @@ pub async fn run() -> anyhow::Result<()> {
             replica_prefix,
             replica_refresh_secs,
             compact_interval_secs,
-            remap_interval_secs,
             service_token,
             tls,
         } => {
@@ -1163,7 +1154,6 @@ pub async fn run() -> anyhow::Result<()> {
                     shards,
                     shard_ordinal,
                     compact_interval_secs,
-                    remap_interval_secs,
                     service_token,
                 })
                 .await?;
@@ -1354,7 +1344,6 @@ fn spawn_auto_compaction(handle: growlerdb_engine::ShardHandle, label: String, i
             growlerdb_telemetry::sli::index_bytes_component(&label, "fieldnorms", bd.fieldnorms);
             growlerdb_telemetry::sli::index_bytes_component(&label, "fast", bd.fast);
             growlerdb_telemetry::sli::index_bytes_component(&label, "store", bd.store);
-            growlerdb_telemetry::sli::index_bytes_component(&label, "locator", bd.locator);
             growlerdb_telemetry::sli::index_bytes_component(&label, "other", bd.other);
             growlerdb_telemetry::sli::background_success("compaction");
             if let Some(reason) = policy.reason_to_compact(&health) {
@@ -1380,121 +1369,6 @@ fn spawn_auto_compaction(handle: growlerdb_engine::ShardHandle, label: String, i
             }
         }
     });
-}
-
-/// Spawn the background **compaction re-map** loop (`coordinates` location
-/// strategy) for the index's hot shard(s): each tick it polls the source table's current plan
-/// (one catalog call; manifest reads only when the snapshot advanced — the reader's
-/// snapshot-pinned plan cache) and diffs the live data-file set against the shards' interned
-/// files. When Iceberg compaction rewrote files away, the disappeared files are marked **dead**
-/// (hydration then skips their doomed point reads — the live-file bitmap) and the affected
-/// location slots are re-pointed at the rewritten rows' new `(file, position)` in the
-/// background — so locator staleness is a bounded background cost, not a per-hydration refresh
-/// tax. It never blocks hydration or ingest (the shard takes the writer lock only per patch
-/// chunk); interleaving safety is argued in [`growlerdb_engine::remap`]. `interval_secs == 0`
-/// disables (spawns nothing; the lazy verify-and-refresh path still heals). A windowed index
-/// passes every hot window's handle: one poll + one key scan serves them all (each window skips
-/// the keys it doesn't hold). Never called for a replica (it pulls the primary's healed
-/// locators) — and a cold window's shard has no writer but is single-writer by construction, so
-/// hot handles only. A **`PREDICATE`** index spawns nothing: it stores no
-/// location data, so source compaction leaves nothing to re-map or mark dead.
-fn spawn_locator_remap(
-    handles: Vec<growlerdb_engine::ShardHandle>,
-    label: String,
-    table: String,
-    partition_fields: Vec<String>,
-    identifier_fields: Vec<String>,
-    interval_secs: u64,
-) {
-    if interval_secs == 0 || handles.is_empty() {
-        return;
-    }
-    // Every shard shares one location strategy (an index-definition option) — first handle speaks
-    // for all.
-    if handles[0].current().location_strategy() == growlerdb_core::LocationStrategy::Predicate {
-        println!(
-            "remap `{label}`: not needed — PREDICATE location strategy (store-less; \
-             hydration re-finds rows by pruned key scan)"
-        );
-        return;
-    }
-    // Released iceberg-rust can't parse variant-table metadata (D49), so the poller would fail
-    // every tick. Skip once and loudly (D45); variant locators refresh lazily on hydration.
-    if handles[0].current().has_variant_fields() {
-        println!(
-            "remap `{label}`: skipped — variant table (iceberg-rust can't plan a v3 variant \
-             schema, D49); locators refresh lazily on hydration via the Trino lane"
-        );
-        return;
-    }
-    tokio::spawn(async move {
-        // Own shared reader: lazily connected, invalidated on failure so the next tick
-        // reconnects (and its plan cache makes the steady-state poll one REST call).
-        let reader = growlerdb_source::SharedReader::new(IcebergConfig::from_env());
-        let mut state = growlerdb_engine::RemapState::default();
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-        tick.tick().await; // skip the immediate first tick
-        loop {
-            tick.tick().await;
-            // Pin the current shard(s) per tick (a reindex swap is respected next tick). Skip
-            // read-only parked windows — served read-through, no locators to patch.
-            let shards: Vec<std::sync::Arc<growlerdb_index::Shard>> = handles
-                .iter()
-                .map(|h| h.current())
-                .filter(|s| !s.is_read_only())
-                .collect();
-            let connected = match reader.get().await {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("remap `{label}`: catalog connect failed ({e})");
-                    growlerdb_telemetry::sli::background_failure("locator-remap");
-                    continue;
-                }
-            };
-            match growlerdb_engine::remap_tick(
-                &connected,
-                &table,
-                (&partition_fields, &identifier_fields),
-                &shards,
-                &mut state,
-            )
-            .await
-            {
-                Ok(Some(o)) => {
-                    eprintln!(
-                        "remap `{label}`: snapshot {} rewrote {} interned file(s) — {} row(s) \
-                         re-mapped from {} added file(s) ({} skipped no-live-doc, {} already \
-                         re-pointed, {} delete-bearing file(s) left to lazy refresh)",
-                        o.snapshot_id,
-                        o.files_marked_dead,
-                        o.stats.remapped,
-                        o.files_scanned,
-                        o.stats.skipped_no_live_doc,
-                        o.stats.skipped_already_live,
-                        o.files_skipped_deletes,
-                    );
-                    growlerdb_telemetry::sli::locator_remap(&label, o.stats.remapped);
-                    emit_dead_files(&label, &shards);
-                    growlerdb_telemetry::sli::background_success("locator-remap");
-                }
-                Ok(None) => {
-                    emit_dead_files(&label, &shards);
-                    growlerdb_telemetry::sli::background_success("locator-remap");
-                }
-                Err(e) => {
-                    eprintln!("remap `{label}`: poll failed ({e})");
-                    // Drop the possibly-dead catalog client; the next tick reconnects.
-                    reader.invalidate().await;
-                    growlerdb_telemetry::sli::background_failure("locator-remap");
-                }
-            }
-        }
-    });
-
-    fn emit_dead_files(label: &str, shards: &[std::sync::Arc<growlerdb_index::Shard>]) {
-        let dead: u64 = shards.iter().map(|s| s.dead_file_count()).sum();
-        growlerdb_telemetry::sli::locator_dead_files(label, dead);
-    }
 }
 
 /// Background **pre-warm** loop for one cold window. Samples the window's **search** counter
@@ -1828,7 +1702,6 @@ struct ServeConfig<'a> {
     shards: u32,
     shard_ordinal: u32,
     compact_interval_secs: u64,
-    remap_interval_secs: u64,
     service_token: Option<String>,
 }
 
@@ -1892,7 +1765,6 @@ async fn serve(cfg: ServeConfig<'_>) -> anyhow::Result<()> {
         shards,
         shard_ordinal,
         compact_interval_secs,
-        remap_interval_secs,
         service_token,
         data_dir: _,
     } = cfg;
@@ -1999,17 +1871,6 @@ async fn serve(cfg: ServeConfig<'_>) -> anyhow::Result<()> {
     // Health-driven auto-compaction so segments don't accumulate under steady ingest. Only this
     // primary path compacts — a `--replica` must never compact or it diverges from pulled segments.
     spawn_auto_compaction(handle.clone(), index.to_string(), compact_interval_secs);
-
-    // Heal locators in bulk when Iceberg compaction rewrites the source's data files, instead of a
-    // per-hydration refresh tax.
-    spawn_locator_remap(
-        vec![handle.clone()],
-        index.to_string(),
-        table.clone(),
-        resolved.key.partition_fields.clone(),
-        resolved.key.identifier_fields.clone(),
-        remap_interval_secs,
-    );
 
     // Optional Engine API over REST/JSON on a second listener: routes through the Gateway → an
     // in-process LocalNode, so embedded mode collapses Gateway + Node into one process, no hop.
@@ -2361,7 +2222,6 @@ async fn serve_windowed(
         register,
         advertise_addr,
         compact_interval_secs,
-        remap_interval_secs,
         service_token,
         ..
     } = cfg;
@@ -2606,17 +2466,6 @@ async fn serve_windowed(
         Arc::new(std::sync::RwLock::new(windowed_lookup));
     let admin_windows: growlerdb_engine::SharedAdminWindows =
         Arc::new(std::sync::RwLock::new(windowed_admin));
-
-    // Compaction re-map across the HOT windows: one poll + one key scan serves every window (each
-    // skips keys it doesn't hold). Cold read-through windows keep the lazy refresh path.
-    spawn_locator_remap(
-        hot_handles.iter().map(|(_, h)| h.clone()).collect(),
-        index.to_string(),
-        table.clone(),
-        resolved.key.partition_fields.clone(),
-        resolved.key.identifier_fields.clone(),
-        remap_interval_secs,
-    );
 
     // Each HOT window gets its own health-driven compaction loop (the current window accumulates
     // segments under steady ingest). Cold read-through windows have no writer and are skipped.
@@ -2869,7 +2718,19 @@ async fn open_pool_hash_index(
                         resolved.clone(),
                     ),
                 );
-                admin_o.insert(key, AdminService::new(handle.clone(), &index_s));
+                // Source access so the primary can rebuild this ordinal on a coordinated reindex/alter
+                // (mirrors `serve` + windowed-hot; a replica serves via the source-less replicate path).
+                admin_o.insert(
+                    key,
+                    AdminService::new(handle.clone(), &index_s).with_source(
+                        resolved.clone(),
+                        store.clone(),
+                        ShardId::shard(&index_s, o),
+                        IcebergConfig::from_env(),
+                        table.clone(),
+                        growlerdb_engine::ReindexFence::new(),
+                    ),
+                );
                 write_o.insert(
                     key,
                     WriteService::new(handle.clone(), index_s.clone(), POOL_HASH_MAX_INFLIGHT)
@@ -3094,9 +2955,19 @@ async fn open_and_publish_ordinal(
         .get(&index)
         .cloned()
     {
-        m.write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key, AdminService::new(handle.clone(), &index));
+        // Source access so a coordinated reindex/alter can rebuild this primary ordinal from source
+        // (the same wiring as the boot-time open path and the single-node `serve`).
+        m.write().unwrap_or_else(|e| e.into_inner()).insert(
+            key,
+            AdminService::new(handle.clone(), &index).with_source(
+                resolved.clone(),
+                store.clone(),
+                ShardId::shard(&index, ordinal),
+                IcebergConfig::from_env(),
+                table.to_string(),
+                growlerdb_engine::ReindexFence::new(),
+            ),
+        );
     }
     if let Some(m) = write_hash_idx
         .read()
@@ -7186,8 +7057,6 @@ mod tests {
             &CommitBatch::from_upserts(
                 vec![LocatedDoc {
                     doc: Document::new(key, f),
-                    iceberg_file: "f".into(),
-                    row_position: 0,
                 }],
                 SourceCheckpoint::iceberg(1),
                 "b1",
@@ -7371,8 +7240,6 @@ mod tests {
             &CommitBatch::from_upserts(
                 vec![LocatedDoc {
                     doc: Document::new(key, f),
-                    iceberg_file: "f".into(),
-                    row_position: 0,
                 }],
                 SourceCheckpoint::iceberg(1),
                 "b1",
@@ -7529,8 +7396,6 @@ mod tests {
             &CommitBatch::from_upserts(
                 vec![LocatedDoc {
                     doc: Document::new(key, f),
-                    iceberg_file: "f".into(),
-                    row_position: 0,
                 }],
                 SourceCheckpoint::iceberg(1),
                 "b1",
@@ -7934,8 +7799,6 @@ mod tests {
         fields.insert("id".to_string(), Value::from(id));
         let doc = LocatedDoc {
             doc: Document::new(key, fields),
-            iceberg_file: "f".into(),
-            row_position: 0,
         };
         IndexWriter::write(
             &shard,
@@ -8083,8 +7946,6 @@ mod tests {
                 &CommitBatch::from_upserts(
                     vec![LocatedDoc {
                         doc: Document::new(key, fields),
-                        iceberg_file: "f".into(),
-                        row_position: 0,
                     }],
                     SourceCheckpoint::iceberg(2),
                     "late-batch",

@@ -23,13 +23,13 @@ duplicates**.
 A single batch can be large (a big source snapshot the connector couldn't sub-divide — it cuts only at
 snapshot boundaries), and committing it as one Tantivy segment is O(batch) — a ~9.5s commit at 300k
 rows. The node therefore applies a batch in **bounded chunks** of
-`GROWLERDB_WRITE_COMMIT_CHUNK` docs (~25k default; `0` disables): each chunk runs the [layered locator](/system/decisions/d30-layered-locator.md) durability
-order (location array synced → Tantivy committed → searcher reloaded), so its docs become searchable
+`GROWLERDB_WRITE_COMMIT_CHUNK` docs (~25k default; `0` disables): each chunk runs the durability
+order (Tantivy committed → searcher reloaded), so its docs become searchable
 immediately, while the **source checkpoint advances exactly once, at the end of the batch**. This is
 invisible to the exactly-once contract: the intermediate chunk commits leave the index *ahead of the
 un-advanced checkpoint* — the steady state this design already tolerates — so a crash before the final
-checkpoint advance replays the whole batch, which the delete-then-add-by-key path applies idempotently
-(and the file interns re-allocate deterministically). It bounds per-commit latency and improves
+checkpoint advance replays the whole batch, which the delete-then-add-by-key path applies
+idempotently. It bounds per-commit latency and improves
 freshness (early rows queryable mid-batch) under large source snapshots, without touching the
 continuity guard or the checkpoint.
 

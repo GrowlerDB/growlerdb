@@ -1,0 +1,144 @@
+# GrowlerDB parallel connector SET — RENDERED per workload, do not apply directly:
+# python3 bench/scale/harness.py render <workload> --shards N --connector-workers W (or scale-up.sh).
+# W workers, each a full connector process owning a disjoint shard group (worker i of W owns shards
+# {s : s % W == i}) — horizontal ingest scale-out over one table onto idle node headroom. Each worker
+# filters the changelog executor-side to its owned rows, writes only its shards (per-shard continuity
+# guard holds: one writer per shard), and resumes from its OWN group's lineage-min checkpoint.
+#
+# RUNBOOK
+#  - NEVER run this set and the single connector (connector.yaml) on the same table at once: two
+#    writers on one shard fail fast at the node (CHECKPOINT_GAP), loudly and safely. Migrate by
+#    scaling one to 0 first (either direction; resume comes from the nodes' checkpoints).
+#  - `--workers` MUST equal `spec.replicas` — one pod template + ${WORKERS} guarantees a uniform value.
+#  - `replicas` (=${WORKERS}) must be <= the shard count: an extra worker owns no shards and crash-loops
+#    with an actionable message (visible misconfig by design). scale-up.sh sets W = SHARDS.
+#  - After a reshard, roll the whole set (routing is read at startup).
+apiVersion: v1
+kind: Service
+metadata:
+  name: growlerdb-connector-set
+  namespace: ${NAMESPACE}
+  labels: { app: growlerdb-connector-set }
+spec:
+  clusterIP: None  # headless: stable pod identity + doubles as the Prometheus scrape target
+  selector: { app: growlerdb-connector-set }
+  ports:
+    - { name: metrics, port: 9091, targetPort: 9091 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: growlerdb-connector-set
+  namespace: ${NAMESPACE}
+  labels: { app: growlerdb-connector-set }
+spec:
+  serviceName: growlerdb-connector-set
+  # W workers; each pod's ordinal is its worker id. Kept = shard count by scale-up.sh.
+  replicas: ${WORKERS}
+  podManagementPolicy: Parallel  # workers are independent; no ordered bring-up needed
+  selector:
+    matchLabels: { app: growlerdb-connector-set }
+  template:
+    metadata:
+      labels: { app: growlerdb-connector-set }
+      # Scrape each worker's own ingest metrics: per-trigger rows read/expected, per-shard acks,
+      # stream restarts, write retries, under-read stalls.
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+        prometheus.io/path: "/metrics"
+    spec:
+      imagePullSecrets: [{ name: ghcr-pull }]
+      containers:
+        - name: connector
+          image: ghcr.io/growlerdb/growlerdb-connector:dev
+          imagePullPolicy: Always   # :dev is mutable — re-pull on every roll so rebuilds land
+          env:
+            - { name: AWS_ACCESS_KEY_ID, value: ${S3_ACCESS_KEY} }
+            - { name: AWS_SECRET_ACCESS_KEY, value: ${S3_SECRET_KEY} }
+            - { name: AWS_REGION, value: ${S3_REGION} }
+            # Graceful in-place recovery from a shard-node crash. The stream commits tiny batches,
+            # so a tight write deadline lets a wedged write fail + retry fast; channel keepalive
+            # (WriteClient) detects the dead connection and re-resolves DNS to the restarted pod's
+            # new IP, so writes resume in seconds with no pod restart. (Code defaults — 30s
+            # deadline — stay safe for large backfills.)
+            - { name: GROWLERDB_WRITE_DEADLINE_SECONDS, value: "8" }
+            # Expose the connector's Prometheus metrics on :9091. Unset ⇒ no server.
+            - { name: GROWLERDB_METRICS_PORT, value: "9091" }
+            # Cap the JVM DNS cache at *launch* so the keepalive-triggered re-resolution returns the
+            # new pod IP. Must be a JVM launch flag — an in-code Security.setProperty runs too late
+            # (Spark resolves hosts before main()). sun.net.inetaddr.ttl is the launch-time knob.
+            # Also point log4j at the bundled config so Spark/Hadoop/Iceberg INFO doesn't flood the
+            # container log and rotate the connector's own lines out of the window.
+            - { name: SPARK_SUBMIT_OPTS, value: "-Dsun.net.inetaddr.ttl=3 -Dsun.net.inetaddr.negative.ttl=1 -Dlog4j2.configurationFile=connector-log4j2.properties" }
+            # Worker id = the pod's ordinal (K8s >= 1.28 sets this label automatically).
+            - name: GROWLERDB_WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
+          ports:
+            - { name: metrics, containerPort: 9091 }
+          command: ["/opt/spark/bin/spark-submit"]
+          args:
+            - --master
+            - "local[6]"
+            # local mode = the driver JVM does all the work; the ~1g default heap OOMs (exit 52) at
+            # high throughput, so give it real heap (pod mem limit raised to match).
+            - --driver-memory
+            - 8g
+            - --conf
+            - spark.jars.ivy=/tmp/.ivy2
+            - --packages
+            - org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.10.0,org.apache.iceberg:iceberg-aws-bundle:1.10.0
+            - --conf
+            - spark.sql.catalog.stream=org.apache.iceberg.spark.SparkCatalog
+            - --conf
+            - spark.sql.catalog.stream.type=rest
+            - --conf
+            - spark.sql.catalog.stream.cache-enabled=false   # see each new append's snapshot
+            - --conf
+            - spark.sql.catalog.stream.uri=http://polaris:8181/api/catalog
+            - --conf
+            - spark.sql.catalog.stream.warehouse=growlerdb
+            - --conf
+            - spark.sql.catalog.stream.credential=root:s3cr3t
+            - --conf
+            - spark.sql.catalog.stream.scope=PRINCIPAL_ROLE:ALL
+            - --conf
+            - spark.sql.catalog.stream.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+            - --conf
+            - spark.sql.catalog.stream.s3.endpoint=${S3_ENDPOINT}
+            - --conf
+            - spark.sql.catalog.stream.s3.path-style-access=${S3_PATH_STYLE}
+            - --class
+            - io.growlerdb.connector.ConnectorApp
+            - /opt/growlerdb/connector.jar
+            # Stream ${TABLE} → the ${INDEX} index. Routing is resolved from the live control-plane
+            # (--control-plane + --index): each row goes to its shard's Node. --nodes lists the shard
+            # Write endpoints, bare host:port (NO http://), in ordinal order, sized to the shard count.
+            # --fields is the KEY + the SEARCHABLE columns the index holds (derived from the
+            # workload's index.yaml); source-only columns stay in Iceberg and hydrate on demand.
+            - --catalog
+            - stream
+            - --table
+            - ${TABLE}
+            - --identifier
+            - ${IDENTIFIER}
+            - --fields
+            - ${FIELDS}
+            - --nodes
+            - ${NODES}
+            - --control-plane
+            - gdb-growlerdb-controlplane:50071
+            - --index
+            - ${INDEX}
+            # Set mode: --workers MUST equal spec.replicas. Worker id arrives via GROWLERDB_WORKER_ID.
+            - --workers
+            - "${WORKERS}"
+            # Bigger commit batches let the cold backfill saturate node write throughput.
+            - --max-commit-rows
+            - "200000"
+            - --stream
+          resources:
+            requests: { cpu: "1", memory: 4Gi }
+            limits: { cpu: "6", memory: 10Gi }

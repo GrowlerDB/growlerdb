@@ -23,8 +23,6 @@ Core GrowlerDB terms. Concepts elsewhere in this bundle link here for definition
   hydration (the `_source`-equivalent).
 - **Fast fields** — columnar-stored fields that are sortable/filterable/aggregatable.
 - **Segment** — an immutable Tantivy index segment; the unit of the local index store.
-- **Locator** — the record (in redb) mapping a document key to its position, kept crash-consistent
-  with the Tantivy commit.
 - **Shard** — a horizontal partition of an index served by one node; queries scatter-gather across
   shards and merge top-K.
 - **Ordinal** — a shard's index (0..N-1); a node serves one or more ordinals.

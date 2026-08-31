@@ -1,0 +1,59 @@
+# Reusable in-cluster driver Job for the comparison run — RENDERED, do not apply directly:
+#   bench/scale/compare_run.py renders this (string.Template) and `kubectl apply -f -`s it.
+#
+# Why a Job, not `kubectl port-forward`: the shake-out proved a port-forwarded load driver reports
+# garbage (500ms/25s, timeouts) — the localhost tunnel, not the engine, becomes the bottleneck. The
+# load generator MUST run inside the cluster and hit the Service directly. This Job clones the branch,
+# installs the driver's deps, and runs one bench/scale command against the in-cluster endpoints; the
+# orchestrator reads the machine-readable result back from the pod's stdout (a marker-delimited JSON).
+#
+# Substituted placeholders (compare_run.py): JOB_NAME, NAMESPACE, GIT_REF, IMAGE, PIP, DRIVER_CMD.
+# DRIVER_CMD must be a SINGLE LINE (no newlines) so the block scalar below stays valid YAML.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+  namespace: ${NAMESPACE}
+  labels: { app: comparison-driver }
+spec:
+  backoffLimit: 0                 # one shot — a failed driver is a real failure, don't silently retry
+  ttlSecondsAfterFinished: 3600   # self-clean an hour after finishing (logs are slurped before then)
+  template:
+    metadata:
+      labels: { app: comparison-driver }
+    spec:
+      restartPolicy: Never
+      volumes:
+        - { name: work, emptyDir: {} }
+      initContainers:
+        # Shallow-clone the branch under test into the shared volume; the driver container runs from it.
+        - name: clone
+          image: alpine/git:2.45.2
+          args: ["clone", "--depth", "1", "-b", "${GIT_REF}", "https://github.com/GrowlerDB/growlerdb", "/work"]
+          volumeMounts: [{ name: work, mountPath: /work }]
+      containers:
+        - name: driver
+          image: ${IMAGE}
+          workingDir: /work/bench/scale
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -o pipefail
+              pip install -q ${PIP}
+              ${DRIVER_CMD}
+          env:
+            # In-cluster Service endpoints — note the gateway is :8080 (not the :8081 a port-forward used).
+            - { name: GROWLERDB_OS_URL, value: "http://gdb-growlerdb-gateway:8080" }
+            - { name: OPENSEARCH_URL, value: "http://opensearch:9200" }
+            - { name: GATEWAY_URL, value: "http://gdb-growlerdb-gateway:8080" }
+            - { name: PROM_URL, value: "http://prometheus:9090" }
+            - { name: TRINO_URL, value: "http://trino:8080" }
+            - { name: NAMESPACE, value: "${NAMESPACE}" }
+            # Iceberg catalog + S3 — freshness writes sentinel rows via pyiceberg (harmless otherwise).
+            - { name: POLARIS_URI, value: "http://polaris:8181/api/catalog" }
+            - { name: POLARIS_CATALOG, value: "growlerdb" }
+            - { name: POLARIS_CREDENTIAL, value: "root:s3cr3t" }
+            - { name: AWS_ENDPOINT_URL_S3, value: "${S3_ENDPOINT}" }
+            - { name: AWS_ACCESS_KEY_ID, value: "${S3_ACCESS_KEY}" }
+            - { name: AWS_SECRET_ACCESS_KEY, value: "${S3_SECRET_KEY}" }
+          volumeMounts: [{ name: work, mountPath: /work }]

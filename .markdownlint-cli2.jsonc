@@ -12,6 +12,7 @@
     "MD031": false, // blanks-around-fences
     "MD032": false, // blanks-around-lists
     "MD036": false, // emphasis-as-heading — used for callouts
+    "MD037": false, // spaces-in-emphasis — false-positives on leading-underscore field names (_source, _id, _bulk) in technical ledgers
     "MD049": false, // emphasis-style consistency
     "MD040": false, // fenced-code-language — some blocks are plain output
     "MD034": false, // bare-urls
