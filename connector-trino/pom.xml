@@ -18,7 +18,7 @@
 
     <trino.version>483</trino.version>
     <grpc.version>1.83.1</grpc.version>
-    <protobuf.version>4.35.1</protobuf.version>
+    <protobuf.version>4.36.0</protobuf.version>
 
     <!-- Live tests (a real Trino QueryRunner / running Gateway) are tag-gated out of the default
          build, like the Rust `#[ignore]` live tests and the Spark connector's integration tag. -->

@@ -2718,7 +2718,19 @@ async fn open_pool_hash_index(
                         resolved.clone(),
                     ),
                 );
-                admin_o.insert(key, AdminService::new(handle.clone(), &index_s));
+                // Source access so the primary can rebuild this ordinal on a coordinated reindex/alter
+                // (mirrors `serve` + windowed-hot; a replica serves via the source-less replicate path).
+                admin_o.insert(
+                    key,
+                    AdminService::new(handle.clone(), &index_s).with_source(
+                        resolved.clone(),
+                        store.clone(),
+                        ShardId::shard(&index_s, o),
+                        IcebergConfig::from_env(),
+                        table.clone(),
+                        growlerdb_engine::ReindexFence::new(),
+                    ),
+                );
                 write_o.insert(
                     key,
                     WriteService::new(handle.clone(), index_s.clone(), POOL_HASH_MAX_INFLIGHT)
@@ -2943,9 +2955,19 @@ async fn open_and_publish_ordinal(
         .get(&index)
         .cloned()
     {
-        m.write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key, AdminService::new(handle.clone(), &index));
+        // Source access so a coordinated reindex/alter can rebuild this primary ordinal from source
+        // (the same wiring as the boot-time open path and the single-node `serve`).
+        m.write().unwrap_or_else(|e| e.into_inner()).insert(
+            key,
+            AdminService::new(handle.clone(), &index).with_source(
+                resolved.clone(),
+                store.clone(),
+                ShardId::shard(&index, ordinal),
+                IcebergConfig::from_env(),
+                table.to_string(),
+                growlerdb_engine::ReindexFence::new(),
+            ),
+        );
     }
     if let Some(m) = write_hash_idx
         .read()

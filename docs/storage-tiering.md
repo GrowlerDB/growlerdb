@@ -26,7 +26,7 @@ workload and hurts the wrong one, so this page is the decision guide.
 
 Cold tiering works by sealing an old time-window shard and shipping its byte-identical segments to
 object storage, where they are served read-through (the local Tantivy bulk is evicted; a small
-locator plus hot cache stay on NVMe). That only holds if the old data never changes. So:
+checkpoint plus hot cache stay on NVMe). That only holds if the old data never changes. So:
 
 | Your table | Index config | Why |
 |---|---|---|
@@ -42,8 +42,8 @@ See [event-time vs ingest-time](#late-arriving-data-event-vs-ingest-time).
 1. Window the index by an ingest-time field into contiguous shards (e.g. daily).
 2. The recent hot window stays on NVMe. Each node automatically parks its own windows once they
    age past the `hot_windows` policy (a background timer): the window's Tantivy bulk is shipped to
-   object storage and evicted from local disk, while a small locator (`aux.redb` + `location.arr`)
-   and a hot cache stay on NVMe. Parking happens in place without interrupting the window, which keeps
+   object storage and evicted from local disk, while a small checkpoint (`aux.redb`) and a hot cache stay
+   on NVMe. Parking happens in place without interrupting the window, which keeps
    answering queries across the hot→cold swap. It's opt-in per deployment and node-local (the parked
    data lives on the node's own object-storage prefix).
 3. A query prunes to the windows its time filter touches. If it touches a cold window, that window

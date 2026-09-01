@@ -15,8 +15,7 @@ GrowlerDB keeps a fast, derived index locally and returns matching primary keys 
 [View on GitHub](https://github.com/GrowlerDB/growlerdb){: .btn .fs-5 .mb-4 .mb-md-0 }
 
 GrowlerDB is pre-1.0 and under active development — the engine is feature-complete for its core
-surface but has not been run in production. See the [GA criteria](ga-criteria) and
-[roadmap](roadmap) for what's done and what's still ahead.
+surface but has not been run in production.
 {: .fs-3 .fw-300 }
 
 ---
@@ -84,10 +83,8 @@ Use the links below to find specific guides and reference pages.
 | [Performance](performance) | Review directional search and hydration latency measurements. |
 | [Migrating from Elasticsearch](migration-from-elasticsearch) | Learn how to move your application search from Elasticsearch or OpenSearch. |
 
-### Operations and roadmap
+### Operations
 
 | Page | What it covers |
 |---|---|
 | [Deployment](deployment) | Deploy GrowlerDB locally with Docker Compose or at scale with Kubernetes and Helm. |
-| [GA criteria](ga-criteria) | Track our criteria and check-off lists for the 1.0 release. |
-| [Roadmap and known limitations](roadmap) | Review upcoming features and current engine constraints. |

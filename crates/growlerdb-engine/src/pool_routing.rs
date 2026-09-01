@@ -301,10 +301,8 @@ impl Lookup for PoolLookupService {
     }
 }
 
-/// The admin (DescribeIndex) counterpart to [`PoolSearchService`]: routes on the index selector, then
-/// delegates to a [`WindowedAdminService`]. Alter/reindex/reconcile/compact/backup stay
-/// `Unimplemented` (cluster-shape ops that don't apply per-unit on a pool node), as on the windowed
-/// mux it wraps.
+/// The admin counterpart to [`PoolSearchService`]: routes on the index + unit selectors to the owning
+/// unit's [`AdminService`]. The reindex lifecycle routes per-unit; alter/reconcile/compact/backup stay `Unimplemented` (CP-driven, not per-unit).
 pub struct PoolAdminService {
     by_index: SharedAdminIndexes,
     kinds: SharedIndexKinds,
@@ -344,38 +342,48 @@ impl Admin for PoolAdminService {
 
     async fn reindex_index(
         &self,
-        _request: Request<ReindexIndexRequest>,
+        request: Request<ReindexIndexRequest>,
     ) -> Result<Response<ReindexIndexResponse>, Status> {
-        Err(Status::unimplemented(
-            "reindex is not supported on a pool node",
-        ))
+        // Route the coordinated reindex to the owning unit (hash: `shard_ordinal`; windowed: `window`)
+        // and delegate to its per-unit AdminService, which enforces the write-fence + single-flight.
+        let r = request.get_ref();
+        let svc = route_unit(
+            &self.by_index,
+            &self.kinds,
+            &r.index,
+            r.window,
+            r.shard_ordinal,
+        )?;
+        Admin::reindex_index(&svc, request).await
     }
 
     async fn reindex_status(
         &self,
-        _request: Request<ReindexStatusRequest>,
+        request: Request<ReindexStatusRequest>,
     ) -> Result<Response<ReindexStatusResponse>, Status> {
-        Err(Status::unimplemented(
-            "reindex is not supported on a pool node",
-        ))
+        // Status/cancel/precheck carry only `index` + `window` (window-oriented); a hash index's sole
+        // unit resolves via the shard-0 default, matching the coordinated driver's per-window polling.
+        let r = request.get_ref();
+        let svc = route_unit(&self.by_index, &self.kinds, &r.index, r.window, 0)?;
+        Admin::reindex_status(&svc, request).await
     }
 
     async fn cancel_reindex(
         &self,
-        _request: Request<CancelReindexRequest>,
+        request: Request<CancelReindexRequest>,
     ) -> Result<Response<CancelReindexResponse>, Status> {
-        Err(Status::unimplemented(
-            "reindex is not supported on a pool node",
-        ))
+        let r = request.get_ref();
+        let svc = route_unit(&self.by_index, &self.kinds, &r.index, r.window, 0)?;
+        Admin::cancel_reindex(&svc, request).await
     }
 
     async fn reindex_precheck(
         &self,
-        _request: Request<ReindexPrecheckRequest>,
+        request: Request<ReindexPrecheckRequest>,
     ) -> Result<Response<ReindexPrecheckResponse>, Status> {
-        Err(Status::unimplemented(
-            "reindex is not supported on a pool node",
-        ))
+        let r = request.get_ref();
+        let svc = route_unit(&self.by_index, &self.kinds, &r.index, r.window, 0)?;
+        Admin::reindex_precheck(&svc, request).await
     }
 
     async fn reconcile_index(
@@ -1057,5 +1065,79 @@ mod tests {
                 .code(),
             tonic::Code::FailedPrecondition
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pool_admin_routes_reindex_lifecycle_and_keeps_alter_unimplemented() {
+        use crate::AdminService;
+        let tmp = tempfile::tempdir().unwrap();
+        // A hash (non-windowed) index `catalog` with one unit keyed on shard ordinal 0 — the
+        // single-shard pool index shape that used to 501 on reindex (the coordinated driver dials the
+        // pool node per unit). The test AdminService has no source context, so it fails *past* the
+        // pool layer with its own message — the point is it no longer blanket-rejects "on a pool node".
+        let unit = AdminService::new(one_doc_shard(tmp.path(), "catalog", "c1"), "catalog");
+        let by_index: SharedAdminIndexes = Arc::new(RwLock::new(BTreeMap::from([(
+            "catalog".to_string(),
+            Arc::new(RwLock::new(BTreeMap::from([(0i64, unit)]))),
+        )])));
+        let kinds: SharedIndexKinds =
+            Arc::new(RwLock::new(BTreeMap::from([("catalog".to_string(), true)])));
+        let mux = PoolAdminService::new(by_index, kinds);
+
+        // Regression: reindex_status routes to the served unit's AdminService (not the pool reject).
+        let err = Admin::reindex_status(
+            &mux,
+            Request::new(ReindexStatusRequest {
+                index: "catalog".into(),
+                window: 0,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            !err.message().contains("pool node"),
+            "reindex_status should route to the unit, got: {}",
+            err.message()
+        );
+
+        // An unserved index is refused by the unit router (FailedPrecondition), not blanket Unimplemented.
+        for code in [
+            Admin::reindex_index(
+                &mux,
+                Request::new(ReindexIndexRequest {
+                    index: "missing".into(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_err()
+            .code(),
+            Admin::reindex_status(
+                &mux,
+                Request::new(ReindexStatusRequest {
+                    index: "missing".into(),
+                    window: 0,
+                }),
+            )
+            .await
+            .unwrap_err()
+            .code(),
+        ] {
+            assert_eq!(code, tonic::Code::FailedPrecondition);
+        }
+
+        // Alter stays Unimplemented on a pool node — the CP applies it at the registry, then rebuilds
+        // via reindex_index (a pool node can't durably change the registry).
+        let err = Admin::alter_index(
+            &mux,
+            Request::new(AlterIndexRequest {
+                index: "catalog".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert!(err.message().contains("pool node"));
     }
 }
