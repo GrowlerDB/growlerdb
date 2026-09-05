@@ -128,9 +128,14 @@ fn with_retry(op: Operator) -> Operator {
 pub fn s3_store(cfg: &S3Config) -> Result<Operator> {
     let mut b = opendal::services::S3::default()
         .bucket(&cfg.bucket)
-        .region(&cfg.region)
-        .access_key_id(&cfg.access_key_id)
-        .secret_access_key(&cfg.secret_access_key);
+        .region(&cfg.region);
+    // Static keys only when supplied; empty ⇒ opendal's default credential chain (env / profile /
+    // IMDS instance role / STS assume-role / IRSA web-identity), so IAM-based auth works — D56.
+    if !cfg.access_key_id.is_empty() && !cfg.secret_access_key.is_empty() {
+        b = b
+            .access_key_id(&cfg.access_key_id)
+            .secret_access_key(&cfg.secret_access_key);
+    }
     if let Some(ep) = &cfg.endpoint {
         b = b.endpoint(ep);
     }

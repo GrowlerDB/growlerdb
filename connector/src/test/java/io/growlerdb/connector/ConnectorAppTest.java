@@ -7,10 +7,33 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.growlerdb.proto.v1.GetIndexResponse;
 import io.growlerdb.proto.v1.RoutingStrategy;
 import io.growlerdb.proto.v1.ShardStatus;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 class ConnectorAppTest {
+
+  @Test
+  void s3CatalogConfMapsSetVarsUnderTheCatalogAndTrims() {
+    Map<String, String> env = new HashMap<>();
+    env.put("GROWLERDB_S3_ACCESS_KEY", "AKIA");
+    env.put("GROWLERDB_S3_SECRET_KEY", "secret");
+    env.put("GROWLERDB_S3_REGION", "  us-west-2 ");
+    Map<String, String> conf = ConnectorApp.s3CatalogConf("stream", env);
+    assertEquals("AKIA", conf.get("spark.sql.catalog.stream.s3.access-key-id"));
+    assertEquals("secret", conf.get("spark.sql.catalog.stream.s3.secret-access-key"));
+    assertEquals("us-west-2", conf.get("spark.sql.catalog.stream.client.region"));
+    assertEquals(3, conf.size());
+  }
+
+  @Test
+  void s3CatalogConfOmitsBlankOrUnsetSoTheAwsDefaultChainIsUsed() {
+    Map<String, String> env = new HashMap<>();
+    env.put("GROWLERDB_S3_ACCESS_KEY", "");
+    // secret + region unset entirely; access-key blank — all omitted so S3FileIO uses the AWS chain.
+    assertTrue(ConnectorApp.s3CatalogConf("stream", env).isEmpty());
+  }
 
   private static GetIndexResponse.Builder indexWithShards(int count) {
     return GetIndexResponse.newBuilder().setShardCount(count).setRouting(RoutingStrategy.ROUTING_HASH);

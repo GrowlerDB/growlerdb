@@ -16,6 +16,10 @@ fullnameOverride: ""
 serviceAccount:
   create: true
   name: ""
+  # For EKS IRSA, annotate the ServiceAccount with the IAM role and leave `credentials.s3AccessKey`
+  # /`s3SecretKey` empty — the engine then uses the pod's web-identity token (D56). Example:
+  #   annotations:
+  #     eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/<growlerdb-s3-reader>
   annotations: {}
 
 # Pod-level security context applied to every component (the image runs as uid 10001 already).
@@ -46,6 +50,9 @@ iceberg:
 credentials:
   existingSecret: ""
   catalogCredential: "" # Polaris client-id:secret, e.g. "client:secret"
+  # Static S3 keys. Leave BOTH empty to authenticate by the pod's IAM identity instead — the engine
+  # falls through to the AWS credential chain (EKS IRSA / instance profile / STS), D56. For IRSA also
+  # set `serviceAccount.annotations` with the role ARN above.
   s3AccessKey: ""
   s3SecretKey: ""
   # Shared cluster service token (GROWLERDB_SERVICE_TOKEN). Closes the control plane's internal

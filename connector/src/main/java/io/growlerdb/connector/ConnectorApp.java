@@ -197,13 +197,15 @@ public final class ConnectorApp {
       System.out.printf("connector set: worker %d/%d owns shards %s%n", workerId, workers, owned);
     }
 
-    SparkSession spark =
+    SparkSession.Builder builder =
         SparkSession.builder()
             .appName("growlerdb-connector")
             .config(
                 "spark.sql.extensions",
-                "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
-            .getOrCreate();
+                "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions");
+    // Apply S3 creds before the catalog is lazily built on first table access (next stmt) — D55.
+    s3CatalogConf(catalog, System.getenv()).forEach(builder::config);
+    SparkSession spark = builder.getOrCreate();
 
     SnapshotLineage lineage = SnapshotLineage.forTable(spark, catalog + "." + table);
     // The writer FACTORY, not a writer: every stream restart re-invokes it, so a CP-driven run
@@ -545,6 +547,30 @@ public final class ConnectorApp {
     }
     java.security.Security.setProperty("networkaddress.cache.ttl", ttl.trim());
     java.security.Security.setProperty("networkaddress.cache.negative.ttl", "1");
+  }
+
+  // --- S3 credentials: GrowlerDB namespace → Iceberg S3FileIO catalog props --------------------
+
+  /**
+   * Map the GrowlerDB-namespaced S3 credentials to this catalog's Iceberg {@code S3FileIO}
+   * properties, so operators configure S3 once under {@code GROWLERDB_S3_*} instead of the AWS SDK's
+   * {@code AWS_*} (D55). A blank/unset var is omitted, so S3FileIO falls back to the AWS default
+   * credential chain — instance profile / STS / IRSA web-identity (D56). {@code env} is a parameter
+   * (not {@code System.getenv()} directly) so the mapping is unit-testable.
+   */
+  static Map<String, String> s3CatalogConf(String catalog, Map<String, String> env) {
+    String p = "spark.sql.catalog." + catalog + ".";
+    Map<String, String> conf = new java.util.LinkedHashMap<>();
+    putIfSet(conf, p + "s3.access-key-id", env.get("GROWLERDB_S3_ACCESS_KEY"));
+    putIfSet(conf, p + "s3.secret-access-key", env.get("GROWLERDB_S3_SECRET_KEY"));
+    putIfSet(conf, p + "client.region", env.get("GROWLERDB_S3_REGION"));
+    return conf;
+  }
+
+  private static void putIfSet(Map<String, String> conf, String key, String value) {
+    if (value != null && !value.isBlank()) {
+      conf.put(key, value.trim());
+    }
   }
 
   // --- tiny arg parsing: `--key value` and bare `--flag` -----------------------

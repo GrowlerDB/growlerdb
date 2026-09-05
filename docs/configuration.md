@@ -34,8 +34,8 @@ override the local-dev defaults:
 | `GROWLERDB_CATALOG_CREDENTIAL` | none | Catalog OAuth `client:secret` (Polaris). |
 | `GROWLERDB_CATALOG_SCOPE` | none | Optional catalog OAuth scope. |
 | `GROWLERDB_S3_ENDPOINT` | `http://localhost:9000` | Object-store endpoint. |
-| `GROWLERDB_S3_ACCESS_KEY` | `minioadmin` | Object-store access key. |
-| `GROWLERDB_S3_SECRET_KEY` | `minioadmin` | Object-store secret key. |
+| `GROWLERDB_S3_ACCESS_KEY` | `minioadmin` | Object-store access key. Empty ⇒ the AWS credential chain (instance profile / STS / EKS IRSA). |
+| `GROWLERDB_S3_SECRET_KEY` | `minioadmin` | Object-store secret key. Empty ⇒ the AWS credential chain (as above). |
 | `GROWLERDB_S3_REGION` | `us-east-1` | Object-store region. |
 | `GROWLERDB_BACKUP_BUCKET` | none | Bucket for `backup`/`restore` (reuses the `GROWLERDB_S3_*` credentials/endpoint). |
 | `GROWLERDB_MODEL_DIR` | `~/.cache/growlerdb/models` | Where the local embedder loads models from (`<dir>/<model-id>/`). Only the index nodes, which embed `VECTOR` fields at ingest, read it. |
