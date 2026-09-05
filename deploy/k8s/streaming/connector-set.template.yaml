@@ -54,9 +54,10 @@ spec:
           image: ghcr.io/growlerdb/growlerdb-connector:dev
           imagePullPolicy: Always   # :dev is mutable — re-pull on every roll so rebuilds land
           env:
-            - { name: AWS_ACCESS_KEY_ID, value: ${S3_ACCESS_KEY} }
-            - { name: AWS_SECRET_ACCESS_KEY, value: ${S3_SECRET_KEY} }
-            - { name: AWS_REGION, value: ${S3_REGION} }
+            # S3 creds under the GrowlerDB namespace (D55); unset ⇒ AWS default chain / IRSA (D56).
+            - { name: GROWLERDB_S3_ACCESS_KEY, value: ${S3_ACCESS_KEY} }
+            - { name: GROWLERDB_S3_SECRET_KEY, value: ${S3_SECRET_KEY} }
+            - { name: GROWLERDB_S3_REGION, value: ${S3_REGION} }
             # Graceful in-place recovery from a shard-node crash. The stream commits tiny batches,
             # so a tight write deadline lets a wedged write fail + retry fast; channel keepalive
             # (WriteClient) detects the dead connection and re-resolves DNS to the restarted pod's

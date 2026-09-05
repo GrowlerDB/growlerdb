@@ -25,13 +25,12 @@ catalog, bucket, and table:
 | Surface | What it does | How it's configured |
 |---|---|---|
 | **Query / hydration** (control plane · node · gateway) | Builds + serves the index; reads Iceberg to hydrate matched keys back to rows | `GROWLERDB_*` environment variables |
-| **Ingestion** (Spark connector) | Streams the Iceberg changelog into the index | `spark-submit --conf spark.sql.catalog.*` + `AWS_*` env |
+| **Ingestion** (Spark connector) | Streams the Iceberg changelog into the index | `spark-submit --conf spark.sql.catalog.*` + `GROWLERDB_S3_*` env |
 
-These are two separate processes with two separate S3 clients, so each reads the credential under its
-own convention: the Rust engine reads `GROWLERDB_S3_ACCESS_KEY`/`GROWLERDB_S3_SECRET_KEY`, while the
-Spark connector authenticates through Iceberg's `S3FileIO` and the AWS SDK's standard
-`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`. It's the same access key and secret in both places; put
-the one credential under both names.
+Both authenticate to S3 with the same `GROWLERDB_S3_*` credentials: the engine reads them directly,
+and the connector maps them onto the catalog's Iceberg `S3FileIO` properties for you. Set the one
+credential; or leave the S3 keys empty to authenticate by an IAM role instead (see
+[Limitations](#limitations)).
 
 ## Before you start
 
@@ -112,10 +111,12 @@ spark-submit \
   --stream
 ```
 
-Provide the connector's S3 credentials via the AWS SDK env (or an IAM role, if you run it on AWS):
+Provide the connector's S3 credentials the same way as the engine — it maps `GROWLERDB_S3_*` onto the
+catalog's Iceberg `S3FileIO` properties itself. Leave them empty to authenticate by an IAM role
+(instance profile / STS / EKS IRSA) instead:
 
 ```sh
-export AWS_ACCESS_KEY_ID=AKIA... AWS_SECRET_ACCESS_KEY=... AWS_REGION=us-east-1
+export GROWLERDB_S3_ACCESS_KEY=AKIA... GROWLERDB_S3_SECRET_KEY=... GROWLERDB_S3_REGION=us-east-1
 export GROWLERDB_SERVICE_TOKEN=...   # must match the value in your .env (mesh auth)
 ```
 
@@ -133,7 +134,7 @@ These are constraints of the current engine. Plan around them:
 - REST catalogs only. The engine builds an Iceberg `RestCatalog`; AWS Glue, Hadoop, and non-REST
   Nessie modes are not supported for the query/hydration side. (The Spark connector can read other
   catalog types, but hydration needs REST, so the end-to-end loop requires a REST catalog.)
-- Static S3 keys only. The engine authenticates to S3 with a static access key and secret key; IAM instance profiles, STS, and Kubernetes service accounts are not supported. Supply static credentials via `GROWLERDB_S3_ACCESS_KEY` and `GROWLERDB_S3_SECRET_KEY`.
+- S3 auth: static keys or an IAM role. Set `GROWLERDB_S3_ACCESS_KEY`/`GROWLERDB_S3_SECRET_KEY` for static keys, or leave them empty to use the AWS credential chain — EC2/ECS instance profile (IMDS), assume-role/STS, and EKS IRSA web-identity all work. On EKS, annotate the pod's ServiceAccount with the role (`eks.amazonaws.com/role-arn`) and leave the keys empty; the Helm chart's `serviceAccount.annotations` wires this.
 - Path-style S3 access is forced on by the engine. It is required for MinIO and still works with
   AWS S3 today; strict virtual-hosted-only setups aren't supported.
 - Rotate the secrets. `GROWLERDB_SERVICE_TOKEN` (mesh auth) and `GROWLERDB_AUTH_SECRET` (gateway
@@ -144,8 +145,8 @@ These are constraints of the current engine. Plan around them:
 - Catalog `401`/`403`: check `GROWLERDB_CATALOG_CREDENTIAL` (`id:secret`) and, for Polaris,
   `GROWLERDB_CATALOG_SCOPE=PRINCIPAL_ROLE:ALL`. Both the node/gateway env and the connector `--conf`
   must carry them.
-- S3 access denied / no such bucket: the engine and the connector authenticate separately, so verify
-  both `GROWLERDB_S3_*` (engine) and `AWS_*` (connector), the endpoint, and the region.
+- S3 access denied / no such bucket: the engine and the connector both read `GROWLERDB_S3_*`, so verify
+  those credentials (or the IAM role, if the keys are empty), the endpoint, and the region.
 - `table not found`: the node's `GROWLERDB_SOURCE_TABLE` and the connector's `--table` must be the
   same `namespace.table`, present in the warehouse you named.
 - Connector commits nothing on a live table: confirm `spark.sql.catalog.<name>.cache-enabled=false`.

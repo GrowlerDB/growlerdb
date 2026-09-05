@@ -94,8 +94,10 @@ pub struct IcebergConfig {
     /// OAuth2 scope (Polaris uses `PRINCIPAL_ROLE:ALL`).
     pub scope: Option<String>,
     pub s3_endpoint: String,
-    pub s3_access_key: String,
-    pub s3_secret_key: String,
+    /// Static S3 keys. `None` (empty `GROWLERDB_S3_*`) ⇒ opendal's default credential chain
+    /// (env / profile / IMDS instance role / STS assume-role / IRSA web-identity) — see D56.
+    pub s3_access_key: Option<String>,
+    pub s3_secret_key: Option<String>,
     pub s3_region: String,
 }
 
@@ -108,8 +110,8 @@ impl IcebergConfig {
             credential: Some("root:s3cr3t".to_string()),
             scope: Some("PRINCIPAL_ROLE:ALL".to_string()),
             s3_endpoint: "http://minio:9000".to_string(),
-            s3_access_key: "minioadmin".to_string(),
-            s3_secret_key: "minioadmin".to_string(),
+            s3_access_key: Some("minioadmin".to_string()),
+            s3_secret_key: Some("minioadmin".to_string()),
             s3_region: "us-east-1".to_string(),
         }
     }
@@ -120,7 +122,8 @@ impl IcebergConfig {
     /// `GROWLERDB_CATALOG_URI`, `GROWLERDB_WAREHOUSE`, `GROWLERDB_CATALOG_CREDENTIAL`,
     /// `GROWLERDB_CATALOG_SCOPE`, `GROWLERDB_S3_ENDPOINT`, `GROWLERDB_S3_ACCESS_KEY`,
     /// `GROWLERDB_S3_SECRET_KEY`, `GROWLERDB_S3_REGION`. An empty value clears the optional
-    /// credential/scope (anonymous catalog).
+    /// credential/scope (anonymous catalog) and, for the S3 keys, selects the ambient credential
+    /// chain (IMDS/STS/IRSA) instead of static keys — see D56.
     pub fn from_env() -> Self {
         let base = Self::local();
         let var = |key: &str| std::env::var(key).ok();
@@ -135,8 +138,8 @@ impl IcebergConfig {
             credential: opt("GROWLERDB_CATALOG_CREDENTIAL", base.credential),
             scope: opt("GROWLERDB_CATALOG_SCOPE", base.scope),
             s3_endpoint: var("GROWLERDB_S3_ENDPOINT").unwrap_or(base.s3_endpoint),
-            s3_access_key: var("GROWLERDB_S3_ACCESS_KEY").unwrap_or(base.s3_access_key),
-            s3_secret_key: var("GROWLERDB_S3_SECRET_KEY").unwrap_or(base.s3_secret_key),
+            s3_access_key: opt("GROWLERDB_S3_ACCESS_KEY", base.s3_access_key),
+            s3_secret_key: opt("GROWLERDB_S3_SECRET_KEY", base.s3_secret_key),
             s3_region: var("GROWLERDB_S3_REGION").unwrap_or(base.s3_region),
         }
     }
@@ -146,14 +149,16 @@ impl IcebergConfig {
             ("uri".to_string(), self.uri.clone()),
             ("warehouse".to_string(), self.warehouse.clone()),
             ("s3.endpoint".to_string(), self.s3_endpoint.clone()),
-            ("s3.access-key-id".to_string(), self.s3_access_key.clone()),
-            (
-                "s3.secret-access-key".to_string(),
-                self.s3_secret_key.clone(),
-            ),
             ("s3.region".to_string(), self.s3_region.clone()),
             ("s3.path-style-access".to_string(), "true".to_string()),
         ]);
+        // Static keys only when set; omit them ⇒ opendal's default chain (IMDS/STS/IRSA) — D56.
+        if let Some(k) = &self.s3_access_key {
+            p.insert("s3.access-key-id".to_string(), k.clone());
+        }
+        if let Some(s) = &self.s3_secret_key {
+            p.insert("s3.secret-access-key".to_string(), s.clone());
+        }
         if let Some(c) = &self.credential {
             p.insert("credential".to_string(), c.clone());
         }
@@ -2337,17 +2342,30 @@ mod tests {
     fn from_env_overrides_defaults_and_clears_optional_on_empty() {
         // Defaults when unset (these vars aren't set elsewhere in the suite).
         assert_eq!(IcebergConfig::from_env().uri, IcebergConfig::local().uri);
+        // Unset S3 key keeps the static dev default.
+        assert_eq!(
+            IcebergConfig::from_env().s3_access_key.as_deref(),
+            Some("minioadmin")
+        );
 
         std::env::set_var("GROWLERDB_CATALOG_URI", "http://polaris:8181/api/catalog");
         std::env::set_var("GROWLERDB_S3_ENDPOINT", "http://minio:9000");
         std::env::set_var("GROWLERDB_CATALOG_CREDENTIAL", ""); // empty → anonymous
+        std::env::set_var("GROWLERDB_S3_ACCESS_KEY", ""); // empty → ambient chain (IRSA/IMDS/STS)
+        std::env::set_var("GROWLERDB_S3_SECRET_KEY", "");
         let c = IcebergConfig::from_env();
         assert_eq!(c.uri, "http://polaris:8181/api/catalog");
         assert_eq!(c.s3_endpoint, "http://minio:9000");
         assert_eq!(c.credential, None);
+        assert_eq!(c.s3_access_key, None);
+        // Omitting the key props is what lets opendal fall through to the provider chain (D56).
+        assert!(!c.props().contains_key("s3.access-key-id"));
+        assert!(!c.props().contains_key("s3.secret-access-key"));
         std::env::remove_var("GROWLERDB_CATALOG_URI");
         std::env::remove_var("GROWLERDB_S3_ENDPOINT");
         std::env::remove_var("GROWLERDB_CATALOG_CREDENTIAL");
+        std::env::remove_var("GROWLERDB_S3_ACCESS_KEY");
+        std::env::remove_var("GROWLERDB_S3_SECRET_KEY");
     }
 
     /// Live read against the local dev stack. Prereqs:

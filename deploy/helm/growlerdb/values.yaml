@@ -16,6 +16,8 @@ fullnameOverride: ""
 serviceAccount:
   create: true
   name: ""
+  # EKS IRSA: put the role ARN here (eks.amazonaws.com/role-arn) and leave credentials.s3AccessKey
+  # /s3SecretKey empty — the engine then uses the pod's web-identity token. See docs/external-iceberg.
   annotations: {}
 
 # Pod-level security context applied to every component (the image runs as uid 10001 already).
@@ -46,6 +48,8 @@ iceberg:
 credentials:
   existingSecret: ""
   catalogCredential: "" # Polaris client-id:secret, e.g. "client:secret"
+  # Static S3 keys. Leave BOTH empty to authenticate by the pod's IAM identity (EKS IRSA / instance
+  # profile / STS) instead; for IRSA also set serviceAccount.annotations with the role ARN above.
   s3AccessKey: ""
   s3SecretKey: ""
   # Shared cluster service token (GROWLERDB_SERVICE_TOKEN). Closes the control plane's internal
