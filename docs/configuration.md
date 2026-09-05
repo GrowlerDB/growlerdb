@@ -55,7 +55,7 @@ your hardware without a rebuild. Set each on the gateway process.
 | `GROWLERDB_MAX_FETCH` | `10000` | Ceiling on `offset + limit` per query; over it returns `InvalidArgument`. `0` = unbounded. |
 | `GROWLERDB_MAX_CONCURRENT_FANOUT` | `256` | Per-shard RPCs in flight across all scatter-gathers. `0` = unbounded. |
 | `GROWLERDB_REQUIRE_AUTH` | _unset_ | When truthy (`1`/`true`/`yes`/`on`), the gateway refuses to start unless authentication is configured (`--oidc-issuer` or `--builtin-auth`). Use it in production so a missing auth flag fails fast instead of serving open. |
-| `GROWLERDB_DEFAULT_INDEX` | _unset_ | The index the console selects by default — its front door — advertised via `/v1/config`. Point it at a `VECTOR` index (the demo uses `movies`) so a fresh visitor lands where semantic/hybrid search is one click away. Unset ⇒ the console uses the first index. |
+| `GROWLERDB_DEFAULT_INDEX` | _unset_ | The index the console selects by default — its front door — advertised via `/v1/config`. Unset ⇒ the console uses the first index. |
 
 Running the gateway without `--oidc-issuer` or `--builtin-auth` leaves it open (no authentication).
 That is fine for local use and prints a warning at startup; set `GROWLERDB_REQUIRE_AUTH` to turn the
@@ -201,9 +201,9 @@ timestamp. You don't also write `type: DATE`; the two together is rejected unles
     - { path: native_ts, type: DATE }         # a native Iceberg `timestamp` needs no format
 ```
 
-Parsing fails loudly rather than silently. A value that doesn't match its declared `format` is
-skipped for that document (the rest of the document still indexes), so it is never written as an
-off-by-1000 or off-by-timezone date. To change a field's `format`/unit on an existing index, re-run
+Parsing fails safe. A value that doesn't match its declared `format` is dropped for that document
+(the field is left unset and the rest of the document still indexes), so a mis-declared value is
+never coerced into an off-by-1000 or off-by-timezone date. To change a field's `format`/unit on an existing index, re-run
 the build (`growlerdb alter` / reindex), and the new unit applies as documents are re-ingested.
 
 > **Windowing.** A time-windowed index (`windowing:`) buckets on the same canonical micros scale,

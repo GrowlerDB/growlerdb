@@ -16,7 +16,7 @@
 <meta property="og:site_name" content="GrowlerDB">
 <meta property="og:locale" content="en_US">
 <meta property="og:title" content="GrowlerDB — full-text, vector, and hybrid search over your data">
-<meta property="og:description" content="Open-source retrieval engine — full-text, vector, and hybrid search over your data. Matches resolve back to authoritative rows in your source — no second copy of your data.">
+<meta property="og:description" content="Open-source retrieval engine — full-text, vector, and hybrid search over your data. Matches resolve back to authoritative rows in your source.">
 <meta property="og:url" content="https://growlerdb.com/">
 <meta property="og:image" content="https://docs.growlerdb.com/img/social-preview.png">
 <meta property="og:image:width" content="1200">
@@ -54,7 +54,7 @@
       "@id": "https://growlerdb.com/#software",
       "name": "GrowlerDB",
       "url": "https://growlerdb.com/",
-      "description": "Open-source retrieval engine — full-text, vector, and hybrid search over Apache Iceberg. Search returns coordinates that hydrate back to the authoritative rows in your source; no second copy of your data.",
+      "description": "Open-source retrieval engine — full-text, vector, and hybrid search over Apache Iceberg. Search returns coordinates that hydrate back to the authoritative rows in your source.",
       "applicationCategory": "DeveloperApplication",
       "operatingSystem": "Linux, macOS",
       "license": "https://www.gnu.org/licenses/agpl-3.0.html",
@@ -199,7 +199,6 @@
 </nav>
 
 <header class="hero wrap">
-  <span class="pill"><span class="dot"></span> beta · pre-1.0 — production-tested</span>
   <h1>Full-text, vector, and hybrid search over your data</h1>
   <p class="sub">GrowlerDB keeps a fast, derived index over your lakehouse and resolves matching
     <b>coordinates</b> back to the authoritative row — your source stays the system of record.</p>
@@ -215,26 +214,17 @@
     <div class="card">
       <div class="kicker">1 — INDEX</div>
       <h3>Point at Iceberg</h3>
-      <p>The connector streams your Iceberg changelog into a derived full-text index — no second copy to keep in sync by hand.</p>
+      <p>The connector streams your Iceberg changelog into a derived full-text index.</p>
     </div>
     <div class="card">
       <div class="kicker">2 — SEARCH</div>
-      <h3>Query returns coordinates</h3>
-      <p>Full-text, vector, and hybrid retrieval — plus filters, ranges, reranking, and even semi-structured Iceberg v3 <b>variant</b> columns. A search returns ranked coordinates — not a stale copy of your data.</p>
+      <h3>Cached fields & coordinates</h3>
+      <p>Full-text, vector, and hybrid retrieval — plus filters, ranges, reranking, and Iceberg v3 variant columns. A search returns ranked records including fields & coordinates.</p>
     </div>
     <div class="card">
       <div class="kicker">3 — HYDRATE</div>
       <h3>Rows from the lake</h3>
       <p>Resolve coordinates back to the authoritative, governed rows in Iceberg by primary key. One source of truth.</p>
-    </div>
-  </section>
-
-  <section class="why">
-    <h2>Why not Elasticsearch or OpenSearch?</h2>
-    <div class="why-list">
-      <div class="why-item"><b>No second copy of your data.</b> Your lakehouse stays the system of record; the index is derived and rebuildable — not a parallel datastore to reconcile.</div>
-      <div class="why-item"><b>The lake is the source of truth.</b> Hydration returns the live, catalog-governed Iceberg row, not a search-time snapshot that drifts.</div>
-      <div class="why-item"><b>No reindex-the-world migrations.</b> Point at a table and go; the connector keeps the index current from the Iceberg changelog.</div>
     </div>
   </section>
 </main>

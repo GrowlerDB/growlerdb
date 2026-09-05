@@ -27,8 +27,11 @@ catalog, bucket, and table:
 | **Query / hydration** (control plane · node · gateway) | Builds + serves the index; reads Iceberg to hydrate matched keys back to rows | `GROWLERDB_*` environment variables |
 | **Ingestion** (Spark connector) | Streams the Iceberg changelog into the index | `spark-submit --conf spark.sql.catalog.*` + `AWS_*` env |
 
-The two authenticate to S3 differently: the engine uses `GROWLERDB_S3_ACCESS_KEY`/`SECRET_KEY`, and
-the connector uses the AWS SDK's `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`. Set both.
+These are two separate processes with two separate S3 clients, so each reads the credential under its
+own convention: the Rust engine reads `GROWLERDB_S3_ACCESS_KEY`/`GROWLERDB_S3_SECRET_KEY`, while the
+Spark connector authenticates through Iceberg's `S3FileIO` and the AWS SDK's standard
+`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`. It's the same access key and secret in both places; put
+the one credential under both names.
 
 ## Before you start
 
