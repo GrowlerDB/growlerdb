@@ -552,11 +552,8 @@ public final class ConnectorApp {
   // --- S3 credentials: GrowlerDB namespace → Iceberg S3FileIO catalog props --------------------
 
   /**
-   * Map the GrowlerDB-namespaced S3 credentials to this catalog's Iceberg {@code S3FileIO}
-   * properties, so operators configure S3 once under {@code GROWLERDB_S3_*} instead of the AWS SDK's
-   * {@code AWS_*} (D55). A blank/unset var is omitted, so S3FileIO falls back to the AWS default
-   * credential chain — instance profile / STS / IRSA web-identity (D56). {@code env} is a parameter
-   * (not {@code System.getenv()} directly) so the mapping is unit-testable.
+   * GrowlerDB S3 creds → this catalog's Iceberg {@code S3FileIO} props (D55); a blank var is omitted
+   * so S3FileIO uses the AWS default chain — IMDS/STS/IRSA (D56). {@code env} injected for testing.
    */
   static Map<String, String> s3CatalogConf(String catalog, Map<String, String> env) {
     String p = "spark.sql.catalog." + catalog + ".";
