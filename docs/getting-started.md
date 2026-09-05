@@ -7,18 +7,18 @@ has_children: true
 
 # Getting started
 
-This tutorial takes you from nothing to your first search against an Iceberg table, using the local
+This tutorial guides you through your first search against an Iceberg table, using the local
 Compose stack (GrowlerDB, MinIO object storage, the Apache Polaris catalog, and the LGTM
-observability stack). It takes a few minutes — mostly pulling the images and building the sample
+observability stack). It takes a couple of minutes to pull the images and build the sample
 indexes (embeddings run on the host CPU); there's no source build on the default path.
 
 ## Prerequisites
 
 You need Docker with the Compose v2 plugin, [`just`](https://github.com/casey/just), and `jq` (the
-REST examples pipe JSON through it). The whole tutorial — including the streaming demo (§11) — runs
-entirely in containers from prebuilt images (the engine and the Spark connector are both pulled), with
-no host language toolchains required. Run it on a Linux host or a VM, or on macOS with Docker Desktop,
-not inside a container (Docker bind mounts won't resolve there). About 4 GB of RAM is enough.
+REST examples pipe JSON through it). The whole tutorial runs entirely in containers from prebuilt 
+images (the engine and the Spark connector are both pulled), with no host language toolchains 
+required. Run it on a Linux host or a VM, or on macOS with Docker Desktop. About 4 GB of RAM is 
+enough.
 
 ### Ubuntu / Debian
 
@@ -37,24 +37,6 @@ brew install --cask docker   # Docker Desktop bundles Compose v2 + buildx; launc
 brew install just jq
 ```
 
-### Optional: read the Compose MinIO directly from your host
-
-You don't need this for the tutorial. Search, `keys:get`, inline `hydrate`, the console, and the MCP
-server all hydrate **server-side** — the gateway reads object storage inside the Compose network and
-returns the rows — so nothing you run on the host touches MinIO.
-
-Add the loopback entry below **only if** you want to read the authoritative rows **directly** from the
-Compose MinIO yourself: client-side hydration, where you take the coordinates a search returns and
-fetch the rows from object storage with your own S3 client (bypassing the gateway). The catalog vends
-the in-network endpoint `minio:9000`, so map that name to localhost:
-
-```sh
-echo "127.0.0.1 minio" | sudo tee -a /etc/hosts
-```
-
-(Running the host-side test suite needs this too, for the same reason — the tests read the store
-directly.)
-
 ## 1. Bring up the full stack
 
 From the repo root:
@@ -63,12 +45,13 @@ From the repo root:
 just stack
 ```
 
-This pulls the released GrowlerDB image, brings up MinIO and Polaris, and seeds sample Iceberg tables:
-`growlerdb.docs` (3 rows), the richer `growlerdb.catalog` (10 rows), and a small `growlerdb.movies`
-slice (300 Wikipedia movie plots). It then starts the control plane, a node per index, the gateway,
-and Grafana/LGTM; each node builds and serves its index and registers with the control plane, and the
-single `--all-indexes` gateway routes each request to its named index (multi-index routing). **The
-console opens on `movies`** — a `VECTOR` index — so semantic and hybrid search are one click away.
+This pulls the latest released GrowlerDB image, brings up MinIO and Polaris, and seeds sample Iceberg
+tables: `growlerdb.movies` (300 Wikipedia movie plots), `growlerdb.docs` (3 rows),
+`growlerdb.catalog` (10 rows), and `growlerdb.events` (an Iceberg v3 variant table; see section 12).
+It then starts the control plane, the serving nodes, the gateway, and Grafana/LGTM; each node builds
+and serves one or more indexes and registers with the control plane, and the gateway routes each
+request to its named index. **The console opens on `movies`**, a `VECTOR` index for semantic and
+hybrid search.
 
 > **First run also fetches the local embedding model.** `just stack` provisions bge-small-en-v1.5
 > (~130 MB) once into `${GROWLERDB_MODEL_DIR:-~/.cache/growlerdb/models}` on the host and reuses it on
@@ -77,14 +60,6 @@ console opens on `movies`** — a `VECTOR` index — so semantic and hybrid sear
 > `GROWLERDB_MODEL_DIR` elsewhere to relocate the cache.
 
 When it settles, the console is at <http://localhost:8081> and Grafana at <http://localhost:3000>.
-
-> **Four indexes now, so every request names one.** `just stack` serves `movies`, `catalog`,
-> `docs`, and `events` (an Iceberg v3 **variant** demo — see section 12). With more than one index
-> served, the gateway can't guess a default: search and `keys:get` requests must include, e.g.,
-> `"index":"movies"` (or `docs` / `catalog` / `events`), and the console's top-left selector switches
-> between them. (Omitting `index` returns `index required; endpoint serves 4 indexes`.) The console
-> itself lands on `movies` — that's the `GROWLERDB_DEFAULT_INDEX` the gateway advertises via
-> `/v1/config` — but the REST API has no default, so name the index yourself.
 
 ## 2. Log in
 
@@ -99,12 +74,9 @@ Open <http://localhost:8081> and you'll get a login form. Sign in with the baked
 ![GrowlerDB console: the closed-mode sign-in gate shown before authentication; sign in with the demo credential](img/console-login.png)
 
 The `demo` user has the reader and operator roles (query and read index metadata; it can't create,
-drop, or ingest) and is scoped to the `movies`, `docs`, and `catalog` indexes, so a token issued to it
-can only touch those three (per-index RBAC). Sign-in mints a short-lived session token the gateway
-validates on every request.
-
-> A deliberately well-known demo credential, not a production account. Change it via the demo auth env
-> in `deploy/compose/docker-compose.yml`.
+drop, or ingest) and is scoped to the `movies`, `docs`, `catalog`, and `events` indexes, so a token
+issued to it can only touch those four (per-index RBAC). Sign-in mints a short-lived session token the
+gateway validates on every request.
 
 To call the REST API you need that token. Fetch one from the (unauthenticated) login endpoint and keep
 it in a shell variable; the `curl` examples below send it as `-H "authorization: Bearer $TOKEN"`:
@@ -160,7 +132,7 @@ GrowlerDB.
 
 ### Inline hydration (one call)
 
-If your client needs the full rows immediately, you can bypass the separate lookup step. Add `"hydrate": true` to your search query:
+If you prefer a single query for full records, add `"hydrate": true` to your search query:
 
 ```sh
 curl -s localhost:8081/v1/search \
@@ -186,7 +158,7 @@ curl -s localhost:8081/v1/search \
 }
 ```
 
-The gateway handles the key lookup in the background. It returns the authoritative row inline under `hit.row`.
+The gateway handles the hydration in the background and returns the authoritative row inline under `hit.row`.
 
 ## 4. Explore in the console
 
@@ -195,13 +167,14 @@ Open <http://localhost:8081>. Pick the `catalog` index in the top-left selector,
 with its cached fields as columns (author, category, rating, title, views), no drawer round-trip
 needed, with matched terms highlighted per cell:
 
-![GrowlerDB console: Search category:(guide OR reference) over the catalog index returns five hits in a datatable, each row showing its cached fields as columns with matched terms highlighted](img/console-search.png)
+![GrowlerDB console: Search category:(guide OR reference) over the catalog index returns five hits 
+in a datatable, each row showing its cached fields as columns with matched terms 
+highlighted](img/console-search.png)
 
-> **Tip:** the top-left selector switches between the `movies`, `docs`, and `catalog` indexes, so pick
-> the one you want to query (it opens on `movies`, the demo's default). In the console's Lucene box a
-> bare word (`search`) queries that index's
+> **Tip:** the top-left selector switches between the `movies`, `docs`, `catalog`, and `events`
+> indexes, so pick the one you want to query. In the console's Lucene box a bare word (`search`) queries that index's
 > default field, so qualify it with a field, for example `body:search` or `title:iceberg`, to match.
-> Click a hit to hydrate the full row in the drawer.
+> Click a row to hydrate the full document in the drawer on the right.
 
 - **Search & Explore**: run queries, inspect hits, hydrate rows in the drawer, export JSON/CSV.
 - **Indexes**: every index with docs, shards, sync lag, and backup state; Create index points at a
@@ -220,8 +193,6 @@ The `catalog` index is a 10-row catalog of GrowlerDB concepts with a field of ev
 type: text (`title`, `body`), keyword (`id`, `category`, `author`), numeric (`views` LONG, `rating`
 DOUBLE), a `published` DATE, a `server_ip` IP, and an `archived` BOOL. It's built for trying out the
 [query language](reference), and every operator below returns a small, known result.
-
-Because several indexes are served with no gateway default, name the index in every request:
 
 ```sh
 curl -s localhost:8081/v1/search \
@@ -256,26 +227,6 @@ The hits column lists the exact `id`s expected against the seed data.
 | 15 | NOT / `-` | `-archived:true` | the other 7: cat-01, cat-02, cat-04, cat-05, cat-07, cat-09, cat-10 |
 | 16 | Match-all | `*:*` | all 10 rows |
 | 17 | Regex (KEYWORD `id`) | `id:/cat-0[12]/` | cat-01, cat-02 |
-
-A few notes:
-
-- #2, default field. A bare term queries `body` because `body` is the first TEXT field in the
-  `catalog` mapping (the engine's default search field is the first analyzed text field). `title` is
-  also TEXT but must be qualified (`title:reference` → cat-02, cat-06).
-- #5 grouped set and #7 exclusive range. `category:(guide OR reference)` groups two terms on one
-  field, the same match set as writing `category:guide OR category:reference` out in full. `{ }` is
-  exclusive and `[ ]` inclusive; mix them per bound, for example `views:[1000 TO 2000]` → cat-03,
-  cat-07.
-- #9, CIDR. `server_ip:192.168.1.0/24` narrows to cat-03, cat-05; `192.168.0.0/16` → cat-03,
-  cat-05, cat-07, cat-09. The IP field is explicit-only in the mapping (Iceberg has no IP type).
-- #12 fuzzy and #13 boost. Boost changes only the score, not the match set. Fuzzy `~1` allows one
-  edit, so `hydrat~1` still reaches `hydrate`.
-- #8, dates. `published` is a DATE field, so range bounds accept an ISO-8601 date string
-  (`2024-01-01`) or the equivalent epoch-microseconds (`1704067200000000`). Both resolve to the same
-  canonical instant, so `published:[2024-01-01 TO *]` and `published:[1704067200000000 TO *]` return
-  the same rows.
-- #14 BOOL and #15 NOT. `archived:true` matches the three archived rows; the negation `-archived:true`
-  (≡ `NOT archived:true`) returns the other seven. `-` and `NOT` are equivalent.
 
 ### KQL
 
@@ -316,8 +267,7 @@ The `catalog` index carries one field the playground above didn't use: `body_vec
 At ingest, GrowlerDB embeds each row's `body` text with the local bge-small-en-v1.5 model (via
 ONNX Runtime, in-process) and stores the 384-dim vector, so `catalog` also supports semantic
 (nearest-neighbour) and hybrid (lexical plus semantic, fused) retrieval alongside the Lucene/KQL
-queries above. It's fully local: the model is the one `just stack` fetched in §1, so there's no
-embedding service and no API key.
+queries above.
 
 Semantic search embeds your `query_text` the same way and returns the `k` nearest rows, matching on
 meaning, so a paraphrase with no shared keywords still hits. The two hydration rows (`cat-02`,
@@ -354,17 +304,16 @@ separate "Ask" screen. GrowlerDB returns governed coordinates and **never calls 
 prose answer is the caller's job (see §7).
 
 > **Want more to explore?** `just stack` already ships a small (300-film) `movies` index. `just
-> demo-data` upgrades it to the full Wikipedia movie-plots corpus (5000+ films), where the ranking
+> demo-data` upgrades it to a larger Wikipedia movie-plots corpus (5000+ films), where the ranking
 > differences across semantic / lexical / hybrid are even clearer and agent Q&A (§7) has more to work
 > with. See [Demo corpus (movies)](demo-corpus).
 
 ## 7. Connect an AI agent (MCP)
 
 GrowlerDB is an MCP server (Model Context Protocol), so an AI agent can use the demo as a retrieval
-tool: grounded, governed search over your Iceberg data with no bespoke glue. The gateway serves the
-MCP Streamable HTTP transport at `POST /mcp` on the same port as the console and verifies the caller's
-bearer token on every tool call, so the token's tenant and per-index RBAC scoping still applies: the
-agent only ever sees what `demo` may see.
+tool. The gateway serves the MCP Streamable HTTP transport at `POST /mcp` on the same port as the
+console and verifies the caller's bearer token on every tool call, so the token's tenant and 
+per-index RBAC scoping still applies: the agent only ever sees what `demo` may see.
 
 With the stack up, one command prints everything you need:
 
@@ -372,23 +321,18 @@ With the stack up, one command prints everything you need:
 just mcp-connect
 ```
 
-It mints a demo token and prints paste-ready snippets: the Claude Code one-liner
-(`claude mcp add --transport http growlerdb http://localhost:8081/mcp --header "Authorization: Bearer <token>"`),
-a generic HTTP-MCP config block for any client, and a Claude Desktop bridge. There's no binary to
-install and no subprocess to manage, just a URL and a token. (Tokens expire; re-run to re-mint.)
+This command mints a demo token and prints snippets that can be pasted into an agent. There's no 
+binary to install and no subprocess to manage, just a URL and a token. If a token expires, re-run
+`just mcp-connect` to mint a new one.
 
-Claude Code auto-discovers the demo server via the repo's checked-in `.mcp.json`. Export the token
-the script prints:
+If Claude Code is running from the GrowlerDB repo root, it will auto-discover the demo server 
+via the repo's checked-in `.mcp.json`. Export the token the script prints:
 
 ```sh
 export GROWLERDB_DEMO_TOKEN=<token>   # printed by `just mcp-connect`
 ```
 
 Then start `claude` anywhere in this repo and approve the `growlerdb-demo` server when prompted.
-Without the export the server fails silently (no growlerdb tools in the session, and the agent will
-fall back to grepping files); verify with `/mcp` inside the session. When a token expires, note that
-`claude mcp add` won't overwrite an existing server, so run `claude mcp remove growlerdb` first (the
-`just mcp-connect` snippet does this for you).
 
 Now ask the agent something the demo data answers, like "what does the catalog say about hydration?",
 and it retrieves from `catalog` (semantic, hybrid, or lexical; `search` even hydrates authoritative
@@ -545,13 +489,12 @@ Section 10 showed the batch path: you insert into the lake, then trigger a full 
 That's right for a table that changes occasionally. For a table that changes continuously, you don't
 want to reindex on every write: GrowlerDB reads the Iceberg changelog and ingests each new snapshot
 incrementally, so rows become searchable on their own. The shipped Spark connector
-(`ConnectorApp --stream`) drives this, the same ingestion path used in production, resuming
-exactly-once from the node's committed checkpoint.
+(`ConnectorApp --stream`) provides exactly-once semantics using node's committed checkpoint.
 
 The `just pipeline` demo wires the whole streaming loop end to end (a generator → Redpanda (Kafka) →
 Iceberg → the connector → a live `telemetry_stream` index), so you can watch data flow and search it
 as it arrives, with no reindex step. It's a self-contained stack (a different node config than the
-`movies`/`docs`/`catalog` batch demo), so stop the batch stack first:
+`movies`/`docs`/`catalog`/`events` batch demo), so stop the batch stack first:
 
 ```sh
 just stack-down          # free port 8081 + the node from the batch demo
@@ -562,9 +505,8 @@ just pipeline            # deps + Polaris bootstrap + pull the connector image +
 the generator, sink, and Spark connector. Give it about 30 s for the first micro-batch to land and the
 node to build the `telemetry_stream` index; the gateway comes up once that node is ready.
 
-Tearing down the batch stack invalidated your earlier `$TOKEN`: a fresh stack signs session tokens
-with a new key, and here the demo user is re-seeded scoped to `telemetry_stream` (not `movies`/`docs`/`catalog`).
-Once the gateway is up, log in again for a token that can query it:
+Tearing down the batch stack likely invalidated your earlier `$TOKEN`. Once the gateway is up, log in 
+again for a token that can query it:
 
 ```sh
 TOKEN=$(curl -s localhost:8081/v1/login -H 'content-type: application/json' \
@@ -651,8 +593,8 @@ just stack-down
 
 - **First `just stack` is slow (~10 min).** It compiles the GrowlerDB image once; subsequent starts
   reuse the cached image and take seconds.
-- **Search returns `0 results` in the console.** Select the right index (`movies`, `docs`, or
-  `catalog`, top-left) and qualify the term with a field, `body:search`, not a bare `search` (a bare
+- **Search returns `0 results` in the console.** Select the right index (`movies`, `docs`, `catalog`,
+  or `events`, top-left) and qualify the term with a field, `body:search`, not a bare `search` (a bare
   term only matches the default field).
 - **REST search/`keys:get` returns `index required; endpoint serves 4 indexes`.** The stack serves
   four indexes, so the gateway can't pick a default; add `"index":"movies"`, `"index":"docs"`,

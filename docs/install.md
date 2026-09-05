@@ -45,16 +45,32 @@ can pin exactly or float.
 ```sh
 mise install            # install the pinned Rust toolchain
 just setup              # add rustfmt + clippy
-just build              # build the workspace (release: cargo build --release -p growlerdb-cli)
-just check              # fmt + clippy + tests (the CI gate)
+just build              # build the workspace (debug)
+just check              # fmt + clippy + tests
 ```
 
-The single binary is `growlerdb` (`target/release/growlerdb`): one binary with four long-running
-roles selected by subcommand, plus the offline index and maintenance commands.
+The single binary `growlerdb` has many modes and sub-commands.
 
 ```sh
-growlerdb --help
+./target/debug/growlerdb --help
 ```
+
+### Release build
+
+`just build` is a debug build. For real runs (`serve`, `gateway`, benchmarks), compile the optimized
+binary instead:
+
+```sh
+just build-release      # cargo build --release -p growlerdb-cli
+```
+
+This produces `target/release/growlerdb`:
+
+```sh
+./target/release/growlerdb --help
+```
+
+Install it onto your PATH with `cargo install --path crates/growlerdb-cli` to run a bare `growlerdb`.
 
 ## Connecting to the lakehouse
 
@@ -151,9 +167,3 @@ Any long-running mode given `--metrics-addr` exposes `/healthz`, `/readyz`, and 
 ```sh
 curl -f localhost:9103/readyz
 ```
-
-## Next
-
-- [Configuration](configuration): flags, env, and the index-definition YAML.
-- [Reference](reference): the query language and REST/gRPC API.
-- [Deployment](deployment): Compose and Kubernetes (Helm).
