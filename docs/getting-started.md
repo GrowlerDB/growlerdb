@@ -15,9 +15,9 @@ indexes (embeddings run on the host CPU); there's no source build on the default
 ## Prerequisites
 
 You need Docker with the Compose v2 plugin, [`just`](https://github.com/casey/just), and `jq` (the
-REST examples pipe JSON through it). The whole tutorial runs entirely in containers from prebuilt 
-images (the engine and the Spark connector are both pulled), with no host language toolchains 
-required. Run it on a Linux host or a VM, or on macOS with Docker Desktop. About 4 GB of RAM is 
+REST examples pipe JSON through it). The whole tutorial runs entirely in containers from prebuilt
+images (the engine and the Spark connector are both pulled), with no host language toolchains
+required. Run it on a Linux host or a VM, or on macOS with Docker Desktop. About 4 GB of RAM is
 enough.
 
 ### Ubuntu / Debian
@@ -167,8 +167,8 @@ Open <http://localhost:8081>. Pick the `catalog` index in the top-left selector,
 with its cached fields as columns (author, category, rating, title, views), no drawer round-trip
 needed, with matched terms highlighted per cell:
 
-![GrowlerDB console: Search category:(guide OR reference) over the catalog index returns five hits 
-in a datatable, each row showing its cached fields as columns with matched terms 
+![GrowlerDB console: Search category:(guide OR reference) over the catalog index returns five hits
+in a datatable, each row showing its cached fields as columns with matched terms
 highlighted](img/console-search.png)
 
 > **Tip:** the top-left selector switches between the `movies`, `docs`, `catalog`, and `events`
@@ -312,7 +312,7 @@ prose answer is the caller's job (see §7).
 
 GrowlerDB is an MCP server (Model Context Protocol), so an AI agent can use the demo as a retrieval
 tool. The gateway serves the MCP Streamable HTTP transport at `POST /mcp` on the same port as the
-console and verifies the caller's bearer token on every tool call, so the token's tenant and 
+console and verifies the caller's bearer token on every tool call, so the token's tenant and
 per-index RBAC scoping still applies: the agent only ever sees what `demo` may see.
 
 With the stack up, one command prints everything you need:
@@ -321,11 +321,11 @@ With the stack up, one command prints everything you need:
 just mcp-connect
 ```
 
-This command mints a demo token and prints snippets that can be pasted into an agent. There's no 
+This command mints a demo token and prints snippets that can be pasted into an agent. There's no
 binary to install and no subprocess to manage, just a URL and a token. If a token expires, re-run
 `just mcp-connect` to mint a new one.
 
-If Claude Code is running from the GrowlerDB repo root, it will auto-discover the demo server 
+If Claude Code is running from the GrowlerDB repo root, it will auto-discover the demo server
 via the repo's checked-in `.mcp.json`. Export the token the script prints:
 
 ```sh
@@ -505,7 +505,7 @@ just pipeline            # deps + Polaris bootstrap + pull the connector image +
 the generator, sink, and Spark connector. Give it about 30 s for the first micro-batch to land and the
 node to build the `telemetry_stream` index; the gateway comes up once that node is ready.
 
-Tearing down the batch stack likely invalidated your earlier `$TOKEN`. Once the gateway is up, log in 
+Tearing down the batch stack likely invalidated your earlier `$TOKEN`. Once the gateway is up, log in
 again for a token that can query it:
 
 ```sh
