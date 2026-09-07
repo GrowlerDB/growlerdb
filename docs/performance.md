@@ -1,92 +1,78 @@
 ---
-title: Performance (directional)
+title: Performance
 layout: default
 nav_order: 9
 ---
 
-# Performance (directional)
+# Performance
 {: .no_toc }
 
 1. TOC
 {:toc}
 
-> **Directional, not the formal suite.** These numbers come from a ballpark assessment on a small
-> dev VM (4 GiB / 2 vCPU, lima), not the pre-1.0 at-scale benchmark. Absolute latencies are
-> small-scale and cache-warm, so the ratios and the findings are the signal, not the milliseconds.
-> This is a directional read, not the formal staged suite (real hardware, tens of millions of rows,
-> QPS/p95/p99, cold-tier read-through, hydration throughput). Reproduce everything here
-> from [`bench/`](https://github.com/GrowlerDB/growlerdb/tree/main/bench) in the repo.
+GrowlerDB runs a head-to-head benchmark against OpenSearch on the same cluster and dataset. This page
+reports the current results: ingestion throughput, freshness, index size, and query latency.
 
-## What was measured
+## Test setup
 
-- **Dataset:** 1,000,000 synthetic IoT telemetry readings in an Iceberg table
-  (`ts, device_id, gateway, site, firmware, metric, subsystem, status, reading, message` free text),
-  with injected needles (a rare `gateway` value ×12, a rare `message` term ×12).
-- **Engines:** GrowlerDB (embedded `serve`, REST) in two flavours: `telemetry` (coordinates
-  only) and `telemetry_cached` (display fields cached, the Elasticsearch `_source` equivalent);
-  Elasticsearch 8.15 (same 1M, dual-indexed); Trino 470 querying the *same* Iceberg table (the
-  scan baseline). Indexes warm; 12–15 reps per query.
+| | |
+|---|---|
+| Dataset | `http_logs`, 25.9M rows (~10 GB raw), non-windowed Iceberg (copy-on-write) |
+| Hardware | 6× ccx43 (16 vCPU / 64 GB) on Hetzner Cloud, nbg1 |
+| GrowlerDB | current build; Spark connector streams the Iceberg changelog |
+| OpenSearch | 2.19.1, fed by Data Prepper 2.15.1 CDC (Iceberg source) |
+| Object store | Hetzner Object Storage (S3-compatible) |
 
-This covers the IoT-realistic *"show me the matching readings"* query, top-K documents rather than
-just a count, so GrowlerDB's coordinate → hydrate model is measured fairly.
+GrowlerDB indexes the Iceberg table and hydrates matching rows back from it. OpenSearch ingests a
+second copy of the data through CDC and serves it from its own store. Both engines index the same
+rows and answer the same query set.
 
-## Filter / count latency
+## Ingestion, freshness, and size
 
-Median ms, lower is better:
+| Metric | GrowlerDB | OpenSearch |
+|---|---:|---:|
+| Ingest throughput (cold-sync backfill) | ~16.8k docs/s | ~17.5k docs/s |
+| Freshness: a new row becomes searchable (p50) | ~2.5 s | ~58 s |
+| Index size (primary) | ~3.9 GB | 14.3 GB |
+| Index size vs the 10 GB raw corpus | ~0.39× | ~1.43× |
 
-| Query | Hits | **GrowlerDB** | Elasticsearch | Trino (scan) |
-|---|---:|---:|---:|---:|
-| Needle, rare keyword `gateway` | 12 | **1.7** | 5.7 | 225 |
-| Full-text rare `message ~ bearing` | 12 | **1.7** | 5.4 | 295 |
-| Filter `status=critical AND metric=vibration` | 15,459 | **3.8** | 5.7 | 156 |
-| Full-text common `message ~ reading` | 199,900 | **2.0** | 5.9 | 262 |
-| Time + filter `status=error` in a 1h window | 772 | **3.1** | 6.7 | 177 |
+GrowlerDB and OpenSearch backfill at comparable rates. During the GrowlerDB backfill the serving
+nodes sat at 6% CPU, so the connector pipeline sets the pace and headroom remains.
 
-GrowlerDB ≈ 1.7–3.8 ms · Elasticsearch ≈ 5–7 ms · Trino ≈ 156–295 ms. GrowlerDB is ~2–3× faster
-than Elasticsearch and ~50–170× faster than a Trino scan on filtered search. At 1M rows Trino's
-scan grows with the data while the index lookups stay flat: Trino scales with rows, the index
-doesn't.
+GrowlerDB makes a new row searchable about 23× faster. It commits streamed changes continuously,
+while the CDC path polls Iceberg snapshots on an interval.
 
-## Top-K documents: "show me the matching readings"
+GrowlerDB's index holds keys and search structures, not a copy of the source rows, so it stays
+smaller than the raw data. OpenSearch stores the documents (`_source`) plus a completion structure,
+so its index runs larger than the raw data. GrowlerDB ran a single primary per shard; OpenSearch ran
+one replica (29.3 GB on disk), so the table compares primaries.
 
-GrowlerDB has three return modes. Median ms for the top-20 documents:
+## Query latency
 
-| Query | GDB coords | **GDB cached** | GDB hydrate (Iceberg) | ES `_source` | Trino `SELECT *` |
-|---|---:|---:|---:|---:|---:|
-| Needle (rare) | 1.6 | **1.9** | 93 | 7.5 | 153 |
-| Text `~ bearing` | 1.7 | **1.5** | 82 | 7.3 | 244 |
-| Filter | 6.2 | **6.5** | 139 | 10.0 | 259 |
-| Text `~ reading` | 2.8 | **3.1** | 81 | 7.7 | 155 |
-| Time + filter | 5.4 | **4.9** | 187 | 7.3 | 200 |
+Median server-side latency, measured at rest.
 
-1. **Cached display fields ≈ coordinates (≈ free).** Returning telemetry fields straight from the
-   index adds almost nothing over coordinates (~1.5–6.5 ms) and is faster than ES `_source` (7–10
-   ms), embedded versus networked. For the common case (you read a reading summary), GrowlerDB is fast.
-2. **Hydration from Iceberg = 80–190 ms.** Fetching the *authoritative governed row* is the real cost
-   of the coordinate → hydrate model (~15–50× the cached path). But it is targeted: a key-equality scan
-   pruned by the sort-key column stats reads only the matching row groups, so it is still ~2× faster than
-   Trino's scan (150–260 ms), and unlike ES `_source` it is the live lakehouse row, not a search-time copy.
+| Query group | GrowlerDB | OpenSearch |
+|---|---:|---:|
+| Selective lookups and counts (point-lookup, exact term, CIDR, `match_all`) | ~7 ms | ~5 ms |
+| Broad filters, ranges, and text (high-cardinality term, range, phrase, boolean) | ~33 ms | ~5 ms |
+| Full-document retrieval (top-20, hydrated) | ~200 ms | ~10 ms |
 
-**Takeaway:** GrowlerDB wins decisively for *filter + display* (cached fields). For *authoritative,
-full-fidelity retrieval* it pays an Iceberg round-trip that Elasticsearch avoids, so cache the display
-fields you serve hot, and reserve hydration for governed/audit reads.
+Selective lookups and counts run about even on both engines. Broad filters cost GrowlerDB more: it
+does the retrieval work over large posting lists, while OpenSearch answers many of them from warmed
+counts and skip lists. Both groups stay within interactive range, and the broad-filter gap is an
+active optimization target.
 
-## Footprint & build
+Full-document retrieval is where the two designs differ. OpenSearch returns a stored copy of each
+document from its own index. GrowlerDB fetches the authoritative, governed row from Iceberg by key, so
+retrieval reads the object store. Retrieval averaged about 200 ms (roughly 20 ms when the matching
+rows cluster in the sorted layout, up to about 300 ms when they scatter), against about 10 ms for
+OpenSearch. The result is the live lakehouse row, not a second copy that can drift. Under heavy
+concurrent load, retrieval throughput follows the object store's capacity, while index-only latency
+holds flat.
 
-- **Streaming build validated at 1M:** both indexes built cleanly on the 4 GiB VM, where a
-  whole-table read would OOM-kill above ~500k rows; the connector streams bounded chunks.
-- **Index footprint (1M, Tantivy):** `telemetry` (no cached) **93 MB** · `telemetry_cached` **176 MB**
-  · Elasticsearch **155 MB**. GrowlerDB's *plain* index is more compact than ES (no `_source`); with
-  all display fields cached it is comparable. (Hydration is store-less — the index carries keys, not row
-  positions, so there is no per-row locator structure on top.)
+## Reading these numbers
 
-## Honest limitations
-
-- **ES `_source` beats GrowlerDB hydration on raw latency** (but not governance). If sub-10 ms
-  *authoritative* single-doc retrieval is a hard requirement, that is a gap today; cached display
-  fields close it for the display case.
-- The cold-tier read path already serves cold data without a full restore, but its at-scale
-  read-through latency is part of the formal suite, not measured here.
-- These are single-node, cache-warm, small-VM numbers, not the formal suite (real hardware, tens of
-  millions of events, concurrency/QPS, p95/p99, cold vs warm cache, hydration throughput at K, an
-  apples-to-apples ES/OpenSearch-at-scale and Spark/Trino full-text baseline).
+GrowlerDB reflects the current optimization build; OpenSearch 2.19.1 is a fixed baseline measured on
+the same cluster and dataset. Retrieval and broad-scan latency keep improving between rounds, so a
+per-query breakdown will follow once the numbers settle. Reproduce the setup from
+[`bench/`](https://github.com/GrowlerDB/growlerdb/tree/main/bench).
