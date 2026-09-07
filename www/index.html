@@ -136,6 +136,11 @@
   .card h3 { font: 700 18px 'Archivo', sans-serif; letter-spacing: -0.01em; color: var(--white); margin: 10px 0 8px; }
   .card p { margin: 0; font-size: 14px; line-height: 1.6; }
 
+  /* Product shot */
+  .shot { margin: 0; display: flex; flex-direction: column; align-items: center; gap: 14px; }
+  .shot img { display: block; width: 100%; height: auto; border: 1px solid var(--line-strong); border-radius: 14px; box-shadow: 0 24px 70px rgba(0, 0, 0, 0.45); }
+  .shot figcaption { max-width: 640px; text-align: center; font-size: 13px; color: var(--text-3); }
+
   .why { display: flex; flex-direction: column; gap: 22px; }
   .why h2 { font: 700 30px/1.2 'Archivo', sans-serif; letter-spacing: -0.02em; color: var(--white); margin: 0; text-align: center; }
   .why-list { display: flex; flex-direction: column; gap: 12px; max-width: 760px; margin: 0 auto; width: 100%; }
@@ -210,6 +215,14 @@
 </header>
 
 <main class="wrap">
+  <section aria-label="The GrowlerDB console">
+    <figure class="shot">
+      <img src="/img/console-search.png" width="2880" height="1800" loading="lazy" decoding="async"
+        alt="The GrowlerDB console: a search over the catalog index — a Lucene query with ranked results showing score, id, author, category, rating, title, and views, alongside saved queries and facets.">
+      <figcaption>The GrowlerDB console — full-text, vector, and hybrid search, with cached fields and coordinates in every result.</figcaption>
+    </figure>
+  </section>
+
   <section class="how" aria-label="How it works">
     <div class="card">
       <div class="kicker">1 — INDEX</div>

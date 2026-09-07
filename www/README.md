@@ -29,9 +29,10 @@ https://…   ─▶ 200, this index.html (Let's Encrypt cert)
 
 The page is a **self-contained static bundle** (Brand v1.0): `index.html` (inline CSS + inline
 [schema.org JSON-LD](#seo--search-engine-submission)), `favicon.svg` (the waterline mark), `fonts/`
-(self-hosted Archivo / Instrument Sans / Geist Mono woff2 — no font CDN), plus `robots.txt` and
-`sitemap.xml` for crawlers. The only external reference is the social image, pulled from
-`docs.growlerdb.com`. To publish, sync the bundle (minus this README) to the Apache document root:
+(self-hosted Archivo / Instrument Sans / Geist Mono woff2 — no font CDN), `img/console-search.png` (the
+product screenshot, reused from `../docs/img/`), plus `robots.txt` and `sitemap.xml` for crawlers. The
+only external reference is the social image, pulled from `docs.growlerdb.com`. To publish, sync the
+bundle (minus this README) to the Apache document root:
 
 ```sh
 # from the repo root, on a host with SSH access to the VM
