@@ -72,8 +72,8 @@ full scan use the keyset `search_after` scroll rather than an unbounded page. Wh
 the response carries `"partial": true` (and `/v1/suggest`, `/v1/keys:get` carry `"failed_shards": N`)
 so the result's incompleteness is never silent; the flag is omitted on a complete result.
 
-Inline hydration (opt-in). Set `"hydrate": true` to get the search → `/v1/keys:get` round trip
-in one call: each hit also carries `row`, its authoritative source row, resolved through the
+Inline hydration (opt-in). Set `"hydrate": true` to fold the search and the `/v1/keys:get` round trip
+into one call: each hit also carries `row`, its authoritative source row, resolved through the
 same governed, key-verified path as `/v1/keys:get` (`hydrate_columns` projects it; empty = all).
 Unlike `fields` (index-cached copies), `row` holds the source-of-truth values. Only the returned page
 is hydrated, and a page above the hydration batch maximum (1000) is rejected up front. A row that
@@ -137,38 +137,38 @@ and what a query can do with it (`indexed` = term-queryable, `fast` = range/sort
 the schema clients compose valid queries from (console pickers, the MCP `describe_index` tool).
 
 ### `POST /v1/index:reindex`
-Rebuild an index from its source and cut over atomically (`{ "index": "<name>" }`; empty ⇒ the served
-index), **synchronously** to completion — for a long multi-shard rebuild prefer the async job API
+Rebuild an index from its source and cut over atomically (`{ "index": "<name>" }`; empty means the served
+index), synchronously to completion. For a long multi-shard rebuild prefer the async job API
 (`POST /v1/jobs`, below). A multi-shard rebuild is coordinated by the control plane: build every
-shard's next generation, then promote all and bump the routing generation — a build failure discards
-every staged generation (never a half-swap). A **windowed** index rebuilds one window at a time.
-**Zero write-downtime**: the build runs unfenced (writes keep flowing to the live generation) and the
-write-fence engages only for the brief cutover swap, with the build-window delta reconciled
-exactly-once (no `CheckpointGap`). The rebuild is single-flight — a second concurrent reindex returns
+shard's next generation, then promote all and bump the routing generation. A build failure discards
+every staged generation (never a half-swap). A windowed index rebuilds one window at a time.
+The build runs with zero write-downtime: it stays unfenced (writes keep flowing to the live
+generation) and the write-fence engages only for the brief cutover swap, with the build-window delta
+reconciled exactly-once (no `CheckpointGap`). The rebuild is single-flight: a second concurrent reindex returns
 `412`. Before starting, the control plane runs an up-front free-disk check across every shard and
 refuses with `412` naming the short nodes, rather than failing mid-rebuild. This is the Engine-side
 trigger behind the console's reindex button.
 
-### `POST /v1/jobs` — async reindex jobs
-Start a coordinated reindex as a background **job**: returns `202` with `{ "job_id" }` immediately.
+### `POST /v1/jobs`: async reindex jobs
+Start a coordinated reindex as a background job: returns `202` with `{ "job_id" }` immediately.
 Poll `GET /v1/jobs/{id}` for its `state` (`pending` → `building` → `cutting_over` → `done`, or
 `failed` / `canceled`) plus per-shard/window progress (`docs_done` / `docs_total`, `generation`);
-`GET /v1/jobs` lists jobs newest-first. `DELETE /v1/jobs/{id}` requests cancellation — the in-flight
+`GET /v1/jobs` lists jobs newest-first. `DELETE /v1/jobs/{id}` requests cancellation: the in-flight
 build aborts, every staged generation is discarded, and the live generation is left intact
-(idempotent on a finished job). Jobs are durable (they survive a control-plane restart — a job still
+(idempotent on a finished job). Jobs are durable (they survive a control-plane restart; a job still
 running when the control plane died is reported `failed`, the old generation intact) and one reindex
 runs per index at a time. `growlerdb reindex --control-plane` streams a job's progress in the
 terminal (`--detach` to just print the id); `growlerdb jobs list|get|cancel` manage them.
 
 ### `POST /v1/index:alter`
-Plan (and optionally apply) an **index-definition change** (`{ "index", "definition_yaml", "apply" }`;
-empty `index` ⇒ the served index). Diffs the candidate against the current definition and returns
+Plan (and optionally apply) an index-definition change (`{ "index", "definition_yaml", "apply" }`;
+empty `index` means the served index). Diffs the candidate against the current definition and returns
 `{ "is_noop", "requires_reindex", "reindex_reasons", "in_place_changes", "applied", "reindex_triggered",
-"generation" }`. When `apply` is `true` the control plane updates the registry definition **durably**
-(it survives restart — a node booting afterward loads the new definition from the registry, not a
+"generation" }`. When `apply` is `true` the control plane updates the registry definition durably
+(it survives restart; a node booting afterward loads the new definition from the registry, not a
 stale local copy). A metadata-only change (rename, `sensitive` flip, `max_bytes` redeclare) takes
 effect live; a change that alters the indexed representation (fields, types, analyzers, `fast`/`cached`,
-key, source) **triggers a coordinated reindex** from the new definition and cuts over to it
+key, source) triggers a coordinated reindex from the new definition and cuts over to it
 (`reindex_triggered`, with the new `generation`). A node started without source access returns `501`.
 
 ## Aggregations & facets
@@ -205,11 +205,11 @@ definition. Request/response (`results` is a JSON object of name → result):
   "over_time": { "buckets": [ { "key": 1719792000000000, "doc_count": 128 }, … ] } }
 ```
 
-**Shard-undercount flag.** `AggregateResponse.failed_shards` is `0` on a complete result; when `> 0`
+Shard-undercount flag: `AggregateResponse.failed_shards` is `0` on a complete result; when `> 0`
 that many shards didn't respond and the merged buckets under-count those shards' documents, a
 flagged gap, never silent. Terms buckets also carry Tantivy's `doc_count_error_upper_bound`
 (cross-shard top-N is exact only within the over-fetch window) and `sum_other_doc_count` (the long
-tail below the top-`size`). `Aggregate` needs the Search scope, same as a query.
+tail below the top-`size`). `Aggregate` needs the search scope, same as a query.
 
 ### `POST /v1/facets`
 
@@ -232,7 +232,7 @@ curl -s localhost:8081/v1/facets -H 'content-type: application/json' -d '{
     { "field": "author",   "buckets": [ { "value": "carol", "count": 3 }, … ] } ] }
 ```
 Up to 12 fields per call; `size` defaults to 10 (capped at 100). When a shard fails the response adds
-`"partial": true` (omitted on a complete result). Needs the Search scope.
+`"partial": true` (omitted on a complete result). Needs the search scope.
 
 ## Index management (gateway `--control-plane`)
 
@@ -247,7 +247,7 @@ Up to 12 fields per call; `size` defaults to 10 (capped at 100). When a shard fa
 | `GET` | `/v1/aliases` | List alias → index mappings. |
 | `POST` | `/v1/aliases` | Point an alias at an index (`{ "alias", "index" }`); admin only. |
 | `DELETE` | `/v1/aliases/{alias}` | Remove an alias; admin only. |
-| `GET` | `/v1/index:activity` (`POST`) | Recent index-lifecycle activity. |
+| `POST` | `/v1/index:activity` | Recent index-lifecycle activity. |
 | `GET` | `/v1/license` | Enterprise-license status (licensee, nodes in use vs. limit). |
 
 Reads (`GET`) need the index-read scope; alias writes need admin.
@@ -263,7 +263,7 @@ segments and backups. Maintenance operations require operator/admin privileges.
 
 ### `POST /v1/index:compact`
 Merge the served shard's segments. Returns the live segment count before and after
-(`{ "index": "<name>" }` ⇒ empty for the served index).
+(`{ "index": "<name>" }` means empty for the served index).
 ```json
 { "segments_before": 7, "segments_after": 1 }
 ```
@@ -340,7 +340,7 @@ Same surface over gRPC (proto package `growlerdb.v1`):
 - **Control plane**: `ControlPlane`: `CreateIndex` / `DropIndex` / `ListIndexes` / `GetIndex` /
   `DescribeSource` / `RegisterServedIndex` / `IngestionStatus` / `PlanReshard` / `ApplyReshard` /
   `MoveBucket`.
-  `GetIndex` also vends the index's virtual-bucket map (empty ⇒ default `fnv % shards`
+  `GetIndex` also vends the index's virtual-bucket map (empty means default `fnv % shards`
   routing). `RegisterServedIndex` takes `shard_ordinals` so node *k* claims only shard *k* of a
   multi-node index. `PlanReshard` computes the bounded bucket→shard reassignment for a new shard
   count (read-only). `ApplyReshard` executes a growth reshard: it builds the new shards from source

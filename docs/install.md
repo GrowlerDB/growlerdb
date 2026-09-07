@@ -90,7 +90,7 @@ export GROWLERDB_S3_SECRET_KEY=minioadmin
 
 ### 1. Embedded (single binary)
 
-Index a table, then search it, no servers needed. Best for laptops, CI, demos, and small corpora.
+Index a table, then search it. No servers needed. Best for laptops, CI, demos, and small corpora.
 
 ```sh
 # Build the index from a source table (auto-maps the schema; --name defaults to the last segment).
@@ -115,7 +115,7 @@ Maintenance commands operate on a local index:
 `GROWLERDB_BACKUP_BUCKET` (see [Configuration](configuration#environment)). After a restore the
 connector resumes the tail from the backed-up checkpoint (exactly-once).
 
-### 2. `serve` (a Node)
+### 2. `serve` (a node)
 
 Host an already-built index over gRPC (Write + Search + Lookup + Suggest + Admin + System), and
 optionally the REST API + console. Register with a control plane so it's cluster-visible.

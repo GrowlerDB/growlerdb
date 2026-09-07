@@ -34,12 +34,12 @@ override the local-dev defaults:
 | `GROWLERDB_CATALOG_CREDENTIAL` | none | Catalog OAuth `client:secret` (Polaris). |
 | `GROWLERDB_CATALOG_SCOPE` | none | Optional catalog OAuth scope. |
 | `GROWLERDB_S3_ENDPOINT` | `http://localhost:9000` | Object-store endpoint. |
-| `GROWLERDB_S3_ACCESS_KEY` | `minioadmin` | Object-store access key. Empty ⇒ the AWS credential chain (instance profile / STS / EKS IRSA). |
-| `GROWLERDB_S3_SECRET_KEY` | `minioadmin` | Object-store secret key. Empty ⇒ the AWS credential chain (as above). |
+| `GROWLERDB_S3_ACCESS_KEY` | `minioadmin` | Object-store access key. Empty means the AWS credential chain (instance profile / STS / EKS IRSA). |
+| `GROWLERDB_S3_SECRET_KEY` | `minioadmin` | Object-store secret key. Empty means the AWS credential chain (as above). |
 | `GROWLERDB_S3_REGION` | `us-east-1` | Object-store region. |
 | `GROWLERDB_BACKUP_BUCKET` | none | Bucket for `backup`/`restore` (reuses the `GROWLERDB_S3_*` credentials/endpoint). |
 | `GROWLERDB_MODEL_DIR` | `~/.cache/growlerdb/models` | Where the local embedder loads models from (`<dir>/<model-id>/`). Only the index nodes, which embed `VECTOR` fields at ingest, read it. |
-| `GROWLERDB_LICENSE` | none | Enterprise scale-limit license token (set on the control plane). Unset ⇒ the free tier. |
+| `GROWLERDB_LICENSE` | none | Enterprise scale-limit license token (set on the control plane). Unset means the free tier. |
 
 In Kubernetes the [Helm chart](deployment#kubernetes-helm) wires these from a ConfigMap (non-secret)
 and a Secret (credentials); the credentials should come from a `Secret`, never inline.
@@ -55,7 +55,7 @@ your hardware without a rebuild. Set each on the gateway process.
 | `GROWLERDB_MAX_FETCH` | `10000` | Ceiling on `offset + limit` per query; over it returns `InvalidArgument`. `0` = unbounded. |
 | `GROWLERDB_MAX_CONCURRENT_FANOUT` | `256` | Per-shard RPCs in flight across all scatter-gathers. `0` = unbounded. |
 | `GROWLERDB_REQUIRE_AUTH` | _unset_ | When truthy (`1`/`true`/`yes`/`on`), the gateway refuses to start unless authentication is configured (`--oidc-issuer` or `--builtin-auth`). Use it in production so a missing auth flag fails fast instead of serving open. |
-| `GROWLERDB_DEFAULT_INDEX` | _unset_ | The index the console selects by default — its front door — advertised via `/v1/config`. Unset ⇒ the console uses the first index. |
+| `GROWLERDB_DEFAULT_INDEX` | _unset_ | The index the console selects by default, advertised via `/v1/config`. Unset means the console uses the first index. |
 
 Running the gateway without `--oidc-issuer` or `--builtin-auth` leaves it open (no authentication).
 That is fine for local use and prints a warning at startup; set `GROWLERDB_REQUIRE_AUTH` to turn the
@@ -102,7 +102,7 @@ source:
 key:
   partition_fields: [region]  # co-locate a partition on a shard (partition routing)
   identifier_fields: [id]     # the per-document identity
-# tenant_field: optional, enables non-widenable tenant scoping (must be a KEYWORD field).
+# tenant_field: optional; turns on non-widenable tenant scoping (must be a KEYWORD field).
 tenant_field: tenant
 mapping:
   selection: EXPLICIT         # ALL = index every source field; EXPLICIT = only those listed
@@ -133,9 +133,9 @@ Beyond `type`, each mapped field takes optional per-field knobs:
 
 | Option | Applies to | Default | Effect |
 |---|---|---|---|
-| `cached` | any | `false` | Store the value in-index and return it with the hit, so a page renders **without hydration**. Cache the display fields you serve hot. |
-| `fast` | scalar | `false` | Columnar **fast** field — sortable, filterable, and aggregatable in-index. |
-| `indexed` | scalar | per type | Whether the field gets an inverted index. TEXT/KEYWORD are always indexed; numeric/date/IP default to `!fast`. Set `indexed: true` with `fast: true` to keep both. |
+| `cached` | any | `false` | Store the value in-index and return it with the hit, so a page renders without hydration. Cache the display fields you serve hot. |
+| `fast` | scalar | `false` | Columnar `fast` field: sortable, filterable, and aggregatable in-index. |
+| `indexed` | scalar | per type | Whether the field gets an inverted index. TEXT/KEYWORD are always indexed; numeric/date/IP are indexed only when not marked `fast`. Set `indexed: true` with `fast: true` to keep both. |
 | `analyzer` | TEXT | built-in | Analyzer name for a TEXT field. |
 | `record` | TEXT | `POSITION` | How much the inverted index records: `BASIC` (doc ids), `FREQ` (+ term frequencies, full BM25), or `POSITION` (+ positions, phrase queries). Drop to `FREQ` on text never phrase-searched. |
 | `fieldnorms` | TEXT | `true` | Store per-doc field lengths (BM25 length-normalization). `false` drops ~1 byte/doc on pure filter/needle fields. |
@@ -153,7 +153,7 @@ A `VECTOR` field is opt-in and derived. Rather than mapping a source column, it 
 `vector:` config naming a text `source_field`, and GrowlerDB embeds that field's value into a dense
 vector at ingest. That powers `POST /v1/search:semantic` and `/v1/search:hybrid` (and the console's
 Search Semantic / Hybrid modes). Embedding runs locally by default, in-process, with no egress and no
-API key, so a vector field adds semantic retrieval without an external service.
+API key, so no external service is required.
 
 ```yaml
     - { path: body_vec, type: VECTOR,
@@ -182,7 +182,7 @@ sort, the console time filter, and window pruning all use. A source column rarel
 It may be an `int64` of epoch millis (very common), or an ISO-8601 string. Set a `format`
 on the field and GrowlerDB normalizes it to canonical micros at ingest. A field with a `format` is
 a `DATE` regardless of its source type, so a plain integer or string column becomes a real
-timestamp. You don't also write `type: DATE`; the two together is rejected unless the type *is*
+timestamp. You don't also write `type: DATE`; the two together are rejected unless the type *is*
 `DATE`.
 
 | `format` | Source value | Example |
@@ -232,8 +232,8 @@ The gateway is open unless you enable AuthN. Your options:
 
 **Tenant scoping.** When an index sets `tenant_field`, every read gets a mandatory, non-scoring
 `tenant_field = <verified claim>` filter ANDed in. No query (`OR`, nested bool) can widen past it,
-and a request with no verified claim is denied. RBAC maps verified roles to operation scopes
-(viewer / index-admin / operator / service).
+and a request with no verified claim is denied. RBAC maps verified roles (`reader`, `operator`,
+`admin`) to operation scopes.
 
 ### Service credentials & internal transport {#service-credentials}
 
@@ -260,4 +260,4 @@ services (node, gateway, connector), not end users.
   It is optional and off by default (the loopback demo doesn't need it). When enabled, clients
   dial it over TLS by setting `GROWLERDB_CP_TLS_CA` (PEM CA verifying the control-plane's server
   certificate); add `GROWLERDB_CP_TLS_CERT` / `GROWLERDB_CP_TLS_KEY` for a client identity (mTLS) and
-  `GROWLERDB_CP_TLS_DOMAIN` (default `localhost`) for the expected server SAN. Unset ⇒ plaintext.
+  `GROWLERDB_CP_TLS_DOMAIN` (default `localhost`) for the expected server SAN. Unset means plaintext.

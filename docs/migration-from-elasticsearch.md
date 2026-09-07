@@ -14,10 +14,10 @@ two integration paths.
 
 | | Elasticsearch / OpenSearch | GrowlerDB |
 |---|---|---|
-| System of record | the engine's own `_source` | **Apache Iceberg** (the lakehouse) |
-| A search returns | full documents | **document coordinates** (the composite key) + score |
-| Getting the row | already in the hit | **hydrate by key** from Iceberg (`/v1/keys:get`), catalog-governed |
-| Ingestion | `_bulk` / index API | a **changelog connector** keeps the index in sync with the source table |
+| System of record | the engine's own `_source` | Apache Iceberg (the lakehouse) |
+| A search returns | full documents | document coordinates (the composite key) + score |
+| Getting the row | already in the hit | hydrate by key from Iceberg (`/v1/keys:get`), catalog-governed |
+| Ingestion | `_bulk` / index API | a changelog connector keeps the index in sync with the source table |
 | Mappings | index mapping | an [index definition](reference) over a source table |
 
 So the mental shift is that the lake is the source of truth and GrowlerDB is a derived index. You
