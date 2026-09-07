@@ -28,8 +28,8 @@ catalog, bucket, and table:
 | **Ingestion** (Spark connector) | Streams the Iceberg changelog into the index | `spark-submit --conf spark.sql.catalog.*` + `GROWLERDB_S3_*` env |
 
 Both authenticate to S3 with the same `GROWLERDB_S3_*` credentials: the engine reads them directly,
-and the connector maps them onto the catalog's Iceberg `S3FileIO` properties for you. Set the one
-credential; or leave the S3 keys empty to authenticate by an IAM role instead (see
+and the connector maps them onto the catalog's Iceberg `S3FileIO` properties for you. Set the S3 keys
+once and both sides use them, or leave them empty to authenticate by an IAM role instead (see
 [Limitations](#limitations)).
 
 ## Before you start
@@ -65,6 +65,10 @@ GROWLERDB_S3_SECRET_KEY=...
 GROWLERDB_S3_REGION=us-east-1
 GROWLERDB_SOURCE_TABLE=your_namespace.your_table
 GROWLERDB_INDEX_NAME=your_index
+GROWLERDB_LOGIN_USER=demo                      # console/API sign-in
+GROWLERDB_LOGIN_PASSWORD=change-me
+GROWLERDB_SERVICE_TOKEN=change-me              # mesh auth (must match the connector's)
+GROWLERDB_AUTH_SECRET=change-me                # signs session tokens
 ```
 
 On first boot the node builds an index from your table's current snapshot, auto-mapping every
@@ -111,19 +115,23 @@ spark-submit \
   --stream
 ```
 
-Provide the connector's S3 credentials the same way as the engine — it maps `GROWLERDB_S3_*` onto the
-catalog's Iceberg `S3FileIO` properties itself. Leave them empty to authenticate by an IAM role
-(instance profile / STS / EKS IRSA) instead:
+Give the connector its S3 credentials the same way as the engine. It maps `GROWLERDB_S3_ACCESS_KEY`,
+`GROWLERDB_S3_SECRET_KEY`, and `GROWLERDB_S3_REGION` onto the catalog's Iceberg `S3FileIO` properties
+(the endpoint comes from the `--conf` above). For static keys, export them:
 
 ```sh
 export GROWLERDB_S3_ACCESS_KEY=AKIA... GROWLERDB_S3_SECRET_KEY=... GROWLERDB_S3_REGION=us-east-1
 export GROWLERDB_SERVICE_TOKEN=...   # must match the value in your .env (mesh auth)
 ```
 
+To authenticate by an IAM role instead (instance profile, STS, or EKS IRSA), leave
+`GROWLERDB_S3_ACCESS_KEY` and `GROWLERDB_S3_SECRET_KEY` unset and export only `GROWLERDB_SERVICE_TOKEN`.
+
 A few `--conf` notes: `type=rest` selects the REST catalog; `cache-enabled=false` is required for
 streaming, so each trigger sees new snapshots; `io-impl=…S3FileIO` plus the `s3.*` settings point
-Spark at your bucket. For AWS S3 use `s3.path-style-access=false` (virtual-hosted); for MinIO use
-`true`. The `ConnectorApp` args (`--identifier`, `--fields`, `--table`, `--index`, `--node`,
+Spark at your bucket. This `s3.path-style-access` setting controls the connector's own S3 client: for
+AWS S3 use `false` (virtual-hosted), for MinIO use `true`. The engine always uses path-style (see
+[Limitations](#limitations)), independent of this connector setting. The `ConnectorApp` args (`--identifier`, `--fields`, `--table`, `--index`, `--node`,
 `--control-plane`, `--stream`) tell it what to ingest and where. See the
 [connector README](https://github.com/GrowlerDB/growlerdb/blob/main/connector/README.md).
 
@@ -134,7 +142,7 @@ These are constraints of the current engine. Plan around them:
 - REST catalogs only. The engine builds an Iceberg `RestCatalog`; AWS Glue, Hadoop, and non-REST
   Nessie modes are not supported for the query/hydration side. (The Spark connector can read other
   catalog types, but hydration needs REST, so the end-to-end loop requires a REST catalog.)
-- S3 auth: static keys or an IAM role. Set `GROWLERDB_S3_ACCESS_KEY`/`GROWLERDB_S3_SECRET_KEY` for static keys, or leave them empty to use the AWS credential chain — EC2/ECS instance profile (IMDS), assume-role/STS, and EKS IRSA web-identity all work. On EKS, annotate the pod's ServiceAccount with the role (`eks.amazonaws.com/role-arn`) and leave the keys empty; the Helm chart's `serviceAccount.annotations` wires this.
+- S3 auth: static keys or an IAM role. Set `GROWLERDB_S3_ACCESS_KEY`/`GROWLERDB_S3_SECRET_KEY` for static keys, or leave them empty to use the AWS credential chain (EC2/ECS instance profile via IMDS, assume-role/STS, and EKS IRSA web-identity). On EKS, annotate the pod's ServiceAccount with the role (`eks.amazonaws.com/role-arn`) and leave the keys empty; the Helm chart's `serviceAccount.annotations` wires this.
 - Path-style S3 access is forced on by the engine. It is required for MinIO and still works with
   AWS S3 today; strict virtual-hosted-only setups aren't supported.
 - Rotate the secrets. `GROWLERDB_SERVICE_TOKEN` (mesh auth) and `GROWLERDB_AUTH_SECRET` (gateway

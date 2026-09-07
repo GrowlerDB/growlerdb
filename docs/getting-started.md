@@ -56,7 +56,7 @@ hybrid search.
 > **First run also fetches the local embedding model.** `just stack` provisions bge-small-en-v1.5
 > (~130 MB) once into `${GROWLERDB_MODEL_DIR:-~/.cache/growlerdb/models}` on the host and reuses it on
 > every later run (and from host `cargo test`/eval). It powers the semantic and hybrid search modes
-> (§6): embedding runs in-process on ONNX Runtime, fully local, with no API key. Point
+> (section 6): embedding runs in-process on ONNX Runtime, fully local, with no API key. Point
 > `GROWLERDB_MODEL_DIR` elsewhere to relocate the cache.
 
 When it settles, the console is at <http://localhost:8081> and Grafana at <http://localhost:3000>.
@@ -97,7 +97,7 @@ curl -s localhost:8081/v1/search \
   -d '{"index":"docs","query":"title:iceberg","limit":5}'
 ```
 
-You get the matching keys and scores, with no row contents, just the coordinates:
+You get the matching keys and scores, only the coordinates and no row contents:
 
 ```json
 {
@@ -297,15 +297,15 @@ curl -s localhost:8081/v1/search:hybrid \
 
 In the console, the Search screen opens on the `movies` index (a `VECTOR` index): a Lexical /
 Semantic / Hybrid mode selector appears (it shows only for an index with a `VECTOR` field) and a **Try
-semantic** hint invites you in. Pick Semantic or Hybrid and describe what you want in plain language —
-e.g. *a heist that goes wrong* — from the same box; matching rows come back, each with a citation to
-its exact Iceberg coordinates. Retrieval lives in one search box that gets smarter — there is no
+semantic** hint invites you in. Pick Semantic or Hybrid and describe what you want in plain language,
+for example *a heist that goes wrong*, from the same box. Matching rows come back, each with a citation to
+its exact Iceberg coordinates. Retrieval lives in one search box that gets smarter. There is no
 separate "Ask" screen. GrowlerDB returns governed coordinates and **never calls an LLM**; generating a
-prose answer is the caller's job (see §7).
+prose answer is the caller's job (see section 7).
 
 > **Want more to explore?** `just stack` already ships a small (300-film) `movies` index. `just
 > demo-data` upgrades it to a larger Wikipedia movie-plots corpus (5000+ films), where the ranking
-> differences across semantic / lexical / hybrid are even clearer and agent Q&A (§7) has more to work
+> differences across semantic / lexical / hybrid are even clearer and agent Q&A (section 7) has more to work
 > with. See [Demo corpus (movies)](demo-corpus).
 
 ## 7. Connect an AI agent (MCP)
@@ -338,8 +338,8 @@ Now ask the agent something the demo data answers, like "what does the catalog s
 and it retrieves from `catalog` (semantic, hybrid, or lexical; `search` even hydrates authoritative
 rows in the same call with `hydrate: true`), grounded by governed coordinates and citations scoped by
 the demo token's RBAC. As everywhere else, GrowlerDB never calls an LLM: it returns the retrieved,
-access-controlled source rows, and the agent composes the answer from them. Retrieval with citations
-is the product; the model stays yours.
+access-controlled source rows, and the agent composes the answer from them. GrowlerDB returns the
+retrieved rows with citations; choosing and running a model is up to you.
 
 > A stdio transport (`growlerdb mcp`) also exists for environments where the agent can't reach the
 > gateway over HTTP. See the
@@ -378,7 +378,7 @@ You get OpenSearch-shaped documents: `_id` from the key, `_source` hydrated from
 
 (The doubled `hits.hits` is OpenSearch's own response envelope: the outer `hits` object carries
 result metadata and the inner array carries the documents, reproduced verbatim so existing clients
-parse it unchanged. GrowlerDB's native `/v1/search` in §3 has no such nesting.)
+parse it unchanged. GrowlerDB's native `/v1/search` in section 3 has no such nesting.)
 
 So an existing OpenSearch/Elasticsearch client can point at GrowlerDB unchanged.
 
@@ -427,7 +427,7 @@ docker compose -f deploy/compose/docker-compose.yml exec trino trino --execute \
   "INSERT INTO iceberg.growlerdb.catalog VALUES ('cat-11','Trino Insert Roundtrip','insert a row through trino then reindex growlerdb to make it searchable end to end','tutorial','alice',BIGINT '1234',DOUBLE '4.5',BIGINT '1719792000000','10.0.5.11',false)"
 ```
 
-`1719792000000` is `2024-07-01` in epoch-milliseconds, matching the Iceberg source table's raw storage representation configured as `format: epoch_ms` (which GrowlerDB automatically scales to its native microsecond resolution during ingestion).
+`1719792000000` is `2024-07-01` in epoch-milliseconds, matching the source column's `format: epoch_ms`. GrowlerDB scales that to its native microsecond resolution during ingestion.
 The row is now in Iceberg, and a Trino `SELECT ... WHERE id = 'cat-11'` shows it immediately, but the
 `catalog` index doesn't know about it yet. A search for it still returns nothing until we reindex.
 
@@ -489,7 +489,7 @@ Section 10 showed the batch path: you insert into the lake, then trigger a full 
 That's right for a table that changes occasionally. For a table that changes continuously, you don't
 want to reindex on every write: GrowlerDB reads the Iceberg changelog and ingests each new snapshot
 incrementally, so rows become searchable on their own. The shipped Spark connector
-(`ConnectorApp --stream`) provides exactly-once semantics using node's committed checkpoint.
+(`ConnectorApp --stream`) provides exactly-once semantics using the node's committed checkpoint.
 
 The `just pipeline` demo wires the whole streaming loop end to end (a generator → Redpanda (Kafka) →
 Iceberg → the connector → a live `telemetry_stream` index), so you can watch data flow and search it
@@ -501,7 +501,7 @@ just stack-down          # free port 8081 + the node from the batch demo
 just pipeline            # deps + Polaris bootstrap + pull the connector image + bring it all up
 ```
 
-`just pipeline` pulls the connector image (fat jar baked in — no host build) on first run, then starts
+`just pipeline` pulls the connector image (fat jar baked in, no host build) on first run, then starts
 the generator, sink, and Spark connector. Give it about 30 s for the first micro-batch to land and the
 node to build the `telemetry_stream` index; the gateway comes up once that node is ready.
 
@@ -524,7 +524,7 @@ curl -s localhost:8081/v1/search \
 
 Run it again a few seconds later and `total` climbs: new rows appeared on their own, because the
 connector picked up each Iceberg changelog snapshot and ingested it. Watch the same thing on the
-console's Observability → Ingestion screen: the per-shard lag (source head − committed checkpoint)
+console's Observability → Ingestion screen: the per-shard lag (source head minus committed checkpoint)
 sawtooths up between the connector's 5 s micro-batches and drops as each one commits, and the
 `telemetry_stream` doc count on the Indexes screen keeps climbing. Raise the generator's `RATE`
 (default 50/s) to push ingest throughput up.
@@ -548,15 +548,19 @@ Tear the streaming demo down with `just pipeline-down`.
 semi-structured `payload` variant whose shape differs per row. A variant column has no fixed leaf
 schema, so GrowlerDB maps it two composable ways ([variant fields](https://github.com/GrowlerDB/growlerdb/blob/main/okf/product/functional/index-management/variant.md)):
 
-- **Flatten** — every leaf is indexed untyped as an exact `path = value` term, plus an analyzed
-  full-text catch-all over string leaves. No declaration needed; covers the whole value.
-- **Shapes** — named typed sub-mappings (`payload.number` LONG, `payload.title` TEXT + a VECTOR,
+- **Flatten**: every leaf is indexed untyped as an exact `path = value` term, plus an analyzed
+  full-text catch-all over string leaves. No declaration needed; it covers the whole value.
+- **Shapes**: named typed sub-mappings (`payload.number` LONG, `payload.title` TEXT + a VECTOR,
   …) selected per row by a **discriminator** (`event_type`), giving ranges/sorts/hybrid on declared
   paths. See [`deploy/compose/events.yaml`](https://github.com/GrowlerDB/growlerdb/blob/main/deploy/compose/events.yaml).
 
 Because released iceberg-rust can't yet scan a v3 variant table, `events` is **connector-fed** (its
-rows are extracted by the Spark connector) and **hydrated through Trino** — transparently; you query
-it exactly like any other index. Reusing the `$TOKEN` from section 2:
+rows are extracted by the Spark connector) and **hydrated through Trino**, transparently: you query
+it exactly like any other index.
+
+This section uses the batch stack from `just stack`. If you ran section 11 (`just pipeline`), bring the
+batch stack back first with `just stack`, then log in again for a token. Otherwise your section-2
+`$TOKEN` still works:
 
 ```sh
 # Flatten term on an UNDECLARED path (works with no mapping):
@@ -571,7 +575,7 @@ curl -s localhost:8081/v1/search -H "authorization: Bearer $TOKEN" -H 'content-t
 curl -s localhost:8081/v1/search -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
   -d '{"index":"events","query":"payload.number:[1000 TO 2000]","sort":[{"field":"payload.number","desc":true}]}' | jq '.hits[].coordinates'
 
-# Hydrate a hit — the whole variant comes back as JSON (fetched via Trino):
+# Hydrate a hit: the whole variant comes back as JSON (fetched via Trino):
 curl -s localhost:8081/v1/search -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
   -d '{"index":"events","query":"payload.number:1347","hydrate":true}' | jq '.hits[0].row.payload'
 
@@ -581,7 +585,7 @@ curl -s localhost:8081/v1/search:hybrid -H "authorization: Bearer $TOKEN" -H 'co
 ```
 
 A row whose `event_type` matches no declared shape (e.g. a `WatchEvent`) is still fully
-flatten-covered — you'll find it by `payload.*` term — but has no typed shape fields.
+flatten-covered (you'll find it by a `payload.*` term) but has no typed shape fields.
 
 ## 13. Tear down
 
@@ -591,8 +595,9 @@ just stack-down
 
 ## Troubleshooting
 
-- **First `just stack` is slow (~10 min).** It compiles the GrowlerDB image once; subsequent starts
-  reuse the cached image and take seconds.
+- **First `just stack` takes a few minutes.** It pulls the released image and builds the sample
+  indexes; later starts reuse the cache and take seconds. (Building from your own checkout, or
+  `just stack-dev`, compiles the image instead, which adds about 10 minutes the first time.)
 - **Search returns `0 results` in the console.** Select the right index (`movies`, `docs`, `catalog`,
   or `events`, top-left) and qualify the term with a field, `body:search`, not a bare `search` (a bare
   term only matches the default field).
@@ -601,10 +606,10 @@ just stack-down
   `"index":"catalog"`, or `"index":"events"` to the request body. (The console lands on `movies` via
   `/v1/config`, but that default doesn't apply to the REST API.)
 - **Reading MinIO directly from the host fails** (`nodename nor servname` / connection refused): this
-  hits only *direct* host-side object-storage reads — client-side hydration with your own S3 client, or
-  the host test suite — not `keys:get`/`hydrate` through the gateway, which hydrate server-side. Add the
-  `127.0.0.1 minio` `/etc/hosts` entry (see *Optional: read the Compose MinIO directly from your host*
-  in Prerequisites).
+  hits only *direct* host-side object-storage reads (client-side hydration with your own S3 client, or
+  the host test suite), not `keys:get`/`hydrate` through the gateway, which hydrate server-side. To read
+  the store yourself, map the in-network name to localhost with
+  `echo "127.0.0.1 minio" | sudo tee -a /etc/hosts`.
 - **Ports already in use** (`8081`, `3000`, `9000`): stop the conflicting service or `just stack-down`
   a previous run first.
 - **Console shows "Unknown"/degraded health right after start:** the node is still building the `docs`
@@ -616,7 +621,7 @@ just stack-down
   on S3 (real AWS S3 or an in-house lakehouse), including the connector setup.
 - **Add semantic search to your own index**: declare a `VECTOR` field over a text column (see the
   [index definition reference](configuration#field-types)); embeddings are produced locally at ingest.
-  Then point an AI agent at it over MCP (§7) for grounded, RBAC-scoped retrieval.
+  Then point an AI agent at it over MCP (section 7) for grounded, RBAC-scoped retrieval.
 - Index your own table: define an index over its columns + key, drop the [index definition](reference)
   in via the console's Indexes → Create (it introspects your source schema).
 - [Migrate from Elasticsearch/OpenSearch](migration-from-elasticsearch).

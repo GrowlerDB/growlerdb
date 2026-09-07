@@ -24,11 +24,11 @@ GrowlerDB operates on a three-step cycle:
 2. **Search:** Run lexical, semantic, or hybrid queries against the index. The query returns documents including cached fields, primary key coordinates, and scores.
 3. **Hydrate:** Fetch the full, authoritative rows from your Iceberg catalog using the returned coordinates.
 
-Traditional search engines store a complete, separate copy of your documents. GrowlerDB stores only what is needed to search, using primary keys to bridge the index and the data lake. With cached fields, paginated lists and paging can be fully powered by GrowlerDB.
+Traditional search engines store a complete, separate copy of your documents. GrowlerDB stores only what is needed to search, using primary keys to bridge the index and the data lake. With cached fields, GrowlerDB can serve paginated result lists on its own.
 
 ## Choose your path
 
-To help you get started quickly, we have organized the documentation into paths based on your role:
+Pick the path for your role:
 
 * **Application developers:** Learn how to write search queries, configure local embeddings, and use the REST/gRPC APIs. Start with [Getting started](getting-started) and the [Query language](query-language).
 * **Platform engineers:** Deploy and manage the distributed stack, configure OIDC/JWT security, and monitor services. Start with [Install and run modes](install) and [Deployment](deployment).
