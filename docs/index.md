@@ -26,6 +26,16 @@ GrowlerDB operates on a three-step cycle:
 
 Traditional search engines store a complete, separate copy of your documents. GrowlerDB stores only what is needed to search, using primary keys to bridge the index and the data lake. With cached fields, GrowlerDB can serve paginated result lists on its own.
 
+## Retrieval options
+
+When retrieving results, you can choose from three paths depending on your latency and data needs:
+
+* **Search - Cached fields:** You can configure the index to store specific columns. These values return with the search hits immediately, requiring no Iceberg lookups.
+* **Search - Inline hydration:** You can request inline hydration by setting `hydrate: true` in your search body. The engine collapses the search and lookup steps, returning the authoritative row directly in the search response.
+* **Get - Full record:** For the authoritative details, your client fetches the full row by key using `POST /v1/keys:get`. This is typically used when a user opens a specific document.
+
+---
+
 ## Choose your path
 
 Pick the path for your role:
@@ -36,10 +46,6 @@ Pick the path for your role:
 
 ---
 
-## Retrieval options
+## Open source & commercial
 
-When retrieving results, you can choose from three paths depending on your latency and data needs:
-
-* **Cached fields:** You can configure the index to store specific columns. These values return with the search hits immediately, requiring no Iceberg lookups.
-* **Full hydration:** For the authoritative record, your client fetches the full row by key using `POST /v1/keys:get`. This is typically used when a user opens a specific document.
-* **Inline hydration:** You can request inline hydration by setting `hydrate: true` in your search body. The engine collapses the search and lookup steps, returning the authoritative row directly in the search response.
+GrowlerDB is open source under AGPL-3.0, free for self-hosted production use up to 3 nodes. Need more nodes, support with an SLA, or to embed GrowlerDB in a closed product? See [License & support](license).
