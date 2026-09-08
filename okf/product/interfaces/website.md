@@ -38,6 +38,18 @@ retired by Google and Bing in 2023): verify `growlerdb.com` and `docs.growlerdb.
 Console and Bing Webmaster Tools and submit each sitemap. The runbook + verification commands live in
 [`www/README.md`](https://github.com/GrowlerDB/growlerdb/blob/main/www/README.md).
 
+## Analytics
+
+Both sites use **self-hosted Plausible** (Community Edition) for visitor/engagement analytics —
+cookieless, no PII, no consent banner. The script + event API are served **first-party** from
+`an.growlerdb.com` (an Apache reverse proxy on the apex VM → the homelab instance over Tailscale) so
+ad-blockers don't strip the beacon; the Plausible dashboard stays tailnet-only. The proxy forwards
+`X-Forwarded-For` so per-visitor country/uniqueness resolve. Each site sets its own `data-domain`
+(`growlerdb.com` inline in `www/index.html`; `docs.growlerdb.com` in `docs/_includes/head_custom.html`).
+This is *website* analytics only — orthogonal to [D26](/system/decisions/d26-telemetry.md) (product
+telemetry: no phone-home, unchanged). See [D57](/system/decisions/d57-website-analytics.md); runbook in
+[`www/README.md`](https://github.com/GrowlerDB/growlerdb/blob/main/www/README.md).
+
 ## Notes
 
 Publishing the site (Pages) and pointing the domain is part of going public — see the GA-release work.
