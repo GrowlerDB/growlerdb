@@ -49,46 +49,52 @@ TLS is managed by certbot on the VM (`certbot renew` runs on a timer); the Apach
 
 Both sites use **self-hosted Plausible** (Community Edition) — cookieless, no PII, no consent banner
 ([D57](../okf/system/decisions/d57-website-analytics.md)). The snippet is first-party: `www/index.html`
-and `docs/_includes/head_custom.html` load `https://an.growlerdb.com/js/script.js` with a per-site
-`data-domain`. `an.growlerdb.com` is an **Apache reverse proxy on this same VM** that forwards to the
-homelab Plausible over Tailscale; the Plausible **dashboard stays tailnet-only** (only `/js/…` and
-`/api/event` are public). The snippet **fails silent** if the endpoint is down or blocked — safe to ship
-independently of the proxy going live.
+and `docs/_includes/head_custom.html` each load their own per-site script
+(`https://an.growlerdb.com/js/pa-<id>.js` + the `plausible.init()` bootstrap). `an.growlerdb.com` is an
+**Apache reverse proxy on this same VM** that forwards to a private, self-hosted Plausible instance; the
+Plausible **dashboard is not exposed publicly** (only the script and `/api/event` are). The snippet
+**fails silent** if the endpoint is down or blocked — safe to ship independently of the proxy going live.
 
 Setup on the VM (one-time):
 
 1. **DNS** — add the `an` A record (above) → `34.145.3.247`.
 2. **TLS** — `certbot --apache -d an.growlerdb.com` (joins the auto-renew timer).
-3. **Tailscale** — this VM is on the tailnet; note the homelab Plausible tailnet address
-   (`http://100.x.x.x:8000`).
-4. **Vhost** for `an.growlerdb.com` — reverse-proxy the two paths, forwarding the real client IP
-   (**required** — without `X-Forwarded-For`, every visitor is the proxy IP: one visitor, no geography):
+3. **Backend** — Plausible runs on a private instance reachable from this VM at
+   `https://<private-plausible-backend>/` (a host with a valid TLS cert).
+4. **Vhost** for `an.growlerdb.com` — reverse-proxy to that backend:
 
    ```apache
    <VirtualHost *:443>
      ServerName an.growlerdb.com
-     ProxyPreserveHost On
-     RequestHeader set X-Forwarded-For "%{REMOTE_ADDR}s"
-     ProxyPass        /js/  http://100.x.x.x:8000/js/
-     ProxyPassReverse /js/  http://100.x.x.x:8000/js/
-     ProxyPass        /api/event  http://100.x.x.x:8000/api/event
-     ProxyPassReverse /api/event  http://100.x.x.x:8000/api/event
-     # SSLEngine + Let's Encrypt cert lines added by certbot
+     SSLProxyEngine On
+     RequestHeader set X-Forwarded-Proto https
+     ProxyPreserveHost Off                                   # send the backend's own SNI/Host, not an.growlerdb.com
+     ProxyPass        /  https://<private-plausible-backend>/
+     ProxyPassReverse /  https://<private-plausible-backend>/
+     # SSLCertificate* + options-ssl-apache.conf added by certbot
    </VirtualHost>
    ```
 
-5. In Plausible, add both sites: `growlerdb.com` and `docs.growlerdb.com`.
+   Two traps, both hit during setup:
+   - **`ProxyPreserveHost Off` is required.** With it `On`, Apache sends `an.growlerdb.com` as the TLS
+     **SNI** to the SNI-strict backend → `AH00898` SSL-handshake failure → 503. `Off` makes SNI
+     match the backend cert.
+   - `X-Forwarded-For` is added by `mod_proxy` automatically (no need to set it); without a real client
+     IP Plausible sees one visitor and no geography, so don't strip it.
+
+5. In Plausible, set `BASE_URL=https://an.growlerdb.com`, and add both sites: `growlerdb.com` and
+   `docs.growlerdb.com` (each yields its own `pa-<id>.js`).
 
 **Verify** (with an ad-blocker *on*, to confirm the first-party path survives):
 
 ```sh
-curl -sI https://an.growlerdb.com/js/script.js | head -1   # → 200
+curl -sI https://an.growlerdb.com/js/pa-<id>.js | head -1   # → 200
 # Load each site, watch the Network tab: POST /api/event → 202
-# Plausible → Realtime should tick up, with the correct COUNTRY (proves X-Forwarded-For works)
+# Plausible → Realtime should tick up, with the correct COUNTRY (proves the client IP is forwarded)
 ```
 
-To add engagement events later, swap the script filename for a Plausible variant your instance serves
-(e.g. `script.file-downloads.outbound-links.js`) — outbound clicks to GitHub and `gdb.tgz` downloads.
+Engagement events (outbound-link clicks to GitHub, `gdb.tgz` downloads, custom events) are toggled per
+site in the Plausible **dashboard** — the served `pa-<id>.js` reflects them, no snippet change needed.
 
 ## Verify (do this after any DNS/host/cert change)
 
