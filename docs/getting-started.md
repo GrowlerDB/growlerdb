@@ -1,5 +1,6 @@
 ---
 title: Getting started
+description: Install GrowlerDB, index an Apache Iceberg table, and run your first lexical, semantic, and hybrid searches, then hydrate full rows back from the lake by key.
 layout: default
 nav_order: 2
 has_children: true

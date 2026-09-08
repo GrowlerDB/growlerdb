@@ -1,5 +1,6 @@
 ---
 title: Performance
+description: GrowlerDB performance: index-lookup search latency that stays flat as the table grows, with directional benchmarks against table scans on Iceberg.
 layout: default
 nav_order: 9
 ---

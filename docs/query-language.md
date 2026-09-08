@@ -1,5 +1,6 @@
 ---
 title: Query language
+description: GrowlerDB query language reference: Lucene and KQL operators for term, phrase, range, wildcard, fuzzy, and boolean queries, plus vector and hybrid search.
 layout: default
 parent: Reference
 nav_order: 1

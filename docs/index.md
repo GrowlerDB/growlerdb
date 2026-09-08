@@ -1,5 +1,6 @@
 ---
 title: GrowlerDB
+description: GrowlerDB is an open-source engine for full-text, vector, and hybrid search over Apache Iceberg. Searches resolve back to the authoritative rows in your lake.
 layout: default
 nav_order: 1
 ---

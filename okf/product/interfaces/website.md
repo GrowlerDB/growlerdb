@@ -31,7 +31,9 @@ inline — `<title>`, meta `description`, `canonical`, a `robots` directive
 and **schema.org JSON-LD** (`Organization` + `WebSite` + a free `SoftwareApplication`) — and ships a
 `robots.txt` + `sitemap.xml` (`www/`). The docs site emits per-page SEO/JSON-LD via `jekyll-seo-tag`
 and a full `sitemap.xml` via `jekyll-sitemap`, with a `robots.txt` advertising it. Each host has its
-**own** sitemap (apex is one page; docs is generated).
+**own** sitemap (apex is one page; docs is generated). Key docs pages set an explicit `description` in
+front matter so each gets a distinct search snippet instead of the shared site-wide fallback; the apex
+`sitemap.xml` is hand-maintained, so its `lastmod` is bumped when the page content changes.
 
 Getting indexed is a one-time, account-based submission per property (anonymous sitemap pings were
 retired by Google and Bing in 2023): verify `growlerdb.com` and `docs.growlerdb.com` in Google Search

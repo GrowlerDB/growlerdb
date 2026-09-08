@@ -1,5 +1,6 @@
 ---
 title: Configuration
+description: Configure GrowlerDB indexes, schemas, cached fields, embeddings, object storage, and security, including the GROWLERDB_S3_ credential contract.
 layout: default
 nav_order: 4
 ---
