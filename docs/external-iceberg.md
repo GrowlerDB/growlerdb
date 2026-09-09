@@ -25,10 +25,12 @@ catalog, bucket, and table:
 | Surface | What it does | How it's configured |
 |---|---|---|
 | **Query / hydration** (control plane · node · gateway) | Builds + serves the index; reads Iceberg to hydrate matched keys back to rows | `GROWLERDB_*` environment variables |
-| **Ingestion** (Spark connector) | Streams the Iceberg changelog into the index | `spark-submit --conf spark.sql.catalog.*` + `AWS_*` env |
+| **Ingestion** (Spark connector) | Streams the Iceberg changelog into the index | `spark-submit --conf spark.sql.catalog.*` + `GROWLERDB_S3_*` env |
 
-The two authenticate to S3 differently: the engine uses `GROWLERDB_S3_ACCESS_KEY`/`SECRET_KEY`, and
-the connector uses the AWS SDK's `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`. Set both.
+Both authenticate to S3 with the same `GROWLERDB_S3_*` credentials: the engine reads them directly,
+and the connector maps them onto the catalog's Iceberg `S3FileIO` properties for you. Set the S3 keys
+once and both sides use them, or leave them empty to authenticate by an IAM role instead (see
+[Limitations](#limitations)).
 
 ## Before you start
 
@@ -63,6 +65,10 @@ GROWLERDB_S3_SECRET_KEY=...
 GROWLERDB_S3_REGION=us-east-1
 GROWLERDB_SOURCE_TABLE=your_namespace.your_table
 GROWLERDB_INDEX_NAME=your_index
+GROWLERDB_LOGIN_USER=demo                      # console/API sign-in
+GROWLERDB_LOGIN_PASSWORD=change-me
+GROWLERDB_SERVICE_TOKEN=change-me              # mesh auth (must match the connector's)
+GROWLERDB_AUTH_SECRET=change-me                # signs session tokens
 ```
 
 On first boot the node builds an index from your table's current snapshot, auto-mapping every
@@ -109,17 +115,23 @@ spark-submit \
   --stream
 ```
 
-Provide the connector's S3 credentials via the AWS SDK env (or an IAM role, if you run it on AWS):
+Give the connector its S3 credentials the same way as the engine. It maps `GROWLERDB_S3_ACCESS_KEY`,
+`GROWLERDB_S3_SECRET_KEY`, and `GROWLERDB_S3_REGION` onto the catalog's Iceberg `S3FileIO` properties
+(the endpoint comes from the `--conf` above). For static keys, export them:
 
 ```sh
-export AWS_ACCESS_KEY_ID=AKIA... AWS_SECRET_ACCESS_KEY=... AWS_REGION=us-east-1
+export GROWLERDB_S3_ACCESS_KEY=AKIA... GROWLERDB_S3_SECRET_KEY=... GROWLERDB_S3_REGION=us-east-1
 export GROWLERDB_SERVICE_TOKEN=...   # must match the value in your .env (mesh auth)
 ```
 
+To authenticate by an IAM role instead (instance profile, STS, or EKS IRSA), leave
+`GROWLERDB_S3_ACCESS_KEY` and `GROWLERDB_S3_SECRET_KEY` unset and export only `GROWLERDB_SERVICE_TOKEN`.
+
 A few `--conf` notes: `type=rest` selects the REST catalog; `cache-enabled=false` is required for
 streaming, so each trigger sees new snapshots; `io-impl=…S3FileIO` plus the `s3.*` settings point
-Spark at your bucket. For AWS S3 use `s3.path-style-access=false` (virtual-hosted); for MinIO use
-`true`. The `ConnectorApp` args (`--identifier`, `--fields`, `--table`, `--index`, `--node`,
+Spark at your bucket. This `s3.path-style-access` setting controls the connector's own S3 client: for
+AWS S3 use `false` (virtual-hosted), for MinIO use `true`. The engine always uses path-style (see
+[Limitations](#limitations)), independent of this connector setting. The `ConnectorApp` args (`--identifier`, `--fields`, `--table`, `--index`, `--node`,
 `--control-plane`, `--stream`) tell it what to ingest and where. See the
 [connector README](https://github.com/GrowlerDB/growlerdb/blob/main/connector/README.md).
 
@@ -130,7 +142,7 @@ These are constraints of the current engine. Plan around them:
 - REST catalogs only. The engine builds an Iceberg `RestCatalog`; AWS Glue, Hadoop, and non-REST
   Nessie modes are not supported for the query/hydration side. (The Spark connector can read other
   catalog types, but hydration needs REST, so the end-to-end loop requires a REST catalog.)
-- Static S3 keys only. The engine authenticates to S3 with a static access key and secret key; IAM instance profiles, STS, and Kubernetes service accounts are not supported. Supply static credentials via `GROWLERDB_S3_ACCESS_KEY` and `GROWLERDB_S3_SECRET_KEY`.
+- S3 auth: static keys or an IAM role. Set `GROWLERDB_S3_ACCESS_KEY`/`GROWLERDB_S3_SECRET_KEY` for static keys, or leave them empty to use the AWS credential chain (EC2/ECS instance profile via IMDS, assume-role/STS, and EKS IRSA web-identity). On EKS, annotate the pod's ServiceAccount with the role (`eks.amazonaws.com/role-arn`) and leave the keys empty; the Helm chart's `serviceAccount.annotations` wires this.
 - Path-style S3 access is forced on by the engine. It is required for MinIO and still works with
   AWS S3 today; strict virtual-hosted-only setups aren't supported.
 - Rotate the secrets. `GROWLERDB_SERVICE_TOKEN` (mesh auth) and `GROWLERDB_AUTH_SECRET` (gateway
@@ -141,8 +153,8 @@ These are constraints of the current engine. Plan around them:
 - Catalog `401`/`403`: check `GROWLERDB_CATALOG_CREDENTIAL` (`id:secret`) and, for Polaris,
   `GROWLERDB_CATALOG_SCOPE=PRINCIPAL_ROLE:ALL`. Both the node/gateway env and the connector `--conf`
   must carry them.
-- S3 access denied / no such bucket: the engine and the connector authenticate separately, so verify
-  both `GROWLERDB_S3_*` (engine) and `AWS_*` (connector), the endpoint, and the region.
+- S3 access denied / no such bucket: the engine and the connector both read `GROWLERDB_S3_*`, so verify
+  those credentials (or the IAM role, if the keys are empty), the endpoint, and the region.
 - `table not found`: the node's `GROWLERDB_SOURCE_TABLE` and the connector's `--table` must be the
   same `namespace.table`, present in the warehouse you named.
 - Connector commits nothing on a live table: confirm `spark.sql.catalog.<name>.cache-enabled=false`.

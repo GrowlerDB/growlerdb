@@ -1,5 +1,6 @@
 ---
 title: Query language
+description: GrowlerDB query language reference: Lucene and KQL operators for term, phrase, range, wildcard, fuzzy, and boolean queries, plus vector and hybrid search.
 layout: default
 parent: Reference
 nav_order: 1
@@ -28,9 +29,9 @@ callers use the Lucene-style string, the default for `/v1/search`'s `query`. A K
 | Boolean | `a AND b`, `a OR b`, `NOT c`, `-c` | Combine clauses; `()` groups. |
 | Field-grouped set | `category:(guide OR reference)` | The field prefix distributes over the group, equivalent to `category:guide OR category:reference` (works with `AND`/implicit-AND too). |
 | Bool term | `archived:true`, `active:false` | Exact match on a `BOOL` field. |
-| Range | `age:[18 TO 65]`, `published:[2024-01-01 TO *]` | `[` `]` inclusive, `{` `}` exclusive; mix freely; `*`/empty = unbounded. On a `DATE` field a bound is epoch **micros** or an **ISO-8601 / RFC3339** date (`2024-01-01`, `2024-01-01T00:00:00Z`). |
+| Range | `age:[18 TO 65]`, `published:[2024-01-01 TO *]` | `[` `]` inclusive, `{` `}` exclusive; mix freely; `*`/empty = unbounded. On a `DATE` field a bound is epoch micros or an ISO-8601 / RFC3339 date (`2024-01-01`, `2024-01-01T00:00:00Z`). |
 | Wildcard | `device_id:sensor-*`, `code:??x` | `*` (many) / `?` (one). A leading `*` is cost-guarded. |
-| Fuzzy | `name:jon~1` | Edit distance 0–2 (`~` alone = 2). |
+| Fuzzy | `name:jon~1` | Edit distance 0 to 2 (`~` alone = 2). |
 | Prefix | `path:/var/*` | Literal prefix match. |
 | Regex | `id:/ab.*/` | Regex against indexed terms. |
 | CIDR | `gateway_ip:10.0.0.0/8` | IP-in-block (requires an `IP` field). |
@@ -39,7 +40,7 @@ callers use the Lucene-style string, the default for `/v1/search`'s `query`. A K
 
 ### KQL
 
-Selecting `syntax: "kql"` parses the same shapes with **lowercase** `and` / `or` / `not` (Kibana
+Selecting `syntax: "kql"` parses the same shapes with lowercase `and` / `or` / `not` (Kibana
 Query Language). Only the search path honors the selector today; aggregate/export stay Lucene.
 
 ## The AST (clauses)

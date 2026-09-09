@@ -13,8 +13,8 @@ nav_order: 11
 ---
 
 GrowlerDB keeps indexes on local NVMe for low-latency search, and can tier older,
-immutable data to object storage to cut steady-state cost. Tiering helps the right
-workload and hurts the wrong one, so this page is the decision guide.
+immutable data to object storage to cut steady-state cost. Tiering pays off for some workloads and
+costs you on others. Use this page to decide.
 
 > Status: **shipped.** Time-windowing, automatic in-place parking, and read-through serving
 > from object storage are live and validated on a windowed k3s cluster. A cold window stays
@@ -22,7 +22,7 @@ workload and hurts the wrong one, so this page is the decision guide.
 > cold window that gets hot traffic again pre-warms back to NVMe. Inspect what's parked via
 > `GET /v1/cold` or the console Storage tiers panel.
 
-## The one rule: tiering needs immutability
+## Tiering needs immutability
 
 Cold tiering works by sealing an old time-window shard and shipping its byte-identical segments to
 object storage, where they are served read-through (the local Tantivy bulk is evicted; a small
@@ -43,8 +43,8 @@ See [event-time vs ingest-time](#late-arriving-data-event-vs-ingest-time).
 2. The recent hot window stays on NVMe. Each node automatically parks its own windows once they
    age past the `hot_windows` policy (a background timer): the window's Tantivy bulk is shipped to
    object storage and evicted from local disk, while a small checkpoint (`aux.redb`) and a hot cache stay
-   on NVMe. Parking happens in place without interrupting the window, which keeps
-   answering queries across the hot→cold swap. It's opt-in per deployment and node-local (the parked
+   on NVMe. Parking happens in place, so the window keeps
+   answering queries across the hot-to-cold swap. It's opt-in per deployment and node-local (the parked
    data lives on the node's own object-storage prefix).
 3. A query prunes to the windows its time filter touches. If it touches a cold window, that window
    is served read-through from object storage: byte-range reads through a cache-bounded object
@@ -52,11 +52,11 @@ See [event-time vs ingest-time](#late-arriving-data-event-vs-ingest-time).
    getting hot traffic again pre-warms back to NVMe automatically. (The `growlerdb` CLI's `park` /
    `revive` also let you back a window up and fully restore it to NVMe on demand.)
 
-A 30-day-hot window over a 180-day corpus keeps ~⅙ of the index's bulk on NVMe, modeled at roughly
-70–85% lower steady-state NVMe spend for time-series workloads where ~90% of queries hit recent
+A 30-day-hot window over a 180-day corpus keeps about one sixth of the index's bulk on NVMe, modeled at roughly
+70% to 85% lower steady-state NVMe spend for time-series workloads where ~90% of queries hit recent
 data.
 
-## Limitations (be honest before you design around it)
+## Limitations
 
 - Cold reads are slower, but never unavailable. A cold window is queried in place (read-through from
   object storage), so the query always completes, though a cold hit pays object-store GET/egress and
@@ -67,7 +67,7 @@ data.
   single shard mixing hot and cold data can't be partially tiered.
 - Cold-read economics. Reaching back into cold data costs object-store GET/egress and slower
   range reads. Tiering pays off only when cold data is rarely queried; a workload that
-  frequently reads old data will thrash the hot⇄cold pre-warm cycle and lose the savings.
+  frequently reads old data will thrash the hot/cold pre-warm cycle and lose the savings.
 - Mutating data can't be tiered (the rule above); it stays hot.
 - Non-windowed indexes do not support tiering. Because hash-sharded indexes do not group documents into immutable temporal shards, they cannot be tiered to object storage. Calling `GET /v1/cold` on a non-windowed index returns a `404 Not Found` response with the body `not a windowed index (no cold tier)`.
 - Late backfills erode pruning. A large late backfill widens a window's event-time zone-map, so

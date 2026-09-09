@@ -42,7 +42,8 @@ and builds the shared image from `deploy/Dockerfile` and the connector from `con
 only GrowlerDB (control-plane + node + gateway, off the published image) against a user's **own**
 external Iceberg REST catalog + S3 store — no bundled MinIO/Polaris/seed. It's the "day 2" step after
 the demo; see the [getting-started site](/product/interfaces/website.md) *Connecting your own Iceberg
-table* page for the walkthrough and limitations (REST-only catalog, static S3 keys, forced path-style).
+table* page for the walkthrough and limitations (REST-only catalog, S3 auth by static keys or an IAM
+role via the credential chain — [D56](/system/decisions/d56-s3-credential-chain.md) — forced path-style).
 
 **Demo indexes on an HA placement pool.** The `seed` profile writes `growlerdb.docs` (3 rows, the
 minimal E2E table) *and* the richer `growlerdb.catalog` (10 rows — one field of every type); a

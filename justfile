@@ -15,6 +15,10 @@ setup:
 build:
     cargo build --workspace
 
+# Optimized release build of the runnable binary → target/release/growlerdb.
+build-release:
+    cargo build --release -p growlerdb-cli
+
 test:
     cargo test --workspace
 

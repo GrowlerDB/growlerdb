@@ -1,5 +1,6 @@
 ---
 title: Install & run modes
+description: Install and run GrowlerDB with Docker Compose or Helm, and choose the right mode for local development, the demo stack, or a distributed deployment.
 layout: default
 nav_order: 3
 ---
@@ -45,16 +46,32 @@ can pin exactly or float.
 ```sh
 mise install            # install the pinned Rust toolchain
 just setup              # add rustfmt + clippy
-just build              # build the workspace (release: cargo build --release -p growlerdb-cli)
-just check              # fmt + clippy + tests (the CI gate)
+just build              # build the workspace (debug)
+just check              # fmt + clippy + tests
 ```
 
-The single binary is `growlerdb` (`target/release/growlerdb`): one binary with four long-running
-roles selected by subcommand, plus the offline index and maintenance commands.
+The single binary `growlerdb` has many modes and sub-commands.
 
 ```sh
-growlerdb --help
+./target/debug/growlerdb --help
 ```
+
+### Release build
+
+`just build` is a debug build. For real runs (`serve`, `gateway`, benchmarks), compile the optimized
+binary instead:
+
+```sh
+just build-release      # cargo build --release -p growlerdb-cli
+```
+
+This produces `target/release/growlerdb`:
+
+```sh
+./target/release/growlerdb --help
+```
+
+Install it onto your PATH with `cargo install --path crates/growlerdb-cli` to run a bare `growlerdb`.
 
 ## Connecting to the lakehouse
 
@@ -74,7 +91,7 @@ export GROWLERDB_S3_SECRET_KEY=minioadmin
 
 ### 1. Embedded (single binary)
 
-Index a table, then search it, no servers needed. Best for laptops, CI, demos, and small corpora.
+Index a table, then search it. No servers needed. Best for laptops, CI, demos, and small corpora.
 
 ```sh
 # Build the index from a source table (auto-maps the schema; --name defaults to the last segment).
@@ -99,7 +116,7 @@ Maintenance commands operate on a local index:
 `GROWLERDB_BACKUP_BUCKET` (see [Configuration](configuration#environment)). After a restore the
 connector resumes the tail from the backed-up checkpoint (exactly-once).
 
-### 2. `serve` (a Node)
+### 2. `serve` (a node)
 
 Host an already-built index over gRPC (Write + Search + Lookup + Suggest + Admin + System), and
 optionally the REST API + console. Register with a control plane so it's cluster-visible.
@@ -151,9 +168,3 @@ Any long-running mode given `--metrics-addr` exposes `/healthz`, `/readyz`, and 
 ```sh
 curl -f localhost:9103/readyz
 ```
-
-## Next
-
-- [Configuration](configuration): flags, env, and the index-definition YAML.
-- [Reference](reference): the query language and REST/gRPC API.
-- [Deployment](deployment): Compose and Kubernetes (Helm).
