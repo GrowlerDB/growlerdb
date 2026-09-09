@@ -31,11 +31,27 @@ inline — `<title>`, meta `description`, `canonical`, a `robots` directive
 and **schema.org JSON-LD** (`Organization` + `WebSite` + a free `SoftwareApplication`) — and ships a
 `robots.txt` + `sitemap.xml` (`www/`). The docs site emits per-page SEO/JSON-LD via `jekyll-seo-tag`
 and a full `sitemap.xml` via `jekyll-sitemap`, with a `robots.txt` advertising it. Each host has its
-**own** sitemap (apex is one page; docs is generated).
+**own** sitemap (apex is one page; docs is generated). Key docs pages set an explicit `description` in
+front matter so each gets a distinct search snippet instead of the shared site-wide fallback; the apex
+`sitemap.xml` is hand-maintained, so its `lastmod` is bumped when the page content changes.
 
 Getting indexed is a one-time, account-based submission per property (anonymous sitemap pings were
 retired by Google and Bing in 2023): verify `growlerdb.com` and `docs.growlerdb.com` in Google Search
 Console and Bing Webmaster Tools and submit each sitemap. The runbook + verification commands live in
+[`www/README.md`](https://github.com/GrowlerDB/growlerdb/blob/main/www/README.md).
+
+## Analytics
+
+Both sites use **self-hosted Plausible** (Community Edition) for visitor/engagement analytics —
+cookieless, no PII, no consent banner. The script + event API are served **first-party** from
+`an.growlerdb.com` (an Apache reverse proxy on the apex VM → a private, self-hosted Plausible instance)
+so ad-blockers don't strip the beacon; the Plausible dashboard is not exposed publicly. The proxy
+forwards `X-Forwarded-For` so per-visitor country/uniqueness resolve. Each site loads its own per-site Plausible
+script (`an.growlerdb.com/js/pa-<id>.js` + the `plausible.init()` bootstrap) — inline in `www/index.html`
+for the apex, in `docs/_includes/head_custom.html` for the docs. Engagement features (outbound links,
+file downloads, etc.) are toggled per site in the Plausible dashboard, not in the snippet.
+This is *website* analytics only — orthogonal to [D26](/system/decisions/d26-telemetry.md) (product
+telemetry: no phone-home, unchanged). See [D57](/system/decisions/d57-website-analytics.md); runbook in
 [`www/README.md`](https://github.com/GrowlerDB/growlerdb/blob/main/www/README.md).
 
 ## Notes

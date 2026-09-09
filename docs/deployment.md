@@ -1,5 +1,6 @@
 ---
 title: Deployment
+description: Deploy and operate GrowlerDB as a distributed stack: control plane, nodes, gateway, replicas, OIDC and JWT security, and observability.
 layout: default
 nav_order: 10
 ---

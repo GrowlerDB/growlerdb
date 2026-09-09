@@ -1,5 +1,6 @@
 ---
 title: Comparison & positioning
+description: How GrowlerDB compares to Elasticsearch, OpenSearch, and Trino or Spark search on Iceberg, and where it fits, since it keeps no second copy of your data.
 layout: default
 nav_order: 8
 ---
@@ -8,7 +9,7 @@ nav_order: 8
 {: .no_toc }
 
 Where GrowlerDB fits, and where it doesn't, next to the tools you're probably already running.
-For the numbers behind the claims here, see [Performance (directional)](performance); for the
+For the numbers behind the claims here, see [Performance](performance); for the
 mechanics of moving over, see [Migrating from Elasticsearch/OpenSearch](migration-from-elasticsearch).
 
 1. TOC
@@ -25,11 +26,11 @@ what separates it from both search engines and query engines.
 
 | | Elasticsearch / OpenSearch | GrowlerDB |
 |---|---|---|
-| System of record | the engine's own `_source` (a **second copy**) | **Apache Iceberg** (your lake) |
-| A search returns | full documents | document **keys** + score → hydrate on demand |
-| Ingestion | `_bulk` / index API you operate | a **changelog connector** tracks the source table |
+| System of record | the engine's own `_source` (a second copy) | Apache Iceberg (your lake) |
+| A search returns | full documents | document keys + score, hydrate on demand |
+| Ingestion | `_bulk` / index API you operate | a changelog connector tracks the source table |
 | Staying in sync | your job (dual-writes, reindex) | derived from the Iceberg changelog |
-| Governance | search-time copy, separately secured | hydration returns the **catalog-governed** live row |
+| Governance | search-time copy, separately secured | hydration returns the catalog-governed live row |
 | Rebuild / re-shard | reindex the world | drop and rebuild the derived index from source |
 
 Choose GrowlerDB when your data already lives in (or can land in) Iceberg and you don't want a
@@ -47,9 +48,9 @@ answer.
 **Ingesting from Iceberg.** Both engines can index an Iceberg table, but by different paths. GrowlerDB's
 ingestion *is* a streaming **changelog connector** purpose-built for Iceberg: it follows the table's
 commit stream to keep the derived index in sync, with no second write path to operate. OpenSearch has no
-native Iceberg ingest — you either **dual-write** via `_bulk` (a separate pipeline to build and keep from
-drifting) or bridge the table through **Data Prepper's Iceberg CDC source, which is experimental and
-copy-on-write-only** and polls snapshots on an interval. So for data that already lives in Iceberg,
+native Iceberg ingest: you either dual-write via `_bulk` (a separate pipeline to build and keep from
+drifting) or bridge the table through Data Prepper's Iceberg CDC source, which is experimental and
+copy-on-write-only and polls snapshots on an interval. So for data that already lives in Iceberg,
 GrowlerDB stays in sync natively where OpenSearch needs an extra, less-mature moving part.
 
 ## vs. Trino / Spark full-text on Iceberg
@@ -59,18 +60,17 @@ difference is scan versus index:
 
 | | Trino / Spark on Iceberg | GrowlerDB |
 |---|---|---|
-| How a text query runs | **scans** the table (grows with rows) | **inverted-index** lookup (flat in dataset size) |
-| Typical filtered-search latency | ~150–300 ms at 1M rows | **single-digit ms** |
+| How a text query runs | scans the table (grows with rows) | inverted-index lookup (flat in dataset size) |
+| Typical filtered-search latency | grows with the table size | milliseconds, flat in dataset size |
 | Ranking | none / bolt-on | BM25 relevance, per-hit explain |
-| Returning rows | reads columns during the scan | hydrates **only** the K matching rows by key |
-| Same source of truth | ✅ the Iceberg table | ✅ the same Iceberg table |
+| Returning rows | reads columns during the scan | hydrates only the K matching rows by key |
+| Same source of truth | Yes, the Iceberg table | Yes, the same Iceberg table |
 
-On the [directional benchmark](performance) (a small dev VM, not a formal at-scale run) GrowlerDB is
-~50–170× faster than a Trino scan on filtered search, and the gap widens with data size because the
-index lookup stays flat while the scan grows. Both read the same Iceberg table. GrowlerDB doesn't replace your query engine; it adds the
-search access path the query engine lacks. (For authoritative full-row retrieval, GrowlerDB's
-hydration is still ~2× faster than a Trino `SELECT *`, because a sort-key-pruned key scan reads only the
-matching rows rather than scanning.)
+Both read the same Iceberg table, but GrowlerDB adds a search index, so filtered search resolves
+through an index lookup instead of a column scan. The lookup stays flat as the table grows while a
+scan grows with it. GrowlerDB doesn't replace your query engine; it adds the search access path the
+query engine lacks. For authoritative full-row retrieval, GrowlerDB fetches only the matching rows by
+key rather than scanning the table. See [Performance](performance) for the current numbers.
 
 ## When GrowlerDB is a good fit
 

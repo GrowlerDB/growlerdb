@@ -52,15 +52,15 @@ same auth + tenant scoping as the native API.
 
 | Clause | Support | Maps to |
 |---|---|---|
-| `match_all` | ✅ | `MatchAll` (via the `*:*` idiom, a cheap all-docs query) |
-| `match` | ✅ | analyzed term(s); multi-token ⇒ OR of tokens |
-| `match_phrase` | ✅ | `Phrase` (ordered, adjacency) |
-| `multi_match` | ✅ | OR of `field:value` across `fields` |
-| `term` | ✅ | `Term` (exact / analyzed per field type) |
-| `terms` | ✅ | OR of `Term`s |
-| `range` (`gte`/`gt`/`lte`/`lt`) | ✅ | `Range` with inclusive/exclusive bounds |
-| `bool` (`must`/`filter`/`must_not`/`should`) | ✅ | `Bool` (see `should`/`filter` caveats) |
-| `exists`, `prefix`, `wildcard`, `fuzzy`, `regexp`, `ids`, … | ❌ | clear `501` error |
+| `match_all` | Yes | `MatchAll` (via the `*:*` idiom, a cheap all-docs query) |
+| `match` | Yes | analyzed term(s); multi-token becomes OR of tokens |
+| `match_phrase` | Yes | `Phrase` (ordered, adjacency) |
+| `multi_match` | Yes | OR of `field:value` across `fields` |
+| `term` | Yes | `Term` (exact / analyzed per field type) |
+| `terms` | Yes | OR of `Term`s |
+| `range` (`gte`/`gt`/`lte`/`lt`) | Yes | `Range` with inclusive/exclusive bounds |
+| `bool` (`must`/`filter`/`must_not`/`should`) | Yes | `Bool` (see `should`/`filter` caveats) |
+| `exists`, `prefix`, `wildcard`, `fuzzy`, `regexp`, `ids`, … | No | clear `501` error |
 
 ### Request body
 - `from` / `size` → offset / page size (default `size` = 10).
