@@ -1,5 +1,6 @@
 ---
 title: Migrating from Elasticsearch
+description: Move search from Elasticsearch or OpenSearch to GrowlerDB over Apache Iceberg, including the OpenSearch _search adapter and how the data model differs.
 layout: default
 nav_order: 7
 ---

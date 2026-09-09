@@ -1,5 +1,6 @@
 ---
 title: Comparison & positioning
+description: How GrowlerDB compares to Elasticsearch, OpenSearch, and Trino or Spark search on Iceberg, and where it fits, since it keeps no second copy of your data.
 layout: default
 nav_order: 8
 ---

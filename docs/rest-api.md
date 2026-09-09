@@ -1,5 +1,6 @@
 ---
 title: REST & gRPC API
+description: GrowlerDB REST and gRPC API reference: search, hybrid queries, key hydration, aggregations and facets, and index management endpoints.
 layout: default
 parent: Reference
 nav_order: 2

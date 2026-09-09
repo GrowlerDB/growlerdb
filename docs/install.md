@@ -1,5 +1,6 @@
 ---
 title: Install & run modes
+description: Install and run GrowlerDB with Docker Compose or Helm, and choose the right mode for local development, the demo stack, or a distributed deployment.
 layout: default
 nav_order: 3
 ---
