@@ -52,10 +52,10 @@ if command -v mc >/dev/null; then
   mc_put_local() { mc cp "$1" "$2"; }
 else
   command -v docker >/dev/null || { echo "ERROR: need 'mc' or 'docker' to run mc"; exit 2; }
-  mcc() { docker run --rm -e MC_HOST_gdbsrc -e MC_HOST_gdbdst minio/mc:latest "$@"; }
+  mcc() { docker run --rm -e MC_HOST_gdbsrc -e MC_HOST_gdbdst quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z "$@"; }
   mc_put_local() {
     local d b; d="$(cd "$(dirname "$1")" && pwd)"; b="$(basename "$1")"
-    docker run --rm -e MC_HOST_gdbdst -v "$d":/data:ro minio/mc:latest cp "/data/$b" "$2"
+    docker run --rm -e MC_HOST_gdbdst -v "$d":/data:ro quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z cp "/data/$b" "$2"
   }
 fi
 

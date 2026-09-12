@@ -18,3 +18,8 @@ Wired in the [Compose](/system/deployment/index.md) and k8s deps manifests; the 
 `minio:9000` endpoint. In-network services and gateway-served hydration use it directly; only a host
 process reading the store directly (the Rust tests, or client-side hydration) maps it in `/etc/hosts`.
 Production can use any S3-compatible service.
+
+The `minio` server and `mc` client images come from **`quay.io/minio/*`, pinned to explicit
+`RELEASE.*` tags** (not Docker Hub `:latest`). MinIO removed its Docker Hub repos, so the old
+`minio/minio:latest` / `minio/mc:latest` references stopped resolving; quay.io is MinIO's canonical
+registry, and pinning keeps the dev/CI stack reproducible.
