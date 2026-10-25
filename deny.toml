@@ -29,6 +29,11 @@ ignore = [
     # VERIFY JWTs (public-key RSA) — never private-key decrypt/sign — so the leak can't apply; no
     # upstream fix exists in `rsa`.
     "RUSTSEC-2023-0071",
+    # crypto-bigint non-constant-time ops: reached only via elliptic-curve/p384 under jsonwebtoken,
+    # which we use solely to VERIFY JWTs (public-key ECDSA) — no secret scalar is processed, so the
+    # timing variability can't leak one. elliptic-curve 0.13 pins crypto-bigint `^0.5`; the fix is in
+    # 0.7, so no in-tree upgrade exists until jsonwebtoken/p384 move to elliptic-curve 0.14+.
+    "RUSTSEC-2026-0387",
     # quick-xml DoS (quadratic attribute scan / unbounded namespace alloc): reached only through
     # opendal, which parses XML from the trusted object store (S3/MinIO), not attacker input; a
     # malicious store would be required. Clears once opendal ships quick-xml >=0.41.
@@ -38,6 +43,13 @@ ignore = [
     "RUSTSEC-2024-0436",
     # atomic-polyfill: unmaintained, no known vulnerability; a transitive dep.
     "RUSTSEC-2023-0089",
+    # zip ZIP-extraction flaws (symlink traversal, SUID/SGID preservation): reached only through
+    # candle-core, which extracts operator-supplied model archives — not attacker input — and the
+    # engine does not run privileged. candle pins zip `^7`; the fix lands in 9.0.0, so no in-tree
+    # upgrade exists until candle is removed (see dependabot `candle-*` ignore / TASK-332).
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
 ]
 
 [sources]
