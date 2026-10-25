@@ -111,10 +111,11 @@ services:
       timeout: 3s
       retries: 20
 
-  # mc (MinIO client) is likewise gated, so provision buckets with the AWS CLI from public ECR
-  # (no docker.io rate limit). Path-style addressing — the engine forces it and RustFS expects it.
+  # mc (MinIO client) is likewise gated, so provision buckets with the AWS CLI. Path-style
+  # addressing — the engine forces it and RustFS expects it. (public.ecr.aws caps anonymous data
+  # transfer and 429s on CI; docker.io already serves the rest of the stack here, so use it.)
   createbuckets:
-    image: public.ecr.aws/aws-cli/aws-cli:latest
+    image: amazon/aws-cli:2.38.5
     depends_on:
       minio:
         condition: service_healthy
