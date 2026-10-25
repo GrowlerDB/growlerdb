@@ -1,4 +1,4 @@
-# Grouped, weekly dependency updates. Grouping is the anti-flood control: an ungrouped config opens a
+# Grouped, monthly dependency updates. Grouping is the anti-flood control: an ungrouped config opens a
 # separate PR per dependency, and pre-1.0 `0.x` crates make this worse because Dependabot counts a
 # `0.x` minor bump (e.g. 0.9 -> 0.11) as "major", so each got its own PR. Each ecosystem now bundles
 # minor/patch into one PR AND major/breaking bumps into a SECOND PR: routine updates stay trivially
@@ -9,7 +9,7 @@ updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
     open-pull-requests-limit: 5
     groups:
       cargo-minor-patch:
@@ -34,7 +34,7 @@ updates:
   - package-ecosystem: npm
     directory: /ui
     schedule:
-      interval: weekly
+      interval: monthly
     open-pull-requests-limit: 5
     groups:
       npm-minor-patch:
@@ -52,7 +52,7 @@ updates:
   - package-ecosystem: maven
     directory: /connector
     schedule:
-      interval: weekly
+      interval: monthly
     open-pull-requests-limit: 5
     groups:
       maven-minor-patch:
@@ -70,7 +70,7 @@ updates:
   - package-ecosystem: maven
     directory: /connector-trino
     schedule:
-      interval: weekly
+      interval: monthly
     open-pull-requests-limit: 5
     groups:
       maven-minor-patch:
@@ -81,7 +81,7 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
     open-pull-requests-limit: 5
     groups:
       github-actions:
