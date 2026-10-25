@@ -2,7 +2,9 @@
 
 GrowlerDB's runtime dependencies for development and tests:
 
-- **MinIO** — S3-compatible object storage (`:9000` API, `:9001` console; `minioadmin`/`minioadmin`).
+- **RustFS** — S3-compatible object storage (`:9000` API, `:9001` console; `minioadmin`/`minioadmin`).
+  Reached in-network as `minio:9000` — the service keeps that name as the stable S3 endpoint
+  (MinIO's own community images went auth-gated, so the implementation moved to RustFS).
 - **Apache Polaris** — Iceberg REST catalog (`:8181`), backed by a persistent Postgres metastore
   (`polaris-db`).
 - **seed** — creates the sample Iceberg tables: `growlerdb.docs` (3 rows), the richer
