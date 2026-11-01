@@ -9,10 +9,10 @@ repository.workspace = true
 [dependencies]
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "fmt", "registry"] }
-tracing-opentelemetry = "0.33"
-opentelemetry = "0.32"
-opentelemetry_sdk = "0.32"
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+tracing-opentelemetry = "0.34"
+opentelemetry = "0.33"
+opentelemetry_sdk = "0.33"
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 axum = "0.8"
